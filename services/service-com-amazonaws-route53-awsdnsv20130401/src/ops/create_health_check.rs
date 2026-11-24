@@ -103,7 +103,8 @@ use super::types::*;
 
 use crate::state::{
     health_check_config_problem, health_check_config_with_defaults, health_check_status,
-    monitored_alarm, now_millis, resource_location, StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION,
+    monitored_alarm, now_millis, repeats_a_child_health_check, resource_location,
+    StoredHealthCheck, DUPLICATE_CHILD_HEALTH_CHECKS_MESSAGE, FIRST_HEALTH_CHECK_VERSION,
     MAX_HEALTH_CHECKS,
 };
 use std::collections::BTreeMap;
@@ -203,6 +204,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(problem) = health_check_config_problem(&input.health_check_config) {
             return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
                 message: Some(format!("Invalid request: {problem}")),
+            })
+            .into());
+        }
+
+        // The children a CALCULATED check adds up are a SET of health check ids, so a
+        // configuration naming one of them twice is refused rather than stored: a
+        // repeated child would be counted twice against `HealthThreshold`, leaving one
+        // endpoint's health carrying a threshold meant for several. The refusal is worded
+        // by the ONE sentence the service states for it, whichever operation persists the
+        // configuration.
+        if repeats_a_child_health_check(&input.health_check_config) {
+            return Err(CreateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                message: Some(DUPLICATE_CHILD_HEALTH_CHECKS_MESSAGE.to_string()),
             })
             .into());
         }

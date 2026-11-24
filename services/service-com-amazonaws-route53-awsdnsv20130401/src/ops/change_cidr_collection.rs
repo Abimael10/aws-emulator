@@ -91,7 +91,8 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    cidr_collection_version_mismatch, no_such_cidr_collection, MAX_CIDR_BLOCKS_PER_COLLECTION,
+    cidr_block_in_use, cidr_collection_version_mismatch, no_such_cidr_collection,
+    MAX_CIDR_BLOCKS_PER_COLLECTION,
 };
 
 /// The `Action` that puts a CIDR block in a location of the collection: "PUT: Create
@@ -102,10 +103,6 @@ const PUT: &str = "PUT";
 /// block from the collection" — so a block the collection does not hold is already in
 /// the state the change asks for.
 const DELETE_IF_EXISTS: &str = "DELETE_IF_EXISTS";
-
-/// The refusal text this operation answers a `PUT` of a block the collection already
-/// holds in ANOTHER location with (`CidrBlockInUseException`, HTTP 400).
-const CIDR_BLOCK_IN_USE_MESSAGE: &str = "This CIDR block is already in use.";
 
 /// The refusal text this operation answers a change over a collection ANOTHER request
 /// changed meanwhile with (`ConcurrentModification`, HTTP 400), as the model words it: the
@@ -291,10 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .get(block.as_str())
                     .is_some_and(|held| *held != change.location_name.as_str());
                 if elsewhere {
+                    // The refusal is MESSAGELESS: the service answers this class by its
+                    // identity alone, which `cidr_block_in_use` is the one place to word.
                     return Err(ChangeCidrCollectionErrorModeled::CidrBlockInUseException(
-                        CidrBlockInUseException {
-                            message: Some(CIDR_BLOCK_IN_USE_MESSAGE.to_string()),
-                        },
+                        cidr_block_in_use(),
                     )
                     .into());
                 }

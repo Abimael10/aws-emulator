@@ -135,6 +135,15 @@ const RESPONSE_CODE_NOERROR: &str = "NOERROR";
 /// the zone the answering name servers are authoritative for.
 const RESPONSE_CODE_NXDOMAIN: &str = "NXDOMAIN";
 
+/// The refusal text a query addressed at a PRIVATE hosted zone is answered with
+/// (`InvalidInput`, HTTP 400).
+///
+/// A CONSTANT: the sentence states the restriction the operation's own
+/// documentation gives ("This call only supports querying public hosted zones")
+/// and carries nothing the request named — not the zone id, which the caller's
+/// own request already holds.
+const PRIVATE_ZONE_QUERY_MESSAGE: &str = "Cannot send DNS query to a Private Hosted Zone.";
+
 /// The `CountryCode` of the geolocation record set that answers a query the
 /// service cannot place.
 ///
@@ -763,11 +772,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // VPCs it is associated with, which no simulated resolver is in.
         if zone.private_zone {
             return Err(TestDNSAnswerErrorModeled::InvalidInput(InvalidInput {
-                message: Some(format!(
-                    "The hosted zone {} is a private hosted zone; TestDNSAnswer only \
-                     supports querying public hosted zones",
-                    zone.id
-                )),
+                message: Some(PRIVATE_ZONE_QUERY_MESSAGE.to_string()),
             })
             .into());
         }

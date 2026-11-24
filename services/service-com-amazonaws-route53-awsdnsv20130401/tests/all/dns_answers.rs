@@ -44,6 +44,10 @@ const NOERROR: &str = "NOERROR";
 /// The response code of a query for a name the zone holds no record at.
 const NXDOMAIN: &str = "NXDOMAIN";
 
+/// The ONE sentence a query addressed at a PRIVATE hosted zone is refused with:
+/// fixed text stating the restriction, carrying nothing the request named.
+const PRIVATE_ZONE_MESSAGE: &str = "Cannot send DNS query to a Private Hosted Zone.";
+
 /// Ask `TestDNSAnswer` one question, with the query string already rendered.
 async fn ask(router: &MultiServiceRouter, query: &str) -> Reply {
     call(
@@ -1049,46 +1053,113 @@ async fn a_private_hosted_zone_cannot_be_queried() {
     // public hosted zones." A private zone answers inside the VPCs it is
     // associated with, and no simulated resolver is in one, so the query is
     // refused rather than answered from the private zone's records.
+    //
+    // The refusal states ONE fixed sentence: it carries nothing the request named
+    // — not the zone id, which the caller's own request already holds. So the
+    // rows span what a private-zone query can differ along (the zone's name and
+    // label count, the VPC and region it is associated with, the name and type
+    // asked about, and whether the zone holds a record at that name at all) and
+    // the sentence has to be the same for every one of them.
     let router = router();
-    let created = call(
-        &router,
-        "POST",
-        "/2013-04-01/hostedzone",
-        &create_zone_body(
+    let rows: [(&str, &str, &str, &str, &str, &str); 4] = [
+        (
+            "the zone apex, asked for SOA",
             "internal.example.com",
-            "ref-private",
-            "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>\
-             <VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-1a2b3c4d</VPCId></VPC>",
+            "us-east-1",
+            "vpc-1a2b3c4d",
+            "internal.example.com",
+            "SOA",
         ),
-    )
-    .await;
-    assert_eq!(
-        created.status, 201,
-        "the private zone must be created, got {} with body {}",
-        created.status, created.body
-    );
-    let zone_id = created
-        .first("HostedZone/Id")
-        .unwrap_or_else(|| panic!("the create must report the zone; body {}", created.body))
-        .trim_start_matches("/hostedzone/")
-        .to_string();
+        (
+            "a name below the apex, asked for A",
+            "internal.example.com",
+            "us-east-1",
+            "vpc-1a2b3c4d",
+            "www.internal.example.com",
+            "A",
+        ),
+        (
+            "a two-label zone in another region, asked for AAAA",
+            "corp.internal",
+            "eu-west-1",
+            "vpc-0a1b2c3d4e5f60718",
+            "corp.internal",
+            "AAAA",
+        ),
+        (
+            "a name outside the zone entirely, asked for TXT",
+            "private.example.org",
+            "ap-southeast-2",
+            "vpc-feedface",
+            "elsewhere.example.net",
+            "TXT",
+        ),
+    ];
 
-    let reply = ask_for(&router, &zone_id, "internal.example.com", "SOA").await;
+    let mut sentences = BTreeSet::new();
+    for (index, (case, zone_name, region, vpc_id, record_name, rr_type)) in
+        rows.iter().enumerate()
+    {
+        let created = call(
+            &router,
+            "POST",
+            "/2013-04-01/hostedzone",
+            &create_zone_body(
+                zone_name,
+                &format!("ref-private-{index}"),
+                &format!(
+                    "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>\
+                     <VPC><VPCRegion>{region}</VPCRegion><VPCId>{vpc_id}</VPCId></VPC>"
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case:?}: the private zone must be created, got {} with body {}",
+            created.status, created.body
+        );
+        let zone_id = created
+            .first("HostedZone/Id")
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the create must report the zone; body {}",
+                    created.body
+                )
+            })
+            .trim_start_matches("/hostedzone/")
+            .to_string();
+
+        let reply = ask_for(&router, &zone_id, record_name, rr_type).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected 400, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            INVALID_INPUT,
+            "case {case:?}: expected {INVALID_INPUT}, got {}",
+            reply.body
+        );
+        let got = message(&reply);
+        assert_eq!(
+            got, PRIVATE_ZONE_MESSAGE,
+            "case {case:?}: expected message {PRIVATE_ZONE_MESSAGE:?}, got {got:?}"
+        );
+        assert!(
+            !got.contains(&zone_id) && !got.contains(zone_name.trim_end_matches('.')),
+            "case {case:?}: the sentence must carry nothing the request named, got {got:?}"
+        );
+        sentences.insert(got);
+    }
+
+    // The sentence has no variable part, so however many private zones were
+    // queried there is exactly ONE sentence among the refusals.
     assert_eq!(
-        reply.status, 400,
-        "expected 400, got {} with body {}",
-        reply.status, reply.body
-    );
-    assert_eq!(
-        reply.error_code(),
-        INVALID_INPUT,
-        "expected {INVALID_INPUT}, got {}",
-        reply.body
-    );
-    assert!(
-        message(&reply).contains(&zone_id) && message(&reply).contains("public hosted zones"),
-        "the refusal must name the zone and the rule, got {:?}",
-        message(&reply)
+        sentences.len(),
+        1,
+        "every private-zone query must be refused with the same sentence, got {sentences:?}"
     );
 }
 

@@ -18,9 +18,9 @@
 //!    policy is not a new policy — the account's traffic policy count does not
 //!    move for one.
 //! 3. An `Id` the account holds no policy under names nothing to add a version
-//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), worded as the one
-//!    fixed sentence Route 53 refuses a traffic policy it does not hold with,
-//!    and nothing is persisted.
+//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), reported on this path by
+//!    its IDENTITY ALONE — `Type` and `Code` and no `Message` element — and
+//!    nothing is persisted.
 //! 4. The document is the version's definition, so a document the published
 //!    traffic policy document format does not define is refused with the
 //!    modelled `InvalidTrafficPolicyDocument` (HTTP 400) and adds no version —
@@ -46,7 +46,7 @@ use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, get_policy, policy_count,
     policy_of, PolicyView,
 };
-use crate::traffic_policy_not_found_envelope::assert_no_such_traffic_policy;
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 
 /// `TrafficPolicyComment` is `len 0..1024`
 /// (smithy_query(query="shape",shape="TrafficPolicyComment")).
@@ -377,10 +377,10 @@ async fn an_id_that_names_no_policy_is_refused() {
             "case {case:?}: expected HTTP 404 for an id that names no policy, got {} with body {}",
             reply.status, reply.body
         );
-        // Route 53 reports a traffic policy it does not hold by its code alone,
-        // so every id above is refused with the same body: `Type` and `Code`
-        // and no `Message` element.
-        assert_no_such_traffic_policy(&reply, case);
+        // Route 53 reports a traffic policy it does not hold on THIS path by its
+        // code alone, so every id above is refused with the same body: `Type` and
+        // `Code` and no `Message` element.
+        assert_identity_only(&reply, case, "NoSuchTrafficPolicy");
     }
 
     // The policy that does exist still holds only the version it was created

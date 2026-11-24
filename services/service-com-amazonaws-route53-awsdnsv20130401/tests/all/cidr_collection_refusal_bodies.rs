@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The error BODY of the two Route 53 CIDR-collection refusals the service answers by
+//! The error BODY of the three Route 53 CIDR-collection refusals the service answers by
 //! their error class alone, end to end over the router.
 //!
 //! The rule under test: the `Message` a refusal carries is what the service puts on the
 //! wire for that error class, and an error shape's model documentation is documentation OF
 //! the class rather than a sentence the service sends — so a class the service reports by
 //! its identity alone leaves the shape's optional `message` member unset and the response
-//! carries no `Message` element at all. Two of `ChangeCidrCollection`'s classes are
+//! carries no `Message` element at all. Three of `ChangeCidrCollection`'s classes are
 //! reported that way: a change held to a collection version the collection is not at
-//! (`CidrCollectionVersionMismatchException`, HTTP 409) and a change addressed at a
-//! collection the account does not hold (`NoSuchCidrCollectionException`, HTTP 404). Both
-//! error shapes carry one optional `message` member and nothing else
-//! (smithy_query(query="shape",shape="CidrCollectionVersionMismatchException,NoSuchCidrCollectionException")),
+//! (`CidrCollectionVersionMismatchException`, HTTP 409), a change addressed at a
+//! collection the account does not hold (`NoSuchCidrCollectionException`, HTTP 404), and a
+//! `PUT` of a block the collection already holds in another location
+//! (`CidrBlockInUseException`, HTTP 400). Each error shape carries one optional `message`
+//! member and nothing else
+//! (smithy_query(query="shape",shape="CidrCollectionVersionMismatchException,NoSuchCidrCollectionException,CidrBlockInUseException")),
 //! so which of them puts an element on the wire is the service's own behaviour, not the
 //! model's.
 //!
@@ -20,8 +22,9 @@
 //! rather than over the one that exposed it: the rows differ along the version the request
 //! states (the published minimum, one past the collection's current one, one far past it,
 //! the largest value the modelled `long` admits), the version the COLLECTION is at when it
-//! arrives, and the changes the refused request carries (one `PUT`, a `DELETE_IF_EXISTS`,
-//! several changes at once) — and they are asked over two collections of one account, so a
+//! arrives, the changes the refused request carries (one `PUT`, a `DELETE_IF_EXISTS`,
+//! several changes at once) and — for the in-use refusal — the block and the two locations
+//! it is held in and put in, and they are asked over two collections of one account, so a
 //! body keyed to one collection could not pass.
 //!
 //! The other half of the rule is asserted too: a refusal of the SAME operation that is
@@ -47,6 +50,12 @@ const VERSION_MISMATCH: &str = "CidrCollectionVersionMismatchException";
 
 /// The wire code of a change addressed at a collection the account does not hold.
 const NO_SUCH_COLLECTION: &str = "NoSuchCidrCollectionException";
+
+/// The wire code of a `PUT` of a block the collection already holds elsewhere.
+const BLOCK_IN_USE: &str = "CidrBlockInUseException";
+
+/// The status the model declares for `CidrBlockInUseException`.
+const BLOCK_IN_USE_STATUS: u16 = 400;
 
 /// The status the model declares for `CidrCollectionVersionMismatchException`
 /// (smithy_query(query="operation",operation="ChangeCidrCollection")).
@@ -224,13 +233,142 @@ async fn a_collection_the_account_does_not_hold_is_refused_by_its_code_alone() {
     }
 }
 
+/// The blocks the collection `id` holds in `location`, read back through
+/// `ListCidrBlocks`.
+async fn blocks_in(router: &MultiServiceRouter, id: &str, location: &str) -> Vec<String> {
+    let reply = call(
+        router,
+        "GET",
+        &format!("/2013-04-01/cidrcollection/{id}/cidrblocks?location={location}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from ListCidrBlocks, got {} with body {}",
+        reply.status, reply.body
+    );
+    reply
+        .all("CidrBlock")
+        .iter()
+        .map(|block| (*block).to_string())
+        .collect()
+}
+
+/// One refused `PUT` of a block the collection already holds: the block, the location
+/// holding it, the location the refused change names, and one further change that
+/// request carries beside it.
+struct InUseRow {
+    case: &'static str,
+    block: &'static str,
+    held_in: &'static str,
+    put_in: &'static str,
+    /// A further change the refused request carries, as `(location, action, block)`.
+    extra: Option<(&'static str, &'static str, &'static str)>,
+}
+
+#[tokio::test]
+async fn a_block_the_collection_holds_elsewhere_is_refused_by_its_code_alone() {
+    // The THIRD class of this operation the service reports by its identity alone. The
+    // rows differ along the block's address family and prefix length, the locations it is
+    // held in and put in, and whether the refused request carries the `PUT` alone or
+    // beside another change — so a body keyed to one block, one location or one request
+    // shape could not pass. A second collection of the account holds the same block in a
+    // location of its own, so the refusal is about the collection the request named.
+    let router = router();
+    let id = create_collection(&router, "refusal-bodies-in-use").await;
+    let beside = create_collection(&router, "refusal-bodies-in-use-beside").await;
+
+    let rows = [
+        InUseRow {
+            case: "an IPv4 /24 put in a second location",
+            block: "192.0.2.0/24",
+            held_in: "east",
+            put_in: "west",
+            extra: None,
+        },
+        InUseRow {
+            case: "an IPv4 /16 put in a second location",
+            block: "198.51.0.0/16",
+            held_in: "north",
+            put_in: "south",
+            extra: None,
+        },
+        InUseRow {
+            case: "an IPv6 /32 put in a second location",
+            block: "2001:db8::/32",
+            held_in: "office",
+            put_in: "branch",
+            extra: None,
+        },
+        InUseRow {
+            case: "a single-address /32 put in a second location",
+            block: "203.0.113.7/32",
+            held_in: "desk",
+            put_in: "lab",
+            extra: None,
+        },
+        InUseRow {
+            case: "a block put in a second location beside another change",
+            block: "203.0.113.128/25",
+            held_in: "campus",
+            put_in: "annex",
+            extra: Some(("extra", DELETE_IF_EXISTS, "10.64.0.0/24")),
+        },
+    ];
+
+    for row in &rows {
+        let InUseRow {
+            case,
+            block,
+            held_in,
+            put_in,
+            extra,
+        } = *row;
+        // The block is held by BOTH collections, each in a location of its own.
+        for (collection, location) in [(&id, held_in), (&beside, "beside")] {
+            let applied = change_collection(
+                &router,
+                collection,
+                None,
+                &change(location, PUT, &[block]),
+            )
+            .await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?}: the holding put must apply, got {} with body {}",
+                applied.status, applied.body
+            );
+        }
+
+        let mut changes = change(put_in, PUT, &[block]);
+        if let Some((location, action, other)) = extra {
+            changes.push_str(&change(location, action, &[other]));
+        }
+        let refused = change_collection(&router, &id, None, &changes).await;
+        assert_identity_only_at(&refused, case, BLOCK_IN_USE_STATUS, BLOCK_IN_USE);
+
+        // The refusal changed nothing: the block is still held where it was, and the
+        // location the refused PUT named holds nothing.
+        let listed = blocks_in(&router, &id, held_in).await;
+        assert!(
+            listed.contains(&block.to_string()),
+            "case {case:?}: the refused change must leave {block} in {held_in}, got {listed:?}"
+        );
+        let elsewhere = blocks_in(&router, &id, put_in).await;
+        assert!(
+            !elsewhere.contains(&block.to_string()),
+            "case {case:?}: the refused change must put {block} nowhere, got {elsewhere:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn another_refusal_of_the_same_operation_still_states_its_message() {
-    // The other half of the rule: the body shape belongs to the two classes above, not to
-    // this operation or to the service's envelope, so every OTHER refusal this operation
-    // answers still says why. The rows span the remaining classes a change can be refused
-    // with from inside the handler: a block the collection already holds in another
-    // location, and a request past the collection's own quota.
+    // The other half of the rule: the body shape belongs to the three classes above, not
+    // to this operation or to the service's envelope, so a refusal this operation answers
+    // from any other class still says why. The row is the remaining class a change can be
+    // refused with from inside the handler: a request past the collection's own quota.
     let router = router();
     let id = create_collection(&router, "refusal-bodies-controls").await;
     let held = "192.0.2.0/24";
@@ -257,20 +395,12 @@ async fn another_refusal_of_the_same_operation_still_states_its_message() {
         })
         .collect();
 
-    let rows = [
-        (
-            "a block the collection already holds in another location",
-            "CidrBlockInUseException",
-            400u16,
-            change("west", PUT, &[held]),
-        ),
-        (
-            "a request past the collection's quota",
-            "LimitsExceeded",
-            400u16,
-            over_quota,
-        ),
-    ];
+    let rows = [(
+        "a request past the collection's quota",
+        "LimitsExceeded",
+        400u16,
+        over_quota,
+    )];
 
     for (case, code, status, changes) in &rows {
         let refused = change_collection(&router, &id, None, changes).await;

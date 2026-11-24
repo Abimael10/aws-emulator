@@ -168,7 +168,8 @@ use super::types::*;
 
 use crate::state::{
     health_check_config_problem, health_check_config_with_defaults, health_check_member_given,
-    health_check_status, monitored_alarm, no_such_health_check, StoredHealthCheck,
+    health_check_status, monitored_alarm, no_such_health_check, repeats_a_child_health_check,
+    StoredHealthCheck, DUPLICATE_CHILD_HEALTH_CHECKS_MESSAGE,
 };
 
 /// The refusal text this operation answers a `HealthCheckVersion` that is not
@@ -464,6 +465,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(UpdateHealthCheckErrorModeled::InvalidInput(InvalidInput {
                     message: Some(format!("Invalid request: {problem}")),
+                })
+                .into());
+            }
+            // The children a CALCULATED check adds up are a SET of health check ids on
+            // this path too: an update that would leave the configuration naming one of
+            // them twice is refused with the SAME sentence the create states, so a child
+            // list the create would not persist is not one an update can leave behind.
+            if repeats_a_child_health_check(&config) {
+                return Err(UpdateHealthCheckErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(DUPLICATE_CHILD_HEALTH_CHECKS_MESSAGE.to_string()),
                 })
                 .into());
             }

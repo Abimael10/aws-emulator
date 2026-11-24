@@ -79,7 +79,9 @@ pub mod alias_target_zones;
 
 pub use alias_target_zones::alias_target_zone_problem;
 
-use crate::ops::types::change_cidr_collection_types::CidrCollectionVersionMismatchException;
+use crate::ops::types::change_cidr_collection_types::{
+    CidrBlockInUseException, CidrCollectionVersionMismatchException,
+};
 use crate::ops::types::create_cidr_collection_types::CidrCollection;
 use crate::ops::types::list_cidr_blocks_types::CidrBlockSummary;
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
@@ -515,13 +517,16 @@ pub const HOSTED_ZONE_ALREADY_EXISTS_MESSAGE: &str =
 ///
 /// A CONSTANT, naming neither the caller reference nor the set the reference
 /// already names, for the same reason [`HOSTED_ZONE_ALREADY_EXISTS_MESSAGE`] is
-/// one: the shape's own documentation states the rule without either ("A
-/// delegation set with the same owner and caller reference combination has
-/// already been created"), and the set's id is server-generated. The set the
-/// reference names is in state, where a delegation-set read reports it.
+/// one: the sentence states the rule without either, and the set's id is
+/// server-generated. The set the reference names is in state, where a
+/// delegation-set read reports it.
+///
+/// The error shape's own documentation ("A delegation set with the same owner and
+/// caller reference combination has already been created") documents the CLASS
+/// rather than the sentence the service puts on the wire, so it is not what this
+/// constant carries.
 pub const DELEGATION_SET_ALREADY_CREATED_MESSAGE: &str =
-    "A delegation set with the same owner and caller reference combination has already been \
-     created.";
+    "A delegation set has already been created with the specified caller reference.";
 
 /// The refusal text `CreateReusableDelegationSet` answers a hosted zone whose
 /// name servers already belong to a reusable delegation set with
@@ -1828,6 +1833,37 @@ pub fn health_check_config_problem(config: &HealthCheckConfig) -> Option<String>
         }
         _ => None,
     }
+}
+
+/// The refusal text a CALCULATED configuration that names one child health check
+/// more than once is answered with (`InvalidInput`, HTTP 400).
+///
+/// A CONSTANT: the sentence carries no request or state value at all — it names
+/// neither the repeated id nor how often it was repeated — and it words the
+/// refusal for every operation that persists a configuration, so the create that
+/// stores a child list and the update that replaces one cannot word it
+/// differently.
+pub const DUPLICATE_CHILD_HEALTH_CHECKS_MESSAGE: &str =
+    "Calculated health checks must not have duplicate child health check IDs.";
+
+/// Whether `config` names one child health check more than once.
+///
+/// `ChildHealthChecks` is the set of health checks a CALCULATED check adds up:
+/// "Route 53 adds up the number of health checks that Route 53 health checkers
+/// consider to be healthy and compares that number with the value of
+/// HealthThreshold" (`HealthCheckConfig$Type`), so an id named twice would be
+/// counted twice and one endpoint's health would carry a threshold meant for
+/// several. The ONE predicate every operation that persists a configuration asks,
+/// beside [`crate::state::Route53State::missing_child_health_check`], so a list
+/// the create refuses is not one an update can leave behind. A configuration of
+/// any other type names no children, so there is nothing to compare.
+pub fn repeats_a_child_health_check(config: &HealthCheckConfig) -> bool {
+    if config.r#type != HEALTH_CHECK_TYPE_CALCULATED {
+        return false;
+    }
+    let children = config.child_health_checks.as_deref().unwrap_or_default();
+    let distinct: BTreeSet<&str> = children.iter().map(String::as_str).collect();
+    distinct.len() != children.len()
 }
 
 /// The refusal text a read of a CALCULATED health check's checker observations
@@ -3360,7 +3396,7 @@ pub const NO_SUCH_TRAFFIC_POLICY_MESSAGE: &str = "The policy does not exist.";
 /// whichever half of `(Id, Version)` the store does not hold, and whether the
 /// request named a version at all — carrying [`NO_SUCH_TRAFFIC_POLICY_MESSAGE`].
 ///
-/// The DELETE words the same code without any message
+/// The DELETE and the version CREATE word the same code without any message
 /// ([`no_such_traffic_policy_without_message`]).
 pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
     NoSuchTrafficPolicy {
@@ -3368,11 +3404,11 @@ pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
     }
 }
 
-/// The modelled `NoSuchTrafficPolicy` (HTTP 404) the DELETE answers a traffic policy
-/// version this store does not hold with: the refusal's IDENTITY alone.
+/// The modelled `NoSuchTrafficPolicy` (HTTP 404) the DELETE and the version CREATE answer
+/// a traffic policy this store does not hold with: the refusal's IDENTITY alone.
 ///
 /// `ErrorMessage`'s own documentation on this shape is empty, so the wire body is the
-/// recorded contract per operation, and the delete's is `Type` and `Code` with no
+/// recorded contract per operation, and on these two paths it is `Type` and `Code` with no
 /// `Message` child — there is no fixed text and no variable part to fill. The readers of
 /// a traffic policy do send the sentence ([`no_such_traffic_policy`]), so the two are
 /// separate constructors rather than one.
@@ -3862,6 +3898,21 @@ pub fn no_such_cidr_collection() -> NoSuchCidrCollectionException {
 /// read, and the version the collection is at now is what the read it repeats reports.
 pub fn cidr_collection_version_mismatch() -> CidrCollectionVersionMismatchException {
     CidrCollectionVersionMismatchException { message: None }
+}
+
+/// The modelled `CidrBlockInUseException` (HTTP 400) for a `PUT` of a CIDR block
+/// the collection already holds in another location.
+///
+/// The ONE place this service words that refusal. MESSAGELESS, like the two
+/// collection refusals above it: Route 53 reports this class as the error's
+/// identity alone — the `Error` element carries `Type` and `Code` and no `Message`
+/// child — so this shape's optional `message` member is left unset and the
+/// serializer emits no element for it. The shape's own documentation ("This CIDR
+/// block is already in use") documents the class rather than a sentence the
+/// service sends, and the block the caller sent is the one thing its own request
+/// named.
+pub fn cidr_block_in_use() -> CidrBlockInUseException {
+    CidrBlockInUseException { message: None }
 }
 
 /// The modelled `NoSuchHostedZone` (HTTP 404) for a zone id that names no zone

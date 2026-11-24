@@ -20,7 +20,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
+use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::refusal_message_rules::assert_identity_only_at;
 
 /// The endpoint host the tests address, which is also the routing signal the
 /// router resolves this service from.
@@ -1336,22 +1339,24 @@ async fn record_paging_covers_every_record_exactly_once() {
 async fn a_start_record_type_without_a_name_is_refused() {
     // The rule, from the operation's documentation: "If you specify Type but not
     // Name … Amazon Route 53 returns the InvalidInput error." Type only orders
-    // records that share a name. The rows span several types.
+    // records that share a name. The refusal is reported by its IDENTITY ALONE:
+    // the `Error` element carries `Type` and `Code` and no `Message` child. The
+    // rows span the record types a `type` can name — every value of the modelled
+    // `RRType` enum — crossed with the other parameters the same request may
+    // carry, so a body keyed to one type or one request shape could not pass.
     let router = router();
     let zone_id = create_zone_ok(&router, "example.com", "ref-start-type").await;
-    for rr_type in ["A", "TXT", "SOA"] {
-        let reply = list_records(&router, &zone_id, &format!("?type={rr_type}")).await;
-        assert_eq!(
-            reply.status, 400,
-            "case type={rr_type}: expected 400, got {} with body {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "InvalidInput",
-            "case type={rr_type}: expected InvalidInput, got {}",
-            reply.body
-        );
+    // The further query parameters the refused request may carry beside `type`:
+    // none, a page size, a set identifier, and an EMPTY `name`, which names no
+    // record to start at.
+    let alongside = ["", "&maxitems=1", "&identifier=sibling", "&name="];
+    for rr_type in R_R_TYPE_VALUES {
+        for extra in alongside {
+            let case = format!("type={rr_type} alongside {extra:?}");
+            let reply = list_records(&router, &zone_id, &format!("?type={rr_type}{extra}")).await;
+            assert_identity_only_at(&reply, &case, 400, "InvalidInput");
+        }
+
         // The same type WITH a name is accepted.
         let ok = list_records(
             &router,

@@ -43,7 +43,7 @@ use crate::traffic_policies::{
     policy_count, policy_of, PolicyView,
 };
 use crate::traffic_policy_deletion::{delete_policy, policy_with_versions};
-use crate::traffic_policy_not_found_envelope::assert_no_such_traffic_policy;
+use crate::traffic_policy_not_found_envelope::{assert_identity_only, assert_no_such_traffic_policy};
 use crate::traffic_policy_version_listing::list_versions;
 use crate::traffic_policy_versions::create_version;
 
@@ -291,26 +291,22 @@ async fn an_id_no_policy_was_minted_under_is_refused() {
     ];
 
     for (case, unknown) in &rows {
-        for reply in [
-            list_versions(&router, unknown, "").await,
-            create_version(
-                &router,
-                unknown,
-                &document_with_start_endpoint("A", "192.0.2.9"),
-                None,
-            )
-            .await,
-        ] {
-            assert_eq!(
-                reply.status, 404,
-                "case {case:?}: expected HTTP 404 for an id that names no policy, got {} with \
-                 body {}",
-                reply.status, reply.body
-            );
-            // Route 53 reports a traffic policy it does not hold by its code
-            // alone: `Type` and `Code`, with no `Message` element.
-            assert_no_such_traffic_policy(&reply, case);
-        }
+        // Route 53 reports a traffic policy it does not hold per path: the LISTING
+        // states the refusal's sentence, while the version CREATE reports the same
+        // class by its identity alone (`Type` and `Code`, with no `Message`
+        // element) — so each path is asserted against the body it answers with.
+        let listed = list_versions(&router, unknown, "").await;
+        let case = format!("ListTrafficPolicyVersions on {case}");
+        assert_no_such_traffic_policy(&listed, &case);
+        let created = create_version(
+            &router,
+            unknown,
+            &document_with_start_endpoint("A", "192.0.2.9"),
+            None,
+        )
+        .await;
+        let case = case.replace("ListTrafficPolicyVersions", "CreateTrafficPolicyVersion");
+        assert_identity_only(&created, &case, "NoSuchTrafficPolicy");
     }
 
     // The emptied policy, by contrast, still serves both operations.

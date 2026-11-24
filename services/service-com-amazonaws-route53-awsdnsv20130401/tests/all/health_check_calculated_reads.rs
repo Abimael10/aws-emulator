@@ -90,9 +90,10 @@ async fn both_readers_refuse_a_calculated_health_check() {
             members: "<HealthThreshold>0</HealthThreshold>",
         },
         Row {
-            case: "a calculated check over the same child twice, at threshold two",
+            // A threshold above the number of children the check adds up: still a
+            // calculated check, and still one no checker reports on.
+            case: "a calculated check at a threshold above its child count",
             members: "<HealthThreshold>2</HealthThreshold><ChildHealthChecks>\
-                      <ChildHealthCheck>{child}</ChildHealthCheck>\
                       <ChildHealthCheck>{child}</ChildHealthCheck></ChildHealthChecks>",
         },
         Row {

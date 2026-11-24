@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The FORM of three more Route 53 refusal messages, end to end over the
+//! The FORM of four more Route 53 refusal messages, end to end over the
 //! router.
 //!
 //! Each of these is a sentence built to a rule rather than a sentence about one
@@ -18,6 +18,12 @@
 //!   resources the refused association was between, each by its ID: the hosted
 //!   zone by the id the request addressed (bare, however the request spelled
 //!   it) and the VPC by the id the request body named;
+//! * a `CreateReusableDelegationSet` whose `CallerReference` already names a set
+//!   of the account is `DelegationSetAlreadyCreated` (HTTP 400) whose message is
+//!   ONE fixed sentence — it names neither the reference nor the set the
+//!   reference already names, both of which the caller's own request and a
+//!   delegation-set read already hold — and it is the sentence the service sends
+//!   rather than the error shape's model documentation of the class;
 //! * the record-type constraint of a traffic policy document is reported by ONE
 //!   clause covering both ways it can be broken — absent, or naming something
 //!   that is not a record type a traffic policy can create — and that clause is
@@ -34,6 +40,7 @@ use service_com_amazonaws_route53_awsdnsv20130401::state::TRAFFIC_POLICY_FORMAT_
 
 use crate::hosted_zone_records::router;
 use crate::refusal_message_rules::{message_of, ENTRY_POINT, NO_ENDPOINT, RECORD_TYPE};
+use crate::reusable_delegation_sets::{create_set, set_count};
 use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, policy_of, policy_count,
 };
@@ -253,6 +260,113 @@ async fn a_public_zone_association_names_the_zone_id_and_the_vpc() {
             row.vpc_id
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// A caller reference a reusable delegation set already holds
+// ---------------------------------------------------------------------------
+
+/// The ONE sentence a `CallerReference` that already names a set is refused with, pinned
+/// HERE rather than read from the service's own constant: the text is the thing under
+/// test, so an edit to that constant has to fail this test.
+const DELEGATION_SET_TAKEN_MESSAGE: &str =
+    "A delegation set has already been created with the specified caller reference.";
+
+#[tokio::test]
+async fn a_caller_reference_a_set_already_holds_is_refused_with_one_sentence() {
+    // The rows differ along everything the refused request can differ along: the
+    // caller reference's length, character class and letter case, whether the
+    // repeat also names a hosted zone to make reusable, and how many times the
+    // reference has been repeated. The sentence is entirely fixed, so every row
+    // must be refused with the SAME text and none of it may come from the request
+    // or from the set the reference already names.
+    let router = router();
+    let long_reference = "r".repeat(64);
+    let references = [
+        "plain-reference",
+        "MixedCase-Reference",
+        "x",
+        "reference.with.dots-and_underscores",
+        long_reference.as_str(),
+    ];
+
+    // The zone a repeat may name: a public zone of the account, whose delegation
+    // the refused request asks to make reusable.
+    let zone = create_zone(&router, "delegation-text.example.com", "msg-set-zone", "").await;
+    assert_eq!(
+        zone.status, 201,
+        "the zone must be created, got {} with body {}",
+        zone.status, zone.body
+    );
+    let zone_id = bare_zone_id(&zone);
+
+    let mut sentences = std::collections::BTreeSet::new();
+    for reference in references {
+        let first = create_set(&router, reference, None).await;
+        assert_eq!(
+            first.status, 201,
+            "case {reference:?}: the first create must be served, got {} with body {}",
+            first.status, first.body
+        );
+        let held_id = first
+            .first("DelegationSet/Id")
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {reference:?}: the create must report the set; body {}",
+                    first.body
+                )
+            })
+            .trim_start_matches("/delegationset/")
+            .to_string();
+        let held_count = set_count(&router).await;
+
+        // The repeat, twice over: once naming no hosted zone and once naming one,
+        // so the refusal is about the REFERENCE whatever else the request carries.
+        for (shape, hosted_zone) in [("on its own", None), ("naming a hosted zone", Some(&zone_id))]
+        {
+            let case = format!("the reference {reference:?} repeated {shape}");
+            let again = create_set(&router, reference, hosted_zone.map(String::as_str)).await;
+            assert_eq!(
+                again.status, 400,
+                "case {case:?}: expected HTTP 400, got {} with body {}",
+                again.status, again.body
+            );
+            assert_eq!(
+                again.error_code(),
+                "DelegationSetAlreadyCreated",
+                "case {case:?}: expected DelegationSetAlreadyCreated, got body {}",
+                again.body
+            );
+            let got = message_of(&again, &case);
+            assert_eq!(
+                got, DELEGATION_SET_TAKEN_MESSAGE,
+                "case {case:?}: expected message {DELEGATION_SET_TAKEN_MESSAGE:?}, got {got:?}"
+            );
+            // Fixed text: neither the reference the request sent nor the id of the
+            // set already holding it reaches the sentence.
+            assert!(
+                !got.contains(reference) && !got.contains(&held_id),
+                "case {case:?}: the sentence must carry nothing the request named and no \
+                 stored id, got {got:?}"
+            );
+            sentences.insert(got);
+            // The refusal persisted nothing: the account still holds the sets it
+            // held before the repeat.
+            let count = set_count(&router).await;
+            assert_eq!(
+                count, held_count,
+                "case {case:?}: a refused create must persist nothing, got Count {count:?} \
+                 against {held_count:?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        sentences.len(),
+        1,
+        "the refusal has no variable part, so every repeated reference must be refused with \
+         the same sentence, got {sentences:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,9 @@
 //! with `<ErrorResponse><Error><Type>Sender</Type><Code>NoSuchTrafficPolicy</Code>` and the
 //! sentence `<Message>The policy does not exist.</Message>` — fixed text stating the rule
 //! and carrying nothing the request named — on every operation that READS or amends a
-//! traffic policy, while the DELETE reports the same code by its IDENTITY ALONE, as a
-//! traffic policy INSTANCE the account does not hold is reported on every operation that
+//! traffic policy VERSION, while the DELETE and the version CREATE report the same code by
+//! their IDENTITY ALONE, as a traffic policy INSTANCE the account does not hold is reported
+//! on every operation that
 //! binds that error: with NO `Message` child. Each holds whichever half of `(Id, Version)`
 //! the store does not hold and whatever form the requested id takes. The error shapes'
 //! documentation states the RULE each refusal reports ("No traffic policy exists with the
@@ -138,8 +139,15 @@ enum PolicyOperation {
 impl PolicyOperation {
     /// Whether this operation words the refusal's sentence, as against reporting
     /// the refusal's identity alone.
+    ///
+    /// Which of the two a path answers with is that path's own recorded behaviour:
+    /// the DELETE and the version CREATE report the class alone, and the operations
+    /// that read or amend a version state the sentence.
     fn states_the_sentence(self) -> bool {
-        self != Self::DeleteTrafficPolicy
+        !matches!(
+            self,
+            Self::DeleteTrafficPolicy | Self::CreateTrafficPolicyVersion
+        )
     }
 
     /// Whether the request names a `TrafficPolicyVersion` at all.
@@ -151,8 +159,8 @@ impl PolicyOperation {
     }
 
     /// Assert the refusal this operation words for a traffic policy the account does not
-    /// hold: the DELETE reports the refusal's identity alone, every other operation states
-    /// the one sentence.
+    /// hold: the DELETE and the version CREATE report the refusal's identity alone, every
+    /// other operation states the one sentence.
     fn assert_refused(self, reply: &Reply, case: &str) {
         if self.states_the_sentence() {
             assert_no_such_traffic_policy(reply, case);

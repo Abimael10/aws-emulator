@@ -224,14 +224,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|name| !name.is_empty());
         // "If you specify Type but not Name: Amazon Route 53 returns the
-        // InvalidInput error." Type only orders records that share a name.
+        // InvalidInput error." Type only orders records that share a name. The
+        // refusal is reported by its IDENTITY alone — the `Error` element carries
+        // `Type` and `Code` and no `Message` child — so the shape's optional
+        // `message` member is left unset: the request itself is what names the
+        // `type` it sent without a `name`.
         if start_name.is_none() && input.start_record_type.is_some() {
             return Err(ListResourceRecordSetsErrorModeled::InvalidInput(InvalidInput {
-                message: Some(
-                    "StartRecordType was specified without StartRecordName; type only sorts \
-                     between records with the same record name"
-                        .to_string(),
-                ),
+                message: None,
             })
             .into());
         }

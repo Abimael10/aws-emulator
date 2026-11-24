@@ -1,21 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: route53.route53-authoritative-nameserver-answers-the-record-it-was-told-to-serve route53.route53-insync-change-is-actually-served-by-every-delegated-nameserver route53.route53-query-for-a-name-absent-from-the-zone-rejected-with-nxdomain route53.route53-cname-answer-carries-the-chased-in-zone-target route53.route53-in-zone-alias-answers-the-targets-address-under-the-aliased-name route53.route53-alias-evaluate-target-health-withholds-the-alias-answer route53.route53-failover-answer-flips-when-an-inverted-health-check-changes-state route53.route53-second-primary-failover-record-in-the-same-group-rejected route53.calculated-health-check-threshold-decides-the-failover-answer route53.route53-latency-routing-selects-the-sibling-for-the-queriers-region route53.route53-multivalue-answer-returns-a-rotating-subset-of-the-healthy-records route53.route53-zero-weight-sibling-answer-rejected-at-the-authoritative-nameserver route53.route53-traffic-policy-instance-records-are-served-and-withdrawn route53.calculated-health-check-duplicate-child-ids-rejected route53.change-cidr-collection-block-already-in-use-rejected route53.create-reusable-delegation-set-duplicate-caller-reference-rejected route53.create-traffic-policy-version-unknown-policy-rejected route53.list-resource-record-sets-start-record-type-without-name-rejected route53.test-dns-answer-private-zone-rejected
+Issue-Trace-Ids: route53.calculated-health-check-duplicate-child-ids-rejected route53.change-cidr-collection-block-already-in-use-rejected route53.create-reusable-delegation-set-duplicate-caller-reference-rejected route53.create-traffic-policy-version-unknown-policy-rejected route53.list-resource-record-sets-start-record-type-without-name-rejected route53.test-dns-answer-private-zone-rejected
 Issue-Shape-Id: com.amazonaws.route53#AWSDnsV20130401
-Issue-Key: route53.route53-authoritative-nameserver-answers-the-record-it-was-told-to-serve|_nameserver_ips#5|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-insync-change-is-actually-served-by-every-delegated-nameserver|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-query-for-a-name-absent-from-the-zone-rejected-with-nxdomain|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-cname-answer-carries-the-chased-in-zone-target|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-in-zone-alias-answers-the-targets-address-under-the-aliased-name|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-alias-evaluate-target-health-withholds-the-alias-answer|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-failover-answer-flips-when-an-inverted-health-check-changes-state|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-second-primary-failover-record-in-the-same-group-rejected|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.calculated-health-check-threshold-decides-the-failover-answer|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-latency-routing-selects-the-sibling-for-the-queriers-region|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-multivalue-answer-returns-a-rotating-subset-of-the-healthy-records|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-zero-weight-sibling-answer-rejected-at-the-authoritative-nameserver|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
-Issue-Key: route53.route53-traffic-policy-instance-records-are-served-and-withdrawn|_nameserver_ips#4|AssertionError|assert entry["addresses"], (
 Issue-Key: route53.calculated-health-check-duplicate-child-ids-rejected|_expect_error#4|AssertionError|raise AssertionError(f"expected the create to be refused, but it succeeded: {result!r}")
 Issue-Key: route53.change-cidr-collection-block-already-in-use-rejected|run#12|AssertionError|assert err.get("Message") == "", err
 Issue-Key: route53.create-reusable-delegation-set-duplicate-caller-reference-rejected|run#12|AssertionError|assert err.get("Message") == (
@@ -24,17 +11,37 @@ Issue-Key: route53.list-resource-record-sets-start-record-type-without-name-reje
 Issue-Key: route53.test-dns-answer-private-zone-rejected|run#19|AssertionError|assert msg == expected_message, f"expected message {expected_message!r}, got {msg!r}"
 Issue-Commit: 464916eef2b3c982c1baee9561b862edbea1b318
 
-# route53: 7 net-new causes — the authoritative DNS plane is unreachable because DelegationSet.NameServers advertises unresolvable AWS hostnames, plus six refusal defects (duplicate CALCULATED children accepted; four emulator-authored refusal Messages)
+# route53: six control-plane refusal defects — duplicate CALCULATED child health checks accepted, and five refusal bodies worded from the model's documentation or from emulator prose (the DNS-plane cause is re-filed, see below)
 
 > _Note: this issue was identified against the code base at commit `464916eef2b3c982c1baee9561b862edbea1b318`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _RESOLVED, in part: causes 2-7 below — the six control-plane refusal defects — now replay
+> as fixed. A CALCULATED `HealthCheckConfig` that names one child health check twice is
+> refused `InvalidInput` (400) with Route 53's own fixed sentence on both operations that
+> persist a configuration (`state::repeats_a_child_health_check`), and the five refusal
+> bodies are what the service puts on the wire: `ChangeCidrCollection`'s
+> `CidrBlockInUseException`, `CreateTrafficPolicyVersion`'s `NoSuchTrafficPolicy` for an
+> unminted `Id` and `ListResourceRecordSets`' `InvalidInput` for a start type without a
+> start name carry no `Message` element at all, while `CreateReusableDelegationSet`'s
+> `DelegationSetAlreadyCreated` and `TestDNSAnswer`'s private-zone refusal state AWS's own
+> fixed sentence._
+>
+> _Cause 1 (the authoritative DNS plane) is NOT fixed: it is BLOCKED on a core capability
+> this emulator does not have — the core listener API offers no datagram socket and no way
+> to serve a protocol's well-known port (`vendor/server/src/listeners.rs:204-381`,
+> `bind_std`/`bind_tokio` at :67-107), while a service crate may not bind a socket of its
+> own (`vendor/engine/src/lib.rs:21-35`) — so it is re-filed, with its 13 replay keys, as
+> `issues/things-that-do-not-work/20261118T090000Z-route53-the-authoritative-dns-plane-is-unreachable-no-dns-wire-is-served.md`.
+> The published delegation set was deliberately left untouched: a name that resolves while
+> nothing answers on port 53 would announce an endpoint nothing protocol-capable serves._
+
 ## Operation
-CreateHostedZone
+CreateHealthCheck
 
 ## Description
-Seven net-new root causes in the route53 emulator, all grounded in failing behavioral checks of this suite. Cause 1 blocks every DNS data-plane check; causes 2-7 are control-plane refusal defects.
+Seven net-new root causes in the route53 emulator, all grounded in failing behavioral checks of this suite. Cause 1 blocks every DNS data-plane check and is re-filed as its own report (see the note above); causes 2-7 are the control-plane refusal defects this report resolves.
 
-=== Cause 1 of 7: the name servers a hosted zone delegates to are AWS hostnames that resolve to nothing in the environment, so no query can ever reach the emulator's authoritative server. ===
+=== Cause 1 of 7 (RE-FILED, see the note above — its 13 replay keys live in the new report): the name servers a hosted zone delegates to are AWS hostnames that resolve to nothing in the environment, so no query can ever reach the emulator's authoritative server. ===
 AWS: Smithy: CreateHostedZone/GetHostedZone output member `DelegationSet` -> `DelegationSet.NameServers` (list of `DNSName`). The wire/DNS behavior itself is not modeled, so: recorded behavior only — the four hostnames Route 53 reports (form `ns-<n>.awsdns-<n>.<tld>`) are the zone's authoritative servers, they RESOLVE to addresses, and those addresses answer queries for names in the zone authoritatively (AA set), and NXDOMAIN for a name not in the zone. Every check here first reads the delegation set, resolves each advertised host, and only then queries it — exactly what a client following the delegation does.
 Emulator: the advertised hostnames do not resolve at all from the vantage point the suite queries from. Each check fails resolving the FIRST advertised name server, verbatim: `AssertionError: the delegated nameserver ns-1819.awsdns-36.com did not resolve from the vantage point: {'addresses': [], 'errno': -2, 'error': 'gaierror: [Errno -2] Name or service not known'}` (the host label varies per zone: ns-301.awsdns-46.com, ns-783.awsdns-40.com, ns-1736.awsdns-10.com, ns-867.awsdns-52.com, ns-603.awsdns-62.com, ns-1631.awsdns-34.com, ns-52.awsdns-03.com, ns-948.awsdns-52.com, ns-1949.awsdns-19.com, ns-788.awsdns-37.com, ns-1432.awsdns-60.com, ns-791.awsdns-16.com). The preceding control-plane calls (CreateHostedZone, ChangeResourceRecordSets, GetChange) all succeeded, so the zone and its records exist; what is missing is that the emulator announces a delegation set it is not reachable on. The generated label is a per-run value; the requirement is that whatever `DelegationSet.NameServers` publishes must be resolvable and must answer on the host the emulator is actually reached on.
 Why: a client that does what Route 53 documents — take the delegation set and query it — can never resolve a name the emulator claims authority for. Every routing-policy behavior the service exists to provide (failover, weighted, latency, multivalue, geo, alias/in-zone alias, CNAME chasing, traffic-policy instances, NXDOMAIN for absent names, INSYNC meaning "actually served") is unobservable, and so is anything layered on a hosted zone.
