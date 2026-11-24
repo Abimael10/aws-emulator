@@ -693,11 +693,13 @@ async fn a_groups_capacity_is_counted_in_the_unit_its_desired_capacity_type_name
         let template_name = format!("lt-units-{index}");
         // The template names a type of its own, with a vCPU count none of the rows asks
         // for: an override that states requirements decides the type whatever the template
-        // carries.
+        // carries. Its AMI is one of the account's published AMIs, built for the architecture
+        // those types run — Amazon EC2 carries out no launch whose AMI and instance type are
+        // built for architectures that disagree.
         create_launch_template(
             &router,
             &template_name,
-            "ami-00000000000000041",
+            "ami-00000000000000031",
             "m5.4xlarge",
         )
         .await;
@@ -935,7 +937,7 @@ async fn an_instance_amazon_ec2_no_longer_runs_is_taken_out_of_the_group_and_rep
         let (router, engine) = emulator();
         let subnets = seed_subnets(&engine, 2);
         let template_name = format!("lt-killed-{index}");
-        create_launch_template(&router, &template_name, "ami-00000000000000051", "t3.micro").await;
+        create_launch_template(&router, &template_name, "ami-00000000000000031", "t3.micro").await;
 
         let name = format!("asg-killed-{index}");
         let capacity = row.capacity.to_string();
@@ -1389,7 +1391,7 @@ async fn a_refresh_waits_the_warmup_it_runs_under_after_each_replacement() {
         let (router, engine) = emulator();
         let subnets = seed_subnets(&engine, 1);
         let template_name = format!("lt-warmup-{index}");
-        create_launch_template(&router, &template_name, "ami-00000000000000061", "t3.micro").await;
+        create_launch_template(&router, &template_name, "ami-00000000000000031", "t3.micro").await;
 
         // Two instances, so a refresh held after its first replacement still has one to
         // make.

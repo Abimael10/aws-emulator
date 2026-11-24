@@ -111,13 +111,17 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// Create one Amazon EC2 launch template over the wire, so the instances a warm pool
 /// launches have a launch source of the account to run.
+///
+/// The AMI is one of the account's published AMIs, built for the architecture the instance
+/// type runs: Amazon EC2 carries out no launch whose AMI and instance type are built for
+/// architectures that disagree.
 async fn create_launch_template(router: &MultiServiceRouter, name: &str) {
     let (status, body) = ec2_query(
         router,
         "CreateLaunchTemplate",
         &[
             p("LaunchTemplateName", name),
-            p("LaunchTemplateData.ImageId", "ami-00000000000000041"),
+            p("LaunchTemplateData.ImageId", "ami-00000000000000031"),
             p("LaunchTemplateData.InstanceType", "t3.micro"),
         ],
     )

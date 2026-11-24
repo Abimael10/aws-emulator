@@ -130,7 +130,7 @@ pub fn cross_vpc_security_group_error<Eng: Send + Sync + 'static, E>(
     let vpc_id = subnets.iter().find_map(|subnet_id| {
         store
             .subnets
-            .get(*subnet_id)
+            .get(subnet_id)
             .and_then(|subnet| subnet.vpc_id.clone())
     })?;
     for reference in &references {

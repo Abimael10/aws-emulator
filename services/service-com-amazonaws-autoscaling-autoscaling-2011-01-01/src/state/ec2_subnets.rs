@@ -21,13 +21,19 @@ use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 /// The subnet ids a `VPCZoneIdentifier` value names, in the order the caller wrote them.
 ///
-/// The member is one comma-separated string, so the ids are what the commas separate,
-/// with surrounding whitespace trimmed and empty entries dropped — a trailing comma names
-/// no subnet.
-pub fn subnet_ids(vpc_zone_identifier: &str) -> Vec<&str> {
+/// The member is one COMMA-separated string, so the ids are what the commas separate, and
+/// whitespace is NOT a separator: every whitespace character is dropped from the value, so a
+/// caller that wrote a space where a comma belongs named one id with the two run together —
+/// which names no subnet, and is refused as that one id. Empty entries are dropped too, so a
+/// trailing comma names no subnet.
+pub fn subnet_ids(vpc_zone_identifier: &str) -> Vec<String> {
     vpc_zone_identifier
         .split(',')
-        .map(str::trim)
+        .map(|id| {
+            id.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        })
         .filter(|id| !id.is_empty())
         .collect()
 }
@@ -140,7 +146,7 @@ pub fn zones_of<Eng: Send + Sync + 'static>(
         // No EC2 store on this engine is no subnet state to read, so the first named
         // subnet is as unresolvable as one the store does not hold.
         return match ids.first() {
-            Some(id) => ZoneResolution::UnknownSubnet((*id).to_string()),
+            Some(id) => ZoneResolution::UnknownSubnet(id.clone()),
             None => ZoneResolution::Zones(Vec::new()),
         };
     };
@@ -150,7 +156,7 @@ pub fn zones_of<Eng: Send + Sync + 'static>(
     for id in ids {
         let zone = store
             .subnets
-            .get(id)
+            .get(&id)
             .and_then(|subnet| subnet.availability_zone.clone())
             .filter(|zone| {
                 zones_of_region
@@ -158,7 +164,7 @@ pub fn zones_of<Eng: Send + Sync + 'static>(
                     .any(|of_region| of_region.zone_name == *zone)
             });
         let Some(zone) = zone else {
-            return ZoneResolution::UnknownSubnet(id.to_string());
+            return ZoneResolution::UnknownSubnet(id);
         };
         if !zones.contains(&zone) {
             zones.push(zone);

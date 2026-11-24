@@ -940,6 +940,42 @@ pub fn architecture_for(instance_type: &str) -> String {
     }
 }
 
+/// Why a launch of `instance_type` from an AMI built for `image_architecture` cannot be
+/// carried out — or `None` when the two agree, which is the launch EC2 makes.
+///
+/// "Specify an instance type and an AMI that have matching architectures": an instance runs
+/// the machine code its AMI holds, so an image built for a processor the type does not have
+/// cannot boot on it, and the launch is refused instead of attempted. Which architectures a
+/// type admits is this module's own fact ([`architecture_for`] and the 32-bit AMIs the
+/// previous-generation sizes still run, [`supported_architectures`]) rather than a comparison
+/// a consumer makes for itself.
+///
+/// An empty `image_architecture` is an image that declares none, so there is nothing for the
+/// type to disagree with and nothing is refused: a launch is stopped by what the store HOLDS,
+/// never by what it does not.
+pub fn architecture_mismatch_message(
+    image_architecture: &str,
+    instance_type: &str,
+) -> Option<String> {
+    if image_architecture.is_empty() {
+        return None;
+    }
+    let architecture = architecture_for(instance_type);
+    if supported_architectures(instance_type, &architecture)
+        .iter()
+        .any(|supported| supported == image_architecture)
+    {
+        return None;
+    }
+    Some(format!(
+        "The architecture '{architecture}' of the specified instance type does not match the \
+         architecture '{image_architecture}' of the specified AMI. Specify an instance type and \
+         an AMI that have matching architectures, and try again. You can use \
+         'describe-instance-types' or 'describe-images' to discover the architecture of the \
+         instance type or AMI."
+    ))
+}
+
 /// The reason EC2 records on a state change a caller asked for, naming the
 /// instant it happened.
 ///

@@ -888,7 +888,7 @@ fn placements(
 ) -> Vec<Placement> {
     let mut placements: Vec<Placement> = Vec::new();
     for subnet_id in ec2_subnets::subnet_ids(request.vpc_zone_identifier.unwrap_or_default()) {
-        let Some(subnet) = store.subnets.get(subnet_id) else {
+        let Some(subnet) = store.subnets.get(&subnet_id) else {
             continue;
         };
         let Some(zone) = subnet.availability_zone.clone() else {
@@ -901,13 +901,13 @@ fn placements(
         }
         if placements
             .iter()
-            .any(|placement| placement.subnet_id.as_deref() == Some(subnet_id))
+            .any(|placement| placement.subnet_id.as_deref() == Some(subnet_id.as_str()))
         {
             continue;
         }
         placements.push(Placement {
             availability_zone: zone,
-            subnet_id: Some(subnet_id.to_string()),
+            subnet_id: Some(subnet_id),
             cidr_block: subnet.cidr_block.clone(),
         });
     }
@@ -1465,9 +1465,10 @@ fn resolved_specification(
 /// profile the instances would run as
 /// ([`super::iam_instance_profiles`], whose header states why that reference is this
 /// service's to resolve) and the KMS key the volumes they boot would be encrypted under
-/// ([`super::volume_encryption_keys`]). What Amazon EC2 itself validates about a launch (an
-/// AMI and an instance type whose architectures disagree among them) stays with the service
-/// that owns the images and the instance types.
+/// ([`super::volume_encryption_keys`]). What Amazon EC2 itself validates about the launch
+/// PARAMETERS — an AMI and an instance type whose architectures disagree — stays with the
+/// service that owns the images and the instance types, which is asked for its verdict rather
+/// than second-guessed ([`architecture_mismatch_reason`]).
 ///
 /// The sentence a reason of this crate's own carries ends the way every launch failure does
 /// ([`super::LAUNCH_FAILED_SENTENCE`]); a reason another service worded is reported as that
@@ -1507,6 +1508,19 @@ pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
             unsatisfiable_requirements_message(),
         ));
     }
+    // What Amazon EC2 refuses about the LAUNCH PARAMETERS this group would send it: an AMI
+    // built for a processor architecture the instance type does not run cannot boot on that
+    // type, so Amazon EC2 carries the launch out for nobody — the attempt is one Amazon EC2
+    // Auto Scaling could not make, which is a launch that FAILED, carrying Amazon EC2's own
+    // sentence for the pair it would not launch. Asked before anything the ACCOUNT holds for
+    // the launch is resolved (the instance profile and the volume key below), because the
+    // parameters are refused without any of them being looked up.
+    if let Some(reason) = architecture_mismatch_reason(engine, request) {
+        return Some(super::BlockedLaunch::failed(format!(
+            "{reason} {}",
+            super::LAUNCH_FAILED_SENTENCE
+        )));
+    }
     // The IAM instance profile the instances would run as, resolved against the account's
     // own IAM records: an instance cannot be launched under a profile the account does not
     // hold. Nothing of this service is locked here, and resolving it reads Amazon EC2's
@@ -1540,6 +1554,36 @@ pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
     .map(|unusable| {
         super::BlockedLaunch::cancelled_attempt(unusable.status_message, unusable.refusal)
     })
+}
+
+/// Why Amazon EC2 would not carry out this launch at all: the AMI the group's launch source
+/// names is built for a processor architecture the instance type it names does not run.
+///
+/// The verdict is Amazon EC2's own — that service owns the images and the instance types, and
+/// states it in its own words
+/// ([`ec2::ComAmazonawsEc2Amazonec2State::launch_architecture_mismatch`]) — and the two values
+/// it is asked about are the ones THIS launch would send it: the AMI and the instance type the
+/// launch source resolves to, read through the one resolution [`launch`] itself launches with
+/// ([`launch_parameters`]), so a launch that would be refused and a launch that is made can
+/// never be judged on different parameters.
+///
+/// `None` for a launch source that names no AMI, and on an engine carrying no Amazon EC2 store
+/// at all: there is then no image to weigh the type against.
+fn architecture_mismatch_reason<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    request: &LaunchRequest<'_>,
+) -> Option<String> {
+    let state = ec2::service_state(engine)?;
+    let store = state.lock();
+    let parameters = launch_parameters(&store, request);
+    let image_id = parameters.image_id.as_deref()?;
+    // The type the launch would be made with, which for a source that names none is the type
+    // Amazon EC2 gives a launch that names none — exactly what [`launch`] launches it as.
+    let instance_type = parameters
+        .instance_type
+        .as_deref()
+        .unwrap_or(ec2::DEFAULT_INSTANCE_TYPE);
+    store.launch_architecture_mismatch(image_id, instance_type)
 }
 
 /// Make the launch Amazon EC2 ACCEPTS and take the instances it minted back, because a volume

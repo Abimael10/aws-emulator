@@ -426,9 +426,7 @@ impl AutoScalingState {
             .and_then(|placement| placement.vpc_zone_identifier.clone())
             .or_else(|| group.and_then(|group| group.vpc_zone_identifier.clone()));
         let subnet_id = subnets.as_deref().and_then(|value| {
-            super::ec2_subnets::subnet_ids(value)
-                .first()
-                .map(|id| (*id).to_string())
+            super::ec2_subnets::subnet_ids(value).into_iter().next()
         });
         let instance_type = group.and_then(|group| {
             super::declared_instance_types(group.mixed_instances_policy.as_ref())

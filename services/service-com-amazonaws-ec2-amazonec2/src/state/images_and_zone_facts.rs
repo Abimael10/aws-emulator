@@ -1854,6 +1854,27 @@ impl ComAmazonawsEc2Amazonec2State {
             .and_then(|ebs| ebs.snapshot_id.clone())
     }
 
+    /// Why Amazon EC2 would not carry out a launch of `instance_type` from the AMI
+    /// `image_id`: the image is built for a processor architecture that instance type does
+    /// not run, which is a launch the service refuses rather than one it makes
+    /// ([`architecture_mismatch_message`]).
+    ///
+    /// THE ONE place a launch's AMI and its instance type are weighed against each other, so
+    /// every consumer that launches from an image of this account — this service's own
+    /// launches and the launches another service makes into it — reaches the same verdict and
+    /// reports it in the same words.
+    ///
+    /// `None` when the two agree, when this store holds no image under that id, and when the
+    /// image it holds declares no architecture: a refusal is grounded in what the store holds.
+    pub fn launch_architecture_mismatch(
+        &self,
+        image_id: &str,
+        instance_type: &str,
+    ) -> Option<String> {
+        let image_architecture = self.images.get(image_id)?.architecture.as_deref()?;
+        architecture_mismatch_message(image_architecture, instance_type)
+    }
+
     /// The id of a registered AMI of this account that restores one of its devices from
     /// `snapshot_id`, or `None` when no image does.
     ///

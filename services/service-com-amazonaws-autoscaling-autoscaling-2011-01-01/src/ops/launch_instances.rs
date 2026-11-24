@@ -341,10 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a subnet is told about the subnet rather than about the zone it happens to be in.
         let group_subnets: Vec<String> = crate::state::ec2_subnets::subnet_ids(
             group_identifier.as_deref().unwrap_or_default(),
-        )
-        .into_iter()
-        .map(::std::string::ToString::to_string)
-        .collect();
+        );
         if requested_subnets
             .iter()
             .any(|subnet_id| !group_subnets.contains(subnet_id))

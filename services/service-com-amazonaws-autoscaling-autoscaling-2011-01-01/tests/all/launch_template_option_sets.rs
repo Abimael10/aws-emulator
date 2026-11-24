@@ -34,8 +34,10 @@ use service_com_amazonaws_ec2_amazonec2::state as ec2;
 use crate::support::{borrowed, ec2_query, p, query, tag_value, tag_values, REGION};
 
 /// The image every launch template in this suite carries, in the long id form Amazon EC2
-/// issues one in.
-const IMAGE_ID: &str = "ami-00000000000000041";
+/// issues one in — one of the account's published AMIs, built for the architecture
+/// [`INSTANCE_TYPE`] runs, since Amazon EC2 carries out no launch whose AMI and instance type
+/// are built for architectures that disagree.
+const IMAGE_ID: &str = "ami-00000000000000031";
 
 /// The instance type every launch template in this suite carries.
 const INSTANCE_TYPE: &str = "t3.micro";

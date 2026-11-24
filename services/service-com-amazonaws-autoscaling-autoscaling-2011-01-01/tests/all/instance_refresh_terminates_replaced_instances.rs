@@ -35,8 +35,10 @@ use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 use crate::support::{borrowed, ec2_query, emulator, p, query, tag_value, tag_values};
 
-/// The AMI every launch template in this suite carries.
-const IMAGE_ID: &str = "ami-00000000000000041";
+/// The AMI every launch template in this suite carries — one of the account's published
+/// AMIs, built for the architecture the instance types below run, since Amazon EC2 carries
+/// out no launch whose AMI and instance type are built for architectures that disagree.
+const IMAGE_ID: &str = "ami-00000000000000031";
 
 /// The instance type the group's instances run BEFORE the refresh, and the one the version
 /// the refresh moves them to runs. Two members of Amazon EC2's own instance-type catalog,
