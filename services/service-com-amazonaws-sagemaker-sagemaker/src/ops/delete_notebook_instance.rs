@@ -156,17 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instances
             .get_mut(&input.notebook_instance_name)
         else {
-            // The transitions word a name nothing is stored under with the token AND the ARN
-            // the name resolves to — the resource this call could not move — where the
-            // reader answers the bare token
-            // (`crate::state::notebook_instance_record_not_found_at`).
+            // A call that ACTS on the instance names the resource it could not act on: the
+            // ARN the requested name resolves to in the Region signed for, in this family's
+            // `does not exist` sentence
+            // (`crate::state::notebook_instance_does_not_exist`). The READER alone answers
+            // the bare sentinel token.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
                 &input.notebook_instance_name,
             );
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::notebook_instance_record_not_found_at(&arn),
+                crate::state::notebook_instance_does_not_exist(&arn),
             ));
         };
 

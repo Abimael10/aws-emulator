@@ -13,8 +13,9 @@
 //!
 //! * an update states what CHANGES: every member the request carries replaces the stored
 //!   one, every member it does not carry is left as it stands, the call answers the domain's
-//!   own ARN, the domain reports the non-terminal `Updating` until the clock settles it back
-//!   into service, and `DescribeDomain` replays exactly the domain the update left;
+//!   own ARN, the domain's move back into service is owed from the instant the update
+//!   answered so the first read reports it settled, and `DescribeDomain` replays exactly the
+//!   domain the update left;
 //! * an update is refused — and changes nothing — for a `DomainId` this account holds no
 //!   domain under (`ResourceNotFound`), for a network identifier no EC2 could have minted
 //!   (`ValidationException`), for the one `HomeEfsFileSystemCreation` change the member does
@@ -250,14 +251,15 @@ async fn update_domain_applies_the_members_it_carries_and_leaves_the_rest() {
                 "case {case:?}: expected {member} to read {expected}, got {after}"
             );
         }
-        // SageMaker applies the change after it has answered, so the domain reports the
-        // non-terminal `Updating` straight after the call — the span is never zero — and the
-        // clock owes it its way back into service.
+        // SageMaker applies the change after it has answered, so `Updating` is the status
+        // the call itself stores; the update DECIDED the new configuration, so the move back
+        // into service is owed from the instant it answered (`state::transition_owed_at`)
+        // and the first read already reports the settled domain.
         assert_eq!(
             after.get("Status"),
-            Some(&json!("Updating")),
-            "case {case:?}: an updated domain reports Updating until the clock settles it, \
-             got {after}"
+            Some(&json!("InService")),
+            "case {case:?}: the first read after the update reports the settled domain, got \
+             {after}"
         );
         let settled = domain_resting_in(&emulator, case, &domain_id, "InService").await;
         for (member, expected) in &row.expected {

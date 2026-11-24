@@ -2,8 +2,9 @@
 
 //! The STUDIO DOMAIN slice of this service's state: the domain `CreateDomain` writes,
 //! `DescribeDomain` replays, `ListDomains` pages over and `DeleteDomain` tears down, with
-//! its ARN kind, its id mint, its Studio address, its statuses, the clock spans it moves
-//! on, its store bound and the sentences its refusals are worded with.
+//! its ARN kind, its id mint, its Studio address, its statuses, the instant its clock-owed
+//! transitions are due from, its store bound and the sentences its refusals are worded
+//! with.
 //!
 //! Its own file, like the other resource slices here, so the parent module stays inside
 //! the project's file-length limit. Every name is re-exported from [`super`], so a
@@ -44,24 +45,14 @@ pub const DOMAIN_STATUS_DELETING: &str = "Deleting";
 /// not in service while that is in flight.
 pub const DOMAIN_STATUS_UPDATING: &str = "Updating";
 
-/// How long after `CreateDomain` the clock owes the `Pending` -> `InService` transition, and
-/// after `UpdateDomain` the `Updating` -> `InService` one.
-///
-/// Three seconds, so a caller that describes or lists the domain straight after creating
-/// it still observes `Pending`, and one that waits observes `InService`. Real SageMaker
-/// takes minutes to provision a Studio domain; the span is compressed, never zero, and
-/// the due instant is stored rather than slept on ([`Domain::settle_status`]).
-pub const DOMAIN_IN_SERVICE_AFTER: Duration = Duration::from_secs(3);
-
-/// How long after `DeleteDomain` the clock owes the `Deleting` -> gone transition of a
-/// domain.
-///
-/// The same compressed, never-zero span as [`DOMAIN_IN_SERVICE_AFTER`]: a caller that
-/// describes the domain straight after asking for its deletion still observes `Deleting`,
-/// and one that polls observes it gone. Real SageMaker takes minutes to tear a Studio
-/// domain down, so the span is compressed; the due instant is stored rather than slept on
-/// ([`Domain::is_released`]).
-pub const DOMAIN_RELEASED_AFTER: Duration = DOMAIN_IN_SERVICE_AFTER;
+// A Studio domain's own transitions are owed from the instant the call that starts them
+// answers (`transition_owed_at`), so this slice owns no span of its own: `CreateDomain`
+// admits the domain and resolves what its provisioning will come to
+// (`Domain::creation_failure_reason`), `UpdateDomain` admits the change and `DeleteDomain`
+// admits the teardown, so nothing is left to compute once each of those has answered. The
+// transient status stays the answer of the call that stores it, and the first request after
+// it reports the settled domain — see `transition_owed_at` for the rule and what it costs.
+// The MEMBERS of a domain keep spans of their own (`USER_PROFILE_IN_SERVICE_AFTER`).
 
 /// The page `ListDomains` serves when the request names no `MaxResults`: its
 /// `MaxResults` doc says "The default value for MaxResults is 10". [`MAX_PAGE_SIZE`]
@@ -395,7 +386,9 @@ pub fn app_network_access_type_locked_by_apps(arn: &str) -> String {
 /// `Pending` — into `InService`, or into [`DOMAIN_STATUS_FAILED`] where the create
 /// resolved a placement the account's network does not admit; it is stored, never slept
 /// on, and materialised by whichever reporting call first runs at or after it
-/// ([`Domain::settle_status`]).
+/// ([`Domain::settle_status`]). The create owes it from the instant it answers
+/// ([`transition_owed_at`]), so the first request after the create reports the settled
+/// domain; a test that needs the transient status sets the stored instant itself.
 ///
 /// The members the request did not carry stay `None`: the model documents a default for
 /// `AppNetworkAccessType`, `HomeEfsFileSystemCreation` and `TagPropagation` only, so
@@ -479,32 +472,36 @@ impl Domain {
     }
 
     /// Start the change `UpdateDomain` asked for: the domain reports
-    /// [`DOMAIN_STATUS_UPDATING`], and the clock owes it its way back into service
-    /// [`DOMAIN_IN_SERVICE_AFTER`] later.
+    /// [`DOMAIN_STATUS_UPDATING`], and the clock owes it its way back into service from the
+    /// instant that call answers ([`transition_owed_at`]).
     ///
     /// SageMaker applies a domain's change to the apps and the network of that domain AFTER
     /// it has answered the call, so the domain is not in service while that is in flight:
-    /// the transient status is observable to a caller that reads the domain straight back,
-    /// and the move out of it is the clock's — stored as an instant and never slept on
-    /// ([`Domain::settle_status`]). The change itself is a change to the domain, so it moves
-    /// `last_modified_time` too.
+    /// [`DOMAIN_STATUS_UPDATING`] is what this call stores and the move out of it is the
+    /// clock's — stored as an instant and never slept on ([`Domain::settle_status`]). The
+    /// update ITSELF is what decides the domain's new configuration, so nothing is left to
+    /// compute afterwards and the first request after it reports the settled domain. The
+    /// change is a change to the domain, so it moves `last_modified_time` too.
     pub fn begin_update(&mut self, now: SystemTime) {
         self.status = DOMAIN_STATUS_UPDATING.to_string();
         self.last_modified_time = now;
-        self.in_service_due_at = now + DOMAIN_IN_SERVICE_AFTER;
+        self.in_service_due_at = transition_owed_at(now);
     }
 
     /// Start the teardown `DeleteDomain` asked for: the domain reports `Deleting`, and the
-    /// clock owes its removal [`DOMAIN_RELEASED_AFTER`] later.
+    /// clock owes its removal from the instant that call answers ([`transition_owed_at`]).
     ///
-    /// The record is NOT dropped here: `DomainStatus` carries `Deleting` and SageMaker
-    /// answers it until the teardown finishes, so the transient status is observable and
-    /// the removal is the clock's — stored as an instant and never slept on. The status
-    /// change is a change to the domain, so it moves `last_modified_time` too.
+    /// The record is NOT dropped here: `DomainStatus` carries `Deleting`, which is what
+    /// this call stores and answers with, and the removal is the clock's — stored as an
+    /// instant and never slept on, so a sweep frees the quota slot without any caller's
+    /// read deciding anything ([`ComAmazonawsSagemakerSagemakerState::release_deleted_domains`]).
+    /// The delete ITSELF admits the teardown, so nothing is left to compute afterwards and
+    /// the first request after it finds the domain gone. The status change is a change to
+    /// the domain, so it moves `last_modified_time` too.
     pub fn begin_deletion(&mut self, now: SystemTime) {
         self.status = DOMAIN_STATUS_DELETING.to_string();
         self.last_modified_time = now;
-        self.removal_due_at = Some(now + DOMAIN_RELEASED_AFTER);
+        self.removal_due_at = Some(transition_owed_at(now));
     }
 
     /// Whether a `DeleteDomain` has asked for this domain's deletion, i.e. it is

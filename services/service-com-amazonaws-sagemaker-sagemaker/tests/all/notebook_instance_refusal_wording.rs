@@ -16,7 +16,7 @@
 //!   whose WHOLE message is the fixed token `RecordNotFound`, with nothing interpolated from
 //!   the request or the store, so the sentinel a client compares against is what it reads;
 //!   the operations that would MOVE the instance (the stop, the delete) word the same fact
-//!   with that token and the ARN the name resolves to;
+//!   by naming the resource they could not move — `Notebook Instance <arn> does not exist`;
 //! * an instance whose status does not admit the transition a call asks for is refused
 //!   `ValidationException`/400 stating the current status, the statuses the transition is
 //!   taken from AS A BRACKETED LIST, the status it could not move to and the instance's ARN,
@@ -29,7 +29,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    notebook_instance_record_not_found_at, NOTEBOOK_INSTANCE_RECORD_NOT_FOUND,
+    notebook_instance_does_not_exist, NOTEBOOK_INSTANCE_RECORD_NOT_FOUND,
 };
 
 use crate::inference_deployment_lifecycle::{error_code, message, Emulator};
@@ -38,12 +38,13 @@ use crate::notebook_instance_lifecycle::create_body;
 
 /// The operations that resolve a `NotebookInstanceName` and refuse one they hold nothing
 /// under, and the message each of them words that fact with: the READER answers the fixed
-/// token, and the two TRANSITIONS answer it with the ARN the name resolves to.
+/// sentinel token, and the two TRANSITIONS — which would ACT on the instance — name the
+/// resource they could not act on in this family's `does not exist` sentence.
 ///
-/// The presigned-URL mint is NOT among them: it words the same fact with its own recorded
-/// sentence, which `resource_precondition_gates` pins.
+/// The presigned-URL mint words the same fact the same way the transitions do, which
+/// `resource_precondition_gates` pins.
 fn absent_refusals(region: &str, name: &str) -> Vec<(&'static str, String)> {
-    let at_the_arn = notebook_instance_record_not_found_at(&notebook_instance_arn(region, name));
+    let at_the_arn = notebook_instance_does_not_exist(&notebook_instance_arn(region, name));
     vec![
         (
             "DescribeNotebookInstance",
@@ -68,9 +69,9 @@ fn transition_refusal(status: &str, allowed: &[&str], target: &str, arn: &str) -
 
 /// RULE: `DescribeNotebookInstance` refuses a name this account holds no instance under
 /// with `ValidationException`/400 whose whole message is the fixed `RecordNotFound` token,
-/// and the two transitions refuse it with that token and the ARN the name resolves to —
-/// whatever the name's shape, whichever Region the request is signed for, and whether the
-/// name was never created or has just been deleted.
+/// and the two transitions refuse it by naming the instance they could not move, in the
+/// `does not exist` sentence — whatever the name's shape, whichever Region the request is
+/// signed for, and whether the name was never created or has just been deleted.
 #[tokio::test]
 async fn an_absent_notebook_instance_is_refused_with_its_operations_own_sentence() {
     // The rows differ along what the rule generalises over: the shapes

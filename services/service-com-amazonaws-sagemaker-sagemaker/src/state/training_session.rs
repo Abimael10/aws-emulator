@@ -33,7 +33,7 @@ pub const TRAINING_SESSION_QUOTA: usize = 1_000;
 /// (`CreateTrainingSession`'s doc), which is not instantaneous: the session is reported
 /// `Created` until that compute is up and `Running` afterwards. AWS publishes no duration
 /// for it, so the span is CHOSEN — the same three seconds this service gives a Studio
-/// domain ([`DOMAIN_IN_SERVICE_AFTER`]) — and it is never zero, so a caller that
+/// user profile ([`USER_PROFILE_IN_SERVICE_AFTER`]) — and it is never zero, so a caller that
 /// describes the session straight after creating it still observes `Created`. The due
 /// instant is stored on the record and materialised by whichever reporting call first
 /// runs at or after it; nothing sleeps.

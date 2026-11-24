@@ -27,11 +27,12 @@ use super::notebook_instance_lifecycle::{create_body, describe, PAST_IN_SERVICE_
 /// Long enough to pass `state::NOTEBOOK_INSTANCE_STOPPED_AFTER` (300 ms).
 const PAST_STOPPED_DUE: Duration = Duration::from_millis(600);
 
-/// The whole message a notebook-instance TRANSITION refuses a name nothing is stored under
-/// with: the not-found token and the ARN the name resolves to — the crate's own helper, so
-/// this suite reads the service's wording rather than a copy of it.
+/// The whole message a notebook-instance operation that ACTS on the instance refuses a name
+/// nothing is stored under with: the resource kind, the ARN the name resolves to and `does
+/// not exist` — the crate's own helper, so this suite reads the service's wording rather
+/// than a copy of it.
 fn not_found_at(arn: &str) -> String {
-    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_record_not_found_at(arn)
+    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_does_not_exist(arn)
 }
 
 /// `StopNotebookInstance` for `name`.

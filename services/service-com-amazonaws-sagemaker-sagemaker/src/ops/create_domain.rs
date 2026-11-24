@@ -352,17 +352,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tag_propagation: input
                     .tag_propagation
                     .unwrap_or_else(|| crate::state::DEFAULT_TAG_PROPAGATION.to_string()),
-                // A domain comes up `Pending` and owes the clock either `InService` or, for
+                // A domain is STORED `Pending` and owes the clock either `InService` or, for
                 // a placement the account's network does not admit, `Failed` with the reason
-                // resolved above — so a caller that reads it straight back still observes
-                // the transient status.
+                // resolved above. This call has already resolved which of the two it will
+                // be, so nothing is left to compute and the transition is owed from the
+                // instant this call answers (`state::transition_owed_at`): the first request
+                // after it reports the settled domain, and a caller driving the documented
+                // poll-until-settled loop spends none of its polling interval on it.
                 status: crate::state::DOMAIN_STATUS_PENDING.to_string(),
                 failure_reason: None,
                 creation_failure_reason,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 last_modified_time: now,
-                in_service_due_at: now + crate::state::DOMAIN_IN_SERVICE_AFTER,
+                in_service_due_at: crate::state::transition_owed_at(now),
                 // Nothing has asked for this domain's removal, so the clock owes none.
                 removal_due_at: None,
             },

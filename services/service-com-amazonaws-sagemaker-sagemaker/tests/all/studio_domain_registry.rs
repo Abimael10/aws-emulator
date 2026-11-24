@@ -15,7 +15,7 @@
 //! crossed against a value outside it; the documented default of each member that has
 //! one; the clock-owed `Pending` -> `InService` move; and the page walk for every page
 //! size from one entry to past the published `MaxResults` maximum.
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::ops::types::{
@@ -23,9 +23,9 @@ use service_com_amazonaws_sagemaker_sagemaker::ops::types::{
     HOME_EFS_FILE_SYSTEM_CREATION_VALUES, TAG_PROPAGATION_VALUES,
 };
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    DEFAULT_APP_NETWORK_ACCESS_TYPE, DEFAULT_HOME_EFS_FILE_SYSTEM_CREATION,
-    DEFAULT_TAG_PROPAGATION, DOMAIN_DEFAULT_PAGE_SIZE, DOMAIN_STATUS_IN_SERVICE,
-    DOMAIN_STATUS_PENDING, MAX_PAGE_SIZE,
+    ComAmazonawsSagemakerSagemakerState, DEFAULT_APP_NETWORK_ACCESS_TYPE,
+    DEFAULT_HOME_EFS_FILE_SYSTEM_CREATION, DEFAULT_TAG_PROPAGATION, DOMAIN_DEFAULT_PAGE_SIZE,
+    DOMAIN_STATUS_IN_SERVICE, DOMAIN_STATUS_PENDING, MAX_PAGE_SIZE,
 };
 
 use crate::inference_deployment_lifecycle::{
@@ -461,9 +461,10 @@ async fn create_domain_refuses_a_name_outside_the_modelled_shape() {
     );
 }
 
-/// RULE: a domain comes up in a non-terminal status and owes its move to `InService` to
-/// the CLOCK — the transition is due at a stored instant whether or not anybody reads the
-/// domain, and a read never changes what a later caller sees.
+/// RULE: a domain owes its move to `InService` to the CLOCK, from the instant the create
+/// that decided it answers (`state::transition_owed_at`) — so the FIRST read after the
+/// create reports the settled domain through both readers, with no wait of any length, and
+/// a read never changes what a later caller sees.
 #[tokio::test]
 async fn domain_status_moves_from_pending_to_in_service_on_the_clock() {
     let emulator = Emulator::new();
@@ -472,13 +473,13 @@ async fn domain_status_moves_from_pending_to_in_service_on_the_clock() {
     let domain_id = str_field(&created, "DomainId");
     let describe = json!({ "DomainId": domain_id });
 
-    // The span is never zero, so the caller that reads straight back still observes the
-    // transient status, through both readers.
-    let described = emulator.ok("DescribeDomain", &describe).await;
+    // The create resolved what the provisioning comes to before it answered, so the very
+    // next request reports it, through both readers.
+    let settled = emulator.ok("DescribeDomain", &describe).await;
     assert_eq!(
-        str_field(&described, "Status"),
-        DOMAIN_STATUS_PENDING,
-        "case straight-after-create: DescribeDomain status, got {described}"
+        str_field(&settled, "Status"),
+        DOMAIN_STATUS_IN_SERVICE,
+        "case straight-after-create: DescribeDomain status, got {settled}"
     );
     let listed = emulator.ok("ListDomains", &json!({})).await;
     assert_eq!(
@@ -489,9 +490,43 @@ async fn domain_status_moves_from_pending_to_in_service_on_the_clock() {
                 .iter()
                 .map(|details| str_field(details, "Status"))
                 .collect::<Vec<_>>()),
-        Some(vec![DOMAIN_STATUS_PENDING.to_string()]),
+        Some(vec![DOMAIN_STATUS_IN_SERVICE.to_string()]),
         "case straight-after-create: ListDomains status, got {listed}"
     );
+
+    // The status the create stored is the transient one, and it is the record's own
+    // starting point rather than anything a reader decides: a domain whose due instant is
+    // still ahead is reported `Pending` by the same reader.
+    {
+        let store = emulator
+            .engine
+            .state::<ComAmazonawsSagemakerSagemakerState>();
+        let mut store = store.lock();
+        let domain = store
+            .domains
+            .get_mut(&domain_id)
+            .unwrap_or_else(|| panic!("the created domain {domain_id} must be stored"));
+        domain.status = DOMAIN_STATUS_PENDING.to_string();
+        domain.in_service_due_at = SystemTime::now() + SETTLE_DEADLINE;
+    }
+    let held = emulator.ok("DescribeDomain", &describe).await;
+    assert_eq!(
+        str_field(&held, "Status"),
+        DOMAIN_STATUS_PENDING,
+        "case transition-still-owed: a domain whose move is not due yet keeps the \
+         transient status, got {held}"
+    );
+    {
+        let store = emulator
+            .engine
+            .state::<ComAmazonawsSagemakerSagemakerState>();
+        let mut store = store.lock();
+        let domain = store
+            .domains
+            .get_mut(&domain_id)
+            .unwrap_or_else(|| panic!("the created domain {domain_id} must be stored"));
+        domain.in_service_due_at = SystemTime::now();
+    }
 
     // Wait for the CONDITION, not for a fixed time.
     let deadline = Instant::now() + SETTLE_DEADLINE;

@@ -46,12 +46,13 @@ pub(crate) fn notebook_instance_arn(region: &str, name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:notebook-instance/{name}")
 }
 
-/// The whole message a notebook-instance TRANSITION refuses a name nothing is stored under
-/// with: the not-found token and the ARN the name resolves to — the crate's own helper, so
-/// this suite reads the service's wording rather than a copy of it. The READER answers the
-/// bare token instead, which `notebook_instance_refusal_wording` pins.
+/// The whole message a notebook-instance operation that ACTS on the instance refuses a name
+/// nothing is stored under with: the resource kind, the ARN the name resolves to and `does
+/// not exist` — the crate's own helper, so this suite reads the service's wording rather
+/// than a copy of it. The READER answers the bare sentinel token instead, which
+/// `notebook_instance_refusal_wording` pins.
 fn record_not_found_at(arn: &str) -> String {
-    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_record_not_found_at(arn)
+    service_com_amazonaws_sagemaker_sagemaker::state::notebook_instance_does_not_exist(arn)
 }
 
 /// The ARN a notebook instance lifecycle configuration of `name` carries in `region`.

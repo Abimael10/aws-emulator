@@ -93,23 +93,12 @@ pub const NOTEBOOK_INSTANCE_STOPPABLE_STATUSES: [&str; 2] =
 /// gone" from any other bad request, so a refusal that appended the ARN the name resolves to
 /// would never match it.
 ///
-/// The TRANSITIONS of the same resource word the same fact differently
-/// ([`notebook_instance_record_not_found_at`]), and so does the presigned-URL mint
-/// ([`notebook_instance_does_not_exist`]): one resource, one fact, and the sentence each
-/// operation is recorded answering it with.
+/// Every OTHER notebook-instance operation — the ones that ACT on the instance: the stop,
+/// the delete, the presigned-URL mint and the tag calls that address its ARN — words the
+/// same fact as the resource-and-sentence form [`notebook_instance_does_not_exist`]
+/// renders, because the subject of such a refusal is the instance the call could not act
+/// on: one resource, one fact, and the sentence each family is recorded answering it with.
 pub const NOTEBOOK_INSTANCE_RECORD_NOT_FOUND: &str = "RecordNotFound";
-
-/// How the notebook-instance TRANSITIONS — the stop and the delete — state a name this
-/// account holds no instance under: the [`NOTEBOOK_INSTANCE_RECORD_NOT_FOUND`] token, then
-/// the clause naming the ARN that name resolves to in the Region the request signed for.
-///
-/// These calls would MOVE the instance, and the refusal names the resource they could not
-/// move; the reader's own answer is the bare token. Stated once here so the two transitions
-/// cannot word the one fact differently.
-#[must_use]
-pub fn notebook_instance_record_not_found_at(arn: &str) -> String {
-    format!("{NOTEBOOK_INSTANCE_RECORD_NOT_FOUND}. Notebook Instance Arn: {arn}")
-}
 
 /// How a notebook-instance operation states that the instance cannot take the transition
 /// asked of it from the status it is in: the CURRENT status in round brackets, the statuses

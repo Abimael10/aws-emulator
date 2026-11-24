@@ -3789,13 +3789,18 @@ pub const AI_BENCHMARK_JOB_ENTITY: &str = "AIBenchmarkJob";
 /// it has stored nothing under the name the request carried.
 pub const REQUESTED_RESOURCE_NOT_FOUND: &str = "Requested resource not found.";
 
-/// How SageMaker's presigned-URL call states a notebook instance this account does not
-/// hold: the resource kind as the service spells it, the ARN the request's
-/// `NotebookInstanceName` resolves to, and `does not exist` with no closing period.
+/// How every notebook-instance operation that ACTS on the instance — the stop, the delete,
+/// the presigned-URL mint and the tag calls that address its ARN — states a notebook
+/// instance this account does not hold: the resource kind as the service spells it, the ARN
+/// the request's `NotebookInstanceName` resolves to, and `does not exist` with no closing
+/// period.
 ///
 /// A separate template from the fixed [`NOTEBOOK_INSTANCE_RECORD_NOT_FOUND`] token the
-/// READERS of this resource answer, because the service words the two differently — the
-/// same split the processing-job family has between its read and its update templates.
+/// READER of this resource answers, because the service words the two differently — the
+/// same split the processing-job family has between its read and its update templates. The
+/// reader's token is a sentinel carrying nothing of the request; these calls name the
+/// resource they could not act on, so the ARN the requested name resolves to in the Region
+/// the request signed for is interpolated.
 #[must_use]
 pub fn notebook_instance_does_not_exist(arn: &str) -> String {
     format!("Notebook Instance {arn} does not exist")

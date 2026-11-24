@@ -71,20 +71,20 @@ pub const USER_PROFILE_STATUS_DELETING: &str = "Deleting";
 /// How long after `CreateUserProfile` the clock owes the `Pending` -> `InService`
 /// transition.
 ///
-/// The same compressed, never-zero span the domain's own provisioning takes
-/// ([`DOMAIN_IN_SERVICE_AFTER`]): a caller that describes the profile straight after
-/// creating it still observes `Pending`, and one that waits observes `InService`. The due
-/// instant is stored rather than slept on ([`UserProfile::settle_status`]).
-pub const USER_PROFILE_IN_SERVICE_AFTER: Duration = DOMAIN_IN_SERVICE_AFTER;
+/// Three seconds, compressed and never zero: a caller that describes the profile straight
+/// after creating it still observes `Pending`, and one that waits observes `InService`.
+/// Real SageMaker takes minutes to provision a Studio user profile. The due instant is
+/// stored rather than slept on ([`UserProfile::settle_status`]).
+pub const USER_PROFILE_IN_SERVICE_AFTER: Duration = Duration::from_secs(3);
 
 /// How long after `DeleteUserProfile` the clock owes the `Deleting` -> gone transition of a
 /// user profile.
 ///
-/// The same compressed, never-zero span the domain's own teardown takes
-/// ([`DOMAIN_RELEASED_AFTER`]): a caller that describes the profile straight after asking
-/// for its deletion still observes `Deleting`, and one that polls observes it gone. The due
-/// instant is stored rather than slept on ([`UserProfile::is_released`]).
-pub const USER_PROFILE_RELEASED_AFTER: Duration = DOMAIN_RELEASED_AFTER;
+/// The same compressed, never-zero span the profile's own provisioning takes
+/// ([`USER_PROFILE_IN_SERVICE_AFTER`]): a caller that describes the profile straight after
+/// asking for its deletion still observes `Deleting`, and one that polls observes it gone.
+/// The due instant is stored rather than slept on ([`UserProfile::is_released`]).
+pub const USER_PROFILE_RELEASED_AFTER: Duration = USER_PROFILE_IN_SERVICE_AFTER;
 
 /// The store key a `(DomainId, UserProfileName)` pair maps to.
 ///

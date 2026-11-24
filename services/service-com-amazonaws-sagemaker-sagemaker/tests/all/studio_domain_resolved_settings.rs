@@ -25,9 +25,12 @@
 //! `smithy_server_runtime::UNSERVED_URL_BASE` — the same value `ctx.endpoint()` answers
 //! in-process, where a served emulator answers its data port's base.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sagemaker_sagemaker::state::{
+    ComAmazonawsSagemakerSagemakerState, DOMAIN_STATUS_PENDING,
+};
 
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator};
 
@@ -52,7 +55,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// The status a domain reports once its provisioning is finished, and the one it reports
 /// while the clock still owes that move (`smithy_query(query="shape",shape="DomainStatus")`).
 const IN_SERVICE: &str = "InService";
-const PENDING: &str = "Pending";
+const PENDING: &str = DOMAIN_STATUS_PENDING;
+
+/// Put the stored domain `domain_id` back in the transient `PENDING` status with its move
+/// into service held off, and answer nothing.
+///
+/// A domain's move into service is owed from the instant `CreateDomain` answers
+/// (`state::transition_owed_at`), so a case that is about what the domain's address serves
+/// BEFORE it is in service seeds that status on the record instead of racing the clock for
+/// it. [`give_the_move_back_to_the_clock`] hands it back.
+fn hold_off_the_move_into_service(emulator: &Emulator, domain_id: &str) {
+    let store = emulator
+        .engine
+        .state::<ComAmazonawsSagemakerSagemakerState>();
+    let mut store = store.lock();
+    let domain = store
+        .domains
+        .get_mut(domain_id)
+        .unwrap_or_else(|| panic!("the created domain {domain_id} must be stored"));
+    domain.status = PENDING.to_string();
+    domain.in_service_due_at = SystemTime::now() + SETTLE_DEADLINE;
+}
+
+/// Owe the stored domain `domain_id` its move into service again, so the next reporting
+/// call materialises it. The reverse of [`hold_off_the_move_into_service`].
+fn give_the_move_back_to_the_clock(emulator: &Emulator, domain_id: &str) {
+    let store = emulator
+        .engine
+        .state::<ComAmazonawsSagemakerSagemakerState>();
+    let mut store = store.lock();
+    let domain = store
+        .domains
+        .get_mut(domain_id)
+        .unwrap_or_else(|| panic!("the created domain {domain_id} must be stored"));
+    domain.in_service_due_at = SystemTime::now();
+}
 
 /// A `CreateDomain` request: the three required members, plus `extra`'s members.
 fn create_domain(name: &str, extra: &Value) -> Value {
@@ -468,7 +505,10 @@ async fn a_domains_url_addresses_a_landing_this_emulator_serves() {
 
         // The address serves no Studio while the domain is still being provisioned, and the
         // answer says which status stands in the way — unless the domain does not admit
-        // Studio at all, which no status of the domain changes.
+        // Studio at all, which no status of the domain changes. The move into service is
+        // owed from the instant the create answered, so the status that stands in the way is
+        // seeded on the record rather than raced for.
+        hold_off_the_move_into_service(&emulator, &domain_id);
         let (status, body) = emulator.fetch(&url).await;
         if admits_studio {
             assert_eq!(
@@ -487,6 +527,7 @@ async fn a_domains_url_addresses_a_landing_this_emulator_serves() {
                  {status} {body:?}"
             );
         }
+        give_the_move_back_to_the_clock(&emulator, &domain_id);
 
         created.push((*case, domain_id, url, admits_studio));
     }
