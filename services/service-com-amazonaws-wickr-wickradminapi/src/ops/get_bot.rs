@@ -5,6 +5,12 @@
 //! Reports the one bot of a network the `botId` label names, from the record the
 //! create stored — the same view `ListBots` reports it in.
 //!
+//! A read it cannot answer is refused at the resource the request named: a `botId`
+//! this store holds no bot for under that `networkId` is a gone BOT, whatever became
+//! of the network around it, answered HTTP 404 with this API's fixed gone-bot
+//! sentence and no error-shape discriminator beside it (see
+//! [`crate::service::untyped_bot_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,12 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        // A bot exists only inside a network: a `networkId` behind which there is no
-        // network of this account has no bot to report, and is answered as the
-        // resource that "doesn't exist or has been deleted" rather than with a bot.
-        if !store.networks.contains_key(&input.network_id) {
-            return Err(gone(crate::state::NETWORK_GONE_MESSAGE));
-        }
+        // The request names ONE bot, and that is the resource this read reports on:
+        // a `botId` this store holds no bot for under the `networkId` the request
+        // named — because no bot of that network ever carried it, because it names a
+        // bot of a different network, or because the network that held it has been
+        // deleted and its bots went with it — is reported as the BOT that "doesn't
+        // exist or has been deleted", never as its parent network. So the refusal a
+        // client reads always names the resource it asked about, whatever became of
+        // the network around it.
         let record = store
             .bot_of(&input.network_id, &input.bot_id)
             .ok_or_else(|| gone(crate::state::BOT_GONE_MESSAGE))?;
@@ -210,6 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled `ResourceNotFoundError` (HTTP 404) for a resource the request named
 /// that "doesn't exist or has been deleted", stated in this API's fixed sentence for
 /// it — which names no id, so it says nothing about what else the store holds.
+///
+/// The 404 this read answers travels UNTYPED on the wire: the status and the sentence
+/// are all a client gets, with no error-shape discriminator beside them. The status,
+/// the sentence and every member stay this handler's; the wire form of that one
+/// refusal is stated once in [`crate::service::untyped_bot_refusal`].
 fn gone(message: &str) -> GetBotError {
     GetBotErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
         message: Some(message.to_string()),

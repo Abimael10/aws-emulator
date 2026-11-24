@@ -223,6 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `username` "must be unique within the network". One username names one
         // account of a network whether that account is a user or a bot — `uname` is
         // derived from it, so two accounts holding it would share one identifier.
+        //
+        // The refusal states the service's fixed reason for a username that is not
+        // available to a new account, which names neither the submitted name nor the
+        // network, so it discloses nothing about what the network already holds.
         if store
             .user_by_username(&input.network_id, &input.username)
             .is_some()
@@ -231,11 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some()
         {
             return Err(refused(
-                "username",
-                format!(
-                    "username {} already exists in network {}",
-                    input.username, input.network_id
-                ),
+                crate::state::USERNAME_FIELD,
+                crate::state::USERNAME_UNAVAILABLE_REASON.to_string(),
             ));
         }
 

@@ -65,6 +65,23 @@ pub const NETWORK_NAME_EXTRA_CHARS: [char; 3] = [' ', '-', '_'];
 /// invalid.
 pub const NETWORK_NAME_INVALID_REASON: &str = "Network Name is not a valid name";
 
+/// The member a refusal of a submitted username names in `ErrorDetail$field`: the
+/// `username` the request carried.
+///
+/// Shared by every operation that refuses one, so the two that create an account
+/// of a network cannot name the member differently.
+pub const USERNAME_FIELD: &str = "username";
+
+/// Why a `username` was refused: an account of the network already holds it.
+///
+/// `username` "must be unique within the network", and the service states this one
+/// fixed sentence as the reason whenever the submitted name is not available to a
+/// new account. RECORDED behaviour, the model stating no reason text: like
+/// [`NETWORK_NAME_INVALID_REASON`] it is ENTIRELY fixed text, carrying neither the
+/// submitted username nor the id of the network, so a refusal discloses nothing
+/// about which name the network already holds or which account holds it.
+pub const USERNAME_UNAVAILABLE_REASON: &str = "username is unavailable";
+
 /// Whether `name` is a name a network may be created with.
 ///
 /// `GenericString`'s `^[\S\s]*$` matches every string, so the model expresses no

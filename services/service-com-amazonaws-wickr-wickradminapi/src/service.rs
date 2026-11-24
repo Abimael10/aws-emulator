@@ -23,8 +23,11 @@
 //! - `override_operation` — EDITED HERE. The routing key, the handler and the store
 //!   stay the generated table's; `GetNetwork` alone is served through
 //!   [`network_ownership::OwnershipFirst`], because this API resolves ownership of a
-//!   `networkId` path label before it validates the label's shape. See "Why this file
-//!   denies a network id" below.
+//!   `networkId` path label before it validates the label's shape (see "Why this file
+//!   denies a network id" below), and `GetBot` alone through
+//!   [`untyped_bot_refusal::UntypedBotRefusalOperation`], because the refusal it states
+//!   for a bot it cannot report names no error shape on this API's wire (see "Why a gone
+//!   bot names no error shape" below).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -66,10 +69,22 @@
 //! lives. Every other operation keeps the framework's order and its own refusals. The
 //! denial it answers, and everything it delegates, carry the same response envelope as
 //! every other response.
+//!
+//! ## Why a gone bot names no error shape
+//!
+//! `override_operation`'s third half. This API names the error shape of most of what it
+//! refuses — a network read of a deleted network is a typed `ForbiddenError`, a refused
+//! member a typed `ValidationError` — but not the refusal a bot read states for a bot it
+//! cannot report: that one carries the status and the sentence alone, so a client
+//! classifies it by status. [`untyped_bot_refusal`] states that wire form for `GetBot`, and
+//! only for it; the status, the sentence and the whole walk stay the framework's and the
+//! handler's.
 
 pub mod network_ownership;
 
 pub mod response_envelope;
+
+pub mod untyped_bot_refusal;
 
 use response_envelope::ResponseEnvelopeOperation;
 use smithy_server_runtime::{
@@ -97,6 +112,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
         crate::ops::get_network::GetNetwork<Eng>,
         ResponseEnvelopeOperation,
     >,
+    /// The untyped answer for `GetBot`, built once here and never per request. It holds no
+    /// operation and no store: it runs the very routing-table entry every other request is
+    /// served through and states the wire form of the one refusal this API names no error
+    /// shape in (see [`untyped_bot_refusal`]), finishing it in the same response envelope as
+    /// every other response.
+    get_bot: untyped_bot_refusal::UntypedBotRefusalOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -108,6 +129,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             envelope: ResponseEnvelopeOperation::new(),
             get_network: network_ownership::OwnershipFirst::new(ResponseEnvelopeOperation::new()),
+            get_bot: untyped_bot_refusal::UntypedBotRefusalOperation::new(),
         }
     }
 }
@@ -152,6 +174,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let key = self.entry.protocol().routing_key(req).ok()?;
         if key == <crate::ops::get_network::GetNetwork<Eng> as Operation>::NAME {
             return Some(&self.get_network as _);
+        }
+        // `GetBot` is served through the untyped answer, because the refusal it states for a
+        // bot it cannot report names no error shape on this API's wire — the one refusal of
+        // this service that does not. It delegates to the same wrapper everything else
+        // reaches, so the walk, the status and the sentence stay the framework's and the
+        // handler's.
+        if key == <crate::ops::get_bot::GetBot<Eng> as Operation>::NAME {
+            return Some(&self.get_bot as _);
         }
         Some(&self.envelope as _)
     }

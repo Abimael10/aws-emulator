@@ -299,14 +299,15 @@ fn create_one(
         });
     }
 
-    // `username` "must be unique within the network".
+    // `username` "must be unique within the network". The item states the service's
+    // fixed reason for a username that is not available to a new account — the same
+    // one `CreateBot` states — so the two operations that create an account of a
+    // network cannot word one refusal two ways, and neither of them reports the
+    // submitted name or the network back.
     if let Some(existing) = store.user_by_username(network_id, &item.username) {
         return Err(BatchUserErrorResponseItem {
-            field: Some("username".to_string()),
-            reason: Some(format!(
-                "username {} already exists in network {network_id}",
-                item.username
-            )),
+            field: Some(crate::state::USERNAME_FIELD.to_string()),
+            reason: Some(crate::state::USERNAME_UNAVAILABLE_REASON.to_string()),
             user_id: existing.user_id.clone(),
         });
     }
