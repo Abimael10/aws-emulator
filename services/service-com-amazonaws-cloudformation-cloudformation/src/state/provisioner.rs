@@ -4750,6 +4750,10 @@ mod rds_db_instance_roles;
 /// Amazon RDS once it reports the resource serving so a stack output carries the address a
 /// client really connects to.
 mod rds_published_endpoints;
+/// The TAGS Amazon RDS holds on a resource a stack already created, reconciled through that
+/// service's own tagging calls — the one arm every Amazon RDS type whose tags it holds
+/// shares, because no call that changes such a resource carries a tag.
+mod rds_tags;
 /// The Amazon RDS OPTION GROUP arm: the group an `AWS::RDS::OptionGroup` declares, created in
 /// the service that owns it so a DB instance's `OptionGroupName` and a client's own read of
 /// that service resolve the name the stack publishes.
@@ -4838,6 +4842,7 @@ use codepipeline_webhooks::*;
 use memorydb_groups::*;
 use elasticache_caches::*;
 use rds_db_clusters::*;
+use rds_tags::*;
 use redshift_parameter_groups::*;
 use redshift_snapshot_copy_grants::*;
 use redshift_event_subscriptions::*;

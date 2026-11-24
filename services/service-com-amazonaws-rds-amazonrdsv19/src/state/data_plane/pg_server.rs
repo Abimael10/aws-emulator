@@ -1409,6 +1409,9 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
         // The relation-size functions answer "the disk space used", which PostgreSQL reports
         // as a `bigint` number of bytes.
         "pg_relation_size" | "pg_table_size" | "pg_total_relation_size" => Some("bigint"),
+        // `to_regclass(text) → regclass` (PostgreSQL, "Object Identifier Types"), the type an
+        // object identifier that denotes a relation is reported under.
+        "to_regclass" => Some("regclass"),
         _ => None,
     }
 }
@@ -1430,21 +1433,29 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
 ///   to it; all three are the PAGES `pg_class` records for it ([`measured_storage`]) in bytes,
 ///   because this engine holds a relation's rows in one store and has no second fork, no
 ///   separate index storage and no out-of-line values of its own.
+/// * `to_regclass(text)` "translates a textual relation name to its OID", and the `to_reg*`
+///   functions "return NULL rather than raising an error if the name is not found"
+///   (PostgreSQL, "Object Identifier Types") — so it is the lookup for that name in
+///   `pg_class` and the schemas `pg_namespace` puts those relations in
+///   ([`to_regclass_lookup`]), which is how a client asks whether a relation exists without
+///   a statement that fails when it does not.
 ///
 /// Nothing is answered from the statement's text: the engine plans and runs the lookup like
 /// any other subquery, and a role the instance does not have resolves to nothing, as
 /// PostgreSQL's own does.
 ///
-/// Answers the catalog the function reads, so a statement that calls it has that catalog
-/// rebuilt first (`super::wire_session::catalogs_named`); [`catalog_function_lookup`] is the
-/// lookup itself.
+/// Answers EVERY catalog the function reads, so a statement that calls it has all of them
+/// rebuilt first (`super::wire_session::catalogs_named`) — a lookup that joins two catalogs
+/// resolves against neither until both are the instance as it stands. The empty slice is a
+/// function that is not one of these; [`catalog_function_lookup`] is the lookup itself.
 #[must_use]
-pub fn catalog_function(function: &str) -> Option<&'static str> {
+pub fn catalog_function(function: &str) -> &'static [&'static str] {
     match function.to_ascii_lowercase().as_str() {
-        "pg_get_userbyid" => Some("pg_roles"),
-        "pg_has_role" => Some("pg_auth_members"),
-        "pg_relation_size" | "pg_table_size" | "pg_total_relation_size" => Some("pg_class"),
-        _ => None,
+        "pg_get_userbyid" => &["pg_roles"],
+        "pg_has_role" => &["pg_auth_members"],
+        "pg_relation_size" | "pg_table_size" | "pg_total_relation_size" => &["pg_class"],
+        "to_regclass" => &["pg_class", "pg_namespace"],
+        _ => &[],
     }
 }
 
@@ -1482,8 +1493,35 @@ pub fn catalog_function_lookup(
         ("pg_relation_size", [relation, _fork]) => {
             Some(relation_size_lookup(function, relation))
         }
+        // The relation the name denotes, or nothing for a name this database holds no
+        // relation of — which is the NULL that function answers rather than an error.
+        ("to_regclass", [relation]) => Some(to_regclass_lookup(relation)),
         _ => None,
     }
+}
+
+/// The RELATION `relation` names, as `to_regclass` answers it: the row `pg_class` holds for
+/// that name, wrapped in the call of the function itself — which is what names the column
+/// after the function and reports it under the function's own type
+/// ([`function_result_type`]), exactly as the role and relation-size lookups do.
+///
+/// A `regclass` is an object identifier whose TEXT form is the relation's name, so what the
+/// lookup answers with is `pg_class.relname`: that is the value a client reading the column
+/// gets, and it is what PostgreSQL prints for a relation reachable on the search path — which
+/// every relation of this server is, since it serves the two schemas every database has
+/// ([`SCHEMAS`]).
+///
+/// The name may be SCHEMA-QUALIFIED (`public.orders`), which is the form a client that does
+/// not rely on the search path writes, so the row is matched on the relation's own name and on
+/// that name under its schema alike — the schema each relation is in being the one
+/// `pg_class.relnamespace` records for it. A name this database holds no relation of matches no
+/// row, so the lookup answers NULL.
+fn to_regclass_lookup(relation: &str) -> String {
+    format!(
+        "to_regclass((SELECT c.relname FROM pg_class AS c \
+           JOIN pg_namespace AS n ON n.oid = c.relnamespace \
+           WHERE {relation} IN (c.relname, n.nspname || '.' || c.relname)))"
+    )
 }
 
 /// The STORAGE `relation` occupies, in bytes: the pages `pg_class` records for it
@@ -1524,7 +1562,7 @@ fn has_role_lookup(user: &str, role: &str) -> String {
 /// connection), so a statement that calls one is planned and run by the engine like any
 /// other — and so a function this list does not carry is refused as undefined rather than
 /// silently answered.
-pub const SERVER_FUNCTIONS: [(&str, i32); 16] = [
+pub const SERVER_FUNCTIONS: [(&str, i32); 17] = [
     ("pg_postmaster_start_time", 0),
     ("pg_is_in_recovery", 0),
     ("pg_backend_pid", 0),
@@ -1549,6 +1587,9 @@ pub const SERVER_FUNCTIONS: [(&str, i32); 16] = [
     ("pg_relation_size", 1),
     ("pg_table_size", 1),
     ("pg_total_relation_size", 1),
+    // `to_regclass`, as the ONE argument its own lookup leaves it: the relation the engine
+    // resolved out of the relation catalog ([`to_regclass_lookup`]).
+    ("to_regclass", 1),
     // `char_length(text)` / `character_length(text)` — "the number of characters in the
     // string" (PostgreSQL, "String Functions and Operators"), and MySQL's `CHAR_LENGTH()`,
     // which "returns the length of the string measured in characters": the same count, under

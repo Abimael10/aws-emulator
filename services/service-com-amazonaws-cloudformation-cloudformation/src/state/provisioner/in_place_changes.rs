@@ -1038,6 +1038,17 @@ impl Provisioner {
             Self::VpcLatticeServiceNetwork | Self::VpcLatticeAccessLogSubscription => {
                 retag_vpc_lattice_resource(ctx, region, resource, declared, propagated).await
             }
+            // Every Amazon RDS resource's tags are that service's own `AddTagsToResource` and
+            // `RemoveTagsFromResource`, addressed by the resource's ARN: each create's `Tags`
+            // list applies to the resource that call creates, and no call that changes a
+            // resource which already exists carries a tag at all — `ModifyDBInstance` and its
+            // siblings publish no `Tags` member — so this is where the set one of them is to
+            // end up carrying is reconciled, for every type whose tags that service holds
+            // ([`rds_tags::retag_rds_resource`], over
+            // [`rds_tags::reported_arn_member`]'s catalogue).
+            owner if reported_arn_member(owner).is_some() => {
+                retag_rds_resource(ctx, region, owner, resource, declared, propagated).await
+            }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.

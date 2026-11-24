@@ -316,7 +316,7 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
                     && called
                     && follow_calls
                     && depth < MAX_CALL_DEPTH
-                    && super::pg_server::catalog_function(&lowered).is_some()
+                    && !super::pg_server::catalog_function(&lowered).is_empty()
                 {
                     match call_arguments(facts, tokens, next.unwrap_or(index + 1), depth + 1) {
                         Some((arguments, consumed)) => {

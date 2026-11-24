@@ -2391,7 +2391,8 @@ fn catalogs_named(tokens: &[Token]) -> Vec<&'static str> {
             Token::Word(word) => {
                 word.value.eq_ignore_ascii_case(catalog)
                     || super::pg_server::catalog_function(&word.value)
-                        .is_some_and(|read| read.eq_ignore_ascii_case(catalog))
+                        .iter()
+                        .any(|read| read.eq_ignore_ascii_case(catalog))
             }
             _ => false,
         })

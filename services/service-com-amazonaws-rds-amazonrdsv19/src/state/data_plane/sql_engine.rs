@@ -2000,6 +2000,26 @@ fn register_server_functions(
         .map_err(unavailable)?;
     }
 
+    // `to_regclass`, as the ONE argument its own lookup leaves it: the relation the engine
+    // resolved out of the relation catalog (`super::pg_server::to_regclass_lookup`). The call
+    // is kept so the column is named after the function and reported under its own type, as
+    // the relation-size functions are; a name this database holds no relation of answers
+    // NULL, which is what that function answers rather than raising an error.
+    conn.create_scalar_function(
+        "to_regclass",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| match context.get_raw(0) {
+            ValueRef::Null => Ok(None),
+            ValueRef::Integer(oid) => Ok(Some(oid.to_string())),
+            ValueRef::Real(oid) => Ok(Some(oid.to_string())),
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        },
+    )
+    .map_err(unavailable)?;
+
     // `md5(text)` — "Computes the MD5 hash of the argument, with the result written in
     // hexadecimal" on PostgreSQL, and the same digest under the same name on MySQL. The
     // digest is computed over the argument's own bytes, so what the client hashes is what

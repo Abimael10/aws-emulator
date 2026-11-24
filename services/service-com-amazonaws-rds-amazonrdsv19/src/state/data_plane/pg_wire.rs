@@ -1326,6 +1326,10 @@ pub(super) fn type_oid(column: &ColumnInfo, sample: Option<&Cell>) -> i32 {
             // Types"), the type the server-address functions answer with.
             "inet" => Some((869, 1041)),
             "uuid" => Some((2950, 2951)),
+            // `regclass` — the object identifier type that "denotes a relation" (PostgreSQL,
+            // "Object Identifier Types"), which `to_regclass` answers with and whose text
+            // form is the relation's name.
+            "regclass" => Some((2205, 2210)),
             "jsonb" => Some((3802, 3807)),
             _ => None,
         };
