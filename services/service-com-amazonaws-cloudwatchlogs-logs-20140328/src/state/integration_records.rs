@@ -418,8 +418,62 @@ impl IntegrationRecord {
         ::engine::emulator_arn(
             OPENSEARCH_SERVERLESS_SERVICE,
             &self.region,
-            &format!("collection/{}{}", self.name, COLLECTION_SUFFIX),
+            &self.collection_resource(),
         )
+    }
+
+    /// The RESOURCE part of this integration's collection ARN: `collection/{name}`, the form
+    /// OpenSearch Serverless names a collection by, over the collection's own name
+    /// ([`Self::collection_name`]).
+    fn collection_resource(&self) -> String {
+        format!("collection/{}", self.collection_name())
+    }
+
+    /// The name of the serverless collection this integration's setup created, after the
+    /// integration it belongs to. The ONE derivation of it, read by the ARN and by the
+    /// endpoint, so neither can name a second collection.
+    fn collection_name(&self) -> String {
+        format!("{}{}", self.name, COLLECTION_SUFFIX)
+    }
+
+    /// `OpenSearchCollection$collectionEndpoint` — "The endpoint of the collection", which is
+    /// where a client queries the indexes the integration's dashboards read.
+    ///
+    /// The collection the setup created lives in the Region the integration was created in, so
+    /// its endpoint is its own name in that Region's OpenSearch Serverless endpoint zone
+    /// ([`opensearch_resource_endpoint`]).
+    pub fn collection_endpoint(&self) -> String {
+        opensearch_resource_endpoint(
+            &self.collection_name(),
+            &self.region,
+            OPENSEARCH_SERVERLESS_SERVICE,
+        )
+    }
+
+    /// `OpenSearchApplication$applicationEndpoint` — "The endpoint of the application": the
+    /// address a viewer opens the vended logs dashboards this integration's application hosts
+    /// at.
+    ///
+    /// The application is the one the create named or the one the setup created for it
+    /// ([`Self::application_id`]), so the endpoint is that application's own id in the Region
+    /// the application lives in — the Region an existing application's ARN names, and the
+    /// integration's own for one the setup created ([`Self::application_region`]).
+    pub fn application_endpoint(&self) -> String {
+        opensearch_resource_endpoint(
+            &self.application_id(),
+            self.application_region(),
+            OPENSEARCH_SERVICE,
+        )
+    }
+
+    /// The Region this integration's OpenSearch Service application lives in: the one the ARN
+    /// of an existing application names, and the integration's own Region for an application
+    /// the setup created there.
+    fn application_region(&self) -> &str {
+        self.existing_application_arn
+            .as_deref()
+            .and_then(arn_region)
+            .unwrap_or(&self.region)
     }
 
     /// `OpenSearchWorkspace$workspaceId` — the workspace the setup created for this
@@ -454,12 +508,13 @@ impl IntegrationRecord {
     /// OpenSearch Service resources such as the collection, the workspace, and policies" —
     /// which is what `GetIntegration` reports.
     ///
-    /// Every name, id and ARN here is derived from the integration itself, so two reads of
-    /// one integration report the same resources. No endpoint is reported: this emulator
-    /// stands up no OpenSearch Service collection or application, so there is no host a
-    /// client could reach, and `applicationEndpoint` / `collectionEndpoint` are left absent
-    /// rather than filled with one nothing answers on. The status MESSAGE is reported on
-    /// every one of them ([`Self::resource_status`]).
+    /// Every name, id, ARN and ENDPOINT here is derived from the integration itself, so two
+    /// reads of one integration report the same resources. The endpoints of the two resources
+    /// a client addresses — the application that hosts the dashboards and the collection they
+    /// query — are reported beside those resources' ARNs and ids, because an endpoint is part
+    /// of the identity the setup assigns a resource; whether the resource is there YET is what
+    /// its `status` says ([`Self::resource_status`]), and that status is also where the status
+    /// MESSAGE is reported.
     pub fn details(&self) -> crate::ops::types::IntegrationDetails {
         let status = self.resource_status();
         crate::ops::types::IntegrationDetails::openSearchIntegrationDetails(
@@ -469,13 +524,13 @@ impl IntegrationRecord {
                     status: Some(status.clone()),
                 }),
                 application: Some(crate::ops::types::OpenSearchApplication {
-                    application_endpoint: None,
+                    application_endpoint: Some(self.application_endpoint()),
                     application_arn: Some(self.application_arn()),
                     application_id: Some(self.application_id()),
                     status: Some(status.clone()),
                 }),
                 collection: Some(crate::ops::types::OpenSearchCollection {
-                    collection_endpoint: None,
+                    collection_endpoint: Some(self.collection_endpoint()),
                     collection_arn: Some(self.collection_arn()),
                     status: Some(status.clone()),
                 }),
@@ -504,6 +559,40 @@ impl IntegrationRecord {
     }
 }
 
+/// Where a client reaches the OpenSearch Service resource named `resource` that an
+/// integration's setup created in `region`, for the AWS service whose endpoint zone owns it
+/// (`service` is an ARN service segment: [`OPENSEARCH_SERVICE`] for the application that hosts
+/// the dashboards, [`OPENSEARCH_SERVERLESS_SERVICE`] for the collection they query).
+///
+/// THE FORM is the one both endpoint members' `@pattern` admits — `^https://[\.\-_/#:A-Za-z0-9]+\.com$`
+/// (`smithy_query(query="shape",shape="OpenSearchCollectionEndpoint")`), which is also what
+/// `OpenSearchApplicationEndpoint` carries — so the resource's identity goes in the HOST: the
+/// expression ends the whole value at the endpoint zone AWS publishes its own endpoints in
+/// ([`aws_endpoint_zone`]), leaving no path to carry it and admitting no address of a listener
+/// of this process. The host is therefore the resource's own name as the first label of its
+/// service's regional endpoint host, which is the form AWS publishes these two resources at
+/// and the address a client that resolves AWS's own names reaches them by.
+///
+/// The name is folded to ONE DNS label through the shared reading of that
+/// ([`::service_common::data_plane_addressing::dns_label`]), because an integration's name may
+/// carry characters a host label does not (`IntegrationName`'s pattern admits `/` and `#`) and
+/// a resource name is what distinguishes one integration's endpoints from another's.
+fn opensearch_resource_endpoint(resource: &str, region: &str, service: &str) -> String {
+    format!(
+        "https://{}.{region}.{service}.{}",
+        ::service_common::data_plane_addressing::dns_label(resource),
+        aws_endpoint_zone()
+    )
+}
+
+/// The DNS zone AWS publishes its own endpoints in, without the leading dot the shared list of
+/// those zones carries: its first entry, the commercial partition's `dnsSuffix` — the
+/// partition every ARN this emulator mints names. Read off that list rather than spelled again
+/// here, so this service states one zone with every other reader of it.
+fn aws_endpoint_zone() -> &'static str {
+    ::service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES[0].trim_start_matches('.')
+}
+
 /// The `OpenSearchResourceStatus$statusMessage` of a resource whose status needs nothing
 /// added to it: the member is "a message with additional information about the status", and
 /// there is none for a resource the setup simply created, so the message is EMPTY. It is
@@ -517,14 +606,89 @@ pub const NO_STATUS_MESSAGE: &str = "";
 /// ([`short_arn_message`]) rather than a complaint about parsing.
 pub const MIN_ARN_CHARS: usize = 20;
 
+/// The characters an ARN may be long at most, the second half of the length bound an
+/// `Arn`-typed member is held to. RECORDED behavior, like the minimum beside it: the Smithy
+/// model carries no constraint trait on `Arn`, and the constraint set this service's refusals
+/// state for one names this maximum ([`arn_constraint_set`]).
+pub const MAX_ARN_CHARS: usize = 2048;
+
+/// The expression an `Arn`-typed member must satisfy, as the SERVICE publishes it in a
+/// refusal: the characters an ARN is written in, with the trailing `*` a wildcard ARN ends
+/// with.
+///
+/// Stated UNANCHORED, which is the form this service's pattern-rendering rule states for a
+/// published expression (see `requirement` in `crate::service`), and the ONE definition the
+/// refusal's text and the check itself both read — so the constraint a request is held to
+/// cannot drift from the constraint the refusal states. RECORDED behavior: the model declares
+/// no `@pattern` on `Arn`.
+pub const ARN_PATTERN: &str = r"[\w#+=/:,.@-]*\*?";
+
+/// [`ARN_PATTERN`] compiled once, ANCHORED: a `@pattern` is a requirement of the whole value,
+/// so what the published expression admits is a value it matches end to end.
+static ARN_EXPRESSION: std::sync::LazyLock<::regex::Regex> = std::sync::LazyLock::new(|| {
+    ::regex::Regex::new(&format!("^(?:{ARN_PATTERN})$"))
+        .expect("the published Arn expression compiles")
+});
+
+/// The whole constraint set this service holds an `Arn`-typed member to, as the requirement
+/// sentences a clause states them in: the maximum length, the minimum length and the
+/// expression, in that order.
+///
+/// THE ORDER is AWS's own for this member's set, and the sentences are the shared ones every
+/// constraint of that class is worded with
+/// ([`::service_common::validation_message::requirement`]), so a clause here cannot word a
+/// bound differently from one the validating walk raised. The SET is what a clause at a
+/// COLLECTION of ARNs states ([`arn_element_set`]) — a collection's clause states what its
+/// elements have to satisfy, not what one element happened to break — while a clause at a
+/// single ARN states the one constraint that value failed ([`arn_requirement`]).
+pub fn arn_constraint_set() -> Vec<String> {
+    use ::aws_smithy_schema_server::constraints::ViolationKind;
+    use ::service_common::validation_message::requirement;
+    vec![
+        requirement(ViolationKind::MaxLength(as_bound(MAX_ARN_CHARS))),
+        requirement(ViolationKind::MinLength(as_bound(MIN_ARN_CHARS))),
+        requirement(ViolationKind::Pattern(ARN_PATTERN.to_string())),
+    ]
+}
+
+/// A character count as a `@length` bound is stated, which is how the sentence for it is
+/// rendered.
+fn as_bound(characters: usize) -> i64 {
+    i64::try_from(characters).unwrap_or(i64::MAX)
+}
+
+/// The requirement the value of an `Arn`-typed member FAILED — the first one of
+/// [`arn_constraint_set`] it breaks, which is the single requirement a clause at that member
+/// states — or `None` for a value inside every constraint of the set.
+pub fn arn_requirement(value: &str) -> Option<String> {
+    use ::aws_smithy_schema_server::constraints::ViolationKind;
+    use ::service_common::validation_message::requirement;
+    let characters = value.chars().count();
+    if characters > MAX_ARN_CHARS {
+        return Some(requirement(ViolationKind::MaxLength(as_bound(
+            MAX_ARN_CHARS,
+        ))));
+    }
+    if characters < MIN_ARN_CHARS {
+        return Some(requirement(ViolationKind::MinLength(as_bound(
+            MIN_ARN_CHARS,
+        ))));
+    }
+    (!ARN_EXPRESSION.is_match(value))
+        .then(|| requirement(ViolationKind::Pattern(ARN_PATTERN.to_string())))
+}
+
 /// The refusal for an ARN-typed member shorter than the [`MIN_ARN_CHARS`] an ARN takes:
 /// the one-violation constraint clause naming the member and that minimum, which is what
 /// tooling reading a refusal parses out of it. `None` for a value long enough to be an ARN.
 pub fn short_arn_message(member: &str, value: &str) -> Option<String> {
+    use ::aws_smithy_schema_server::constraints::ViolationKind;
     (value.chars().count() < MIN_ARN_CHARS).then(|| {
         validation_message(
             member,
-            &format!("Member must have length greater than or equal to {MIN_ARN_CHARS}"),
+            &::service_common::validation_message::requirement(ViolationKind::MinLength(
+                as_bound(MIN_ARN_CHARS),
+            )),
         )
     })
 }
@@ -750,20 +914,18 @@ fn config_member_path(member: &str) -> String {
 
 /// The constraint set a clause states for the ELEMENTS of a list of ARNs: a collection's
 /// clause states what its elements have to satisfy rather than what one element happened to
-/// break, so the requirement is nested inside the element-set wrapper every service words
-/// one with.
+/// break, so the whole set is nested inside the element-set wrapper every service words one
+/// with.
 ///
-/// The set is the bound this service is KNOWN to hold an ARN member to — the characters an
-/// ARN takes at least ([`MIN_ARN_CHARS`]), which its recorded refusals state. No further
-/// requirement is stated: a bound nothing records is a bound this service would be inventing.
+/// The set is the one this service holds every `Arn`-typed member to ([`arn_constraint_set`]),
+/// in the order that function states it, so the requirements a list member's clause lists are
+/// the requirements a single ARN member is judged by one at a time.
 fn arn_element_set() -> String {
-    ::service_common::validation_message::element_set_requirement(&[format!(
-        "Member must have length greater than or equal to {MIN_ARN_CHARS}"
-    )])
+    ::service_common::validation_message::element_set_requirement(&arn_constraint_set())
 }
 
 /// The refusal for a `PutIntegration` configuration whose members break the constraints the
-/// SERVICE holds them to: the length an ARN takes on every `Arn`-typed member — an ARN
+/// SERVICE holds them to: the constraint set of an ARN on every `Arn`-typed member — an ARN
 /// member is a constrained string before it is a reference to a resource — and the retention
 /// bounds on `retentionDays`.
 ///
@@ -775,15 +937,13 @@ fn arn_element_set() -> String {
 pub fn config_constraint_envelope(
     config: &crate::ops::types::OpenSearchResourceConfig,
 ) -> Option<String> {
-    let arn_length = format!("Member must have length greater than or equal to {MIN_ARN_CHARS}");
-    let short = |value: &str| value.chars().count() < MIN_ARN_CHARS;
     let mut refused: Vec<(&str, String)> = Vec::new();
     // `dashboardViewerPrincipals` is a LIST of ARNs: its clause states its ELEMENTS'
-    // constraint set, once however many of them failed it.
+    // constraint set, once however many of them failed however many of its constraints.
     if config
         .dashboard_viewer_principals
         .iter()
-        .any(|principal| short(principal))
+        .any(|principal| arn_requirement(principal).is_some())
     {
         refused.push(("dashboardViewerPrincipals", arn_element_set()));
     }
@@ -795,8 +955,8 @@ pub fn config_constraint_envelope(
         ),
         ("kmsKeyArn", config.kms_key_arn.as_deref()),
     ] {
-        if value.is_some_and(short) {
-            refused.push((member, arn_length.clone()));
+        if let Some(requirement) = value.and_then(arn_requirement) {
+            refused.push((member, requirement));
         }
     }
     if let Some(requirement) = retention_days_requirement(config.retention_days) {

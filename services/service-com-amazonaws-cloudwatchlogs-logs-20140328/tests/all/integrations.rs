@@ -420,16 +420,39 @@ async fn a_created_integration_is_reported_back_exactly_as_it_was_configured() {
                 expected_resource_status(&status)
             );
         }
-        // No endpoint is reported: this emulator stands up no OpenSearch Service collection
-        // or application, so there is no host a client could reach.
-        for (resource, key) in [
-            ("application", "applicationEndpoint"),
-            ("collection", "collectionEndpoint"),
-        ] {
+        // The two resources a client ADDRESSES — the application that hosts the dashboards and
+        // the collection they query — report the endpoint they are reached at: the resource's
+        // own identity as the first label of a host in its own service's regional endpoint
+        // zone, in the form `OpenSearchApplicationEndpoint` / `OpenSearchCollectionEndpoint`
+        // admit.
+        let label = ::service_common::data_plane_addressing::dns_label;
+        // (the resource, the member carrying its endpoint, the endpoint expected there)
+        let addressed: [(&str, &str, String); 2] = [
+            (
+                "application",
+                "applicationEndpoint",
+                format!(
+                    "https://{}.{REGION}.opensearch.amazonaws.com",
+                    label(&expected_application_id)
+                ),
+            ),
+            (
+                "collection",
+                "collectionEndpoint",
+                format!(
+                    "https://{}.{REGION}.aoss.amazonaws.com",
+                    label(&format!("{}-collection", row.name))
+                ),
+            ),
+        ];
+        for (resource, key, expected) in addressed {
+            let reported_resource = details.get(resource).unwrap_or_else(|| {
+                panic!("case {case:?}: the details carry {resource}, got {details}")
+            });
             assert_eq!(
-                details.get(resource).and_then(|reported| reported.get(key)),
-                None,
-                "case {case:?}: no {resource}.{key} is reported, got {details}"
+                member(reported_resource, key),
+                Some(expected.as_str()),
+                "case {case:?}: expected {resource}.{key} {expected:?}, got {reported_resource}"
             );
         }
 

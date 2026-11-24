@@ -212,9 +212,7 @@ async fn a_read_of_one_integration_carries_the_members_its_wire_response_carries
             );
         }
         // The collection's own name, which is the resource segment of its ARN, so the two
-        // cannot name two collections. No ENDPOINT is reported for the application or the
-        // collection: this emulator stands up neither resource, so there is no address a
-        // client could open.
+        // cannot name two collections.
         let collection = details
             .get("collection")
             .unwrap_or_else(|| panic!("case {case:?}: expected the collection, got {details}"));
@@ -229,14 +227,23 @@ async fn a_read_of_one_integration_carries_the_members_its_wire_response_carries
             "case {case:?}: the name and the ARN must name one collection, got \
              {collection_arn:?}"
         );
+        // Both resources a client addresses report the endpoint it reaches them at, whatever
+        // status the clock has them in: the endpoint is part of the identity the setup gave
+        // the resource, and `status` is what says whether it is there yet.
         for (resource, key) in [
             ("application", "applicationEndpoint"),
             ("collection", "collectionEndpoint"),
         ] {
-            assert_eq!(
-                details.get(resource).and_then(|reported| reported.get(key)),
-                None,
-                "case {case:?}: no {resource}.{key} is reported, got {details}"
+            let endpoint = details
+                .get(resource)
+                .and_then(|reported| member(reported, key))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected {resource}.{key}, got {details}")
+                });
+            assert!(
+                endpoint.starts_with("https://") && endpoint.ends_with(".com"),
+                "case {case:?}: expected {resource}.{key} in the modelled endpoint form, got \
+                 {endpoint:?}"
             );
         }
     }
@@ -415,6 +422,15 @@ fn arn_length_requirement() -> String {
     "Member must have length greater than or equal to 20".to_string()
 }
 
+/// The whole constraint set a clause at a LIST of ARNs states, in the order AWS states it.
+fn arn_element_set() -> String {
+    format!(
+        "Member must satisfy constraint: [Member must have length less than or equal to 2048, \
+         {}, Member must satisfy regular expression pattern: [\\w#+=/:,.@-]*\\*?]",
+        arn_length_requirement()
+    )
+}
+
 /// A `PutIntegration` body whose OpenSearch configuration is `config`.
 fn put_config_body(name: &str, config: Value) -> Value {
     json!({
@@ -431,7 +447,7 @@ fn put_config_body(name: &str, config: Value) -> Value {
 #[tokio::test]
 async fn every_configuration_member_outside_a_constraint_is_counted_in_one_envelope() {
     let role = role_arn();
-    let element_set = format!("Member must satisfy constraint: [{}]", arn_length_requirement());
+    let element_set = arn_element_set();
     // (case, the configuration, the clauses the refusal must state in order)
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
         (
