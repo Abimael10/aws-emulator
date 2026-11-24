@@ -168,8 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
-        // A deleted resource leaves no tags behind, so the shared tag directory is
-        // resolved before the delete and every deleted ARN's entry dropped with it.
+        // A deleted resource leaves no tags behind, and its ARN stops addressing a resource
+        // at all: both facts are recorded in the family's shared ARN-keyed directory, which
+        // is resolved before the delete.
         let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
             DeleteAppInstanceErrorModeled::ServiceFailureException(ServiceFailureException {
                 code: Some("ServiceFailure".to_string()),
@@ -216,12 +217,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
-        // The cascade reaches the tags too: the instance's own and those of every child
-        // it took with it.
+        // The cascade reaches the tags too: the instance's own and those of every child it
+        // took with it. Each of those ARNs is WITHDRAWN rather than merely forgotten — the
+        // record carries the class and the wording this service refuses a tagging call
+        // naming it with — because the member serving the next tagging call may be a sibling
+        // that cannot read this store, and would otherwise take the ARN at its word and
+        // report a deleted resource as a live, untagged one.
         let mut tags = tag_directory.lock();
-        tags.forget(&input.app_instance_arn);
-        for child_arn in removed.users.keys().chain(removed.bots.keys()) {
-            tags.forget(child_arn);
+        // Every ARN this delete speaks for: the instance, the children it just removed, and
+        // the children an EARLIER delete of their own already withdrew — those hang under
+        // this instance, so what they earn now is the refusal the instance's deletion earns
+        // and not the one they carried while their parent was live.
+        let mut withdrawn: ::std::collections::BTreeSet<String> = removed
+            .users
+            .keys()
+            .chain(removed.bots.keys())
+            .cloned()
+            .collect();
+        withdrawn.insert(input.app_instance_arn.clone());
+        // Restated only for the ARNs THIS service owns: a sibling's resource nests under the
+        // same app instance (Chime SDK Messaging's `…/channel/<id>`), and the class and the
+        // wording of a withdrawal are its OWNER's, so a record this service did not write is
+        // left exactly as the member that wrote it stated it.
+        withdrawn.extend(
+            tags.withdrawn_at_or_under(&input.app_instance_arn)
+                .into_iter()
+                .filter(|arn| crate::state::names_identity_resource(arn)),
+        );
+        for arn in &withdrawn {
+            let (class, message) = crate::state::withdrawal_for(&state, arn);
+            tags.withdraw(arn, class, message);
         }
         drop(tags);
 

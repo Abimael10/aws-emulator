@@ -266,6 +266,41 @@ impl ChimeTagDirectory {
             })
     }
 
+    /// Drop any withdrawal recorded for `resource_arn`, so the ARN reads as a live one
+    /// again. Answers whether a withdrawal was held.
+    ///
+    /// The counterpart of [`withdraw`](Self::withdraw), called by the owning member when it
+    /// CREATES a resource under an ARN: a member that mints an ARN from identifiers the
+    /// caller chose hands the same ARN out again after a delete and a re-create, and the
+    /// resource that ARN names then exists, so the record of the earlier deletion must not
+    /// outlive it and have a sibling refuse a tagging call for a live resource.
+    pub fn readmit(&mut self, resource_arn: &str) -> bool {
+        self.withdrawn_order.retain(|held| held != resource_arn);
+        self.withdrawn.remove(resource_arn).is_some()
+    }
+
+    /// The withdrawn ARNs that are `prefix` itself or hang UNDER it — `<prefix>/…`, the way
+    /// an AWS ARN nests a child resource inside its parent's resource field.
+    ///
+    /// What a member deleting a resource that OWNS others reads: the refusal it serves for a
+    /// child it withdrew EARLIER changes when the parent goes too (the child is now gone
+    /// because its parent is), so the owner restates those records
+    /// ([`withdraw`](Self::withdraw)) instead of leaving a sibling answering the refusal the
+    /// child earned while its parent was live.
+    #[must_use]
+    pub fn withdrawn_at_or_under(&self, prefix: &str) -> Vec<String> {
+        self.withdrawn
+            .keys()
+            .filter(|held| {
+                held.as_str() == prefix
+                    || held
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// How many resources the directory currently holds tags for.
     pub fn tagged_resources(&self) -> usize {
         self.tags.len()
@@ -520,6 +555,95 @@ mod tests {
                 "case {case:?}: an ARN no member withdrew must not be refused"
             );
         }
+    }
+
+    #[test]
+    fn creating_a_resource_again_under_a_withdrawn_arn_readmits_it() {
+        // A member whose ARNs carry identifiers the caller chose hands the SAME ARN out
+        // again after a delete and a re-create, so the record of the earlier deletion has to
+        // be released by the create: otherwise a sibling serving a tagging call would refuse
+        // a resource that exists.
+        let mut directory = ChimeTagDirectory::default();
+        // Rows: whether the re-created resource carries tags, and which class the earlier
+        // delete recorded.
+        let rows = [
+            (
+                "a resource re-created with tags after a revoking delete",
+                "arn:aws:chime:us-east-1:000000000000:app-instance/ai1/user/u1",
+                vec![("env", "prod")],
+                WithdrawnClass::Forbidden,
+            ),
+            (
+                "a resource re-created with no tags after an invalid-request delete",
+                "arn:aws:chime:eu-west-1:000000000000:app-instance/ai2/bot/b1",
+                Vec::new(),
+                WithdrawnClass::InvalidRequest,
+            ),
+        ];
+
+        for (case, arn, tagged, class) in rows {
+            directory.withdraw(arn, class, "gone");
+            assert!(
+                directory.readmit(arn),
+                "case {case:?}: expected the readmission to report the withdrawal it released"
+            );
+            directory.tag(arn, pairs(&tagged));
+            assert_eq!(
+                directory.withdrawn_refusal(arn),
+                None,
+                "case {case:?}: expected a re-created resource to read as live, got {:?}",
+                directory.withdrawn_refusal(arn)
+            );
+            assert_eq!(
+                directory.tags_of(arn),
+                pairs(&tagged),
+                "case {case:?}: expected the tags the re-create was given"
+            );
+            assert!(
+                !directory.readmit(arn),
+                "case {case:?}: expected a second readmission to release nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_withdrawn_arns_at_or_under_a_parent_are_the_ones_its_deletion_speaks_for() {
+        let mut directory = ChimeTagDirectory::default();
+        let parent = "arn:aws:chime:us-east-1:000000000000:app-instance/ai1";
+        // Rows span what the reading has to separate: the parent's own ARN, children nested
+        // under it under different resource segments, a DIFFERENT parent whose ARN merely
+        // starts with the same text, and another member's resource altogether.
+        let held = [
+            parent.to_string(),
+            format!("{parent}/user/u1"),
+            format!("{parent}/bot/b1"),
+            format!("{parent}-other/user/u2"),
+            "arn:aws:chime:us-east-1:000000000000:meeting/m1".to_string(),
+        ];
+        for arn in &held {
+            directory.withdraw(arn, WithdrawnClass::InvalidRequest, "gone");
+        }
+
+        let mut under = directory.withdrawn_at_or_under(parent);
+        under.sort();
+        assert_eq!(
+            under,
+            vec![
+                parent.to_string(),
+                format!("{parent}/bot/b1"),
+                format!("{parent}/user/u1"),
+            ],
+            "case the withdrawn ARNs of one parent: expected the parent and its nested \
+             children only, got {under:?}"
+        );
+        assert!(
+            directory
+                .withdrawn_at_or_under("arn:aws:chime:us-east-1:000000000000:app-instance/ai9")
+                .is_empty(),
+            "case a parent nothing was withdrawn under: expected none, got {:?}",
+            directory
+                .withdrawn_at_or_under("arn:aws:chime:us-east-1:000000000000:app-instance/ai9")
+        );
     }
 
     #[test]

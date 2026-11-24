@@ -339,8 +339,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &fingerprint,
         );
         name_directory.lock().register(&arn, &input.name);
-        if !tags.is_empty() {
-            tag_directory.lock().tag(&arn, tags);
+        // The user ARN carries the id the caller chose, so this create can mint an ARN a
+        // delete of the same id earlier WITHDREW in the shared directory. The resource that
+        // ARN names exists again, so the withdrawal is released here — without that, a
+        // sibling serving one of the family's shared tagging routes would keep refusing a
+        // tagging call for a live user.
+        {
+            let mut tag_directory = tag_directory.lock();
+            tag_directory.readmit(&arn);
+            if !tags.is_empty() {
+                tag_directory.tag(&arn, tags);
+            }
         }
 
         Ok(CreateAppInstanceUserOutput {

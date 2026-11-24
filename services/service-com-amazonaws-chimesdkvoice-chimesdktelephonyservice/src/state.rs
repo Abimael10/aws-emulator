@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    BadRequestException, NotFoundException, ResourceLimitExceededException,
+    BadRequestException, ForbiddenException, NotFoundException, ResourceLimitExceededException,
     ServiceFailureException, VoiceConnector, VoiceConnectorGroup, VoiceConnectorItem,
 };
 
@@ -108,6 +108,18 @@ pub const MAX_VOICE_CONNECTOR_ITEMS_PER_GROUP: usize = 3;
 pub fn bad_request(message: impl Into<String>) -> BadRequestException {
     BadRequestException {
         code: Some("BadRequest".to_string()),
+        message: Some(message.into()),
+    }
+}
+
+/// `ForbiddenException`'s payload: the request is one this caller may permanently not make.
+///
+/// The `message` is the SENTENCE the refusal carries, which for a tagging call naming a
+/// resource another family member deleted is that member's own wording, read from the shared
+/// directory: the class belongs to the owner of the resource, the shape to this model.
+pub fn forbidden(message: impl Into<String>) -> ForbiddenException {
+    ForbiddenException {
+        code: Some("Forbidden".to_string()),
         message: Some(message.into()),
     }
 }

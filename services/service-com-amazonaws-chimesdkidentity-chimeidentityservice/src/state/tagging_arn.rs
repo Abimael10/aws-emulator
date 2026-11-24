@@ -19,6 +19,13 @@
 //! * The shared directory carries the class and the wording the member that OWNS a
 //!   withdrawn resource serves for a tagging call naming it, because this service serves the
 //!   tagging routes for every member's resource and cannot read a sibling's store.
+//!
+//! The same rule read the other way round is what this service's own deletes PUBLISH:
+//! [`withdrawal_for`] answers, for an ARN this service has just stopped holding, the class
+//! and the wording a tagging call naming it earns here, and a delete records that pair in
+//! the shared directory. Both directions are then one statement of the rule, so the refusal
+//! a sibling serves for one of this service's deleted ARNs is the refusal this service
+//! serves for it.
 
 use ::service_common::chime_tags::{ChimeTagDirectory, WithdrawnClass};
 
@@ -62,6 +69,50 @@ pub enum TaggingArnRefusal {
     },
 }
 
+/// The sentence a refusal of an ARN this service holds no resource for carries.
+///
+/// One function because it is answered twice: to the caller of a tagging call this service
+/// serves ([`tagging_arn_refusal`]), and to the shared directory when a delete withdraws the
+/// ARN ([`withdrawal_for`]).
+fn absent_resource_message(resource_arn: &str) -> String {
+    format!("resource {resource_arn} does not exist")
+}
+
+/// What a delete of `resource_arn` records in the family's shared directory: the class and
+/// the wording THIS service answers a tagging call naming that ARN with, now that it holds
+/// no resource under it.
+///
+/// A delete withdraws an ARN rather than only dropping its tags because the member that
+/// serves the next tagging call naming it may be a sibling, which cannot read this store:
+/// without the record it would take the ARN at its word and report a deleted resource as a
+/// live, untagged one. The pair comes from the same [`super::UnresolvedArn`] reading the
+/// own-store half of [`tagging_arn_refusal`] answers with, so what a sibling serves and what
+/// this service serves for one of its own deleted ARNs cannot drift apart.
+///
+/// Call it with the store AFTER the removal, so the ARN already reads as one this service
+/// does not hold.
+pub fn withdrawal_for(
+    store: &ComAmazonawsChimesdkidentityChimeidentityserviceState,
+    resource_arn: &str,
+) -> (WithdrawnClass, String) {
+    match store.unresolved_arn(resource_arn) {
+        // The `AppInstance` this ARN belongs to is gone, so a tagging call naming it — or
+        // naming one of the children the delete cascaded away — is a request this caller may
+        // no longer make.
+        UnresolvedArn::DeletedAppInstance => (
+            WithdrawnClass::Forbidden,
+            FORBIDDEN_REQUEST_MESSAGE.to_string(),
+        ),
+        // A child deleted on its own, under an `AppInstance` that is still live: nothing
+        // this service holds carries the ARN any more, which is an invalid request rather
+        // than a revoked one.
+        UnresolvedArn::NeverExisted => (
+            WithdrawnClass::InvalidRequest,
+            absent_resource_message(resource_arn),
+        ),
+    }
+}
+
 /// Why a tagging call may not address `resource_arn`, or `None` when it may.
 ///
 /// Reads only: whichever way it answers, neither store is changed.
@@ -90,7 +141,7 @@ pub fn tagging_arn_refusal(
             // carrying the `NotFound` error code.
             UnresolvedArn::NeverExisted => TaggingArnRefusal::BadRequest {
                 code: NOT_FOUND_CODE,
-                message: format!("resource {resource_arn} does not exist"),
+                message: absent_resource_message(resource_arn),
             },
         });
     }

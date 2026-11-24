@@ -171,8 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
-        // A deleted resource leaves no tags behind, so the shared tag directory is
-        // resolved before the delete and the entry dropped with the resource.
+        // A deleted resource leaves no tags behind, and its ARN stops addressing a resource
+        // at all: both facts are recorded in the family's shared ARN-keyed directory, which
+        // is resolved before the delete.
         let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
             DeleteAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
                 code: Some("ServiceFailure".to_string()),
@@ -218,7 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        tag_directory.lock().forget(&input.app_instance_bot_arn);
+        // The ARN is WITHDRAWN rather than merely forgotten — the record carries the class
+        // and the wording this service refuses a tagging call naming it with — because the
+        // member serving the next tagging call may be a sibling that cannot read this store,
+        // and would otherwise take the ARN at its word and report a deleted resource as a
+        // live, untagged one.
+        let (class, message) = crate::state::withdrawal_for(&state, &input.app_instance_bot_arn);
+        tag_directory
+            .lock()
+            .withdraw(&input.app_instance_bot_arn, class, message);
         name_directory.lock().forget(&input.app_instance_bot_arn);
 
         Ok(DeleteAppInstanceBotOutput)

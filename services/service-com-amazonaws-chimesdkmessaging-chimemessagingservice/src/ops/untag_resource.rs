@@ -186,6 +186,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An ARN whose OWNING member has deleted the resource it named is refused with that
+        // member's own class and wording: the family's shared tagging routes are served by
+        // whichever member the request reached, which cannot read a sibling's store, so the
+        // fact that the resource is gone is read from the shared directory its owner
+        // recorded it in, and each class is mapped onto the shape THIS model declares.
+        let withdrawn = directory
+            .lock()
+            .withdrawn_refusal(&input.resource_arn)
+            .map(|refusal| (refusal.class, refusal.message.to_string()));
+        if let Some((class, message)) = withdrawn {
+            return Err(match class {
+                ::service_common::chime_tags::WithdrawnClass::InvalidRequest => {
+                    UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                        code: Some("BadRequest".to_string()),
+                        message: Some(message),
+                    })
+                }
+                ::service_common::chime_tags::WithdrawnClass::Forbidden => {
+                    UntagResourceErrorModeled::ForbiddenException(ForbiddenException {
+                        code: Some("Forbidden".to_string()),
+                        message: Some(message),
+                    })
+                }
+            }
+            .into());
+        }
 
         // Untagging is stated by what the resource carries AFTERWARDS: a key the
         // resource does not have is nothing to remove, so repeating the call answers the
