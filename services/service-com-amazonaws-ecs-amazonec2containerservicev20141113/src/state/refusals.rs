@@ -253,7 +253,7 @@ pub const CAPACITY_PROVIDER_MISSING_MESSAGE: &str =
     "The specified capacity provider does not exist. Specify a valid name or ARN and try \
      again.";
 
-/// The `MISSING` `Failure` a batch read reports for an identifier that resolves to no
+/// The `MISSING` `Failure` a batch READ reports for an identifier that resolves to no
 /// resource of `resource_type`, naming the identifier AS THE CALLER SENT IT: the value
 /// itself when it is already an ARN, otherwise that id alone under the resource type.
 ///
@@ -263,13 +263,78 @@ pub const CAPACITY_PROVIDER_MISSING_MESSAGE: &str =
 /// identifies it account-wide by itself, so no cluster is inserted into the ARN the
 /// failure echoes. That is what lets a caller match each failure entry back to the
 /// identifier it sent.
+///
+/// `UpdateTaskProtection` names the task it could not resolve by that task's OWN ID
+/// instead, whichever form the entry took ([`unqualified_task_failure`]) — recorded
+/// behavior of each surface, which is why the two constructions are separate.
 pub fn unresolved_failure(region: &str, resource_type: &str, reference: &str) -> Failure {
-    let arn = if reference.starts_with("arn:") {
+    let reference = reference.trim();
+    let arn = if is_arn(reference) {
         reference.to_string()
     } else {
         ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("{resource_type}/{reference}"))
     };
     missing_failure(&arn)
+}
+
+/// The `MISSING` [`Failure`] `UpdateTaskProtection` reports for a `tasks` entry that
+/// resolves to no task of the cluster: the task's own id alone under the task resource type
+/// ([`unqualified_resource_arn`]), whichever of the member's two forms — "a list of up to
+/// 10 task IDs or full ARN entries" — the entry spelled it in.
+///
+/// The cluster segment of a task ARN names the cluster a task is REGISTERED IN, which only
+/// a stored task has; a task that resolves to nothing is registered nowhere, so the entry
+/// names it account-wide by itself even where the request spelled a cluster-qualified ARN.
+/// Recorded behavior of this operation, and the same reading a task set that exists in no
+/// service is reported under ([`unresolved_task_set_failure`]); the batch READS echo the
+/// identifier they were given instead ([`unresolved_failure`]).
+pub fn unqualified_task_failure(region: &str, reference: &str) -> Failure {
+    missing_failure(&unqualified_resource_arn(
+        region,
+        TASK_RESOURCE_TYPE,
+        reference,
+    ))
+}
+
+/// The ARN a resource of `resource_type` that exists in NO cluster is named by: its own id
+/// alone under the resource type (`arn:aws:ecs:<region>:<account>:<type>/<id>`), with no
+/// cluster segment in the resource part.
+///
+/// `reference` is read as the member it came from documents it — "the id or full ARN" — so
+/// an ARN of this type contributes the id its resource path ENDS with and is never wrapped
+/// in another ARN, and a value that is not an ARN at all is the id it already is. A value
+/// that IS an ARN but of some other resource names no resource of this type to report an
+/// id of, so it is reported exactly as it was sent.
+pub fn unqualified_resource_arn(region: &str, resource_type: &str, reference: &str) -> String {
+    let reference = reference.trim();
+    match resource_id_from_reference(resource_type, reference) {
+        Some(id) => ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("{resource_type}/{id}")),
+        None => reference.to_string(),
+    }
+}
+
+/// The ID of the resource a reference of `resource_type` names: the value as given when it
+/// is not an ARN, the last segment of the ARN's resource path when it is one of this type —
+/// the resource's own id, after whatever scope the path puts in front of it
+/// (`<type>/<id>` and `<type>/<cluster>/<id>` both name the id they end with) — and `None`
+/// for an ARN of another resource, which names no id of this type.
+///
+/// Read through the project's ONE parse of a caller-supplied ARN (`service_common::arn`),
+/// the same reading [`cluster_from_scoped_arn`] gives the cluster of such an ARN.
+pub fn resource_id_from_reference(resource_type: &str, reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if !is_arn(reference) {
+        return Some(reference.to_string());
+    }
+    let path = ::service_common::arn::resource_id_of_type(reference, resource_type)?;
+    Some(path.rsplit('/').next().unwrap_or(path).to_string())
+}
+
+/// Whether `reference` is spelled as an ARN rather than as a resource's own name or id,
+/// through the project's one parse of a caller-supplied ARN — the same reading every other
+/// reference question of this service makes.
+fn is_arn(reference: &str) -> bool {
+    ::service_common::arn::parse(reference).is_some()
 }
 
 /// Check a requested `launch_type` against the launch types `definition` supports,

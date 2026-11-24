@@ -416,11 +416,14 @@ async fn the_same_identifier_in_this_region_is_resolved_as_the_identifier_it_is(
 }
 
 /// The failure entry a protection call reports for ONE reference, with the reference's own
-/// spelling and the ARN the entry is expected to carry.
+/// spelling and the ARN each of the two operations names it under: the READ echoes the entry
+/// as sent, and the WRITE names the task by its own id — recorded behavior of each, pinned
+/// row by row in [`crate::task_protection_failure_identifiers`].
 struct FailureRow {
     case: &'static str,
     reference: String,
-    expected_arn: String,
+    read_arn: String,
+    written_arn: String,
     expected_reason: &'static str,
 }
 
@@ -442,13 +445,15 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
         FailureRow {
             case: "a task id nothing holds",
             reference: TASK_ID.to_string(),
-            expected_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
+            read_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
+            written_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
             expected_reason: MISSING,
         },
         FailureRow {
             case: "an unqualified task ARN nothing holds",
             reference: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
-            expected_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
+            read_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
+            written_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
             expected_reason: MISSING,
         },
         FailureRow {
@@ -456,15 +461,19 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
             reference: format!(
                 "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{CLUSTER}/{TASK_ID}"
             ),
-            expected_arn: format!(
+            read_arn: format!(
                 "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{CLUSTER}/{TASK_ID}"
             ),
+            // A task that resolves to nothing is registered in no cluster, so the WRITE
+            // names it by its own id however the entry spelled it.
+            written_arn: format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{TASK_ID}"),
             expected_reason: MISSING,
         },
         FailureRow {
             case: "a standalone task this cluster holds",
             reference: running.clone(),
-            expected_arn: running.clone(),
+            read_arn: running.clone(),
+            written_arn: running.clone(),
             expected_reason: TASK_NOT_VALID,
         },
     ];
@@ -473,9 +482,12 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
         for operation in ["GetTaskProtection", "UpdateTaskProtection"] {
             let case = format!("{operation}: {}", row.case);
             let mut request = json!({ "cluster": CLUSTER, "tasks": [row.reference.clone()] });
-            if operation == "UpdateTaskProtection" {
+            let expected_arn = if operation == "UpdateTaskProtection" {
                 request["protectionEnabled"] = json!(true);
-            }
+                row.written_arn.clone()
+            } else {
+                row.read_arn.clone()
+            };
             let body = ok(&router, operation, request, &case).await;
             let failures = list(&body, "failures", &case);
             assert_eq!(
@@ -489,9 +501,8 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
                     string(&failures[0], "arn", &case).as_str(),
                     string(&failures[0], "reason", &case).as_str()
                 ),
-                (row.expected_arn.as_str(), row.expected_reason),
-                "case {case:?}: expected the failure to name {:?}, got {body}",
-                row.expected_arn
+                (expected_arn.as_str(), row.expected_reason),
+                "case {case:?}: expected the failure to name {expected_arn:?}, got {body}"
             );
             assert!(
                 list(&body, "protectedTasks", &case).is_empty(),

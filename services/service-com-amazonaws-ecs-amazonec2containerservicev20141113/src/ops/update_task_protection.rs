@@ -329,15 +329,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     protected_tasks.push(task.protection_view());
                 }
-                // An entry that resolves to no task is reported under the identifier the
-                // request sent, NOT under the cluster-qualified ARN a stored task of that
-                // id would carry, so a caller can match the entry back to what it asked
-                // about ([`crate::state::unresolved_failure`]).
-                None => failures.push(crate::state::unresolved_failure(
-                    &region,
-                    crate::state::TASK_RESOURCE_TYPE,
-                    reference,
-                )),
+                // An entry that resolves to no task is reported under the TASK's own id,
+                // not under the cluster-qualified ARN a stored task of that id would carry
+                // and not under a cluster-qualified ARN the entry itself spelled: a task
+                // this call could not resolve is registered in no cluster, so it is named
+                // account-wide by itself ([`crate::state::unqualified_task_failure`]).
+                None => failures.push(crate::state::unqualified_task_failure(&region, reference)),
             }
         }
 

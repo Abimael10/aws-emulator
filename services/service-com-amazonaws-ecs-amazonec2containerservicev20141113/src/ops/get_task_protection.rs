@@ -279,7 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // An entry that resolves to no task is reported under the identifier the
                 // request sent, NOT under the cluster-qualified ARN a stored task of that
                 // id would carry, so a caller can match the entry back to what it asked
-                // about ([`crate::state::unresolved_failure`]).
+                // about ([`crate::state::unresolved_failure`]). This READ echoes that
+                // identifier where `UpdateTaskProtection` names the task's own id
+                // ([`crate::state::unqualified_task_failure`]) — recorded behavior of each.
                 None => failures.push(crate::state::unresolved_failure(
                     &region,
                     crate::state::TASK_RESOURCE_TYPE,
