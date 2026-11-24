@@ -549,13 +549,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model a patch is applied to carries nothing at that pointer for an operation
         // to update in place: Cloud Control API admits only the operation that SETS such a
         // property and refuses every other one naming it — whatever the stored model happens
-        // to carry, which is what makes this too a verdict on the DOCUMENT.
+        // to carry, which is what makes this too a verdict on the DOCUMENT. A schema may
+        // declare a MEMBER of a structured property write-only, so the document's pointers
+        // are matched against the schema's own ([`crate::state::names_write_only`]) rather
+        // than by the property that holds them.
         let write_only = crate::state::write_only_properties(&input.type_name);
-        let updated = crate::state::properties_patched_without_add(&patch);
+        let updated = crate::state::pointers_patched_without_add(&patch);
         let write_only_offending: Vec<&str> = write_only
             .iter()
             .copied()
-            .filter(|property| updated.contains(*property))
+            .filter(|pointer| {
+                updated
+                    .iter()
+                    .any(|updated| crate::state::names_write_only(updated, pointer))
+            })
             .collect();
         if !write_only_offending.is_empty() {
             return Err(validation(crate::state::write_only_message(

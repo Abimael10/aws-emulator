@@ -56,6 +56,15 @@ pub(crate) const CLOUDFORMATION_SIGNING_NAME: &str = "cloudformation";
 /// The API version an `awsQuery` call of that service carries, as its model declares it.
 pub(crate) const CLOUDFORMATION_API_VERSION: &str = "2010-05-15";
 
+/// The sigv4 signing name of the AWS Lambda service, which OWNS the functions
+/// `AWS::Lambda::Function` names — and creates, changes and removes them through its own
+/// API.
+pub(crate) const LAMBDA_SIGNING_NAME: &str = "lambda";
+
+/// The endpoint host a request to that service is addressed to: the REGIONAL one its own
+/// REST surface is served on.
+pub(crate) const LAMBDA_ENDPOINT_HOST: &str = "lambda.us-east-1.amazonaws.com";
+
 /// The sigv4 signing name of the Amazon SQS service, whose own store holds the queues
 /// `AWS::SQS::Queue` names.
 pub(crate) const SQS_SIGNING_NAME: &str = "sqs";
@@ -349,6 +358,66 @@ impl Emulator {
             "{action}: expected HTTP 200 from CloudFormation, got {status} with body {body}"
         );
         body
+    }
+
+    /// One emulator with the service that OWNS `AWS::Lambda::Function` mounted beside this
+    /// one.
+    ///
+    /// A function is created, read, changed and removed by AWS Lambda's OWN API, which this
+    /// service calls in process over the framework's callback — the same router, so the two
+    /// services share one engine exactly as the assembled router mounts them.
+    pub(crate) fn with_lambda() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One request to the AWS Lambda service's own API — the OWNING service's own API, the
+    /// one a client uses when it is not going through Cloud Control API.
+    ///
+    /// That service speaks `restJson1` over a REST surface rather than a JSON RPC one, so a
+    /// call is a method, a path and (where the operation takes one) a JSON document.
+    pub(crate) async fn lambda(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{SIGNING_REGION}/\
+             {LAMBDA_SIGNING_NAME}/aws4_request, SignedHeaders=host, Signature=00"
+        );
+        let payload = body.map_or_else(Vec::new, |body| {
+            serde_json::to_vec(body).expect("the request body serializes")
+        });
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{LAMBDA_ENDPOINT_HOST}{path}"))
+            .header("host", LAMBDA_ENDPOINT_HOST)
+            .header("content-type", "application/json")
+            .header("authorization", authorization)
+            .body(Bytes::from(payload))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let decoded = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, decoded)
+    }
+
+    /// One request to the AWS Lambda service's own API, required to succeed.
+    pub(crate) async fn lambda_ok(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
+        let (status, decoded) = self.lambda(method, path, body).await;
+        assert!(
+            (200..300).contains(&status),
+            "{method} {path}: expected a 2xx from AWS Lambda, got {status} with body {decoded:?}"
+        );
+        decoded
     }
 
     /// One emulator with the service that OWNS `AWS::StepFunctions::StateMachine` mounted

@@ -40,6 +40,10 @@ pub mod stacks;
 /// `AWS::ApiGatewayV2::Api`, the other type an owning service's own API answers for.
 pub mod apis;
 
+/// `AWS::Lambda::Function`, whose create deploys a package in AWS Lambda and whose own
+/// lifecycle that service reports.
+pub mod functions;
+
 use ::std::time::SystemTime;
 
 use ::serde_json::Value;
@@ -234,6 +238,7 @@ pub fn identifier_property(type_name: &str) -> Option<&'static str> {
     match type_name {
         stacks::TYPE_NAME => Some(stacks::IDENTIFIER_PROPERTY),
         apis::TYPE_NAME => Some(apis::IDENTIFIER_PROPERTY),
+        functions::TYPE_NAME => Some(functions::IDENTIFIER_PROPERTY),
         _ => None,
     }
 }
@@ -278,6 +283,7 @@ impl Resolution {
         let read = match type_name {
             stacks::TYPE_NAME => stacks::read(ctx, region, identifier).await,
             apis::TYPE_NAME => apis::read(ctx, region, identifier).await,
+            functions::TYPE_NAME => functions::read(ctx, region, identifier).await,
             _ => return Self::Stored,
         };
         let Some(identifier_property) = identifier_property(type_name) else {
@@ -300,6 +306,7 @@ pub async fn page(
     let listed = match type_name {
         stacks::TYPE_NAME => stacks::list(ctx, region, after, limit).await,
         apis::TYPE_NAME => apis::list(ctx, region, after, limit).await,
+        functions::TYPE_NAME => functions::list(ctx, region, after, limit).await,
         _ => return None,
     };
     let identifier_property = identifier_property(type_name)?;
@@ -574,6 +581,9 @@ pub async fn settle<Eng: Send + Sync + 'static>(
                 stacks::TYPE_NAME => {
                     stacks::progress(ctx, &work.region, &identifier, &work.operation).await
                 }
+                functions::TYPE_NAME => {
+                    functions::progress(ctx, &work.region, &identifier, &work.operation).await
+                }
                 // No owning API answers for this type, so there is no lifecycle to follow:
                 // the request fails rather than being read against another type's service.
                 other => Progress::Failed(unanswered(other)),
@@ -640,6 +650,27 @@ pub async fn settle<Eng: Send + Sync + 'static>(
                 )
                 .await
             }
+            (functions::TYPE_NAME, crate::state::OPERATION_DELETE) => {
+                functions::delete(ctx, &work.region, &identifier)
+                    .await
+                    .map(|()| identifier.clone())
+            }
+            (functions::TYPE_NAME, crate::state::OPERATION_UPDATE) => functions::update(
+                ctx,
+                &work.region,
+                &identifier,
+                &work.properties.clone().unwrap_or_default(),
+            )
+            .await
+            .map(|()| identifier.clone()),
+            (functions::TYPE_NAME, _) => {
+                functions::create(
+                    ctx,
+                    &work.region,
+                    &work.properties.clone().unwrap_or_default(),
+                )
+                .await
+            }
             (other, _) => Err(unanswered(other)),
         };
         match started {
@@ -682,6 +713,7 @@ mod tests {
         for (type_name, expected) in [
             (stacks::TYPE_NAME, stacks::IDENTIFIER_PROPERTY),
             (apis::TYPE_NAME, apis::IDENTIFIER_PROPERTY),
+            (functions::TYPE_NAME, functions::IDENTIFIER_PROPERTY),
         ] {
             assert_eq!(
                 identifier_property(type_name),

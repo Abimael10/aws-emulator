@@ -1454,16 +1454,25 @@ pub fn patched_properties(patch: &::json_patch::Patch) -> BTreeSet<String> {
     properties_changed_by(patch, |_| true)
 }
 
-/// The top-level properties of the resource model a patch document would change with an
-/// operation that is NOT an `add` — the only operation a write-only property may be named
-/// by ([`write_only_properties`]).
+/// The pointers into the resource model a patch document would change with an operation that
+/// is NOT an `add` — the only operation a write-only property may be named by
+/// ([`write_only_properties`]).
 ///
-/// A property is read off each operation's pointers the way [`patched_properties`] reads
-/// them, so the two cannot disagree about which property one pointer names.
-pub fn properties_patched_without_add(patch: &::json_patch::Patch) -> BTreeSet<String> {
-    properties_changed_by(patch, |operation| {
+/// A pointer is the operation's own tokens joined the way a schema's pointer into the model
+/// writes them (`Code/ZipFile`), so a write-only pointer and the pointer a patch names are
+/// read in ONE vocabulary ([`names_write_only`]) — which a schema that declares a MEMBER of a
+/// structured property write-only needs. The empty pointer names the whole model rather than
+/// anything in it, so it names nothing here, exactly as it names no property.
+pub fn pointers_patched_without_add(patch: &::json_patch::Patch) -> BTreeSet<String> {
+    pointers_changed_by(patch, |operation| {
         !matches!(operation, ::json_patch::PatchOperation::Add(_))
     })
+}
+
+/// Whether `pointer` names `write_only` or something inside it — which is what makes the
+/// operation that named it one that would update that write-only property.
+pub fn names_write_only(pointer: &str, write_only: &str) -> bool {
+    pointer == write_only || pointer.starts_with(&format!("{write_only}/"))
 }
 
 /// The top-level properties the operations of `patch` that `selected` admits would change.
@@ -1471,9 +1480,35 @@ fn properties_changed_by(
     patch: &::json_patch::Patch,
     selected: impl Fn(&::json_patch::PatchOperation) -> bool,
 ) -> BTreeSet<String> {
+    changed_by(patch, selected, |target| {
+        target.first().map(|token| token.decoded().into_owned())
+    })
+}
+
+/// The pointers the operations of `patch` that `selected` admits would change.
+fn pointers_changed_by(
+    patch: &::json_patch::Patch,
+    selected: impl Fn(&::json_patch::PatchOperation) -> bool,
+) -> BTreeSet<String> {
+    changed_by(patch, selected, |target| {
+        let tokens: Vec<String> = target
+            .tokens()
+            .map(|token| token.decoded().into_owned())
+            .collect();
+        (!tokens.is_empty()).then(|| tokens.join("/"))
+    })
+}
+
+/// What `named` reads off every pointer the operations of `patch` that `selected` admits
+/// would change.
+fn changed_by(
+    patch: &::json_patch::Patch,
+    selected: impl Fn(&::json_patch::PatchOperation) -> bool,
+    named: impl Fn(&::json_patch::jsonptr::Pointer) -> Option<String>,
+) -> BTreeSet<String> {
     use ::json_patch::PatchOperation;
 
-    let mut properties = BTreeSet::new();
+    let mut targets_named = BTreeSet::new();
     for operation in patch.0.iter().filter(|operation| selected(operation)) {
         let targets: Vec<&::json_patch::jsonptr::Pointer> = match operation {
             PatchOperation::Add(operation) => vec![&operation.path],
@@ -1484,12 +1519,12 @@ fn properties_changed_by(
             PatchOperation::Test(_) => Vec::new(),
         };
         for target in targets {
-            if let Some(token) = target.first() {
-                properties.insert(token.decoded().into_owned());
+            if let Some(name) = named(target) {
+                targets_named.insert(name);
             }
         }
     }
-    properties
+    targets_named
 }
 
 /// Apply `patch` to `properties`, ONE operation at a time, holding the document to the
@@ -2136,6 +2171,7 @@ const READ_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
     ("AWS::CloudWatch::Alarm", &["Arn"]),
     ("AWS::DynamoDB::Table", &["Arn", "StreamArn"]),
     ("AWS::IAM::ManagedPolicy", &["PolicyArn", "PolicyId", "AttachmentCount", "CreateDate", "DefaultVersionId", "IsAttachable", "PermissionsBoundaryUsageCount", "UpdateDate"]),
+    ("AWS::Lambda::Function", &["Arn", "SnapStartResponse"]),
     ("AWS::Logs::LogGroup", &["Arn"]),
     ("AWS::S3::Bucket", &["Arn", "DomainName", "DualStackDomainName", "RegionalDomainName", "WebsiteURL"]),
     ("AWS::SecretsManager::Secret", &["Id"]),
@@ -2199,6 +2235,11 @@ fn invalid_patch_update_message(classification: &str, properties: &[&str]) -> St
 /// does not report, so there is nothing in the model a patch is applied to for an operation
 /// to update in place: such a property can only be `add`ed
 /// ([`write_only_properties`]). A type whose schema declares none is absent from here.
+///
+/// A pointer may name a MEMBER of a structured property (`Code/ZipFile`) rather than a
+/// property of the type, which is what such a pointer says: the MEMBER is what a caller sets
+/// and no read reports, while the structure that holds it is part of the model either way.
+/// That is the form an entry keeps here, and [`reported_model`] is what applies it.
 const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
     // `AWS::ApiGatewayV2::Api`: the OpenAPI definition an api is imported from and how that
     // document is read, and the `RouteKey`, `Target` and `CredentialsArn` of a quick-create
@@ -2226,6 +2267,25 @@ const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
             "TemplateURL",
             "StackPolicyBody",
             "StackPolicyURL",
+        ],
+    ),
+    // `AWS::Lambda::Function`: the MEMBERS of the deployment package a create deploys — the
+    // inline source, the Amazon S3 object holding the package, the image and the key the
+    // package is encrypted under — none of which `lambda:GetFunction`, the call the type's
+    // read handler reads a function with, reports as a member of that property; and the
+    // SnapStart setting a request STATES, which that service reports back under the type's
+    // own `SnapStartResponse` instead. The package itself is part of the model either way,
+    // which is why the pointers name its members rather than the property that holds them.
+    (
+        "AWS::Lambda::Function",
+        &[
+            "Code/ImageUri",
+            "Code/S3Bucket",
+            "Code/S3Key",
+            "Code/S3ObjectVersion",
+            "Code/SourceKMSKeyArn",
+            "Code/ZipFile",
+            "SnapStart",
         ],
     ),
     // `AWS::SSM::Parameter`: the properties the type's read handler, which reads a
@@ -2286,7 +2346,7 @@ pub fn write_only_message(properties: &[&str]) -> String {
 }
 
 /// One resource model of `type_name` as this service REPORTS it: the properties the
-/// resource carries, WITHOUT any the type's registry schema declares
+/// resource carries, WITHOUT anything the type's registry schema declares
 /// `writeOnlyProperties` ([`write_only_properties`]).
 ///
 /// A resource model is serialised from the resource type's schema, and a write-only
@@ -2296,6 +2356,10 @@ pub fn write_only_message(properties: &[&str]) -> String {
 /// round-trips a reported model into a later request, or diffs one against a desired state,
 /// therefore never sees a property no read of the resource would answer with, and a value
 /// the schema keeps out of the model is reported by nothing here.
+///
+/// A pointer that names a MEMBER of a structured property drops that MEMBER and keeps the
+/// structure, which is what the pointer says: a property whose every member a caller sets is
+/// still part of the model, reported as the empty structure its members were dropped from.
 ///
 /// The value itself is untouched where the resource LIVES: it was applied, and the owning
 /// service's own API is what reports it. A property is matched by the name the schema
@@ -2310,9 +2374,46 @@ pub fn reported_model(type_name: &str, properties: &Value) -> Value {
         model
             .iter()
             .filter(|(property, _)| !write_only.contains(&property.as_str()))
-            .map(|(property, value)| (property.clone(), value.clone()))
+            .map(|(property, value)| {
+                (
+                    property.clone(),
+                    without_write_only_members(property, value, write_only),
+                )
+            })
             .collect(),
     )
+}
+
+/// `value`, as the model reports the property `property` holds it under: without the members
+/// a write-only pointer of the form `<property>/<member>` names.
+///
+/// A list of such structures is projected entry by entry, because a pointer into a list of
+/// structures names the member the same way: the schema states the member of the structure,
+/// and every entry of the list carries that structure.
+fn without_write_only_members(property: &str, value: &Value, write_only: &[&str]) -> Value {
+    let prefix = format!("{property}/");
+    let members: Vec<&str> = write_only
+        .iter()
+        .filter_map(|pointer| pointer.strip_prefix(&prefix))
+        .collect();
+    if members.is_empty() {
+        return value.clone();
+    }
+    match value {
+        Value::Object(held) => Value::Object(
+            held.iter()
+                .filter(|(member, _)| !members.contains(&member.as_str()))
+                .map(|(member, held)| (member.clone(), held.clone()))
+                .collect(),
+        ),
+        Value::Array(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|entry| without_write_only_members(property, entry, write_only))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// How a mutating operation words a `PatchDocument` its reader would not take, with the

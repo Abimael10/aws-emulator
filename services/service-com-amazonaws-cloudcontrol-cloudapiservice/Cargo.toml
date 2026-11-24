@@ -62,6 +62,18 @@ aws-sdk-cloudformation = { version = "1", default-features = false, features = [
 # over the framework's callback (`state::owning_api::apis`). No network client feature: the
 # transport is the emulator's own.
 aws-sdk-apigatewayv2 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# And `AWS::Lambda::Function`, whose create deploys a package and whose own lifecycle AWS
+# Lambda reports (`Pending` while it provisions the function): the function is created, read,
+# patched and removed by that service's own calls, dispatched in process over the framework's
+# callback (`state::owning_api::functions`). No network client feature: the transport is the
+# emulator's own.
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Writes the .zip deployment package an `AWS::Lambda::Function` whose model states INLINE
+# source text is created from: the schema's `Code.ZipFile` is that text, while the API member
+# is the bytes of an archive, so the archive is built with the maintained implementation of
+# the format rather than by hand. `default-features = false` keeps it to the one compression
+# method a deployment package uses.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -106,6 +118,10 @@ automod = { workspace = true }
 # stack through its own API — `DescribeStackResource` and `SignalResource` — while the
 # Cloud Control request follows it.
 service-com-amazonaws-cloudformation-cloudformation = { workspace = true }
+# The service that OWNS `AWS::Lambda::Function`, for the same reason: a suite about that type
+# mounts it beside this one on the same engine and drives the function through its own API —
+# `CreateFunction`, `GetFunction` and `UpdateFunctionCode` — while Cloud Control API reads it.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # The test harness drives the services that OWN some resource types over their own
 # `awsQuery` wire, whose form values are percent-encoded by this crate rather than by an
 # encoder of ours.

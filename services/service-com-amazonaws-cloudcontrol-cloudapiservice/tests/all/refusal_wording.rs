@@ -1068,10 +1068,13 @@ async fn a_type_the_registry_does_not_hold_is_refused_before_anything_it_names_i
     }
 
     // And a type the registry DOES hold goes ahead — including one no row above names, so
-    // the rule is about the registry rather than about the types the other suites use.
+    // the rule is about the registry rather than about the types the other suites use. Every
+    // row is a type whose resources live in THIS service's own store: a type an owning
+    // service answers for is created by that service's own call, which the suites about those
+    // types drive with that service mounted.
     for (type_name, desired) in [
         ("AWS::Kinesis::Stream", json!({ "StreamName": "registered" })),
-        ("AWS::Lambda::Function", json!({ "FunctionName": "registered" })),
+        ("AWS::Lambda::Alias", json!({ "Name": "registered" })),
         ("Alexa::ASK::Skill", json!({ "Id": "registered-skill" })),
     ] {
         let identifier = emulator.provision(type_name, &desired).await;
