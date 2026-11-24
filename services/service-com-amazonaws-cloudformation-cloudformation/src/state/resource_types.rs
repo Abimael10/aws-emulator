@@ -110,7 +110,8 @@ use super::template::{
     CLOUDHSM_CLUSTER,
     CUSTOMER_PROFILES_DOMAIN, DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
-    DLM_LIFECYCLE_POLICY, ECR_SIGNING_CONFIGURATION, GLUE_TABLE_OPTIMIZER,
+    DLM_LIFECYCLE_POLICY, ECR_PULL_TIME_UPDATE_EXCLUSION, ECR_SIGNING_CONFIGURATION,
+    GLUE_TABLE_OPTIMIZER,
     HEALTHLAKE_DATA_TRANSFORMATION_PROFILE, HEALTHLAKE_FHIR_DATASTORE,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
@@ -594,6 +595,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Amazon ECR, private registry and public gallery
     "AWS::ECR::PublicRepository",
     "AWS::ECR::PullThroughCacheRule",
+    // ONE entry of the private registry's pull-time-update exclusion list: the IAM principal
+    // Amazon ECR records no image pull time for, registered in that registry itself
+    // (`super::provisioner`).
+    ECR_PULL_TIME_UPDATE_EXCLUSION,
     "AWS::ECR::RegistryPolicy",
     "AWS::ECR::ReplicationConfiguration",
     "AWS::ECR::Repository",

@@ -32,7 +32,15 @@ use service_com_amazonaws_cloudformation_cloudformation::state::resource_status;
 const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
 
 /// One Amazon ECR request, over the awsJson1.1 wire it speaks.
-async fn ecr(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// Shared with the suites beside this one that read a declared resource back out of the
+/// private registry (`ecr_pull_time_update_exclusion_resource_type.rs`): one copy of the
+/// registry's wire, so the suites cannot drift from each other.
+pub(crate) async fn ecr(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ecr/aws4_request, \
          SignedHeaders=host, Signature=0123456789abcdef"

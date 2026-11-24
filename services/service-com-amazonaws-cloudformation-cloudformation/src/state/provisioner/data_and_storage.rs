@@ -24,6 +24,11 @@ mod bucket_website;
 /// settings Amazon ECR writes through a call of its own — as one concern of their own.
 mod ecr_repositories;
 pub(in crate::state) use ecr_repositories::*;
+/// The `AWS::ECR::PullTimeUpdateExclusion` arms — the IAM principals of that same registry's
+/// pull-time-update exclusion list, which is registry-wide state rather than a setting of any
+/// repository — as a concern of their own beside them.
+mod ecr_pull_time_update_exclusions;
+pub(in crate::state) use ecr_pull_time_update_exclusions::*;
 
 /// The `AWS::ECR::SigningConfiguration` arms — the ONE signing configuration that same private
 /// registry holds, whose create is an upsert the stack has to probe before — as one concern of

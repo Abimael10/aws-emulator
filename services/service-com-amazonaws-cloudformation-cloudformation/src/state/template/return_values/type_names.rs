@@ -1639,6 +1639,19 @@ pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 /// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
 pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
 
+/// The `AWS::ECR::PullTimeUpdateExclusion` resource type, under that same namespace: ONE
+/// entry of the private registry's pull-time-update exclusion list — the IAM principal
+/// Amazon ECR records no image pull time for.
+///
+/// The resource IS the principal it excludes: `RegisterPullTimeUpdateExclusion` takes that
+/// `principalArn` and no identifier of its own, and the deregister addresses the record by
+/// the same ARN, so the declared `PrincipalArn` is the resource's physical id and what its
+/// `Ref` returns. The name property is unconventional — the type's last segment is
+/// `PullTimeUpdateExclusion`, so neither `PullTimeUpdateExclusionName` nor `Name` finds it —
+/// so the type is registered in [`declared_name_property`], and
+/// [`crate::state::provisioner`] is what registers the principal in Amazon ECR itself.
+pub const ECR_PULL_TIME_UPDATE_EXCLUSION: &str = "AWS::ECR::PullTimeUpdateExclusion";
+
 /// The SIGNING CONFIGURATION of that private registry, under the same namespace: the one
 /// configuration an account's registry holds, which `PutSigningConfiguration` is documented to
 /// create or update ("Creates or updates the registry's signing configuration") and

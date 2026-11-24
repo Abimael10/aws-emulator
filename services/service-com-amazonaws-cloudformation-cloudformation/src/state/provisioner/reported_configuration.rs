@@ -56,6 +56,12 @@ impl Provisioner {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
             Self::EcrRepository => describe_repository(ctx, region, physical_resource_id).await,
+            // Amazon ECR publishes no read of ONE exclusion, so the record is read out of the
+            // listing that registry answers its exclusion list in, by the principal ARN that
+            // is this resource's physical id.
+            Self::EcrPullTimeUpdateExclusion => {
+                describe_pull_time_update_exclusion(ctx, region, physical_resource_id).await
+            }
             // That registry's own read of its signing configuration, which carries no
             // identifier: a registry holds one, and it is the resource the stack declared.
             Self::EcrSigningConfiguration => describe_signing_configuration(ctx, region).await,

@@ -208,6 +208,13 @@ pub const DECLARED_PROPERTIES: &[DeclaredProperties] = &[
         resource_type: crate::state::template::MEDIACONVERT_CERTIFICATE_ASSOCIATION,
         declared: &["Arn"],
     },
+    // `AWS::ECR::PullTimeUpdateExclusion` publishes ONE property: the `PrincipalArn` of the IAM
+    // principal the private registry is to record no image pull times for, which is the whole
+    // of the resource.
+    DeclaredProperties {
+        resource_type: crate::state::template::ECR_PULL_TIME_UPDATE_EXCLUSION,
+        declared: &["PrincipalArn"],
+    },
     // `AWS::CloudFormation::WaitConditionHandle` publishes NO property at all ("this type has
     // no properties"), so every member a declaration of it carries is one the type does not
     // have.

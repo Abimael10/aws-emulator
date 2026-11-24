@@ -1006,6 +1006,15 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
             Some("EcrRepositoryPrefix")
         }
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // An Amazon ECR pull-time-update exclusion IS the IAM principal it excludes:
+        // `RegisterPullTimeUpdateExclusion` takes that `principalArn` and no identifier of
+        // its own, `DeregisterPullTimeUpdateExclusion` addresses the record by the same ARN,
+        // and `ListPullTimeUpdateExclusions` reports nothing else about one — so the declared
+        // `PrincipalArn` is this resource's physical id. The type's last segment is
+        // `PullTimeUpdateExclusion`, so neither `PullTimeUpdateExclusionName` nor `Name`
+        // finds it, and a generated `<stack>-<logical id>-<unique id>` would name no
+        // principal that registry can exclude at all.
+        ECR_PULL_TIME_UPDATE_EXCLUSION => Some("PrincipalArn"),
         // An AWS Elemental MediaConvert certificate association IS the certificate it trusts:
         // `AssociateCertificate` and `DisassociateCertificate` each take that `Arn` and no
         // identifier of their own, and "Ref returns" it — so the declared `Arn` is this

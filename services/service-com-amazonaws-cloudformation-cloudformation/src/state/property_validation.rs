@@ -349,6 +349,14 @@ pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: crate::state::template::MEDIACONVERT_CERTIFICATE_ASSOCIATION,
         required: &["Arn"],
     },
+    // `AWS::ECR::PullTimeUpdateExclusion`: the resource IS the IAM principal the private
+    // registry excludes from pull-time recording, and `RegisterPullTimeUpdateExclusion`
+    // declares that `principalArn` required — a declaration stating none describes no
+    // exclusion at all.
+    RequiredProperties {
+        resource_type: crate::state::template::ECR_PULL_TIME_UPDATE_EXCLUSION,
+        required: &["PrincipalArn"],
+    },
     // `AWS::SSMQuickSetup::ConfigurationManager`: a configuration manager IS the deployment
     // of its definitions — `CreateConfigurationManager` declares `ConfigurationDefinitions`
     // required, and the name it also takes is the one CloudFormation may generate — so a
