@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    messages, ComAmazonawsGlueAwsglueState, BLUEPRINT_RUN_SETTLES_AFTER,
+    ComAmazonawsGlueAwsglueState, BLUEPRINT_RUN_SETTLES_AFTER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -410,8 +410,10 @@ async fn listing_the_runs_of_an_unknown_blueprint_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            messages::BLUEPRINT_NOT_FOUND,
-            "case {case:?}: expected the recorded blueprint miss, got {body}"
+            // The whole sentence, as a literal: the run-history read answers the service's
+            // generic absent-entity text, which names no part of the request.
+            "Entity not found",
+            "case {case:?}: expected this operation's own recorded miss, got {body}"
         );
     }
 }

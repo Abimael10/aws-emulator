@@ -343,10 +343,11 @@ async fn each_write_advances_the_version_by_one() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// Updating a crawler this account does not hold is the modelled not-found refusal, and
-/// it creates nothing: the rows span a name never created and names that differ from a
-/// stored crawler's only in case, because the model documents no case fold for a crawler
-/// name.
+/// Updating a crawler this account does not hold is the modelled not-found refusal, worded
+/// as this operation words it — the sentence states that the name provided names no crawler
+/// and discloses no value — and it creates nothing: the rows span a name never created and
+/// names that differ from a stored crawler's only in case, because the model documents no
+/// case fold for a crawler name.
 #[tokio::test]
 async fn an_update_of_an_absent_crawler_is_the_modelled_miss() {
     let router = emulator();
@@ -373,8 +374,14 @@ async fn an_update_of_an_absent_crawler_is_the_modelled_miss() {
         );
         assert_eq!(
             error_message(&body),
-            messages::crawler_not_found(name),
-            "case {case}: expected the crawler miss for {name}, got {body}"
+            // The whole sentence, as a literal: the definition write states the miss over the
+            // member the request addressed the crawler by and discloses no value.
+            "Crawler with provided name does not exist",
+            "case {case}: expected this operation's own crawler miss, got {body}"
+        );
+        assert!(
+            !error_message(&body).contains(name),
+            "case {case}: the update's miss must disclose no requested name, got {body}"
         );
 
         // The refused update created nothing under that name.

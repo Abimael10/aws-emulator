@@ -183,11 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BlueprintName` is `@required` with `length 1..255`, so an absent or over-long one
         // is refused at the boundary: reaching here, the only question is whether this
         // account holds a blueprint of that name, which is the whole key every blueprint
-        // operation addresses one by.
+        // operation addresses one by. The history read answers that miss with this
+        // operation's OWN sentence, which names no part of the request.
         let Some(blueprint) = store.blueprint_mut(&input.blueprint_name) else {
             return Err(GetBlueprintRunsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::BLUEPRINT_NOT_FOUND.to_string()),
+                    message: Some(crate::state::messages::BLUEPRINT_RUNS_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

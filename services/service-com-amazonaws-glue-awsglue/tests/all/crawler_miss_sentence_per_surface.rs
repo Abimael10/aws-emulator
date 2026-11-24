@@ -13,11 +13,11 @@
 //! not one sentence happens to be an extension of another.
 //!
 //! The rows below span what the rule generalises over: every operation of this service that
-//! refuses an absent crawler (the crawler-definition reads and writes, the run start, and the
-//! two schedule-state toggles), the request member each of them addresses the crawler by, and
-//! the name itself (both published length bounds, a space, a tab, a non-ASCII letter, and a
-//! name differing from a stored crawler only in case). The recorded case,
-//! `StartCrawlerSchedule` on a name no crawler has, is one row.
+//! refuses an absent crawler (the crawler-definition reads, the definition write, the schedule
+//! write, the run start, and the two schedule-state toggles), the request member each of them
+//! addresses the crawler by, and the name itself (both published length bounds, a space, a tab,
+//! a non-ASCII letter, and a name differing from a stored crawler only in case). The recorded
+//! cases, `StartCrawlerSchedule` and `UpdateCrawler` on a name no crawler has, are two rows.
 //!
 //! The same rule across `TestConnection`'s two request forms is
 //! `tests/all/test_connection_unified_only_wording.rs`, which spans every connection kind.
@@ -39,11 +39,16 @@ const PRESENT: &str = "present-crawler";
 const NAME_MIN: usize = 1;
 const NAME_MAX: usize = 255;
 
-/// The sentence the crawler-DEFINITION surface words a miss with: the reads and the writes of
-/// the crawler record itself.
+/// The sentence the crawler-DEFINITION surface words a miss with: the reads of the crawler
+/// record itself, and the write that replaces its schedule.
 fn definition_sentence(name: &str) -> String {
     format!("Crawler entry with name {name} does not exist")
 }
+
+/// The sentence the crawler-definition WRITE (`UpdateCrawler`) words the same miss with: it
+/// states the miss over the member the request addressed the crawler by and names no value, so
+/// it is the one sentence here with no variable part at all.
+const DEFINITION_WRITE_SENTENCE: &str = "Crawler with provided name does not exist";
 
 /// The sentence the RUN-start surface words the same miss with.
 fn run_start_sentence(name: &str) -> String {
@@ -59,8 +64,10 @@ fn schedule_sentence(name: &str) -> String {
 /// Which sentence a surface answers with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Surface {
-    /// The crawler record's own reads and writes.
+    /// The crawler record's own reads, and the write that replaces its schedule.
     Definition,
+    /// The write that replaces the crawler's definition.
+    DefinitionWrite,
     /// Starting a crawl.
     RunStart,
     /// Putting a schedule back in force, or suspending it.
@@ -72,6 +79,7 @@ impl Surface {
     fn sentence(self, name: &str) -> String {
         match self {
             Self::Definition => definition_sentence(name),
+            Self::DefinitionWrite => DEFINITION_WRITE_SENTENCE.to_string(),
             Self::RunStart => run_start_sentence(name),
             Self::ScheduleState => schedule_sentence(name),
         }
@@ -83,7 +91,7 @@ impl Surface {
 const CRAWLER_SURFACES: [(&str, &str, Surface); 9] = [
     ("GetCrawler", "Name", Surface::Definition),
     ("DeleteCrawler", "Name", Surface::Definition),
-    ("UpdateCrawler", "Name", Surface::Definition),
+    ("UpdateCrawler", "Name", Surface::DefinitionWrite),
     ("StopCrawler", "Name", Surface::Definition),
     ("ListCrawls", "CrawlerName", Surface::Definition),
     ("UpdateCrawlerSchedule", "CrawlerName", Surface::Definition),
@@ -181,10 +189,11 @@ async fn every_crawler_surface_words_the_miss_its_own_way() {
     }
 }
 
-/// The three sentences are DIFFERENT for one and the same absent name, and no surface is
-/// served by another's: in particular the schedule toggles' sentence is not the run start's
-/// extended by accident — a caller reading the whole message must see the surface's own text,
-/// and only the toggles restate the miss.
+/// The sentences are DIFFERENT for one and the same absent name, and no surface is served by
+/// another's: in particular the schedule toggles' sentence is not the run start's extended by
+/// accident, and the definition write's names nothing where the reads' names the crawler — a
+/// caller reading the whole message must see the surface's own text, and only the toggles
+/// restate the miss.
 #[tokio::test]
 async fn the_surfaces_sentences_are_not_interchangeable() {
     let router = emulator();
@@ -195,6 +204,13 @@ async fn the_surfaces_sentences_are_not_interchangeable() {
         "definition read",
         &router,
         "GetCrawler",
+        &json!({ "Name": name }),
+    )
+    .await;
+    let definition_write = miss_message(
+        "definition write",
+        &router,
+        "UpdateCrawler",
         &json!({ "Name": name }),
     )
     .await;
@@ -215,11 +231,13 @@ async fn the_surfaces_sentences_are_not_interchangeable() {
 
     for (left_case, left) in [
         ("definition read", &definition),
+        ("definition write", &definition_write),
         ("run start", &run_start),
         ("schedule toggle", &schedule),
     ] {
         for (right_case, right) in [
             ("definition read", &definition),
+            ("definition write", &definition_write),
             ("run start", &run_start),
             ("schedule toggle", &schedule),
         ] {
@@ -234,12 +252,33 @@ async fn the_surfaces_sentences_are_not_interchangeable() {
         }
     }
 
+    // The definition write is the one sentence that discloses no part of the request.
+    assert!(
+        !definition_write.contains(name),
+        "case definition write: its sentence names no requested crawler, got \
+         {definition_write:?}"
+    );
+    for (case, other) in [
+        ("definition read", &definition),
+        ("run start", &run_start),
+        ("schedule toggle", &schedule),
+    ] {
+        assert!(
+            other.contains(name),
+            "case {case}: its sentence names the crawler that was asked for, got {other:?}"
+        );
+    }
+
     // Only the schedule toggles restate the miss after naming the crawler.
     assert!(
         schedule.ends_with(" not found."),
         "case schedule toggle: the toggles restate the miss, got {schedule:?}"
     );
-    for (case, other) in [("definition read", &definition), ("run start", &run_start)] {
+    for (case, other) in [
+        ("definition read", &definition),
+        ("definition write", &definition_write),
+        ("run start", &run_start),
+    ] {
         assert!(
             !other.ends_with(" not found."),
             "case {case}: only the schedule toggles restate the miss, got {other:?}"

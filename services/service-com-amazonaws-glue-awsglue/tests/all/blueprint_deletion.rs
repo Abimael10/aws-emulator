@@ -260,8 +260,10 @@ async fn deleting_a_blueprint_removes_the_record_stored_under_its_name() {
             );
             assert_eq!(
                 error_message(&body),
-                messages::BLUEPRINT_NOT_FOUND,
-                "case {case}: the run read misses on the blueprint itself, got {body}"
+                // The whole sentence, as a literal: the run read addresses the RUN, so it
+                // names the run id and the blueprint the request sent.
+                format!("Blueprint run with id:{run_id} and blueprint name:{name} not found"),
+                "case {case}: the run read reports the run's own address, got {body}"
             );
         }
 

@@ -4,12 +4,14 @@
 //! blueprint has been REMOVED — the axis `tests/all/not_found_wording.rs` does not cover,
 //! which pins the same sentence over a name nothing ever registered.
 //!
-//! RULE: every operation that addresses one blueprint by name answers a name this account
-//! holds no blueprint under with the service's single FIXED sentence for that miss — the same
-//! text whichever of those operations asked and however the name came to hold nothing — so
-//! the sentence carries no part of the request and never varies with it. A name whose whole
-//! registration `DeleteBlueprint` removed is therefore the same miss as a name nothing ever
-//! registered.
+//! RULE: each operation of the blueprint family answers a name this account holds no
+//! blueprint under with the sentence the service words THAT operation's refusal with —
+//! however the name came to hold nothing — so a name whose whole registration
+//! `DeleteBlueprint` removed is the same miss as a name nothing ever registered. The reads
+//! that address a blueprint by name answer the blueprint surface's one FIXED sentence,
+//! carrying no part of the request; the run-history read answers its own fixed sentence; and
+//! the single-run read, which addresses a RUN, reports that run's whole address — the run id
+//! and the blueprint name the request sent.
 //!
 //! The rows differ along what the rule generalises over: the form, character set and length of
 //! the requested name, the state the registration was in when it went (still in flight,
@@ -17,9 +19,9 @@
 //! registration and removal, which operation of the family asks, and whether the run the
 //! request addresses is one the removed blueprint had really recorded or an id nothing minted.
 //!
-//! The expected sentence is written out as a literal rather than read from the service's own
-//! helper, so this suite pins the wording instead of restating it; a template interpolating
-//! the requested name — or any other request-derived prose — fails here.
+//! The expected sentences are written out as literals rather than read from the service's own
+//! helpers, so this suite pins the wording instead of restating it; a fixed sentence that
+//! starts interpolating the requested name — or any other request-derived prose — fails here.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
@@ -34,15 +36,28 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::blueprint_deletion::{delete, ROLE_ARN};
 use crate::blueprint_runs::{emulator_with_engine, register_active, rewind, start, stored_runs};
-use crate::not_found_wording::assert_fixed_miss;
+use crate::not_found_wording::{assert_fixed_miss, assert_miss};
 use crate::wire::ok;
 
-/// The whole sentence a blueprint lookup miss is reported with. Fixed text: it names the
-/// member the request addressed the blueprint by and discloses no value. The status (400) and
-/// the error code (`EntityNotFoundException`, shared by every entity this service holds —
-/// `smithy_query operation=GetBlueprint,StartBlueprintRun,GetBlueprintRun,GetBlueprintRuns`)
-/// come with it, which is why the sentence is what tells a client WHICH entity was missing.
+/// The whole sentence the operations that address a BLUEPRINT by name report a miss with.
+/// Fixed text: it names the member the request addressed the blueprint by and discloses no
+/// value. The status (400) and the error code (`EntityNotFoundException`, shared by every
+/// entity this service holds — `smithy_query
+/// operation=GetBlueprint,StartBlueprintRun,GetBlueprintRun,GetBlueprintRuns`) come with it,
+/// which is why the sentence is what tells a client WHICH entity was missing.
 const BLUEPRINT_MISS: &str = "Blueprint with given name not found.";
+
+/// The whole sentence the run-HISTORY read (`GetBlueprintRuns`) reports the same miss with:
+/// the service's generic absent-entity text, fixed, naming neither the blueprint nor the
+/// member it was addressed by.
+const RUN_HISTORY_MISS: &str = "Entity not found";
+
+/// The whole sentence the single-run read (`GetBlueprintRun`) reports a miss with: it
+/// addresses a RUN, so both halves of that run's address — the id and the blueprint name the
+/// request sent — are the sentence's variable parts.
+fn run_miss(blueprint_name: &str, run_id: &str) -> String {
+    format!("Blueprint run with id:{run_id} and blueprint name:{blueprint_name} not found")
+}
 
 /// The longest name the family's strictest member admits: `OrchestrationNameString`,
 /// "len 1..128", pattern `^[\.\-_A-Za-z0-9]+$` (`smithy_query operation=StartBlueprintRun`).
@@ -151,12 +166,11 @@ async fn register_then_remove(
     }
 }
 
-/// A name whose whole registration was removed is reported with the one fixed sentence by
-/// each of the four reads that address a blueprint by name — whatever state the registration
-/// was in when it went, and even where the run id the request addresses is one that blueprint
-/// really carried.
+/// A name whose whole registration was removed is reported the way each of the four reads
+/// that address it words its own miss — whatever state the registration was in when it went,
+/// and even where the run id the request addresses is one that blueprint really carried.
 #[tokio::test]
-async fn a_removed_blueprint_is_the_one_fixed_miss_sentence() {
+async fn a_removed_blueprint_is_each_operations_own_miss_sentence() {
     let (router, engine) = emulator_with_engine();
     // A registration that stays throughout, so every refusal below is about the name the row
     // addressed and not a lookup that stopped resolving.
@@ -204,14 +218,6 @@ async fn a_removed_blueprint_is_the_one_fixed_miss_sentence() {
                 "StartBlueprintRun",
                 json!({ "BlueprintName": name, "RoleArn": ROLE_ARN }),
             ),
-            (
-                // The blueprint half of the address is resolved first, so a run id the
-                // removed blueprint really carried is reported as the blueprint miss and not
-                // as the run-id miss, which is a sentence of its own.
-                "GetBlueprintRun",
-                json!({ "BlueprintName": name, "RunId": run_id }),
-            ),
-            ("GetBlueprintRuns", json!({ "BlueprintName": name })),
         ];
 
         for (operation, request) in &requests {
@@ -219,6 +225,26 @@ async fn a_removed_blueprint_is_the_one_fixed_miss_sentence() {
             // `tests/all/not_found_wording.rs` owns for a fixed refusal of this service.
             assert_fixed_miss(&router, case, operation, request, name, BLUEPRINT_MISS).await;
         }
+        assert_fixed_miss(
+            &router,
+            case,
+            "GetBlueprintRuns",
+            &json!({ "BlueprintName": name }),
+            name,
+            RUN_HISTORY_MISS,
+        )
+        .await;
+        // A run id the removed blueprint really carried misses the same way as one nothing
+        // minted: this read addresses the run, so both halves of the address it could not
+        // resolve are reported, whichever half is the one that holds nothing.
+        assert_miss(
+            &router,
+            case,
+            "GetBlueprintRun",
+            &json!({ "BlueprintName": name, "RunId": &run_id }),
+            &run_miss(name, &run_id),
+        )
+        .await;
 
         // The refused start above named a blueprint that is gone, so it must not have
         // recorded its run against the registration that remains.

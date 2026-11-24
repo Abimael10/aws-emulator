@@ -989,7 +989,9 @@ async fn reading_a_run_the_blueprint_holds_none_of_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Blueprint run {run_id} not found for blueprint {blueprint}."),
+            // The whole sentence, as a literal: this read addresses the RUN, so it names both
+            // halves of the address it could not resolve.
+            format!("Blueprint run with id:{run_id} and blueprint name:{blueprint} not found"),
             "case {case}: the refusal must name the address asked for, got {body}"
         );
     }

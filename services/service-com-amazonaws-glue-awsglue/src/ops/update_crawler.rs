@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so a crawl the clock has already finished does not refuse this write.
             store.settle_due_crawls(::std::time::SystemTime::now());
             let Some(entry) = store.crawlers.get(&input.name) else {
-                return Err(crawler_not_found(&input.name));
+                return Err(crawler_not_found());
             };
             if entry.state != crate::state::CRAWLER_STATE_READY {
                 return Err(crawler_running(&input.name));
@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_crawls(::std::time::SystemTime::now());
         let Some(entry) = store.crawlers.get_mut(&input.name) else {
-            return Err(crawler_not_found(&input.name));
+            return Err(crawler_not_found());
         };
         if entry.state != crate::state::CRAWLER_STATE_READY {
             return Err(crawler_running(&input.name));
@@ -326,10 +326,12 @@ fn invalid_input(message: String) -> UpdateCrawlerError {
 
 /// This operation's modelled refusal for a `Name` no crawler in this account has. Built
 /// once here because the lookup happens twice: before the role resolution, which cannot
-/// hold the store guard, and again under the guard that writes.
-fn crawler_not_found(name: &str) -> UpdateCrawlerError {
+/// hold the store guard, and again under the guard that writes. The wording is the
+/// definition WRITE's own ([`crate::state::messages::CRAWLER_NOT_FOUND_FOR_UPDATE`]), not
+/// the definition reads', which name the requested crawler.
+fn crawler_not_found() -> UpdateCrawlerError {
     UpdateCrawlerErrorModeled::EntityNotFoundException(EntityNotFoundException {
-        message: Some(crate::state::messages::crawler_not_found(name)),
+        message: Some(crate::state::messages::CRAWLER_NOT_FOUND_FOR_UPDATE.to_string()),
         from_federation_source: None,
     })
     .into()

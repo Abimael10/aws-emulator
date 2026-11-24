@@ -155,30 +155,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // This read addresses the RUN, whose address is the blueprint name AND the run id, so
+        // every address it resolves no run at is reported in the run's own words — naming both
+        // halves — whether the blueprint is absent or merely holds no run under that id. The
+        // blueprint surface's own sentence belongs to the operations that address a blueprint.
         let Some(entry) = store.blueprint_mut(&input.blueprint_name) else {
-            return Err(GetBlueprintRunErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::BLUEPRINT_NOT_FOUND.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+            return Err(run_not_found(&input.blueprint_name, &input.run_id));
         };
         // The only write a read makes: the state change the clock had already made due.
         entry.settle_due_runs(now);
         let Some(run) = entry.run(&input.run_id) else {
-            // A run is addressed by its blueprint AND its id, so an id the blueprint holds
-            // no run under is the same miss as a blueprint nothing registered.
-            return Err(GetBlueprintRunErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::blueprint_run_not_found(
-                        &input.blueprint_name,
-                        &input.run_id,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+            return Err(run_not_found(&input.blueprint_name, &input.run_id));
         };
 
         // "Returns a BlueprintRun object" — rebuilt from the stored run, so this read
@@ -187,4 +174,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             blueprint_run: Some(run.to_blueprint_run()),
         })
     }
+}
+
+/// This operation's modelled miss ("A specified entity does not exist"), worded as the run
+/// read states it ([`crate::state::messages::blueprint_run_not_found`]): built once here
+/// because the address is resolved in two steps — the blueprint, then the run it holds — and
+/// both steps report the one entity this read addresses.
+fn run_not_found(blueprint_name: &str, run_id: &str) -> GetBlueprintRunError {
+    GetBlueprintRunErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::blueprint_run_not_found(
+            blueprint_name,
+            run_id,
+        )),
+        from_federation_source: None,
+    })
+    .into()
 }

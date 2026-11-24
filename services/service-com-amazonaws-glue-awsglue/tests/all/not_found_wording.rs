@@ -53,7 +53,7 @@ fn absent_names() -> Vec<(String, String)> {
 }
 
 /// Assert one refusal: HTTP 400, `EntityNotFoundException`, and `expected` verbatim.
-async fn assert_miss(
+pub(crate) async fn assert_miss(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -162,11 +162,13 @@ async fn write_versioned_table(router: &MultiServiceRouter, database: &str, tabl
     }
 }
 
-/// Every blueprint operation that addresses one blueprint by name answers the service's
-/// FIXED blueprint miss — the sentence states that the name resolved to no blueprint and
-/// carries no part of the request.
+/// Each blueprint operation answers a name this account holds no blueprint under with the
+/// sentence the service words THAT operation's refusal with: the blueprint surface's own
+/// fixed miss for the reads that address a blueprint by name, the run-history read's own
+/// fixed miss, and — for the single-run read, which addresses a RUN — the run's whole
+/// address, both halves of it, because that read reports the run as the missing entity.
 #[tokio::test]
-async fn the_blueprint_miss_is_the_services_fixed_sentence() {
+async fn each_blueprint_operation_words_the_miss_its_own_way() {
     let router = emulator();
     // A blueprint that DOES exist, so every refusal below is about the name it asked for.
     ok(
@@ -180,6 +182,12 @@ async fn the_blueprint_miss_is_the_services_fixed_sentence() {
     .await;
 
     let expected = "Blueprint with given name not found.";
+    // The run-history read's own sentence: the service's generic absent-entity text, which
+    // names neither the blueprint nor the member it was addressed by.
+    let expected_history = "Entity not found";
+    // A run id nothing minted, inside `IdString` ("len 1..255" — `smithy_query
+    // operation=GetBlueprintRun`), so the single-run read misses on the whole address.
+    let unminted_run_id = "br_0000000000000000";
     let mut cases = absent_names();
     // A blueprint name is matched exactly as sent, so a name differing from a stored one
     // only in case is a miss too.
@@ -198,14 +206,28 @@ async fn the_blueprint_miss_is_the_services_fixed_sentence() {
                     "RoleArn": "arn:aws:iam::000000000000:role/GlueBlueprintRole",
                 }),
             ),
-            (
-                "GetBlueprintRun",
-                json!({ "BlueprintName": name, "RunId": "br_0000000000000000" }),
-            ),
-            ("GetBlueprintRuns", json!({ "BlueprintName": name })),
         ] {
             assert_fixed_miss(&router, case, operation, &request, name, expected).await;
         }
+        assert_fixed_miss(
+            &router,
+            case,
+            "GetBlueprintRuns",
+            &json!({ "BlueprintName": name }),
+            name,
+            expected_history,
+        )
+        .await;
+        assert_miss(
+            &router,
+            case,
+            "GetBlueprintRun",
+            &json!({ "BlueprintName": name, "RunId": unminted_run_id }),
+            &format!(
+                "Blueprint run with id:{unminted_run_id} and blueprint name:{name} not found"
+            ),
+        )
+        .await;
     }
 
     // The registration that exists is still served, so the refusals above are about the

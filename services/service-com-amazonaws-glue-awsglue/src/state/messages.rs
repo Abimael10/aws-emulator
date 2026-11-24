@@ -3,16 +3,25 @@
 //! The wording of every refusal this service answers with, so one miss reads the same
 //! wherever it is reported.
 
-/// A crawler lookup (`GetCrawler`, and the `UpdateCrawler` that addresses one the
-/// same way) for a name no crawler in this account has. Built from the request's
-/// `Name`, which is stored and matched exactly as sent.
+/// A crawler lookup (`GetCrawler`, `DeleteCrawler`, `StopCrawler`, and the listings and
+/// definitions that resolve one the same way) for a name no crawler in this account has.
+/// Built from the request's `Name`, which is stored and matched exactly as sent.
 ///
 /// RECORDED template for the crawler-DEFINITION reads. The run surface words the very same
-/// miss its own way ([`start_crawler_not_found`]), so neither of the two may be borrowed
-/// for the other.
+/// miss its own way ([`start_crawler_not_found`]), and so does the definition WRITE
+/// ([`CRAWLER_NOT_FOUND_FOR_UPDATE`]), so none of the three may be borrowed for another.
 pub fn crawler_not_found(name: &str) -> String {
     format!("Crawler entry with name {name} does not exist")
 }
+
+/// `UpdateCrawler` for a `Name` no crawler in this account has.
+///
+/// RECORDED constant, and the whole message: the definition WRITE states the miss over the
+/// member the request addressed the crawler by and withholds the value, where the definition
+/// READS name it ([`crawler_not_found`]) and the start of a crawl words it a third way
+/// ([`start_crawler_not_found`]) — the sentence belongs to the operation that refuses and
+/// not to the resource, so the requested name is NOT interpolated here.
+pub const CRAWLER_NOT_FOUND_FOR_UPDATE: &str = "Crawler with provided name does not exist";
 
 /// `StartCrawler` for a `Name` no crawler in this account has.
 ///
@@ -1941,11 +1950,14 @@ pub const COLUMN_STATISTICS_TASK_SETTINGS_RUN_ALREADY_STARTED: &str =
 
 /// `StopColumnStatisticsTaskRun` for a table with no statistics run in flight — the
 /// operation's modelled `ColumnStatisticsTaskNotRunningException`, "thrown when you
-/// try to stop a task run when there is no task running". NOT recorded: what is
-/// pinned is the behaviour, and the sentence is fixed like the in-flight refusals
-/// above, naming neither the database nor the table.
+/// try to stop a task run when there is no task running".
+///
+/// RECORDED constant, and the whole message: the sentence states that no run of the
+/// requested database and table stands in the state a stop acts on, naming the MEMBERS the
+/// request addressed the run by rather than the values it sent — so neither the database nor
+/// the table is disclosed, as in the in-flight refusals above.
 pub const COLUMN_STATISTICS_TASK_NOT_RUNNING: &str =
-    "Column Statistics task for input table is not running";
+    "No task found in Running state for input database and table name combination";
 
 /// `CreateRegistry` for a `RegistryName` this account already holds. NOT recorded
 /// either: inferred from the recorded `CreateDatabase` duplicate, like
@@ -2023,13 +2035,31 @@ pub const BLUEPRINT_RUN_DEPLOYED_NOTHING: &str =
     "The blueprint's layout created no job, crawler or trigger, so the blueprint run deployed \
      no workflow.";
 
-/// A blueprint run lookup (`GetBlueprintRun`) for a `RunId` the named blueprint holds no
-/// run under. NOT recorded: the sentence follows the per-resource template of
-/// [`column_statistics_task_run_not_found`], built from the ADDRESS the request sent — the
-/// blueprint and the run id, which together name a blueprint run.
+/// A blueprint run lookup (`GetBlueprintRun`) that resolves no run at the address it was
+/// given — a `RunId` the named blueprint holds no run under, and a `BlueprintName` this
+/// account holds no blueprint under at all.
+///
+/// RECORDED template: the fixed text is "Blueprint run with id:", " and blueprint name:"
+/// and " not found", and the two variable parts are the `RunId` and the `BlueprintName` the
+/// request itself sent, which together are the whole address of a blueprint run. The read
+/// addresses the RUN, so BOTH halves of a miss are reported in these words rather than the
+/// blueprint surface's own sentence ([`BLUEPRINT_NOT_FOUND`]) — the recorded miss answers
+/// this sentence for an address whose blueprint this account holds nothing under either, the
+/// same way the workflow surface answers a workflow miss and a run miss alike
+/// ([`WORKFLOW_NOT_FOUND`]).
 pub fn blueprint_run_not_found(blueprint_name: &str, run_id: &str) -> String {
-    format!("Blueprint run {run_id} not found for blueprint {blueprint_name}.")
+    format!("Blueprint run with id:{run_id} and blueprint name:{blueprint_name} not found")
 }
+
+/// A blueprint run HISTORY read (`GetBlueprintRuns`) for a `BlueprintName` this account
+/// holds no blueprint under.
+///
+/// RECORDED constant, and the whole message: the history read answers with the service's
+/// generic absent-entity sentence — the same text [`WORKFLOW_NOT_FOUND`] carries — naming
+/// neither the blueprint nor the member it was addressed by, where the single-run read states
+/// the run's whole address ([`blueprint_run_not_found`]) and the blueprint surface names the
+/// member it was addressed by ([`BLUEPRINT_NOT_FOUND`]): each operation's wording is its own.
+pub const BLUEPRINT_RUNS_NOT_FOUND: &str = "Entity not found";
 
 /// The miss of the WORKFLOW surface: a `Name` that names no workflow this account holds
 /// (`GetWorkflow`, and every sibling that addresses a workflow the same way), and a `RunId`
