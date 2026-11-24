@@ -16349,6 +16349,7 @@ dependencies = [
  "ruzstd",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",

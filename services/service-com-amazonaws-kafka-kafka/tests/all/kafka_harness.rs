@@ -112,6 +112,23 @@ impl Emulator {
         Self::mounting(true, false)
     }
 
+    /// The same emulator with AWS SECRETS MANAGER and AWS KMS both mounted beside this
+    /// service on the SAME engine, as the production router mounts them.
+    ///
+    /// A SASL/SCRAM secret names a customer managed key, and Secrets Manager SEALS the
+    /// value it stores under that key by asking KMS — so a suite about the credential a
+    /// broker reads out of such a secret needs the service that owns the key to be there
+    /// too, and mints the key through its own `CreateKey` ([`Emulator::kms`]).
+    pub fn with_secrets_manager_and_kms() -> Self {
+        let mut emulator = Self::mounting(true, false);
+        emulator.router.register_service(
+            service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(
+                &emulator.engine,
+            )),
+        );
+        emulator
+    }
+
     /// The same emulator with AWS IAM mounted beside this service on the SAME engine,
     /// as the production router mounts them.
     ///
@@ -153,17 +170,39 @@ impl Emulator {
     /// Call one AWS Secrets Manager operation — `target` is its name, as the
     /// `X-Amz-Target` header of that service's awsJson1.1 wire carries it — in `region`.
     pub async fn secrets_manager(&self, region: &str, target: &str, body: Value) -> Reply {
+        self.awsjson("secretsmanager", region, &format!("secretsmanager.{target}"), body)
+            .await
+    }
+
+    /// Call one AWS KMS operation — `target` is its name, as the `X-Amz-Target` header of
+    /// that service's awsJson1.1 wire carries it under KMS's own `TrentService` prefix —
+    /// in `region`.
+    pub async fn kms(&self, region: &str, target: &str, body: Value) -> Reply {
+        self.awsjson("kms", region, &format!("TrentService.{target}"), body)
+            .await
+    }
+
+    /// One awsJson1.1 call of the service that signs under `signing_name`, with
+    /// `target` as the whole `X-Amz-Target` header: the one dispatch every
+    /// neighbouring-service call above is made through.
+    async fn awsjson(
+        &self,
+        signing_name: &str,
+        region: &str,
+        target: &str,
+        body: Value,
+    ) -> Reply {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", format!("secretsmanager.{region}.amazonaws.com"))
+            .header("host", format!("{signing_name}.{region}.amazonaws.com"))
             .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("secretsmanager.{target}"))
+            .header("x-amz-target", target)
             .header(
                 "authorization",
                 format!(
                     "AWS4-HMAC-SHA256 Credential={DEFAULT_ACCESS_KEY_ID}/20240101/{region}\
-                     /secretsmanager/aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+                     /{signing_name}/aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )
             .body(bytes::Bytes::from(

@@ -144,7 +144,7 @@ async fn every_codec_round_trips_with_headers_timestamps_and_the_topic_s_own_cod
 
         let base_timestamp = 1_700_000_000_000;
         let sent = submitted(base_timestamp);
-        let payload = records::encode(&sent, *produced_with)
+        let payload = records::encode(&sent, *produced_with, records::MAGIC_V2)
             .unwrap_or_else(|| panic!("case {case:?}: the batch must encode"));
         let acknowledged = produce(&mut client, case, &topic, 0, payload).await;
         assert_eq!(
@@ -311,7 +311,8 @@ async fn a_log_append_time_topic_stamps_its_own_records() {
     let stated = 1_600_000_000_000;
     let before = epoch_millis();
     let sent = submitted(stated);
-    let payload = records::encode(&sent, RecordCodec::None).expect("the batch encodes");
+    let payload = records::encode(&sent, RecordCodec::None, records::MAGIC_V2)
+        .expect("the batch encodes");
     let acknowledged = produce(&mut client, case, topic, 0, payload).await;
     let after = epoch_millis();
     assert_eq!(
@@ -361,7 +362,8 @@ async fn an_unreadable_batch_is_refused_and_appends_nothing() {
 
     // One good batch first, so the rows below have an end offset that must not move.
     let sent = submitted(1_700_000_000_000);
-    let good = records::encode(&sent, RecordCodec::None).expect("the batch encodes");
+    let good = records::encode(&sent, RecordCodec::None, records::MAGIC_V2)
+        .expect("the batch encodes");
     produce(&mut client, "a readable batch", topic, 0, good.clone()).await;
 
     let truncated = good.slice(0..good.len() - 4);
@@ -392,6 +394,7 @@ async fn an_unreadable_batch_is_refused_and_appends_nothing() {
             codec: RecordCodec::Gzip,
         }],
         RecordCodec::Gzip,
+        records::MAGIC_V2,
     )
     .expect("the batch encodes");
     assert!(

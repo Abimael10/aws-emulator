@@ -115,6 +115,16 @@ automod = { workspace = true }
 # workspace already builds.
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# A SASL/SCRAM secret names a customer managed key, and Secrets Manager seals the value it
+# stores under that key by asking KMS: the suite that drives a credential sealed that way
+# mounts the service that OWNS the key beside this one, on the same engine, and mints the
+# key through its own `CreateKey`.
+service-com-amazonaws-kms-trentservice = { workspace = true }
+# The CRC-32 Apache Kafka's older message formats checksum every message with, which the
+# data-plane suite frames those formats with: the same crate this crate's record layer takes
+# it from, so the suite's framing and the broker's agree by construction rather than by a
+# second implementation.
+flate2 = "1"
 
 [lints]
 workspace = true

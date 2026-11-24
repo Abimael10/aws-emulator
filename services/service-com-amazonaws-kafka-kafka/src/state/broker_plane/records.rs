@@ -20,29 +20,26 @@
 //! no codec of its own.
 
 use ::bytes::{Buf, BufMut, Bytes, BytesMut};
-use ::kafka_protocol::records::RecordBatchDecoder;
 
 use super::{codecs, RecordCodec, RecordHeaders, StoredRecord, SubmittedRecord};
 
 /// The record batch format this endpoint writes and reads field by field: the one
-/// Apache Kafka has used since 0.11, which is the only one that carries headers.
-const MAGIC_V2: i8 = 2;
+/// Apache Kafka has used since 0.11, which is the only one that carries headers — and
+/// the one every current producer writes, so it is also the format a batch this endpoint
+/// is HANDED arrives in.
+pub const MAGIC_V2: i8 = 2;
+
+/// The two message formats that predate it, which a client fetching at an older version
+/// of the API reads: the oldest, which carries neither a timestamp nor headers, and the
+/// one that added a timestamp (Apache Kafka message format v0 and v1).
+const MAGIC_V0: i8 = 0;
+/// See [`MAGIC_V0`].
+const MAGIC_V1: i8 = 1;
 
 /// Where the magic byte sits in a batch: a batch opens with its base offset (8), its
 /// length (4) and its partition leader epoch (4), and the magic follows them.
 const MAGIC_OFFSET: usize = 16;
 
-/// Where the ATTRIBUTES byte of one message of a batch in the two older formats sits,
-/// relative to the message's own start, and where that message's SIZE sits: those formats
-/// write each message as an offset (8) and a size (4), then the message itself — a CRC
-/// (4), the magic (1) and the attributes, which is the byte that names the message's
-/// codec. [`LEGACY_PREFIX_BYTES`] is what the size does NOT count, so the next message
-/// begins that many bytes plus the size on.
-const LEGACY_SIZE_OFFSET: usize = 8;
-/// See [`LEGACY_SIZE_OFFSET`].
-const LEGACY_PREFIX_BYTES: usize = 12;
-/// See [`LEGACY_SIZE_OFFSET`].
-const LEGACY_ATTRIBUTES_OFFSET: usize = 17;
 /// The bytes of one batch's fixed header that FOLLOW its `batch_length` field, which is
 /// what that field counts: the leader epoch, the magic, the CRC, the attributes, the
 /// last offset delta, the base and max timestamps, the producer id and epoch, the base
@@ -67,6 +64,11 @@ const CODEC_SNAPPY: i16 = 2;
 const CODEC_LZ4: i16 = 3;
 /// See [`CODEC_NONE`].
 const CODEC_ZSTD: i16 = 4;
+
+/// The timestamp a message in a format that carries none states, and the one a record
+/// whose producer set none carries: Apache Kafka's `NO_TIMESTAMP`. A record that states it
+/// is stamped by the broker at the instant it appends it.
+const NO_TIMESTAMP: i64 = -1;
 
 /// The `producer_id`, `producer_epoch` and `base_sequence` a batch no idempotent
 /// producer owns carries (Apache Kafka writes -1 for each), each in the width its own
@@ -130,65 +132,87 @@ pub fn decode(payload: &Bytes, budget: &mut usize) -> Option<Vec<SubmittedRecord
     }
 }
 
-/// The records of a batch in a format that predates headers, read by the protocol
-/// implementation's own decoder.
+/// The records of a batch in a format that predates headers, read field by field.
 ///
-/// Only an UNCOMPRESSED batch of those formats is read, and that is decided from the
-/// batch's OWN BYTES before the decoder is handed them: the codec a batch of these
-/// formats names sits in the attributes byte of its header, and one that names a codec
-/// would expand inside the decoder, outside the budget every batch above is read under.
-/// What is left is a batch whose records are its own bytes, so the budget is judged
-/// against the payload itself before anything is read and charged for it after.
+/// Those formats are a CONCATENATION of self-describing messages, each with its own
+/// offset, size, checksum, magic and attributes. Only an UNCOMPRESSED message is read: a
+/// message naming a codec would expand inside the decode, outside the budget every batch
+/// above is read under. What is left is a message whose record is its own bytes, so the
+/// budget is judged against the payload itself before anything is read and charged for it
+/// after.
+///
+/// Neither format carries headers, and the OLDEST carries no timestamp at all: such a
+/// message states [`NO_TIMESTAMP`], which is what the broker stamps at append.
 fn decode_legacy(payload: &Bytes, budget: &mut usize) -> Option<Vec<SubmittedRecord>> {
     if payload.len() > *budget {
         return None;
     }
-    if !legacy_is_uncompressed(payload)? {
-        return None;
-    }
-    let mut encoded = payload.clone();
-    let decoded = RecordBatchDecoder::decode(&mut encoded).ok()?;
-    if decoded.records.len() > MAX_RECORDS_PER_PAYLOAD {
-        return None;
+    let mut records: Vec<SubmittedRecord> = Vec::new();
+    let mut remaining = payload.clone();
+    while remaining.has_remaining() {
+        let _offset = remaining.try_get_i64().ok()?;
+        let size = usize::try_from(remaining.try_get_i32().ok()?).ok()?;
+        if size > remaining.remaining() {
+            return None;
+        }
+        let mut message = remaining.split_to(size);
+        let stated_crc = message.try_get_u32().ok()?;
+        // The two older formats checksum every MESSAGE on its own, over everything after
+        // the checksum itself, with the CRC-32 Apache Kafka's message format states.
+        if crc32(&message) != stated_crc {
+            return None;
+        }
+        let magic = message.try_get_i8().ok()?;
+        if magic != MAGIC_V0 && magic != MAGIC_V1 {
+            return None;
+        }
+        let attributes = message.try_get_i8().ok()?;
+        if i16::from(attributes) & CODEC_MASK != CODEC_NONE {
+            return None;
+        }
+        let timestamp_ms = match magic >= MAGIC_V1 {
+            true => message.try_get_i64().ok()?,
+            false => NO_TIMESTAMP,
+        };
+        let key = read_sized_bytes(&mut message)?;
+        let value = read_sized_bytes(&mut message)?;
+        records.push(SubmittedRecord {
+            timestamp_ms,
+            key,
+            value,
+            headers: Vec::new(),
+            codec: RecordCodec::None,
+        });
+        if records.len() > MAX_RECORDS_PER_PAYLOAD {
+            return None;
+        }
     }
     *budget = budget.checked_sub(payload.len())?;
-    Some(
-        decoded
-            .records
-            .iter()
-            .map(|record| SubmittedRecord {
-                timestamp_ms: record.timestamp,
-                key: record.key.as_ref().map(|key| key.to_vec()),
-                value: record.value.as_ref().map(|value| value.to_vec()),
-                headers: Vec::new(),
-                codec: RecordCodec::None,
-            })
-            .collect(),
-    )
+    Some(records)
 }
 
-/// Whether EVERY message of a payload in one of the two older formats is uncompressed,
-/// and `None` for bytes that are no such payload at all.
-///
-/// Those formats are a CONCATENATION of self-describing messages, each with its own
-/// offset, size, checksum, magic and attributes — so each one names its own codec, and a
-/// message naming one would expand inside the decoder, outside the budget every batch is
-/// read under. Every message's attributes are therefore read here, from the payload's own
-/// bytes, before the decoder is handed any of them; each step is bounds-checked against
-/// the payload and advances by at least a message header, so the walk is as bounded as
-/// the payload is.
-fn legacy_is_uncompressed(payload: &[u8]) -> Option<bool> {
-    let mut at = 0usize;
-    while at < payload.len() {
-        let size = payload.get(at + LEGACY_SIZE_OFFSET..at + LEGACY_PREFIX_BYTES)?;
-        let size = usize::try_from(i32::from_be_bytes([size[0], size[1], size[2], size[3]])).ok()?;
-        let attributes = *payload.get(at + LEGACY_ATTRIBUTES_OFFSET)? as i8;
-        if i16::from(attributes) & CODEC_MASK != CODEC_NONE {
-            return Some(false);
-        }
-        at = at.checked_add(LEGACY_PREFIX_BYTES)?.checked_add(size)?;
+/// One `BYTES` of the two older message formats: an `INT32` length and that many bytes,
+/// where `-1` is the ABSENCE of the field — a message with no key, a tombstone's absent
+/// value.
+fn read_sized_bytes(message: &mut Bytes) -> Option<Option<Vec<u8>>> {
+    let length = message.try_get_i32().ok()?;
+    if length < 0 {
+        return Some(None);
     }
-    Some(true)
+    let length = usize::try_from(length).ok()?;
+    if length > message.remaining() {
+        return None;
+    }
+    Some(Some(message.split_to(length).to_vec()))
+}
+
+/// The CRC-32 one message of those formats states over itself: the checksum Apache Kafka's
+/// message format names, computed here because the record batch states a different one
+/// (CRC-32C) and the gzip stream's own implementation is the only CRC-32 this crate links.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = ::flate2::Crc::new();
+    crc.update(bytes);
+    crc.sum()
 }
 
 /// One batch off the front of `buf`, leaving the buffer at the batch after it and taking
@@ -347,13 +371,25 @@ fn write_nullable_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
     }
 }
 
-/// The batch a fetch answers `records` with, compressed with `codec`.
+/// The batch a fetch answers `records` with, compressed with `codec`, in the MESSAGE
+/// FORMAT the version of the fetch carries ([`fetch_magic`]).
 ///
 /// Every field of each record is written back as the log holds it — its offset, its
 /// timestamp and the kind of timestamp it is, its key, its value and its headers in
 /// order — so a consumer reads the record the producer sent.
+///
+/// The two older formats carry neither headers nor (for the oldest) a timestamp, so a
+/// client that negotiated one of them is answered with what that format HAS: a broker
+/// converts the batch down to the format the fetching client can read, and what the
+/// format has no field for cannot be reported in it. Those formats are written by the
+/// protocol implementation's own encoder, which is what computes their per-message
+/// checksum, and they are handed back UNCOMPRESSED — the codec of such a message is its
+/// own, and every client of those versions reads an uncompressed one.
 #[must_use]
-pub fn encode(records: &[StoredRecord], codec: RecordCodec) -> Option<Bytes> {
+pub fn encode(records: &[StoredRecord], codec: RecordCodec, magic: i8) -> Option<Bytes> {
+    if magic < MAGIC_V2 {
+        return encode_legacy(records, magic);
+    }
     let first = records.first()?;
     let base_offset = first.offset;
     let base_timestamp = first.timestamp_ms;
@@ -419,5 +455,67 @@ fn codec_bits(codec: RecordCodec) -> i16 {
         RecordCodec::Snappy => CODEC_SNAPPY,
         RecordCodec::Lz4 => CODEC_LZ4,
         RecordCodec::Zstd => CODEC_ZSTD,
+    }
+}
+
+/// The MESSAGE FORMAT a `Fetch` of `api_version` is answered in: the magic a client that
+/// negotiated that version can read.
+///
+/// A broker converts the records of its log DOWN to the format the fetching client
+/// understands, and which that is follows from the version of the fetch alone: the record
+/// batch (magic 2) arrived with `Fetch` version 4, the message set carrying a timestamp
+/// (magic 1) with version 2, and version 0 and 1 of the API carry only the oldest message
+/// set (magic 0) — a client that negotiated one of them cannot read a newer batch at all,
+/// so answering one leaves it reading no records out of a non-empty answer.
+#[must_use]
+pub fn fetch_magic(api_version: i16) -> i8 {
+    match api_version {
+        ..=1 => MAGIC_V0,
+        2..=3 => MAGIC_V1,
+        _ => MAGIC_V2,
+    }
+}
+
+/// The message set `records` are handed back in for a client that negotiated one of the
+/// two formats that predate the record batch.
+///
+/// Those formats are a concatenation of self-describing messages: each one carries its own
+/// offset, its size, its CRC-32 over everything after it, the magic, the attributes, the
+/// timestamp (from magic 1 on) and its key and value. What the format has no field for is
+/// not reported in it — magic 0 carries no timestamp, and neither format carries headers —
+/// and the messages are handed back UNCOMPRESSED, which every client of those versions
+/// reads.
+fn encode_legacy(records: &[StoredRecord], magic: i8) -> Option<Bytes> {
+    let mut encoded = BytesMut::new();
+    for record in records {
+        // Everything the message's CRC covers: the magic to the end of the value.
+        let mut message = BytesMut::new();
+        message.put_i8(magic);
+        message.put_i8(match record.log_append_time {
+            true => LOG_APPEND_TIME_BIT as i8,
+            false => 0,
+        });
+        if magic >= MAGIC_V1 {
+            message.put_i64(record.timestamp_ms);
+        }
+        write_sized_bytes(&mut message, record.key.as_deref());
+        write_sized_bytes(&mut message, record.value.as_deref());
+        encoded.put_i64(record.offset);
+        // The size counts the CRC and everything it covers.
+        encoded.put_i32(i32::try_from(message.len() + 4).unwrap_or(i32::MAX));
+        encoded.put_u32(crc32(&message));
+        encoded.put_slice(&message);
+    }
+    Some(encoded.freeze())
+}
+
+/// Write one `BYTES` of those formats, with `-1` for an absent one.
+fn write_sized_bytes(message: &mut BytesMut, value: Option<&[u8]>) {
+    match value {
+        None => message.put_i32(-1),
+        Some(bytes) => {
+            message.put_i32(i32::try_from(bytes.len()).unwrap_or(i32::MAX));
+            message.put_slice(bytes);
+        }
     }
 }

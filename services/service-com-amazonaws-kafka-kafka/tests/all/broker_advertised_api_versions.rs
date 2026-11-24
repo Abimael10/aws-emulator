@@ -35,8 +35,9 @@ use ::kafka_protocol::messages::{
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
     SyncGroupRequest, SyncGroupResponse,
 };
+use ::kafka_protocol::protocol::Message;
 
-use crate::broker_data_plane::Client;
+use crate::broker_data_plane::{pre_flexible, Client};
 use crate::kafka_harness::{ClusterRequest, Emulator};
 
 /// Send one request of `key` at `version` and read the response back, decoding it in the
@@ -50,6 +51,29 @@ use crate::kafka_harness::{ClusterRequest, Emulator};
 async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
     match key {
         ApiKey::Produce => {
+            // The oldest versions this endpoint advertises are ones the protocol crate
+            // cannot encode, and a client of them sends the MESSAGE SET its own produce
+            // version carries rather than a record batch.
+            if version < ProduceRequest::VERSIONS.min {
+                let records = pre_flexible::message_set(
+                    match version >= 2 {
+                        true => 1,
+                        false => 0,
+                    },
+                    &[(1_700_000_000_000, None, "advertised")],
+                );
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::produce_body("versions-swept", 0, &records, 1_000),
+                    )
+                    .await
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                pre_flexible::produce_results(&answered, version)
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                return;
+            }
             let _: ProduceResponse = client
                 .call(
                     case,
@@ -60,6 +84,19 @@ async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
                 .await;
         }
         ApiKey::Fetch => {
+            if version < FetchRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::fetch_body(version, "versions-swept", 0, 0, 0),
+                    )
+                    .await
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                pre_flexible::fetch_results(&answered, version)
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                return;
+            }
             let _: FetchResponse = client.call(case, key, version, &FetchRequest::default()).await;
         }
         ApiKey::ListOffsets => {
@@ -128,6 +165,24 @@ async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
                 .await;
         }
         ApiKey::CreateTopics => {
+            let topic = format!("versions-{}-{version}", key as i16);
+            // The oldest versions this endpoint advertises are ones the protocol crate
+            // cannot encode, so a client picking one frames the request itself.
+            if version < CreateTopicsRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::create_topics_body(
+                            version, &topic, -1, -1, &[], 1_000, false,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                pre_flexible::topic_results(&answered, version >= 1)
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                return;
+            }
             let _: CreateTopicsResponse = client
                 .call(
                     case,
@@ -138,10 +193,7 @@ async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
                         .with_topics(vec![
                             ::kafka_protocol::messages::create_topics_request::CreatableTopic::default()
                                 .with_name(::kafka_protocol::messages::TopicName(
-                                    ::kafka_protocol::protocol::StrBytes::from_string(format!(
-                                        "versions-{}-{version}",
-                                        key as i16
-                                    )),
+                                    ::kafka_protocol::protocol::StrBytes::from_string(topic),
                                 ))
                                 // The count and the factor the BROKER decides, which is
                                 // what the fields a newer response carries report back.
@@ -152,6 +204,19 @@ async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
                 .await;
         }
         ApiKey::DeleteTopics => {
+            if version < DeleteTopicsRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::delete_topics_body(&[], 1_000),
+                    )
+                    .await
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                pre_flexible::topic_results(&answered, false)
+                    .unwrap_or_else(|why| panic!("case {case:?}: {why}"));
+                return;
+            }
             let _: DeleteTopicsResponse = client
                 .call(
                     case,

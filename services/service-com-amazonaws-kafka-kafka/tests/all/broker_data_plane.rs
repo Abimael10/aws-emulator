@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use ::bytes::{Bytes, BytesMut};
+use ::bytes::{BufMut, Bytes, BytesMut};
 use ::kafka_protocol::messages::{
     describe_configs_request::DescribeConfigsResource,
     fetch_request::{FetchPartition, FetchTopic},
@@ -39,7 +39,7 @@ use ::kafka_protocol::messages::{
     ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
     SaslHandshakeResponse, TopicName,
 };
-use ::kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use ::kafka_protocol::protocol::{Decodable, Encodable, Message, StrBytes};
 use ::kafka_protocol::records::{
     Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
@@ -1127,6 +1127,50 @@ impl Client {
             .collect()
     }
 
+    /// `Fetch` one partition at ONE version of the API, answering the partition's high
+    /// watermark and the records bytes exactly as the broker framed them — so a suite can
+    /// read the MESSAGE FORMAT the answer carries as well as the records in it.
+    ///
+    /// Only the members the negotiated version declares are set: `MaxBytes` arrived with
+    /// version 3, so a request below it states none.
+    pub(crate) async fn fetch_at(
+        &mut self,
+        case: &str,
+        version: i16,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> (i64, Bytes) {
+        let mut request = FetchRequest::default()
+            .with_max_wait_ms(100)
+            .with_min_bytes(0)
+            .with_topics(vec![FetchTopic::default()
+                .with_topic(TopicName(StrBytes::from_string(topic.to_string())))
+                .with_partitions(vec![FetchPartition::default()
+                    .with_partition(partition)
+                    .with_fetch_offset(offset)
+                    .with_partition_max_bytes(1_048_576)])]);
+        if version >= 3 {
+            request = request.with_max_bytes(1_048_576);
+        }
+        let answered: FetchResponse = self.call(case, ApiKey::Fetch, version, &request).await;
+        let partition_data = answered
+            .responses
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .unwrap_or_else(|| panic!("case {case:?}: Fetch reported no partition"))
+            .clone();
+        assert_eq!(
+            partition_data.error_code, 0,
+            "case {case:?}: Fetch must be answered, got error {}",
+            partition_data.error_code
+        );
+        (
+            partition_data.high_watermark,
+            partition_data.records.clone().unwrap_or_default(),
+        )
+    }
+
     /// `ListOffsets` for one partition at `timestamp`.
     async fn offset(&mut self, case: &str, topic: &str, partition: i32, timestamp: i64) -> i64 {
         let answered: ListOffsetsResponse = self
@@ -1359,16 +1403,22 @@ async fn a_produced_record_is_readable_from_the_earliest_offset() {
     }
 }
 
-/// RULE: a record older than its topic's `retention.ms` is no longer served, and the
-/// partition's earliest readable offset moves past it — while a record inside the
-/// window, and every record of a topic whose retention is unlimited, stays readable.
+/// RULE: a record older than its topic's `retention.ms` is no longer served once the log
+/// has CLOSED the segment it sits in, and the partition's earliest readable offset moves
+/// past it — while a record inside the window, every record of a topic whose retention is
+/// unlimited, and the records of the segment the log is still appending to (which Apache
+/// Kafka never deletes) stay readable.
 #[tokio::test]
 async fn records_past_the_topics_retention_are_no_longer_fetched() {
     let emulator = Emulator::new();
     let cluster = given_plaintext_cluster(&emulator, "plane-retention").await;
     // The rows differ along the topic's retention and the AGE of the record against
     // it: the age is the record's own timestamp, which is what a producer sets and
-    // what the broker ages a record out by, so no row waits for a clock.
+    // what the broker ages a record out by, so no row waits for a clock. Every row
+    // produces a SECOND, fresh record after the first, which is what closes the first
+    // record's segment: the topic's `segment.ms` is set low enough that the second
+    // append rolls the log, so the aged record is in a segment the sweep may delete
+    // while the fresh one is in the segment the log is appending to.
     // (case, topic, retention.ms as the topic sets it, the record's age, still readable)
     let rows: &[(&str, &str, Option<&str>, Duration, bool)] = &[
         (
@@ -1408,7 +1458,13 @@ async fn records_past_the_topics_retention_are_no_longer_fetched() {
         ),
     ];
     for (case, topic, retention, age, readable) in rows {
-        let configs = retention.map(|retention| json!({ "retention.ms": retention }));
+        // `segment.ms` of one second: the fresh record below is produced far enough past
+        // the aged one for the log to close the segment that holds it, which is what
+        // makes it sweepable at all.
+        let configs = Some(match retention {
+            Some(retention) => json!({ "retention.ms": retention, "segment.ms": "1000" }),
+            None => json!({ "segment.ms": "1000" }),
+        });
         given_topic(&emulator, &cluster, topic, 1, configs).await;
         let authority = plaintext_address(&emulator, &cluster, case).await;
         let mut client = Client::plaintext(case, &authority).await;
@@ -1418,11 +1474,16 @@ async fn records_past_the_topics_retention_are_no_longer_fetched() {
         client
             .produce(case, topic, 0, &[(stamped, Some("key"), "payload")])
             .await;
+        // The record that closes the first one's segment, so what the sweep may remove is
+        // decided by the retention and not by the segment the log still appends to.
+        client
+            .produce(case, topic, 0, &[(epoch_millis(), Some("key"), "fresh")])
+            .await;
         let read = client.fetch(case, topic, 0, 0).await;
+        let holds_the_aged_record = read.iter().any(|(offset, _, _)| *offset == 0);
         assert_eq!(
-            !read.is_empty(),
-            *readable,
-            "case {case:?}: expected the record to be {}, got {read:?}",
+            holds_the_aged_record, *readable,
+            "case {case:?}: expected the aged record to be {}, got {read:?}",
             match readable {
                 true => "readable",
                 false => "aged out",
@@ -1431,7 +1492,7 @@ async fn records_past_the_topics_retention_are_no_longer_fetched() {
         let earliest = client.offset(case, topic, 0, OFFSET_EARLIEST).await;
         let latest = client.offset(case, topic, 0, OFFSET_LATEST).await;
         assert_eq!(
-            latest, 1,
+            latest, 2,
             "case {case:?}: retention moves the log's start, never its end"
         );
         assert_eq!(
@@ -3139,6 +3200,29 @@ pub(crate) async fn given_secret_associated_as(
     password: &str,
     case: &str,
 ) -> String {
+    given_secret_associated_under_key(
+        emulator,
+        cluster,
+        name,
+        user,
+        password,
+        CUSTOMER_KEY_ARN,
+        case,
+    )
+    .await
+}
+
+/// The same, under the customer managed key `kms_key_id` — so a suite whose rule is about
+/// the KEY the secret's value is SEALED under names a key the account really holds.
+pub(crate) async fn given_secret_associated_under_key(
+    emulator: &Emulator,
+    cluster: &str,
+    name: &str,
+    user: &str,
+    password: &str,
+    kms_key_id: &str,
+    case: &str,
+) -> String {
     let created = emulator
         .secrets_manager(
             REGION,
@@ -3146,7 +3230,7 @@ pub(crate) async fn given_secret_associated_as(
             json!({
                 "Name": name,
                 "ClientRequestToken": format!("00000000-0000-4000-8000-{:012x}", name.len() * 7919),
-                "KmsKeyId": CUSTOMER_KEY_ARN,
+                "KmsKeyId": kms_key_id,
                 "SecretString":
                     format!("{{\"username\":\"{user}\",\"password\":\"{password}\"}}"),
             }),
@@ -3229,6 +3313,53 @@ impl Client {
             .map_err(|error| format!("the response does not decode: {error}"))
     }
 
+    /// Send one PRE-FLEXIBLE request — the versions of the data-plane APIs that carry an
+    /// `INT32` array count, an `INT16` string length and no tagged fields — and read the
+    /// answer back, as the bytes that follow its response header.
+    ///
+    /// Those versions are ones every Apache Kafka 3.x broker answers and the protocol
+    /// crate this suite frames every other request with cannot encode (its message types
+    /// start above them), so the frame is written here: that is exactly what a client that
+    /// frames the protocol itself does, and a suite that skipped them would not drive the
+    /// oldest versions the broker advertises at all.
+    ///
+    /// `Err` carries what went wrong, like [`Client::exchange`].
+    pub(crate) async fn exchange_pre_flexible(
+        &mut self,
+        key: ApiKey,
+        version: i16,
+        body: &[u8],
+    ) -> Result<Bytes, String> {
+        self.correlation += 1;
+        let mut frame = BytesMut::new();
+        // Request header version 1: the api key, the version, the correlation id and the
+        // client id, which is the header every pre-flexible request carries.
+        frame.put_i16(key as i16);
+        frame.put_i16(version);
+        frame.put_i32(self.correlation);
+        frame.put_i16(i16::try_from(self.client_id.len()).unwrap_or_default());
+        frame.put_slice(self.client_id.as_bytes());
+        frame.put_slice(body);
+        let length = u32::try_from(frame.len()).expect("a request frame fits in a u32");
+        self.session
+            .write_all(&length.to_be_bytes())
+            .await
+            .map_err(|error| format!("the frame could not be written: {error}"))?;
+        self.session
+            .write_all(&frame)
+            .await
+            .map_err(|error| format!("the frame could not be written: {error}"))?;
+        let mut answered = self
+            .answer()
+            .await
+            .ok_or_else(|| "the broker closed the connection instead of answering".to_string())?;
+        // Response header version 0: the correlation id alone.
+        if answered.len() < 4 {
+            return Err("the answer carries no response header".to_string());
+        }
+        Ok(answered.split_off(4))
+    }
+
     /// The next response frame, or `None` when the broker closed the connection or
     /// framed something this client cannot read.
     async fn answer(&mut self) -> Option<Bytes> {
@@ -3302,6 +3433,26 @@ async fn call_at(
                 .map(drop)
         }
         ApiKey::Produce => {
+            // The oldest versions this endpoint advertises are ones the protocol crate
+            // cannot encode, and a client of them sends the MESSAGE SET its own produce
+            // version carries rather than a record batch.
+            if version < wire::ProduceRequest::VERSIONS.min {
+                let records = pre_flexible::message_set(
+                    match version >= 2 {
+                        true => 1,
+                        false => 0,
+                    },
+                    &[(epoch_millis(), None, "swept")],
+                );
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::produce_body(topic, 0, &records, 1_000),
+                    )
+                    .await?;
+                return pre_flexible::produce_results(&answered, version).map(drop);
+            }
             let record = Record {
                 transactional: false,
                 control: false,
@@ -3341,6 +3492,16 @@ async fn call_at(
                 .map(drop)
         }
         ApiKey::Fetch => {
+            if version < wire::FetchRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::fetch_body(version, topic, 0, 0, 0),
+                    )
+                    .await?;
+                return pre_flexible::fetch_results(&answered, version).map(drop);
+            }
             let request = FetchRequest::default()
                 .with_max_wait_ms(0)
                 .with_min_bytes(1)
@@ -3523,13 +3684,27 @@ async fn call_at(
         }
         ApiKey::CreateTopics => {
             // A name of its own per row, so no row depends on another's outcome.
+            let name = format!("swept-create-v{version}");
+            // The oldest versions this endpoint advertises are ones the protocol crate
+            // cannot encode, so a client that picks one frames it itself
+            // ([`pre_flexible`]) — which is what the broker has to answer.
+            if version < wire::CreateTopicsRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::create_topics_body(
+                            version, &name, 1, 1, &[], 1_000, false,
+                        ),
+                    )
+                    .await?;
+                return pre_flexible::topic_results(&answered, version >= 1).map(drop);
+            }
             let request = wire::CreateTopicsRequest::default()
                 .with_timeout_ms(1_000)
                 .with_topics(vec![
                     wire::create_topics_request::CreatableTopic::default()
-                        .with_name(TopicName(StrBytes::from_string(format!(
-                            "swept-create-v{version}"
-                        ))))
+                        .with_name(TopicName(StrBytes::from_string(name)))
                         .with_num_partitions(1)
                         .with_replication_factor(1),
                 ]);
@@ -3557,11 +3732,20 @@ async fn call_at(
                 .map(drop)
         }
         ApiKey::DeleteTopics => {
+            let name = format!("swept-delete-v{version}");
+            if version < wire::DeleteTopicsRequest::VERSIONS.min {
+                let answered = client
+                    .exchange_pre_flexible(
+                        key,
+                        version,
+                        &pre_flexible::delete_topics_body(&[name.as_str()], 1_000),
+                    )
+                    .await?;
+                return pre_flexible::topic_results(&answered, false).map(drop);
+            }
             let request = wire::DeleteTopicsRequest::default()
                 .with_timeout_ms(1_000)
-                .with_topic_names(vec![TopicName(StrBytes::from_string(format!(
-                    "swept-delete-v{version}"
-                )))]);
+                .with_topic_names(vec![TopicName(StrBytes::from_string(name))]);
             client
                 .exchange::<_, wire::DeleteTopicsResponse>(key, version, &request)
                 .await
@@ -3912,4 +4096,351 @@ async fn every_advertised_api_version_is_answered() {
         "case {case:?}: every advertised (API, version) pair must be answered with the \
          response that version declares; these were not: {unanswered:#?}"
     );
+}
+
+/// The PRE-FLEXIBLE frames of the topic-administration APIs, written by this suite.
+///
+/// `CreateTopics` from version 0 and `DeleteTopics` from version 0 are versions every
+/// Apache Kafka 3.x broker answers, and the `kafka-protocol` crate — which tracks the 4.x
+/// message definitions, where they were removed — cannot encode them. A client that picks
+/// one of them frames it itself: an `INT32` count before every array, an `INT16` length
+/// before every string, no tagged fields and no throttle time. Written here INDEPENDENTLY
+/// of the broker's own framing, so these suites agree with the published protocol rather
+/// than with the code under test.
+pub(crate) mod pre_flexible {
+    use ::bytes::{BufMut, Bytes, BytesMut};
+
+    /// What one answer says about one partition: its topic, its index, its error code,
+    /// its high watermark and the records bytes exactly as the broker framed them.
+    pub(crate) type FetchedPartition = (String, i32, i16, i64, Bytes);
+
+    /// One record read out of a message set: its offset, its key, its value and its
+    /// timestamp (`-1` in the format that carries none).
+    pub(crate) type ReadRecord = (i64, Option<String>, Option<String>, i64);
+
+    /// The MESSAGE SET a client of the oldest produce versions sends, and the broker
+    /// answers the oldest fetch versions with: a concatenation of self-describing
+    /// messages, each carrying its offset, its size, its CRC-32 over everything after it,
+    /// the magic, the attributes, the timestamp (from magic 1 on), and its key and value.
+    ///
+    /// Written here from the published format rather than through a library, because the
+    /// protocol crate this suite frames everything else with refuses to encode these
+    /// formats at all — which is exactly why the broker has to frame them itself.
+    pub(crate) fn message_set(magic: i8, records: &[(i64, Option<&str>, &str)]) -> Bytes {
+        let mut encoded = BytesMut::new();
+        for (index, (timestamp, key, value)) in records.iter().enumerate() {
+            let mut message = BytesMut::new();
+            message.put_i8(magic);
+            // Uncompressed, with the producer's own timestamps.
+            message.put_i8(0);
+            if magic >= 1 {
+                message.put_i64(*timestamp);
+            }
+            match key {
+                None => message.put_i32(-1),
+                Some(key) => {
+                    message.put_i32(i32::try_from(key.len()).unwrap_or_default());
+                    message.put_slice(key.as_bytes());
+                }
+            }
+            message.put_i32(i32::try_from(value.len()).unwrap_or_default());
+            message.put_slice(value.as_bytes());
+            encoded.put_i64(i64::try_from(index).unwrap_or_default());
+            encoded.put_i32(i32::try_from(message.len() + 4).unwrap_or_default());
+            encoded.put_u32(crc32(&message));
+            encoded.put_slice(&message);
+        }
+        encoded.freeze()
+    }
+
+    /// The CRC-32 one such message states over itself: Apache Kafka's message format
+    /// checksums every message with the IEEE CRC-32, taken from the crate this workspace
+    /// already links for the gzip stream rather than written out here.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = ::flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+
+    /// The `Produce` request body of `version` (0, 1 or 2) for one partition.
+    pub(crate) fn produce_body(
+        topic: &str,
+        partition: i32,
+        records: &Bytes,
+        timeout_ms: i32,
+    ) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        // Acknowledged by the leader, which is what a producer asks for.
+        body.put_i16(1);
+        body.put_i32(timeout_ms);
+        body.put_i32(1);
+        put_string(&mut body, topic);
+        body.put_i32(1);
+        body.put_i32(partition);
+        body.put_i32(i32::try_from(records.len()).unwrap_or_default());
+        body.put_slice(records);
+        body.to_vec()
+    }
+
+    /// What one such answer says about one partition: its error code and the offset the
+    /// batch was appended at.
+    pub(crate) fn produce_results(
+        answered: &Bytes,
+        version: i16,
+    ) -> Result<Vec<(String, i32, i16, i64)>, String> {
+        let mut body = answered.clone();
+        let count = int32(&mut body).ok_or_else(|| "the answer states no topic count".to_string())?;
+        let mut results = Vec::new();
+        for index in 0..count {
+            let name = string(&mut body).ok_or_else(|| format!("topic {index} is unnamed"))?;
+            let partitions =
+                int32(&mut body).ok_or_else(|| format!("topic {index} states no partitions"))?;
+            for _ in 0..partitions {
+                let partition = int32(&mut body).ok_or_else(|| "a partition has no index".to_string())?;
+                let code = int16(&mut body).ok_or_else(|| "a partition has no error code".to_string())?;
+                let offset = int64(&mut body).ok_or_else(|| "a partition has no offset".to_string())?;
+                // The instant the broker stamped the batch at arrives with version 2.
+                if version >= 2 {
+                    int64(&mut body)
+                        .ok_or_else(|| "a partition has no append time".to_string())?;
+                }
+                results.push((name.clone(), partition, code, offset));
+            }
+        }
+        // The throttle time of this response is its LAST member, from version 1 on.
+        if version >= 1 {
+            int32(&mut body).ok_or_else(|| "the answer states no throttle time".to_string())?;
+        }
+        match body.is_empty() {
+            true => Ok(results),
+            false => Err(format!("{} bytes of the answer were not read", body.len())),
+        }
+    }
+
+    /// The `Fetch` request body of `version` (0 to 3) for one partition from `offset`.
+    pub(crate) fn fetch_body(
+        version: i16,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_wait_ms: i32,
+    ) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        // No replica of its own: a consumer fetches as a client.
+        body.put_i32(-1);
+        body.put_i32(max_wait_ms);
+        body.put_i32(0);
+        if version >= 3 {
+            body.put_i32(1_048_576);
+        }
+        body.put_i32(1);
+        put_string(&mut body, topic);
+        body.put_i32(1);
+        body.put_i32(partition);
+        body.put_i64(offset);
+        body.put_i32(1_048_576);
+        body.to_vec()
+    }
+
+    /// What one such answer says about one partition: its error code, its high watermark
+    /// and the records bytes exactly as the broker framed them.
+    pub(crate) fn fetch_results(
+        answered: &Bytes,
+        version: i16,
+    ) -> Result<Vec<FetchedPartition>, String> {
+        let mut body = answered.clone();
+        // The throttle time of this response is its FIRST member, from version 1 on.
+        if version >= 1 {
+            int32(&mut body).ok_or_else(|| "the answer states no throttle time".to_string())?;
+        }
+        let count = int32(&mut body).ok_or_else(|| "the answer states no topic count".to_string())?;
+        let mut results = Vec::new();
+        for index in 0..count {
+            let name = string(&mut body).ok_or_else(|| format!("topic {index} is unnamed"))?;
+            let partitions =
+                int32(&mut body).ok_or_else(|| format!("topic {index} states no partitions"))?;
+            for _ in 0..partitions {
+                let partition =
+                    int32(&mut body).ok_or_else(|| "a partition has no index".to_string())?;
+                let code = int16(&mut body).ok_or_else(|| "a partition has no error code".to_string())?;
+                let high_watermark =
+                    int64(&mut body).ok_or_else(|| "a partition has no high watermark".to_string())?;
+                let records = nullable_bytes(&mut body)
+                    .ok_or_else(|| "a partition has no record set".to_string())?;
+                results.push((
+                    name.clone(),
+                    partition,
+                    code,
+                    high_watermark,
+                    records.unwrap_or_default(),
+                ));
+            }
+        }
+        match body.is_empty() {
+            true => Ok(results),
+            false => Err(format!("{} bytes of the answer were not read", body.len())),
+        }
+    }
+
+    /// The `CreateTopics` request body of `version` (0 or 1) for one topic: the name, the
+    /// partition count and replication factor the request states, its configuration
+    /// entries, the timeout and — from version 1 — whether it only validates.
+    pub(crate) fn create_topics_body(
+        version: i16,
+        topic: &str,
+        partitions: i32,
+        replication_factor: i16,
+        configs: &[(&str, &str)],
+        timeout_ms: i32,
+        validate_only: bool,
+    ) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        body.put_i32(1);
+        put_string(&mut body, topic);
+        body.put_i32(partitions);
+        body.put_i16(replication_factor);
+        // No replica assignment: the broker places the partitions itself.
+        body.put_i32(0);
+        body.put_i32(i32::try_from(configs.len()).unwrap_or_default());
+        for (name, value) in configs {
+            put_string(&mut body, name);
+            put_string(&mut body, value);
+        }
+        body.put_i32(timeout_ms);
+        if version >= 1 {
+            body.put_u8(u8::from(validate_only));
+        }
+        body.to_vec()
+    }
+
+    /// The `DeleteTopics` request body of version 0 for the topics `names`.
+    pub(crate) fn delete_topics_body(names: &[&str], timeout_ms: i32) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        body.put_i32(i32::try_from(names.len()).unwrap_or_default());
+        for name in names {
+            put_string(&mut body, name);
+        }
+        body.put_i32(timeout_ms);
+        body.to_vec()
+    }
+
+    /// The per-topic results of a topic-administration answer: an array of
+    /// `(name, error code)` pairs, each carrying an error message as well on the versions
+    /// that declare one.
+    ///
+    /// `Err` when the answer is not that: a client of these versions reads them this way
+    /// and nothing else.
+    pub(crate) fn topic_results(
+        answered: &Bytes,
+        results_carry_a_message: bool,
+    ) -> Result<Vec<(String, i16, Option<String>)>, String> {
+        let mut body = answered.clone();
+        let count = int32(&mut body).ok_or_else(|| "the answer states no result count".to_string())?;
+        let mut results = Vec::new();
+        for index in 0..count {
+            let name = string(&mut body)
+                .ok_or_else(|| format!("result {index} names no topic"))?;
+            let code =
+                int16(&mut body).ok_or_else(|| format!("result {index} carries no error code"))?;
+            let message = match results_carry_a_message {
+                true => nullable_string(&mut body)
+                    .ok_or_else(|| format!("result {index} carries no error message"))?,
+                false => None,
+            };
+            results.push((name, code, message));
+        }
+        match body.is_empty() {
+            true => Ok(results),
+            false => Err(format!("{} bytes of the answer were not read", body.len())),
+        }
+    }
+
+    /// The records one such message set carries, read the way a client of those versions
+    /// reads them: `(offset, key, value, timestamp)` each, with the timestamp the oldest
+    /// format carries none of reported as `-1`.
+    pub(crate) fn message_set_records(
+        encoded: &Bytes,
+    ) -> Result<Vec<ReadRecord>, String> {
+        let mut body = encoded.clone();
+        let mut records = Vec::new();
+        while !body.is_empty() {
+            let offset = int64(&mut body).ok_or_else(|| "a message has no offset".to_string())?;
+            let size = int32(&mut body).ok_or_else(|| "a message has no size".to_string())?;
+            let size = usize::try_from(size).map_err(|_| "a message states no size".to_string())?;
+            let mut message = take(&mut body, size)
+                .ok_or_else(|| "a message is shorter than it states".to_string())?;
+            int32(&mut message).ok_or_else(|| "a message has no checksum".to_string())?;
+            let magic = take(&mut message, 1)
+                .map(|byte| byte[0] as i8)
+                .ok_or_else(|| "a message has no magic".to_string())?;
+            take(&mut message, 1).ok_or_else(|| "a message has no attributes".to_string())?;
+            let timestamp = match magic >= 1 {
+                true => int64(&mut message).ok_or_else(|| "a message has no timestamp".to_string())?,
+                false => -1,
+            };
+            let key = sized_text(&mut message).ok_or_else(|| "a message has no key".to_string())?;
+            let value =
+                sized_text(&mut message).ok_or_else(|| "a message has no value".to_string())?;
+            records.push((offset, key, value, timestamp));
+        }
+        Ok(records)
+    }
+
+    /// One `BYTES` of those formats, read as text, where a length of `-1` is an absent
+    /// field.
+    fn sized_text(message: &mut Bytes) -> Option<Option<String>> {
+        let length = int32(message)?;
+        if length < 0 {
+            return Some(None);
+        }
+        let bytes = take(message, usize::try_from(length).ok()?)?;
+        Some(Some(String::from_utf8_lossy(&bytes).to_string()))
+    }
+
+    fn put_string(body: &mut BytesMut, value: &str) {
+        body.put_i16(i16::try_from(value.len()).unwrap_or_default());
+        body.put_slice(value.as_bytes());
+    }
+
+    fn int16(body: &mut Bytes) -> Option<i16> {
+        let bytes = take(body, 2)?;
+        Some(i16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn int32(body: &mut Bytes) -> Option<i32> {
+        let bytes = take(body, 4)?;
+        Some(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn int64(body: &mut Bytes) -> Option<i64> {
+        let bytes = take(body, 8)?;
+        Some(i64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn string(body: &mut Bytes) -> Option<String> {
+        Some(nullable_string(body)?.unwrap_or_default())
+    }
+
+    fn nullable_string(body: &mut Bytes) -> Option<Option<String>> {
+        let length = int16(body)?;
+        if length < 0 {
+            return Some(None);
+        }
+        let bytes = take(body, usize::try_from(length).ok()?)?;
+        Some(Some(String::from_utf8(bytes.to_vec()).ok()?))
+    }
+
+    fn nullable_bytes(body: &mut Bytes) -> Option<Option<Bytes>> {
+        let length = int32(body)?;
+        if length < 0 {
+            return Some(None);
+        }
+        Some(Some(take(body, usize::try_from(length).ok()?)?))
+    }
+
+    fn take(body: &mut Bytes, count: usize) -> Option<Bytes> {
+        (body.len() >= count).then(|| body.split_to(count))
+    }
 }

@@ -50,6 +50,8 @@ pub mod broker_config;
 pub mod codecs;
 pub mod groups;
 pub mod iam_access;
+pub mod legacy_frames;
+pub mod legacy_topic_admin;
 pub mod records;
 pub mod sasl;
 pub mod topic_config;
@@ -132,6 +134,14 @@ pub const BROKER_CONFIG_DEFAULTS: &[(&str, &str)] = &[
 
 /// The topic configuration key that says how long a record is kept.
 pub const RETENTION_MS_CONFIG: &str = "retention.ms";
+
+/// The two topic configuration keys that say when the log CLOSES a segment, which is
+/// what makes the records in it sweepable at all ("Topic-Level Configs", Apache Kafka
+/// documentation: `segment.ms` forces the roll after a period, `segment.bytes` after a
+/// size).
+pub const SEGMENT_MS_CONFIG: &str = "segment.ms";
+/// See [`SEGMENT_MS_CONFIG`].
+pub const SEGMENT_BYTES_CONFIG: &str = "segment.bytes";
 
 /// The topic configuration key that says WHOSE clock a record's timestamp is, and the
 /// value of it that makes the timestamp the broker's own ("Topic-Level Configs", Apache
@@ -264,17 +274,72 @@ pub struct PartitionLog {
     /// The bytes of record key and value the log currently retains, kept with the
     /// records so the byte ceiling costs no walk of the log.
     retained_bytes: usize,
+    /// The offset of the first record of the log's ACTIVE SEGMENT — the segment the log
+    /// is appending to.
+    ///
+    /// Apache Kafka keeps a partition's log in SEGMENTS and deletes a whole segment at a
+    /// time: "the active segment is never deleted", however old the records in it are, and
+    /// a segment is only closed once a record is appended past the topic's `segment.ms` or
+    /// `segment.bytes` ([`Self::rolls_at`]). So this is the boundary the retention sweep
+    /// stops at ([`Self::expire`]): a client that produced a record and reads it back is
+    /// answered that record whatever timestamp it carries, which is what a broker does,
+    /// while the records of a CLOSED segment age out.
+    segment_base_offset: i64,
+    /// The timestamp the active segment's first record carries, which is what the roll is
+    /// measured from (Apache Kafka rolls on the largest timestamp of the segment against
+    /// its first), and the bytes it holds.
+    segment_first_timestamp_ms: i64,
+    /// See [`Self::segment_first_timestamp_ms`].
+    segment_bytes: usize,
+}
+
+/// What closes a segment: the topic's own `segment.ms` and `segment.bytes`, as the
+/// effective topic configuration states them.
+#[derive(Debug, Clone, Copy)]
+pub struct Segmenting {
+    /// `segment.ms` — "this configuration controls the period of time after which Kafka
+    /// will force the log to roll even if the segment file isn't full" ("Topic-Level
+    /// Configs", Apache Kafka documentation).
+    pub segment_ms: i64,
+    /// `segment.bytes` — "this configuration controls the segment file size for the log"
+    /// (same source).
+    pub segment_bytes: usize,
+}
+
+impl Default for Segmenting {
+    /// Apache Kafka's documented defaults for both keys: a week, and one gibibyte.
+    fn default() -> Self {
+        Self {
+            segment_ms: 604_800_000,
+            segment_bytes: 1_073_741_824,
+        }
+    }
 }
 
 impl PartitionLog {
     /// Append one record, handing back the offset it took.
     ///
+    /// `segmenting` is what closes the log's active segment: a record appended past the
+    /// topic's `segment.ms` or `segment.bytes` starts a new one, which is what makes the
+    /// records before it sweepable at all ([`Self::expire`]).
+    ///
     /// Bounded by [`MAX_RECORDS_PER_PARTITION`] and
     /// [`MAX_LOG_BYTES_PER_PARTITION`]: the oldest records go until both hold, which
     /// raises the log's start offset exactly as a retention sweep does.
-    pub fn append(&mut self, record: StoredRecord) -> i64 {
+    pub fn append(&mut self, record: StoredRecord, segmenting: Segmenting) -> i64 {
         let offset = self.next_offset;
-        self.retained_bytes += record_bytes(&record);
+        let bytes = record_bytes(&record);
+        if self.rolls_at(&record, bytes, segmenting) {
+            self.segment_base_offset = offset;
+            self.segment_first_timestamp_ms = record.timestamp_ms;
+            self.segment_bytes = 0;
+        }
+        if self.records.is_empty() && self.segment_bytes == 0 {
+            self.segment_base_offset = offset;
+            self.segment_first_timestamp_ms = record.timestamp_ms;
+        }
+        self.segment_bytes += bytes;
+        self.retained_bytes += bytes;
         self.records.push_back(StoredRecord { offset, ..record });
         self.next_offset += 1;
         while self.records.len() > MAX_RECORDS_PER_PARTITION
@@ -284,6 +349,22 @@ impl PartitionLog {
         }
         self.restate_log_start();
         offset
+    }
+
+    /// Whether appending `record` CLOSES the active segment and starts a new one: the
+    /// record sits further than the topic's `segment.ms` past the timestamp the segment
+    /// opened at, or it would take the segment past `segment.bytes`.
+    ///
+    /// A segment that holds nothing is not closed by the first record appended to it.
+    fn rolls_at(&self, record: &StoredRecord, bytes: usize, segmenting: Segmenting) -> bool {
+        if self.segment_bytes == 0 {
+            return false;
+        }
+        record
+            .timestamp_ms
+            .saturating_sub(self.segment_first_timestamp_ms)
+            > segmenting.segment_ms
+            || self.segment_bytes.saturating_add(bytes) > segmenting.segment_bytes
     }
 
     /// Drop the oldest record the log holds, keeping the retained byte count with it.
@@ -303,22 +384,25 @@ impl PartitionLog {
     }
 
     /// Drop every record the topic's retention has aged out at `now_ms`: one older
-    /// than `retention_ms` milliseconds. `None` — or a negative value, which Apache
-    /// Kafka documents as "no limit" — keeps every record.
+    /// than `retention_ms` milliseconds whose SEGMENT the log has closed. `None` — or a
+    /// negative value, which Apache Kafka documents as "no limit" — keeps every record.
     ///
-    /// The removal was owed at the instant each record aged out, whether or not
+    /// The removal was owed at the instant each such record aged out, whether or not
     /// anybody fetched, so materialising it on a read reports the log the clock
     /// already left behind rather than changing what a later caller sees.
+    ///
+    /// The records of the ACTIVE segment are never removed: Apache Kafka deletes a whole
+    /// segment at a time and never the one it is appending to, so a record a producer has
+    /// just written stays readable whatever timestamp it carries, and what ages out is the
+    /// segments the log has closed behind it ([`Self::segment_base_offset`]).
     pub fn expire(&mut self, now_ms: i64, retention_ms: Option<i64>) {
         let Some(retention_ms) = retention_ms.filter(|retention| *retention >= 0) else {
             return;
         };
         let cutoff = now_ms.saturating_sub(retention_ms);
-        while self
-            .records
-            .front()
-            .is_some_and(|record| record.timestamp_ms < cutoff)
-        {
+        while self.records.front().is_some_and(|record| {
+            record.timestamp_ms < cutoff && record.offset < self.segment_base_offset
+        }) {
             self.drop_oldest();
         }
         self.restate_log_start();
@@ -785,6 +869,24 @@ pub fn retention_ms(configuration: &BTreeMap<String, String>) -> Option<i64> {
         .and_then(|value| value.trim().parse::<i64>().ok())
 }
 
+/// What closes a partition's active segment for a topic running `configuration`: its own
+/// `segment.ms` and `segment.bytes`, each falling back to Apache Kafka's documented
+/// default when the topic does not set a readable one ([`Segmenting::default`]).
+pub fn segmenting_of(configuration: &BTreeMap<String, String>) -> Segmenting {
+    let defaults = Segmenting::default();
+    Segmenting {
+        segment_ms: configuration
+            .get(SEGMENT_MS_CONFIG)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|stated| *stated >= 0)
+            .unwrap_or(defaults.segment_ms),
+        segment_bytes: configuration
+            .get(SEGMENT_BYTES_CONFIG)
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(defaults.segment_bytes),
+    }
+}
+
 /// Epoch milliseconds at `now`, the unit a Kafka record's timestamp is in.
 pub fn epoch_millis(now: SystemTime) -> i64 {
     now.duration_since(std::time::UNIX_EPOCH)
@@ -961,28 +1063,37 @@ impl ComAmazonawsKafkaKafkaState {
             .get(MESSAGE_TIMESTAMP_TYPE_CONFIG)
             .is_some_and(|value| value.trim() == LOG_APPEND_TIME);
         let now_ms = epoch_millis(now);
+        // What closes the log's active segment, which is what makes the records before it
+        // sweepable: the topic's own `segment.ms` and `segment.bytes`.
+        let segmenting = segmenting_of(&configuration);
         let log = self
             .partition_logs
             .entry((cluster_arn.to_string(), topic.to_string(), partition))
             .or_default();
         let base = log.next_offset;
         for record in records {
-            let stamped = match log_append_time || record.timestamp_ms < 0 {
+            let stamped = match log_append_time || record.timestamp_ms <= 0 {
                 // A producer that sends no timestamp has the broker stamp the record
                 // with the instant it was appended, which is also what a topic keeping
-                // `LogAppendTime` does to every record.
+                // `LogAppendTime` does to every record. A message in a format that
+                // carries no timestamp states `-1` for it, and a value at or before the
+                // epoch is no instant a producer set either, so both are the broker's to
+                // stamp.
                 true => now_ms,
                 false => record.timestamp_ms,
             };
-            log.append(StoredRecord {
-                offset: 0,
-                timestamp_ms: stamped,
-                log_append_time,
-                key: record.key,
-                value: record.value,
-                headers: record.headers,
-                codec: record.codec,
-            });
+            log.append(
+                StoredRecord {
+                    offset: 0,
+                    timestamp_ms: stamped,
+                    log_append_time,
+                    key: record.key,
+                    value: record.value,
+                    headers: record.headers,
+                    codec: record.codec,
+                },
+                segmenting,
+            );
         }
         Ok(Appended {
             base_offset: base,

@@ -67,7 +67,8 @@ use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sasl::{self, Authenticated, Mechanism};
 use super::{
-    acls, groups, iam_access, records, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES,
+    acls, groups, iam_access, legacy_frames, records, topics, AccessPath, BROKER_NODE_ID,
+    MAX_FRAME_BYTES,
 };
 
 /// The resource type a `DescribeConfigs` request names a TOPIC by, and the one it
@@ -167,14 +168,23 @@ fn served_apis() -> Vec<(ApiKey, i16, i16)> {
             apis.push((key, min, max));
         }
     };
+    // Every API below whose OLDEST versions the protocol implementation has dropped is
+    // advertised from the oldest version an Apache Kafka 3.x broker answers, because this
+    // crate frames those versions itself ([`legacy_frames`]).
     serve(
         ApiKey::Produce,
-        carried::<ProduceRequest, ProduceResponse>(0, 9),
+        legacy_frames::lowered(
+            ApiKey::Produce,
+            carried::<ProduceRequest, ProduceResponse>(0, 9),
+        ),
     );
     // `Fetch` and the topic administration below stop at the last version that names a
     // topic by NAME alone: this endpoint reports no topic ids, so the versions that read
     // and write topics by id are not ones it can serve.
-    serve(ApiKey::Fetch, carried::<FetchRequest, FetchResponse>(0, 12));
+    serve(
+        ApiKey::Fetch,
+        legacy_frames::lowered(ApiKey::Fetch, carried::<FetchRequest, FetchResponse>(0, 12)),
+    );
     serve(
         ApiKey::ListOffsets,
         carried::<ListOffsetsRequest, ListOffsetsResponse>(0, 7),
@@ -245,11 +255,17 @@ fn served_apis() -> Vec<(ApiKey, i16, i16)> {
     );
     serve(
         ApiKey::CreateTopics,
-        carried::<CreateTopicsRequest, ::kafka_protocol::messages::CreateTopicsResponse>(0, 5),
+        legacy_frames::lowered(
+            ApiKey::CreateTopics,
+            carried::<CreateTopicsRequest, ::kafka_protocol::messages::CreateTopicsResponse>(0, 5),
+        ),
     );
     serve(
         ApiKey::DeleteTopics,
-        carried::<DeleteTopicsRequest, ::kafka_protocol::messages::DeleteTopicsResponse>(0, 5),
+        legacy_frames::lowered(
+            ApiKey::DeleteTopics,
+            carried::<DeleteTopicsRequest, ::kafka_protocol::messages::DeleteTopicsResponse>(0, 5),
+        ),
     );
     // The API an admin client GROWS a topic with: a client that raises a topic's
     // partition count sends this, and a broker that does not serve it leaves that client
@@ -536,8 +552,12 @@ impl Broker {
             return self.unsupported_version(key, correlation_id);
         }
         let mut body = frame;
-        let header =
-            RequestHeader::decode(&mut body, key.request_header_version(api_version)).ok()?;
+        // The header of a frame whose version this crate frames itself is the
+        // pre-flexible one; every other is the version the protocol implementation
+        // declares for this API and version pair.
+        let header_version = legacy_frames::request_header_version(key, api_version)
+            .unwrap_or_else(|| key.request_header_version(api_version));
+        let header = RequestHeader::decode(&mut body, header_version).ok()?;
         // Before the exchange this path requires, only the frames that negotiate it
         // are served; anything else ends the connection, as an unauthenticated
         // connection to a broker does.
@@ -546,6 +566,14 @@ impl Broker {
                 ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate => {}
                 _ => return None,
             }
+        }
+        // The oldest versions of the data-plane APIs: what they ask for is served exactly
+        // as every other version is, and only the FRAME is this crate's
+        // ([`legacy_frames`]).
+        if let Some(framing) = legacy_frames::Framing::of(key, api_version) {
+            return self
+                .legacy_framed(session, framing, &mut body, &header)
+                .await;
         }
         match key {
             ApiKey::ApiVersions => {
@@ -574,7 +602,7 @@ impl Broker {
             }
             ApiKey::Fetch => {
                 let request = FetchRequest::decode(&mut body, api_version).ok()?;
-                let response = self.fetch(&request, session).await;
+                let response = self.fetch(&request, session, api_version).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::ListOffsets => {
@@ -701,51 +729,12 @@ impl Broker {
             }
             ApiKey::CreateTopics => {
                 let request = CreateTopicsRequest::decode(&mut body, api_version).ok()?;
-                // The ACL decision is taken BEFORE the store is locked: it reads the
-                // bindings under the same lock, so the two cannot be held at once.
-                let withheld = self.withheld_topics(
-                    session,
-                    request.topics.iter().map(|topic| topic.name.0.to_string()),
-                    super::OPERATION_CREATE,
-                    iam_access::ACTION_CREATE_TOPIC,
-                );
-                let mut store = self.state.lock();
-                let response = topics::create(
-                    &mut store,
-                    &self.region,
-                    &self.cluster_arn,
-                    &request,
-                    &withheld,
-                    MAX_REQUEST_ENTRIES,
-                    SystemTime::now(),
-                );
-                drop(store);
+                let response = self.create_topics(session, &request);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::DeleteTopics => {
                 let request = DeleteTopicsRequest::decode(&mut body, api_version).ok()?;
-                let withheld = self.withheld_topics(
-                    session,
-                    request
-                        .topic_names
-                        .iter()
-                        .map(|name| name.0.to_string())
-                        .chain(request.topics.iter().filter_map(|topic| {
-                            topic.name.as_ref().map(|name| name.0.to_string())
-                        })),
-                    super::OPERATION_DELETE,
-                    iam_access::ACTION_DELETE_TOPIC,
-                );
-                let mut store = self.state.lock();
-                let response = topics::delete(
-                    &mut store,
-                    &self.cluster_arn,
-                    &request,
-                    &withheld,
-                    MAX_REQUEST_ENTRIES,
-                    SystemTime::now(),
-                );
-                drop(store);
+                let response = self.delete_topics(session, &request);
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::CreatePartitions => {
@@ -834,6 +823,111 @@ impl Broker {
             .encode(&mut encoded, key.response_header_version(api_version))
             .ok()?;
         response.encode(&mut encoded, api_version).ok()?;
+        Some(encoded.to_vec())
+    }
+
+    /// `CreateTopics`: the topics of the request created in this cluster's registry, each
+    /// with the per-topic answer Apache Kafka gives it.
+    ///
+    /// The ACL decision is taken BEFORE the store is locked: it reads the bindings under
+    /// the same lock, so the two cannot be held at once. One place, so every VERSION of
+    /// the API a client can send — the ones the protocol implementation carries and the
+    /// older ones this crate frames ([`legacy_topic_admin`]) — administers the cluster the
+    /// same way.
+    fn create_topics(
+        &self,
+        session: &Session,
+        request: &CreateTopicsRequest,
+    ) -> ::kafka_protocol::messages::CreateTopicsResponse {
+        let withheld = self.withheld_topics(
+            session,
+            request.topics.iter().map(|topic| topic.name.0.to_string()),
+            super::OPERATION_CREATE,
+            iam_access::ACTION_CREATE_TOPIC,
+        );
+        let mut store = self.state.lock();
+        topics::create(
+            &mut store,
+            &self.region,
+            &self.cluster_arn,
+            request,
+            &withheld,
+            MAX_REQUEST_ENTRIES,
+            SystemTime::now(),
+        )
+    }
+
+    /// `DeleteTopics`, the same way round: the one administration every version of the API
+    /// is served by ([`Self::create_topics`]).
+    fn delete_topics(
+        &self,
+        session: &Session,
+        request: &DeleteTopicsRequest,
+    ) -> ::kafka_protocol::messages::DeleteTopicsResponse {
+        let withheld = self.withheld_topics(
+            session,
+            request
+                .topic_names
+                .iter()
+                .map(|name| name.0.to_string())
+                .chain(
+                    request
+                        .topics
+                        .iter()
+                        .filter_map(|topic| topic.name.as_ref().map(|name| name.0.to_string())),
+                ),
+            super::OPERATION_DELETE,
+            iam_access::ACTION_DELETE_TOPIC,
+        );
+        let mut store = self.state.lock();
+        topics::delete(
+            &mut store,
+            &self.cluster_arn,
+            request,
+            &withheld,
+            MAX_REQUEST_ENTRIES,
+            SystemTime::now(),
+        )
+    }
+
+    /// One frame of a version this crate frames itself: read as that version states it,
+    /// served exactly as every other version is, and answered in the same version — which
+    /// is what a client that negotiated it then reads.
+    async fn legacy_framed(
+        &self,
+        session: &Session,
+        framing: legacy_frames::Framing,
+        body: &mut Bytes,
+        header: &RequestHeader,
+    ) -> Option<Vec<u8>> {
+        let answer = match framing {
+            legacy_frames::Framing::Produce(version) => {
+                let request = legacy_frames::produce_request(body, version)?;
+                let response = self.produce(&request, session).await;
+                legacy_frames::produce_response(&response, version)
+            }
+            legacy_frames::Framing::Fetch(version) => {
+                let request = legacy_frames::fetch_request(body, version)?;
+                let response = self.fetch(&request, session, version).await;
+                legacy_frames::fetch_response(&response, version)
+            }
+            legacy_frames::Framing::CreateTopics(version) => {
+                let request = legacy_frames::create_topics_request(body, version)?;
+                let response = self.create_topics(session, &request);
+                legacy_frames::create_topics_response(&response, version)
+            }
+            legacy_frames::Framing::DeleteTopics(version) => {
+                let request = legacy_frames::delete_topics_request(body, version)?;
+                let response = self.delete_topics(session, &request);
+                legacy_frames::delete_topics_response(&response, version)
+            }
+        };
+        let mut encoded = BytesMut::new();
+        ResponseHeader::default()
+            .with_correlation_id(header.correlation_id)
+            .encode(&mut encoded, legacy_frames::response_header_version())
+            .ok()?;
+        encoded.extend_from_slice(&answer);
         Some(encoded.to_vec())
     }
 
@@ -1637,7 +1731,17 @@ impl Broker {
     /// instead of being answered an empty response at once and asking again immediately.
     /// The wait is bounded by [`MAX_FETCH_WAIT`] and ends as soon as a record lands, and
     /// a partition that cannot be served at all is answered without waiting.
-    async fn fetch(&self, request: &FetchRequest, session: &Session) -> FetchResponse {
+    ///
+    /// The records are handed back in the MESSAGE FORMAT the negotiated `api_version`
+    /// carries ([`records::fetch_magic`]): a broker converts its log's batches down to the
+    /// format the fetching client can read, and a client answered a newer one reads no
+    /// records out of an answer that is not empty.
+    async fn fetch(
+        &self,
+        request: &FetchRequest,
+        session: &Session,
+        api_version: i16,
+    ) -> FetchResponse {
         let min_bytes = usize::try_from(request.min_bytes).unwrap_or(0);
         let wait = fetch_wait(request.max_wait_ms);
         let deadline = ::std::time::Instant::now() + wait;
@@ -1651,7 +1755,7 @@ impl Broker {
             iam_access::ACTION_READ_DATA,
         );
         loop {
-            let answered = self.fetch_once(request, &withheld);
+            let answered = self.fetch_once(request, &withheld, api_version);
             let enough = min_bytes == 0 || rendered_bytes(&answered) >= min_bytes;
             if enough || refuses_a_partition(&answered) || ::std::time::Instant::now() >= deadline {
                 return answered;
@@ -1668,7 +1772,12 @@ impl Broker {
     /// and the records rendered across the whole response stop at
     /// [`MAX_FETCHED_RECORDS_PER_REQUEST`]. The store's lock is taken and released per
     /// entry, so one request cannot hold it for a whole batch.
-    fn fetch_once(&self, request: &FetchRequest, withheld: &BTreeSet<String>) -> FetchResponse {
+    fn fetch_once(
+        &self,
+        request: &FetchRequest,
+        withheld: &BTreeSet<String>,
+        api_version: i16,
+    ) -> FetchResponse {
         let now = SystemTime::now();
         let mut responses = Vec::new();
         let mut entries = 0usize;
@@ -1720,7 +1829,11 @@ impl Broker {
                             // out, since a client acts on them.
                             .with_aborted_transactions(Some(Vec::new()))
                             .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
-                            .with_records(encode_records(&fetched.records, fetched.codec))
+                            .with_records(encode_records(
+                                &fetched.records,
+                                fetched.codec,
+                                api_version,
+                            ))
                     }
                     Err(refusal) => PartitionData::default()
                         .with_partition_index(partition.partition)
@@ -2143,6 +2256,7 @@ fn decode_records(
 fn encode_records(
     records: &[super::StoredRecord],
     topic_codec: Option<super::RecordCodec>,
+    api_version: i16,
 ) -> Option<Bytes> {
     if records.is_empty() {
         return Some(Bytes::new());
@@ -2151,5 +2265,9 @@ fn encode_records(
         .first()
         .map(|record| record.codec)
         .unwrap_or_default();
-    records::encode(records, topic_codec.unwrap_or(producer_codec))
+    records::encode(
+        records,
+        topic_codec.unwrap_or(producer_codec),
+        records::fetch_magic(api_version),
+    )
 }

@@ -37,10 +37,10 @@ use ::kafka_protocol::messages::{
     CreatePartitionsRequest, CreatePartitionsResponse, CreateTopicsRequest, CreateTopicsResponse,
     DeleteTopicsRequest, DeleteTopicsResponse, TopicName,
 };
-use ::kafka_protocol::protocol::StrBytes;
+use ::kafka_protocol::protocol::{Message, StrBytes};
 use serde_json::{json, Value};
 
-use crate::broker_data_plane::{Client, AWS_MSK_IAM};
+use crate::broker_data_plane::{pre_flexible, Client, AWS_MSK_IAM};
 use crate::kafka_harness::{
     given_assumed_role_session, given_role_inline_policy, ClusterRequest, Emulator, ACCOUNT,
     DEFAULT_ACCESS_KEY_ID, REGION,
@@ -507,6 +507,36 @@ async fn create_topic(
     topic: &str,
     partitions: i32,
 ) -> TopicOutcome {
+    // The oldest versions the broker advertises are ones the protocol crate cannot
+    // encode, so a client that picks one frames the request itself — which is what a
+    // hand-rolled admin client does.
+    if version < CreateTopicsRequest::VERSIONS.min {
+        let answered = client
+            .exchange_pre_flexible(
+                ApiKey::CreateTopics,
+                version,
+                &pre_flexible::create_topics_body(
+                    version,
+                    topic,
+                    partitions,
+                    1,
+                    &[],
+                    REQUEST_TIMEOUT_MS,
+                    false,
+                ),
+            )
+            .await
+            .unwrap_or_else(|why| panic!("case {case:?}: CreateTopics v{version}: {why}"));
+        let results = pre_flexible::topic_results(&answered, version >= 1)
+            .unwrap_or_else(|why| panic!("case {case:?}: CreateTopics v{version}: {why}"));
+        return results
+            .iter()
+            .find(|(name, _, _)| name == topic)
+            .map(|(_, code, message)| (*code, message.clone()))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: CreateTopics reported nothing about {topic}")
+            });
+    }
     let answered: CreateTopicsResponse = client
         .call(
             case,
@@ -565,6 +595,25 @@ async fn grow_topic(
 
 /// `DeleteTopics` for one topic at `version`, answering the error code it was given.
 async fn delete_topic(client: &mut Client, case: &str, version: i16, topic: &str) -> i16 {
+    if version < DeleteTopicsRequest::VERSIONS.min {
+        let answered = client
+            .exchange_pre_flexible(
+                ApiKey::DeleteTopics,
+                version,
+                &pre_flexible::delete_topics_body(&[topic], REQUEST_TIMEOUT_MS),
+            )
+            .await
+            .unwrap_or_else(|why| panic!("case {case:?}: DeleteTopics v{version}: {why}"));
+        let results = pre_flexible::topic_results(&answered, false)
+            .unwrap_or_else(|why| panic!("case {case:?}: DeleteTopics v{version}: {why}"));
+        return results
+            .iter()
+            .find(|(name, _, _)| name == topic)
+            .map(|(_, code, _)| *code)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: DeleteTopics reported nothing about {topic}")
+            });
+    }
     let answered: DeleteTopicsResponse = client
         .call(
             case,
