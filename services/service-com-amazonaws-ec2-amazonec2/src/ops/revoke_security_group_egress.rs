@@ -310,21 +310,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let mut found: Vec<String> = Vec::with_capacity(rule_ids.len());
             for rule_id in rule_ids {
-                // A rule id names ONE rule, so an id naming no outbound rule OF THIS GROUP
-                // is refused whichever VPC the group is in: the default VPC's forgiveness
-                // is documented for values that "do not match the existing rule's values",
-                // which is a statement about rule PROPERTIES. A request naming one id twice
-                // revokes the rule once.
-                let names_a_rule = store
-                    .security_group_rules
-                    .get(rule_id.as_str())
-                    .is_some_and(|record| {
-                        record.rule.group_id.as_deref() == Some(group_id.as_str())
-                            && record.rule.is_egress.unwrap_or(false) == IS_EGRESS
-                    });
-                if !names_a_rule {
-                    return Err(state::invalid_security_group_rule_id_not_found(rule_id));
-                }
+                // A rule id names ONE rule of the group that holds it, whichever side that
+                // rule is on, so the id is resolved across BOTH sides of this group and the
+                // MISMATCH is what is refused: an id of the inbound side named a real rule
+                // in the wrong request, which is a bad parameter value rather than a rule
+                // that does not exist. Refused whichever VPC the group is in: the default
+                // VPC's forgiveness is documented for values that "do not match the existing
+                // rule's values", which is a statement about rule PROPERTIES. A request
+                // naming one id twice revokes the rule once.
+                state::require_security_group_rule_in_group(
+                    &store,
+                    &group_id,
+                    IS_EGRESS,
+                    rule_id,
+                    state::REVOKE_SECURITY_GROUP_RULE_API,
+                )?;
                 if !found.iter().any(|held| held == rule_id) {
                     found.push(rule_id.clone());
                 }

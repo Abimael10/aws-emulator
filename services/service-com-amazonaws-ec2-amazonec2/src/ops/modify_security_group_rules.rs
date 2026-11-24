@@ -277,16 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let requested_permission = permission_of_request(requested, source);
             let protocol = state::validated_ip_protocol(&requested_permission, &member)?;
             state::validate_ip_permission_port_range(
-                protocol,
+                &protocol,
                 &member,
                 requested.from_port,
                 requested.to_port,
             )?;
+            // An ICMPv6 rule whose peer is an address range carries no type and code — the
+            // same reading an authorize holds a new rule to.
+            state::validate_icmpv6_ip_range_port_range(&protocol, &requested_permission)?;
             let permission = state::prepared_ip_permission(
                 &store,
                 &vpc_id,
                 &requested_permission,
-                protocol,
+                &protocol,
                 &member,
                 is_egress,
             )?;

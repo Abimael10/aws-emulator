@@ -233,14 +233,18 @@ async fn a_rule_the_group_already_holds_is_refused_naming_that_rule() {
             descriptor: "peer: 0.0.0.0/0, ICMP, type: 8, code: -1, ALLOW".to_string(),
         },
         DuplicateRow {
-            case: "an ICMPv6 type and code from an IPv6 range, inbound",
+            // "For `icmpv6`, the port range is optional" (`$IpProtocol`), and where the peer
+            // is an address RANGE the only range such a rule may carry is the pair that
+            // stands for every type and code — see
+            // `security_group_protocol_tokens_and_rule_id_scope`.
+            case: "every ICMPv6 type and code from an IPv6 range, inbound",
             action: INGRESS,
             rule: Rule::new(
                 "icmpv6",
-                Some((128, 0)),
+                Some((-1, -1)),
                 Peer::Ipv6("2001:db8::/32".to_string()),
             ),
-            descriptor: "peer: 2001:db8::/32, ICMPV6, type: 128, code: 0, ALLOW".to_string(),
+            descriptor: "peer: 2001:db8::/32, ICMPV6, type: -1, code: -1, ALLOW".to_string(),
         },
         DuplicateRow {
             // "To specify all protocols, use -1" (`$IpProtocol`), which carries no port

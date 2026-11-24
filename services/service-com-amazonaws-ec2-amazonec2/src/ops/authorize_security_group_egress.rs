@@ -254,13 +254,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let member = format!("ipPermissions.{position}", position = index + 1);
             let protocol = state::validated_ip_protocol(permission, &member)?;
             state::validate_ip_permission_port_range(
-                protocol,
+                &protocol,
                 &member,
                 permission.from_port,
                 permission.to_port,
             )?;
+            // An ICMPv6 rule whose peer is an address range carries no type and code.
+            state::validate_icmpv6_ip_range_port_range(&protocol, permission)?;
             prepared.push(state::prepared_ip_permission(
-                &store, &vpc_id, permission, protocol, &member, IS_EGRESS,
+                &store, &vpc_id, permission, &protocol, &member, IS_EGRESS,
             )?);
         }
         // "The prefix list IDs" (`IpPermission$PrefixListIds`): a rule grants the ranges the

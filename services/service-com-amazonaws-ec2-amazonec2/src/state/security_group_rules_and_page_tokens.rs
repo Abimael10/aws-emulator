@@ -2051,6 +2051,58 @@ pub fn invalid_permission_not_found<E>() -> Scaffolded<E> {
 /// codes, "InvalidSecurityGroupRuleId.Malformed").
 pub const INVALID_SECURITY_GROUP_RULE_ID_MALFORMED: &str = "InvalidSecurityGroupRuleId.Malformed";
 
+/// The word EC2 names one SIDE of a security group's rules with: "indicates whether the
+/// security group rule is an outbound rule" (`SecurityGroupRule$IsEgress`) — outbound rules
+/// are the egress side and inbound rules the ingress side, which is also how the operations
+/// that work on one side are named.
+pub fn security_group_rule_direction(is_egress: bool) -> &'static str {
+    if is_egress { "egress" } else { "ingress" }
+}
+
+/// The API name of `revoke-security-group-ingress`/`-egress`, which the refusals below name
+/// as the request a rule id arrived in.
+pub const REVOKE_SECURITY_GROUP_RULE_API: &str = "revoke-security-group";
+
+/// Hold a DIRECTION-SCOPED operation of `group_id` to a rule id that names a rule it may
+/// work on, resolved across BOTH sides of that group's rules.
+///
+/// A security group rule id names ONE rule of the group that holds it, whichever side that
+/// rule is on, so a request of the group's OTHER side named a real rule and asked the wrong
+/// operation about it: a bad parameter value, which EC2 answers by naming the rule, the side
+/// it is really on and the request it arrived in — not a rule that does not exist. An id the
+/// group holds no rule under on either side is the one thing the not-found class says.
+///
+/// `api` is the operation's own name without its direction
+/// ([`REVOKE_SECURITY_GROUP_RULE_API`]); the request is named with the direction the caller's
+/// operation works in, the rule with the side it is really on.
+pub fn require_security_group_rule_in_group<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    group_id: &str,
+    is_egress: bool,
+    rule_id: &str,
+    api: &str,
+) -> Result<(), Scaffolded<E>> {
+    let Some(record) = store
+        .security_group_rules
+        .get(rule_id)
+        .filter(|record| record.rule.group_id.as_deref() == Some(group_id))
+    else {
+        // This group holds no rule under that id, on either side.
+        return Err(invalid_security_group_rule_id_not_found(rule_id));
+    };
+    let held_is_egress = record.rule.is_egress.unwrap_or(false);
+    if held_is_egress != is_egress {
+        return Err(invalid_parameter_value(format!(
+            "The security group rule ID '{echoed}' is an {held} rule and may not be \
+             specified in a {api}-{asked} request.",
+            echoed = echoed_resource_id(rule_id),
+            held = security_group_rule_direction(held_is_egress),
+            asked = security_group_rule_direction(is_egress),
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Security group rules
 // ---------------------------------------------------------------------------
@@ -2111,7 +2163,59 @@ pub fn protocol_requires_port_range(protocol: &str) -> bool {
 /// Whether `protocol` names ICMP or ICMPv6, whose `FromPort`/`ToPort` are an ICMP type and
 /// code rather than ports (`IpPermission$FromPort`).
 pub fn protocol_is_icmp(protocol: &str) -> bool {
-    protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMP) || protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
+    protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMP)
+        || protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
+}
+
+/// The IANA protocol number of ICMPv6 — the same number a network ACL entry names the
+/// protocol by ([`NETWORK_ACL_PROTOCOL_ICMPV6`], "if you specify protocol 58 (ICMPv6)"), and
+/// the form EC2 names it in the refusal [`validate_icmpv6_ip_range_port_range`] builds.
+pub const IP_PROTOCOL_NUMBER_ICMPV6: i32 = NETWORK_ACL_PROTOCOL_ICMPV6;
+
+/// Whether `protocol` names ICMPv6, in either of the two spellings
+/// `IpPermission$IpProtocol` admits: "the IP protocol name (`tcp`, `udp`, `icmp`, `icmpv6`)
+/// or number (see Protocol Numbers)" — the word, or the protocol's own number.
+pub fn protocol_is_icmpv6(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
+        || protocol.trim().parse::<i32>() == Ok(IP_PROTOCOL_NUMBER_ICMPV6)
+}
+
+/// Hold an ICMPv6 rule whose peer is an IP address range to the port range such a rule may
+/// carry: no type and code at all, or the pair that stands for every type and code.
+///
+/// "For `icmpv6`, the port range is optional; if you omit the port range, traffic for all
+/// types and codes is allowed" (`IpPermission$IpProtocol`) — and where the rule's peer is an
+/// address range rather than a prefix list or another security group, those are the only two
+/// forms the range may take: EC2 refuses any other type/code pair instead of storing a rule
+/// that would never match. The refusal names the protocol by its own number, the way EC2
+/// words it.
+pub fn validate_icmpv6_ip_range_port_range<E>(
+    protocol: &str,
+    permission: &IpPermission,
+) -> Result<(), Scaffolded<E>> {
+    if !protocol_is_icmpv6(protocol) {
+        return Ok(());
+    }
+    // The peer forms that ARE an address range: an `IpRange$CidrIp` and an
+    // `Ipv6Range$CidrIpv6` are the two address families of one peer, while a prefix list and
+    // a referenced security group are peers of other kinds.
+    let names_ip_range = permission.ip_ranges.iter().flatten().count()
+        + permission.ipv6_ranges.iter().flatten().count()
+        > 0;
+    if !names_ip_range {
+        return Ok(());
+    }
+    if matches!(
+        (permission.from_port, permission.to_port),
+        (None, None) | (Some(ALL_PORTS), Some(ALL_PORTS))
+    ) {
+        return Ok(());
+    }
+    Err(invalid_parameter_value(format!(
+        "When protocol is {IP_PROTOCOL_NUMBER_ICMPV6} and remote-ip-range is specified, port \
+         range must either not be specified or must be specified as from={ALL_PORTS} and \
+         to={ALL_PORTS}."
+    )))
 }
 
 /// Whether `protocol` is one whose rules HAVE a port range: the four protocols the model
@@ -2169,14 +2273,28 @@ pub fn permission_port_range(
     (None, None)
 }
 
+/// The word a security group rule names every protocol with, beside the number `-1`.
+///
+/// "Use `-1` to specify all protocols" (`IpPermission$IpProtocol`) is the value the member
+/// carries, and EC2 reads this word as that same value — it is what the console and the CLI
+/// show an all-protocols rule as, and what `DescribeSecurityGroups` reports as `-1`. So it is
+/// an ALIAS folded onto [`ALL_IP_PROTOCOLS`] rather than a protocol of its own: a rule
+/// authorized under either spelling is one rule, stored and reported as `-1`.
+pub const ANY_IP_PROTOCOL_KEYWORD: &str = "all";
+
 /// `protocol` in the one form a stored rule carries it in.
 ///
 /// The model spells every protocol name in lower case (`tcp`, `udp`, `icmp`, `icmpv6` —
 /// `IpPermission$IpProtocol`), so a name is stored folded to it the way a CIDR is stored
 /// canonicalised: one rule then has one stored form however the request spelled it, and a
-/// duplicate is recognised as one. A protocol NUMBER has only one spelling and is kept as
-/// it was written.
+/// duplicate is recognised as one. The word for every protocol ([`ANY_IP_PROTOCOL_KEYWORD`])
+/// is folded onto the number the model gives for it. A protocol NUMBER has only one spelling
+/// and is kept as it was written.
 pub fn canonical_ip_protocol(protocol: &str) -> String {
+    let protocol = protocol.trim();
+    if protocol.eq_ignore_ascii_case(ANY_IP_PROTOCOL_KEYWORD) {
+        return ALL_IP_PROTOCOLS.to_string();
+    }
     for named in [
         IP_PROTOCOL_TCP,
         IP_PROTOCOL_UDP,
@@ -2273,41 +2391,59 @@ pub const MAX_PROTOCOL_NUMBER: i32 = 255;
 pub const PEERING_STATUSES: &[&str] =
     crate::ops::types::VPC_PEERING_CONNECTION_STATE_REASON_CODE_VALUES;
 
-/// The protocol `permission` names, refused when it names none or names one no rule may
-/// carry. `member` is the REQUEST PATH the permission arrived on — `ipPermissions.<n>` for an
-/// authorize, `securityGroupRules.<n>.securityGroupRule` for a modify — so a refusal names
-/// the member of the caller's own request it has to fix rather than a member of another
+/// The protocol `permission` names, in the one form it is stored in
+/// ([`canonical_ip_protocol`]) — refused when it names none or names one no rule may carry.
+/// `member` is the REQUEST PATH the permission arrived on — `ipPermissions.<n>` for an
+/// authorize, `securityGroupRules.<n>.securityGroupRule` for a modify — so a MISSING protocol
+/// names the member of the caller's own request it has to fix rather than a member of another
 /// operation's.
 ///
 /// "The IP protocol name (`tcp`, `udp`, `icmp`, `icmpv6`) or number (see Protocol Numbers).
 /// Use `-1` to specify all protocols" (`IpPermission$IpProtocol`) — so a protocol is one of
-/// those four names, a number a single byte holds, or `-1`.
-pub fn validated_ip_protocol<'a, E>(
-    permission: &'a IpPermission,
+/// those four names, a number a single byte holds, `-1`, or the word for the same thing
+/// ([`ANY_IP_PROTOCOL_KEYWORD`]). Every token is read case-insensitively and answered in its
+/// canonical form, so what the rest of the handler sees never depends on how the request
+/// spelled it.
+pub fn validated_ip_protocol<E>(
+    permission: &IpPermission,
     member: &str,
-) -> Result<&'a str, Scaffolded<E>> {
+) -> Result<String, Scaffolded<E>> {
     let protocol = permission
         .ip_protocol
         .as_deref()
-        .filter(|protocol| !protocol.is_empty())
+        .filter(|protocol| !protocol.trim().is_empty())
         .ok_or_else(|| {
             missing_parameter(format!(
                 "The request must contain the parameter {member}.ipProtocol"
             ))
         })?;
-    if !ip_protocol_is_known(protocol) {
-        return Err(invalid_parameter_value(format!(
-            "Invalid IP protocol '{protocol}' for {member}: use a protocol \
-             name ({IP_PROTOCOL_TCP}, {IP_PROTOCOL_UDP}, {IP_PROTOCOL_ICMP}, \
-             {IP_PROTOCOL_ICMPV6}), a protocol number between 0 and {MAX_PROTOCOL_NUMBER}, \
-             or {ALL_IP_PROTOCOLS} for all protocols"
-        )));
+    let canonical = canonical_ip_protocol(protocol);
+    if !ip_protocol_is_known(&canonical) {
+        return Err(unknown_ip_protocol(protocol));
     }
-    Ok(protocol)
+    Ok(canonical)
+}
+
+/// Refuse a token that names no IP protocol: HTTP 400 [`INVALID_PARAMETER_VALUE`].
+///
+/// The sentence is the one EC2 answers an unreadable protocol with, fixed text around the
+/// value the REQUEST sent — the thing the caller has to fix — and it names no member and no
+/// entry number of ours: the value alone is what is wrong with the request. The echo is held
+/// to [`MAX_ECHOED_RESOURCE_ID_CHARS`], the ceiling this crate repeats every caller-chosen
+/// value back under, because `IpPermission$IpProtocol` is a bare string the model bounds
+/// nowhere.
+pub fn unknown_ip_protocol<E>(protocol: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value '{echoed}' for IP protocol. Unknown protocol.",
+        echoed = echoed_resource_id(protocol),
+    ))
 }
 
 /// Whether `protocol` is a protocol a rule may name: one of the four names the model
-/// lists, a protocol number, or `-1` for every protocol (`IpPermission$IpProtocol`).
+/// lists, a protocol number, or `-1` for every protocol (`IpPermission$IpProtocol`). A
+/// security group rule's protocol is asked this of in its canonical form
+/// ([`canonical_ip_protocol`]), which is where the word for every protocol is folded onto
+/// `-1`.
 pub fn ip_protocol_is_known(protocol: &str) -> bool {
     if protocol == ALL_IP_PROTOCOLS {
         return true;
