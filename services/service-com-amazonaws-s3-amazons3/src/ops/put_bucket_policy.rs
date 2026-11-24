@@ -9,6 +9,19 @@
 //! bucket's policy as it was. Neither code is in the model — this operation declares no
 //! errors at all — but they are the codes S3 sends, and a client branches on the code.
 //!
+//! Validating the document means the GRANTS it states, not just its JSON. A statement grants
+//! nothing, and the document is refused, when:
+//!
+//! * an `Action` it names is no action the policy language can read, or is performed on no
+//!   resource TYPE any resource that statement names is of
+//!   ([`crate::state::policy_action_fault`]) — the `<Detail>` of that refusal names the
+//!   action and the statement;
+//! * a `Resource` it names is no resource of this service
+//!   ([`crate::state::policy_resource_fault`]);
+//! * a `Principal` it names is written in no form its principal type defines, or names an
+//!   identity the account does not hold
+//!   ([`crate::service::policy_principals::ungrantable_principal`]).
+//!
 //! A SUCCESS answers `204 No Content` with an empty body. The operation's output shape is
 //! `smithy.api#Unit` — no members, so nothing to carry — and S3's own API Reference sample
 //! response for `PutBucketPolicy` is `HTTP/1.1 204 NoContent`, which recorded traffic
@@ -290,14 +303,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A resource-based policy states WHO it grants to, so every identity the document
-        // names is resolved against this account's IAM before anything is stored: a grant to
-        // an identity that does not exist is a grant to nobody, and a user group is not a
-        // principal at all ([`crate::service::policy_principals`] carries that rule). The
-        // whole write is refused — one unresolvable value in a `Principal` list refuses the
-        // document, not just that statement — and the policy the bucket already carried is
-        // left exactly as it was.
-        if crate::service::policy_principals::unresolvable_principal(&*self.engine, &input.policy)
+        // A statement states its grant as who, which ACTIONS and which RESOURCES, and an
+        // action is performed on a resource TYPE: one named beside resources of no other type
+        // — an object read scoped to the bucket itself, a bucket listing scoped to its
+        // objects — grants nothing, and neither does an action spelled in a way the service
+        // publishes no action under. S3 refuses such a document rather than storing a grant
+        // that cannot work ([`crate::state::policy_action_fault`] is the one reading of both,
+        // over every statement of the document), and the `<Detail>` of the refusal names the
+        // action and the statement the caller has to change. Judged before the store is read,
+        // so the policy the bucket already carries is left exactly as it was.
+        if let Some(fault) = crate::state::policy_action_fault(&input.policy) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_POLICY_CODE,
+                400,
+                fault.message(),
+            )
+            .naming(crate::scaffolded::ErrorDetail::Detail(fault.detail())));
+        }
+
+        // A statement's `Resource` names the resources its grant covers, and a resource is
+        // named by its ARN ([`crate::state::policy_resource_fault`] adds this service's half
+        // of that reading to the shared one). A value that is no resource of this service
+        // names nothing a bucket policy could grant on, so the document is refused.
+        if crate::state::policy_resource_fault(&input.policy).is_some() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_POLICY_CODE,
+                400,
+                crate::state::INVALID_RESOURCE_MESSAGE,
+            ));
+        }
+
+        // A resource-based policy states WHO it grants to: every value is written in a form
+        // its principal type defines, and names an identity the account holds
+        // ([`crate::service::policy_principals`] carries both halves, with the legacy origin
+        // access identity read through CloudFront's own spelling). One value that names
+        // nobody refuses the whole document, not just that statement, and the policy the
+        // bucket already carried is left exactly as it was.
+        if crate::service::policy_principals::ungrantable_principal(&*self.engine, &input.policy)
             .is_some()
         {
             return Err(crate::scaffolded::Scaffolded::unmodeled(

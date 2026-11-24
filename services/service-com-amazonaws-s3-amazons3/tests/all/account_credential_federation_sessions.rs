@@ -54,9 +54,14 @@ const PUT_BUCKET_POLICY: &str = "s3:PutBucketPolicy";
 /// A `Deny` is used because a wildcard-principal `Allow` is public access, which Block Public
 /// Access refuses by default; neither action it names is one any row calls, so the stored
 /// document decides nothing else here.
+///
+/// The statement names the bucket AND its objects, because the two rows deny a bucket action
+/// and an object action respectively: S3 refuses a document whose action is performed on no
+/// resource type any resource the statement names is of, so a statement naming only the
+/// bucket could carry the bucket-scoped row's action alone.
 fn written_policy(denied_action: &str) -> String {
     format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"{denied_action}","Resource":"arn:aws:s3:::{BUCKET}"}}]}}"#
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"{denied_action}","Resource":["arn:aws:s3:::{BUCKET}","arn:aws:s3:::{BUCKET}/*"]}}]}}"#
     )
 }
 

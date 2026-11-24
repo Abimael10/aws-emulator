@@ -402,21 +402,31 @@ fn rows() -> Vec<Row> {
             refusal: None,
         },
         Row {
-            case: "both calls granted on the objects rather than on the bucket",
+            // The ACL read is granted beside the write, but on the OBJECTS and on another
+            // bucket — never on this bucket, which is what the export reads. (A statement
+            // naming a bucket action beside object ARNs alone is a document S3 refuses
+            // outright, so the other bucket's ARN is what keeps this one a document AWS
+            // would store while the ACL read still reaches nothing here.)
+            case: "both calls granted on the objects and on another bucket, not on this one",
             policy: Some(policy(vec![statement(
                 logs_principal(),
                 both_calls.clone(),
-                objects.clone(),
+                json!([objects_arn(DEFAULT_PREFIX), "arn:aws:s3:::another-bucket-entirely"]),
             )])),
             prefix: None,
             refusal: Some(ACL_READ_WITHHELD_MESSAGE),
         },
         Row {
-            case: "both calls granted on the bucket rather than on its objects",
+            // The mirror image: the write is granted beside the ACL read, but on the BUCKET
+            // and on another bucket's objects — never on this bucket's objects, which is
+            // where the export writes. (A statement naming an object action beside bucket
+            // ARNs alone is a document S3 refuses outright, so the other bucket's objects
+            // are what keep this one a document AWS would store.)
+            case: "both calls granted on the bucket and on another bucket's objects",
             policy: Some(policy(vec![statement(
                 logs_principal(),
                 both_calls.clone(),
-                bucket.clone(),
+                json!([bucket_arn(), "arn:aws:s3:::another-bucket-entirely/*"]),
             )])),
             prefix: None,
             refusal: Some(OBJECT_WRITE_WITHHELD_MESSAGE),

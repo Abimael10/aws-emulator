@@ -498,13 +498,15 @@ fn rows() -> Vec<Row> {
             served: false,
         },
         // A DIFFERENT action granted to this service: reading the bucket is not writing it.
+        // (The bucket is named beside its objects because S3 refuses a document whose
+        // bucket-level action is performed on no resource the statement names.)
         Row {
             label: "another action granted to this service",
             policy: |bucket| {
                 Some(policy(grant(
                     json!({ "Service": [DELIVERY_SERVICE_PRINCIPAL] }),
                     json!(["s3:GetObject", "s3:ListBucket"]),
-                    json!([objects_of(bucket)]),
+                    json!([objects_of(bucket), format!("arn:aws:s3:::{bucket}")]),
                     None,
                 )))
             },

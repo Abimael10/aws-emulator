@@ -1066,6 +1066,21 @@ static BUCKET_NAMESPACE: Schema = Schema::new_member(
 )
 .with_xml_name("BucketNamespace");
 
+/// The `<Detail>` of an S3 error document: what, inside a DOCUMENT the request carried, the
+/// refusal is about — the element and the statement of a policy whose grant S3 would not
+/// store, which the sentence of such a refusal names neither of. See [`BUCKET_NAME`].
+static REFUSED_DETAIL: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$detail",
+        "smithy.framework",
+        "detail",
+    ),
+    ShapeType::String,
+    "detail",
+    28,
+)
+.with_xml_name("Detail");
+
 /// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
 /// PARAMETER that asked for functionality the service does not implement for the resource
 /// addressed: "NotImplemented — A query parameter you provided implies functionality that is
@@ -1275,6 +1290,11 @@ pub enum ErrorDetail {
     /// namespace, and the account id a name in an account regional namespace embeds, are
     /// spelled.
     BucketNamespace(String),
+    /// A refusal about a DOCUMENT the request carried, named by `<Detail>`: which part of
+    /// that document the service would not take — the action and the statement of a policy
+    /// whose grant cannot work — since the sentence of such a refusal states the condition
+    /// alone and names no part of the document.
+    Detail(String),
 }
 
 /// What asked for functionality the service does not implement — see
@@ -1401,6 +1421,7 @@ impl ErrorDetail {
             Self::Unimplemented(UnimplementedBy::Header(header))
             | Self::MissingHeader(header) => s.write_string(&REFUSED_HEADER, header),
             Self::BucketNamespace(bucket) => s.write_string(&BUCKET_NAMESPACE, bucket),
+            Self::Detail(detail) => s.write_string(&REFUSED_DETAIL, detail),
             Self::Unimplemented(UnimplementedBy::QueryParameter(parameter)) => {
                 s.write_string(&UNIMPLEMENTED_QUERY_PARAMETER, parameter)
             }
@@ -1423,7 +1444,8 @@ impl ErrorDetail {
             | Self::LocationConstraint(name)
             | Self::StorageClassRequested(name)
             | Self::MissingHeader(name)
-            | Self::BucketNamespace(name) => name.clone(),
+            | Self::BucketNamespace(name)
+            | Self::Detail(name) => name.clone(),
             Self::Unimplemented(by) => by.name().to_string(),
             // The first of the series, which is the one such a refusal is reported by.
             Self::Arguments(arguments) => arguments

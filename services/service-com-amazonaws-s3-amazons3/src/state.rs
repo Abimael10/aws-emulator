@@ -4543,6 +4543,16 @@ pub mod metadata_table_provisioning;
 mod notification_document;
 // One stored object version.
 mod object;
+// Which resources the actions a bucket-policy statement names can be performed on at all.
+mod policy_action_scope;
+// Whether the resources a bucket-policy statement targets are resources this service names
+// at all.
+mod policy_resource_target;
+// How a refusal of a policy document says which part of that document it is about.
+mod policy_document_detail;
+// Whether the values a bucket-policy statement's `Principal` element names are of a form
+// that names a principal at all.
+mod policy_principal_form;
 // The server-side encryption headers a READ of an object may not carry.
 mod read_encryption_headers;
 // The wire codes, statuses and sentences a refusal of this service carries.
@@ -4583,6 +4593,10 @@ pub use metadata_table_provisioning::{
 };
 pub use notification_document::*;
 pub use object::*;
+pub use policy_action_scope::*;
+pub use policy_resource_target::*;
+pub use policy_document_detail::*;
+pub use policy_principal_form::*;
 pub use read_encryption_headers::*;
 pub use refusals::*;
 pub use renames::*;

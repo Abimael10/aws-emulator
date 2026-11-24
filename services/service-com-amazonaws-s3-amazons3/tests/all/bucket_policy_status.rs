@@ -193,11 +193,14 @@ fn status_rows() -> Vec<StatusRow> {
             true,
         ),
         (
+            // The wildcard under the account key as a LIST, which is the form the language
+            // defines a list of principals in; the untyped shorthand is defined for the bare
+            // wildcard alone, so a bare list is a document S3 refuses.
             "a principal list carrying the wildcard".to_string(),
             serde_json::json!({
                 "Statement": {
                     "Effect": "Allow",
-                    "Principal": ["*"],
+                    "Principal": {"AWS": ["*"]},
                     "Action": "s3:GetObject",
                 },
             })

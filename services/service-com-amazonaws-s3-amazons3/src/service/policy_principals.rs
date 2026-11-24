@@ -41,11 +41,29 @@
 //! to be grounded in what that store holds.
 //!
 //! WHICH values a document names is the document reading
-//! ([`crate::state::policy_principals`]); this module is only where those values meet the
-//! records that resolve them.
+//! ([`crate::state::policy_principals`]); the FORM those values have to be written in is the
+//! policy language's ([`crate::state::unreadable_principal`], the shared reading); this
+//! module is where both meet the records that resolve them
+//! ([`ungrantable_principal`], the one question `PutBucketPolicy` asks).
 
 use ::service_com_amazonaws_cloudfront_cloudfront2020_05_31::state as cloudfront_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
+
+/// The first principal of `policy` the account cannot GRANT TO: one written in no form that
+/// names a principal, or one whose form names an identity the account does not hold.
+///
+/// Both are the same refusal on the wire (`MalformedPolicy` with `Invalid principal in
+/// policy`) and both are questions about the document's `Principal` elements, so the two
+/// readings are composed here rather than in the handler: the FORM first
+/// ([`crate::state::unreadable_principal`]), because it needs no store, and then the
+/// resolution below.
+#[must_use]
+pub fn ungrantable_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    policy: &str,
+) -> Option<String> {
+    crate::state::unreadable_principal(policy).or_else(|| unresolvable_principal(engine, policy))
+}
 
 /// The first principal of `policy` the account cannot resolve as a grantee, or `None` when
 /// every value it names resolves (see the module docs).

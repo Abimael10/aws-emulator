@@ -42,3 +42,24 @@ Replay of simparity-wire-aws-v1. Representative s3-cfoac-oac-grant-policy-docume
 
 ## Steps to Reproduce
 1. Replay s3-cfoac-oac-grant-policy-document-mistakes and compare steps task#4 and task#8. 2. Replay s3-pab-block-public-policy-classifies-the-document steps task#7, task#9 and task#11.
+
+## Resolution (what landed, and what is left)
+Causes 3, 4 and 5 replay clean. Cause 1's representative step (task#4) replays clean including its
+`<Detail>`: `PutBucketPolicy` now validates the grants a document states — an action performed on no
+resource type any resource its statement names is of, a value the policy language cannot read as an
+action, a resource that is no resource of this service, and a principal written in no published form
+— each refused 400 `MalformedPolicy` with that class's own sentence.
+
+Three keys of this report stay open for steps of task#4's cluster whose requests the replay withholds:
+
+* `s3|PutBucketPolicy|4xx->4xx|$.Error.Detail` on task#5 — its status, code and message
+  (`Invalid principal in policy`) now match; only the `<Detail>` member AWS carries for THAT error
+  class is still absent, and the recorded text for it is withheld, so nothing is invented for it.
+  That member is the subject of 20261102T111455Z-s3-refusal-envelopes-omit-aws-contextual-error-members.md
+  (Cause 9), which owns it.
+* `s3|PutBucketPolicy|4xx->2xx|$` and `|status` for two further puts of the cluster, which every
+  reading above accepts (a `Resource` naming another bucket and a statement naming no `Resource`
+  were probed and are not what they carry), together with
+  `s3|GetBucketPolicy|2xx->2xx|$.Statement[*]`, which follows from them: the stored document differs
+  while those two puts are served.
+

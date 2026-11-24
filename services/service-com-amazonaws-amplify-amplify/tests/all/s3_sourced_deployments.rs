@@ -316,6 +316,11 @@ fn zip_of(paths: &[&str]) -> Vec<u8> {
 /// principal, actions, resources and condition the row varies: the Amplify service
 /// principal is granted the actions on the resources, scoped to the account and the
 /// apps the deployment is for.
+///
+/// A row's `resources` name the bucket as well as its objects wherever `actions` carries a
+/// bucket-level action beside an object-level one: S3 refuses a document whose action is
+/// performed on no resource type the statement names, so a grant of the pair has to name
+/// both ARNs however little of it the row means to reach.
 fn bucket_policy(
     principal: &str,
     actions: &[&str],
@@ -398,7 +403,10 @@ async fn a_source_the_bucket_policy_does_not_grant_amplify_is_refused() {
             Some(bucket_policy(
                 "cloudfront.amazonaws.com",
                 &["s3:GetObject", "s3:ListBucket"],
-                &["arn:aws:s3:::deploy-refusal-1/*".to_string()],
+                &[
+                    "arn:aws:s3:::deploy-refusal-1".to_string(),
+                    "arn:aws:s3:::deploy-refusal-1/*".to_string(),
+                ],
                 ACCOUNT_ID,
             )),
             json!({ "sourceUrl": "s3://deploy-refusal-1/src/", "sourceUrlType": "BUCKET_PREFIX" }),
@@ -418,7 +426,10 @@ async fn a_source_the_bucket_policy_does_not_grant_amplify_is_refused() {
             Some(bucket_policy(
                 AMPLIFY,
                 &["s3:GetObject", "s3:ListBucket"],
-                &["arn:aws:s3:::some-other-bucket/*".to_string()],
+                &[
+                    "arn:aws:s3:::some-other-bucket".to_string(),
+                    "arn:aws:s3:::some-other-bucket/*".to_string(),
+                ],
                 ACCOUNT_ID,
             )),
             json!({ "sourceUrl": "s3://deploy-refusal-3/src/", "sourceUrlType": "BUCKET_PREFIX" }),
@@ -428,7 +439,10 @@ async fn a_source_the_bucket_policy_does_not_grant_amplify_is_refused() {
             Some(bucket_policy(
                 AMPLIFY,
                 &["s3:GetObject", "s3:ListBucket"],
-                &["arn:aws:s3:::deploy-refusal-4/src/*".to_string()],
+                &[
+                    "arn:aws:s3:::deploy-refusal-4".to_string(),
+                    "arn:aws:s3:::deploy-refusal-4/src/*".to_string(),
+                ],
                 ACCOUNT_ID,
             )),
             json!({ "sourceUrl": "s3://deploy-refusal-4/", "sourceUrlType": "BUCKET_PREFIX" }),
@@ -438,7 +452,10 @@ async fn a_source_the_bucket_policy_does_not_grant_amplify_is_refused() {
             Some(bucket_policy(
                 AMPLIFY,
                 &["s3:GetObject", "s3:ListBucket"],
-                &["arn:aws:s3:::deploy-refusal-5/*".to_string()],
+                &[
+                    "arn:aws:s3:::deploy-refusal-5".to_string(),
+                    "arn:aws:s3:::deploy-refusal-5/*".to_string(),
+                ],
                 "999999999999",
             )),
             json!({ "sourceUrl": "s3://deploy-refusal-5/src/", "sourceUrlType": "BUCKET_PREFIX" }),
@@ -449,10 +466,14 @@ async fn a_source_the_bucket_policy_does_not_grant_amplify_is_refused() {
             json!({ "sourceUrl": "s3://deploy-refusal-6/archives/site.zip", "sourceUrlType": "ZIP" }),
         ),
         (
+            // The bucket itself, under the action that is performed on a bucket: the
+            // archive's own object read is granted nowhere. (A statement naming an object
+            // action beside a bucket ARN alone is a document S3 refuses outright, so the
+            // row names the bucket action instead.)
             "a ZIP source whose bucket names no object of it",
             Some(bucket_policy(
                 AMPLIFY,
-                &["s3:GetObject"],
+                &["s3:ListBucket"],
                 &["arn:aws:s3:::deploy-refusal-7".to_string()],
                 ACCOUNT_ID,
             )),

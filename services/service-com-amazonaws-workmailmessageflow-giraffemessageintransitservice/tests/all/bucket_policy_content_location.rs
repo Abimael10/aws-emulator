@@ -202,12 +202,14 @@ fn rows() -> Vec<Row> {
             true,
         ),
         Row::new(
+            // The bucket itself is named beside the objects, because S3 refuses a document
+            // whose bucket-level action is performed on no resource the statement names.
             "a grant whose action list carries the read beside another action",
             document(vec![statement(
                 "Allow",
                 service("workmail.amazonaws.com"),
                 json!(["s3:ListBucket", "s3:GetObject"]),
-                every_key(),
+                json!([format!("arn:aws:s3:::{BUCKET}"), every_key()]),
             )]),
             true,
         ),
@@ -263,12 +265,20 @@ fn rows() -> Vec<Row> {
             false,
         ),
         Row::new(
-            "a grant whose resource is the bucket rather than its objects",
+            // This bucket is named as the BUCKET rather than as its objects; the object
+            // read the grant carries reaches another bucket's objects alone. (A statement
+            // naming an object action beside a bucket ARN alone is a document S3 refuses
+            // outright, so the other bucket's objects are what keep this one a document AWS
+            // would store.)
+            "a grant whose resources name this bucket rather than its objects",
             document(vec![statement(
                 "Allow",
                 service("workmail.amazonaws.com"),
                 json!("s3:GetObject"),
-                json!(format!("arn:aws:s3:::{BUCKET}")),
+                json!([
+                    format!("arn:aws:s3:::{BUCKET}"),
+                    "arn:aws:s3:::otherbucket/*",
+                ]),
             )]),
             false,
         ),
