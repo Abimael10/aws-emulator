@@ -9,8 +9,10 @@
 //! punctuation included — and interpolates nothing the sentence does not name, so each
 //! already-exists surface keeps its own wording and none of them is derived from another's.
 //! The catalog surface's duplicate-name sentence names the resource kind, withholds the
-//! requested name and ends on a full stop; the suite below drives the database surface
-//! beside it so the wording is pinned per surface rather than blanket-derived.
+//! requested name and carries no terminal full stop — while the same surface's MISS
+//! sentence does carry one, so the punctuation cannot be normalised across the service;
+//! the suite below drives the database surface beside it so the wording is pinned per
+//! surface rather than blanket-derived.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over: the
 //! requested name's value, length, casing and character set, and how the second create
@@ -30,15 +32,19 @@ use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID, REG
 const ALREADY_EXISTS: &str = "AlreadyExistsException";
 
 /// The whole `Message` a `CreateCatalog` for a name the account already holds answers:
-/// fixed text, ending on a full stop.
-const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
+/// fixed text, with no terminal full stop.
+const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
 
 /// The whole `Message` the catalog read and delete answer for an id holding no catalog.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
 /// A `CreateCatalog` body for `name` carrying `description`, naming a source outside the
 /// Glue Data Catalog — the only catalog this operation registers.
-fn create_body(name: &str, description: &str) -> Value {
+///
+/// Shared with the suite that pins the terminal punctuation of each catalog-surface
+/// sentence ([`crate::catalog_refusal_terminal_punctuation`]), so both drive the create
+/// with one request shape.
+pub(crate) fn create_body(name: &str, description: &str) -> Value {
     json!({
         "Name": name,
         "CatalogInput": {
@@ -57,7 +63,10 @@ fn create_body(name: &str, description: &str) -> Value {
 /// `smithy_query operation=CreateCatalog`), so no row is refused at the request boundary
 /// instead of by the handler. The first row is the shape of the recorded behavioural case
 /// and the last sits at the modelled ceiling.
-fn catalog_names() -> Vec<(&'static str, String)> {
+///
+/// Shared with [`crate::catalog_refusal_terminal_punctuation`], so the conditions of the
+/// catalog surface are driven over one name axis.
+pub(crate) fn catalog_names() -> Vec<(&'static str, String)> {
     vec![
         (
             "recorded behavioural shape",
@@ -78,7 +87,8 @@ async fn description_of(router: &MultiServiceRouter, catalog_id: &str) -> Option
 }
 
 /// A second `CreateCatalog` for a name already taken is refused with the catalog surface's
-/// own fixed sentence — which ends on a full stop and names nothing of the request —
+/// own fixed sentence — which carries no terminal full stop and names nothing of the
+/// request —
 /// whatever the name is spelled like and however the second create differs from the first,
 /// and the stored catalog keeps the definition the first create wrote.
 #[tokio::test]
