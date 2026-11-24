@@ -336,18 +336,29 @@ async fn a_registration_creates_no_other_namespaces_service_linked_role() {
         );
     }
 
-    // Listing the whole account finds that one role and nothing else: a registration creates
-    // one role, not a role per namespace the service knows of.
+    // Listing the whole account finds that one role beside the roles AWS creates WITH an
+    // account (the service-linked roles of its account-wide services, which IAM holds from
+    // the moment the account exists): a registration creates one role, not a role per
+    // namespace the service knows of.
     let (status, body) = emulator.call_iam("ListRoles", &[]).await;
     assert_eq!(
         status, 200,
         "case {REGISTERED:?}: expected ListRoles to answer 200, got {status} {body}"
     );
     let listed = elements(&body, "RoleName");
+    let brought_in: Vec<String> = listed
+        .iter()
+        .filter(|role_name| {
+            !service_com_amazonaws_iam_awsidentitymanagementv20100508::state::account_creation_role_names()
+                .contains(&role_name.as_str())
+        })
+        .cloned()
+        .collect();
     assert_eq!(
-        listed,
+        brought_in,
         vec![minted.clone()],
-        "case {REGISTERED:?}: expected the account to hold exactly {minted:?}, got {listed:?}"
+        "case {REGISTERED:?}: expected the registration to have brought in exactly \
+         {minted:?}, got {listed:?}"
     );
 }
 

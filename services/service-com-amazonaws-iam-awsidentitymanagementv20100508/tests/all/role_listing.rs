@@ -16,6 +16,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::account_creation_roles::{account_creation_role_path, roles_in_account_order};
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{call, element, elements, error_code, router};
 
@@ -39,13 +40,29 @@ const ROLES: &[(&str, &str)] = &[
     ("theta-4", "/eng/tools/"),
 ];
 
-/// The fixture role names in the order the service enumerates them: ascending by
-/// the case-folded name, which is the key the store is ordered on — IAM entity
-/// names "are not distinguished by case" (`CreateRole$RoleName`).
-fn roles_in_store_order() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = ROLES.iter().map(|(name, _)| *name).collect();
-    names.sort_by_key(|name| name.to_ascii_lowercase());
-    names
+/// The names of the roles the account HOLDS once the fixture set is created, in the
+/// order the service enumerates them: ascending by the case-folded name, which is
+/// the key the store is ordered on — IAM entity names "are not distinguished by
+/// case" (`CreateRole$RoleName`).
+///
+/// The fixture roles are not the only ones the account holds: AWS creates the
+/// service-linked role of each of its account-wide services with the account itself
+/// (`tests/all/account_creation_roles.rs`), so every listing reports those beside
+/// the fixture's own.
+fn roles_in_store_order() -> Vec<String> {
+    roles_in_account_order(&ROLES.iter().map(|(name, _)| *name).collect::<Vec<&str>>())
+}
+
+/// The path the account holds the role named `role_name` under: the fixture path for
+/// a role this suite created, and the service-linked path for a role AWS created with
+/// the account.
+fn held_path(role_name: &str) -> String {
+    ROLES
+        .iter()
+        .find(|(name, _)| *name == role_name)
+        .map(|(_, path)| (*path).to_string())
+        .or_else(|| account_creation_role_path(role_name))
+        .unwrap_or_else(|| panic!("{role_name:?} is no role the account holds"))
 }
 
 /// Create one role, asserting the fixture create succeeded.
@@ -142,10 +159,7 @@ async fn list_roles_reports_the_stored_record_of_every_role() {
     let listed = listed_roles(&body);
     assert_eq!(
         listed.iter().map(|r| r.role_name.clone()).collect::<Vec<_>>(),
-        roles_in_store_order()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
+        roles_in_store_order(),
         "expected every persisted role once, in store order, got {:?}",
         listed.iter().map(|r| r.role_name.clone()).collect::<Vec<_>>()
     );
@@ -167,11 +181,7 @@ async fn list_roles_reports_the_stored_record_of_every_role() {
             role, &stored[0],
             "case {case:?}: expected the listing to report the stored record, got {role:?}"
         );
-        let expected_path = ROLES
-            .iter()
-            .find(|(name, _)| name == case)
-            .map(|(_, path)| *path)
-            .expect("a fixture role");
+        let expected_path = held_path(case);
         assert_eq!(
             role.path, expected_path,
             "case {case:?}: expected path {expected_path:?}, got {:?}",
@@ -185,18 +195,21 @@ async fn list_roles_reports_the_stored_record_of_every_role() {
     }
 }
 
-/// RULE: a listing of an empty collection is an empty list with `IsTruncated`
+/// RULE: a listing that selects no resource is an empty list with `IsTruncated`
 /// false and no `Marker`, not an error.
 #[tokio::test]
-async fn listing_an_account_holding_no_roles_is_an_empty_list() {
+async fn a_listing_that_selects_no_role_is_an_empty_list() {
     let router = router();
-    // Rows span the parameters a caller may add to an empty-collection listing.
+    // Rows span the parameters a caller may add to a listing that selects nothing:
+    // every path prefix here selects none of the roles an account that has created
+    // no role of its own holds, since AWS files the roles it creates with the
+    // account under the path it reserves for service-linked roles.
     let cases: &[&[(&str, &str)]] = &[
-        &[],
-        &[("MaxItems", "1")],
-        &[("MaxItems", "1000")],
-        &[("PathPrefix", "/")],
-        &[("PathPrefix", "/eng/"), ("MaxItems", "5")],
+        &[("PathPrefix", "/nobody/")],
+        &[("PathPrefix", "/nobody/"), ("MaxItems", "1")],
+        &[("PathPrefix", "/nobody/"), ("MaxItems", "1000")],
+        &[("PathPrefix", "/eng/")],
+        &[("PathPrefix", "/eng/tools/"), ("MaxItems", "5")],
     ];
     for params in cases {
         let (status, body) = call(&router, "ListRoles", params).await;
@@ -228,10 +241,7 @@ async fn listing_an_account_holding_no_roles_is_an_empty_list() {
 #[tokio::test]
 async fn list_roles_pages_through_every_role_exactly_once() {
     let router = with_fixture_roles().await;
-    let expected: Vec<String> = roles_in_store_order()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let expected: Vec<String> = roles_in_store_order();
 
     // Rows span the page size: the published minimum, sizes that do and do not
     // divide the set, a size equal to the set, the published maximum, and the
@@ -380,7 +390,6 @@ async fn a_marker_this_collection_did_not_issue_is_refused() {
     let expected: Vec<String> = roles_in_store_order()
         .into_iter()
         .filter(|name| *name != first)
-        .map(str::to_string)
         .collect();
     assert_eq!(
         listed_names(&body),
@@ -396,22 +405,11 @@ async fn a_marker_this_collection_did_not_issue_is_refused() {
 async fn list_roles_filters_by_path_prefix() {
     let router = with_fixture_roles().await;
 
-    // Rows span the prefix depth: the root, a one-segment prefix, a nested prefix,
-    // a prefix that selects exactly one role, and one that selects none.
+    // Rows span the prefix depth: a one-segment prefix, a nested prefix, a prefix
+    // that selects exactly one role, and one that selects none. The root and the
+    // path IAM reserves for the roles AWS creates with the account follow below,
+    // because what they select is not the fixture set alone.
     let cases: &[(&str, &[&str])] = &[
-        (
-            "/",
-            &[
-                "alpha",
-                "Beta",
-                "delta.x",
-                "Epsilon+1",
-                "eta@3",
-                "gamma_7",
-                "theta-4",
-                "zeta=2",
-            ],
-        ),
         ("/eng/", &["alpha", "Epsilon+1", "gamma_7", "theta-4"]),
         ("/eng/tools/", &["gamma_7", "theta-4"]),
         ("/sales/", &["delta.x", "eta@3"]),
@@ -423,6 +421,23 @@ async fn list_roles_filters_by_path_prefix() {
         let (status, body) = call(&router, "ListRoles", &[("PathPrefix", prefix)]).await;
         assert_eq!(status, 200, "case {prefix:?}: expected 200, got {status}: {body}");
         let expected: Vec<String> = expected.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(
+            listed_names(&body),
+            expected,
+            "case {prefix:?}: expected {expected:?}, got {:?}",
+            listed_names(&body)
+        );
+    }
+
+    // The root selects every role the account holds — the fixture's own and the ones
+    // AWS created with the account — and the path IAM reserves for a service-linked
+    // role selects exactly the latter.
+    for (prefix, expected) in [
+        ("/", roles_in_store_order()),
+        ("/aws-service-role/", roles_in_account_order(&[])),
+    ] {
+        let (status, body) = call(&router, "ListRoles", &[("PathPrefix", prefix)]).await;
+        assert_eq!(status, 200, "case {prefix:?}: expected 200, got {status}: {body}");
         assert_eq!(
             listed_names(&body),
             expected,
@@ -486,6 +501,10 @@ async fn a_filtered_listing_pages_through_only_the_matching_roles() {
     }
 }
 
+/// The path the withheld-attribute rows file their role under, so the listing that reads it
+/// back selects that role alone.
+const WITHHELD_ATTRIBUTES_PATH: &str = "/withheld/";
+
 /// One row of the withheld-attribute table: a role carrying `tags` and whichever
 /// optional members the row names.
 struct SubsetCase {
@@ -538,8 +557,12 @@ async fn a_listing_withholds_the_attributes_its_documentation_excludes() {
     {
         let router = router();
         let role_name = format!("role-{}", case.replace('-', "_"));
+        // The role is created under a path of its own, so the listing below selects it
+        // alone: an account also holds the roles AWS created with it, and what this rule
+        // is about is which ATTRIBUTES of a role a listing reports.
         let mut params = vec![
             param("RoleName", &role_name),
+            param("Path", WITHHELD_ATTRIBUTES_PATH),
             param("AssumeRolePolicyDocument", TRUST_POLICY),
         ];
         if let Some(description) = description {
@@ -582,7 +605,8 @@ async fn a_listing_withholds_the_attributes_its_documentation_excludes() {
         );
 
         // The listing reports the role, WITHOUT the withheld attributes.
-        let (status, listed) = call(&router, "ListRoles", &[]).await;
+        let (status, listed) =
+            call(&router, "ListRoles", &[("PathPrefix", WITHHELD_ATTRIBUTES_PATH)]).await;
         assert_eq!(status, 200, "case {case:?}: expected 200, got {status}: {listed}");
         assert_eq!(
             listed_names(&listed),

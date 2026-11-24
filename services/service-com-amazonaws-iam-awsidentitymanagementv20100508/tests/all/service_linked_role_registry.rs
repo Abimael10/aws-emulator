@@ -75,7 +75,7 @@ const SERVED: &[Served] = &[
     },
     Served {
         case: "an upper-cased spelling of the principal",
-        service_principal: "SUPPORT.AMAZONAWS.COM",
+        service_principal: "RDS.AMAZONAWS.COM",
         custom_suffix: None,
     },
     Served {
@@ -322,11 +322,13 @@ async fn a_value_naming_no_registered_service_is_refused_and_writes_nothing() {
         );
     }
 
-    // Across every refused row, the reserved path is still empty: no refused create left a
+    // Across every refused row, the reserved path still carries only the roles AWS created
+    // WITH the account (`tests/all/account_creation_roles.rs`): no refused create left a
     // role behind under a name this suite did not predict either.
     let listed = roles_under_the_reserved_path(&router, "after every refusal").await;
-    assert!(
-        listed.is_empty(),
-        "expected no role under the reserved path after the refusals, got {listed:?}"
+    assert_eq!(
+        listed,
+        crate::account_creation_roles::roles_in_account_order(&[]),
+        "expected no role of a refused create under the reserved path, got {listed:?}"
     );
 }

@@ -774,7 +774,12 @@ async fn the_account_role_quota_refuses_one_role_too_many() {
         {
             let state = engine.state::<ComAmazonawsIamAwsidentitymanagementv20100508State>();
             let mut store = state.lock();
-            for index in 0..seeded {
+            // The account already holds the roles AWS created WITH it
+            // (`tests/all/account_creation_roles.rs`), and the quota counts every role the
+            // account holds, so the seed tops it up TO the row's count rather than adding
+            // that many beside them.
+            let held = store.roles.len();
+            for index in held..seeded {
                 let role_name = format!("seeded-{index}");
                 store
                     .roles

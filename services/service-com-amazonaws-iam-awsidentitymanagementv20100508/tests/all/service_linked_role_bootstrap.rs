@@ -20,7 +20,9 @@
 //! namespace it scales. The awsQuery harness (router, call, element) is the one
 //! `tests/all/user_lifecycle.rs` owns.
 
-use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state::{
+    ACCOUNT_CREATION_SERVICE_LINKED_ROLE_PRINCIPALS, PUBLISHED_SERVICE_LINKED_ROLE_NAMES,
+};
 
 use crate::user_lifecycle::{account_id, call, element, error_code, router};
 
@@ -218,22 +220,41 @@ async fn every_assigned_name_is_what_the_bootstrap_converges_on() {
 
     for (service_principal, assigned_name) in PUBLISHED_SERVICE_LINKED_ROLE_NAMES {
         let case = *service_principal;
+        // A principal whose service-linked role AWS creates WITH the account already has
+        // a role under its assigned name (`tests/all/account_creation_roles.rs`), and a
+        // name the account already holds a service role under is refused as taken rather
+        // than created a second time — the bootstrap converges on the role already held.
+        let created_with_the_account =
+            ACCOUNT_CREATION_SERVICE_LINKED_ROLE_PRINCIPALS.contains(service_principal);
         let (status, created) = call(
             &router,
             "CreateServiceLinkedRole",
             &[("AWSServiceName", service_principal)],
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected the create to answer 200, got {status}: {created}"
-        );
-        assert_eq!(
-            element(&created, "RoleName"),
-            *assigned_name,
-            "case {case:?}: expected the assigned role name {assigned_name:?}, got {:?}",
-            element(&created, "RoleName")
-        );
+        if created_with_the_account {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the name to be refused as taken, got {status}: {created}"
+            );
+            assert_eq!(
+                error_code(&created),
+                "InvalidInput",
+                "case {case:?}: expected InvalidInput, got {:?}",
+                error_code(&created)
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to answer 200, got {status}: {created}"
+            );
+            assert_eq!(
+                element(&created, "RoleName"),
+                *assigned_name,
+                "case {case:?}: expected the assigned role name {assigned_name:?}, got {:?}",
+                element(&created, "RoleName")
+            );
+        }
 
         let (status, fetched) = call(&router, "GetRole", &[("RoleName", assigned_name)]).await;
         assert_eq!(
@@ -241,12 +262,14 @@ async fn every_assigned_name_is_what_the_bootstrap_converges_on() {
             "case {case:?}: expected GetRole on {assigned_name:?} to answer 200, \
              got {status}: {fetched}"
         );
-        assert_eq!(
-            element(&fetched, "RoleId"),
-            element(&created, "RoleId"),
-            "case {case:?}: expected the created role to be the one read back, got {:?}",
-            element(&fetched, "RoleId")
-        );
+        if !created_with_the_account {
+            assert_eq!(
+                element(&fetched, "RoleId"),
+                element(&created, "RoleId"),
+                "case {case:?}: expected the created role to be the one read back, got {:?}",
+                element(&fetched, "RoleId")
+            );
+        }
 
         // A principal the catalog assigns a name to is never filed under the derived
         // one. Skipped where the derived name is a name the catalog assigns to SOME

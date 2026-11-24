@@ -70,6 +70,15 @@ const GROUPS: &[(&str, &str)] = &[("Admins", "/"), ("auditors_1", "/audit/")];
 /// profile, one with nothing but its trust policy.
 const ROLES: &[(&str, &str)] = &[("RoleOne", "/"), ("role.two", "/svc/")];
 
+/// Every role the account holds while the fixture is in place: the two the fixture
+/// created, and the ones AWS creates WITH the account — the service-linked role of each
+/// of its account-wide services (`tests/all/account_creation_roles.rs`). A report of the
+/// account's configuration carries them like any other role of the account.
+fn all_roles() -> Vec<String> {
+    let fixture: Vec<&str> = ROLES.iter().map(|(name, _)| *name).collect();
+    crate::account_creation_roles::roles_in_account_order(&fixture)
+}
+
 /// The fixture customer managed policies, at two path depths and in both cases.
 const POLICIES: &[(&str, &str)] = &[("readers", "/"), ("Writers+1", "/data/")];
 
@@ -128,9 +137,12 @@ fn boundary_aws_arn() -> String {
 }
 
 /// The AWS-managed policies the fixture account USES, ascending by ARN: the one
-/// attached to a role and the one setting a role's permissions boundary.
+/// attached to a role, the one setting a role's permissions boundary, and the policy
+/// each role AWS created with the account carries, which that role's attachment puts to
+/// use in the account.
 fn aws_arns() -> Vec<String> {
     let mut arns = vec![attached_aws_arn(), boundary_aws_arn()];
+    arns.extend(crate::account_creation_roles::account_creation_role_policy_arns());
     arns.sort();
     arns
 }
@@ -448,7 +460,11 @@ fn detail_names(body: &str, list_tag: &str, name_tag: &str) -> Vec<String> {
 }
 
 /// The one detail of `list_tag` whose `name_tag` is `name`.
-fn detail_block(body: &str, list_tag: &str, name_tag: &str, name: &str) -> String {
+///
+/// Shared with the suites that read ONE entity's detail out of a whole report
+/// (`tests/all/instance_profile_embedded_role_document_readers.rs`), so the report and the
+/// extraction are defined once.
+pub(crate) fn detail_block(body: &str, list_tag: &str, name_tag: &str, name: &str) -> String {
     let found: Vec<String> = members(body, list_tag)
         .into_iter()
         .filter(|block| first(block, name_tag).as_deref() == Some(name))
@@ -543,7 +559,7 @@ fn type_cases() -> Vec<TypeCase> {
             entity_type: state::ENTITY_FILTER_ROLE,
             list_tag: "RoleDetailList",
             name_tag: "RoleName",
-            expected: in_store_order(ROLES),
+            expected: all_roles(),
         },
         TypeCase {
             case: "the account's own managed policies",

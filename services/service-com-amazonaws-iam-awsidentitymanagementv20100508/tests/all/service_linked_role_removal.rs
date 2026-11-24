@@ -87,12 +87,14 @@ const DELETION_CASES: &[DeletionCase] = &[
         created_by_the_account: false,
         role_name: "AWSServiceRoleForAPIGateway",
     },
-    // A role every account's support tooling reads, provisioned rather than created.
+    // A role of a service whose role AWS does NOT create with the account, provisioned
+    // rather than created: the account holds no record of its own under that name, which
+    // is what makes the submit a refusal.
     DeletionCase {
-        service_principal: "support.amazonaws.com",
+        service_principal: "guardduty.amazonaws.com",
         custom_suffix: None,
         created_by_the_account: false,
-        role_name: "AWSServiceRoleForSupport",
+        role_name: "AWSServiceRoleForAmazonGuardDuty",
     },
 ];
 
@@ -365,14 +367,15 @@ async fn the_reported_role_details_are_one_member_per_role_the_account_holds() {
         ordered
     }
 
-    // Rows: an account holding no role, then one, two and three — the cardinalities the
-    // report's entry count has to follow, including the single-role account a repeated
-    // member list is easiest to get wrong on.
-    let mut expected: Vec<String> = Vec::new();
+    // Rows: an account that has created no role of its own — which still holds the roles
+    // AWS created WITH it (`tests/all/account_creation_roles.rs`) — then one, two and
+    // three created roles: the cardinalities the report's entry count has to follow.
+    let mut expected: Vec<String> = crate::account_creation_roles::roles_in_account_order(&[]);
     assert_eq!(
-        reported_role_names(&router, "no roles").await,
+        reported_role_names(&router, "no roles of its own").await,
         expected,
-        "expected an account holding no roles to report none"
+        "expected an account that created no role of its own to report the roles AWS \
+         created with it"
     );
 
     for role_name in ["Deployer", "Auditor"] {
@@ -445,8 +448,8 @@ async fn the_reported_role_details_are_one_member_per_role_the_account_holds() {
 /// service's own user guide, which names the role AND the policy AWS attaches to it —
 /// the same documentation `src/state.rs`'s `SERVICE_LINKED_ROLE_POLICIES` cites. Rows
 /// span a service whose policy is named for the service (Elastic Load Balancing,
-/// Amazon ECS), one whose policy name carries a prefix the principal does not
-/// (AWS Support), the Auto Scaling row the recorded suite reads, and two services whose
+/// Amazon ECS), one whose policy name carries a prefix and a suffix the principal does not
+/// (AWS Backup), the Auto Scaling row the recorded suite reads, and two services whose
 /// service-linked role AWS publishes no policy name this emulator carries for.
 const POLICY_ROWS: &[(&str, Option<&str>)] = &[
     (
@@ -454,7 +457,7 @@ const POLICY_ROWS: &[(&str, Option<&str>)] = &[
         Some("ElasticLoadBalancingServiceRolePolicy"),
     ),
     ("ecs.amazonaws.com", Some("AmazonECSServiceRolePolicy")),
-    ("support.amazonaws.com", Some("AWSSupportServiceRolePolicy")),
+    ("backup.amazonaws.com", Some("AWSBackupServiceLinkedRolePolicyForBackup")),
     ("autoscaling.amazonaws.com", Some("AutoScalingServiceRolePolicy")),
     ("ec2fleet.amazonaws.com", None),
     ("globalaccelerator.amazonaws.com", None),
@@ -552,7 +555,9 @@ async fn a_service_linked_role_carries_the_policy_its_service_controls_it_throug
         }
 
         // The same attachment is what the account's authorization details report for the
-        // role.
+        // role. The report enumerates the roles the account HOLDS in its own key order —
+        // the created role beside the roles AWS created with the account — so the policy
+        // ARNs it carries are each of those roles', in that order.
         let (status, details) = call(
             &router,
             "GetAccountAuthorizationDetails",
@@ -563,10 +568,18 @@ async fn a_service_linked_role_carries_the_policy_its_service_controls_it_throug
             status, 200,
             "case {case:?}: expected 200, got {status}: {details}"
         );
+        let mut by_role: Vec<(String, String)> = expected_arns
+            .iter()
+            .map(|arn| (role_name.clone(), arn.clone()))
+            .collect();
+        by_role.extend(crate::account_creation_roles::account_creation_role_policies());
+        by_role.sort_by_key(|(role, _)| role.to_ascii_lowercase());
+        let expected_in_report: Vec<String> =
+            by_role.into_iter().map(|(_, arn)| arn).collect();
         assert_eq!(
             elements(&details, "PolicyArn"),
-            expected_arns,
-            "case {case:?}: expected the role's attached managed policies to be reported, \
+            expected_in_report,
+            "case {case:?}: expected the roles' attached managed policies to be reported, \
              got {:?}",
             elements(&details, "PolicyArn")
         );

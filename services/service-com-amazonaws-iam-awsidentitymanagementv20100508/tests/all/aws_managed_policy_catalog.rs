@@ -216,10 +216,20 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
             "case {case:?}: a read must report the attachability AWS publishes for this \
              policy: {body}"
         );
+        // The policy each role AWS created WITH the account carries is attached to that
+        // role from the moment the account exists
+        // (`tests/all/account_creation_roles.rs`); nothing in this account has attached
+        // any other catalog policy.
+        let expected_attachments =
+            if crate::account_creation_roles::account_creation_role_policy_arns().contains(&arn) {
+                "1"
+            } else {
+                "0"
+            };
         assert_eq!(
             element(&body, "AttachmentCount"),
-            "0",
-            "case {case:?}: nothing is attached in this account yet: {body}"
+            expected_attachments,
+            "case {case:?}: expected the attachments this account holds of it: {body}"
         );
         assert_eq!(
             element(&body, "PermissionsBoundaryUsageCount"),

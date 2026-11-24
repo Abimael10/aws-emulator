@@ -480,7 +480,9 @@ async fn a_principal_with_no_registered_service_linked_role_is_refused() {
         );
     }
 
-    // And nothing is listed under the path IAM reserves for service-linked roles.
+    // And no role of a refused create is listed under the path IAM reserves for
+    // service-linked roles: what it carries is the roles AWS created WITH the account
+    // (`tests/all/account_creation_roles.rs`) and nothing else.
     let (status, listed) = call(
         &router,
         "ListRoles",
@@ -488,9 +490,10 @@ async fn a_principal_with_no_registered_service_linked_role_is_refused() {
     )
     .await;
     assert_eq!(status, 200, "expected the listing to be served, got {status}: {listed}");
-    assert!(
-        elements(&listed, "RoleName").is_empty(),
-        "expected no role under the service-linked role path, got {:?}",
+    assert_eq!(
+        elements(&listed, "RoleName"),
+        crate::account_creation_roles::roles_in_account_order(&[]),
+        "expected no role of a refused create under the service-linked role path, got {:?}",
         elements(&listed, "RoleName")
     );
 

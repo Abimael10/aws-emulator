@@ -251,17 +251,21 @@ async fn the_provisioned_role_is_the_same_record_however_it_is_read() {
 
 /// RULE: a read reports; it stores nothing — so reading the roles the services keep
 /// provisioned leaves the account's own collection of roles exactly as it was, and
-/// `ListRoles` still enumerates only what the ACCOUNT holds.
+/// `ListRoles` still enumerates only the roles the ACCOUNT holds.
 #[tokio::test]
 async fn reading_a_provisioned_role_leaves_the_accounts_own_roles_untouched() {
     let router = router();
+    // The account that has created no role of its own still holds the roles AWS created
+    // WITH it (`tests/all/account_creation_roles.rs`), and nothing below creates or
+    // deletes one, so that is what every listing here must report.
+    let held = crate::account_creation_roles::roles_in_account_order(&[]);
 
     let (status, body) = call(&router, "ListRoles", &[]).await;
     assert_eq!(status, 200, "expected ListRoles 200, got {status}: {body}");
     assert_eq!(
         elements(&body, "RoleName"),
-        Vec::<String>::new(),
-        "expected an account holding no roles of its own to list none, got {:?}",
+        held,
+        "expected the roles the account holds to be listed, got {:?}",
         elements(&body, "RoleName")
     );
 
@@ -281,7 +285,7 @@ async fn reading_a_provisioned_role_leaves_the_accounts_own_roles_untouched() {
     assert_eq!(status, 200, "expected ListRoles 200, got {status}: {body}");
     assert_eq!(
         elements(&body, "RoleName"),
-        Vec::<String>::new(),
+        held,
         "a read stored a role: expected the account's roles to be untouched, got {:?}",
         elements(&body, "RoleName")
     );
@@ -320,9 +324,9 @@ async fn reading_a_provisioned_role_leaves_the_accounts_own_roles_untouched() {
         );
         assert_eq!(
             elements(&listed, "RoleName"),
-            vec![(*published_name).to_string()],
-            "case {published_name:?}: expected the created role to be the account's only one, \
-             got {:?}",
+            crate::account_creation_roles::roles_in_account_order(&[published_name]),
+            "case {published_name:?}: expected the created role beside the ones AWS created \
+             with the account, got {:?}",
             elements(&listed, "RoleName")
         );
     }

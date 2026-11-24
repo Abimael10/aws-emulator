@@ -229,10 +229,20 @@ impl Emulator {
     fn fill_role_quota(&self, held: &[&str]) {
         let store = self.iam_store();
         let mut store = store.lock();
-        for index in 0..iam::MAX_ROLES_PER_ACCOUNT {
-            let name = held
-                .get(index)
-                .map_or_else(|| format!("filler-role-{index}"), |name| (*name).to_string());
+        // The account already holds the roles AWS created WITH it — the service-linked role
+        // of each of its account-wide services — and the quota counts every role the account
+        // holds, so the fill tops it up TO the quota rather than adding that many beside
+        // them. `held` is seeded first, so a profile that must hold one of those roles still
+        // finds it.
+        for (index, name) in held
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain((0..iam::MAX_ROLES_PER_ACCOUNT).map(|index| format!("filler-role-{index}")))
+            .enumerate()
+        {
+            if store.roles.len() >= iam::MAX_ROLES_PER_ACCOUNT {
+                break;
+            }
             store
                 .roles
                 .insert(iam::name_key(&name), seeded_role(&name, index));

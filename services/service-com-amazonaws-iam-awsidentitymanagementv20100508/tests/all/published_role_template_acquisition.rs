@@ -466,8 +466,9 @@ async fn a_published_template_is_rendered_only_with_the_parameters_it_defines() 
             "case {case:?}: expected the refusal {expected:?}, got {:?}",
             element(&body, "Message")
         );
-        assert!(
-            listed_roles(&router).await.is_empty(),
+        assert_eq!(
+            listed_roles(&router).await,
+            crate::account_creation_roles::roles_in_account_order(&[]),
             "case {case:?}: a refused call creates no role, got {:?}",
             listed_roles(&router).await
         );

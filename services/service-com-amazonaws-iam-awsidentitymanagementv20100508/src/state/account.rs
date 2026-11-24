@@ -471,9 +471,9 @@ pub fn organizations_entity_path_organization(entity_path: &str) -> Option<&str>
 /// strictly after the key the marker names.
 ///
 /// `Default` is NOT derived: the account does not start out empty. It starts out holding
-/// the IAM user this emulator's own long-term credential belongs to
-/// ([`Self::default`]), which is why [`Self::empty`] — the account with nothing at all in
-/// it — is a separate constructor.
+/// the IAM user this emulator's own long-term credential belongs to and the service-linked
+/// roles AWS creates with an account ([`Self::default`]), which is why [`Self::empty`] —
+/// the account with nothing at all in it — is a separate constructor.
 #[derive(Debug)]
 pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The persisted IAM users, keyed by [`name_key`] of the user name. IAM names
@@ -928,7 +928,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
 
 impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The account's IAM as it stands before any request: holding the one user this
-    /// emulator's own long-term credential belongs to, and nothing else.
+    /// emulator's own long-term credential belongs to, the roles AWS creates with the
+    /// account, and nothing else.
     ///
     /// A long-term access key belongs to an IAM USER, so the principal STS reports for a
     /// caller presenting the key the emulator publishes
@@ -952,6 +953,11 @@ impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// configuration an account IS in: each account-wide feature these properties gate is
     /// in its default state from the moment the account exists, so a read of one before a
     /// write reports that state rather than nothing.
+    ///
+    /// It holds roles for the same reason: AWS creates the service-linked roles of its
+    /// account-wide services when it creates the account, so those roles are part of the
+    /// account's configuration from the start and every enumeration of its roles reports
+    /// them ([`super::account_creation_roles`]).
     fn default() -> Self {
         let mut account = Self::empty();
         let caller = ambient_user();
@@ -959,6 +965,7 @@ impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
             .users
             .insert(name_key(&caller.user_name), caller);
         account.account_properties = default_account_properties();
+        super::account_creation_roles::hold_account_creation_roles(&mut account);
         account
     }
 }

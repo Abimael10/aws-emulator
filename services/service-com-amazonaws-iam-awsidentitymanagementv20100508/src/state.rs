@@ -21,6 +21,7 @@ use crate::ops::types::{
 };
 
 pub mod account;
+pub mod account_creation_roles;
 pub mod account_summary;
 pub mod action_resource_types;
 pub mod authorization;
@@ -61,6 +62,7 @@ pub use saml_metadata::*;
 pub use managed_policy_catalog::*;
 
 pub use account::*;
+pub use account_creation_roles::*;
 pub use account_summary::*;
 pub use action_resource_types::*;
 pub use credential_report::*;
@@ -2579,6 +2581,10 @@ const SERVICE_PROVISIONED_ROLE_CREATE_MILLIS: i64 = 0;
 ///   every client that follows a service's documented bootstrap (create the role,
 ///   then read it back under the published name) depends on that create succeeding.
 ///   The created record then supersedes this one for every later read.
+/// * The roles AWS creates WITH the account are not resolved here at all: the account
+///   HOLDS them, so they are stored records from the moment it exists
+///   ([`account_creation_roles`]) and every enumeration of its roles reports them. Every
+///   other row of the catalog stays a record only this function derives.
 /// * The operations that report the ACCOUNT's own record of a role's attachments or
 ///   change a member no protection covers (`UpdateRole`, `Get`/`DeleteRolePolicy`'s
 ///   policy lookup, `Tag`/`UntagRole`, the `ListRole*` listings and `ListRoles`) keep

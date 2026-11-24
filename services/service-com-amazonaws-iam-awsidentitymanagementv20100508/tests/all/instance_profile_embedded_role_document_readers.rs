@@ -48,21 +48,34 @@ const READERS_PATH: &str = "/readers/";
 /// account-wide report carries the projection more than once.
 const READERS_PROFILES: usize = 2;
 
-/// Every `AssumeRolePolicyDocument` the account-wide configuration report carries for the roles
-/// it reports: each role's own member, and the one inside every instance profile that contains
-/// it.
+/// Every `AssumeRolePolicyDocument` the account-wide configuration report carries for ONE
+/// role: the role's own member, and the one inside every instance profile that contains it.
 ///
-/// The one-page read of that report — filtered to the roles, asked for at the published maximum
-/// page size and asserted untruncated — is the account-report suite's
-/// (`crate::account_authorization_details::report`), so this adds only the extraction.
-async fn reported_by_the_account_report(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+/// The report carries every role the ACCOUNT holds — the roles AWS created with the account
+/// included (`tests/all/account_creation_roles.rs`) — so the documents are taken from the
+/// addressed role's own detail. The one-page read of that report — filtered to the roles,
+/// asked for at the published maximum page size and asserted untruncated — and the
+/// extraction of one entity's detail are the account-report suite's
+/// (`crate::account_authorization_details::report`, `detail_block`), so this adds only the
+/// member read.
+async fn reported_by_the_account_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    role: &str,
+) -> Vec<String> {
     let body = crate::account_authorization_details::report(
         router,
         case,
         &[state::ENTITY_FILTER_ROLE],
     )
     .await;
-    elements(&body, "AssumeRolePolicyDocument")
+    let detail = crate::account_authorization_details::detail_block(
+        &body,
+        "RoleDetailList",
+        "RoleName",
+        role,
+    );
+    elements(&detail, "AssumeRolePolicyDocument")
 }
 
 /// A role holding `document`, embedded in [`READERS_PROFILES`] instance profiles under
@@ -121,7 +134,7 @@ async fn documents_by_reader(
         )
         .await,
     );
-    let account = reported_by_the_account_report(router, case).await;
+    let account = reported_by_the_account_report(router, case, role).await;
 
     vec![
         ("GetInstanceProfile", single, 1),
@@ -195,7 +208,7 @@ async fn the_account_report_carries_the_embedded_roles_encoded_trust_policy() {
     let case = "the canonical trust policy";
     let (router, _) = with_embedded_role(case, "account-readers-role", CANONICAL_TRUST_POLICY).await;
 
-    let reported = reported_by_the_account_report(&router, case).await;
+    let reported = reported_by_the_account_report(&router, case, "account-readers-role").await;
     assert_eq!(
         reported.len(),
         READERS_PROFILES + 1,

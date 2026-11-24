@@ -399,6 +399,21 @@ struct Call {
     expected: fn(&str, &str) -> Value,
 }
 
+/// The role names the account holds, sorted the way the handler sorts the names it read: the
+/// role this suite's function runs as, beside the roles AWS creates WITH an account — IAM
+/// holds the service-linked role of each of its account-wide services from the moment the
+/// account exists, so a listing of the account's roles reports them too.
+fn held_role_names() -> Vec<String> {
+    let mut names: Vec<String> =
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::state::account_creation_role_names()
+            .into_iter()
+            .map(ToString::to_string)
+            .chain(::std::iter::once(SURFACE.to_string()))
+            .collect();
+    names.sort();
+    names
+}
+
 /// The calls: a role read, a read of the document embedded in it, a read of the managed
 /// policies attached to it, a listing of the account's roles, a WRITE read back, and an
 /// operation this runtime's SDK binds no request for.
@@ -428,7 +443,7 @@ fn calls() -> Vec<Call> {
         Call {
             case: "a listing of the account's roles",
             event: |_attached| json!({ "action": "ListRoles", "role": SURFACE }),
-            expected: |_attached, _document| json!({ "roles": [SURFACE] }),
+            expected: |_attached, _document| json!({ "roles": held_role_names() }),
         },
         Call {
             case: "a write, read back through the role's own tags",

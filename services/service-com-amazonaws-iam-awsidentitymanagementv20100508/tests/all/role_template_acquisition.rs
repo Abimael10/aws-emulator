@@ -43,6 +43,7 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::{
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::account_creation_roles::account_creation_role_keys;
 use crate::identity_policy_enforcement::{principal, statement};
 use crate::user_lifecycle::{
     account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
@@ -601,8 +602,9 @@ async fn a_minor_version_the_template_does_not_hold_is_refused_as_a_missing_enti
         );
     }
 
-    assert!(
-        held_roles(&engine).is_empty(),
+    assert_eq!(
+        held_roles(&engine),
+        account_creation_role_keys(),
         "no refused call may create a role, got {:?}",
         held_roles(&engine)
     );
@@ -649,8 +651,9 @@ async fn a_disabled_template_or_minor_version_creates_no_role() {
             "case {case:?}: the refusal must name the disabled template, got {:?}",
             element(&body, "Message")
         );
-        assert!(
-            held_roles(&engine).is_empty(),
+        assert_eq!(
+            held_roles(&engine),
+            account_creation_role_keys(),
             "case {case:?}: a refused call creates no role, got {:?}",
             held_roles(&engine)
         );
@@ -771,8 +774,9 @@ async fn a_value_the_template_cannot_be_rendered_with_is_refused_as_invalid_inpu
             row.message,
             element(&body, "Message")
         );
-        assert!(
-            held_roles(&engine).is_empty(),
+        assert_eq!(
+            held_roles(&engine),
+            account_creation_role_keys(),
             "case {:?}: a refused call creates no role, got {:?}",
             row.case,
             held_roles(&engine)
@@ -825,8 +829,9 @@ async fn a_rendered_policy_that_is_no_policy_document_is_refused() {
             !element(&body, "Message").is_empty(),
             "case {case:?}: the refusal must describe the specific error, got {body}"
         );
-        assert!(
-            held_roles(&engine).is_empty(),
+        assert_eq!(
+            held_roles(&engine),
+            account_creation_role_keys(),
             "case {case:?}: a refused call creates no role, got {:?}",
             held_roles(&engine)
         );

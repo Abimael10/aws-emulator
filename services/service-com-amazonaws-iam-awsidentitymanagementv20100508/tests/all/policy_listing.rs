@@ -319,7 +319,7 @@ async fn a_scope_holding_no_policy_is_an_empty_list() {
         &[("Scope", "Local"), ("PathPrefix", "/")],
         &[("Scope", "All"), ("PathPrefix", "/nobody/")],
         &[("PathPrefix", "/nobody/"), ("MaxItems", "5")],
-        &[("OnlyAttached", "true")],
+        &[("OnlyAttached", "true"), ("Scope", "Local")],
     ];
     for params in cases {
         let (status, body) = call(&router, "ListPolicies", params).await;
@@ -694,6 +694,10 @@ async fn with_fixture_usage() -> (MultiServiceRouter, Usage) {
     );
 
     let mut attached = vec![role_policy, user_policy, aws_policy];
+    // The roles AWS created WITH the account carry the policy each of their services
+    // controls them through (`tests/all/account_creation_roles.rs`), so those policies are
+    // attached to an identity of this account too.
+    attached.extend(crate::account_creation_roles::account_creation_role_policy_arns());
     attached.sort();
     (
         router,

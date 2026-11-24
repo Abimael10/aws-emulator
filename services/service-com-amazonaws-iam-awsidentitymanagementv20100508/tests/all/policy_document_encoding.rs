@@ -185,6 +185,10 @@ fn assert_reported_documents(case: &str, body: &str, tag: &str, stored: &str, ex
     }
 }
 
+/// The path this suite's fixture roles are created under, so a role listing can select them
+/// apart from the roles AWS creates with the account.
+const FIXTURE_ROLE_PATH: &str = "/probe/";
+
 /// Create a role whose trust policy is `submitted`, asserting the fixture create succeeded
 /// and that the create's own answer already reports the STORED document, encoded.
 async fn create_role(
@@ -197,7 +201,14 @@ async fn create_role(
     let (status, body) = call(
         router,
         "CreateRole",
-        &[("RoleName", name), ("AssumeRolePolicyDocument", submitted)],
+        &[
+            ("RoleName", name),
+            // A path of the fixture's own, so a listing can select this suite's roles
+            // apart from the roles AWS created with the account
+            // (`tests/all/account_creation_roles.rs`).
+            ("Path", FIXTURE_ROLE_PATH),
+            ("AssumeRolePolicyDocument", submitted),
+        ],
     )
     .await;
     assert_eq!(
@@ -328,7 +339,11 @@ async fn every_page_of_the_instance_profile_listings_reports_the_encoded_trust_p
             vec![param("InstanceProfileName", profiles[0])],
         ),
         ("GetRole", "GetRole", vec![param("RoleName", ROLE)]),
-        ("ListRoles", "ListRoles", vec![param("MaxItems", "1")]),
+        (
+            "ListRoles",
+            "ListRoles",
+            vec![param("PathPrefix", FIXTURE_ROLE_PATH), param("MaxItems", "1")],
+        ),
     ] {
         let (status, body) = call(&router, operation, &borrowed(&params)).await;
         assert_eq!(
