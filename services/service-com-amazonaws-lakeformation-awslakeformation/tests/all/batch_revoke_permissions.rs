@@ -20,7 +20,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::glue_catalog::{
     account_catalog, emulator_with_catalog, error_code, lake_formation as call, list_permissions,
-    revoke_default_database_grant, revoke_table_default_grants, NOTHING_TO_REVOKE,
+    permissions_not_held_message, revoke_default_database_grant, revoke_table_default_grants,
+    NOTHING_TO_REVOKE,
 };
 
 /// A Data Catalog holding the `sales` database with its `orders` table, with the grants
@@ -176,7 +177,9 @@ async fn a_batch_revoke_applies_every_entry_it_does_not_report_as_failed() {
             granted: Some((database.clone(), vec!["DESCRIBE"])),
             resource: database.clone(),
             permissions: vec!["DROP"],
-            outcome: Err(NOTHING_TO_REVOKE.to_string()),
+            // This grantee DOES hold something on the database, so the failure reports the
+            // difference rather than saying the grantee holds nothing.
+            outcome: Err(permissions_not_held_message(&["DROP"])),
         },
         BatchEntryCase {
             id: "absent-table",

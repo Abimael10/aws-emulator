@@ -22,7 +22,8 @@ use smithy_server_runtime::MultiServiceRouter;
 // The one copy of the harness every permission suite shares: the Glue+LakeFormation
 // emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
 use crate::glue_catalog::{
-    account_catalog, create_database, emulator, error_code, lake_formation as call,
+    account_catalog, create_database, create_database_with_input, create_table, emulator,
+    error_code, lake_formation as call, permissions_not_held_message,
     revoke_default_database_grant, revoke_table_default_grants, NOTHING_TO_REVOKE,
 };
 
@@ -38,13 +39,15 @@ type RepeatedGrantCase = (
 );
 
 /// One row of the absent-revoke table: the case name, what was granted first (if
-/// anything), and the principal, resource and permissions the revoke names.
+/// anything), the principal, resource and permissions the revoke names, and the whole
+/// sentence the refusal must carry.
 type AbsentRevokeCase = (
     &'static str,
     Option<Vec<&'static str>>,
     &'static str,
     Value,
     Vec<&'static str>,
+    String,
 );
 
 /// One row of the partial-revoke table: the case name, the permissions granted, those
@@ -404,7 +407,10 @@ async fn granting_again_unions_into_the_records_it_already_holds() {
 #[tokio::test]
 async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
     // Rows differ along WHY nothing is there to revoke: no grant at all, a permission the
-    // grant does not carry, another principal's grant, another resource, another catalog.
+    // grant does not carry, another principal's grant, another resource — and, across them,
+    // along WHICH of the two nothing-was-revoked sentences that draws: the grantee the
+    // service always models is told which permissions it does not have, a grantee that
+    // holds nothing on the resource is told it holds nothing.
     let resource = json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } });
     let other_resource = json!({ "Table": { "DatabaseName": "sales", "Name": "returns" } });
     let cases: Vec<AbsentRevokeCase> = vec![
@@ -415,6 +421,7 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "IAM_ALLOWED_PRINCIPALS",
             resource.clone(),
             vec!["ALL"],
+            permissions_not_held_message(&["ALL"]),
         ),
         (
             "permission not held",
@@ -422,6 +429,7 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "IAM_ALLOWED_PRINCIPALS",
             resource.clone(),
             vec!["DROP"],
+            permissions_not_held_message(&["DROP"]),
         ),
         (
             "one held and one not",
@@ -429,13 +437,17 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "IAM_ALLOWED_PRINCIPALS",
             resource.clone(),
             vec!["SELECT", "DROP"],
+            permissions_not_held_message(&["SELECT", "DROP"]),
         ),
         (
+            // Another principal's grant is not this grantee's, and this grantee holds
+            // nothing of its own here, so it is told exactly that.
             "another principal",
             Some(vec!["ALL"]),
             "arn:aws:iam::111122223333:role/other",
             resource.clone(),
             vec!["ALL"],
+            NOTHING_TO_REVOKE.to_string(),
         ),
         (
             "another resource",
@@ -443,10 +455,11 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "IAM_ALLOWED_PRINCIPALS",
             other_resource,
             vec!["ALL"],
+            permissions_not_held_message(&["ALL"]),
         ),
     ];
 
-    for (case, granted, principal, revoked_resource, revoked) in cases {
+    for (case, granted, principal, revoked_resource, revoked, expected) in cases {
         let router = emulator_with_catalog().await;
         if let Some(permissions) = &granted {
             grant(
@@ -479,17 +492,17 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
             "InvalidInputException",
             "case {case:?}: expected InvalidInputException, got {payload:?}"
         );
-        // The refusal is the fixed sentence Lake Formation answers a revoke that would
-        // take nothing away: no value of THIS request is interpolated, so every row's
-        // refusal reads the same.
+        // Which of the two nothing-was-revoked sentences this row draws: the per-permission
+        // difference for a grantee the service models on the resource, the fixed
+        // holds-nothing sentence otherwise.
         let message = payload
             .get("message")
             .or_else(|| payload.get("Message"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert_eq!(
-            message, NOTHING_TO_REVOKE,
-            "case {case:?}: expected Message {NOTHING_TO_REVOKE:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected Message {expected:?}, got {message:?}"
         );
 
         // The refusal took nothing away: whatever was granted is still there.
@@ -1218,4 +1231,266 @@ async fn a_grant_records_the_set_of_the_permissions_it_names_up_to_the_modelled_
         );
     }
 }
+
+/// An emulator whose Data Catalog holds a GOVERNED database — `CreateTableDefaultPermissions`
+/// is the empty list, so the tables created in it are handed NO `IAM_ALLOWED_PRINCIPALS`
+/// grant — with one table in it.
+///
+/// The condition both nothing-was-revoked wordings are measured under: the table holds no
+/// grant for the group at all, and none for any principal but its creator.
+async fn emulator_with_governed_table() -> MultiServiceRouter {
+    let router = emulator();
+    create_database_with_input(&router, &crate::creator_table_grants::governed_database("lake"))
+        .await;
+    create_table(&router, "lake", "events").await;
+    router
+}
+
+/// `RevokePermissions` that must be refused, asserting the status, the modelled error and
+/// `expected` as the WHOLE message.
+async fn assert_revoke_refused(
+    router: &MultiServiceRouter,
+    case: &str,
+    principal: &str,
+    resource: &Value,
+    permissions: &[&str],
+    with_grant_option: &[&str],
+    expected: &str,
+) {
+    let (status, payload) = call(
+        router,
+        "RevokePermissions",
+        &json!({
+            "Principal": { "DataLakePrincipalIdentifier": principal },
+            "Resource": resource,
+            "Permissions": permissions,
+            "PermissionsWithGrantOption": with_grant_option,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a refused revoke to answer 400, got {status} {payload:?}"
+    );
+    assert_eq!(
+        error_code(&payload),
+        "InvalidInputException",
+        "case {case:?}: expected InvalidInputException, got {payload:?}"
+    );
+    let message = payload
+        .get("Message")
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected Message {expected:?}, got {message:?}"
+    );
+}
+
+/// One row of the refusal-wording table: the case name, the grantee the revoke names, the
+/// `Permissions` and `PermissionsWithGrantOption` it names, and the whole sentence the
+/// refusal must carry.
+type RefusalWordingCase = (
+    &'static str,
+    String,
+    Vec<&'static str>,
+    Vec<&'static str>,
+    String,
+);
+
+#[tokio::test]
+async fn a_revoke_that_takes_nothing_away_is_worded_by_whether_the_grantee_is_modelled() {
+    // Nothing is held on this table by anyone but its creator, so every row below revokes
+    // what is not there — and the rows differ along WHICH grantee asks: the group the
+    // service always models (`IAM_ALLOWED_PRINCIPALS`, which stands for every principal IAM
+    // itself allows, so it is never absent from a resource's permission model) against the
+    // other forms a `DataLakePrincipalIdentifier` takes — an IAM role, an IAM user, an
+    // account id — none of which holds anything here. They differ along the permissions
+    // named too: one, several, the column-scoped one, and a request that names them in
+    // `PermissionsWithGrantOption` only.
+    let account = account_catalog();
+    let table = json!({ "Table": { "DatabaseName": "lake", "Name": "events" } });
+    let cases: Vec<RefusalWordingCase> = vec![
+        // The issue's own request: the group, `["ALL"]`, on a governed table.
+        (
+            "the group, one permission",
+            "IAM_ALLOWED_PRINCIPALS".to_string(),
+            vec!["ALL"],
+            vec![],
+            permissions_not_held_message(&["ALL"]),
+        ),
+        (
+            "the group, several permissions",
+            "IAM_ALLOWED_PRINCIPALS".to_string(),
+            vec!["DESCRIBE", "ALTER", "DROP"],
+            vec![],
+            permissions_not_held_message(&["DESCRIBE", "ALTER", "DROP"]),
+        ),
+        (
+            "the group, the column-scoped permission",
+            "IAM_ALLOWED_PRINCIPALS".to_string(),
+            vec!["SELECT"],
+            vec![],
+            permissions_not_held_message(&["SELECT"]),
+        ),
+        (
+            "the group, named with the grant option only",
+            "IAM_ALLOWED_PRINCIPALS".to_string(),
+            vec![],
+            vec!["DESCRIBE"],
+            permissions_not_held_message(&["DESCRIBE"]),
+        ),
+        (
+            "an IAM role that holds nothing",
+            format!("arn:aws:iam::{account}:role/analyst"),
+            vec!["ALL"],
+            vec![],
+            NOTHING_TO_REVOKE.to_string(),
+        ),
+        (
+            "an IAM user that holds nothing",
+            format!("arn:aws:iam::{account}:user/auditor"),
+            vec!["DESCRIBE", "ALTER"],
+            vec![],
+            NOTHING_TO_REVOKE.to_string(),
+        ),
+        (
+            "an account that holds nothing",
+            account.clone(),
+            vec!["ALL"],
+            vec![],
+            NOTHING_TO_REVOKE.to_string(),
+        ),
+    ];
+
+    let router = emulator_with_governed_table().await;
+    // The group holds nothing on this table: what the issue's check confirms before it
+    // revokes.
+    let listed = list(
+        &router,
+        "the group holds nothing",
+        &json!({
+            "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
+            "Resource": table,
+        }),
+    )
+    .await;
+    assert!(
+        listed.is_empty(),
+        "case \"the group holds nothing\": a governed table hands the group no grant, got \
+         {listed:?}"
+    );
+
+    for (case, principal, permissions, with_grant_option, expected) in cases {
+        assert_revoke_refused(
+            &router,
+            case,
+            &principal,
+            &table,
+            &permissions,
+            &with_grant_option,
+            &expected,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn the_wording_of_a_refused_revoke_follows_what_the_grantee_still_holds() {
+    // The same rule read the other way: the sentence a grantee draws follows what it holds
+    // at the moment of the call, so a grant and a revoke move a principal between the two
+    // classes. The group is in the modelled class throughout, held or not.
+    let router = emulator_with_governed_table().await;
+    let table = json!({ "Table": { "DatabaseName": "lake", "Name": "events" } });
+    let analyst = format!("arn:aws:iam::{}:role/analyst", account_catalog());
+
+    // Granting the group `ALL` twice records one grant: a repeated grant is idempotent.
+    for attempt in ["first grant", "second grant"] {
+        grant(&router, attempt, "IAM_ALLOWED_PRINCIPALS", &table, &["ALL"]).await;
+    }
+    let listed = list(
+        &router,
+        "the group after two grants",
+        &json!({
+            "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
+            "Resource": table,
+        }),
+    )
+    .await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "case \"the group after two grants\": expected one entry, got {listed:?}"
+    );
+    assert_eq!(
+        permissions_of(&listed[0]),
+        vec!["ALL".to_string()],
+        "case \"the group after two grants\": expected [ALL], got {:?}",
+        listed[0]
+    );
+
+    // The first revoke takes that grant away, so the group holds nothing again.
+    let (status, payload) = call(
+        &router,
+        "RevokePermissions",
+        &json!({
+            "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
+            "Resource": table,
+            "Permissions": ["ALL"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"the first revoke\": expected 200, got {status} {payload:?}"
+    );
+
+    // A second revoke of the same grant has nothing left to take — and the group is still
+    // the grantee the service models, so it is told which permissions it does not have.
+    assert_revoke_refused(
+        &router,
+        "the group revoked twice",
+        "IAM_ALLOWED_PRINCIPALS",
+        &table,
+        &["ALL"],
+        &[],
+        &permissions_not_held_message(&["ALL"]),
+    )
+    .await;
+
+    // A role that was never granted anything here holds nothing, so it draws the other
+    // sentence.
+    assert_revoke_refused(
+        &router,
+        "a role before its grant",
+        &analyst,
+        &table,
+        &["DROP"],
+        &[],
+        NOTHING_TO_REVOKE,
+    )
+    .await;
+
+    // Once that role holds something on the table, a revoke naming what it does not hold
+    // reports the difference instead.
+    grant(&router, "the role's grant", &analyst, &table, &["DESCRIBE"]).await;
+    let held_cases: Vec<(&str, Vec<&str>)> = vec![
+        ("a role holding one of them", vec!["DROP"]),
+        ("a role holding one of two named", vec!["DESCRIBE", "DROP"]),
+    ];
+    for (case, permissions) in held_cases {
+        assert_revoke_refused(
+            &router,
+            case,
+            &analyst,
+            &table,
+            &permissions,
+            &[],
+            &permissions_not_held_message(&permissions),
+        )
+        .await;
+    }
+}
+
 

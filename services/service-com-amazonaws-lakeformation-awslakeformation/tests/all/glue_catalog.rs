@@ -267,14 +267,30 @@ pub async fn table_created_by(router: &MultiServiceRouter, database: &str, name:
         .to_string()
 }
 
-/// The sentence Lake Formation refuses a revoke that would take nothing away with: wholly
-/// fixed text, in two sentences, with no part taken from the request.
+/// The sentence Lake Formation refuses a revoke with when the grantee holds NOTHING on the
+/// resource the request names: wholly fixed text, in two sentences, with no part taken from
+/// the request.
 ///
 /// The one copy the permission suites compare against, spelled out here rather than read
 /// back out of the crate, so the five suites that assert it cannot drift apart.
 pub const NOTHING_TO_REVOKE: &str =
     "No permissions revoked. Grantee has no permissions and no grantable permissions on \
      resource.";
+
+/// The OTHER nothing-was-revoked sentence: what a revoke draws when the service does model
+/// the grantee on the resource — the `IAM_ALLOWED_PRINCIPALS` group it always models, or a
+/// principal holding something there — and the grantee does not hold what the request
+/// named. Fixed text with `named`, the permissions the request named, bracketed and
+/// separated by a space.
+///
+/// The one copy, for the same reason as [`NOTHING_TO_REVOKE`]. The doubled "does not does
+/// not" is the service's own wording.
+pub fn permissions_not_held_message(named: &[&str]) -> String {
+    format!(
+        "No permissions revoked. Grantee does not does not have:[{}]",
+        named.join(" ")
+    )
+}
 
 /// The ARN-shape refusal as the service words it: fixed text followed by the rejected
 /// identifier, unquoted and exactly as the request wrote it.

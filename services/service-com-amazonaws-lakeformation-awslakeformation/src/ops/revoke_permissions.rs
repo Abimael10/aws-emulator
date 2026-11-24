@@ -8,7 +8,11 @@
 //! and drops a record when nothing is left of it. A revoke of a permission the
 //! grantee does not hold — including a grant that was never made — takes nothing away
 //! and is refused with the modelled `InvalidInputException`, so a caller is never told a
-//! permission it still holds was removed.
+//! permission it still holds was removed. WHICH sentence that refusal carries follows
+//! whether this service models the grantee on the resource at all: one it does — the
+//! `IAM_ALLOWED_PRINCIPALS` group it always models, or a principal holding something there
+//! — is told which of the named permissions it does not have, while a grantee holding
+//! nothing there is told it holds nothing (see [`crate::state::apply_revoke`]).
 //!
 //! A revoke reaches every SCOPE the matching grant wrote at: naming a TABLE takes back
 //! both the table's own record and the column-scoped record `GrantPermissions` wrote for

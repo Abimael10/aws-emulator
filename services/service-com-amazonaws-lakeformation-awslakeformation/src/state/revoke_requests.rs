@@ -16,7 +16,8 @@
 //! 3. at least one permission is named;
 //! 4. the `Resource` names exactly one resource, at a scope its permissions apply at;
 //! 5. the grantee holds, at every scope the request reaches, every permission it names —
-//!    else there is nothing to revoke ([`NOTHING_TO_REVOKE`]).
+//!    else nothing is revoked, worded by whether this service models the grantee on the
+//!    resource at all ([`NOTHING_TO_REVOKE`] against [`permissions_not_held`]).
 
 use super::*;
 
@@ -38,6 +39,21 @@ pub struct RevokeRequest {
     /// `Condition$Expression` when the request carries a non-empty one: a grant under a
     /// condition is a different grant.
     pub condition: Option<String>,
+}
+
+impl RevokeRequest {
+    /// Every permission this request asks to take away, in the order it named them:
+    /// `Permissions` first, then each `PermissionsWithGrantOption` value it did not already
+    /// name — one value names one permission however often it is written.
+    ///
+    /// What the refusal that reports the difference ([`permissions_not_held`]) lists.
+    pub fn named_permissions(&self) -> Vec<String> {
+        dedup_values(
+            self.permissions
+                .iter()
+                .chain(self.permissions_with_grant_option.iter()),
+        )
+    }
 }
 
 /// What one revoke will take away, resolved before this service's store is locked.
@@ -202,8 +218,14 @@ pub fn plan_revoke<Eng: Send + Sync + 'static>(
 /// every record the plan reaches, or says why nothing could be taken away.
 ///
 /// Everything the grantee does not hold, whether because the grant does not exist at all or
-/// because it never carried these permissions, is "there is nothing here to revoke", so both
-/// are refused the same way and nothing is trimmed.
+/// because it never carried these permissions, takes nothing away and is refused — but the
+/// two refusal CLASSES are not worded alike: a grantee this service models on the resource
+/// is told WHICH of the named permissions it does not have ([`permissions_not_held`]), while
+/// a grantee that holds nothing there at all draws the sentence about holding nothing
+/// ([`NOTHING_TO_REVOKE`]). The grantee the service always models is the
+/// [`IAM_ALLOWED_PRINCIPALS`] group, which stands for every principal IAM itself allows and
+/// is therefore never absent from a resource's permission model, however little it holds
+/// there.
 pub fn apply_revoke(
     store: &mut ComAmazonawsLakeformationAwslakeformationState,
     catalog_id: &str,
@@ -224,6 +246,9 @@ pub fn apply_revoke(
     .filter(|_| !store.revoked_default_grants.contains(&plan.key));
 
     let mut missing: Vec<String> = Vec::new();
+    // Whether the grantee holds ANYTHING at a scope this revoke reaches, which is what
+    // decides between the two nothing-was-revoked sentences below.
+    let mut holds_something = false;
     for (scoped_key, permissions, permissions_with_grant_option) in &plan.scoped {
         let held = store.permission_grants.get(scoped_key);
         let mut held_permissions: Vec<String> = held
@@ -249,6 +274,7 @@ pub fn apply_revoke(
                     .extend(implicit.permissions_with_grant_option.iter().cloned());
             }
         }
+        holds_something |= !held_permissions.is_empty() || !held_with_grant_option.is_empty();
         missing.extend(missing_permissions(&held_permissions, permissions));
         missing.extend(missing_permissions(
             &held_with_grant_option,
@@ -256,9 +282,16 @@ pub fn apply_revoke(
         ));
     }
     if !missing.is_empty() {
-        // Wholly fixed text: the permissions THIS request named are not interpolated,
-        // because the request already carries them.
-        return Err(NOTHING_TO_REVOKE.to_string());
+        // A grantee this service models on the resource — the group it always models, or a
+        // principal holding something at a scope the revoke reaches — is told the
+        // difference, with the permissions the request named; one that holds nothing there
+        // draws the wholly fixed sentence about holding nothing.
+        let modelled_on_resource = request.principal == IAM_ALLOWED_PRINCIPALS || holds_something;
+        return Err(if modelled_on_resource {
+            permissions_not_held(&request.named_permissions())
+        } else {
+            NOTHING_TO_REVOKE.to_string()
+        });
     }
 
     // Taking a default grant away leaves no record to trim, so what is left behind is the

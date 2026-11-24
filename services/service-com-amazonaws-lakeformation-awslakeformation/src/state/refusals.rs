@@ -66,13 +66,43 @@ pub const ROW_FILTER_BOTH_SET: &str = "Filter expression and AllRowsWildcard can
 /// table nor the database the request carried is echoed.
 pub const TABLE_NAME_AND_WILDCARD: &str = "Table name and table wildcard cannot both be present.";
 
-/// What a revoke that would take nothing away answers.
+/// What a revoke whose grantee holds NOTHING on the resource it names answers.
 ///
-/// Wholly fixed text, in two sentences: the permissions the request named are NOT
-/// interpolated, because the request already carries them.
+/// Wholly fixed text, in two sentences: there is no permission of the grantee's to report a
+/// difference against, so the permissions the request named are not interpolated. A grantee
+/// the service DOES model on that resource is answered the other way — see
+/// [`permissions_not_held`] — so the two classes of "nothing was revoked" are worded apart.
 pub const NOTHING_TO_REVOKE: &str =
     "No permissions revoked. Grantee has no permissions and no grantable permissions on \
      resource.";
+
+/// The fixed text of the refusal a revoke draws when the grantee IS modelled on the
+/// resource but does not hold what the request named, up to the bracket those permissions
+/// open.
+///
+/// Fixed to the character, the doubled "does not does not" included: that is how this
+/// service words this class, not a slip to correct.
+pub const PERMISSIONS_NOT_HELD_PREFIX: &str =
+    "No permissions revoked. Grantee does not does not have:[";
+
+/// The same sentence from the bracket those permissions close.
+pub const PERMISSIONS_NOT_HELD_SUFFIX: &str = "]";
+
+/// How the permissions the request named are listed between those two: no comma.
+const NOT_HELD_PERMISSION_SEPARATOR: &str = " ";
+
+/// What a revoke is refused with when the grantee is one this service models on the
+/// resource — the group it always models, or a principal that holds something there — and
+/// `named`, the permissions the request asked to take away, are not all held.
+///
+/// This one is NOT wholly fixed: the refusal reports the DIFFERENCE, so the permissions the
+/// request named are its one variable part, bracketed, in the order the request named them.
+pub fn permissions_not_held(named: &[String]) -> String {
+    format!(
+        "{PERMISSIONS_NOT_HELD_PREFIX}{}{PERMISSIONS_NOT_HELD_SUFFIX}",
+        named.join(NOT_HELD_PERMISSION_SEPARATOR)
+    )
+}
 
 /// What a create of an LF-tag whose key the Data Catalog already holds answers.
 ///
