@@ -1477,10 +1477,10 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     // kind is issued at, a minted id of another kind (the profile's, a different resource
     // under the same surface), the configuration's own id with a character changed, a bare
     // digit, and a value outside the identifier alphabet. A value written in the identifier
-    // alphabet claims to be an identifier of this mint, so another namespace letter and a width
-    // no identifier is issued at — a bare digit included — are reported unreadable, while a
-    // value outside that alphabet claims nothing about its form and is carried through to the
-    // store like an id of this kind's own form.
+    // alphabet claims to be an identifier of this mint, so it is carried through to the store
+    // whatever namespace letter and width it carries — WHICH identifier was ever issued is the
+    // store's to say — while a value outside that alphabet is no identifier the service can
+    // READ at all.
     let mut mangled: Vec<char> = stored_id.chars().collect();
     if let Some(last) = mangled.last_mut() {
         *last = if *last == 'A' { 'B' } else { 'A' };
@@ -1488,11 +1488,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
-        (profile.as_str(), UNREADABLE_ID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
-        ("0", UNREADABLE_ID_MESSAGE),
+        ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
+        ("0", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

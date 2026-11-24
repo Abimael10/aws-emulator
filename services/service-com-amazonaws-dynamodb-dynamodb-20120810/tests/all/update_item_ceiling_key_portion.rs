@@ -210,36 +210,21 @@ async fn a_transactional_update_shares_the_single_item_ceiling() {
             transact(&table, shape, largest + 1),
         )
         .await;
-        // The crossing is found by applying this action against the item its key holds, which
-        // is "an item size becomes too large [...] because of changes made by the
-        // transaction" — so the transaction is cancelled and that action's reason words the
-        // quota.
+        // An item the change would grow past the ceiling is a change no item could be left
+        // by, so the CALL is refused with the single-item path's sentence and none of the
+        // transaction is applied.
         assert_eq!(
             (status, error_code(&body).as_str(), message(&body).as_str()),
-            (
-                400,
-                "TransactionCanceledException",
-                "Transaction cancelled, please refer cancellation reasons for specific reasons \
-                 [ValidationError]"
-            ),
-            "case {:?}: expected the transaction cancelled one byte past the ceiling, got \
+            (400, "ValidationException", UPDATE_TOO_BIG),
+            "case {:?}: expected the call refused one byte past the ceiling, got \
              {status} with {body}",
-            shape.case
-        );
-        assert_eq!(
-            (
-                body["CancellationReasons"][0]["Code"].as_str(),
-                body["CancellationReasons"][0]["Message"].as_str(),
-            ),
-            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-            "case {:?}: expected that action's reason to word the ceiling, got {body}",
             shape.case
         );
         let stored = stored_length(&router, &table, shape).await;
         assert_eq!(
             stored,
             Some(largest),
-            "case {:?}: a cancelled transactional update must leave the stored item where it \
+            "case {:?}: a refused transactional update must leave the stored item where it \
              was, got {stored:?} byte(s)",
             shape.case
         );

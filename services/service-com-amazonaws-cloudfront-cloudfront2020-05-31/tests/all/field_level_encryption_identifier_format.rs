@@ -8,16 +8,15 @@
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart, and the identifier's FORM is what decides it — for the routes that
-//! READ one. A value written in
-//! the identifier ALPHABET (digits and uppercase letters, carrying no separator and no lower
-//! case) claims to be an identifier this service issued, so it earns the unreadable-identifier
-//! sentence ("Id format is invalid") unless it is written the way the addressed kind's
-//! identifiers are ISSUED — the kind's own namespace letter, or a letter this service issues no
-//! identifier under, over a body of the issued width. Every other value the store holds nothing
-//! for is the ABSENT resource ("The specified field level encryption config/profile does not
-//! exist."), a value of the issued form as much as one written outside the alphabet, which
-//! claims to be no identifier of this mint at all. `GetFieldLevelEncryption`, the
+//! the two conditions apart, and the ALPHABET the value is written in is what decides it — for
+//! the routes that READ one. A value written in the identifier ALPHABET (digits and uppercase
+//! letters, carrying no separator and no lower case) claims to be an identifier this service
+//! issued, so it is carried through to the STORE whatever body, width or namespace letter it
+//! carries — WHICH identifier was ever issued, and for which kind, is a property of the store —
+//! and the record the store holds none under is the ABSENT resource ("The specified field level
+//! encryption config/profile does not exist."). A value written OUTSIDE that alphabet is no
+//! identifier of this mint at all, so there is nothing in it to resolve: it earns the
+//! unreadable-identifier sentence ("Id format is invalid"). `GetFieldLevelEncryption`, the
 //! configuration's RESOURCE read, reads NO form of the value at all — its own recorded contract
 //! — so there every value is carried through to the store and the absent resource is the only
 //! sentence. Both sentences are fixed text: neither echoes the value submitted.
@@ -34,13 +33,14 @@
 //! * the values of the identifier alphabet the addressed kind's issued form rules out: bodies
 //!   one character short of and one character past the width the kind is issued at, the sibling
 //!   kind's own minted id, a public key id, the `E`-prefixed namespace the other CloudFront
-//!   entity ids are drawn from, and an unminted namespace letter over a far longer body;
+//!   entity ids are drawn from, and an unminted namespace letter over a far longer body — each
+//!   carried through to the store, which reports the record absent;
 //! * the values of the alphabet of the issued WIDTH under a letter that identifies NO namespace
-//!   of this service, which say nothing about the kind that issued them and are therefore
-//!   carried through to the store;
+//!   of this service, carried through to the store as well;
 //! * and the values written outside the alphabet: a minted id in lower case, a body outside the
-//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each resolved
-//!   against the store on every route.
+//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each the
+//!   identifier reported UNREADABLE on every route that reads the alphabet, and the absent
+//!   record on the one that reads none.
 //!
 //! Each kind's width and alphabet are read off an id this emulator really MINTED rather than
 //! written out here, so the table cannot drift from what the service issues.
@@ -280,13 +280,13 @@ impl Shape {
 
     /// A value written in the identifier alphabet that the addressed kind's issued form rules
     /// out — another width, or another kind's namespace letter: it claims to be an identifier
-    /// this service issued and could not be one of this kind, so every route that reads the
-    /// form reports it unreadable.
+    /// this service issued, and WHICH identifier was ever issued is the store's to say, so
+    /// every route carries it through to the store.
     fn misread(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            expected: UNREADABLE_IDENTIFIER,
+            expected: absent,
             absent,
         }
     }
@@ -304,12 +304,13 @@ impl Shape {
     }
 
     /// A value written OUTSIDE that alphabet, which claims to be no identifier of this mint at
-    /// all: there is no form in it to refuse, so every route resolves it against the store.
+    /// all: there is nothing in it to resolve, so every route that reads the alphabet reports
+    /// the identifier unreadable while the one that reads no form carries it to the store.
     fn foreign(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            expected: absent,
+            expected: UNREADABLE_IDENTIFIER,
             absent,
         }
     }

@@ -59,7 +59,7 @@ use crate::field_level_encryption_config_lifecycle::{
 };
 use crate::field_level_encryption_identifier_alphabet::body;
 use crate::field_level_encryption_identifier_width_and_namespace::{
-    assert_refusal, in_the_identifier_alphabet, of_the_issued_form,
+    assert_refusal, in_the_identifier_alphabet,
 };
 use crate::field_level_encryption_profile_lifecycle::{store_profile, upload_key};
 
@@ -238,14 +238,14 @@ fn identifiers_the_store_holds_nothing_for(stored: &Stored) -> Vec<(String, Stri
 }
 
 /// The rows above that the CONFIGURATION document read of the same record refuses on their
-/// FORM: a value WRITTEN as an identifier of this service's mint (the identifier alphabet) that
-/// is not of the form a configuration identifier is ISSUED in
-/// ([`of_the_issued_form`]) — another width, or the namespace letter of a kind this service
-/// issues identifiers under that is not the configuration's.
+/// FORM: a value written OUTSIDE the alphabet this service writes an identifier in, which is no
+/// identifier of this mint for that route to resolve at all
+/// ([`in_the_identifier_alphabet`]).
 fn refused_on_their_form_by_the_document_read(stored: &Stored) -> Vec<(String, String)> {
+    let _ = &stored.id;
     identifiers_the_store_holds_nothing_for(stored)
         .into_iter()
-        .filter(|(_, id)| in_the_identifier_alphabet(id) && !of_the_issued_form(id, &stored.id))
+        .filter(|(_, id)| !in_the_identifier_alphabet(id))
         .collect()
 }
 
@@ -289,10 +289,9 @@ async fn every_identifier_the_store_cannot_resolve_is_the_absent_configuration()
 }
 
 /// The CONTRAST: the CONFIGURATION document read of the same record keeps its own recorded
-/// contract, reporting every one of those values that is written as an identifier of this
-/// service's mint and is not of a configuration identifier's issued form as the identifier it
-/// cannot READ — so the rule above is about this one route rather than a refusal dropped from
-/// the whole surface.
+/// contract, reporting every one of those values that is written OUTSIDE the alphabet this
+/// service writes an identifier in as the identifier it cannot READ — so the rule above is
+/// about this one route rather than a refusal dropped from the whole surface.
 #[tokio::test]
 async fn the_configuration_document_read_keeps_its_own_identifier_contract() {
     let router = emulator();

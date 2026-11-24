@@ -191,19 +191,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The value of the ETag header that you received when retrieving the profile to
-        // delete": what this route evaluates of that header is its FORM — "the If-Match
-        // version is missing or not valid" — and not whose version the token is
-        // ([`crate::state::if_match_form_admits`]). A delete stating no version token at all
-        // is refused with `InvalidIfMatchVersion`; one stating a version token proceeds, as
-        // this route's recorded answers report even where the token was issued to another
-        // record of the account.
-        if !crate::state::if_match_form_admits(input.if_match.as_deref()) {
-            return Err(
-                DeleteFieldLevelEncryptionProfileErrorModeled::InvalidIfMatchVersion(
-                    crate::state::invalid_if_match_version(),
+        // delete": the delete is gated on the profile's OWN version token, as every
+        // conditional request of this service is ([`crate::state::check_if_match`]) — a
+        // header that is absent or carries something that is no version token at all is
+        // "the If-Match version is missing or not valid", and a version token that is not
+        // the one this profile is currently at is a precondition that evaluated to false,
+        // so the caller has to read the profile back before deleting it.
+        let current_etag = store
+            .field_level_encryption_profile(&input.id)
+            .map(|profile| profile.etag.clone())
+            .unwrap_or_default();
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteFieldLevelEncryptionProfileErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
                 )
-                .into(),
-            );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(
+                    DeleteFieldLevelEncryptionProfileErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                )
+            }
         }
 
         // A field-level encryption configuration names the profile its matching fields are

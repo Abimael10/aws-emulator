@@ -273,7 +273,7 @@ impl TagLimitExceeded {
 /// in this service's modelled surface delivers a report — delivery is the billing
 /// pipeline's, not an API call's — so a report created through `PutReportDefinition`
 /// holds none until a delivery is recorded against it, and a read of such a report states
-/// no delivery status at all.
+/// the delivery-status dictionary with [`NO_DELIVERY`] in both of its keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportDelivery {
     /// The instant the report was delivered, reported through [`report_timestamp`].
@@ -282,6 +282,11 @@ pub struct ReportDelivery {
     /// (`smithy_query(shape="LastStatus")`).
     pub status: String,
 }
+
+/// How a report NO delivery has been recorded against states each key of its delivery
+/// status: the empty string, which is what the recorded service answers for both
+/// `lastDelivery` and `lastStatus` of such a report ([`StoredReport::delivery_status`]).
+pub const NO_DELIVERY: &str = "";
 
 /// One persisted report definition: the definition exactly as the caller supplied it,
 /// its tags, when it was first created, and the last delivery recorded against it.
@@ -327,15 +332,16 @@ impl StoredReport {
     /// versioning preference is [`DEFAULT_REPORT_VERSIONING`], and an unstated billing view
     /// is the account's primary one ([`primary_billing_view_arn`]) — and the service's own
     /// facts about the report: the status of its last delivery ([`Self::delivery_status`],
-    /// stated when a delivery has been recorded against the report and left out while none
-    /// has) and the date it was created, which is the STORED instant and so the same on
-    /// every read rather than the moment of the read.
+    /// the two-element dictionary this read states for every report) and the date it was
+    /// created, which is the STORED instant and so the same on every read rather than the
+    /// moment of the read.
     ///
-    /// Every value it states is one the shape's constrained members admit, so the
-    /// definition a read serves is a definition the operations taking the same shape
-    /// (`PutReportDefinition`, `ModifyReportDefinition`) accept back: a member the service
-    /// holds no value for is left out rather than filled with a stand-in the member's
-    /// modelled constraints exclude.
+    /// Every member a CALLER may submit holds a value the shape's constraints admit, so the
+    /// definition a read serves is one the operations taking the same shape
+    /// (`PutReportDefinition`, `ModifyReportDefinition`) accept back once the
+    /// service-populated delivery status is left off it — that member is the service's own
+    /// fact about the report ([`Self::delivery_status`]), filled from the report's delivery
+    /// history rather than from the request.
     pub fn wire_definition(&self) -> ReportDefinition {
         ReportDefinition {
             additional_artifacts: Some(
@@ -361,7 +367,7 @@ impl StoredReport {
                     .clone()
                     .unwrap_or_else(primary_billing_view_arn),
             ),
-            report_status: self.delivery_status(),
+            report_status: Some(self.delivery_status()),
             report_creation_date: report_timestamp(self.created_at),
             ..self.definition.clone()
         }
@@ -372,23 +378,32 @@ impl StoredReport {
     /// last delivered report for a particular report definition" (the modelled
     /// `ReportStatus` doc, `smithy_query(shape="ReportStatus")`).
     ///
-    /// What the dictionary describes is a DELIVERY, so a report one has been recorded
-    /// against states the instant it was delivered and the outcome it ended with, and a
-    /// report none has been recorded against has no delivery status to state: `None`, which
-    /// leaves the optional member out of the read altogether.
+    /// The dictionary itself is UNCONDITIONAL on this read path — the recorded service
+    /// states both keys on every report definition it serves — and only the VALUES depend
+    /// on whether and when the report was last delivered: a report a delivery HAS been
+    /// recorded against states the instant it was delivered and the outcome it ended with,
+    /// and a report none has been recorded against states [`NO_DELIVERY`] for both, which
+    /// is how "never delivered" is spelled on the wire.
     ///
-    /// There is no stand-in value to state instead. The modelled constraints on the two
-    /// members — `lastDelivery` length 16..20 with the pattern
+    /// That spelling is an OUTPUT-only value: it is outside the constraints the model
+    /// declares on the two members — `lastDelivery` length 16..20 with the pattern
     /// `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` the `LastStatus` catalog
-    /// (`smithy_query(shape="LastDelivery,LastStatus")`) — admit no "not yet" spelling, and
-    /// `ReportStatus` is a member of the SAME `ReportDefinition` the create and the update
-    /// take as input, so anything outside them would be a value this service emits and then
-    /// refuses on the way back in.
-    pub fn delivery_status(&self) -> Option<ReportStatus> {
-        self.last_delivery.as_ref().map(|delivery| ReportStatus {
-            last_delivery: report_timestamp(delivery.at),
-            last_status: Some(delivery.status.clone()),
-        })
+    /// (`smithy_query(shape="LastDelivery,LastStatus")`) — which describe the values a
+    /// DELIVERY has, and the boundary validator holds every REQUEST to them. So the member
+    /// is the service's own to fill and not a caller's to submit: a read-modify-write
+    /// replays the reported definition without it, and the create and the update fill it
+    /// from the report's own delivery history whatever the request put there.
+    pub fn delivery_status(&self) -> ReportStatus {
+        match self.last_delivery.as_ref() {
+            Some(delivery) => ReportStatus {
+                last_delivery: report_timestamp(delivery.at),
+                last_status: Some(delivery.status.clone()),
+            },
+            None => ReportStatus {
+                last_delivery: Some(NO_DELIVERY.to_string()),
+                last_status: Some(NO_DELIVERY.to_string()),
+            },
+        }
     }
 
     /// Merge `tags` onto this report: a key already present takes the new value, a key

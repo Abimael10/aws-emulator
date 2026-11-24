@@ -42,7 +42,8 @@ use cur::state::ReportDelivery;
 // is the stored record a test pins the read-back projection against.
 use super::report_definition_lifecycle::{
     assert_delivery_status, at_epoch_seconds, error_code, expected_read_back, is_report_timestamp,
-    minimal_definition, primary_billing_view_arn, read_back_of, stored_report_at as stored_at, Cur,
+    minimal_definition, never_delivered, primary_billing_view_arn, read_back_of,
+    stored_report_at as stored_at, Cur,
 };
 
 #[tokio::test]
@@ -105,12 +106,15 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
     // Rows differ in whether a delivery has been recorded against the report and in how
     // that delivery ended: every value of the modelled `LastStatus` enum
     // (`smithy_query(shape="LastStatus")`) is covered, beside the report nothing has
-    // delivered, whose read-back states no `ReportStatus` at all — the dictionary
-    // describes a delivery, and its members' modelled constraints admit no value for a
-    // report that has had none.
+    // delivered, whose read-back states the same dictionary with both keys EMPTY — the
+    // dictionary is unconditional on this read path and only its values report the
+    // delivery.
     let delivered_at = at_epoch_seconds(1_700_000_000);
-    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> =
-        vec![("no delivery recorded".to_string(), None, None)];
+    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> = vec![(
+        "no delivery recorded".to_string(),
+        None,
+        Some(never_delivered()),
+    )];
     for status in cur::ops::types::LAST_STATUS_VALUES {
         table.push((
             format!("a delivery that ended {status}"),

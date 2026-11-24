@@ -172,11 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The FORM of the `If-Match` header: `InvalidIfMatchVersion` is "the If-Match
         // version is missing or not valid", a property of the request alone, so it is
         // decided before the id is resolved — no version of any key could make an absent or
-        // malformed header valid. The form is also ALL this route evaluates of the header:
-        // a delete stating a version token proceeds, as its recorded answers report even
-        // where the token was issued to another record of the account
-        // ([`crate::state::if_match_form_admits`]).
-        if !crate::state::if_match_form_admits(input.if_match.as_deref()) {
+        // malformed header valid.
+        if crate::state::if_match_version(input.if_match.as_deref()).is_none() {
             return Err(DeletePublicKeyErrorModeled::InvalidIfMatchVersion(
                 crate::state::invalid_if_match_version(),
             )
@@ -195,9 +192,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what resolves the `Id` — the model constrains that member no further than
         // `string` — so an `Id` no key answers to is the key that is absent, whatever form
         // the value takes ([`crate::state::no_such_public_key`]).
-        if store.public_key(&input.id).is_none() {
+        let Some(key) = store.public_key(&input.id) else {
             return Err(DeletePublicKeyErrorModeled::NoSuchPublicKey(
                 crate::state::no_such_public_key(),
+            )
+            .into());
+        };
+
+        // "The value of the ETag header that you received when retrieving the public key
+        // identity to delete": the delete is gated on the key's OWN version token, as every
+        // conditional request of this service is ([`crate::state::check_if_match`]), so a
+        // token that is not the one this key is currently at is a precondition that
+        // evaluated to false and the caller has to read the key back before deleting it.
+        if crate::state::check_if_match(&key.etag, input.if_match.as_deref())
+            == crate::state::IfMatch::Stale
+        {
+            return Err(DeletePublicKeyErrorModeled::PreconditionFailed(
+                crate::state::precondition_failed(),
             )
             .into());
         }

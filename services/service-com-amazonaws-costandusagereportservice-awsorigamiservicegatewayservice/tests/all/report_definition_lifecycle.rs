@@ -192,8 +192,8 @@ pub(crate) fn primary_billing_view_arn() -> String {
 /// preference is on, an unstated versioning preference delivers a new version, and an
 /// unstated billing view is the account's primary one. The report's delivery status is the
 /// service's and not the caller's: nothing in this service delivers a report, so a report
-/// created through the API has never been delivered and its read-back states NO
-/// `ReportStatus` at all — whatever the request put there.
+/// created through the API has never been delivered and its read-back states the
+/// delivery-status dictionary with both keys EMPTY — whatever the request put there.
 /// `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
 /// and drops it rather than this expectation carrying a value.
 pub(crate) fn expected_read_back(definition: &Value) -> Value {
@@ -213,22 +213,27 @@ pub(crate) fn expected_read_back(definition: &Value) -> Value {
     object
         .entry("BillingViewArn")
         .or_insert_with(|| json!(primary_billing_view_arn()));
-    object.remove("ReportStatus");
+    object.insert("ReportStatus".to_string(), never_delivered());
     expected
+}
+
+/// The delivery status a read states for a report NO delivery has been recorded against:
+/// the two-element dictionary with the empty string in both keys, which is what the
+/// recorded service answers for such a report.
+pub(crate) fn never_delivered() -> Value {
+    json!({ "lastDelivery": "", "lastStatus": "" })
 }
 
 /// The `ReportStatus` a read states for a report, checked against the delivery (if any)
 /// recorded against it. Shared by every suite of this target that reads a definition back.
 ///
-/// A report a delivery HAS been recorded against states the modelled two-element
-/// dictionary: the instant of that delivery, in the form this service states a report
-/// timestamp in, and the outcome it ended with. A report none has been recorded against
-/// states no `ReportStatus` at all — the modelled `ReportStatus` describes "the date and
-/// status of the last delivered report" (`smithy_query(shape="ReportStatus")`) and its two
-/// members are constrained to the values a DELIVERY has (`lastDelivery` length 16..20 with
-/// the pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` the `LastStatus`
-/// catalog, `smithy_query(shape="LastDelivery,LastStatus")`), so there is no value the
-/// member admits for a report nothing has delivered and the optional member is left out.
+/// A report a delivery HAS been recorded against states the instant of that delivery, in
+/// the form this service states a report timestamp in, and the outcome it ended with. A
+/// report none has been recorded against states the SAME two-element dictionary with the
+/// empty string in both keys ([`never_delivered`]): the dictionary is unconditional on the
+/// read path — "a two element dictionary with a `lastDelivery` and `lastStatus` key"
+/// (`smithy_query(shape="ReportStatus")`) — and only its values depend on whether and when
+/// the report was last delivered, as the recorded service answers it.
 pub(crate) fn assert_delivery_status(
     case: &str,
     reported: &Value,
@@ -237,9 +242,10 @@ pub(crate) fn assert_delivery_status(
     let status = reported.get("ReportStatus").cloned();
     match recorded {
         None => assert_eq!(
-            status, None,
-            "case {case:?}: no delivery was recorded, so the read must state no ReportStatus, \
-             got {reported:?}"
+            status,
+            Some(never_delivered()),
+            "case {case:?}: no delivery was recorded, so the read must state the \
+             delivery-status dictionary with both keys empty, got {reported:?}"
         ),
         Some(delivery) => {
             let status = status.unwrap_or(Value::Null);

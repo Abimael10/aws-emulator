@@ -10,12 +10,17 @@
 //! constrained identifier, not a free-form name — the holding account's own twelve-digit
 //! number, alone or followed by the path of a catalog inside it written in the characters a
 //! catalog id carries (lowercase letters, digits, underscores, hyphens and the nesting
-//! separator) — so an id outside that form selects no catalog any account could hold and is
-//! refused with HTTP 400 `InvalidInputException` carrying the service's fixed grammar
-//! sentence, BEFORE the cross-account authorization decision and before the entity lookup.
-//! An id that IS of that form keeps the answer its target earns: the account's own catalog
-//! serves the entity, another account's catalog is the authorization refusal, and a
-//! well-formed id this account holds no catalog under is the catalog miss.
+//! separator) — so an id outside that form selects no catalog any account could hold. WHICH
+//! refusal it earns follows the surface's own contract, and both are decided BEFORE the
+//! cross-account authorization decision and before the entity lookup: a surface that
+//! resolves the catalog an ENTITY lives in reports the catalog ABSENT (HTTP 400
+//! `EntityNotFoundException` with the catalog-miss sentence) — the catalog the entity would
+//! have to live in is not there — while the operations that read the grammar themselves,
+//! whose subject is the catalog or its own settings, refuse it as invalid input with the
+//! service's fixed grammar sentence. An id that IS of the catalog-id form keeps the answer its
+//! target earns: the account's own catalog serves the entity, another account's catalog is the
+//! authorization refusal, and a well-formed id this account holds no catalog under is the
+//! catalog miss.
 //!
 //! The rows differ along HOW an id leaves the grammar (no account-id prefix, too few or too
 //! many digits, upper case, a character outside the id's set, an empty path, a whole ARN)
@@ -70,32 +75,39 @@ async fn emulator_with_entities() -> MultiServiceRouter {
 /// The requests a row is asked of: one per operation that resolves a `CatalogId` before it
 /// looks anything up, drawn from both resolution paths — reads and writes of databases and
 /// tables, the listings, a connection read, the search and the catalog's encryption
-/// settings.
-fn catalog_addressed_requests() -> Vec<(&'static str, Value)> {
+/// settings. The flag says whether the operation reads the catalog-id GRAMMAR itself — the
+/// ones whose subject is the catalog or its own settings, which refuse an id outside it as
+/// invalid input — against the ones that resolve the catalog an ENTITY lives in, which report
+/// such an id as the catalog being absent.
+fn catalog_addressed_requests() -> Vec<(&'static str, Value, bool)> {
     vec![
-        ("GetDatabase", json!({ "Name": DATABASE })),
-        ("GetDatabases", json!({})),
+        ("GetDatabase", json!({ "Name": DATABASE }), false),
+        ("GetDatabases", json!({}), false),
         (
             "GetTable",
             json!({ "DatabaseName": DATABASE, "Name": TABLE }),
+            false,
         ),
-        ("GetTables", json!({ "DatabaseName": DATABASE })),
+        ("GetTables", json!({ "DatabaseName": DATABASE }), false),
         (
             "GetTableVersions",
             json!({ "DatabaseName": DATABASE, "TableName": TABLE }),
+            false,
         ),
         (
             "UpdateDatabase",
             json!({ "Name": DATABASE, "DatabaseInput": { "Name": DATABASE } }),
+            false,
         ),
-        ("DeleteDatabase", json!({ "Name": DATABASE })),
+        ("DeleteDatabase", json!({ "Name": DATABASE }), false),
         (
             "CreateDatabase",
             json!({ "DatabaseInput": { "Name": "written_db" } }),
+            true,
         ),
-        ("GetConnection", json!({ "Name": "no-such-connection" })),
-        ("SearchTables", json!({})),
-        ("GetDataCatalogEncryptionSettings", json!({})),
+        ("GetConnection", json!({ "Name": "no-such-connection" }), false),
+        ("SearchTables", json!({}), true),
+        ("GetDataCatalogEncryptionSettings", json!({}), true),
     ]
 }
 
@@ -154,14 +166,21 @@ fn malformed_catalog_ids() -> Vec<(&'static str, String)> {
 }
 
 /// The grammar verdict is the same on every surface that resolves a `CatalogId`, and it is
-/// the WHOLE answer: HTTP 400, `InvalidInputException`, and the fixed sentence.
+/// the WHOLE answer: HTTP 400 and the refusal that surface's own contract states — the
+/// grammar sentence where the operation reads the grammar itself, the catalog miss where it
+/// resolves the catalog an entity lives in.
 #[tokio::test]
-async fn an_id_outside_the_catalog_id_grammar_is_refused_as_invalid_input() {
+async fn an_id_outside_the_catalog_id_grammar_is_refused() {
     let router = emulator_with_entities().await;
 
     for (case, catalog_id) in malformed_catalog_ids() {
-        for (operation, request) in catalog_addressed_requests() {
+        for (operation, request, reads_the_grammar) in catalog_addressed_requests() {
             let label = format!("{case} ({catalog_id:?}) via {operation}");
+            let (expected_code, expected_message) = if reads_the_grammar {
+                ("InvalidInputException", CATALOG_ID_INVALID)
+            } else {
+                ("EntityNotFoundException", CATALOG_NOT_FOUND)
+            };
             let (status, body) =
                 call(&router, operation, &addressed_at(&request, &catalog_id)).await;
             assert_eq!(
@@ -169,14 +188,14 @@ async fn an_id_outside_the_catalog_id_grammar_is_refused_as_invalid_input() {
                 "case {label}: expected 400, got {status} with {body}"
             );
             assert!(
-                error_code(&body).ends_with("InvalidInputException"),
-                "case {label}: expected InvalidInputException, got {} in {body}",
+                error_code(&body).ends_with(expected_code),
+                "case {label}: expected {expected_code}, got {} in {body}",
                 error_code(&body)
             );
             assert_eq!(
                 error_message(&body),
-                CATALOG_ID_INVALID,
-                "case {label}: expected the fixed grammar sentence, got {:?}",
+                expected_message,
+                "case {label}: expected {expected_message:?}, got {:?}",
                 error_message(&body)
             );
         }
@@ -197,9 +216,9 @@ async fn an_id_outside_the_catalog_id_grammar_is_refused_as_invalid_input() {
     );
 }
 
-/// The verdict is a constraint on the REQUEST, so it precedes the cross-account
-/// authorization decision: a malformed id that carries ANOTHER account's number is still the
-/// input refusal, not the authorization one.
+/// The verdict is a constraint the REQUEST alone decides, so it precedes the cross-account
+/// authorization decision: a malformed id that carries ANOTHER account's number is still
+/// answered on the id, not as the authorization refusal.
 #[tokio::test]
 async fn the_grammar_precedes_the_cross_account_decision() {
     let router = emulator_with_entities().await;
@@ -221,14 +240,14 @@ async fn the_grammar_precedes_the_cross_account_decision() {
         (
             "a catalog of another account in upper case",
             format!("{foreign_account}:Analytics"),
-            "InvalidInputException",
-            Some(CATALOG_ID_INVALID),
+            "EntityNotFoundException",
+            Some(CATALOG_NOT_FOUND),
         ),
         (
             "another account's number with a digit too few",
             "21098765432".to_string(),
-            "InvalidInputException",
-            Some(CATALOG_ID_INVALID),
+            "EntityNotFoundException",
+            Some(CATALOG_NOT_FOUND),
         ),
     ] {
         let (status, body) = call(
@@ -250,7 +269,7 @@ async fn the_grammar_precedes_the_cross_account_decision() {
             assert_eq!(
                 error_message(&body),
                 message,
-                "case {case}: expected the fixed grammar sentence for {catalog_id:?}, got {:?}",
+                "case {case}: expected {message:?} for {catalog_id:?}, got {:?}",
                 error_message(&body)
             );
         }
@@ -275,8 +294,9 @@ async fn the_grammar_is_decided_without_reading_the_store() {
     .await;
     assert_eq!(
         error_message(&before.1),
-        CATALOG_ID_INVALID,
-        "case before the create: a malformed id is refused on the request, got {:?}",
+        CATALOG_NOT_FOUND,
+        "case before the create: a malformed id names no catalog for the entity to live in, \
+         got {:?}",
         before.1
     );
 

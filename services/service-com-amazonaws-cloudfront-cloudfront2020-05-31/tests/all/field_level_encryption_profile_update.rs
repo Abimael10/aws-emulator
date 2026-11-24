@@ -730,17 +730,17 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token of no profile id's shape",
             "not-a-profile".to_string(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "an identifier of this mint's alphabet at no issued width",
             "PNEVERMINTEDATALL".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
     ];
 

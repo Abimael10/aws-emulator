@@ -3676,15 +3676,14 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// These operations model this one not-found code and no argument error, so one code and one
 /// status cover two conditions and the MESSAGE is what tells them apart, decided from the value
 /// alone and therefore before the store is consulted. What the value has to say for the format
-/// refusal to be the answer is that it is WRITTEN as one of this service's identifiers and yet
-/// is not one a profile could have been issued under ([`id_format_refused_for`]): the
-/// identifier alphabet at a width CloudFront never issues an identifier at, or under the
-/// namespace letter of another kind this service mints an identifier for. Every other value the
-/// store holds no profile under names a profile that is simply ABSENT — an identifier of the
-/// profile's own issued form, since WHICH identifier of that form was ever issued is a property
-/// of the store, and equally a value that is no identifier of this mint at all (a word, a UUID,
-/// a lower-cased or hyphenated value), which claims nothing about its form for the service to
-/// refuse ([`id_format_invalid_message`]).
+/// refusal to be the answer is that it is written OUTSIDE the alphabet CloudFront writes an
+/// identifier in ([`id_format_refused_for`]): such a value is no identifier of this mint for
+/// the service to resolve at all, so the route reports the identifier it cannot READ
+/// ([`id_format_invalid_message`]). A value written INSIDE that alphabet claims to be an
+/// identifier this service issued, so it is carried through to the store whatever body, width
+/// or namespace letter it carries — WHICH identifier was ever issued, and for which kind, is a
+/// property of the STORE rather than of the value — and the profile the store holds none under
+/// is the profile that is simply ABSENT.
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
 /// submitted CONFIGURATION (a query-arg or content-type mapping's `ProfileId`) addresses
@@ -3820,7 +3819,7 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
 /// field-level encryption configuration `Id` that read or write the CONFIGURATION DOCUMENT —
 /// its `/config` read, its update and its delete — answer an `Id` they cannot resolve: the
 /// split [`unresolved_field_level_encryption_profile`] makes for the other field-level
-/// encryption record, over the configuration's own namespace letter
+/// encryption record, over the alphabet an identifier of this mint is written in
 /// ([`id_format_refused_for`]).
 ///
 /// The RESOURCE read of the same kind (`GetFieldLevelEncryption`, `GET

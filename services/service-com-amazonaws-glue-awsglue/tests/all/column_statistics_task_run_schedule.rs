@@ -68,12 +68,6 @@ const NO_SCHEDULE_FOUND: &str = "No schedule found.";
 /// holds.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
-/// A `CatalogID` that is no catalog id at all — one carrying no account-id prefix — refused
-/// on the request's own terms, before the address is resolved against the store.
-const CATALOG_ID_INVALID: &str = "Catalog id is invalid. The catalog id must be prepended \
-     with the account id prefix and can only contain lowercase letters, numbers, \
-     underscores, and slashes.";
-
 /// The body that addresses one table's schedule, plus whatever `extra` adds — the same three
 /// members both operations take (`DatabaseName`, `TableName`, the optional `CatalogID`).
 fn schedule_body(database: &str, table: &str, extra: &Value) -> Value {
@@ -442,16 +436,16 @@ async fn an_address_that_holds_no_schedule_is_refused() {
             expected_message: Some(CATALOG_NOT_FOUND.to_string()),
         },
         RefusalCase {
-            // An id carrying no account-id prefix is no catalog id at all, which is a verdict
-            // on the REQUEST: both operations refuse it as invalid input, before the address
-            // is resolved against the store.
+            // An id carrying no account-id prefix is no catalog id at all, so it names no
+            // catalog this account holds and none any account could: a miss, for both
+            // operations, before the address is resolved against the store.
             case: "an id that is no catalog id at all",
             database: "refusal_db",
             table: "scheduled",
             extra: json!({ "CatalogID": "no_such_catalog" }),
-            start_code: "InvalidInputException",
-            stop_code: "InvalidInputException",
-            expected_message: Some(CATALOG_ID_INVALID.to_string()),
+            start_code: "EntityNotFoundException",
+            stop_code: "EntityNotFoundException",
+            expected_message: Some(CATALOG_NOT_FOUND.to_string()),
         },
     ];
 

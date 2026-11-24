@@ -525,7 +525,7 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
         let subject_row = key_row(1, "public-key-in-use-subject");
         let (subject, subject_etag) = seed(&router, &subject_row).await;
         let replacement_row = key_row(2, "public-key-in-use-replacement");
-        let (replacement, _) = seed(&router, &replacement_row).await;
+        let (replacement, replacement_etag) = seed(&router, &replacement_row).await;
         let spare_row = key_row(3, "public-key-in-use-spare");
         let (spare, spare_etag) = seed(&router, &spare_row).await;
         let mut filler: Vec<String> = Vec::new();
@@ -616,13 +616,20 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
         assert_still_stored(&router, &subject, &subject_etag, case).await;
 
         // A header carrying no version token is refused on its own terms, before anything about
-        // the reference; a header carrying one is read no further than its form, so the
-        // reference is what refuses the delete whichever record's token it names.
+        // the reference; a header carrying a version token that is not this key's is the
+        // precondition that evaluated to false, and the key's OWN current token reaches the
+        // reference, which is what refuses the delete.
         for (description, if_match, status, code) in [
             ("no If-Match at all", None, 400, "InvalidIfMatchVersion"),
             (
                 "a version token that is the referencing record's",
                 Some(record_etag.as_str()),
+                412,
+                "PreconditionFailed",
+            ),
+            (
+                "the key's own current version token",
+                Some(subject_etag.as_str()),
                 409,
                 "PublicKeyInUse",
             ),
@@ -686,9 +693,10 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
              with {}",
             reader.status, reader.raw
         );
-        // The reference is what refuses that delete: the header carries a version token, which
-        // is all this route reads of it ([`crate::key_material_if_match_form`]).
-        let moved = delete_key(&router, &replacement, Some("E1Z2Y3X4W5V6U7")).await;
+        // The reference is what refuses that delete: the header carries the key's own current
+        // version token, so the precondition holds and the reference is all that is left to
+        // refuse it ([`crate::key_material_if_match_form`]).
+        let moved = delete_key(&router, &replacement, Some(&replacement_etag)).await;
         assert_eq!(
             moved.error_code(),
             "PublicKeyInUse",

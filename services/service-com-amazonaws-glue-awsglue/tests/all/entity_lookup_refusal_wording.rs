@@ -53,12 +53,6 @@ const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and ru
 /// The whole `Message` a request addressed to a catalog that does not exist earns.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
-/// The whole `Message` a request whose `CatalogId` is no catalog id at all earns: fixed
-/// text stating the grammar, interpolating nothing from the request.
-const CATALOG_ID_INVALID: &str = "Catalog id is invalid. The catalog id must be prepended \
-     with the account id prefix and can only contain lowercase letters, numbers, \
-     underscores, and slashes.";
-
 /// The whole `Message` the schema read answers for a `SchemaId` that addresses no schema
 /// set completely.
 const SCHEMA_ID_INCOMPLETE: &str =
@@ -443,10 +437,12 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
         }
     }
 
-    // An id that is no catalog id at all is a verdict on the REQUEST: it carries no
-    // account-id prefix, or characters no catalog id is written with, so it selects no Data
-    // Catalog any account could hold and is refused as invalid input before the catalog is
-    // resolved — with the whole sentence fixed, naming no part of the request.
+    // An id that is no catalog id at all names no Data Catalog any account could hold, so on
+    // a surface that resolves the catalog an ENTITY lives in there is no catalog for the
+    // entity to live in: the catalog is reported ABSENT, with the whole sentence fixed,
+    // naming no part of the request. (The operations whose own subject is a catalog or its
+    // settings read the grammar themselves and refuse such an id as invalid input, which
+    // `crate::data_catalog_id_grammar` tables.)
     let malformed = [
         ("a bare name nothing created", "never-created".to_string()),
         ("too few digits for an account number", "12345".to_string()),
@@ -467,13 +463,13 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
                 &label,
                 operation,
                 &body,
-                "InvalidInputException",
-                CATALOG_ID_INVALID,
+                ENTITY_NOT_FOUND,
+                CATALOG_NOT_FOUND,
             )
             .await;
             assert!(
                 !error_message(&answer).contains(catalog_id.as_str()),
-                "case {label}: the grammar verdict carries no part of the request, got {:?}",
+                "case {label}: the catalog miss carries no part of the request, got {:?}",
                 error_message(&answer)
             );
         }
@@ -530,7 +526,8 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
     // A catalog this account DOES hold is resolved from its account-qualified id, so the
     // miss above is decided from stored state: the request reaches the entity lookup and
     // earns the ENTITY's miss. The same catalog named WITHOUT the account-id prefix is no
-    // catalog id at all, which is the input refusal rather than a lookup.
+    // catalog id at all, so it names no catalog the entity could live in and earns the
+    // CATALOG's miss however many catalogs the store holds.
     assert_refusal(
         &router,
         "a stored catalog addressed by its account-qualified id",
@@ -548,8 +545,8 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
         "a stored catalog addressed by its bare name",
         "GetDatabase",
         &json!({ "CatalogId": "stored-catalog", "Name": "present_db" }),
-        "InvalidInputException",
-        CATALOG_ID_INVALID,
+        ENTITY_NOT_FOUND,
+        CATALOG_NOT_FOUND,
     )
     .await;
 

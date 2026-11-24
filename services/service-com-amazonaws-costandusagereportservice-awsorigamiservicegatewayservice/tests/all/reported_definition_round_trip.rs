@@ -5,27 +5,29 @@
 //!
 //! Three rules, all about the read path:
 //!
-//! 1. **A read states the delivery recorded against the report, and no more.** The modelled
+//! 1. **A read states the delivery recorded against the report.** The modelled
 //!    `ReportStatus` is "a two element dictionary with a `lastDelivery` and `lastStatus`
 //!    key whose values describe the date and status of the last delivered report for a
-//!    particular report definition" (`smithy_query(shape="ReportStatus")`), so a report a
-//!    delivery HAS been recorded against states that dictionary with the instant of the
-//!    delivery and the outcome it ended with, and a report none has been recorded against
-//!    states no `ReportStatus` at all.
-//! 2. **Every member a read fills holds a value the model admits for it.** The members this
-//!    service populates are constrained like every other: `lastDelivery` is length 16..20
-//!    with the pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` is the
-//!    `LastStatus` catalog `SUCCESS | ERROR_PERMISSIONS | ERROR_NO_BUCKET`
-//!    (`smithy_query(shape="LastDelivery,LastStatus")`), `BillingViewArn` is length 0..128,
-//!    and each enum member is its own catalog — so a member the service holds no value for
-//!    is left out of the response rather than filled with a stand-in outside those
-//!    constraints.
+//!    particular report definition" (`smithy_query(shape="ReportStatus")`), so every read
+//!    states that dictionary: a report a delivery HAS been recorded against carries the
+//!    instant of the delivery and the outcome it ended with, and a report none has been
+//!    recorded against carries both keys EMPTY.
+//! 2. **Every member a CALLER may submit holds a value the model admits for it.** Those
+//!    members are constrained like every other: `BillingViewArn` is length 0..128 and each
+//!    enum member is its own catalog — so a member the service holds no value for is left
+//!    out of the response rather than filled with a stand-in outside those constraints.
+//!    The delivery status is the exception the service OWNS: `lastDelivery` is length
+//!    16..20 with the pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$` and `lastStatus` is
+//!    the `LastStatus` catalog `SUCCESS | ERROR_PERMISSIONS | ERROR_NO_BUCKET`
+//!    (`smithy_query(shape="LastDelivery,LastStatus")`), which describe a DELIVERY, and the
+//!    never-delivered report reports the empty spelling the recorded service answers.
 //! 3. **A reported definition round-trips.** `ModifyReportDefinition` replaces a definition
 //!    wholesale, so read-modify-write is this API's normal way to change one: the whole
-//!    `ReportDefinition` a read serves, replayed verbatim, is accepted by both operations
-//!    that take that shape — the boundary validator holds a request to the same
-//!    constraints the read's own values satisfy (its refusals are pinned by
-//!    `modelled_constraints.rs`).
+//!    `ReportDefinition` a read serves, replayed without the service-populated delivery
+//!    status, is accepted by both operations that take that shape — the boundary validator
+//!    holds a request to the same constraints the read's own caller-submittable values
+//!    satisfy (its refusals are pinned by `modelled_constraints.rs`), and the delivery
+//!    status the service fills is not a caller's to send back.
 //!
 //! The table's rows differ along what the rules generalise over: whether a delivery has
 //! been recorded against the report, how that delivery ended (every value of the modelled
@@ -228,17 +230,28 @@ fn assert_members_are_admissible(case: &str, reported: &Value) {
         "case {case:?}: expected a ReportCreationDate stated as yyyymmddThhmmssZ, got {created:?}"
     );
 
-    // The member the service fills from the report's delivery history: present only for a
-    // report a delivery was recorded against, and then holding the values the two
-    // constrained members admit.
-    if let Some(status) = reported.get("ReportStatus") {
-        let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
+    // The member the service fills from the report's delivery history: present on every
+    // read, holding the values a delivery has for a report one was recorded against and the
+    // empty spelling for a report none was.
+    let status = reported
+        .get("ReportStatus")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
+    let last_status = status["lastStatus"].as_str().unwrap_or_default();
+    if last_delivery.is_empty() || last_status.is_empty() {
+        assert_eq!(
+            (last_delivery, last_status),
+            ("", ""),
+            "case {case:?}: a report with no delivery recorded states both keys empty, got \
+             {status:?}"
+        );
+    } else {
         assert!(
             (16..=20).contains(&last_delivery.chars().count()) && is_report_timestamp(last_delivery),
             "case {case:?}: expected a lastDelivery inside the modelled length 16..20 and its \
              pattern, got {status:?}"
         );
-        let last_status = status["lastStatus"].as_str().unwrap_or_default();
         assert!(
             LAST_STATUS_VALUES.contains(&last_status),
             "case {case:?}: expected a lastStatus inside the modelled catalog \
@@ -324,13 +337,19 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
                 .unwrap_or_default()
                 .to_string();
 
-            // Read-modify-write: the definition just read, replayed verbatim. Every value
-            // it carries is one the modelled constraints admit, so the boundary validator
-            // takes the whole of it back.
+            // Read-modify-write: the definition just read, replayed without the delivery
+            // status the service fills for itself. Every value a caller may submit is one
+            // the modelled constraints admit, so the boundary validator takes the whole of
+            // it back.
+            let mut submitted = reported.clone();
+            submitted
+                .as_object_mut()
+                .expect("a report definition is an object")
+                .remove("ReportStatus");
             let (status, body) = cur
                 .call(
                     "ModifyReportDefinition",
-                    &json!({ "ReportName": report_name, "ReportDefinition": reported }),
+                    &json!({ "ReportName": report_name, "ReportDefinition": submitted }),
                 )
                 .await;
             assert_eq!(
@@ -348,7 +367,7 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
 
             // The same definition under a free name, through the create path: accepted,
             // and the new report has no delivery of its own to report.
-            let mut copy = reported.clone();
+            let mut copy = submitted.clone();
             copy["ReportName"] = json!(format!("{report_name}-copy"));
             let (status, body) = cur.put(&copy, None).await;
             assert_eq!(

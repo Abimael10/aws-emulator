@@ -93,27 +93,6 @@ impl Route {
         }
     }
 
-    /// Does this route read the whole form the addressed kind's identifiers are ISSUED in? The
-    /// field-level encryption kinds' identifiers come from namespaces of their own, so their
-    /// routes do — of a value written as an identifier of this mint at all; an origin access
-    /// control's comes from a namespace four kinds share, so those read the alphabet alone.
-    fn reads_the_issued_form(self) -> bool {
-        !matches!(
-            self,
-            Self::OriginAccessControl | Self::OriginAccessControlConfig
-        )
-    }
-
-    /// The namespace letter this route's resources are issued under, for the routes that read
-    /// one.
-    fn namespace(self) -> Option<char> {
-        match self {
-            Self::FieldLevelEncryptionConfig => Some('C'),
-            Self::FieldLevelEncryptionProfile => Some('P'),
-            _ => None,
-        }
-    }
-
     /// Send this route at `id`.
     async fn send(self, router: &MultiServiceRouter, id: &str) -> Answer {
         match self {
@@ -143,31 +122,17 @@ impl Route {
     }
 
     /// The sentence this route owes `id` when nothing of its kind answers to it.
+    ///
+    /// Every route of both families reads the ALPHABET alone: a value written in it is carried
+    /// through to the store, since WHICH identifier was issued — and for which kind — is a
+    /// property of the store, so the record it holds none under is the record reported ABSENT;
+    /// a value outside it is the identifier the route reports it cannot READ.
     fn expected(self, id: &str) -> &'static str {
-        if !self.reads_the_issued_form() {
-            // The alphabet alone: a value of it is carried through to the store, and a value
-            // outside it is the identifier this route reports it cannot read.
-            return if in_the_identifier_alphabet(id) {
-                self.absent()
-            } else {
-                UNREADABLE_IDENTIFIER
-            };
+        if in_the_identifier_alphabet(id) {
+            self.absent()
+        } else {
+            UNREADABLE_IDENTIFIER
         }
-        if !in_the_identifier_alphabet(id) {
-            // No identifier of this service's mint at all, so there is no form to refuse.
-            return self.absent();
-        }
-        let letter = id.chars().next();
-        // A value written as an identifier of this mint could be this kind's only as an
-        // identifier of its OWN namespace, or of no namespace this service issues one under, at
-        // the width one is written at.
-        let another_namespace = letter.is_some_and(|letter| {
-            ISSUED_NAMESPACES.contains(&letter) && Some(letter) != self.namespace()
-        });
-        if another_namespace || id.len() != MINTED_ID_WIDTH {
-            return UNREADABLE_IDENTIFIER;
-        }
-        self.absent()
     }
 }
 

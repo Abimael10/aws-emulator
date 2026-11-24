@@ -549,22 +549,22 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a token that is no configuration id",
             "not-a-config-id".to_string(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-config-the-only-one".to_string(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "an identifier of this mint's alphabet at no issued width",
             "CBOGUSCONFIGID0000".to_string(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_CONFIG_MESSAGE,
         ),
     ];
 

@@ -181,10 +181,11 @@ async fn the_leading_letter_decides_within_the_identifier_alphabet() {
 }
 
 /// A SEPARATOR or a lower-cased character in a body that is otherwise of the kind's own issued
-/// form takes the value out of the mint's alphabet, so no route refuses it on its form: each
-/// resolves it against the store and reports the absent record.
+/// form takes the value out of the mint's alphabet, so there is nothing in it for the service
+/// to resolve: every route that reads the alphabet reports the identifier UNREADABLE and the one
+/// that reads no form at all carries it through to the store ([`unresolved_answer`]).
 #[tokio::test]
-async fn a_separator_takes_a_value_out_of_the_mint_and_into_the_store() {
+async fn a_separator_takes_a_value_out_of_the_mint() {
     let router = emulator();
     let seeded = seed(&router).await;
 
@@ -220,7 +221,7 @@ async fn a_separator_takes_a_value_out_of_the_mint_and_into_the_store() {
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    kind.absent(),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }

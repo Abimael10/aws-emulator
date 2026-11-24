@@ -1259,6 +1259,27 @@ fn refused_element(error: crate::state::RequestError) -> ElementRefusal {
     }
 }
 
+/// How an `Update` element states a refusal about the item its change would LEAVE.
+///
+/// The documented item-SIZE quota refuses the CALL: a change that would leave an item past
+/// the ceiling is a change no item could be left by, so the request is refused on its own
+/// terms — a top-level `ValidationException` carrying the sentence the update path states for
+/// that quota — and none of the transaction is applied, as this route's recorded answers
+/// report. Every OTHER rule about that item (an operand of the wrong type, a document path
+/// the stored item cannot hold, an attribute it does not carry) can only be found by reading
+/// the change against the stored item, so it stays this ACTION's failure and cancels the
+/// transaction ([`refused_element`]).
+fn refused_update_outcome(error: crate::state::RequestError) -> ElementRefusal {
+    match error {
+        crate::state::RequestError::Validation(message)
+            if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE =>
+        {
+            ElementRefusal::Call(crate::scaffolded::Scaffolded::validation(message))
+        }
+        other => refused_element(other),
+    }
+}
+
 /// How an action answers a bad key: the cancellation its table's key schema decided, or
 /// the request-level refusal its own shape earned ([`crate::state::KeyRefusal`] owns
 /// which is which).
@@ -1584,14 +1605,16 @@ fn resolve_element(
             let mut item = before.clone().unwrap_or_else(|| addressed_key.clone());
             // APPLYING the update is where the stored item decides: an operand the stored
             // value has the wrong type for, a document path the stored item cannot hold,
-            // an attribute it does not carry, a value the update computes that no item may
-            // hold. None of it can be settled from the request alone, so it is this ACTION
-            // that failed and the transaction is cancelled with that sentence against this
-            // action ([`ElementRefusal::Element`]).
+            // an attribute it does not carry. None of it can be settled from the request
+            // alone, so it is this ACTION that failed and the transaction is cancelled with
+            // that sentence against this action ([`ElementRefusal::Element`]) — EXCEPT the
+            // documented item-SIZE quota, which refuses the CALL
+            // ([`refused_update_outcome`]): a change no item could be left by is a defect of
+            // the request.
             let touched = applied
                 .apply(&mut item)
                 .map_err(crate::state::refused_in_element)
-                .map_err(refused_element)?;
+                .map_err(refused_update_outcome)?;
             for attribute in touched.attributes() {
                 if attribute.as_str() == partition_key.as_str()
                     || Some(attribute.as_str()) == sort_key.as_deref()
@@ -1609,13 +1632,14 @@ fn resolve_element(
                 }
             }
             // The item this update LEAVES is read against the stored one, so every rule
-            // about it is this action's outcome too: a value the update COMPUTES, or one it
-            // carries, can be larger than any item may hold.
+            // about it is this action's outcome too — EXCEPT the documented item-SIZE quota,
+            // which refuses the CALL wherever this element crosses it
+            // ([`refused_update_outcome`]).
             for (attribute, value) in &item {
                 crate::state::check_attribute_value(attribute, value)
                     .map_err(crate::state::stated_for_an_update)
                     .map_err(crate::state::unenveloped)
-                    .map_err(refused_element)?;
+                    .map_err(refused_update_outcome)?;
             }
             crate::state::canonicalize_item(&mut item)
                 .map_err(crate::state::unenveloped)
@@ -1627,18 +1651,17 @@ fn resolve_element(
             // frame each clause of the update costs
             // ([`crate::state::ParsedUpdate::request_shape_charge`]).
             //
-            // A crossing found HERE is "an item size becomes too large (larger than 400 KB)
-            // [...] or a similar validation error occurs because of changes made by the
-            // transaction" (`TransactionCanceledException`) — the change this transaction
-            // would make is what carries the item past the quota — so it is THIS ACTION's
-            // failure: the transaction is cancelled and the reason list names this action
-            // with the sentence the update path words that quota with, every other action
-            // reporting its own outcome beside it. The item a `Put` CARRIES is the request's
-            // own, settled before any of the transaction is applied and worded for an item
-            // that was carried.
+            // Crossing it refuses the CALL — a top-level `ValidationException` carrying the
+            // sentence the update path words that quota with — rather than cancelling the
+            // transaction: the change this element states is one no item could be left by,
+            // so the request is refused on its own terms and none of the transaction is
+            // applied, as the recorded answers of this route report. The item a `Put`
+            // CARRIES is refused the same way, worded for an item that was carried.
             if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
-                return Err(ElementRefusal::Element(
-                    crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
+                return Err(ElementRefusal::Call(
+                    crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+                    ),
                 ));
             }
             table

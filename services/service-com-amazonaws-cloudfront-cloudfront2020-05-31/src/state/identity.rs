@@ -1196,15 +1196,19 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// A form is refused only of a value that is WRITTEN as one of this service's identifiers:
 /// the characters CloudFront writes an identifier in ([`is_entity_id_form`] — decimal digits
 /// and uppercase ASCII letters, carrying no separator and no lower case). Such a value claims
-/// to be an identifier, so it has to be written the way identifiers are ISSUED to be one:
+/// to be an identifier, so it has to be written at the WIDTH identifiers are ISSUED at
+/// ([`ISSUED_ENTITY_ID_LEN`]) to be one: a value of the alphabet at any other width is no
+/// identifier CloudFront ever issued, and is the identifier a route reports it cannot READ
+/// ([`invalid_id_format`]).
 ///
-/// * at the width they are issued at ([`ISSUED_ENTITY_ID_LEN`]) — a value of the alphabet at
-///   any other width is no identifier CloudFront ever issued;
-/// * and, where its leading letter identifies a namespace this service issues identifiers
-///   under ([`identifies_a_namespace`]), under THIS kind's namespace ([`is_prefixed_token`]):
-///   an identifier of another kind's namespace was issued for that kind and can therefore
-///   never name this one. A leading letter that identifies no namespace of this service says
-///   nothing about which kind issued it, so the STORE is what answers for it.
+/// The width is the WHOLE of the form these routes read. The namespace letter is not: WHICH
+/// kind an identifier of the issued form was issued for is a property of the STORE rather than
+/// of the value, so a value at the issued width is carried through to it and the record it
+/// holds none under is the resource that is ABSENT — whether the leading letter is the
+/// addressed kind's own, another kind's of this service, or one no kind of it mints under.
+/// The recorded answers of this surface are what say so: a read of a field-level encryption
+/// configuration, and one of a profile, each addressed by a value of the issued form under
+/// ANOTHER namespace letter, both report the record absent rather than unreadable.
 ///
 /// A value written OUTSIDE that alphabet — in lower case, around a separator, as a UUID or as
 /// a word — makes no claim to be an identifier of this mint at all, so there is no identifier
@@ -1212,21 +1216,16 @@ pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
 /// the store and report the resource ABSENT.
 ///
 /// So the two refusals keep the conditions they describe: a value this reports `true` for is
-/// the identifier a route reports it cannot READ ([`invalid_id_format`]), and every other
-/// value the store holds nothing under is the resource that is ABSENT.
+/// the identifier a route reports it cannot READ, and every other value the store holds
+/// nothing under is the resource that is ABSENT.
 ///
-/// NOT for a kind of the family whose four members share ONE namespace letter
-/// ([`ENTITY_ID_PREFIX`]): the value cannot say which of them issued it, so those routes read
-/// their own form
+/// `prefix` is the namespace letter the addressed kind mints under, kept in the signature
+/// because it NAMES the kind this question is asked for; the identifiers of the family whose
+/// four members share ONE namespace letter ([`ENTITY_ID_PREFIX`]) read their own form instead
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
 pub fn id_format_refused_for(prefix: char, value: &str) -> bool {
-    if !is_entity_id_form(value) {
-        return false;
-    }
-    if identifies_a_namespace(value) {
-        return !is_prefixed_token(value, prefix);
-    }
-    value.len() != ISSUED_ENTITY_ID_LEN
+    let _ = prefix;
+    !is_entity_id_form(value)
 }
 
 /// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every
@@ -1297,28 +1296,6 @@ pub fn check_if_match(current: &str, if_match: Option<&str>) -> IfMatch {
     } else {
         IfMatch::Stale
     }
-}
-
-/// Whether the `If-Match` of a conditional request may proceed on the KEY-MATERIAL surface —
-/// CloudFront's signed-URL public keys and the field-level encryption profiles that encrypt
-/// with them — where a version token is read for its FORM and not compared to the addressed
-/// record's own.
-///
-/// `InvalidIfMatchVersion` is documented as "the `If-Match` version is missing or not valid",
-/// and that is the whole of what these deletes evaluate: an absent header, or one carrying
-/// anything that is no version token at all, is refused with it ([`if_match_version`]), and
-/// any value written as a version token admits the delete. Their recorded answers are what
-/// says so — a delete of a public key, and one of a field-level encryption profile, each
-/// carrying a well-formed version token this service had issued to ANOTHER record of the same
-/// account, are both served (HTTP 204) rather than refused.
-///
-/// The resources a caller conditionally REWRITES keep the comparison instead
-/// ([`check_if_match`]): a distribution, a policy, a key group or a field-level encryption
-/// configuration presented a version token that is not its current one answers
-/// `PreconditionFailed`, as their own recorded answers report. Which of the two a route
-/// follows is each route's recorded contract, so do not fold the two into one.
-pub fn if_match_form_admits(if_match: Option<&str>) -> bool {
-    if_match_version(if_match).is_some()
 }
 
 /// Whether two invalidation batches ask for the same thing, which is what decides

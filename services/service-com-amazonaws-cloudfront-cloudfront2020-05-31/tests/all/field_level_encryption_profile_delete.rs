@@ -506,13 +506,20 @@ async fn a_profile_a_configuration_names_cannot_be_deleted() {
         );
 
         // A header carrying no version token is refused on its own terms, before anything about
-        // the reference; a header carrying one is read no further than its form, so the
-        // reference is what refuses the delete whichever record's token it names.
+        // the reference; a header carrying a version token that is not this profile's is the
+        // precondition that evaluated to false, and the profile's OWN current token reaches the
+        // reference, which is what refuses the delete.
         for (description, if_match, status, code) in [
             ("no If-Match at all", None, 400, "InvalidIfMatchVersion"),
             (
                 "a version token that is the configuration's",
                 Some(config_etag.as_str()),
+                412,
+                "PreconditionFailed",
+            ),
+            (
+                "the profile's own current version token",
+                Some(profile_etag.as_str()),
                 409,
                 "FieldLevelEncryptionProfileInUse",
             ),
@@ -629,22 +636,22 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-the-only-one".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "an identifier of this mint's alphabet at no issued width",
             "PBOGUSPROFILEID0000".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
     ];
 

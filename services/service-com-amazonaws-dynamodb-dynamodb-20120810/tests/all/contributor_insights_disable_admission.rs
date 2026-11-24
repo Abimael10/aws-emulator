@@ -183,9 +183,11 @@ async fn a_disable_of_insights_no_enable_has_configured_is_refused_and_writes_no
             disable_in(&router, REGION, "InsightsConfigured", index, None).await;
         assert_eq!(
             (status, reported(&repeated, "ContributorInsightsStatus")),
-            (200, json!("DISABLING")),
+            (200, json!("DISABLED")),
             "case {case}: the configuration an enable wrote outlives the disable, so the same \
-             disable repeated is served, got {status} with {repeated}"
+             disable repeated is served — and it asks for the direction the resource is already \
+             in, so nothing is applied and the status in force is what it answers, got {status} \
+             with {repeated}"
         );
     }
     let listed_before = listed_in(&router, REGION).await;

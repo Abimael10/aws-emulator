@@ -215,9 +215,10 @@ async fn an_actions_condition_is_read_before_the_change_it_states_is_applied() {
         );
     }
 
-    // An item past the documented ceiling is a defect of the applied change like the others,
-    // so it too is only reached once the condition holds — and then it is that action's own
-    // cancellation reason.
+    // An item past the documented ceiling is a defect of the REQUEST — a change no item could
+    // be left by — so once the condition holds it refuses the whole CALL rather than cancelling
+    // the transaction; with the condition failing it is never reached at all, which is what
+    // this row's two legs pin.
     let oversize = json!({":v": {"S": "x".repeat(400 * 1024)}});
     let (reported, said) = cancellation(
         &router,
@@ -240,26 +241,30 @@ async fn an_actions_condition_is_read_before_the_change_it_states_is_applied() {
         "case a change past the item ceiling with the condition failing: expected the \
          condition named, got {said:?}"
     );
-    let (reported, said) = cancellation(
+    let (status, answered) = call(
         &router,
-        "a change past the item ceiling with the condition holding",
+        "TransactWriteItems",
         json!({"TransactItems": [guarded_update("SET big = :v", oversize, "ON")]}),
     )
     .await;
     assert_eq!(
-        reported,
-        vec![(
-            "ValidationError".to_string(),
-            Some("Item size to update has exceeded the maximum allowed size".to_string())
-        )],
-        "case a change past the item ceiling with the condition holding: expected that \
-         action's reason to word the ceiling, got {reported:?}"
+        (
+            status,
+            error_code(&answered).as_str(),
+            message(&answered).as_str()
+        ),
+        (
+            400,
+            "ValidationException",
+            "Item size to update has exceeded the maximum allowed size"
+        ),
+        "case a change past the item ceiling with the condition holding: expected the call \
+         refused with the update-path sentence, got {status} with {answered}"
     );
-    assert_eq!(
-        said,
-        cancelled_message(&["ValidationError"]),
-        "case a change past the item ceiling with the condition holding: expected the \
-         validation code named, got {said:?}"
+    assert!(
+        answered.get("CancellationReasons").is_none(),
+        "case a change past the item ceiling with the condition holding: a refused call grades \
+         no action, so it reports no reason list, got {answered}"
     );
 
     // NOTHING any of those transactions carried was applied: the seeded item is exactly as

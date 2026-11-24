@@ -676,26 +676,38 @@ pub struct ContributorInsights {
 impl ContributorInsights {
     /// Apply one `ContributorInsightsAction`, with the mode an enable names.
     ///
-    /// An `ENABLE` is accepted whether or not it changes anything — re-stating it re-states
-    /// the mode and starts the span again — so what a later read reports is always the last
-    /// accepted request's.
+    /// An action that asks for the direction this resource's key access insights are ALREADY
+    /// in — with the configuration they are already in it under — asks for NO change: nothing
+    /// is applied, no move is owed, and the status the call answers is the one in force. That
+    /// is what a second `DISABLE` of a resource an accepted disable has already turned off
+    /// answers (`DISABLED`, the settled status, rather than a fresh `DISABLING` span), and
+    /// equally what a re-stated `ENABLE` of a resource already enabled under the same mode
+    /// answers.
     ///
-    /// Either action is applied asynchronously, so the call leaves the setting in the
-    /// transient status of its own direction and the clock owes the move to the settled one
-    /// a [`STATUS_TRANSITION`] later: an enable has the resource's CloudWatch rules to put in
-    /// place and a disable has them to tear down, and neither is complete when the call
-    /// answers. The rules themselves are minted and deleted by the accepted call
+    /// An action that DOES ask for a change — the other direction, or an enable naming a mode
+    /// the resource is not configured under — is applied asynchronously, so the call leaves
+    /// the setting in the transient status of its own direction and the clock owes the move to
+    /// the settled one a [`STATUS_TRANSITION`] later: an enable has the resource's CloudWatch
+    /// rules to put in place and a disable has them to tear down, and neither is complete when
+    /// the call answers. The rules themselves are minted and deleted by the accepted call
     /// ([`crate::state::contributor_insights`]), so the status the clock settles on is
     /// reached only once the resource's rule set is the one the action asked for.
     pub fn apply(&mut self, enable: bool, mode: Option<&str>, now: SystemTime) {
+        let requested_mode = enable.then(|| {
+            mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
+                .to_string()
+        });
+        let asks_for_no_change = self.requested_at.is_some()
+            && self.enabled == enable
+            && (!enable || requested_mode == self.mode);
+        if asks_for_no_change {
+            return;
+        }
         self.enabled = enable;
         self.requested_at = Some(now);
         self.settles_at = Some(now + STATUS_TRANSITION);
-        if enable {
-            self.mode = Some(
-                mode.unwrap_or(DEFAULT_CONTRIBUTOR_INSIGHTS_MODE)
-                    .to_string(),
-            );
+        if let Some(configured) = requested_mode {
+            self.mode = Some(configured);
         }
     }
 

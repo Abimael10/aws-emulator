@@ -968,20 +968,20 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
     // never minted, an id in another namespace and of a width no identifier of this kind is
-    // issued at, and a value of no CloudFront identifier form at all. A value WRITTEN as an
-    // identifier of this mint has to be of the whole form a profile id is issued in to be read
-    // as one, so another namespace is the identifier reported unreadable; a value that is no
-    // identifier of this mint claims no form to refuse and is the profile reported absent.
+    // issued at, and a value of no CloudFront identifier form at all. A value WRITTEN in the
+    // alphabet this service writes an identifier in is carried through to the STORE, whatever
+    // namespace letter and width it carries, so it is the profile reported absent; a value
+    // outside that alphabet is no identifier the service can READ at all.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
         (
-            "not-a-profile-id",
+            "EDFDVBD6EXAMPLE",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
+        ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),

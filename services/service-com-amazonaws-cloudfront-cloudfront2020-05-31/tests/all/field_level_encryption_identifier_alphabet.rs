@@ -161,12 +161,12 @@ fn outside_the_alphabet(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
     ]
 }
 
-/// RULE: a value written in the identifier alphabet is judged on the form the addressed kind's
-/// identifiers are ISSUED in — its namespace letter and its width — so one the store holds no
-/// record for is either the record reported ABSENT or the identifier reported UNREADABLE, and
-/// never anything else, through every operation addressed by an identifier of either kind.
+/// RULE: a value written in the identifier alphabet claims to be an identifier this service
+/// issued, so it is carried through to the STORE whatever body, width or namespace letter it
+/// carries, and one the store holds no record for is the record reported ABSENT, through every
+/// operation addressed by an identifier of either kind.
 #[tokio::test]
-async fn a_value_of_the_identifier_alphabet_is_judged_on_the_issued_form() {
+async fn a_value_of_the_identifier_alphabet_is_carried_through_to_the_store() {
     let router = emulator();
     let seeded = seed(&router).await;
 
@@ -206,21 +206,23 @@ async fn a_value_of_the_identifier_alphabet_is_judged_on_the_issued_form() {
 }
 
 /// RULE's boundary: a value carrying a character the alphabet does not admit claims to be no
-/// identifier this service issued, so no operation addressed by one refuses its form — each
-/// resolves it against the store and reports the record ABSENT.
+/// identifier this service issued, so there is nothing in it to resolve — every operation that
+/// reads the alphabet reports the identifier UNREADABLE, and the one that reads no form at all
+/// carries it through to the store ([`unresolved_answer`]).
 #[tokio::test]
-async fn a_value_carrying_a_character_outside_the_alphabet_is_carried_through_to_the_store() {
+async fn a_value_carrying_a_character_outside_the_alphabet_is_reported_unreadable() {
     let router = emulator();
     let seeded = seed(&router).await;
 
     for kind in [Kind::Config, Kind::Profile] {
+        let minted = seeded.minted(kind).to_string();
         for (case, id) in outside_the_alphabet(kind, &seeded) {
             for (operation, answer) in address(&router, kind, &id, &seeded).await {
                 assert_refusal(
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    kind.absent(),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }

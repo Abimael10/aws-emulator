@@ -398,12 +398,11 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         );
     }
 
-    // The TRANSACTIONAL surface states that same sentence as the REASON the crossing action
-    // reports where the crossing is found by APPLYING the action against the item its key
-    // holds — "an item size becomes too large [...] or a similar validation error occurs
-    // because of changes made by the transaction", one of the circumstances a cancellation
-    // documents. Here the value the action writes is one the ceiling admits on its own and
-    // the item it would leave is past it; the case below drives a small value over an item
+    // The TRANSACTIONAL surface states the same sentence in the same class wherever the
+    // crossing is found: a change that would leave the item past the ceiling is a change no
+    // item could be left by, so it is a defect of the REQUEST — the whole call is refused and
+    // no action is graded. The first case asks to store a value the ceiling admits on its own
+    // over an item the change would take past it; the second drives a small value over an item
     // already near the ceiling.
     let case = "one action of a transaction asking for an item past the ceiling";
     let (status, answered) = call(
@@ -418,11 +417,16 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         (
             status,
             error_code(&answered).as_str(),
-            answered["CancellationReasons"][0]["Message"].as_str(),
+            message(&answered).as_str()
         ),
-        (400, "TransactionCanceledException", Some(UPDATE_TOO_BIG)),
-        "case {case:?}: expected the transaction cancelled over that action's crossing, got \
-         {status} with {answered}"
+        (400, "ValidationException", UPDATE_TOO_BIG),
+        "case {case:?}: expected the call refused with the update-path sentence, got {status} \
+         with {answered}"
+    );
+    assert!(
+        answered.get("CancellationReasons").is_none(),
+        "case {case:?}: a refused call grades no action, so it reports no reason list, got \
+         {answered}"
     );
 
     let near_the_ceiling = json!({"pk": {"S": "near-the-ceiling"}, "sk": {"S": "a"}});
@@ -449,23 +453,14 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
             error_code(&answered).as_str(),
             message(&answered).as_str()
         ),
-        (
-            400,
-            "TransactionCanceledException",
-            "Transaction cancelled, please refer cancellation reasons for specific reasons \
-             [ValidationError]"
-        ),
-        "case \"a transactional change past the ceiling\": expected the transaction cancelled \
-         over that action, got {status} with {answered}"
+        (400, "ValidationException", UPDATE_TOO_BIG),
+        "case \"a transactional change past the ceiling\": expected the call refused with the \
+         update-path sentence, got {status} with {answered}"
     );
-    assert_eq!(
-        (
-            answered["CancellationReasons"][0]["Code"].as_str(),
-            answered["CancellationReasons"][0]["Message"].as_str(),
-        ),
-        (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-        "case \"a transactional change past the ceiling\": expected that action's reason to \
-         word the ceiling, got {answered}"
+    assert!(
+        answered.get("CancellationReasons").is_none(),
+        "case \"a transactional change past the ceiling\": a refused call grades no action, so \
+         it reports no reason list, got {answered}"
     );
 
     // The seeded item is where it was: a change that did not go through writes nothing.

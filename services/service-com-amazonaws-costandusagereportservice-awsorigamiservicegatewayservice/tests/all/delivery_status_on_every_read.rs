@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every report definition a read serves states the delivery recorded against it, and no
-//! more.
+//! Every report definition a read serves states the delivery recorded against it.
 //!
 //! The rule: the modelled `ReportStatus` is "a two element dictionary with a
 //! `lastDelivery` and `lastStatus` key whose values describe the date and status of the
 //! last delivered report for a particular report definition"
 //! (`smithy_query(shape="ReportStatus")`), so the read path states that dictionary, with
-//! both of its keys, for every report definition a delivery HAS been recorded against —
-//! the instant of that delivery and the outcome it ended with — and states no
-//! `ReportStatus` at all for one none has: the member's modelled constraints admit only
-//! the values a delivery has, so there is nothing a report nothing delivered can fill it
-//! with.
+//! both of its keys, for EVERY report definition it serves: the instant of the delivery
+//! and the outcome it ended with for a report a delivery HAS been recorded against, and
+//! both keys empty for one none has — the dictionary is unconditional and only its values
+//! report the delivery.
 //!
 //! The rows span what the rule generalises over: how many definitions the account holds
 //! (one, several, more than one page's worth), which position in the page a definition
