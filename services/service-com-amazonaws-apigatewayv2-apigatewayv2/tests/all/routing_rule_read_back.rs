@@ -42,6 +42,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 use crate::api_lifecycle::{
     as_str, assert_minted_id, call_in_region, emulator, error_code, strip_nulls,
 };
+use crate::routing_rule_strip_base_path_default::served_actions;
 
 /// The region every request in this suite is signed for. Deliberately NOT the emulator's
 /// `us-east-1` default, so nothing region-derived (the rule's ARN) can be hardcoded.
@@ -324,15 +325,19 @@ async fn create_routing_rule_persists_the_rule_get_routing_rule_reports_it_back(
         );
         // Every member the caller sent is part of that, so a reader that dropped or
         // rewrote one fails here rather than agreeing with a create that did the same.
+        // The actions are compared against what the request is SERVED as: an action whose
+        // optional setting the request named no value for is served under the service's
+        // own (see [`served_actions`]).
         assert_eq!(
             read.get("priority"),
             request.get("priority"),
             "case {label:?}: expected the Priority that was sent, got {read}"
         );
+        let served = served_actions(&request["actions"]);
         assert_eq!(
             strip_nulls(&read["actions"]),
-            strip_nulls(&request["actions"]),
-            "case {label:?}: expected the Actions that were sent, got {read}"
+            strip_nulls(&served),
+            "case {label:?}: expected the Actions the request is served as, got {read}"
         );
         assert_eq!(
             strip_nulls(&read["conditions"]),

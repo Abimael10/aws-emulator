@@ -51,6 +51,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 };
 
 use crate::api_lifecycle::{as_str, assert_minted_id, call_in_region, error_code};
+use crate::routing_rule_strip_base_path_default::served_actions;
 
 /// The region every request in this suite is signed for. Deliberately NOT the emulator's
 /// `us-east-1` default, so nothing region-derived (the rule's ARN) can be hardcoded.
@@ -325,14 +326,17 @@ async fn create_routing_rule_persists_the_rule_list_routing_rules_reports_it_bac
             "case {label:?}: expected the rule's own ARN, got {created}"
         );
 
-        // Every member the caller sent is reported back as it was stored.
+        // Every member the caller sent is reported back as it was stored; the actions as
+        // the request is SERVED, an action whose optional setting the request named no
+        // value for carrying the service's own (see [`served_actions`]).
         assert_eq!(
             created["priority"], request["priority"],
             "case {label:?}: expected the Priority that was sent, got {created}"
         );
         assert_eq!(
-            created["actions"], request["actions"],
-            "case {label:?}: expected the Actions that were sent, got {created}"
+            created["actions"],
+            served_actions(&request["actions"]),
+            "case {label:?}: expected the Actions the request is served as, got {created}"
         );
         assert_eq!(
             created["conditions"], request["conditions"],
@@ -598,8 +602,9 @@ async fn an_action_is_stored_as_the_reference_the_request_wrote() {
             "case {label:?}: expected 201 from CreateRoutingRule, got {status} {created}"
         );
         assert_eq!(
-            created["actions"], request["actions"],
-            "case {label:?}: expected the Actions that were sent, got {created}"
+            created["actions"],
+            served_actions(&request["actions"]),
+            "case {label:?}: expected the Actions the request is served as, got {created}"
         );
         expected.push((as_str(&created, "routingRuleId"), created["actions"].clone()));
     }

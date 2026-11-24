@@ -216,7 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             routing_rule_id: routing_rule_id.clone(),
             priority: input.priority,
-            actions: input.actions,
+            // The actions are stored in their EFFECTIVE form: the references the request
+            // wrote, with each optional setting it named no value for resolved to the one
+            // the rule is served under (see
+            // `crate::state::resolve_routing_rule_actions`), so every reader of the rule
+            // reports the setting it is actually evaluated with.
+            actions: crate::state::resolve_routing_rule_actions(input.actions),
             conditions: input.conditions,
         };
 

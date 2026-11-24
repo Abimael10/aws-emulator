@@ -198,7 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minted, so a client holding either keeps reaching this rule.
         record.priority = input.priority;
         record.conditions = input.conditions;
-        record.actions = input.actions;
+        // The actions are stored in their EFFECTIVE form, the same way the create stores
+        // them (see `crate::state::resolve_routing_rule_actions`): a rewrite that names no
+        // value for an optional setting of an action asks for the one the rule is served
+        // under, so the stored rule always carries the setting it is evaluated with.
+        record.actions = crate::state::resolve_routing_rule_actions(input.actions);
 
         // Report the STORED record, so what the caller is told is what a later
         // GetRoutingRule reports.

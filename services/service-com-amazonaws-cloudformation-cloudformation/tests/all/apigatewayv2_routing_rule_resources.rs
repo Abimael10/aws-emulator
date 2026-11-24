@@ -33,6 +33,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::DEFAULT_STRIP_BASE_PATH;
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 
 use crate::harness::{failed_resource_reason, quoted_and_class};
@@ -372,6 +373,29 @@ fn as_members(declared: &Value) -> Value {
     }
 }
 
+/// The actions a declaration is SERVED as, once API Gateway v2 has resolved them: every
+/// member the template stated, plus the `StripBasePath` setting the service supplies for an
+/// action that states none (`DEFAULT_STRIP_BASE_PATH`), which every reader of the rule
+/// reports.
+fn served_actions(declared: &Value) -> Value {
+    Value::Array(
+        as_members(declared)
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|action| {
+                let mut served = action.clone();
+                let strip = served["invokeApi"]["stripBasePath"]
+                    .as_bool()
+                    .unwrap_or(DEFAULT_STRIP_BASE_PATH);
+                served["invokeApi"]["stripBasePath"] = json!(strip);
+                served
+            })
+            .collect(),
+    )
+}
+
 #[tokio::test]
 async fn a_declared_routing_rule_is_created_in_api_gateway_v2() {
     for row in ROWS {
@@ -435,8 +459,9 @@ async fn a_declared_routing_rule_is_created_in_api_gateway_v2() {
         );
         assert_eq!(
             reported(&held, "actions"),
-            as_members(&actions),
-            "case {case:?}: expected the declared actions, got {held}"
+            served_actions(&actions),
+            "case {case:?}: expected the declared actions as the service serves them, \
+             got {held}"
         );
         let listed = listed_routing_rules(&router, case, row.domain_name).await;
         assert!(
@@ -520,8 +545,8 @@ async fn a_changed_rule_is_put_over_the_one_the_stack_created() {
     );
     assert_eq!(
         reported(&held, "actions"),
-        as_members(&revised_actions),
-        "case {case:?}: expected the revised actions, got {held}"
+        served_actions(&revised_actions),
+        "case {case:?}: expected the revised actions as the service serves them, got {held}"
     );
     assert_eq!(
         listed_routing_rules(&router, case, domain_name).await.len(),

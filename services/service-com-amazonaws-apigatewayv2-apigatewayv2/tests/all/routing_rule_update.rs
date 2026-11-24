@@ -44,6 +44,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 };
 
 use crate::api_lifecycle::{as_str, assert_minted_id, call_in_region, error_code, strip_nulls};
+use crate::routing_rule_strip_base_path_default::served_actions;
 
 /// The region every request in this suite is signed for. Deliberately NOT the
 /// emulator's `us-east-1` default, so nothing region-derived (the rule's ARN) can be
@@ -262,11 +263,14 @@ fn assert_reports_rule(
         "case {case:?}: expected {what} to report conditions {:?}, got {body}",
         request["conditions"]
     );
+    // Against the actions the request is SERVED as: an action whose optional setting the
+    // request named no value for is served under the service's own (see
+    // [`served_actions`]), and the reader reports what the rule is served under.
+    let served = served_actions(&request["actions"]);
     assert_eq!(
         strip_nulls(&body["actions"]),
-        strip_nulls(&request["actions"]),
-        "case {case:?}: expected {what} to report actions {:?}, got {body}",
-        request["actions"]
+        strip_nulls(&served),
+        "case {case:?}: expected {what} to report actions {served:?}, got {body}"
     );
 }
 

@@ -46,6 +46,7 @@ pub mod portal_transport;
 pub mod route_key;
 pub mod route_request_parameters;
 pub mod route_throttle;
+pub mod routing_rule_action;
 pub mod selection_expression;
 pub mod websocket_transport;
 pub mod wire_status;
@@ -3718,9 +3719,11 @@ impl ApiMapping {
 /// its conditions and invoking the api stage its action names.
 ///
 /// Keyed in its owning [`DomainName`] by [`RoutingRule::routing_rule_id`]. `Actions` and
-/// `Conditions` are held as the modelled shapes: both are the caller's own composite
-/// values, reported back exactly as they were stored, and no member of either is
-/// service-computed.
+/// `Conditions` are held as the modelled shapes, in the order and with the values the
+/// caller wrote, except that an action is held in its EFFECTIVE form — every optional
+/// setting the request named no value for carries the one the rule is served under (see
+/// [`resolve_routing_rule_actions`]), so every reader reports the setting the rule is
+/// evaluated with.
 #[derive(Debug, Clone)]
 pub struct RoutingRule {
     pub routing_rule_id: String,
@@ -4783,6 +4786,11 @@ pub use route_key::{
     validate_route_key, DEFAULT_ROUTE_KEY, DISCONNECT_ROUTE_KEY, GREEDY_VARIABLE_POSITION,
     RESERVED_WEBSOCKET_ROUTE_KEYS, ROUTE_KEY_NOT_FORMATTED_PROPERLY,
 };
+
+/// The effective form of a routing rule's actions, with each omitted optional setting
+/// resolved to the value the rule is served under — see
+/// [`routing_rule_action::resolve_routing_rule_actions`].
+pub use routing_rule_action::{resolve_routing_rule_actions, DEFAULT_STRIP_BASE_PATH};
 
 /// The variable namespaces a selection expression may read — see
 /// [`selection_expression::SELECTION_EXPRESSION_VARIABLES`].
