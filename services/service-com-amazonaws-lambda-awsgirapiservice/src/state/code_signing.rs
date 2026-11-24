@@ -26,15 +26,16 @@
 //! operations the model binds that error to. The policy is therefore read in ONE place, and
 //! a configuration whose policy is `Warn` lets the same deployment land.
 //!
-//! WHAT AN ARTIFACT ATTESTS TO is not something a deployment request carries. A signature is
-//! stamped on an artifact by the signing service that produced it — the service that mints
-//! the signing job a signed function reports as `SigningJobArn`, beside the
-//! `SigningProfileVersionArn` of the profile that signed it — and travels with that
-//! artifact, not with the call that deploys it: no member of any of those operations names a
-//! signing profile version. This emulator mounts no signing service, so no artifact handed
-//! to this API bears a signature and none of them attests to a publisher, which is what a
-//! function stored here reports by carrying neither of those two members. See
-//! [`DeployedArtifact::signing_profile_version`].
+//! WHAT AN ARTIFACT ATTESTS TO is carried by the artifact itself: the signing service writes
+//! the signature into the .zip package it signs, so the package a deployment hands over is
+//! what names the signing profile version it was signed under, and no member of any of these
+//! operations names a publisher. That signature is read and VERIFIED in one place
+//! ([`super::package_signature`]) — against the key pair the signing service holds for that
+//! profile version, so an envelope anyone can write attributes nothing on its own — and a
+//! function reports the publisher of the package it is serving as
+//! `SigningProfileVersionArn`, beside the `SigningJobArn` of the job that signed it.
+//! A package bearing no signature this emulator can verify is attributed to no publisher,
+//! and is the deployment an `Enforce` policy blocks.
 
 use super::*;
 
@@ -66,8 +67,14 @@ pub fn code_verification_failed_message(resource: &str) -> String {
 /// code-signing checks are made against.
 #[derive(Debug, Clone, Copy)]
 pub enum DeployedArtifact<'a> {
-    /// The function's own deployment package, as the create or the code update resolved it.
-    Package(&'a CodeRecord),
+    /// The function's own deployment package, as the create or the code update resolved it,
+    /// with the publisher its own signature was verified as coming from.
+    ///
+    /// The signature is read and verified where the package is resolved, which is before the
+    /// store is reached ([`super::verified_package_signature`]) — the same attribution the
+    /// stored configuration then reports as `SigningProfileVersionArn`, so what admitted the
+    /// deployment and what the function reports for it cannot differ.
+    Package(&'a CodeRecord, Option<&'a DeploymentSignature>),
     /// The layer versions a configuration change mounts: "A list of function layers to add
     /// to the function's execution environment" — each its own package, signed the same way
     /// and verified alongside the function's, which is what the refusal means by "The
@@ -77,26 +84,13 @@ pub enum DeployedArtifact<'a> {
     /// The versions carried here are the ones the request RESOLVED to
     /// ([`super::resolve_function_layers`]), because each of them is the package whose
     /// signature is verified and whose own ARN the refusal names
-    /// ([`DeployedArtifact::named_subject`]).
+    /// ([`DeployedArtifact::untrusted_subject`]). Each carries the publisher its own archive
+    /// was verified as coming from, settled when that version was published
+    /// ([`FunctionLayer::signing_profile_version_arn`]).
     Layers(&'a [FunctionLayer]),
 }
 
 impl<'a> DeployedArtifact<'a> {
-    /// The signing profile version this artifact's signature attests to, when it bears one.
-    ///
-    /// `None` for every artifact this emulator is handed, and that is a statement about
-    /// where a signature comes from rather than about this artifact: the signing service
-    /// that produces a signed artifact is what stamps it and what mints the signing job
-    /// attributing it to a profile version, no member of a deployment request names either,
-    /// and this emulator mounts no such service. A function stored here reports no
-    /// `SigningJobArn` and no `SigningProfileVersionArn` for exactly the same reason, so the
-    /// two surfaces agree: what it holds is attributed to no publisher.
-    #[must_use]
-    fn signing_profile_version(&self) -> Option<&str> {
-        let _unattributed = self;
-        None
-    }
-
     /// Whether code signing VERIFIES this artifact at all.
     ///
     /// A container image is outside the control: the signature a check is made against is
@@ -107,44 +101,69 @@ impl<'a> DeployedArtifact<'a> {
     #[must_use]
     fn is_verified(&self) -> bool {
         match self {
-            Self::Package(code) => !code.is_image(),
+            Self::Package(code, _) => !code.is_image(),
             Self::Layers(_) => true,
         }
     }
 
-    /// WHICH artifact the refusal names: the one whose signature the checks were made
-    /// against.
+    /// WHICH artifact of this deployment `config` counts as coming from no trusted
+    /// publisher, named as a refusal names it, or `None` when every one of them does.
     ///
     /// A deployment of the function's own package is named by the function it deploys to,
     /// as the operation making it addresses one (`resource`) — the ARN of the function an
     /// update changes, the name a create was given for a function that does not exist yet.
     /// A LAYER attach deploys the layer version's own package instead: "A list of function
     /// layers to add to the function's execution environment", each a package of its own
-    /// signed on its own, so the artifact whose signature is in question is that layer
-    /// version and the refusal names it by its version ARN. A change mounting several names
-    /// the first of them, which is the one the checks were made on.
+    /// signed on its own, so each is verified on its own and the artifact in question is the
+    /// FIRST one whose signature no allowed publisher made — which is the one the refusal
+    /// names, by its version ARN. A change mounting nothing deploys nothing and falls back
+    /// to the function it addressed.
     #[must_use]
-    fn named_subject(self, resource: &'a str) -> &'a str {
+    fn untrusted_subject(
+        self,
+        config: &CodeSigningConfigRecord,
+        resource: &'a str,
+    ) -> Option<String> {
         match self {
-            Self::Package(_) => resource,
+            Self::Package(_, signature) => (!allowed_publisher_signed(
+                config,
+                signature.map(|signature| signature.profile_version_arn.as_str()),
+            ))
+            .then(|| resource.to_string()),
             Self::Layers(layers) => layers
-                .first()
-                .map_or(resource, |layer| layer.arn.as_str()),
+                .iter()
+                .find(|layer| {
+                    !allowed_publisher_signed(
+                        config,
+                        layer.signing_profile_version_arn.as_deref(),
+                    )
+                })
+                .map(|layer| layer.arn.clone()),
         }
     }
+}
 
-    /// Whether `config` counts this artifact as coming from a trusted publisher: whether the
-    /// signature it bears attests to one of the signing profile versions the configuration
-    /// allows.
-    #[must_use]
-    fn signed_by_allowed_publisher(&self, config: &CodeSigningConfigRecord) -> bool {
-        self.signing_profile_version().is_some_and(|profile| {
-            config
-                .signing_profile_version_arns
-                .iter()
-                .any(|allowed| allowed == profile)
-        })
-    }
+/// Whether `config` counts a package signed by the publisher `signed_by` as coming from a
+/// TRUSTED one: whether that publisher is one of the signing profile versions the
+/// configuration allows.
+///
+/// `AllowedPublishers$SigningProfileVersionArns` is "The Amazon Resource Name (ARN) for each
+/// of the signing profiles. A signing profile defines a trusted user who can sign a code
+/// package" — the ARN of a signing profile VERSION, which is what a signature attests to — so
+/// an entry covers the one version it names and nothing else, whatever it shares with another
+/// ARN. `None` is a package attributed to nobody — one bearing no signature this emulator
+/// could verify ([`super::verified_package_signature`]) — which no entry can cover.
+#[must_use]
+fn allowed_publisher_signed(
+    config: &CodeSigningConfigRecord,
+    signed_by: Option<&str>,
+) -> bool {
+    signed_by.is_some_and(|signed_by| {
+        config
+            .signing_profile_version_arns
+            .iter()
+            .any(|allowed| allowed == signed_by)
+    })
 }
 
 /// The refusal the code-signing configuration `config` owes the deployment of `artifact` to
@@ -153,14 +172,20 @@ impl<'a> DeployedArtifact<'a> {
 /// The one reading of the policy, made by every operation that deploys to a function the
 /// configuration is attached to:
 ///
-/// * an artifact whose signature attests to one of the configuration's allowed publishers
-///   passes every check there is to make and lands;
+/// * an artifact whose own signature verifies under one of the configuration's allowed
+///   publishers passes every check there is to make and lands;
 /// * an artifact that does not, under [`CODE_SIGNING_POLICY_ENFORCE`], is the deployment
 ///   Lambda BLOCKS — the caller gets [`code_verification_failed_message`] naming the
-///   artifact whose signature was checked ([`DeployedArtifact::named_subject`]) and the
+///   artifact whose signature was checked ([`DeployedArtifact::untrusted_subject`]) and the
 ///   store is left as it was;
 /// * an artifact that does not, under any other policy — `Warn`, the documented default —
 ///   lands, because that policy "allows the deployment".
+///
+/// Every artifact arrives with the publisher its own signature was verified as coming from
+/// ([`super::verified_package_signature`]), read before this service's store was reached: the
+/// function's own package by the call deploying it, and a layer version's archive by the
+/// publish that stored it. So what is decided here is WHO signed, never whether a signature
+/// verifies.
 #[must_use]
 pub fn untrusted_deployment_refusal(
     config: &CodeSigningConfigRecord,
@@ -170,15 +195,11 @@ pub fn untrusted_deployment_refusal(
     if !artifact.is_verified() {
         return None;
     }
-    if artifact.signed_by_allowed_publisher(config) {
-        return None;
-    }
+    let untrusted = artifact.untrusted_subject(config, resource)?;
     if config.untrusted_artifact_on_deployment != CODE_SIGNING_POLICY_ENFORCE {
         return None;
     }
-    Some(code_verification_failed_message(
-        artifact.named_subject(resource),
-    ))
+    Some(code_verification_failed_message(&untrusted))
 }
 
 /// Lambda's sentence for a request that asks for code signing on a function whose
@@ -220,6 +241,15 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
 mod tests {
     use super::*;
 
+    /// One row of the layer-attach table: the case, the layer versions the change mounts,
+    /// and the artifact the refusal must name (`None` for a change every allowed publisher
+    /// signed).
+    type AttachRow<'a> = (&'a str, Vec<FunctionLayer>, Option<String>);
+
+    /// One row of the allowed-publisher table: the case, the entry the configuration carries,
+    /// the publisher a package was signed by, and whether the entry covers it.
+    type PublisherRow<'a> = (&'a str, String, Option<String>, bool);
+
     /// One stored configuration, under the policy `policy`, allowing one publisher.
     fn config(policy: &str) -> CodeSigningConfigRecord {
         CodeSigningConfigRecord {
@@ -237,47 +267,76 @@ mod tests {
         }
     }
 
-    /// One resolved layer version, as `resolve_function_layers` hands one over.
-    fn layer(version: u32) -> FunctionLayer {
+    /// One resolved layer version, as `resolve_function_layers` hands one over — signed by
+    /// `signed_by`, as the publish that stored it verified its archive's own signature.
+    fn layer(version: u32, signed_by: Option<&str>) -> FunctionLayer {
         FunctionLayer {
             arn: format!("arn:aws:lambda:us-east-1:000000000000:layer:shared:{version}"),
             code_size: 64,
             uncompressed_code_size: 128,
             zip_bytes: None,
+            signing_profile_version_arn: signed_by.map(str::to_string),
         }
     }
 
+    /// The publisher the configuration above allows.
+    const ALLOWED_PUBLISHER: &str =
+        "arn:aws:signer:us-east-1:000000000000:/signing-profiles/Profile1/00000001";
+
     /// RULE: the refusal names the ARTIFACT whose signature was checked, so a LAYER ATTACH
     /// is named by the layer version it mounts rather than by the function it mounts it into
-    /// — one row per number of layers the change mounts, since a change mounting several is
-    /// decided on the first of them.
+    /// — and a change mounting several is decided on the FIRST version no allowed publisher
+    /// signed, whichever position it is in.
     #[test]
     fn a_blocked_layer_attach_names_the_layer_version_it_mounts() {
         let function = "arn:aws:lambda:us-east-1:000000000000:function:probe";
-        let mounted = [layer(1), layer(2), layer(3)];
-        // (case, the layers the change mounts, the artifact the sentence must name)
-        let rows: Vec<(&str, &[FunctionLayer], String)> = vec![
-            ("one layer version", &mounted[..1], mounted[0].arn.clone()),
-            ("two layer versions", &mounted[..2], mounted[0].arn.clone()),
+        let unsigned = [layer(1, None), layer(2, None), layer(3, None)];
+        let signed = layer(4, Some(ALLOWED_PUBLISHER));
+        let elsewhere = layer(5, Some(
+            "arn:aws:signer:us-east-1:000000000000:/signing-profiles/Other/00000001",
+        ));
+        // (case, the layers the change mounts, the artifact the sentence must name, or
+        // `None` for a change every allowed publisher signed)
+        let rows: Vec<AttachRow<'_>> = vec![
             (
-                "every layer a change may mount",
-                &mounted[..],
-                mounted[0].arn.clone(),
+                "one unsigned layer version",
+                vec![unsigned[0].clone()],
+                Some(unsigned[0].arn.clone()),
             ),
-            // A change that mounts nothing deploys nothing, so the sentence falls back to
-            // the function the change addressed rather than naming no artifact at all.
-            ("no layer at all", &[], function.to_string()),
+            (
+                "every layer a change may mount, none of them signed",
+                unsigned.to_vec(),
+                Some(unsigned[0].arn.clone()),
+            ),
+            (
+                "a signed version before an unsigned one",
+                vec![signed.clone(), unsigned[1].clone()],
+                Some(unsigned[1].arn.clone()),
+            ),
+            (
+                "a version signed by a publisher the configuration does not allow",
+                vec![signed.clone(), elsewhere.clone()],
+                Some(elsewhere.arn.clone()),
+            ),
+            (
+                "every version signed by the allowed publisher",
+                vec![signed.clone(), layer(6, Some(ALLOWED_PUBLISHER))],
+                None,
+            ),
+            // A change that mounts nothing deploys nothing, so there is no artifact whose
+            // signature could fail a check and nothing to refuse.
+            ("no layer at all", Vec::new(), None),
         ];
         for (case, layers, named) in rows {
             let stated = untrusted_deployment_refusal(
                 &config(CODE_SIGNING_POLICY_ENFORCE),
-                DeployedArtifact::Layers(layers),
+                DeployedArtifact::Layers(&layers),
                 function,
             );
+            let expected = named.as_deref().map(code_verification_failed_message);
             assert_eq!(
-                stated.as_deref(),
-                Some(code_verification_failed_message(&named).as_str()),
-                "case {case:?}: expected the refusal to name {named:?}, got {stated:?}"
+                stated, expected,
+                "case {case:?}: expected the refusal {expected:?}, got {stated:?}"
             );
         }
     }
@@ -288,12 +347,69 @@ mod tests {
     fn the_same_attach_lands_under_the_admitting_policy() {
         let stated = untrusted_deployment_refusal(
             &config("Warn"),
-            DeployedArtifact::Layers(&[layer(1)]),
+            DeployedArtifact::Layers(&[layer(1, None)]),
             "arn:aws:lambda:us-east-1:000000000000:function:probe",
         );
         assert_eq!(
             stated, None,
             "expected the Warn policy to admit the attach, got {stated:?}"
         );
+    }
+
+    /// RULE: an allowed publisher entry covers the one signing profile VERSION it names and
+    /// nothing else, whatever that version shares with the entry.
+    #[test]
+    fn an_allowed_publisher_covers_the_profile_version_it_names() {
+        const PROFILE: &str = "arn:aws:signer:us-east-1:000000000000:/signing-profiles/Release";
+        // (case, the allowed entry, the profile version a signature was made under, whether
+        // the entry covers it)
+        let rows: Vec<PublisherRow<'_>> = vec![
+            (
+                "the very version the entry names",
+                format!("{PROFILE}/00000001"),
+                Some(format!("{PROFILE}/00000001")),
+                true,
+            ),
+            (
+                "another version of the profile the entry names a version of",
+                format!("{PROFILE}/00000001"),
+                Some(format!("{PROFILE}/00000002")),
+                false,
+            ),
+            (
+                "the profile itself, naming no version",
+                PROFILE.to_string(),
+                Some(format!("{PROFILE}/00000002")),
+                false,
+            ),
+            (
+                "another profile of the same account",
+                format!("{PROFILE}Candidate/00000001"),
+                Some(format!("{PROFILE}/00000001")),
+                false,
+            ),
+            (
+                "the same profile and version in another region",
+                format!("{PROFILE}/00000001").replace("us-east-1", "eu-west-1"),
+                Some(format!("{PROFILE}/00000001")),
+                false,
+            ),
+            (
+                "a package no publisher's signature covers",
+                format!("{PROFILE}/00000001"),
+                None,
+                false,
+            ),
+        ];
+        for (case, allowed, signed_under, covered) in rows {
+            let mut record = config(CODE_SIGNING_POLICY_ENFORCE);
+            record.signing_profile_version_arns = vec![allowed.clone()];
+            let decided = allowed_publisher_signed(&record, signed_under.as_deref());
+            assert_eq!(
+                decided, covered,
+                "case {case:?}: expected {allowed:?} to {} {signed_under:?}, got {decided}",
+                if covered { "cover" } else { "not cover" }
+            );
+        }
     }
 }

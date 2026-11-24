@@ -78,6 +78,14 @@ pub struct LayerVersionRecord {
     /// The base64 SHA-256 of the stored archive bytes; absent when this emulator holds
     /// no bytes to hash.
     pub code_sha256: Option<String>,
+    /// The signing profile version the archive's OWN signature was verified as coming from,
+    /// when it bears one ([`crate::state::verified_package_signature`]).
+    ///
+    /// Read once, when the version was published: "Each time you call PublishLayerVersion
+    /// with the same layer name, a new version is created", so a version's archive and what
+    /// signed it are as immutable as its size and its digest. A configuration change that
+    /// mounts this version is verified against it ([`crate::state::code_signing`]).
+    pub signing_profile_version_arn: Option<String>,
     /// ISO-8601 instant the version was published.
     pub created: String,
     /// The resource-based policy of this version, once a statement has been added to

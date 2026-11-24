@@ -421,6 +421,11 @@ pub mod clock;
 /// every service whose API takes one and then writes into the group it names — so two
 /// services asked whether CloudWatch Logs could hold a name cannot answer differently.
 pub mod cloudwatch_logs;
+/// The ONE form of the SIGNATURE a signed .zip code package carries — the entry it travels
+/// in, the envelope it states and the digest of the package's contents it covers — for the
+/// signing service that stamps one into an artifact and the deploying service that verifies
+/// one, so the two ends of that handoff cannot read a signature differently.
+pub mod code_signing_signature;
 /// The ONE gate on whether the account's Amazon Connect instance registry holds the
 /// instance id a request names — and the ONE distinction between an id the account does not
 /// hold (a request fault) and a registry that could not be read at all (a server fault) —

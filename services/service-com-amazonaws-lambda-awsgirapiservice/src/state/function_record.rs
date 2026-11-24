@@ -1067,6 +1067,14 @@ impl FunctionRecord {
             capacity_provider_config: config.capacity_provider_config.clone(),
             durable_config: config.durable_config.clone(),
             tenancy_config: config.tenancy_config.clone(),
+            // "The ARN of the signing profile version" and "The ARN of the signing job" of
+            // the deployment package this configuration holds: both are read off the
+            // signature the package itself carried when it was deployed
+            // ([`crate::state::verified_package_signature`]), so a function reports the
+            // publisher of the code it is serving and an unsigned one reports neither
+            // member.
+            signing_profile_version_arn: config.signing_profile_version_arn.clone(),
+            signing_job_arn: config.signing_job_arn.clone(),
             ..CreateFunctionOutput::default()
         }
     }

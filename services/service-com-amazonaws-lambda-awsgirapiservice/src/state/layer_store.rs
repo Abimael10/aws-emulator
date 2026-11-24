@@ -365,6 +365,9 @@ pub fn resolve_function_layers(
                 code_size: 0,
                 uncompressed_code_size: 0,
                 zip_bytes: None,
+                // A layer Lambda itself provides is held here as no archive at all, so
+                // there is no signature of it to have been verified.
+                signing_profile_version_arn: None,
             }),
             LayerVersionReference::Published { name, version, .. } => {
                 // Region-scoped: the Region was settled above, so a name this Region holds
@@ -385,6 +388,10 @@ pub fn resolve_function_layers(
                         .zip_bytes
                         .clone()
                         .map(::std::sync::Arc::new),
+                    signing_profile_version_arn: published
+                        .1
+                        .signing_profile_version_arn
+                        .clone(),
                 })
             }
         })

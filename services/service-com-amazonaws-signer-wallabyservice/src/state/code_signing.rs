@@ -35,16 +35,23 @@
 //!
 //! The artifact itself is the source archive's own entries plus ONE added entry
 //! carrying the signature envelope ([`SIGNATURE_ENTRY_NAME`]): the signature is
-//! made by the in-process cryptography provider over the source object's bytes,
+//! made by the in-process cryptography provider over the DIGEST OF THE ARTIFACT'S
+//! CONTENTS — every entry of it but the envelope, as
+//! [`::service_common::code_signing_signature::content_digest`] states them —
 //! under the key pair of the signing profile version the job signs with
-//! ([`super::payload_signing`]), so it is verifiable with the public half the
-//! envelope carries. `SigningImageFormat`'s values (`JSON`, `JSONEmbedded`,
-//! `JSONDetached`) are what say the envelope is a JSON document.
+//! ([`super::payload_signing`]). So a service handed the artifact later recomputes
+//! that digest from the entries in front of it and checks the signature against
+//! the public half of the pair this store holds for that profile version: the
+//! signature covers the code it travels with, and the FORM of the envelope is the
+//! one both ends of that handoff read
+//! ([`::service_common::code_signing_signature`]). `SigningImageFormat`'s values
+//! (`JSON`, `JSONEmbedded`, `JSONDetached`) are what say the envelope is a JSON
+//! document.
 
 use std::io::{Cursor, Read as _, Write as _};
 use std::time::Duration;
 
-use sha2::Digest as _;
+use service_common::code_signing_signature::{content_digest, render_envelope, signed_material};
 
 use super::payload_signing::PayloadSigningKey;
 use crate::ops::types::{Destination, S3SignedObject, S3Source, SignedObject};
@@ -62,10 +69,11 @@ pub enum JobOutcome {
 
 /// The entry the signature envelope travels in, inside the signed archive.
 ///
-/// The name is this emulator's own: nothing in the model names it, and it is
-/// prefixed with the service so it cannot collide with an entry the source
-/// archive already carries at the archive root.
-pub const SIGNATURE_ENTRY_NAME: &str = "aws-signer-signature.json";
+/// The ONE name both ends of the code-signing handoff read it under
+/// ([`::service_common::code_signing_signature::SIGNATURE_ENTRY_NAME`]): nothing in
+/// the model names it, and it is prefixed with the service so it cannot collide
+/// with an entry the source archive already carries at the archive root.
+pub use ::service_common::code_signing_signature::SIGNATURE_ENTRY_NAME;
 
 /// The most entries a source archive this emulator signs may carry.
 ///
@@ -165,6 +173,14 @@ const ARTIFACT_WORK_TIMEOUT: Duration = Duration::from_secs(10);
 /// work runs. Taking longer than [`ARTIFACT_WORK_TIMEOUT`] fails the job rather
 /// than holding the request open.
 ///
+/// What is SIGNED is the material the artifact's own contents and this job's
+/// attribution make up ([`::service_common::code_signing_signature::signed_material`]):
+/// the digest is taken off the archive this job has assembled out of the
+/// source's entries and before the envelope is added to it, so what the envelope
+/// states is what a service handed the finished artifact recomputes from it — and
+/// neither the code nor the attribution can be changed afterwards without the
+/// signature ceasing to verify.
+///
 /// `Err` is the sentence the job fails with.
 pub async fn signed_artifact(
     source: Vec<u8>,
@@ -173,17 +189,26 @@ pub async fn signed_artifact(
     job_id: String,
 ) -> Result<Vec<u8>, String> {
     let work = ::tokio::task::spawn_blocking(move || {
+        let entries = source_entries(&source)?;
+        let contents = archive_of(&entries, None)?;
+        let digest = content_digest(&contents).ok_or_else(|| {
+            artifact_not_built(&"the assembled contents could not be digested")
+        })?;
         let (signature, public_key) = key
-            .signature_and_public_key(&source)
+            .signature_and_public_key(&signed_material(
+                &profile_version_arn,
+                &job_id,
+                &digest,
+            ))
             .ok_or_else(no_signature_message)?;
-        let envelope = signature_envelope(
-            &source,
+        let envelope = render_envelope(
+            &digest,
             &signature,
             &public_key,
             &profile_version_arn,
             &job_id,
         );
-        signed_archive(&source, &envelope)
+        archive_of(&entries, Some(&envelope))
     });
     match ::tokio::time::timeout(ARTIFACT_WORK_TIMEOUT, work).await {
         Ok(Ok(artifact)) => artifact,
@@ -203,39 +228,15 @@ fn no_signature_message() -> String {
     "No signature could be produced for the signing profile's platform".to_string()
 }
 
-/// The signature envelope a signed archive carries, as the JSON document it is
-/// written as.
-///
-/// Every member is computed from the job's own inputs: the digest and the
-/// signature are over the SOURCE object's bytes, the public key is the half of
-/// the profile version's pair a verifier checks that signature against, and the
-/// profile version ARN and job id are the ones the job signs under and reports.
-pub fn signature_envelope(
-    source: &[u8],
-    signature: &[u8],
-    public_key: &[u8],
-    profile_version_arn: &str,
-    job_id: &str,
-) -> Vec<u8> {
-    let envelope = ::serde_json::json!({
-        "profileVersionArn": profile_version_arn,
-        "jobId": job_id,
-        // The digest of what was signed, so a verifier can tell the envelope
-        // apart from one made over other bytes without re-reading the source.
-        "payloadSha384": ::hex::encode(sha2::Sha384::digest(source)),
-        // The DER `Ecdsa-Sig-Value` the provider produced, and the DER X.509
-        // `SubjectPublicKeyInfo` it is verified with.
-        "signature": ::hex::encode(signature),
-        "publicKey": ::hex::encode(public_key),
-    });
-    // A JSON document always renders, and the fallback is never a document a
-    // verifier could mistake for one: the only member that could fail to render
-    // is a non-finite number, and this object carries none.
-    ::serde_json::to_vec(&envelope).unwrap_or_default()
+/// ONE entry of a source archive, as the job read it: its name, and the bytes it
+/// holds (empty for a directory entry, which is a name and nothing else).
+struct SourceEntry {
+    name: String,
+    directory: bool,
+    bytes: Vec<u8>,
 }
 
-/// The signed artifact: the source archive's entries, then the signature
-/// envelope as one added entry.
+/// The entries of `source`, read whole.
 ///
 /// CPU-bound and synchronous: it is called from the blocking worker
 /// [`signed_artifact`] hands the work to, never from the thread serving a
@@ -244,7 +245,7 @@ pub fn signature_envelope(
 /// `Err` is the sentence the job fails with: a source object that is not a
 /// readable zip archive — the one thing this function judges — signs nothing, and
 /// so does one past the bounds this emulator holds caller content to.
-fn signed_archive(source: &[u8], envelope: &[u8]) -> Result<Vec<u8>, String> {
+fn source_entries(source: &[u8]) -> Result<Vec<SourceEntry>, String> {
     let mut archive =
         ::zip::ZipArchive::new(Cursor::new(source)).map_err(|err| not_an_archive(&err))?;
     if archive.len() > MAX_ARCHIVE_ENTRIES {
@@ -254,8 +255,7 @@ fn signed_archive(source: &[u8], envelope: &[u8]) -> Result<Vec<u8>, String> {
             archive.len()
         ));
     }
-    let mut signed = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = ::zip::write::SimpleFileOptions::default();
+    let mut entries = Vec::with_capacity(archive.len());
     let mut read = 0usize;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|err| not_an_archive(&err))?;
@@ -272,9 +272,11 @@ fn signed_archive(source: &[u8], envelope: &[u8]) -> Result<Vec<u8>, String> {
             ));
         }
         if name.ends_with('/') {
-            signed
-                .add_directory(name, options)
-                .map_err(|err| artifact_not_built(&err))?;
+            entries.push(SourceEntry {
+                name,
+                directory: true,
+                bytes: Vec::new(),
+            });
             continue;
         }
         // The remaining budget plus one byte: reading MORE than the budget is
@@ -292,21 +294,61 @@ fn signed_archive(source: &[u8], envelope: &[u8]) -> Result<Vec<u8>, String> {
             ));
         }
         read += bytes.len();
+        entries.push(SourceEntry {
+            name,
+            directory: false,
+            bytes,
+        });
+    }
+    Ok(entries)
+}
+
+/// An archive carrying `entries`, and `envelope` as ONE added entry when there is
+/// one to add.
+///
+/// Called twice for one job and with the same entries both times
+/// ([`signed_artifact`]): once to assemble the contents whose digest is signed,
+/// and once to assemble the artifact that carries the envelope over that digest.
+/// So the entries a verifier reads out of the artifact are the ones the digest was
+/// taken over, whatever the writer makes of a name.
+///
+/// CPU-bound and synchronous, like [`source_entries`]. `Err` is the sentence the
+/// job fails with.
+fn archive_of(entries: &[SourceEntry], envelope: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let mut signed = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = ::zip::write::SimpleFileOptions::default();
+    for entry in entries {
+        if entry.directory {
+            signed
+                .add_directory(entry.name.clone(), options)
+                .map_err(|err| artifact_not_built(&err))?;
+            continue;
+        }
         signed
-            .start_file(name, options)
+            .start_file(entry.name.clone(), options)
             .map_err(|err| artifact_not_built(&err))?;
         signed
-            .write_all(&bytes)
+            .write_all(&entry.bytes)
             .map_err(|err| artifact_not_built(&err))?;
     }
-    signed
-        .start_file(SIGNATURE_ENTRY_NAME, options)
-        .map_err(|err| artifact_not_built(&err))?;
-    signed
-        .write_all(envelope)
-        .map_err(|err| artifact_not_built(&err))?;
+    if let Some(envelope) = envelope {
+        signed
+            .start_file(SIGNATURE_ENTRY_NAME, options)
+            .map_err(|err| artifact_not_built(&err))?;
+        signed
+            .write_all(envelope)
+            .map_err(|err| artifact_not_built(&err))?;
+    }
     let built = signed.finish().map_err(|err| artifact_not_built(&err))?;
     Ok(built.into_inner())
+}
+
+/// The signed artifact's own shape, for the cases below: the source archive's
+/// entries, then the signature envelope as one added entry — [`source_entries`]
+/// followed by [`archive_of`], which is what [`signed_artifact`] assembles.
+#[cfg(test)]
+fn signed_archive(source: &[u8], envelope: &[u8]) -> Result<Vec<u8>, String> {
+    archive_of(&source_entries(source)?, Some(envelope))
 }
 
 /// Write `artifact` at the destination `destination` names for the job `job_id`,
@@ -413,7 +455,8 @@ fn client(
 mod tests {
     use std::io::Write as _;
 
-    use super::{refusal_message, signature_envelope, signed_archive, SIGNATURE_ENTRY_NAME};
+    use super::{refusal_message, signed_archive, source_entries, SIGNATURE_ENTRY_NAME};
+    use ::service_common::code_signing_signature::content_digest;
 
     /// One row of the artifact table: the case, and the entries the source
     /// archive carries as `(name, bytes)`.
@@ -520,41 +563,45 @@ mod tests {
         }
     }
 
-    /// The envelope is a JSON document carrying the job's own values.
+    /// The digest the job SIGNS covers the artifact it ships: the contents assembled out of
+    /// the source's entries hash to the same digest whether the envelope has been added to
+    /// them or not, so what a service handed the artifact recomputes is what was signed.
     #[test]
-    fn the_envelope_states_what_was_signed_and_what_signed_it() {
-        let envelope = signature_envelope(
-            b"payload",
-            b"\x01\x02",
-            b"\x03\x04",
-            "arn:aws:signer:us-west-2:000000000000:/signing-profiles/P/0000000001",
-            "job-1",
-        );
-        let parsed: ::serde_json::Value =
-            ::serde_json::from_slice(&envelope).expect("the envelope is JSON");
-        // (the member, the value it must carry)
-        let rows: [(&str, &str); 4] = [
+    fn the_signed_digest_covers_the_shipped_artifacts_contents() {
+        // (case, the source archive's entries)
+        let rows: Vec<ArchiveRow<'_>> = vec![
+            ("one entry", vec![("index.js", b"exports.handler = 1;".as_ref())]),
             (
-                "profileVersionArn",
-                "arn:aws:signer:us-west-2:000000000000:/signing-profiles/P/0000000001",
+                "three entries, one of them empty",
+                vec![
+                    ("a.txt", b"a".as_ref()),
+                    ("nested/b.txt", b"bb".as_ref()),
+                    ("empty.txt", b"".as_ref()),
+                ],
             ),
-            ("jobId", "job-1"),
-            ("signature", "0102"),
-            ("publicKey", "0304"),
+            ("a directory entry beside a file", vec![("lib/", b"".as_ref()), ("lib/a", b"a".as_ref())]),
+            ("no entries at all", vec![]),
         ];
-        for (member, expected) in rows {
-            let carried = parsed[member].as_str().unwrap_or_default();
+        for (case, entries) in rows {
+            let source = archive(&entries);
+            let read = source_entries(&source)
+                .unwrap_or_else(|err| panic!("case {case:?}: expected readable entries, got {err}"));
+            let contents = super::archive_of(&read, None)
+                .unwrap_or_else(|err| panic!("case {case:?}: expected contents, got {err}"));
+            let signed = super::archive_of(&read, Some(b"{\"signature\":\"00\"}"))
+                .unwrap_or_else(|err| panic!("case {case:?}: expected an artifact, got {err}"));
+            let over_contents = content_digest(&contents);
+            let over_artifact = content_digest(&signed);
+            assert!(
+                over_contents.is_some(),
+                "case {case:?}: expected the assembled contents to digest"
+            );
             assert_eq!(
-                carried, expected,
-                "member {member:?}: expected {expected:?}, got {carried:?}"
+                over_artifact, over_contents,
+                "case {case:?}: expected the artifact's contents to hash to the signed digest, \
+                 got {over_artifact:?}"
             );
         }
-        let digest = parsed["payloadSha384"].as_str().unwrap_or_default();
-        assert_eq!(
-            digest,
-            ::hex::encode(<sha2::Sha384 as sha2::Digest>::digest(b"payload")),
-            "expected the digest of the signed bytes, got {digest:?}"
-        );
     }
 
     /// A refusal states the call and what Amazon S3 said, and an answer that said

@@ -707,7 +707,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same change lands under the `Warn` policy ([`crate::state::DeployedArtifact`]).
         // A request that names no layers mounts none and deploys nothing. The versions
         // handed over are the RESOLVED ones, because each of them is the package whose
-        // signature is verified and whose own ARN the refusal names.
+        // signature was verified when that version was published and whose own ARN the
+        // refusal names.
         if let Some(layers) = layers.as_deref().filter(|layers| !layers.is_empty()) {
             if let Some(config) = &signing_config {
                 if let Some(message) = crate::state::untrusted_deployment_refusal(

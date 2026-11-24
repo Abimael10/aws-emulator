@@ -76,6 +76,11 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # image and tag records are reached through the shared engine, which needs the owning
 # service's state TYPE.
 service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# A .zip deployment package carries the CODE SIGNATURE it was signed with, and that
+# signature is verified against the key pair the signing profile version holds
+# (`state::package_signature`): the pair lives in the AWS Signer emulator's own store,
+# reached through the shared engine, which needs the owning service's state TYPE.
+service-com-amazonaws-signer-wallabyservice = { workspace = true }
 # A function's own invocation logs go to the CloudWatch Logs store of the same engine
 # (`state::log_delivery`), which is where `FilterLogEvents` and `GetLogEvents` read them
 # from: the delivery writes that service's own records rather than a second copy.

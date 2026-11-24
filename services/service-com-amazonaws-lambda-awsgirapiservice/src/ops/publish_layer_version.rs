@@ -231,6 +231,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (0, None),
         };
 
+        // WHO signed this archive: the signature the archive itself carries, verified
+        // against the signing service that made it (see
+        // [`crate::state::verified_package_signature`]). Read HERE, before the store is
+        // reached, for the two reasons the Amazon S3 read above is read here: it is a call
+        // back into the engine, across which no store guard may be held, and it is work this
+        // emulator does off the thread serving the request. It is settled once because "each
+        // time you call PublishLayerVersion with the same layer name, a new version is
+        // created" — a published version's archive never changes, so neither does what signed
+        // it, and every later mount of this version compares that value instead of verifying
+        // the signature again.
+        let signing_profile_version_arn =
+            crate::state::verified_package_signature(&*self.engine, archive.zip_bytes.as_deref())
+                .await
+                .map(|signature| signature.profile_version_arn);
+
         let mut store = state.lock();
 
         // "The amount of storage space, in bytes, that's being used by deployment
@@ -304,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 archive,
                 code_size,
                 code_sha256,
+                signing_profile_version_arn,
                 created: crate::state::iso8601(now),
                 // A freshly published version has had no permission granted on it yet,
                 // so it holds no resource-based policy at all.

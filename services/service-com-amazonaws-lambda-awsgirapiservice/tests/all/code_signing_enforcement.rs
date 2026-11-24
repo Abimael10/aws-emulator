@@ -7,13 +7,15 @@
 //!
 //! 1. A deployment to a function attached to a code-signing configuration is verified
 //!    against that configuration's `AllowedPublishers` ("A signing profile defines a trusted
-//!    user who can sign a code package"), and
-//!    `CodeSigningPolicies$UntrustedArtifactOnDeployment` decides what happens when the
-//!    verification fails: "If you set the policy to `Enforce`, Lambda blocks the deployment
-//!    request if signature validation checks fail. If you set the policy to `Warn`, Lambda
-//!    allows the deployment". An artifact this emulator cannot attribute to an allowed
-//!    publisher — every artifact it is handed, since no signing service stamps one here — is
-//!    therefore BLOCKED under `Enforce` with the modelled
+//!    user who can sign a code package"): the package's OWN signature is read out of it and
+//!    verified against the signing service that made it, and a package signed by a profile
+//!    the configuration allows is deployed. An artifact this emulator cannot attribute to an
+//!    allowed publisher — one bearing no signature, one whose signature covers other
+//!    contents, one made under another publisher's key — fails the checks, and
+//!    `CodeSigningPolicies$UntrustedArtifactOnDeployment` decides what happens then: "If you
+//!    set the policy to `Enforce`, Lambda blocks the deployment request if signature
+//!    validation checks fail. If you set the policy to `Warn`, Lambda allows the deployment".
+//!    So such an artifact is BLOCKED under `Enforce` with the modelled
 //!    `CodeVerificationFailedException` (HTTP 400) and stores nothing, and lands under
 //!    `Warn`. It applies to each operation the model binds that error to: `CreateFunction`
 //!    and `UpdateFunctionCode` for the function's own deployment package, and
@@ -115,22 +117,33 @@ fn signing_profile(index: usize) -> String {
     format!("arn:aws:signer:{REGION}:{ACCOUNT}:/signing-profiles/Profile{index}/{index:08x}")
 }
 
-/// The bytes of a .zip archive holding `entries`, written in memory; each entry's content is
-/// a run of one byte.
-fn archive(entries: &[(&str, usize)]) -> Vec<u8> {
+/// The bytes of a .zip archive holding `entries` as `(name, content)`, written in memory.
+///
+/// The ONE writer every package below is assembled with, so a package and the contents a
+/// signature was taken over carry the same entry names: an archive this writes and reads back
+/// is what [`service_common::code_signing_signature::content_digest`] states.
+fn archive_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
         let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
-        for (name, length) in entries {
+        for (name, content) in entries {
             writer.start_file(*name, options).expect("a new entry");
-            writer
-                .write_all(&vec![b'x'; *length])
-                .expect("the entry's bytes");
+            writer.write_all(content).expect("the entry's bytes");
         }
         writer.finish().expect("a finished archive");
     }
     buffer.into_inner()
+}
+
+/// The bytes of a .zip archive holding `entries`, written in memory; each entry's content is
+/// a run of one byte.
+fn archive(entries: &[(&str, usize)]) -> Vec<u8> {
+    let named: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(name, length)| (*name, vec![b'x'; *length]))
+        .collect();
+    archive_of(&named)
 }
 
 /// A `ZipFile` member: restJson1 carries a blob base64-encoded in a JSON body.
@@ -196,11 +209,16 @@ impl Answer {
     }
 }
 
-/// One service mounted on its own engine, reached the way the production router reaches it.
+/// One service mounted on its own engine, reached the way the production router reaches it —
+/// with the SIGNING service beside it, because a package's signature is verified against the
+/// key pair that service holds for the signing profile version it was signed under.
 fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
+    router.register_service(
+        service_com_amazonaws_signer_wallabyservice::EmulatedService::new(Arc::clone(engine)),
+    );
     router
 }
 
@@ -247,7 +265,19 @@ async fn create_config(
     policy: &str,
     publishers: usize,
 ) -> String {
-    let profiles: Vec<Value> = (0..publishers).map(|index| json!(signing_profile(index))).collect();
+    let profiles: Vec<String> = (0..publishers).map(signing_profile).collect();
+    create_config_allowing(router, label, policy, &profiles).await
+}
+
+/// `CreateCodeSigningConfig` allowing exactly `publishers`, answering the stored
+/// configuration's ARN.
+async fn create_config_allowing(
+    router: &MultiServiceRouter,
+    label: &str,
+    policy: &str,
+    publishers: &[String],
+) -> String {
+    let profiles: Vec<Value> = publishers.iter().map(|arn| json!(arn)).collect();
     let answer = call(
         router,
         "POST",
@@ -1063,4 +1093,599 @@ async fn get_function_code_signing_config_reports_the_association_as_a_whole() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// RULE 1, the ADMITTING half: a package an allowed publisher signed is deployed.
+//
+// The signature is the package's own, so a case makes one the way the signing service does:
+// a signing profile is created through that service's front door, and the envelope is
+// written over the digest of the contents it travels with, under that profile version's key
+// pair ([`signed_by`]). Nothing here reaches into Lambda's store.
+// ---------------------------------------------------------------------------------------
+
+/// The key pair of one signing profile version, as the signing service holds it.
+type SigningKey =
+    service_com_amazonaws_signer_wallabyservice::state::payload_signing::PayloadSigningKey;
+
+/// A signing platform of the code-signing workflow the signing service publishes, and the
+/// certificate ARN a profile on it signs with.
+const SIGNING_PLATFORM: &str = "AWSLambda-SHA384-ECDSA";
+const CERTIFICATE_ARN: &str = "arn:aws:acm:us-east-1:000000000000:certificate/abc";
+
+/// A SigV4 credential scope naming the SIGNING service in the same region, which is what
+/// routes a profile create there.
+const SIGNER_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+     Credential=emulator-test-key/20260101/us-east-1/signer/aws4_request, \
+     SignedHeaders=host, Signature=not-verified";
+
+/// The signing job id a case's envelope names. The signing service holds no job of this id
+/// here — these packages are signed without one — so a function deploying such a package
+/// reports its publisher and no `SigningJobArn`; the job half is what the cross-service suite
+/// that signs through a real `StartSigningJob` pins.
+const JOB_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+/// The status a function's `LastUpdateStatus` reports while the update's completion is still
+/// owed by the clock, and the one it settles to.
+const UPDATE_IN_PROGRESS: &str = "InProgress";
+const UPDATE_SUCCESSFUL: &str = "Successful";
+
+/// One signing profile of the signing service: the version ARN a signature of it names, the
+/// profile ARN that version belongs to, and the key pair it signs with.
+struct Publisher {
+    version_arn: String,
+    profile_arn: String,
+    key: SigningKey,
+}
+
+/// `PutSigningProfile` on the signing service, then the key pair that profile version signs
+/// with, read out of that service's own store.
+async fn publisher(
+    engine: &Arc<engine::InMemoryEngine>,
+    router: &MultiServiceRouter,
+    label: &str,
+    name: &str,
+) -> Publisher {
+    let host = format!("signer.{REGION}.amazonaws.com");
+    let body = json!({
+        "platformId": SIGNING_PLATFORM,
+        "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+    });
+    let request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("http://{host}/signing-profiles/{name}"))
+        .header("host", host)
+        .header("authorization", SIGNER_AUTHORIZATION)
+        .header("content-type", "application/json")
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the profile request body must serialize"),
+        ))
+        .expect("the test request must build");
+    let response = router.dispatch(request).await;
+    let (parts, payload) = response.into_parts();
+    assert_eq!(
+        parts.status.as_u16(),
+        200,
+        "case {label:?}: PutSigningProfile {name:?} must answer 200, got {} {}",
+        parts.status.as_u16(),
+        String::from_utf8_lossy(&payload)
+    );
+    let answered: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    let version_arn = answered["profileVersionArn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {label:?}: PutSigningProfile must answer a profileVersionArn, got {}",
+                String::from_utf8_lossy(&payload)
+            )
+        })
+        .to_string();
+    let profile_arn = answered["arn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {label:?}: PutSigningProfile must answer the profile's ARN, got {}",
+                String::from_utf8_lossy(&payload)
+            )
+        })
+        .to_string();
+    // The key pair that version signs with, taken out of the signing service's store the way
+    // a signing job takes it: it is that service's own material, so nothing here invents a
+    // key a verifier would then have to be told about.
+    let state = service_com_amazonaws_signer_wallabyservice::state::service_state(&**engine)
+        .expect("the engine carries the signing service's store");
+    let key = {
+        let mut store = state.lock();
+        store
+            .profile_mut(REGION, name)
+            .and_then(service_com_amazonaws_signer_wallabyservice::state::SigningProfileRecord::signing_key_copy)
+            .unwrap_or_else(|| panic!("case {label:?}: the profile {name:?} must hold a key pair"))
+    };
+    Publisher {
+        version_arn,
+        profile_arn,
+        key,
+    }
+}
+
+/// A package `key` signed: the entries `carried`, plus the signature envelope over the
+/// material the digest of the entries `declared` and the stated attribution make up, made
+/// under that key.
+///
+/// The four ways a row varies from a package signed as it stands:
+///
+/// * `declared` differing from `carried` — contents changed after they were signed;
+/// * `attributed_to` naming a publisher other than the one whose `key` signed — an envelope
+///   claiming a signer that did not make it;
+/// * `stated_job` differing from `signed_job` — an attribution rewritten after signing;
+/// * `key` being another publisher's.
+fn signed_by(
+    key: &SigningKey,
+    attributed_to: &str,
+    (signed_job, stated_job): (&str, &str),
+    declared: &[(&str, usize)],
+    carried: &[(&str, usize)],
+) -> Vec<u8> {
+    let digest = service_common::code_signing_signature::content_digest(&archive(declared))
+        .expect("the declared contents digest");
+    let (signature, public_key) = key
+        .signature_and_public_key(&service_common::code_signing_signature::signed_material(
+            attributed_to,
+            signed_job,
+            &digest,
+        ))
+        .expect("the signing profile version signs");
+    let envelope = service_common::code_signing_signature::render_envelope(
+        &digest,
+        &signature,
+        &public_key,
+        attributed_to,
+        stated_job,
+    );
+    let mut entries: Vec<(&str, Vec<u8>)> = carried
+        .iter()
+        .map(|(name, length)| (*name, vec![b'x'; *length]))
+        .collect();
+    entries.push((
+        service_common::code_signing_signature::SIGNATURE_ENTRY_NAME,
+        envelope,
+    ));
+    archive_of(&entries)
+}
+
+/// The `CodeSha256` a stored package reports: "The SHA256 hash of the function's deployment
+/// package", base64-encoded as the member documents.
+fn code_sha256(package: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD
+        .encode(<sha2::Sha256 as sha2::Digest>::digest(package))
+}
+
+/// Read the function's configuration until `LastUpdateStatus` has settled, and answer the
+/// status it settled to.
+///
+/// The move out of `InProgress` is owed by the CLOCK, so the case looks again until it holds
+/// rather than waiting a fixed time, and gives up only on a deadline generous enough that a
+/// loaded machine does not fail it.
+async fn settled_update_status(
+    router: &MultiServiceRouter,
+    label: &str,
+    function: &str,
+) -> String {
+    let deadline = SystemTime::now() + Duration::from_secs(120);
+    loop {
+        let answer = get_configuration(router, function).await;
+        let status = answer.string("LastUpdateStatus").unwrap_or_default();
+        if status != UPDATE_IN_PROGRESS {
+            return status;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "case {label:?}: the update of {function} never settled: {}",
+            answer.text()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One row of the admitted-deployment table.
+struct AdmittedCase {
+    name: &'static str,
+    function: &'static str,
+    /// Whether the configuration allows other publishers beside the one that signed.
+    other_publishers: usize,
+    /// The entries of the package the update deploys.
+    entries: Vec<(&'static str, usize)>,
+    /// The other members the update carries.
+    extra: Value,
+}
+
+/// The rows differ along what the rule generalises over: how many other publishers the
+/// configuration allows, the shape and size of the signed package, and the other members the
+/// update carries.
+fn admitted_cases() -> Vec<AdmittedCase> {
+    vec![
+        AdmittedCase {
+            name: "the only publisher the configuration allows",
+            function: "csc-signed-version",
+            other_publishers: 0,
+            entries: vec![("index.py", 64)],
+            extra: json!({}),
+        },
+        AdmittedCase {
+            name: "allowed among several publishers, publishing a version",
+            function: "csc-signed-among-many",
+            other_publishers: 3,
+            entries: vec![("index.py", 2_048), ("lib/helper.py", 16)],
+            extra: json!({ "Publish": true }),
+        },
+        AdmittedCase {
+            name: "allowed beside one other publisher, an archive with an empty entry",
+            function: "csc-signed-empty-entry",
+            other_publishers: 1,
+            entries: vec![("index.py", 32), ("data/empty", 0)],
+            extra: json!({}),
+        },
+    ]
+}
+
+/// RULE 1, the half the refusal is the other side of: a package whose own signature verifies
+/// under one of the configuration's allowed publishers is DEPLOYED under the `Enforce`
+/// policy — answered 200, stored, settling to `Successful`, and reporting the publisher that
+/// signed it.
+#[tokio::test]
+async fn updating_code_with_a_package_an_allowed_publisher_signed_is_deployed() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let release = publisher(&engine, &router, "signed deployments", "Release_Profile").await;
+
+    for case in admitted_cases() {
+        let label = case.name;
+        let mut publishers: Vec<String> = (0..case.other_publishers).map(signing_profile).collect();
+        publishers.push(release.version_arn.clone());
+        let config = create_config_allowing(&router, label, POLICY_ENFORCE, &publishers).await;
+
+        // The function starts from an UNSIGNED package, which is why it is created before the
+        // enforcing configuration is attached to it: that create would itself be a blocked
+        // deployment.
+        let created = create_active_function(
+            &engine,
+            &router,
+            label,
+            case.function,
+            &archive(&[("index.py", 32)]),
+            None,
+        )
+        .await;
+        put_association(&router, label, case.function, &config).await;
+        assert_eq!(
+            created["SigningProfileVersionArn"],
+            Value::Null,
+            "case {label:?}: a function created from an unsigned package must report no \
+             publisher, got {:?}",
+            created["SigningProfileVersionArn"]
+        );
+
+        let package = signed_by(
+            &release.key,
+            &release.version_arn,
+            (JOB_ID, JOB_ID),
+            &case.entries,
+            &case.entries,
+        );
+        let mut body = case.extra.clone();
+        body["ZipFile"] = zip_file(&package);
+        let updated = update_code(&router, case.function, &body).await;
+        assert_eq!(
+            updated.status,
+            200,
+            "case {label:?}: expected 200 from UpdateFunctionCode for a package the \
+             configuration's allowed publisher signed, got {} {}",
+            updated.status,
+            updated.text()
+        );
+        // The digest of the very bytes that were deployed.
+        assert_eq!(
+            updated.string("CodeSha256"),
+            Some(code_sha256(&package)),
+            "case {label:?}: expected the deployed package's own digest, got {:?}",
+            updated.string("CodeSha256")
+        );
+        // ... and WHO signed them, read back off the stored configuration.
+        assert_eq!(
+            updated.string("SigningProfileVersionArn"),
+            Some(release.version_arn.clone()),
+            "case {label:?}: expected the update to report the publisher that signed the \
+             package, got {}",
+            updated.text()
+        );
+
+        let settled = settled_update_status(&router, label, case.function).await;
+        assert_eq!(
+            settled, UPDATE_SUCCESSFUL,
+            "case {label:?}: expected the update to settle to {UPDATE_SUCCESSFUL}, got \
+             {settled:?}"
+        );
+
+        // The round trip: an independent read reports the package that was deployed and the
+        // publisher it was signed by.
+        let read = get_function(&router, case.function).await;
+        let configuration = read.json()["Configuration"].clone();
+        assert_eq!(
+            configuration["CodeSha256"].as_str(),
+            Some(code_sha256(&package).as_str()),
+            "case {label:?}: expected GetFunction to report the deployed package, got {:?}",
+            configuration["CodeSha256"]
+        );
+        assert_eq!(
+            configuration["SigningProfileVersionArn"].as_str(),
+            Some(release.version_arn.as_str()),
+            "case {label:?}: expected GetFunction to report the publisher, got {:?}",
+            configuration["SigningProfileVersionArn"]
+        );
+    }
+}
+
+/// How a row's package fails to be one an allowed publisher signed.
+#[derive(Debug, Clone, Copy)]
+enum NotSignedBy {
+    /// Signed, as it claims, by a profile the configuration does not allow.
+    AnotherPublisher,
+    /// An envelope naming the allowed publisher, made under another profile's key.
+    AnotherPublishersKey,
+    /// The allowed publisher's own envelope, lifted onto other contents.
+    OtherContents,
+    /// The allowed publisher's own signature, with the job it attributes the package to
+    /// rewritten afterwards.
+    ARewrittenAttribution,
+    /// A version ARN of the allowed profile that no signature was made under.
+    AnotherVersionOfTheProfile,
+    /// Signed by the allowed PROFILE, where the configuration allows the profile's own ARN
+    /// and not the version a signature names.
+    AProfileWithNoVersion,
+    /// No signature at all.
+    Nothing,
+}
+
+/// RULE 1, the refusing half, on the cases a VERIFIED signature tells apart: only a package
+/// whose signature verifies under one of the signing profile VERSIONS the configuration
+/// allows is deployed, so a package signed by someone else, one whose signature was made
+/// under another key, one whose contents or attribution changed after they were signed, one
+/// naming a version nothing signed, one whose configuration names a profile rather than a
+/// version of it, and one bearing no signature at all are each blocked under `Enforce` — with
+/// the stored package left alone.
+#[tokio::test]
+async fn updating_code_with_a_package_no_allowed_publisher_signed_is_blocked() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let release = publisher(&engine, &router, "refused deployments", "Release_Profile").await;
+    let other = publisher(&engine, &router, "refused deployments", "Other_Profile").await;
+
+    let deployed: Vec<(&str, usize)> = vec![("index.py", 64)];
+    let elsewhere: Vec<(&str, usize)> = vec![("index.py", 65)];
+    // (case, the function, how the package fails to be signed by an allowed publisher)
+    let rows: Vec<(&str, &str, NotSignedBy)> = vec![
+        (
+            "signed by a publisher the configuration does not allow",
+            "csc-unsigned-other",
+            NotSignedBy::AnotherPublisher,
+        ),
+        (
+            "an envelope naming the allowed publisher, signed with another key",
+            "csc-unsigned-forged",
+            NotSignedBy::AnotherPublishersKey,
+        ),
+        (
+            "the allowed publisher's envelope, lifted onto other contents",
+            "csc-unsigned-lifted",
+            NotSignedBy::OtherContents,
+        ),
+        (
+            "the signing job attribution rewritten after signing",
+            "csc-unsigned-rewritten",
+            NotSignedBy::ARewrittenAttribution,
+        ),
+        (
+            "a version of the allowed profile that nothing signed",
+            "csc-unsigned-version",
+            NotSignedBy::AnotherVersionOfTheProfile,
+        ),
+        (
+            "a configuration naming the signing profile rather than the version that signed",
+            "csc-unsigned-profile",
+            NotSignedBy::AProfileWithNoVersion,
+        ),
+        ("no signature at all", "csc-unsigned-none", NotSignedBy::Nothing),
+    ];
+
+    for (label, function, failure) in rows {
+        // The publisher the configuration allows: the version ARN a signature names, except
+        // for the row whose configuration names the profile itself.
+        let allowed = match failure {
+            NotSignedBy::AProfileWithNoVersion => release.profile_arn.clone(),
+            _ => release.version_arn.clone(),
+        };
+        let config = create_config_allowing(&router, label, POLICY_ENFORCE, &[allowed]).await;
+        let created = create_active_function(
+            &engine,
+            &router,
+            label,
+            function,
+            &archive(&[("index.py", 32)]),
+            None,
+        )
+        .await;
+        put_association(&router, label, function, &config).await;
+        let stored_before = created["CodeSha256"].clone();
+
+        let package = match failure {
+            NotSignedBy::AnotherPublisher => signed_by(
+                &other.key,
+                &other.version_arn,
+                (JOB_ID, JOB_ID),
+                &deployed,
+                &deployed,
+            ),
+            NotSignedBy::AnotherPublishersKey => signed_by(
+                &other.key,
+                &release.version_arn,
+                (JOB_ID, JOB_ID),
+                &deployed,
+                &deployed,
+            ),
+            NotSignedBy::OtherContents => signed_by(
+                &release.key,
+                &release.version_arn,
+                (JOB_ID, JOB_ID),
+                &elsewhere,
+                &deployed,
+            ),
+            NotSignedBy::ARewrittenAttribution => signed_by(
+                &release.key,
+                &release.version_arn,
+                (JOB_ID, "99999999-8888-7777-6666-555555555555"),
+                &deployed,
+                &deployed,
+            ),
+            NotSignedBy::AnotherVersionOfTheProfile => signed_by(
+                &release.key,
+                &format!("{}/0000000000", release.profile_arn),
+                (JOB_ID, JOB_ID),
+                &deployed,
+                &deployed,
+            ),
+            // The package IS signed by the allowed profile's version; what fails is the
+            // configuration, which names the profile rather than that version.
+            NotSignedBy::AProfileWithNoVersion => signed_by(
+                &release.key,
+                &release.version_arn,
+                (JOB_ID, JOB_ID),
+                &deployed,
+                &deployed,
+            ),
+            NotSignedBy::Nothing => archive(&deployed),
+        };
+        let updated = update_code(&router, function, &json!({ "ZipFile": zip_file(&package) }))
+            .await;
+        assert_blocked(label, "UpdateFunctionCode", &function_arn(function), &updated);
+
+        // Nothing was deployed: the function still serves the package it held, and reports no
+        // publisher for it.
+        let configuration = get_configuration(&router, function).await;
+        assert_eq!(
+            configuration.json()["CodeSha256"], stored_before,
+            "case {label:?}: a blocked update must leave the stored package alone, got {}",
+            configuration.text()
+        );
+        assert_eq!(
+            configuration.json()["SigningProfileVersionArn"],
+            Value::Null,
+            "case {label:?}: expected the function to report no publisher, got {}",
+            configuration.text()
+        );
+    }
+}
+
+/// RULE 1, on `CreateFunction` and on the LAYER packages a configuration change mounts: the
+/// same verification admits a create whose package an allowed publisher signed, and a change
+/// mounting a layer version whose own package one signed.
+#[tokio::test]
+async fn creating_and_mounting_signed_packages_under_an_enforcing_configuration_lands() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let release = publisher(&engine, &router, "signed create", "Release_Profile").await;
+    let config = create_config_allowing(
+        &router,
+        "signed create",
+        POLICY_ENFORCE,
+        std::slice::from_ref(&release.version_arn),
+    )
+    .await;
+    // A create naming the enforcing configuration, deploying a package that publisher signed.
+    let function = "csc-signed-create";
+    let entries: Vec<(&str, usize)> = vec![("index.py", 128)];
+    let package = signed_by(
+        &release.key,
+        &release.version_arn,
+        (JOB_ID, JOB_ID),
+        &entries,
+        &entries,
+    );
+    let created = create_function(&router, function, &package, Some(&config)).await;
+    assert_eq!(
+        created.status,
+        201,
+        "expected 201 from CreateFunction for a package the allowed publisher signed, got {} {}",
+        created.status,
+        created.text()
+    );
+    make_activation_due(&engine);
+    assert_eq!(
+        created.string("SigningProfileVersionArn"),
+        Some(release.version_arn.clone()),
+        "expected the create to report the publisher that signed the package, got {}",
+        created.text()
+    );
+    assert_eq!(
+        created.string("CodeSha256"),
+        Some(code_sha256(&package)),
+        "expected the create to report the deployed package's own digest, got {}",
+        created.text()
+    );
+
+    // A layer version whose own package that publisher signed, mounted into the same
+    // function: each layer is a package of its own, verified on its own when it is published.
+    let layer_entries: Vec<(&str, usize)> = vec![("python/lib.py", 96)];
+    let layer_package = signed_by(
+        &release.key,
+        &release.version_arn,
+        (JOB_ID, JOB_ID),
+        &layer_entries,
+        &layer_entries,
+    );
+    let layer = publish_layer(&router, "signed layer", function, &layer_package).await;
+    let mounted = update_configuration(&router, function, &json!({ "Layers": [layer.clone()] })).await;
+    assert_eq!(
+        mounted.status,
+        200,
+        "expected 200 from UpdateFunctionConfiguration mounting a signed layer version, got {} {}",
+        mounted.status,
+        mounted.text()
+    );
+    let configuration = get_configuration(&router, function).await;
+    let held: Vec<String> = configuration.json()["Layers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["Arn"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        held,
+        vec![layer.clone()],
+        "expected the function to hold the signed layer version, got {held:?}"
+    );
+
+    // And the other half of the same rule on the same function: a layer version no allowed
+    // publisher signed is still blocked, named by that version's own ARN. The mount above is
+    // an update in flight, so the case waits for the clock to settle it before making
+    // another change.
+    let settled = settled_update_status(&router, "signed layer", function).await;
+    assert_eq!(
+        settled, UPDATE_SUCCESSFUL,
+        "expected the mount to settle to {UPDATE_SUCCESSFUL}, got {settled:?}"
+    );
+    let unsigned_layer =
+        publish_layer(&router, "unsigned layer", function, &archive(&layer_entries)).await;
+    let refused = update_configuration(
+        &router,
+        function,
+        &json!({ "Layers": [unsigned_layer.clone()] }),
+    )
+    .await;
+    assert_blocked(
+        "unsigned layer",
+        "UpdateFunctionConfiguration",
+        &unsigned_layer,
+        &refused,
+    );
 }

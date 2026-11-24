@@ -25,11 +25,12 @@ use std::collections::HashMap;
 use aws_lc_rs::encoding::{AsDer, PublicKeyX509Der};
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{
-    EcdsaKeyPair, EcdsaSigningAlgorithm, KeyPair as _, ECDSA_P256_SHA256_ASN1_SIGNING,
-    ECDSA_P384_SHA384_ASN1_SIGNING,
+    EcdsaKeyPair, EcdsaSigningAlgorithm, EcdsaVerificationAlgorithm, KeyPair as _,
+    ParsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING,
+    ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING,
 };
 
-use super::SigningProfileRecord;
+use super::{ComAmazonawsSignerWallabyserviceState, SigningProfileRecord};
 
 /// The one payload content type a payload signature is made over.
 ///
@@ -109,8 +110,11 @@ pub fn signature_metadata(profile_version_arn: &str, job_id: &str) -> HashMap<St
 #[derive(Clone)]
 pub struct PayloadSigningKey {
     /// The ECDSA scheme this pair signs under — the curve and digest the profile's
-    /// platform publishes (see [`profile_signing_algorithm`]).
+    /// platform publishes (see [`profile_signature_scheme`]).
     algorithm: &'static EcdsaSigningAlgorithm,
+    /// The same scheme as a VERIFIER names it, so a signature this pair made is checked
+    /// under the curve and digest it was made with rather than under a guessed one.
+    verification: &'static EcdsaVerificationAlgorithm,
     /// The private key, as a DER PKCS#8 `PrivateKeyInfo`.
     private_key_der: Vec<u8>,
     /// The public key, as a DER X.509 `SubjectPublicKeyInfo`.
@@ -161,6 +165,19 @@ impl PayloadSigningKey {
     pub fn signature_and_public_key(&self, payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         Some((self.signature(payload)?, self.public_key_der.clone()))
     }
+
+    /// Whether `signature` is a signature of `payload` made under THIS pair.
+    ///
+    /// The check is made against the public half held here and the scheme this pair signs
+    /// under, so a signature made under another key or another scheme does not verify. It
+    /// is what a service HOLDING a signed artifact asks about the signature that artifact
+    /// carries: the trusted answer comes from the pair the signing profile version holds,
+    /// never from a public key travelling beside the signature.
+    #[must_use]
+    pub fn verifies(&self, payload: &[u8], signature: &[u8]) -> bool {
+        ParsedPublicKey::new(self.verification, &self.public_key_der)
+            .is_ok_and(|parsed| parsed.verify_sig(payload, signature).is_ok())
+    }
 }
 
 /// The ECDSA scheme a profile's payload signatures are made under: the encryption
@@ -176,10 +193,13 @@ impl PayloadSigningKey {
 ///
 /// `None` when the profile is on a platform this emulator publishes no entry for,
 /// or when the pair names no scheme the provider implements
-/// ([`ecdsa_signing_algorithm`]).
-pub fn profile_signing_algorithm(
+/// ([`ecdsa_scheme`]).
+pub fn profile_signature_scheme(
     profile: &SigningProfileRecord,
-) -> Option<&'static EcdsaSigningAlgorithm> {
+) -> Option<(
+    &'static EcdsaSigningAlgorithm,
+    &'static EcdsaVerificationAlgorithm,
+)> {
     let entry = super::signing_platform(&profile.platform_id)?;
     let configuration = profile
         .overrides
@@ -191,7 +211,7 @@ pub fn profile_signing_algorithm(
     let hash_algorithm = configuration
         .and_then(|configuration| configuration.hash_algorithm.as_deref())
         .or_else(|| entry.hash_algorithms.first().copied())?;
-    ecdsa_signing_algorithm(encryption_algorithm, hash_algorithm)
+    ecdsa_scheme(encryption_algorithm, hash_algorithm)
 }
 
 /// The signature scheme an (`EncryptionAlgorithm`, `HashAlgorithm`) pair names, as
@@ -203,27 +223,35 @@ pub fn profile_signing_algorithm(
 /// `hashAlgorithmOptions` publish `SHA384`). So `SHA256` names P-256 and `SHA384`
 /// names P-384, and a pair outside that — an encryption algorithm that is not
 /// ECDSA, a digest no published curve is paired with — names no scheme here.
-fn ecdsa_signing_algorithm(
+fn ecdsa_scheme(
     encryption_algorithm: &str,
     hash_algorithm: &str,
-) -> Option<&'static EcdsaSigningAlgorithm> {
+) -> Option<(
+    &'static EcdsaSigningAlgorithm,
+    &'static EcdsaVerificationAlgorithm,
+)> {
     match (encryption_algorithm, hash_algorithm) {
-        ("ECDSA", "SHA256") => Some(&ECDSA_P256_SHA256_ASN1_SIGNING),
-        ("ECDSA", "SHA384") => Some(&ECDSA_P384_SHA384_ASN1_SIGNING),
+        ("ECDSA", "SHA256") => Some((&ECDSA_P256_SHA256_ASN1_SIGNING, &ECDSA_P256_SHA256_ASN1)),
+        ("ECDSA", "SHA384") => Some((&ECDSA_P384_SHA384_ASN1_SIGNING, &ECDSA_P384_SHA384_ASN1)),
         _ => None,
     }
 }
 
-/// A fresh key pair signing under `algorithm`, or `None` when the provider refuses
+/// A fresh key pair signing under `scheme`, or `None` when the provider refuses
 /// to mint or to encode one.
 fn generate_payload_signing_key(
-    algorithm: &'static EcdsaSigningAlgorithm,
+    scheme: (
+        &'static EcdsaSigningAlgorithm,
+        &'static EcdsaVerificationAlgorithm,
+    ),
 ) -> Option<PayloadSigningKey> {
+    let (algorithm, verification) = scheme;
     let private = EcdsaKeyPair::generate_pkcs8(algorithm, &SystemRandom::new()).ok()?;
     let pair = EcdsaKeyPair::from_pkcs8(algorithm, private.as_ref()).ok()?;
     let public: PublicKeyX509Der = AsDer::as_der(pair.public_key()).ok()?;
     Some(PayloadSigningKey {
         algorithm,
+        verification,
         private_key_der: private.as_ref().to_vec(),
         public_key_der: public.as_ref().to_vec(),
     })
@@ -238,13 +266,13 @@ impl SigningProfileRecord {
     /// holding the public half can verify every signature that version made.
     ///
     /// `None` when this profile's platform names no signature scheme the provider
-    /// implements ([`profile_signing_algorithm`]): there is then no key to sign
+    /// implements ([`profile_signature_scheme`]): there is then no key to sign
     /// with, and the caller is told the service failed rather than handed bytes
     /// that are not a signature.
     pub fn payload_signing_key(&mut self) -> Option<&PayloadSigningKey> {
         if self.payload_signing_key.is_none() {
             self.payload_signing_key =
-                Some(generate_payload_signing_key(profile_signing_algorithm(self)?)?);
+                Some(generate_payload_signing_key(profile_signature_scheme(self)?)?);
         }
         self.payload_signing_key.as_ref()
     }
@@ -267,5 +295,41 @@ impl SigningProfileRecord {
     /// there is no key to sign with.
     pub fn signing_key_copy(&mut self) -> Option<PayloadSigningKey> {
         self.payload_signing_key().cloned()
+    }
+}
+
+impl ComAmazonawsSignerWallabyserviceState {
+    /// Whether `signature` is a signature of `payload` made under the signing profile
+    /// VERSION `profile_version_arn` names.
+    ///
+    /// The question a service holding a signed artifact asks about the signature that
+    /// artifact carries: a signature attests to the profile version whose key pair made
+    /// it, so the only trusted answer is the one the store holding that pair can give
+    /// ([`PayloadSigningKey::verifies`]). It is a READ — the pair is never minted here, so
+    /// a version that has signed nothing holds no key and verifies nothing, which is
+    /// exactly what a signature claiming to come from it is worth.
+    ///
+    /// `false` whenever the claim cannot be made good: an ARN that is no signing-profile
+    /// version ARN, a version this endpoint's region holds no profile for, a version other
+    /// than the one that profile holds ([`SigningProfileRecord::holds_version`]), and a
+    /// signature that does not verify under that version's key.
+    #[must_use]
+    pub fn signature_made_under_profile_version(
+        &self,
+        profile_version_arn: &str,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        let Some((region, profile_name, version)) = super::profile_version_in_arn(profile_version_arn)
+        else {
+            return false;
+        };
+        self.profile(region, profile_name).is_some_and(|profile| {
+            profile.holds_version(version)
+                && profile
+                    .payload_signing_key
+                    .as_ref()
+                    .is_some_and(|key| key.verifies(payload, signature))
+        })
     }
 }

@@ -583,6 +583,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO signed the package this create deploys, read out of the signature the package
+        // itself carries and verified against the signing service that made it (see
+        // [`crate::state::verified_package_signature`]). Read HERE, before the store is
+        // reached, for both reasons the Amazon S3 read above is: it is a call back into the
+        // engine, across which no store guard may be held, and reading the archive is work
+        // this emulator does off the thread serving the request. It is what the code-signing
+        // configuration's allowed publishers are checked against below, and what the stored
+        // configuration reports as `SigningProfileVersionArn` and `SigningJobArn`.
+        let package_signature =
+            crate::state::verified_package_signature(&*self.engine, code.zip_bytes.as_deref())
+                .await;
+
         // "The ARN of the Key Management Service (KMS) customer managed key that's used to
         // encrypt your function's .zip deployment package" (`Code$SourceKMSKeyArn`): Lambda
         // DECRYPTS that package under the key when it deploys the function, so the key has to
@@ -728,7 +740,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
-        let mut store = state.lock();
+        // Read-only while every refusal below is decided: the record is stored under the
+        // guard taken again after the interfaces are placed.
+        let store = state.lock();
 
         if store.functions.contains_key(&reference.name) {
             return Err(CreateFunctionErrorModeled::ResourceConflictException(
@@ -801,11 +815,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // cannot attribute to one of its allowed publishers BLOCKED, with no
                     // function created, and the same deployment lands under the `Warn`
                     // policy — the one reading of the policy every deployment operation
-                    // shares ([`crate::state::untrusted_deployment_refusal`]). There is no
-                    // function yet, so the refusal names the one the request asked for.
+                    // shares ([`crate::state::untrusted_deployment_refusal`]), made against
+                    // the publisher the package's own signature was verified as coming from
+                    // above. There is no function yet, so the refusal names the one the
+                    // request asked for.
                     if let Some(message) = crate::state::untrusted_deployment_refusal(
                         config,
-                        crate::state::DeployedArtifact::Package(&code),
+                        crate::state::DeployedArtifact::Package(
+                            &code,
+                            package_signature.as_ref(),
+                        ),
                         &input.function_name,
                     ) {
                         return Err(
@@ -849,12 +868,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not resolved against that inventory (see [`crate::state::vpc_interfaces`]). Done
         // after EVERY refusal above, so a request that is turned away stands nothing up: no
         // path from here to the stored function answers anything but success.
+        //
+        // The store guard is RELEASED across the call, as it is across every other call this
+        // handler makes into the engine: standing an interface up writes ANOTHER service's
+        // state, and no guard of this service's store may be held while a second one is
+        // taken. Nothing of this function is stored yet, so there is nothing for the gap to
+        // expose; the guard is taken again below, to store the record.
+        drop(store);
         let attachment = crate::state::place_function_interfaces(
             &*self.engine,
             &region,
             &reference.name,
             input.vpc_config.as_ref(),
         );
+        let mut store = state.lock();
 
         let config = crate::state::FunctionConfig {
             name: reference.name.clone(),
@@ -907,6 +934,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.durable_config.as_ref(),
             ),
             tenancy_config: input.tenancy_config.clone(),
+            signing_profile_version_arn: package_signature
+                .as_ref()
+                .map(|signature| signature.profile_version_arn.clone()),
+            signing_job_arn: package_signature
+                .as_ref()
+                .and_then(|signature| signature.signing_job_arn.clone()),
         };
 
         let mut record = crate::state::FunctionRecord {
@@ -992,8 +1025,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(version_number) = record.publish_next_version(config, now) else {
                 // Nothing is stored, so the interfaces the attachment stood up above belong
                 // to no function and are given back: a refused create leaves no interface
-                // holding a place in a subnet (see [`crate::state::vpc_interfaces`]).
+                // holding a place in a subnet (see [`crate::state::vpc_interfaces`]). The
+                // guard is released first, for the reason the placement released it.
                 let placed = ::std::mem::take(&mut record.vpc_network_interface_ids);
+                drop(store);
                 crate::state::release_function_interfaces(&*self.engine, &placed);
                 return Err(CreateFunctionErrorModeled::ServiceException(ServiceException {
                     r#type: None,
@@ -1009,6 +1044,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let stored_name = reference.name.clone();
+        // The conflict and the ceiling were decided before the guard was released for the
+        // interface placement, so both are asserted again HERE, where the record is stored:
+        // a name another call took in the gap is the conflict this operation answers rather
+        // than a function silently replaced, and the interfaces this call stood up are given
+        // back, exactly as they are on the publish failure above.
+        let taken = store.functions.contains_key(&stored_name);
+        let full = store.functions.len() >= crate::state::MAX_FUNCTIONS;
+        if taken || full {
+            let placed = ::std::mem::take(&mut record.vpc_network_interface_ids);
+            drop(store);
+            crate::state::release_function_interfaces(&*self.engine, &placed);
+            if taken {
+                return Err(CreateFunctionErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!("Function already exist: {stored_name}")),
+                    },
+                )
+                .into());
+            }
+            return Err(CreateFunctionErrorModeled::CodeStorageExceededException(
+                CodeStorageExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Code storage limit exceeded: this account already holds the maximum \
+                         of {} functions.",
+                        crate::state::MAX_FUNCTIONS
+                    )),
+                },
+            )
+            .into());
+        }
         store.functions.insert(stored_name.clone(), record);
 
         // Answered by reading the record back out of the store, so GetFunction reports

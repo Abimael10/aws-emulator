@@ -438,6 +438,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::image_package_digest(&*self.engine, ctx, &region, image_uri)
         });
 
+        // WHO signed the .zip package this request SUBMITS — the bytes it carried inline, or
+        // the ones Amazon S3 handed over for the location it named — read out of the
+        // signature the package itself carries and verified against the signing service that
+        // made it (see [`crate::state::verified_package_signature`]). Read HERE, before the
+        // store is reached, for both reasons the three resolutions above are: it is a call
+        // back into the engine, across which no store guard may be held, and reading the
+        // archive is work this emulator does off the thread serving the request. Whether
+        // these bytes are a package this function admits at all is decided below, where the
+        // package is resolved, so the order a client sees this operation's refusals in is
+        // unchanged.
+        let submitted_package = input
+            .zip_file
+            .as_deref()
+            .map(<[u8]>::to_vec)
+            .or_else(|| match &s3_package {
+                Some(crate::state::S3Package::Read(bytes)) => Some(bytes.clone()),
+                _ => None,
+            });
+        let package_signature = crate::state::verified_package_signature(
+            &*self.engine,
+            submitted_package.as_deref(),
+        )
+        .await;
+
         let mut store = state.lock();
 
         // The code-signing configuration this function deploys under, read BEFORE the
@@ -573,12 +597,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attribute to one of that configuration's allowed publishers BLOCKED, with
         // nothing stored, and the same deployment lands under the `Warn` policy — the one
         // reading of the policy both deployment operations share
-        // ([`crate::state::untrusted_deployment_refusal`]). The function this deployment is
-        // of exists, so the refusal names its ARN.
+        // ([`crate::state::untrusted_deployment_refusal`]), made against the publisher the
+        // package's own signature was verified as coming from above. The function this
+        // deployment is of exists, so the refusal names its ARN.
         if let Some(config) = &signing_config {
             if let Some(message) = crate::state::untrusted_deployment_refusal(
                 config,
-                crate::state::DeployedArtifact::Package(&code),
+                crate::state::DeployedArtifact::Package(&code, package_signature.as_ref()),
                 &record.arn,
             ) {
                 return Err(code_verification_failed(message));
@@ -639,6 +664,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut config = record.config.clone();
             config.code_size = code_size;
             config.code_sha256 = code_sha256;
+            // The publisher of that same validated package, for the same reason.
+            config.signing_profile_version_arn = package_signature
+                .as_ref()
+                .map(|signature| signature.profile_version_arn.clone());
+            config.signing_job_arn = package_signature
+                .as_ref()
+                .and_then(|signature| signature.signing_job_arn.clone());
             return Ok(function_configuration(
                 record.configuration(crate::state::VERSION_LATEST, &config),
             ));
@@ -658,6 +690,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.deploy_code(code);
         record.config.code_size = code_size;
         record.config.code_sha256 = code_sha256;
+        // The publisher of the package this call deployed, which is the package's own
+        // signature: a function serving an unsigned package reports neither member.
+        record.config.signing_profile_version_arn = package_signature
+            .as_ref()
+            .map(|signature| signature.profile_version_arn.clone());
+        record.config.signing_job_arn = package_signature
+            .as_ref()
+            .and_then(|signature| signature.signing_job_arn.clone());
         if let Some(architectures) = input.architectures.clone() {
             record.config.architectures = architectures;
         }

@@ -16755,6 +16755,7 @@ dependencies = [
  "service-com-amazonaws-ses-simpleemailservice",
  "service-com-amazonaws-sesv2-simpleemailservice-v2",
  "service-com-amazonaws-sfn-awsstepfunctions",
+ "service-com-amazonaws-signer-wallabyservice",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-ssm-amazonssm",
@@ -22806,6 +22807,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]

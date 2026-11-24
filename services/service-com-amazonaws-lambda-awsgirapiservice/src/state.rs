@@ -1214,6 +1214,15 @@ pub struct FunctionLayer {
     /// than copied, so attaching a layer to a function and invoking it hold one copy of
     /// the archive between them.
     pub zip_bytes: Option<::std::sync::Arc<Vec<u8>>>,
+    /// The signing profile version the archive's OWN signature was verified as coming from,
+    /// when it bears one — the publisher a code-signing configuration's `AllowedPublishers`
+    /// is checked against when a configuration change mounts this layer version
+    /// ([`crate::state::code_signing`]).
+    ///
+    /// Settled when the version was PUBLISHED, for the reason both sizes above are: a
+    /// published layer version is immutable, so neither the archive nor what signed it can
+    /// change, and a mount compares a value rather than verifying a signature again.
+    pub signing_profile_version_arn: Option<String>,
 }
 
 /// The configuration of one function version — the members `FunctionConfiguration`
@@ -1292,6 +1301,16 @@ pub struct FunctionConfig {
     /// modified after function creation", and `UpdateFunctionConfiguration` models no
     /// member for it.
     pub tenancy_config: Option<TenancyConfig>,
+    /// `SigningProfileVersionArn`, "The ARN of the signing profile version": the publisher
+    /// of the deployment package this configuration holds, read out of the signature that
+    /// package itself carries by the deployment that stored it
+    /// ([`crate::state::verified_package_signature`]). `None` for a package bearing no
+    /// signature this emulator could verify, which is what an unsigned deployment is.
+    pub signing_profile_version_arn: Option<String>,
+    /// `SigningJobArn`, "The ARN of the signing job": the job that made that signature, as
+    /// the signing service's own record of it names one. `None` for the same reason the
+    /// member above is, and for a job that service no longer holds.
+    pub signing_job_arn: Option<String>,
 }
 
 /// One published version of a function: its frozen configuration plus when it was
@@ -4760,6 +4779,10 @@ pub use policy_identity::{
 /// What the code-signing configuration a function is attached to does to a DEPLOYMENT of a
 /// package to it; see the module's own header.
 mod code_signing;
+/// WHO signed a deployment package, verified against the signing service that signs for that
+/// publisher; see the module's own header.
+mod package_signature;
+pub use package_signature::{verified_package_signature, DeploymentSignature, SignerState};
 /// What a function's TENANT ISOLATION configuration requires of an invocation of it; see the
 /// module's own header.
 mod tenant_isolation;

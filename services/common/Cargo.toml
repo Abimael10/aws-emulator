@@ -312,6 +312,12 @@ regex-syntax = "0.8"
 # every match runs under an explicit backtrack budget (`PATTERN_BACKTRACK_LIMIT`), so a
 # backtracking engine cannot spin on a caller's value.
 fancy-regex = "0.16"
+# `code_signing_signature`: a signed code package IS a .zip archive carrying the signature
+# envelope as one added entry, so the entries a signature covers are read by the maintained
+# zip implementation this workspace already reads and writes those archives with. Read with
+# `deflate` alone — no other compression method is linked in — and never extracted to a host
+# path.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # `record_identicon`: the PNG encoder the image a service serves for a record whose own image
 # bytes it does not hold is written with — the maintained codec this workspace already encodes
 # PNGs with, so the one renderer every such service shares writes a real image rather than
