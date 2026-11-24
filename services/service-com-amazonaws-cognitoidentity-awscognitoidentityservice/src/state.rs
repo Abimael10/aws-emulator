@@ -2489,6 +2489,28 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             >= MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL
     }
 
+    /// The principal-tag attribute map IN FORCE for one
+    /// `(IdentityPoolId, IdentityProviderName)` pair, or `None` for a pair no mapping has been
+    /// written for.
+    ///
+    /// The ONE reading of that record: the call that REPORTS a provider's mapping answers it,
+    /// and every vend builds the session tags it asks its assume to attach from it
+    /// ([`session_tags`]). So what a client is told the mapping is and what a credential vended
+    /// after that cannot drift apart — each is this record, read at the instant the call is
+    /// answered rather than copied when the mapping was written, which is why a mapping a later
+    /// write REPLACED governs neither.
+    #[must_use]
+    pub fn principal_tag_attribute_map(
+        &self,
+        identity_pool_id: &str,
+        identity_provider_name: &str,
+    ) -> Option<&PrincipalTagAttributeMap> {
+        self.principal_tag_attribute_maps.get(&(
+            identity_pool_id.to_string(),
+            identity_provider_name.to_string(),
+        ))
+    }
+
     /// Every stored `IdentityPoolId`, in the order a listing of the account's pools
     /// reports them: sorted, so two successive pages of one listing neither overlap nor
     /// skip a pool. The pools are held in a hash map, whose iteration order is not

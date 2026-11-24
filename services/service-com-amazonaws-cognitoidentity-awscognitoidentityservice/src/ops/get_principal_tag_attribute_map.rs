@@ -227,11 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetPrincipalTagAt
             )));
         }
 
-        let key = (
-            input.identity_pool_id.clone(),
-            input.identity_provider_name.clone(),
-        );
-        let Some(mapping) = store.principal_tag_attribute_maps.get(&key) else {
+        // The record IN FORCE for the pair, read through the state's one reading of it
+        // ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::principal_tag_attribute_map`]),
+        // which is the same reading every vend's session tags are built from.
+        let Some(mapping) = store.principal_tag_attribute_map(
+            &input.identity_pool_id,
+            &input.identity_provider_name,
+        ) else {
             return Err(not_found(format!(
                 "No Principal Tags configured for Provider {}",
                 input.identity_provider_name

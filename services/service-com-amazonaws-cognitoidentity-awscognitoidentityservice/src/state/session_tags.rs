@@ -101,14 +101,19 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// The pool's own mapping comes first: it is the configuration of the provider the login
     /// was made under, and a token this service minted carries the pairs its issuing call
     /// asked for only because no provider mapping states them.
+    ///
+    /// The mapping is read AT THIS VEND, through the state's one reading of that record
+    /// ([`super::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::principal_tag_attribute_map`],
+    /// which the call that reports a provider's mapping answers from too), so the map in force
+    /// is what the exchange's tags come from: a write that replaced it is in force for the next
+    /// vend, and the map it replaced is in force for none.
     fn provider_session_tags(
         &self,
         identity_pool_id: &str,
         provider: &str,
         token: &str,
     ) -> Vec<(String, String)> {
-        let key = (identity_pool_id.to_string(), provider.to_string());
-        if let Some(mapping) = self.principal_tag_attribute_maps.get(&key) {
+        if let Some(mapping) = self.principal_tag_attribute_map(identity_pool_id, provider) {
             let claims = presented_token_claims(token).unwrap_or_default();
             return mapping
                 .principal_tags
