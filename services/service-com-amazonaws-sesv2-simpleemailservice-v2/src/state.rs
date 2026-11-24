@@ -90,6 +90,11 @@ mod tenant_associations;
 /// feature is on, and how a call that can only be answered from its data is refused
 /// while it is off.
 mod vdm;
+/// What the REQUEST alone settles about an outbound message — the addresses it names, the
+/// recipients it addresses, the headers, tags and attachments it carries — and how a defect
+/// in it reads, which is the stage both send paths run before anything of the account is
+/// read.
+pub mod send_validation;
 /// The template language a template SAVED in the account is written in, and how one is
 /// evaluated against a set of rendering data — the full language, as against the inline
 /// substitution below.
@@ -1096,14 +1101,18 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// operation that reports a failed verification check.
 ///
 /// SES identities are per Region ([`request_region`]), so the refusal names the Region
-/// whose identity list the check failed in — upper-cased, as the service writes it —
-/// and then the identities that failed it. One wording, so two send paths cannot
-/// disagree about how the same failed check reads.
-pub fn unverified_identities_message(region: &str, identities: &str) -> String {
+/// whose identity list the check failed in — upper-cased, as the service writes it — and
+/// then EVERY identity that failed it, comma-separated, in the order the check consulted
+/// them. Each is named by the mailbox its value names ([`addr_spec`]), since that is the
+/// identity the request asked SES to use. One wording, so two send paths cannot disagree
+/// about how the same failed check reads.
+pub fn unverified_identities_message(region: &str, identities: &[&str]) -> String {
+    let failed: Vec<&str> = identities.iter().map(|identity| addr_spec(identity)).collect();
     format!(
         "Email address is not verified. The following identities failed the check in \
-         region {}: {identities}",
-        region.to_uppercase()
+         region {}: {}",
+        region.to_uppercase(),
+        failed.join(", ")
     )
 }
 
@@ -1833,6 +1842,53 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             return Some(exact);
         }
         self.covering_domain_identity(region, &key)
+    }
+
+    /// Every identity a send asks Amazon SES to use that this account has not verified, in
+    /// the order the request states them.
+    ///
+    /// The verification check covers every identity ONE message involves: the sending
+    /// identity the message is sent from, each recipient it addresses, and the address
+    /// bounce and complaint notifications are forwarded to, whose use is authorised by that
+    /// identity's own policy (`FeedbackForwardingEmailAddressIdentityArn`). The mailbox
+    /// SIMULATOR's own mailboxes are not identities of any account and need none
+    /// ([`is_mailbox_simulator`]), so they never fail the check.
+    ///
+    /// This is the list a failed check REPORTS ([`unverified_identities_message`]), which is
+    /// why it names every identity the check rejected rather than only the first. Each is
+    /// named as the request spells it ([`addr_spec`]), since a refusal names what the caller
+    /// asked for, and one mailbox named twice is named once — the names already seen are
+    /// held in a SET, so the pass costs one store lookup per address and nothing more.
+    ///
+    /// The caller bounds how many addresses it hands over: a single send weighs at most the
+    /// recipients one message may address, and a bulk send the recipients of the entries it
+    /// has messages for.
+    pub fn unverified_send_identities(
+        &self,
+        region: &str,
+        sender: &str,
+        recipients: &[String],
+        feedback_forwarding: Option<&str>,
+    ) -> Vec<String> {
+        let mut failed: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let asked = ::std::iter::once(sender)
+            .chain(recipients.iter().map(String::as_str))
+            .chain(feedback_forwarding);
+        for address in asked {
+            let mailbox = addr_spec(address);
+            if is_mailbox_simulator(mailbox) || !seen.insert(mailbox) {
+                continue;
+            }
+            let verified = self
+                .sending_identity_in(region, mailbox)
+                .is_some_and(|identity| identity.verified_for_sending);
+            if verified {
+                continue;
+            }
+            failed.push(mailbox.to_string());
+        }
+        failed
     }
 
     /// The most specific domain identity that covers the address `key` names, if any,
@@ -3707,6 +3763,27 @@ impl AccountState {
         let sequence = self.review_case_sequence;
         format!("case-{account_id}-{millis:012x}-{sequence:08x}")
     }
+}
+
+/// The domain of the Amazon SES mailbox SIMULATOR, whose mailboxes
+/// (`success@`, `bounce@`, `complaint@`, `ooto@`, `suppressionlist@`) SES answers for
+/// itself: they belong to no account, so no account verifies them as identities.
+///
+/// The one statement of that domain in this crate is the one the simulated answers are
+/// decided by ([`event_publication::outcome::MAILBOX_SIMULATOR_DOMAIN`]); this names it so
+/// the identity check and those answers cannot disagree about which mailboxes are the
+/// simulator's.
+pub const MAILBOX_SIMULATOR_DOMAIN: &str = event_publication::outcome::MAILBOX_SIMULATOR_DOMAIN;
+
+/// Whether `address` is a mailbox of the SES mailbox simulator
+/// ([`MAILBOX_SIMULATOR_DOMAIN`]).
+///
+/// The domain part is compared the way DNS compares a name ([`domain_key`]), so the
+/// simulator is the same mailbox in any spelling.
+pub fn is_mailbox_simulator(address: &str) -> bool {
+    identity_domain(address)
+        .eq_ignore_ascii_case(MAILBOX_SIMULATOR_DOMAIN)
+        && addr_spec(address).contains('@')
 }
 
 /// The addr-spec of a `From`-style address.

@@ -736,15 +736,34 @@ async fn data_that_states_no_value_for_an_attribute_the_template_names_is_refuse
 #[tokio::test]
 async fn rendering_data_that_is_no_set_of_key_value_pairs_is_refused() {
     // The model: `TemplateData` "is a set of key-value pairs", so a JSON value that is no
-    // object states no values for anything. The rows span what else text can be.
-    for (case, data) in [
-        ("text that is no JSON at all", "not json"),
-        ("a JSON array", r#"["name","Ada"]"#),
-        ("a JSON string", r#""Ada""#),
-        ("a JSON number", "42"),
-        ("a JSON null", "null"),
-        ("a JSON boolean", "true"),
-        ("an object that never closes", r#"{"name":"Ada""#),
+    // object states no values for anything. The rows span what else text can be, with the
+    // sentence each is refused with: text the JSON reader cannot read at all is reported as
+    // the parse that failed, and a JSON value that IS read but is no object is reported as
+    // data that is not what the member has to be.
+    for (case, data, sentence) in [
+        (
+            "text that is no JSON at all",
+            "not json",
+            "Unable to parse template data (invalid JSON).",
+        ),
+        (
+            "a JSON array",
+            r#"["name","Ada"]"#,
+            "Template rendering data is invalid",
+        ),
+        (
+            "a JSON string",
+            r#""Ada""#,
+            "Template rendering data is invalid",
+        ),
+        ("a JSON number", "42", "Template rendering data is invalid"),
+        ("a JSON null", "null", "Template rendering data is invalid"),
+        ("a JSON boolean", "true", "Template rendering data is invalid"),
+        (
+            "an object that never closes",
+            r#"{"name":"Ada""#,
+            "Unable to parse template data (invalid JSON).",
+        ),
     ] {
         let ses = Ses::new();
         let created = ses
@@ -766,7 +785,7 @@ async fn rendering_data_that_is_no_set_of_key_value_pairs_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "Template rendering data is invalid",
+            sentence,
             "case {case:?}: expected AWS's sentence for malformed rendering data, got {:?}",
             reply.message()
         );

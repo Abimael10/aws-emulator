@@ -21275,6 +21275,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "csv",
+ "encoding_rs",
  "getrandom 0.3.4",
  "handlebars",
  "hex",

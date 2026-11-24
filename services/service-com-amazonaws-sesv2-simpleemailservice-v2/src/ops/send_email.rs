@@ -240,11 +240,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // "You can send either a Simple message, Raw message, or a Templated
+        // message" — exactly one of the three. Which form was sent is settled first,
+        // because every check below reads the content in the form it names.
+        let form = content_form(&input.content)?;
+
+        // The REQUEST/CONTENT validation stage, which Amazon SES runs BEFORE it weighs the
+        // message against anything the account holds: the addresses the message names, the
+        // recipients it addresses, the headers, tags and attachments it carries. A request
+        // outside the form SES reads is the caller's mistake, whatever the account's
+        // sending switches, its sending identities or the resources the content names say
+        // — so it is refused here, ahead of every one of those
+        // ([`crate::state::send_validation`]).
+        validate_request(&input)?;
+
         // Members that select a resource this slice does not own: the sending
         // authorization policies, tenants and multi-region endpoints they name are
         // kept by operations nobody has written yet. A request that names one is
         // answered as unwritten, rather than accepted as if the member had not been
-        // sent.
+        // sent. Behind the validation above: a request that is malformed is refused for
+        // that whichever of these members it also carries.
         for (present, member) in [
             (
                 input.from_email_address_identity_arn.is_some(),
@@ -270,11 +285,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "You can send either a Simple message, Raw message, or a Templated
-        // message" — exactly one of the three. Which form was sent is settled here;
-        // the message itself is composed below, once the store a templated message
-        // reads its template from is locked.
-        let form = content_form(&input.content)?;
+        // "The List of attachments to include in your email. All recipients will
+        // receive the same attachments": assembling a MIME document that carries them is a
+        // capability this slice does not have, and a request whose attachments SES itself
+        // would carry (checked above) is a valid one — answered as unwritten rather than as
+        // the caller's mistake, exactly as the bulk send answers the same member.
+        if input
+            .content
+            .template
+            .as_ref()
+            .and_then(|template| template.attachments.as_ref())
+            .is_some_and(|attachments| !attachments.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendEmail with template attachments",
+            ));
+        }
 
         // Everything the REQUEST itself settles about the message is settled before any of
         // this account's state is read: a simple message's own parts, a raw message's
@@ -311,9 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "SendEmail with the recipients only in the raw message's headers",
                 ));
             }
-            return Err(bad_request(
-                "Destination must contain at least one of ToAddresses, CcAddresses or BccAddresses.",
-            ));
+            return Err(bad_request(MISSING_RECIPIENT_HEADER));
         }
 
         let now = ::std::time::SystemTime::now();
@@ -402,15 +426,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // How many recipients ONE message may address: a quota on the message, read after
+        // the configuration set the message names has been resolved and before the sending
+        // identity is weighed — which is where SES is recorded reading it, between the two.
+        // Every recipient line is one recipient set: the ceiling is counted across them, and
+        // each recipient counts once against the account's sending quota below.
+        let addressed: Vec<String> = to.iter().chain(&cc).chain(&bcc).cloned().collect();
+        if addressed.len() > crate::state::send_validation::MAX_RECIPIENTS_PER_MESSAGE {
+            return Err(bad_request(
+                crate::state::send_validation::too_many_recipients(),
+            ));
+        }
+
         // "The address that you specify has to be verified." An address identity
         // authorises itself; a domain identity authorises every address in that
-        // domain and its subdomains.
-        let authorised = store
-            .sending_identity_in(&region, &from)
-            .is_some_and(|identity| identity.verified_for_sending);
-        if !authorised {
+        // domain and its subdomains. The check covers every identity this message
+        // involves — the sending identity, the recipients it addresses and the address
+        // bounce and complaint notifications are forwarded to — and the refusal names
+        // every one of them that failed it, in the order the request states them.
+        let failed = store.unverified_send_identities(
+            &region,
+            &from,
+            &addressed,
+            input.feedback_forwarding_email_address.as_deref(),
+        );
+        // What the failed check REFUSES is the sending identity: a send whose own sender
+        // this account has not verified has no identity to send as.
+        if failed.iter().any(|identity| identity == crate::state::addr_spec(&from)) {
+            let named: Vec<&str> = failed.iter().map(String::as_str).collect();
             return Err(SendEmailErrorModeled::MessageRejected(MessageRejected {
-                message: Some(crate::state::unverified_identities_message(&region, &from)),
+                message: Some(crate::state::unverified_identities_message(&region, &named)),
             })
             .into());
         }
@@ -434,7 +479,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account's 24-hour sending quota, measured over the window rather
         // than over all time: `settle` above recomputed the counter from the log, so
         // this reads the one view of it rather than scanning the log again.
-        let addressed: Vec<String> = to.iter().chain(&cc).chain(&bcc).cloned().collect();
         let recipients = addressed.len() as f64;
         let charged = store.send_counters.sent_last_24h;
         let quota = store.send_counters.max_24h;
@@ -638,10 +682,43 @@ enum ContentForm {
     Templated,
 }
 
+/// How this operation refuses a simple message whose body carries neither part.
+///
+/// "The body of the message. You can specify an HTML version of the message, a text-only
+/// version of the message, or both" (`Message$Body`): a body stating neither has no content
+/// to send. The sentence names the two members, in the spelling SES reads them under, and
+/// nothing of the request.
+const EMPTY_BODY: &str = "Value null at both body.text and body.html.";
+
+/// How this operation refuses a message that addresses nobody: a `Destination` whose three
+/// recipient lines are all absent or empty.
+///
+/// "The message must include at least one recipient email address. The recipient address can
+/// be a To: address, a CC: address, or a BCC: address": the message is refused as the
+/// recipient header it has not got, which is how this operation reports the sending
+/// identity it has not got too ("Missing required header 'From'."). Fixed text, naming the
+/// header. The BULK send states the same absence as the empty destination it is
+/// (`crate::state::send_validation::EMPTY_DESTINATION`), per entry.
+const MISSING_RECIPIENT_HEADER: &str = "Missing required header 'To'.";
+
 /// How this operation refuses templated content that identifies no template at all — content
-/// whose `Template` names neither a stored template nor content of its own: there is no
-/// template to render the message from.
-const NO_TEMPLATE: &str = "The template does not exist";
+/// whose `Template` states neither the name nor the ARN of a template of this account, and
+/// carries no content of its own: there is nothing to render the message from.
+///
+/// `Template$TemplateName` is "the name of the template" and `Template$TemplateArn` "the
+/// Amazon Resource Name (ARN) of the template": a request that states neither has not said
+/// which template to render, which is what this sentence reports. Fixed text, naming the two
+/// members and nothing from the request.
+const NO_TEMPLATE: &str = "TemplateName and TemplateArn cannot be both empty";
+
+/// How this operation refuses templated content that states no values for the template's
+/// message variables — content whose `Template` carries no `TemplateData` at all, or carries
+/// it empty.
+///
+/// `Template$TemplateData` is "an object that defines the values to use for message
+/// variables in the template", which a templated send states: nothing is the values of no
+/// variable, so there is no message to render. Fixed text, naming the member.
+const EMPTY_TEMPLATE_DATA: &str = "Template data cannot be empty";
 
 /// The resource type an email template's ARN addresses it by, as SES writes the resource
 /// field of one (`crate::state::ses_resource_of`).
@@ -678,27 +755,129 @@ fn content_form(content: &EmailContent) -> Result<ContentForm, SendEmailError> {
     ) {
         (Some(_), None, None) => Ok(ContentForm::Simple),
         (None, Some(_), None) => Ok(ContentForm::Raw),
-        (None, None, Some(template)) => {
-            if template
-                .attachments
-                .as_ref()
-                .is_some_and(|attachments| !attachments.is_empty())
-            {
-                // "The List of attachments to include in your email. All recipients will
-                // receive the same attachments": assembling a MIME document that carries
-                // them is a capability this slice does not have, and the request is a valid
-                // one — answered as unwritten rather than as the caller's mistake, exactly
-                // as the bulk send answers the same member.
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "SendEmail with template attachments",
-                ));
-            }
-            Ok(ContentForm::Templated)
-        }
+        (None, None, Some(_)) => Ok(ContentForm::Templated),
         _ => Err(bad_request(
             "Content must carry exactly one of Simple, Raw or Template.",
         )),
     }
+}
+
+/// What the REQUEST and the message CONTENT have to be for Amazon SES to look at the
+/// message at all, checked before anything the account holds is read.
+///
+/// The ONE stage both send paths run ([`crate::state::send_validation`]), over every element
+/// of this request that carries one: each address member it names, the recipient set it
+/// addresses, the headers and the tags the message carries, and the attachments it includes.
+/// A defect in any of them is the caller's mistake — `BadRequestException`, naming the
+/// element that is wrong — so the sender's verification check, the account's sending
+/// switches and the resources the content names are never reached by a malformed request.
+fn validate_request(input: &SendEmailInput) -> Result<(), SendEmailError> {
+    // The sending identity and the two addresses the message nominates for replies and for
+    // feedback: each names a mailbox, so each is read against the one address form.
+    for value in [
+        input.from_email_address.as_deref(),
+        input.feedback_forwarding_email_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        input
+            .reply_to_addresses
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str),
+    ) {
+        if let Some(defect) = crate::state::send_validation::address_defect(value) {
+            return Err(bad_request(defect));
+        }
+    }
+
+    // The recipients the message addresses: how many of them one message may carry, and
+    // then each of their addresses. A destination that addresses nobody is read below,
+    // where a raw message's own recipient headers are accounted for.
+    if let Some(destination) = input.destination.as_ref() {
+        let recipients = crate::state::send_validation::destination_recipients(destination);
+        if let Some(defect) = crate::state::send_validation::recipient_set_defect(&recipients) {
+            return Err(bad_request(defect));
+        }
+    }
+
+    // The headers the message adds to itself and the attachments it includes, which a
+    // simple message and a templated message each carry as their own members; a raw message
+    // writes both inside the MIME document, which is the caller's own business.
+    if let Some(defect) =
+        crate::state::send_validation::headers_defect(content_headers(&input.content))
+    {
+        return Err(bad_request(defect));
+    }
+    if let Some(defect) =
+        crate::state::send_validation::attachments_defect(content_attachments(&input.content))
+    {
+        return Err(bad_request(defect));
+    }
+
+    // "A list of tags, in the form of name/value pairs, to apply to an email that you send
+    // using the SendEmail operation": they are the message's whatever form it carries.
+    if let Some(defect) = crate::state::send_validation::tags_defect(
+        input.email_tags.as_deref().unwrap_or_default(),
+    ) {
+        return Err(bad_request(defect));
+    }
+
+    // The character set each part of a simple message's text is written in: a part that
+    // names one names a character set SES can read it in.
+    if let Some(simple) = input.content.simple.as_ref() {
+        for part in [
+            Some(&simple.subject),
+            simple.body.text.as_ref(),
+            simple.body.html.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(charset) = part.charset.as_deref() {
+                if let Some(defect) = crate::state::send_validation::charset_defect(charset) {
+                    return Err(bad_request(defect));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+/// The headers the message adds to itself, as the content's form carries them: a simple
+/// message's own `Message$Headers` and a templated message's `Template$Headers`. A raw
+/// message writes its headers inside the MIME document, so it states none here.
+fn content_headers(content: &EmailContent) -> &[MessageHeader] {
+    content
+        .simple
+        .as_ref()
+        .and_then(|simple| simple.headers.as_deref())
+        .or_else(|| {
+            content
+                .template
+                .as_ref()
+                .and_then(|template| template.headers.as_deref())
+        })
+        .unwrap_or_default()
+}
+
+/// The attachments the message includes, as the content's form carries them:
+/// `Message$Attachments` and `Template$Attachments` — "the List of attachments to include in
+/// your email" either way. A raw message carries its own MIME parts instead.
+fn content_attachments(content: &EmailContent) -> &[Attachment] {
+    content
+        .simple
+        .as_ref()
+        .and_then(|simple| simple.attachments.as_deref())
+        .or_else(|| {
+            content
+                .template
+                .as_ref()
+                .and_then(|template| template.attachments.as_deref())
+        })
+        .unwrap_or_default()
 }
 
 /// What the REQUEST alone settles about the message, before any state of the account is
@@ -779,9 +958,7 @@ fn request_content(
             let body = simple.body.text.as_ref().map(|part| part.data.clone());
             let html = simple.body.html.as_ref().map(|part| part.data.clone());
             if body.is_none() && html.is_none() {
-                return Err(bad_request(
-                    "Body must contain either a Text or an Html part.",
-                ));
+                return Err(bad_request(EMPTY_BODY));
             }
             Ok(RequestContent::Composed(MessageParts {
                 subject: Some(simple.subject.data.clone()),
@@ -812,29 +989,25 @@ fn request_content(
             rendering_failure: None,
         })),
         (ContentForm::Templated, _, _, Some(template)) => {
+            // Which template renders the message is settled first: a request that has not
+            // said which is refused for that, whatever values it carries.
+            let selector = template_selector(template)?;
             // "An object that defines the values to use for message variables in the
             // template": the data is the set of key-value pairs the variables take their
-            // values from. A template sent with no data at all has no value for any
-            // variable, and a name the data does not give renders as nothing, so the
-            // absent member renders the template's own text with every reference resolved
-            // to the empty string rather than refusing the send.
+            // values from, and a templated send states it — a send carrying no data at all
+            // states no value for any variable, which is not a message SES renders.
             let variables = match template.template_data.as_deref() {
-                None => ::serde_json::Value::Object(::serde_json::Map::new()),
+                None | Some("") => return Err(bad_request(EMPTY_TEMPLATE_DATA)),
                 Some(raw) => match crate::state::template_rendering::message_variables(raw) {
-                    Some(variables) => variables,
-                    None => {
-                        // The one sentence this service states for rendering data that is
-                        // no set of key-value pairs, which the operation that PREVIEWS a
-                        // render states too
-                        // ([`crate::state::template_rendering::invalid_rendering_data`]).
-                        return Err(bad_request(
-                            crate::state::template_rendering::invalid_rendering_data(),
-                        ));
-                    }
+                    Ok(variables) => variables,
+                    // The sentences this service states for rendering data that supplies no
+                    // message variables, which the operation that PREVIEWS a render states
+                    // too ([`crate::state::template_rendering::message_variables`]).
+                    Err(defect) => return Err(bad_request(defect)),
                 },
             };
             Ok(RequestContent::Templated(TemplatedRequest {
-                selector: template_selector(template)?,
+                selector,
                 variables,
                 // "The list of message headers that will be added to the email message", in
                 // the order the template states them.
@@ -959,6 +1132,11 @@ fn template_selector(template: &Template) -> Result<TemplateSelector, SendEmailE
     let Some(content) = template.template_content.clone() else {
         return Err(bad_request(NO_TEMPLATE));
     };
+    // Content the request carries INLINE is the template, so it has to carry what a
+    // template carries ([`crate::state::send_validation::inline_template_defect`]).
+    if let Some(defect) = crate::state::send_validation::inline_template_defect(&content) {
+        return Err(bad_request(defect));
+    }
     // Content the request carries INLINE belongs to no named template, so the quota
     // sentence a named write is refused with
     // (`crate::state::email_template_exceeds_maximum_size`, which names the template) has

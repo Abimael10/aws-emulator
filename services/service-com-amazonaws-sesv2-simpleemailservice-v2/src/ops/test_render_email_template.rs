@@ -189,13 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which the keys correspond to replacement tags in the email template": the one
         // reading of the rendering data, shared with the send operations that substitute
         // the same data into a template.
-        let Some(variables) =
-            crate::state::template_rendering::message_variables(&input.template_data)
-        else {
-            return Err(bad_request(
-                crate::state::template_rendering::invalid_rendering_data(),
-            ));
-        };
+        let variables =
+            match crate::state::template_rendering::message_variables(&input.template_data) {
+                Ok(variables) => variables,
+                Err(defect) => return Err(bad_request(defect)),
+            };
 
         let rendered = match crate::state::template_language::evaluate(&content, &variables).await {
             Ok(rendered) => rendered,

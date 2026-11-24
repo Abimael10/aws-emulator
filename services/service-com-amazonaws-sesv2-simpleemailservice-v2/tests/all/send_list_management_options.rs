@@ -365,10 +365,11 @@ async fn a_well_formed_pair_goes_on_to_the_sender_check() {
                 reply.message(),
                 format!(
                     "Email address is not verified. The following identities failed the check in \
-                     region {}: stranger@nowhere.example",
+                     region {}: stranger@nowhere.example, reader@example.net",
                     region.to_uppercase()
                 ),
-                "case ({region}, {options}): expected the refusal to name the Region and the sender, got {:?}",
+                "case ({region}, {options}): expected the refusal to name the Region and every \
+                 identity that failed the check, got {:?}",
                 reply.message()
             );
         }

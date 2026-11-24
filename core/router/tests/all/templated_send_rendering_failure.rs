@@ -420,10 +420,10 @@ const ROWS: &[Row] = &[
         missing: Some("amount"),
     },
     Row {
-        case: "no TemplateData member at all, so no variable has a value",
+        case: "data stating a value only for a name the template does not use",
         content: subject_and_text,
         identified: Identified::ByName,
-        data: None,
+        data: Some(r#"{"other":"x"}"#),
         missing: Some("name"),
     },
     Row {

@@ -86,7 +86,7 @@ pub enum RenderRefusal {
     TooLarge,
 }
 
-/// The message variables `raw` supplies, or `None` when it is no set of key-value pairs.
+/// The message variables `raw` supplies, or the sentence refusing data that supplies none.
 ///
 /// "This object is a set of key-value pairs": a JSON object is the only value that is one,
 /// so an array, a bare scalar and text that is no JSON at all supply no variables. The
@@ -94,14 +94,35 @@ pub enum RenderRefusal {
 /// `length: min 0` in the model, so a caller may send it, and a send that states no value
 /// for any variable is what it states.
 ///
+/// The two ways data supplies no variables are refused in their own words, because they are
+/// different failures of the member: text the JSON reader cannot read at all is reported as
+/// the parse that failed ([`unparseable_rendering_data`]), and a JSON value that IS read but
+/// is no set of key-value pairs is reported as data that is not what the member has to be
+/// ([`invalid_rendering_data`]).
+///
 /// The parse is `serde_json`'s, which returns an error rather than panicking on anything a
 /// caller sends, and the input is bounded by the member's own 262144-byte maximum.
-pub fn message_variables(raw: &str) -> Option<Value> {
+pub fn message_variables(raw: &str) -> Result<Value, String> {
     if raw.is_empty() {
-        return Some(Value::Object(::serde_json::Map::new()));
+        return Ok(Value::Object(::serde_json::Map::new()));
     }
-    let parsed: Value = ::serde_json::from_str(raw).ok()?;
-    parsed.is_object().then_some(parsed)
+    let parsed: Value =
+        ::serde_json::from_str(raw).map_err(|_| unparseable_rendering_data())?;
+    match parsed.is_object() {
+        true => Ok(parsed),
+        false => Err(invalid_rendering_data()),
+    }
+}
+
+/// How this service words the refusal of rendering DATA the JSON reader cannot read at all.
+///
+/// The sentence this condition is RECORDED answering with, which is wholly fixed text: the
+/// parse that failed is reported, and no part of the data is echoed back. Stated once here,
+/// so the surface that previews a render (`crate::ops::test_render_email_template`) and the
+/// sends that render a template (`crate::ops::send_email`,
+/// `crate::ops::send_bulk_email`) word the one condition the same way.
+pub fn unparseable_rendering_data() -> String {
+    "Unable to parse template data (invalid JSON).".to_string()
 }
 
 /// How this service words the refusal of rendering DATA that is no set of key-value pairs

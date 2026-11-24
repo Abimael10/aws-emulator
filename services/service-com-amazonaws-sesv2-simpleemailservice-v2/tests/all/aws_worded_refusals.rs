@@ -318,20 +318,31 @@ async fn a_refused_create_persists_nothing_so_the_name_stays_reusable() {
     );
 }
 
-/// The forms rendering data takes when it is not the object the model says it is.
-const MALFORMED_DATA: [(&str, &str); 7] = [
-    ("text that is no JSON at all", "name=Ada"),
-    ("a JSON array", r#"["name","Ada"]"#),
-    ("a JSON string", r#""Ada""#),
-    ("a JSON number", "42"),
-    ("a JSON null", "null"),
-    ("a JSON boolean", "true"),
-    ("an object that never closes", r#"{"name":"Ada""#),
+/// The forms rendering data takes when it is not the object the model says it is, with the
+/// sentence each is refused with: text the JSON reader cannot read at all is reported as the
+/// parse that failed, and a JSON value that IS read but is no set of key-value pairs is
+/// reported as data that is not what the member has to be.
+const MALFORMED_DATA: [(&str, &str, &str); 7] = [
+    ("text that is no JSON at all", "name=Ada", UNPARSEABLE_RENDERING_DATA),
+    ("a JSON array", r#"["name","Ada"]"#, INVALID_RENDERING_DATA),
+    ("a JSON string", r#""Ada""#, INVALID_RENDERING_DATA),
+    ("a JSON number", "42", INVALID_RENDERING_DATA),
+    ("a JSON null", "null", INVALID_RENDERING_DATA),
+    ("a JSON boolean", "true", INVALID_RENDERING_DATA),
+    (
+        "an object that never closes",
+        r#"{"name":"Ada""#,
+        UNPARSEABLE_RENDERING_DATA,
+    ),
 ];
 
 /// AWS's sentence for rendering data that is not a set of key-value pairs: fixed text with
 /// no variable part and no trailing full stop.
 const INVALID_RENDERING_DATA: &str = "Template rendering data is invalid";
+
+/// AWS's sentence for rendering data the JSON reader cannot read at all: fixed text, with a
+/// trailing full stop.
+const UNPARSEABLE_RENDERING_DATA: &str = "Unable to parse template data (invalid JSON).";
 
 #[tokio::test]
 async fn malformed_rendering_data_is_refused_in_one_sentence_whoever_read_it() {
@@ -343,7 +354,7 @@ async fn malformed_rendering_data_is_refused_in_one_sentence_whoever_read_it() {
         "the template must be saved first"
     );
 
-    for (case, data) in MALFORMED_DATA {
+    for (case, data, sentence) in MALFORMED_DATA {
         // The operation that previews a render.
         let rendered = ses.render(template, data).await;
         refused(
@@ -351,7 +362,7 @@ async fn malformed_rendering_data_is_refused_in_one_sentence_whoever_read_it() {
             &rendered,
             400,
             "BadRequestException",
-            INVALID_RENDERING_DATA,
+            sentence,
         );
 
         // And the send that renders the same template from the same data. The sender is one
@@ -370,7 +381,7 @@ async fn malformed_rendering_data_is_refused_in_one_sentence_whoever_read_it() {
             &sent,
             400,
             "BadRequestException",
-            INVALID_RENDERING_DATA,
+            sentence,
         );
     }
 
@@ -433,7 +444,7 @@ async fn an_unverified_sender_masks_which_templates_the_account_holds() {
             400,
             "MessageRejected",
             "Email address is not verified. The following identities failed the check in \
-             region US-EAST-1: stranger@example.com",
+             region US-EAST-1: stranger@example.com, reader@example.net",
         );
     }
 }

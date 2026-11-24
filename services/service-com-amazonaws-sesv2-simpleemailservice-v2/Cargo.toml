@@ -130,6 +130,10 @@ service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 # (`state::import_source`). Only the generated client is needed — the emulator supplies the
 # transport.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `encoding_rs`: the register of character-set labels and their aliases, which is what a
+# `Content$Charset` a send states is read against (`state::send_validation`) — the
+# standard's own naming rather than a list of charset names kept in this crate.
+encoding_rs = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -368,50 +368,47 @@ fn request(data: Option<&str>, entries: Vec<Value>) -> Value {
 
 #[tokio::test]
 async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
-    // The member is what makes a bulk send's content complete, so the rows span the ways a
-    // request can fail to carry one: the member absent altogether (the recorded case), and
-    // every JSON value that is no object — a list, each kind of scalar, and text that is no
-    // JSON at all. The accepted rows below are the counter-case.
+    // The rows span the ways default template data can fail to supply message variables:
+    // every JSON value that is no object — a list, each kind of scalar — and text the JSON
+    // reader cannot read at all, which is reported as the parse that failed. The accepted
+    // rows below are the counter-case, and they include the member left out altogether: a
+    // bulk send with no default data states no value for any variable rather than being
+    // malformed.
     let refused: &[(&str, Option<&str>, &str)] = &[
-        (
-            "no TemplateData member at all",
-            None,
-            "The default template data does not exist",
-        ),
         (
             "a JSON list",
             Some("[]"),
-            "The default template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "a JSON string",
             Some("\"name\""),
-            "The default template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "a JSON number",
             Some("42"),
-            "The default template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "a JSON boolean",
             Some("true"),
-            "The default template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "JSON null",
             Some("null"),
-            "The default template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "text that is no JSON at all",
             Some("name=reader"),
-            "The default template data is not a valid JSON object",
+            "Unable to parse template data (invalid JSON).",
         ),
         (
             "an unterminated JSON object",
             Some("{\"name\":"),
-            "The default template data is not a valid JSON object",
+            "Unable to parse template data (invalid JSON).",
         ),
     ];
 
@@ -448,19 +445,20 @@ async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
     }
 
     // The values that ARE a set of key-value pairs, including the two empty ones a caller
-    // may send (`EmailTemplateData` is `length: min 0`).
+    // may send (`EmailTemplateData` is `length: min 0`) and the member left out entirely.
     for (case, data) in [
-        ("the empty string", ""),
-        ("an empty JSON object", "{}"),
-        ("one pair", "{\"name\":\"Ada\"}"),
+        ("no TemplateData member at all", None),
+        ("the empty string", Some("")),
+        ("an empty JSON object", Some("{}")),
+        ("one pair", Some("{\"name\":\"Ada\"}")),
         (
             "a pair the template names and one it does not",
-            "{\"name\":\"Ada\",\"unused\":1}",
+            Some("{\"name\":\"Ada\",\"unused\":1}"),
         ),
     ] {
         let ses = seeded().await;
         let reply = ses
-            .send_bulk(request(Some(data), vec![entry("reader@example.net")]))
+            .send_bulk(request(data, vec![entry("reader@example.net")]))
             .await;
         assert_eq!(
             reply.status, 200,
@@ -485,6 +483,9 @@ async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
 enum Gate {
     /// The default content names no template at all.
     NoTemplate,
+    /// The default content carries a template that states neither a name nor an ARN, and
+    /// carries no content of its own.
+    NoTemplateNamed,
     /// The template the request names is one the account does not hold.
     TemplateMissing,
     /// The request names a configuration set nothing created.
@@ -497,6 +498,8 @@ enum Gate {
     UnverifiedSender,
     /// The request addresses one destination more than a bulk send may.
     TooManyDestinations,
+    /// The request addresses no destination at all.
+    NoDestinations,
 }
 
 /// Destinations one bulk send may address, which the handler refuses past.
@@ -509,7 +512,13 @@ async fn a_failure_of_the_request_refuses_the_whole_send() {
             Gate::NoTemplate,
             400,
             "BadRequestException",
-            "The default template does not exist".to_string(),
+            "Template content must be specified".to_string(),
+        ),
+        (
+            Gate::NoTemplateNamed,
+            400,
+            "BadRequestException",
+            "TemplateName and TemplateArn both can not be empty".to_string(),
         ),
         (
             Gate::TemplateMissing,
@@ -543,18 +552,26 @@ async fn a_failure_of_the_request_refuses_the_whole_send() {
             "MessageRejected",
             format!(
                 "Email address is not verified. The following identities failed the check in \
-                 region {}: stranger@nowhere.example",
+                 region {}: stranger@nowhere.example, reader@example.net",
                 HOME.to_uppercase()
             ),
         ),
         (
             Gate::TooManyDestinations,
             400,
-            "LimitExceededException",
+            "BadRequestException",
             format!(
-                "A bulk send may address no more than {MAX_DESTINATIONS} destinations, but {} \
-                 were provided.",
-                MAX_DESTINATIONS + 1
+                "You must specify at least 1 destination, and no more than \
+                 {MAX_DESTINATIONS} destinations"
+            ),
+        ),
+        (
+            Gate::NoDestinations,
+            400,
+            "BadRequestException",
+            format!(
+                "You must specify at least 1 destination, and no more than \
+                 {MAX_DESTINATIONS} destinations"
             ),
         ),
     ];
@@ -565,6 +582,10 @@ async fn a_failure_of_the_request_refuses_the_whole_send() {
         match gate {
             Gate::NoTemplate => {
                 body["DefaultContent"] = json!({});
+            }
+            Gate::NoTemplateNamed => {
+                body["DefaultContent"]["Template"] =
+                    json!({"TemplateData": "{\"name\":\"Ada\"}"});
             }
             Gate::TemplateMissing => {
                 body["DefaultContent"]["Template"]["TemplateName"] = json!("no-such-template");
@@ -604,6 +625,9 @@ async fn a_failure_of_the_request_refuses_the_whole_send() {
                         .map(|index| entry(&format!("reader-{index}@example.net")))
                         .collect(),
                 );
+            }
+            Gate::NoDestinations => {
+                body["BulkEmailEntries"] = json!([]);
             }
         }
 
@@ -929,15 +953,13 @@ async fn an_entry_that_names_no_message_is_the_only_one_that_fails() {
             "a destination with no addresses at all",
             json!({"Destination": {}}),
             "INVALID_PARAMETER",
-            "Destination must contain at least one of ToAddresses, CcAddresses or \
-             BccAddresses.",
+            "Destination cannot be empty",
         ),
         (
             "a destination whose address lists are all empty",
             json!({"Destination": {"ToAddresses": [], "CcAddresses": [], "BccAddresses": []}}),
             "INVALID_PARAMETER",
-            "Destination must contain at least one of ToAddresses, CcAddresses or \
-             BccAddresses.",
+            "Destination cannot be empty",
         ),
         (
             "replacement data that is a JSON list",
@@ -948,7 +970,7 @@ async fn an_entry_that_names_no_message_is_the_only_one_that_fails() {
                 }},
             }),
             "INVALID_PARAMETER",
-            "The replacement template data is not a valid JSON object",
+            "Template rendering data is invalid",
         ),
         (
             "replacement data that is no JSON at all",
@@ -959,7 +981,7 @@ async fn an_entry_that_names_no_message_is_the_only_one_that_fails() {
                 }},
             }),
             "INVALID_PARAMETER",
-            "The replacement template data is not a valid JSON object",
+            "Unable to parse template data (invalid JSON).",
         ),
     ];
 
@@ -1756,14 +1778,6 @@ async fn a_templated_send_composes_its_message_from_the_template() {
             headers: Vec::new(),
         },
         TemplatedCase {
-            case: "no TemplateData member at all, so no variable has a value",
-            template: json!({ "TemplateName": TEMPLATE }),
-            subject: None,
-            text: None,
-            html: None,
-            headers: Vec::new(),
-        },
-        TemplatedCase {
             case: "headers the template states, which are added to the message",
             template: json!({
                 "TemplateName": TEMPLATE,
@@ -1888,14 +1902,14 @@ async fn a_templated_send_that_names_no_renderable_template_is_refused() {
             json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "name=Ada"}}),
             400,
             "BadRequestException",
-            "Template rendering data is invalid".to_string(),
+            "Unable to parse template data (invalid JSON).".to_string(),
         ),
         (
             "a template naming neither a stored template nor content of its own",
             json!({"Template": {"TemplateData": "{}"}}),
             400,
             "BadRequestException",
-            "The template does not exist".to_string(),
+            "TemplateName and TemplateArn cannot be both empty".to_string(),
         ),
         (
             "content carrying a simple message beside the template",

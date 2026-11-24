@@ -262,9 +262,17 @@ const DATA: &str = "{\"name\":\"Ada\"}";
 /// which `TestRenderEmailTemplate` answers the same data with.
 const INVALID_DATA: &str = "Template rendering data is invalid";
 
+/// The sentence this service answers for template data the JSON reader cannot read at all,
+/// which `TestRenderEmailTemplate` answers the same data with.
+const UNPARSEABLE_DATA: &str = "Unable to parse template data (invalid JSON).";
+
+/// The sentence a templated send is refused with when it states no values for the template's
+/// message variables at all.
+const EMPTY_DATA: &str = "Template data cannot be empty";
+
 /// The sentence this service answers for content whose `Template` identifies no template at
 /// all — naming neither a stored one nor carrying content of its own.
-const NO_TEMPLATE: &str = "The template does not exist";
+const NO_TEMPLATE: &str = "TemplateName and TemplateArn cannot be both empty";
 
 /// The sentence every operation over an `EmailTemplateName` answers for a template the
 /// account holds nothing under.
@@ -272,13 +280,14 @@ fn no_such_template(name: &str) -> String {
     format!("Template {name} does not exist.")
 }
 
-/// The sentence the service answers for a sender that failed the verification check:
-/// the Region the call executes in, upper-cased, then the identities that failed.
-fn refusal(region: &str, identities: &str) -> String {
+/// The sentence the service answers for a send whose identities failed the verification
+/// check: the Region the call executes in, upper-cased, then every identity that failed it.
+fn refusal(region: &str, identities: &[&str]) -> String {
     format!(
         "Email address is not verified. The following identities failed the check in region {}: \
-         {identities}",
-        region.to_uppercase()
+         {}",
+        region.to_uppercase(),
+        identities.join(", ")
     )
 }
 
@@ -361,7 +370,9 @@ async fn the_refusal_names_the_region_of_the_call_and_the_identity_that_failed()
             refused.status,
             refused.body
         );
-        let expected = refusal(row.served_in, row.sender);
+        // The recipient every row addresses is an address this account holds no identity
+        // for either, so the check fails for it as well and the refusal names both.
+        let expected = refusal(row.served_in, &[row.sender, "recipient@example.net"]);
         assert_eq!(
             refused.message(),
             expected,
@@ -496,7 +507,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "pending@example.com",
             names: Names::Stored,
             data: None,
-            expect: Expect::IdentityGate,
+            expect: Expect::BadRequest(EMPTY_DATA),
         },
         TemplatedRow {
             case: "an address inside a domain identity that is not verified yet, with the \
@@ -518,7 +529,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "stranger@example.com",
             names: Names::Stored,
             data: Some("{\"name\": "),
-            expect: Expect::BadRequest(INVALID_DATA),
+            expect: Expect::BadRequest(UNPARSEABLE_DATA),
         },
         TemplatedRow {
             case: "a JSON list rather than a set of key-value pairs, with an unverified \
@@ -540,7 +551,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "stranger@example.com",
             names: Names::Absent("absent"),
             data: Some("name=Ada"),
-            expect: Expect::BadRequest(INVALID_DATA),
+            expect: Expect::BadRequest(UNPARSEABLE_DATA),
         },
         TemplatedRow {
             case: "a JSON string rather than an object, with the content carried inline and \
@@ -582,7 +593,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "ada@verified.example",
             names: Names::Stored,
             data: Some("{\"name\": "),
-            expect: Expect::BadRequest(INVALID_DATA),
+            expect: Expect::BadRequest(UNPARSEABLE_DATA),
         },
         TemplatedRow {
             case: "a verified sender and a template name that does not exist: the name is \
@@ -624,7 +635,7 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             sender: "ada@verified.example",
             names: Names::Stored,
             data: None,
-            expect: Expect::Accepted,
+            expect: Expect::BadRequest(EMPTY_DATA),
         },
     ];
 
@@ -671,7 +682,9 @@ async fn template_data_is_refused_first_then_the_sender_then_the_template_name()
             .send_content(row.region, row.sender, json!({"Template": template}))
             .await;
         let (status, code, message) = match row.expect {
-            Expect::IdentityGate => (400, "MessageRejected", refusal(row.region, row.sender)),
+            // Every templated row addresses the mailbox simulator, which is no identity of
+            // any account and needs none, so the sender is the only identity that failed.
+            Expect::IdentityGate => (400, "MessageRejected", refusal(row.region, &[row.sender])),
             Expect::BadRequest(sentence) => (400, "BadRequestException", sentence.to_string()),
             Expect::NotFound(name) => (404, "NotFoundException", no_such_template(name)),
             Expect::Accepted => (200, "", String::new()),
@@ -801,7 +814,7 @@ async fn an_accepted_templated_send_carries_the_rendered_message() {
             Some("{\"other\":\"x\"}"),
             None,
         ),
-        ("no TemplateData member at all", None, None),
+        ("an empty set of values", Some("{}"), None),
     ];
     let region = "us-west-2";
 

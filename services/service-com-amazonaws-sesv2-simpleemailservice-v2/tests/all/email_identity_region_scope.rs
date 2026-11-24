@@ -422,8 +422,11 @@ async fn an_identity_is_reachable_only_from_the_region_it_was_created_in() {
         );
         assert_eq!(
             sent_away.message(),
-            unverified_identities_message(row.elsewhere, row.sender),
-            "case {case:?}: the refusal names the Region the send executes in and the sender"
+            // The recipient the send addresses is no identity of this account either, so
+            // the check fails for it as well and the refusal names both.
+            unverified_identities_message(row.elsewhere, &[row.sender, "rcpt@example.net"]),
+            "case {case:?}: the refusal names the Region the send executes in and every \
+             identity that failed the check"
         );
 
         // The delete is region-scoped too, and a refused one leaves the identity exactly
