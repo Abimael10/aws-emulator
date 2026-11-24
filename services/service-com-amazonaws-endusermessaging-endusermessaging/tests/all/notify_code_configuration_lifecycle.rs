@@ -54,6 +54,12 @@ mod listing;
 #[path = "notify_code_configuration_lifecycle/update.rs"]
 mod update;
 
+// `DeleteNotifyCodeConfiguration` and the deletion protection that refuses it, driven
+// over the same wire off its own harness: a child module of this suite, declared the
+// same way `listing` is.
+#[path = "notify_code_configuration_lifecycle/deletion.rs"]
+mod deletion;
+
 // The identifier-format and template-placeholder gates every operation of this surface
 // applies to a supplied value: another child module of this suite, declared the same way.
 #[path = "notify_code_configuration_lifecycle/identifier_and_template_gates.rs"]
