@@ -1130,3 +1130,239 @@ async fn a_deleted_endpoints_address_publishes_nothing() {
         "the listener of a deleted endpoint must be released"
     );
 }
+
+/// One row of the auth-gate table below: the endpoint's `authType`, the package the
+/// revision it routes to runs, and the answer THAT PACKAGE'S OWN CODE produces for the
+/// request — the status, the content type, the body and the header it sets.
+struct AuthGateRow {
+    case: &'static str,
+    auth_type: &'static str,
+    key: &'static str,
+    /// The revision's own environment variables, which the CommonJS package answers from.
+    environment: Value,
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+    served_by: &'static str,
+}
+
+/// The rows: the rule generalises over the endpoint's `authType` and over the code the
+/// revision ships, so the rows differ along both — each `authType` value crossed with each
+/// module form a Node.js package takes. The recorded case (an `IamAuth` endpoint running a
+/// CommonJS package) is one row.
+fn auth_gate_rows() -> Vec<AuthGateRow> {
+    vec![
+        AuthGateRow {
+            case: "an IamAuth endpoint running a CommonJS package",
+            auth_type: "IamAuth",
+            key: CJS_KEY,
+            environment: json!({ "GREETING": "the iam-authorized revision" }),
+            status: 200,
+            content_type: "text/plain",
+            body: "hello from the iam-authorized revision",
+            served_by: "commonjs",
+        },
+        AuthGateRow {
+            case: "an IamAuth endpoint running an ES module package",
+            auth_type: "IamAuth",
+            key: ESM_KEY,
+            environment: json!({}),
+            status: 201,
+            content_type: "text/plain",
+            body: "hello from an es module",
+            served_by: "esm",
+        },
+        AuthGateRow {
+            case: "an ApplicationManaged endpoint running a CommonJS package",
+            auth_type: "ApplicationManaged",
+            key: CJS_KEY,
+            environment: json!({ "GREETING": "the application-managed revision" }),
+            status: 200,
+            content_type: "text/plain",
+            body: "hello from the application-managed revision",
+            served_by: "commonjs",
+        },
+        AuthGateRow {
+            case: "an ApplicationManaged endpoint running an ES module package",
+            auth_type: "ApplicationManaged",
+            key: ESM_KEY,
+            environment: json!({}),
+            status: 201,
+            content_type: "text/plain",
+            body: "hello from an es module",
+            served_by: "esm",
+        },
+    ]
+}
+
+/// RULE: at ONE published address, the endpoint's `authType` decides only what a request
+/// PRESENTING NO SigV4 credential earns — an `IamAuth` endpoint ("requests ... must be
+/// signed with Signature Version 4") refuses it with the `403 Forbidden` page naming that
+/// response, an `ApplicationManaged` endpoint ("your application handles authorization")
+/// refuses nothing — while a request that DOES present a credential is answered by the
+/// revision's own code either way, with that code's status, headers and body.
+///
+/// So the refusal is observable at an address that SERVES: the same address, in the same
+/// state, answers the authorized request with the handler's response, which is what makes
+/// the unsigned request's `403` mean the auth gate rather than an endpoint that serves
+/// nothing. A request is also not a consumable: once the refusal has been earned, the next
+/// authorized request earns the same answer the first did, under an id of its own.
+///
+/// Driven over a real socket at the address `GetWebFunctionEndpoint` reports, in the order
+/// a client follows: read `domainName` off the `Active` endpoint, issue the authorized
+/// request, then the same request with no credential at all.
+#[tokio::test]
+async fn an_authorized_request_is_served_at_the_same_address_that_refuses_an_unsigned_one() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+    let rows = auth_gate_rows();
+
+    // Every function is created FIRST, so the clock-owed `Pending -> Active` spans of the
+    // rows' endpoints are waited out together rather than one after another.
+    let mut published = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("auth-gate-{index}");
+        let address = create_serving(
+            &emulator,
+            &name,
+            row.auth_type,
+            row.key,
+            row.environment.clone(),
+        )
+        .await;
+        assert!(
+            !address.is_empty(),
+            "case {:?}: the create must publish the endpoint's address, got {address:?}",
+            row.case
+        );
+        published.push((name, address));
+    }
+
+    let signed =
+        format!("authorization: {SIGNED}\r\nx-amz-content-sha256: {EMPTY_BODY_SHA256}\r\n");
+    for (row, (name, address)) in rows.iter().zip(published) {
+        let case = row.case;
+        // The address a client uses is the one the READ reports, taken once that same read
+        // says the endpoint is serving traffic.
+        let active = poll_until_active(&emulator, &name, "ep").await;
+        let domain_name = active
+            .get("domainName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            domain_name, address,
+            "case {case:?}: the Active read must report the published address, got {active:?}"
+        );
+
+        // The positive control, in both forms a client presents a SigV4 credential in.
+        let presentations: [(&str, &str, String); 2] = [
+            ("a credential in the Authorization header", "/", signed.clone()),
+            (
+                "a presigned credential in the query",
+                "/?X-Amz-Credential=AKIDEXAMPLE&X-Amz-Signature=deadbeef",
+                String::new(),
+            ),
+        ];
+        let mut named = Vec::new();
+        for (presentation, target, headers) in presentations {
+            let answered = dial_request(&domain_name, "GET", target, &headers).await;
+            assert_eq!(
+                status_on_the_wire(&answered),
+                row.status,
+                "case {case:?}/{presentation:?}: expected the status the code set, got {answered:?}"
+            );
+            assert_eq!(
+                header_on_the_wire(&answered, "content-type"),
+                row.content_type,
+                "case {case:?}/{presentation:?}: expected the content type the code set, got {:?}",
+                header_on_the_wire(&answered, "content-type")
+            );
+            assert_eq!(
+                header_on_the_wire(&answered, "x-served-by"),
+                row.served_by,
+                "case {case:?}/{presentation:?}: expected the header the code set, got {answered:?}"
+            );
+            assert_eq!(
+                body_on_the_wire(&answered),
+                row.body,
+                "case {case:?}/{presentation:?}: expected the body the code produced, got {:?}",
+                body_on_the_wire(&answered)
+            );
+            let request_id = header_on_the_wire(&answered, REQUEST_ID_HEADER);
+            assert!(
+                !request_id.is_empty(),
+                "case {case:?}/{presentation:?}: every answer names the response it is in its \
+                 {REQUEST_ID_HEADER} header, got {answered:?}"
+            );
+            named.push(request_id);
+        }
+
+        // The SAME request at that same address, presenting no credential at all.
+        let unsigned = dial_request(&domain_name, "GET", "/", "").await;
+        if row.auth_type == "IamAuth" {
+            assert_eq!(
+                status_on_the_wire(&unsigned),
+                403,
+                "case {case:?}: an unsigned request to an IamAuth endpoint is refused, got \
+                 {unsigned:?}"
+            );
+            assert_eq!(
+                header_on_the_wire(&unsigned, "content-type"),
+                "text/html",
+                "case {case:?}: expected the refusal to be served as the page, got {:?}",
+                header_on_the_wire(&unsigned, "content-type")
+            );
+            let request_id = header_on_the_wire(&unsigned, REQUEST_ID_HEADER);
+            assert!(
+                !request_id.is_empty(),
+                "case {case:?}: a 403 must carry a {REQUEST_ID_HEADER} header, got {unsigned:?}"
+            );
+            assert_eq!(
+                body_on_the_wire(&unsigned),
+                forbidden_page(&request_id),
+                "case {case:?}: expected the Forbidden page naming {request_id:?}, got {:?}",
+                body_on_the_wire(&unsigned)
+            );
+            assert!(
+                !named.contains(&request_id),
+                "case {case:?}: each answer names its own response, got {request_id:?} twice"
+            );
+            named.push(request_id);
+        } else {
+            assert_eq!(
+                status_on_the_wire(&unsigned),
+                row.status,
+                "case {case:?}: an ApplicationManaged endpoint refuses nothing of its own, got \
+                 {unsigned:?}"
+            );
+            assert_eq!(
+                body_on_the_wire(&unsigned),
+                row.body,
+                "case {case:?}: expected the body the code produced, got {:?}",
+                body_on_the_wire(&unsigned)
+            );
+        }
+
+        // Nothing was consumed by either answer: the next authorized request earns the same
+        // answer the first did, under an id of its own.
+        let again = dial_request(&domain_name, "GET", "/", &signed).await;
+        assert_eq!(
+            status_on_the_wire(&again),
+            row.status,
+            "case {case:?}: expected the code's own status again, got {again:?}"
+        );
+        assert_eq!(
+            body_on_the_wire(&again),
+            row.body,
+            "case {case:?}: expected the code's own body again, got {:?}",
+            body_on_the_wire(&again)
+        );
+        let request_id = header_on_the_wire(&again, REQUEST_ID_HEADER);
+        assert!(
+            !request_id.is_empty() && !named.contains(&request_id),
+            "case {case:?}: each answer names its own response, got {request_id:?} among \
+             {named:?}"
+        );
+    }
+}
