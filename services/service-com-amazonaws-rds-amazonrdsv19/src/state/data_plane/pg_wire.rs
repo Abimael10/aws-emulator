@@ -274,6 +274,7 @@ async fn serve_session(
         insert_id: super::mysql_insert_id::SessionInsertId::default(),
         diagnostics: super::mysql_diagnostics::SessionDiagnostics::default(),
         data_source_id: facts.data_source_id.clone(),
+        server_id: facts.server_id.clone(),
         activity: context.activity.clone(),
         lock_wait: super::activity_samples::LockWaitClock::default(),
     };

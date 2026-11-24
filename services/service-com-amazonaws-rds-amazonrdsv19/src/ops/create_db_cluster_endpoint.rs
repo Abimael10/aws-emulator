@@ -229,8 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // in a state no endpoint can be added to is the refusal that cause carries
             // ([`admits_the_cluster`]) rather than an endpoint pointing at nothing. RDS is
             // regional, so only the region the request was signed for is in scope.
-            let db_cluster_identifier =
+            let cluster =
                 admits_the_cluster(&store, &region, &input.db_cluster_identifier, Self::NAME)?;
+            let db_cluster_identifier = cluster.identifier;
 
             // "List of DB instance identifiers that are part of the custom endpoint group" and
             // the list that is not: each names a DB instance, so an identifier that resolves to
@@ -247,6 +248,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             admits_another_endpoint(&store, &key, &named, &db_cluster_identifier)?;
 
             let mint = store.next_mint();
+            // A custom endpoint is provisioned INTO the cluster it is associated with, so the
+            // span it owes the clock runs from the instant THAT cluster became ready rather
+            // than from this call ([`crate::state::provisioning_to`]): one span per dependency
+            // level, which is the same reading a cluster MEMBER's own provisioning follows
+            // (`crate::ops::create_db_instance`). The create itself still answers `creating`,
+            // and an endpoint created back to back with its cluster is still reported in that
+            // status for the rest of the span — what it does not do is cost a client that has
+            // already polled the cluster to `available` a whole poll interval of its own.
+            // Nothing is provisioned FROM a custom endpoint, so the instant it becomes ready
+            // is not kept on the record: the pending transition carries it.
+            let (provisioning, _) = crate::state::provisioning_to(
+                crate::state::DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE,
+                Some(cluster.ready_at),
+            );
             // WHAT the endpoint's own listener is opened onto: the cluster's VOLUME, on the
             // wire its engine speaks — the same storage every other endpoint of that cluster
             // addresses, since "each Aurora DB cluster hosts copies of its data" on one
@@ -263,9 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // reports `creating` until the transition the clock owes it comes due, which
                 // the next call materialises. Nothing sleeps.
                 status: crate::state::DB_CLUSTER_ENDPOINT_STATUS_CREATING.to_string(),
-                pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                    crate::state::DB_CLUSTER_ENDPOINT_STATUS_AVAILABLE,
-                )),
+                pending_status: Some(provisioning),
                 static_members,
                 excluded_members,
                 served_endpoint: None,
@@ -337,8 +350,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Whether the CLUSTER `named` still admits a custom endpoint, and the identifier it is
-/// stored under where it does — or the refusal that cause carries: the modelled not-found
+/// Whether the CLUSTER `named` still admits a custom endpoint, and what the new endpoint
+/// takes from it where it does ([`AdmittedCluster`]) — or the refusal that cause carries: the
+/// modelled not-found
 /// fault for a cluster this store does not hold, the parameter refusal for one this call does
 /// not apply to ("this action applies only to Aurora DB clusters"), and the modelled
 /// cluster-state fault for one in a state no endpoint can be added to
@@ -355,7 +369,7 @@ fn admits_the_cluster(
     region: &str,
     named: &str,
     operation: &str,
-) -> Result<String, CreateDBClusterEndpointError> {
+) -> Result<AdmittedCluster, CreateDBClusterEndpointError> {
     let Some(cluster) = store.resolve_db_cluster(region, named) else {
         return Err(CreateDBClusterEndpointErrorModeled::DBClusterNotFoundFault(
             DBClusterNotFoundFault {
@@ -393,7 +407,21 @@ fn admits_the_cluster(
             .into(),
         );
     }
-    Ok(cluster.identifier.clone())
+    Ok(AdmittedCluster {
+        identifier: cluster.identifier.clone(),
+        ready_at: cluster.ready_at,
+    })
+}
+
+/// The CLUSTER a new custom endpoint hangs off, as [`admits_the_cluster`] read it: the
+/// identifier it is stored under, and the instant it became — or becomes — ready.
+///
+/// The ready instant is what the endpoint's own provisioning span is charged from
+/// ([`crate::state::provisioning_to`]), so it is read from the cluster record beside the
+/// identifier rather than looked up a second time.
+struct AdmittedCluster {
+    identifier: String,
+    ready_at: ::std::time::Instant,
 }
 
 /// Whether the store admits another custom endpoint under `key` for the cluster

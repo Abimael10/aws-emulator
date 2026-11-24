@@ -450,6 +450,9 @@ pub(super) fn instance_facts(
             // The instance's own immutable id, which is the data source Performance
             // Insights monitors this engine as.
             data_source_id: record.dbi_resource_id.clone(),
+            // A session on a DB instance's own endpoint is served by that instance, member
+            // of a cluster or not: it is the server the client landed on.
+            server_id: Some(record.identifier.clone()),
         },
         database,
     ))
@@ -627,6 +630,17 @@ pub(super) struct RecordFacts {
     /// member's included, since Performance Insights monitors the member), the cluster's
     /// own `DbClusterResourceId` for a cluster endpoint.
     pub data_source_id: String,
+    /// The DB INSTANCE identifier of the Aurora member that SERVES this session, where one
+    /// does: the member a custom endpoint selected, the member whose own endpoint the client
+    /// dialled, or the member the cluster writes through / one of its read-only members for
+    /// the cluster's own two endpoints.
+    ///
+    /// Kept beside [`Self::identifier`] because the two answer different questions: the
+    /// identifier is the resource a record of what the session did is attributable to, while
+    /// this is the SERVER the session landed on, which Aurora MySQL publishes as
+    /// `aurora_server_id` ([`server_setting`]). `None` where no DB instance serves the
+    /// session.
+    pub server_id: Option<String>,
 }
 
 /// The facts a login is admitted against, derived from what one record says ([`RecordFacts`])
@@ -706,6 +720,7 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
         read_only: record.read_only,
         runtime: replaying(record.runtime, record.read_only),
         data_source_id: record.data_source_id,
+        server_id: record.server_id,
     }
 }
 
@@ -1010,6 +1025,8 @@ pub struct InstanceFacts {
     /// The data source a session on this endpoint is attributable to, as
     /// [`RecordFacts::data_source_id`] holds it.
     pub data_source_id: String,
+    /// The Aurora member that serves this session, as [`RecordFacts::server_id`] holds it.
+    pub server_id: Option<String>,
 }
 
 impl InstanceFacts {
@@ -1381,6 +1398,9 @@ pub struct SessionFacts {
     /// id of the resource whose engine it is running on
     /// ([`InstanceFacts::data_source_id`]), which is the id a monitoring service names.
     pub data_source_id: String,
+    /// The Aurora member SERVING this session, as [`InstanceFacts::server_id`] holds it —
+    /// what an Aurora MySQL session reads as `aurora_server_id` ([`server_setting`]).
+    pub server_id: Option<String>,
     /// Where each statement of this session records what it cost
     /// ([`super::activity_samples`]). `None` when no activity store is reachable from the
     /// engine this service is mounted on.
@@ -1502,7 +1522,7 @@ pub const MYSQL_MASTER_HOST_PATTERN: &str = "%";
 
 /// The settings the SERVER itself answers for, by name — the ones that are not
 /// parameter-group parameters at all. See [`server_setting`], which answers each of them.
-pub const SERVER_SETTING_NAMES: [&str; 29] = [
+pub const SERVER_SETTING_NAMES: [&str; 30] = [
     "ssl",
     "server_version",
     "version",
@@ -1532,6 +1552,7 @@ pub const SERVER_SETTING_NAMES: [&str; 29] = [
     "innodb_read_only",
     "transaction_read_only",
     "default_transaction_read_only",
+    "aurora_server_id",
 ];
 
 /// The settings the server itself answers for, by lowercased name.
@@ -1622,6 +1643,22 @@ fn server_setting(facts: &SessionFacts, lowered: &str) -> Option<String> {
         "transaction_read_only" | "default_transaction_read_only" => match facts.wire {
             EngineWire::Postgres => on_off(facts.read_only),
             EngineWire::MySql => None,
+        },
+        // WHICH Aurora member is serving this session. Aurora MySQL publishes it as a server
+        // variable of its own, which is how a client that dialled an endpoint standing in
+        // front of a SET of members — a custom endpoint, or the cluster's own reader endpoint
+        // — learns the DB instance it landed on; the value is therefore the member this
+        // session is served by ([`InstanceFacts::server_id`]) and not the resource the
+        // endpoint belongs to.
+        //
+        // An Aurora MySQL variable: no RDS for MySQL server has it, and the PostgreSQL family
+        // has no `@@` form to read one with at all, so neither reports it — a name that is not
+        // here is not a setting the server has.
+        "aurora_server_id" => match facts.wire {
+            EngineWire::MySql if crate::state::is_aurora(&facts.engine) => {
+                facts.server_id.clone()
+            }
+            EngineWire::MySql | EngineWire::Postgres => None,
         },
         _ => None,
     }
@@ -2950,6 +2987,9 @@ fn session_variables(facts: &SessionFacts) -> Vec<(String, String)> {
         "read_only",
         "super_read_only",
         "innodb_read_only",
+        // WHICH member of the cluster is serving this session, for an Aurora MySQL server:
+        // the same reading a `@@aurora_server_id` reference answers ([`server_setting`]).
+        "aurora_server_id",
     ]
     .iter()
     .filter_map(|name| {

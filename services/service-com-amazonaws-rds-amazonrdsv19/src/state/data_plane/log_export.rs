@@ -418,36 +418,27 @@ fn exported(cluster: &DbClusterRecord, log_type: &str) -> Option<()> {
 /// The STREAM a line written on one of `cluster`'s endpoints goes to: the DB instance whose
 /// engine wrote it.
 ///
-/// A member's own endpoint names that member; the cluster's writer endpoint names the member
-/// the cluster writes through and its reader endpoint the first of the readers, which is the
-/// instance a session on either address is served by. A cluster with no member instance yet
-/// has no DB instance to name, so its own identifier is the stream — the line was still
-/// written by the engine behind that cluster's endpoint.
+/// WHICH member that is is the one reading of that rule
+/// ([`super::cluster_endpoint::serving_member`]), so the member a session reports as the server
+/// it landed on and the member its log lines are filed under cannot disagree: a member's own
+/// endpoint names that member, the cluster's writer endpoint the member it writes through, its
+/// reader endpoint the first of the readers, and a custom endpoint the member it routes to.
+///
+/// An endpoint NO member of the cluster serves — a custom endpoint whose type and membership
+/// admit none, or a cluster with no member instance yet — has no DB instance to name, so the
+/// cluster's own identifier is the stream: the line was still written by the engine behind that
+/// cluster's endpoint, which is the resource such a session is served by.
 fn stream_of(
     store: &ComAmazonawsRdsAmazonrdsv19State,
     cluster: &DbClusterRecord,
     role: &EndpointRole,
 ) -> String {
+    // A member's own endpoint names that member, whatever the store still holds under the
+    // identifier its listener was opened for.
     if let EndpointRole::ClusterMember(identifier) = role {
         return identifier.clone();
     }
-    // A CUSTOM endpoint names the member it ROUTES to, which is the instance whose engine
-    // served the session ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`]); an
-    // endpoint that selects none falls through to the cluster's own reading below.
-    if let EndpointRole::CustomEndpoint(identifier) = role {
-        if let Some(member) = store
-            .resolve_db_cluster_endpoint(&cluster.region, identifier)
-            .and_then(|custom| store.cluster_endpoint_member(custom))
-        {
-            return member.identifier.clone();
-        }
-    }
-    let members = store.cluster_members(cluster);
-    let served = match role {
-        EndpointRole::Reader => members.get(1).or_else(|| members.first()),
-        _ => members.first(),
-    };
-    served.map_or_else(
+    super::cluster_endpoint::serving_member(store, cluster, role).map_or_else(
         || cluster.identifier.clone(),
         |member| member.identifier.clone(),
     )

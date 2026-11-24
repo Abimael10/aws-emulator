@@ -346,6 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let dbi_resource_id = instance.dbi_resource_id.clone();
+        // When the instance that holds this tenant database became ready, which is what the
+        // tenant database's own provisioning span is charged from below.
+        let instance_ready_at = instance.ready_at;
         let deletion_protection = instance.deletion_protection;
         let instance_engine = instance.engine.clone();
 
@@ -394,6 +397,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mint = store.next_mint();
         // A new tenant database is not usable yet: it reports `creating` and reaches
         // `available` on its own. The due instant is stored on the record — nothing sleeps.
+        //
+        // A tenant database is a pluggable database INSIDE a DB instance, so it is
+        // provisioned from that instance: the span runs from the instant the instance became
+        // ready rather than from this call ([`crate::state::provisioning_to`]), one span per
+        // dependency level.
+        let (provisioning, _) = crate::state::provisioning_to(
+            crate::state::TENANT_DATABASE_STATUS_AVAILABLE,
+            Some(instance_ready_at),
+        );
         let record = crate::state::TenantDatabaseRecord {
             region: region.clone(),
             db_instance_identifier: identifier,
@@ -408,9 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             character_set_name: input.character_set_name,
             nchar_character_set_name: input.nchar_character_set_name,
             status: crate::state::TENANT_DATABASE_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::TENANT_DATABASE_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(provisioning),
             create_time: crate::state::now_as_wire_timestamp(),
             tags,
         };

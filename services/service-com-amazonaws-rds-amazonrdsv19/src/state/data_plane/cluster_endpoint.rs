@@ -275,6 +275,12 @@ pub(super) fn cluster_facts(
             // `FailoverDBCluster` moves.
             read_only: serves_reads_only(store, record, &role),
             runtime: cluster_runtime_of(store, record),
+            // WHICH member of the cluster is serving this session, read through the ONE
+            // reading of that rule ([`serving_member`]): the member this endpoint routes to
+            // where it selects one, and for the cluster's OWN two endpoints the member each
+            // of them reaches.
+            server_id: serving_member(store, record, &role)
+                .map(|member| member.identifier.clone()),
             // A session on a MEMBER's own endpoint is activity of that member, which
             // Performance Insights monitors as its own data source; a session on one of the
             // cluster's two endpoints is the cluster's.
@@ -285,6 +291,48 @@ pub(super) fn cluster_facts(
         },
         database,
     ))
+}
+
+/// The DB INSTANCE that serves a session on an endpoint of `cluster` in `role`, or `None`
+/// where no member of the cluster does, read under the state lock the caller holds.
+///
+/// The ONE reading of that rule in this crate — the member a session reports as the server it
+/// landed on ([`cluster_facts`]) and the member the engine's log lines are attributed to
+/// ([`super::log_export`]) are the same one, so the two cannot drift:
+///
+/// * a MEMBER's own endpoint is served by that member;
+/// * a CUSTOM endpoint by the member it routes to, out of the set its `CustomEndpointType` and
+///   its membership lists admit ([`ComAmazonawsRdsAmazonrdsv19State::cluster_endpoint_member`])
+///   — `None` where it admits none, because then no member serves the session at all and the
+///   cluster itself answers it, so naming a member the endpoint leaves out would be a server
+///   the session never reached;
+/// * the cluster's WRITER endpoint by the member the cluster writes through, that being "the
+///   connection endpoint for the primary instance of the DB cluster";
+/// * and its READER endpoint, which "load-balances connections across the Aurora Replicas that
+///   are available in a DB cluster", by the first replica — falling back to the primary on a
+///   cluster that has no replica, since such a cluster is still reached at that endpoint.
+///
+/// The members are read in the order `DBClusterMembers` reports them, writer first
+/// ([`ComAmazonawsRdsAmazonrdsv19State::cluster_members`]), so this and `IsClusterWriter`
+/// cannot disagree about which member writes.
+pub(super) fn serving_member<'a>(
+    store: &'a ComAmazonawsRdsAmazonrdsv19State,
+    cluster: &DbClusterRecord,
+    role: &EndpointRole,
+) -> Option<&'a crate::state::DbInstanceRecord> {
+    match role {
+        EndpointRole::ClusterMember(identifier) => store
+            .db_instances
+            .get(&(cluster.region.clone(), identifier.to_ascii_lowercase())),
+        EndpointRole::CustomEndpoint(identifier) => store
+            .resolve_db_cluster_endpoint(&cluster.region, identifier)
+            .and_then(|custom| store.cluster_endpoint_member(custom)),
+        EndpointRole::Writer => store.cluster_members(cluster).first().copied(),
+        EndpointRole::Reader => {
+            let members = store.cluster_members(cluster);
+            members.get(1).or_else(|| members.first()).copied()
+        }
+    }
 }
 
 /// Whether an endpoint of the cluster `record` in the role `role` serves NO writes, read
