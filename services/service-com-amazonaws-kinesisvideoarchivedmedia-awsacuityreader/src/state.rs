@@ -679,10 +679,15 @@ pub enum StreamLookupError {
 /// A pagination cursor over one stream's archive, carried in `NextToken`.
 ///
 /// Self-describing, so a replayed token continues where the previous page
-/// stopped without the service holding per-token server state: it carries the
-/// stream it was issued for, the selector the first page used (the model makes
-/// `FragmentSelector` optional precisely because a continuation re-uses the
-/// selector the token remembers) and the offset the next page starts at.
+/// stopped without the service holding per-token server state: it carries
+/// EVERY request member that determines the result set its offset indexes into
+/// — the stream it was issued for, the selector the first page used (the model
+/// makes `FragmentSelector` optional precisely because a continuation re-uses
+/// the selector the token remembers), and, for a page of sampled instants, the
+/// sampling interval those instants were computed at — plus the offset the next
+/// page starts at. A token "specifies where to start paginating the next set"
+/// of ONE query's results, so a continuation is served against the set the
+/// token names, never against a differently shaped one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentCursor {
     /// The name of the stream the token was issued for.
@@ -696,6 +701,11 @@ pub struct FragmentCursor {
     /// How many results earlier pages already returned: matching fragments for a
     /// fragment listing, sampled instants for an image page.
     pub offset: usize,
+    /// The sampling interval, in milliseconds, the instants this cursor's offset
+    /// indexes into were computed at, when the paged result set is a sampled one.
+    /// [`None`] for a fragment listing, whose results the archive itself
+    /// enumerates, and for an image page whose query named no interval.
+    pub interval_millis: Option<i64>,
 }
 
 impl FragmentCursor {
@@ -706,13 +716,18 @@ impl FragmentCursor {
     /// plus at most two `=` of padding).
     #[must_use]
     pub fn encode(&self) -> String {
-        let json = ::serde_json::json!({
+        let mut json = ::serde_json::json!({
             "s": self.stream_name,
             "o": self.origin.as_str(),
             "f": self.start_millis,
             "t": self.end_millis,
             "i": self.offset,
         });
+        // Only a sampled result set has an interval, so a cursor without one
+        // encodes exactly as it always did.
+        if let (Some(object), Some(interval)) = (json.as_object_mut(), self.interval_millis) {
+            object.insert("v".to_string(), ::serde_json::json!(interval));
+        }
         ::aws_smithy_types::base64::encode(json.to_string())
     }
 
@@ -728,6 +743,12 @@ impl FragmentCursor {
             start_millis: json.get("f")?.as_i64()?,
             end_millis: json.get("t")?.as_i64()?,
             offset: usize::try_from(json.get("i")?.as_u64()?).ok()?,
+            interval_millis: match json.get("v") {
+                None => None,
+                // A token carrying the member but no number for it is not one
+                // this service minted.
+                Some(value) => Some(value.as_i64()?),
+            },
         })
     }
 }

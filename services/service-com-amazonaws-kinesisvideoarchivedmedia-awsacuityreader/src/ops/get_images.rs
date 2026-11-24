@@ -35,7 +35,12 @@
 //!   `NO_MEDIA` when no fragment covers the instant, `MEDIA_ERROR` when the covering
 //!   fragment's bytes carry no frame that can be generated into the requested image.
 //! * The response carries at most the documented 25 images, and a `NextToken` while
-//!   sampled instants remain.
+//!   sampled instants remain. That token names the query it was minted for — the
+//!   stream, the selector, the window and the sampling interval the instants were
+//!   computed at — so a continuation that re-states any of them differently is
+//!   `InvalidArgumentException` (400) rather than a page of another set, and one that
+//!   leaves the optional `SamplingInterval` out continues on the interval the token
+//!   carries.
 //!
 //! ## Shape of an operation
 //!
@@ -221,6 +226,14 @@ const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the Get
 /// thrown" — and this operation refuses such a request as a bad argument before the
 /// archive is consulted. Entirely fixed text, with no part taken from the request.
 const INCOMPLETE_RESIZE_MESSAGE: &str = "Height and width for the images need to be provided or none.";
+
+/// The refusal a `NextToken` replayed against another query carries. The token
+/// "specifies where to start paginating the next set of Images" of ONE query, so the
+/// stream, the selector, the window and the sampling interval it was minted over are
+/// what a continuation must agree with; the sentence names those members and nothing of
+/// the request's own values.
+const TOKEN_FOR_ANOTHER_QUERY_MESSAGE: &str =
+    "NextToken was issued for a different stream, timestamp range or sampling interval";
 
 /// The largest frame side one decode or one resize may produce. NOT an AWS limit: it
 /// bounds what the archived bytes of a single fragment may expand into, both while the
@@ -472,7 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
 
-            let interval = match input.sampling_interval {
+            let requested_interval = match input.sampling_interval {
                 None => None,
                 Some(value) => {
                     let millis = i64::from(value);
@@ -485,14 +498,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            // Where this page starts. A continuation re-states the window and the
-            // selector (the model makes all three required members), so the token
-            // carries only how far the previous pages got — and it must have been issued
-            // for this very query.
-            let offset = match input.next_token.as_deref() {
-                None => 0,
+            // Where this page starts, and over WHICH instants. A token "specifies where
+            // to start paginating the next set of Images" of the query that minted it, so
+            // every member that determines that set — the stream, the selector, the
+            // window, and the sampling interval the instants are computed at — is bound
+            // into it: a continuation that re-states one of them differently names another
+            // set than the offset indexes into and is refused, and the optional interval a
+            // continuation leaves out is the one the token was minted with, never a fresh
+            // default that would collapse the set and report the walk complete.
+            let (offset, interval) = match input.next_token.as_deref() {
+                None => (0, requested_interval),
                 Some(token) => {
-                    let Some(cursor) = FragmentCursor::decode(token) else {
+                    // The interval a token carries shapes the instant list this page is
+                    // cut from, so it is held to the same documented floor a request's
+                    // own is: a token naming an interval no sampling could have used is
+                    // not one this service minted.
+                    let minted = FragmentCursor::decode(token).filter(|cursor| {
+                        cursor
+                            .interval_millis
+                            .is_none_or(|millis| millis >= MIN_SAMPLING_INTERVAL_MILLIS)
+                    });
+                    let Some(cursor) = minted else {
                         return Err(invalid(
                             "NextToken is not a valid pagination token".to_string(),
                         ));
@@ -501,13 +527,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         || cursor.origin != origin
                         || cursor.start_millis != start_millis
                         || cursor.end_millis != end_millis
+                        || (requested_interval.is_some()
+                            && requested_interval != cursor.interval_millis)
                     {
-                        return Err(invalid(
-                            "NextToken was issued for a different stream or timestamp range"
-                                .to_string(),
-                        ));
+                        return Err(invalid(TOKEN_FOR_ANOTHER_QUERY_MESSAGE.to_string()));
                     }
-                    cursor.offset
+                    (cursor.offset, cursor.interval_millis)
                 }
             };
 
@@ -559,6 +584,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     start_millis,
                     end_millis,
                     offset: next_offset,
+                    interval_millis: interval,
                 }
                 .encode()
             });
@@ -658,7 +684,10 @@ fn bounded_side(value: Option<i32>, member: &str, max: i32) -> Result<Option<u32
 /// image `SamplingInterval`'s documentation describes for a window shorter than the
 /// interval — "the image from the startTimestamp will be returned if available".
 fn sampled_instants(start_millis: i64, end_millis: i64, interval: Option<i64>) -> Vec<i64> {
-    let Some(interval) = interval else {
+    // A step that does not run forwards names no second sample point — and would never
+    // advance this walk — so it samples the window's start alone, as naming no interval
+    // at all does.
+    let Some(interval) = interval.filter(|&interval| interval > 0) else {
         return vec![start_millis];
     };
     let mut instants = Vec::new();

@@ -136,6 +136,15 @@ use crate::state::{
 /// could ask for.
 const DEFAULT_MAX_RESULTS: usize = 1000;
 
+/// The refusal a `NextToken` replayed against another query carries. The token is
+/// issued for ONE listing, and `FragmentSelector` "is only required when the NextToken
+/// isn't passed in the API" — so a continuation that leaves the selector out continues
+/// on the token's own, and one that re-states a different stream or range names another
+/// listing than the token's offset indexes into. The sentence names those members and
+/// nothing of the request's own values.
+const TOKEN_FOR_ANOTHER_QUERY_MESSAGE: &str =
+    "NextToken was issued for a different stream or timestamp range";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -261,16 +270,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Where this page starts, and what it selects on: the token when the
-        // request continues a previous page, else the request's own selector.
+        // request continues a previous page, else the request's own selector. A
+        // continuation that re-states the selector must re-state the one the
+        // token was issued for: another stream or range names another listing
+        // than the token's offset indexes into.
         let cursor = match input.next_token.as_deref() {
             Some(token) => {
                 let Some(cursor) = FragmentCursor::decode(token) else {
                     return Err(invalid("NextToken is not a valid pagination token".to_string()));
                 };
                 if cursor.stream_name != stream.name {
-                    return Err(invalid(
-                        "NextToken was issued for a different stream".to_string(),
-                    ));
+                    return Err(invalid(TOKEN_FOR_ANOTHER_QUERY_MESSAGE.to_string()));
+                }
+                if let Some(selector) = input.fragment_selector.as_ref() {
+                    let origin = TimestampOrigin::parse(&selector.fragment_selector_type);
+                    let start_millis = date_time_millis(&selector.timestamp_range.start_timestamp);
+                    let end_millis = date_time_millis(&selector.timestamp_range.end_timestamp);
+                    if origin != Some(cursor.origin)
+                        || start_millis != cursor.start_millis
+                        || end_millis != cursor.end_millis
+                    {
+                        return Err(invalid(TOKEN_FOR_ANOTHER_QUERY_MESSAGE.to_string()));
+                    }
                 }
                 cursor
             }
@@ -297,6 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     start_millis,
                     end_millis,
                     offset: 0,
+                    // A fragment listing's results are the archive's own, so no
+                    // sampling shapes the set this cursor walks.
+                    interval_millis: None,
                 }
             }
         };

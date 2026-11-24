@@ -27,7 +27,10 @@ use std::sync::Arc;
 
 use service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader as archived_media;
 
-use archived_media::state::{from_epoch_millis, service_state, ArchivedStream, StoredFragment};
+use archived_media::state::{
+    from_epoch_millis, service_state, ArchivedStream, FragmentCursor, StoredFragment,
+    TimestampOrigin,
+};
 
 use crate::archived_media_read_path::{body_json, register_stream, seeded, Harness};
 
@@ -1158,5 +1161,300 @@ async fn a_request_outside_the_documented_rules_is_refused() {
             !code.is_empty() && code != "NotImplemented",
             "case {case:?}: expected a modelled refusal code, got {code:?}"
         );
+    }
+}
+
+/// The refusal a continuation that names another set of instants than its token was
+/// minted over is answered with.
+const TOKEN_FOR_ANOTHER_QUERY: &str =
+    "NextToken was issued for a different stream, timestamp range or sampling interval";
+
+/// The refusal a `NextToken` no sampling of this service could have minted is answered
+/// with.
+const NOT_A_TOKEN: &str = "NextToken is not a valid pagination token";
+
+/// The smallest sampling interval the service samples at, in milliseconds:
+/// `SamplingInterval` — "The minimum value that can be provided is 200 ms (5 images per
+/// second)."
+const MIN_SAMPLING_INTERVAL: i64 = 200;
+
+/// Every instant, in milliseconds from the epoch, the query over `[from_secs, to_secs]`
+/// sampled every `interval_millis` ms covers: the window's start, then one per interval
+/// while the window lasts.
+fn sampled_millis(from_secs: i64, to_secs: i64, interval_millis: i64) -> Vec<i64> {
+    let mut instants = Vec::new();
+    let mut at = from_secs * 1000;
+    while at <= to_secs * 1000 {
+        instants.push(at);
+        at += interval_millis;
+    }
+    instants
+}
+
+/// RULE: a `NextToken` names the query it was minted for, the sampling interval the
+/// instants were computed at included, so a continuation is served against THAT set of
+/// instants: one that leaves the optional `SamplingInterval` out continues on the
+/// interval the token carries, and the pages of a walk are together the window's
+/// instants, each exactly once, with no page short of the window's end coming back
+/// empty.
+///
+/// The rows differ along what the rule generalises over: how the pages are cut
+/// (`MaxResults` of 1, a few, and the whole set), which interval the instants were
+/// computed at, and whether a continuation re-states that optional interval or leaves it
+/// to the token.
+#[tokio::test]
+async fn a_continuation_walks_the_instants_its_token_was_minted_over() {
+    let harness = harness();
+    let from = producer_secs(0);
+    let to = from + 2;
+
+    for interval in [200i64, 500, 1_000] {
+        let expected = sampled_millis(from, to, interval);
+        for restates_interval in [true, false] {
+            for page_size in [1i64, 2, 25] {
+                let case = format!(
+                    "interval {interval} ms, MaxResults {page_size}, continuation re-states the \
+                     interval: {restates_interval}"
+                );
+                let first = with(
+                    &request(IMAGES_STREAM, "PRODUCER_TIMESTAMP", from, to, "JPEG"),
+                    serde_json::json!({
+                        "SamplingInterval": interval,
+                        "MaxResults": page_size,
+                    }),
+                );
+                let mut seen: Vec<i64> = Vec::new();
+                let mut token: Option<String> = None;
+                let mut pages: usize = 0;
+                loop {
+                    let body = match &token {
+                        None => first.clone(),
+                        Some(token) => {
+                            let mut body =
+                                with(&first, serde_json::json!({ "NextToken": token }));
+                            if !restates_interval {
+                                body.as_object_mut()
+                                    .expect("a request object")
+                                    .remove("SamplingInterval");
+                            }
+                            body
+                        }
+                    };
+                    let response = harness.post("/getImages", &body).await;
+                    assert_eq!(
+                        response.status().as_u16(),
+                        200,
+                        "case {case}: expected HTTP 200, got {} with body {:?}",
+                        response.status(),
+                        String::from_utf8_lossy(response.body())
+                    );
+                    let page = images(&response);
+                    assert!(
+                        !page.is_empty(),
+                        "case {case}: page {pages} came back with no images, so the rest of the \
+                         window was never served"
+                    );
+                    seen.extend(page.iter().map(image_millis));
+                    token = body_json(&response)["NextToken"].as_str().map(str::to_string);
+                    pages += 1;
+                    assert!(
+                        pages <= expected.len() + 1,
+                        "case {case}: expected the walk to end, got {pages} pages"
+                    );
+                    if token.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    seen, expected,
+                    "case {case}: expected the instants {expected:?}, got {seen:?}"
+                );
+            }
+        }
+    }
+}
+
+/// What a continuation is answered with.
+#[derive(Debug)]
+enum Outcome {
+    /// Served, resuming at this instant — milliseconds from the epoch.
+    Resumes(i64),
+    /// Refused HTTP 400 `InvalidArgumentException` carrying this sentence.
+    Refused(&'static str),
+}
+
+/// RULE: every member of a `GetImages` request that determines WHICH instants the page
+/// is cut from — the stream, the selector, the window and the sampling interval — is
+/// bound into the `NextToken`, so a continuation that re-states one of them differently
+/// is refused HTTP 400 `InvalidArgumentException` with one fixed sentence rather than
+/// served a page of another set; a member that only shapes how an image is rendered or
+/// how many fit in one page may differ freely, and a token naming an interval no
+/// sampling could have used is no token of this service's at all.
+///
+/// The rows differ along which member the continuation re-states differently (and along
+/// which members it may: page size, format, pixel size), and over the interval a token
+/// itself carries — the documented minimum, one millisecond under it, and the degenerate
+/// steps 0 and a negative one. Each served row pins the instant the continuation resumes
+/// at, which is the token's own offset in the token's own instants.
+#[tokio::test]
+async fn a_continuation_that_names_another_set_than_its_token_is_refused() {
+    let harness = harness();
+    let from = producer_secs(0);
+    let to = from + 2;
+    // The first page is cut at one image, so the token it mints points at the SECOND
+    // instant of a three-instant window.
+    let minted_interval = 1_000i64;
+    let first = with(
+        &request(IMAGES_STREAM, "PRODUCER_TIMESTAMP", from, to, "JPEG"),
+        serde_json::json!({ "SamplingInterval": minted_interval, "MaxResults": 1 }),
+    );
+    let response = harness.post("/getImages", &first).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the first page must be served, got {} with body {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    let token = body_json(&response)["NextToken"]
+        .as_str()
+        .expect("the first page of a three-instant window carries a NextToken")
+        .to_string();
+    // A continuation that re-states nothing optional: the token, and the members the
+    // model makes required.
+    let bare = with(
+        &request(IMAGES_STREAM, "PRODUCER_TIMESTAMP", from, to, "JPEG"),
+        serde_json::json!({ "NextToken": token, "MaxResults": 1 }),
+    );
+    // A token this service could have minted for the same window, carrying `interval`
+    // as the interval its instants were sampled at, pointing one instant in.
+    let token_sampled_at = |interval: i64| {
+        FragmentCursor {
+            stream_name: IMAGES_STREAM.to_string(),
+            origin: TimestampOrigin::Producer,
+            start_millis: from * 1000,
+            end_millis: to * 1000,
+            offset: 1,
+            interval_millis: Some(interval),
+        }
+        .encode()
+    };
+    // (case, what the continuation states on top of the bare one, how it is answered)
+    let rows: Vec<(&str, serde_json::Value, Outcome)> = vec![
+        (
+            "no sampling interval at all",
+            serde_json::json!({}),
+            Outcome::Resumes(from * 1000 + minted_interval),
+        ),
+        (
+            "the interval the token was minted with",
+            serde_json::json!({ "SamplingInterval": minted_interval }),
+            Outcome::Resumes(from * 1000 + minted_interval),
+        ),
+        (
+            "a page size the first page did not use",
+            serde_json::json!({ "MaxResults": 3 }),
+            Outcome::Resumes(from * 1000 + minted_interval),
+        ),
+        (
+            "another image format",
+            serde_json::json!({ "Format": "PNG" }),
+            Outcome::Resumes(from * 1000 + minted_interval),
+        ),
+        (
+            "another image size",
+            serde_json::json!({ "WidthPixels": 20, "HeightPixels": 10 }),
+            Outcome::Resumes(from * 1000 + minted_interval),
+        ),
+        (
+            "a token minted at the documented minimum interval",
+            serde_json::json!({ "NextToken": token_sampled_at(MIN_SAMPLING_INTERVAL) }),
+            Outcome::Resumes(from * 1000 + MIN_SAMPLING_INTERVAL),
+        ),
+        (
+            "a wider sampling interval",
+            serde_json::json!({ "SamplingInterval": 20_000 }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "a narrower sampling interval, still above the documented minimum",
+            serde_json::json!({ "SamplingInterval": MIN_SAMPLING_INTERVAL }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "a window that ends elsewhere",
+            serde_json::json!({ "EndTimestamp": to + 1 }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "a window that starts elsewhere",
+            serde_json::json!({ "StartTimestamp": from + 1 }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "the other timestamp field",
+            serde_json::json!({ "ImageSelectorType": "SERVER_TIMESTAMP" }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "another stream",
+            serde_json::json!({ "StreamName": EMPTY_STREAM }),
+            Outcome::Refused(TOKEN_FOR_ANOTHER_QUERY),
+        ),
+        (
+            "a token minted one millisecond under the documented minimum interval",
+            serde_json::json!({ "NextToken": token_sampled_at(MIN_SAMPLING_INTERVAL - 1) }),
+            Outcome::Refused(NOT_A_TOKEN),
+        ),
+        (
+            "a token minted at a step of zero",
+            serde_json::json!({ "NextToken": token_sampled_at(0) }),
+            Outcome::Refused(NOT_A_TOKEN),
+        ),
+        (
+            "a token minted at a step that runs backwards",
+            serde_json::json!({ "NextToken": token_sampled_at(-minted_interval) }),
+            Outcome::Refused(NOT_A_TOKEN),
+        ),
+    ];
+
+    for (case, extra, outcome) in rows {
+        let body = with(&bare, extra);
+        let response = harness.post("/getImages", &body).await;
+        let status = match outcome {
+            Outcome::Resumes(_) => 200,
+            Outcome::Refused(_) => 400,
+        };
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        match outcome {
+            // Served from the token's own instants, resumed at the token's own offset.
+            Outcome::Resumes(at_millis) => {
+                let page = images(&response);
+                let resumed = page.first().map(image_millis);
+                assert_eq!(
+                    resumed,
+                    Some(at_millis),
+                    "case {case:?}: expected the page to resume at {at_millis} ms from the epoch, \
+                     got {page:?}"
+                );
+            }
+            Outcome::Refused(sentence) => {
+                let (code, message) = reported(&response);
+                assert_eq!(
+                    code, INVALID_ARGUMENT,
+                    "case {case:?}: expected {INVALID_ARGUMENT}, got {code:?}"
+                );
+                assert_eq!(
+                    message, sentence,
+                    "case {case:?}: expected {sentence:?}, got {message:?}"
+                );
+            }
+        }
     }
 }

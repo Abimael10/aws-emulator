@@ -1043,6 +1043,138 @@ async fn list_fragments_refuses_a_selector_it_cannot_page_on() {
     }
 }
 
+/// The refusal a `ListFragments` continuation that names another listing than its token
+/// was minted over is answered with.
+const LIST_TOKEN_FOR_ANOTHER_QUERY: &str =
+    "NextToken was issued for a different stream or timestamp range";
+
+/// RULE: a `NextToken` names the listing it was minted for — the stream and the
+/// selector's timestamp field and range — so a continuation is served against THAT
+/// listing: the selector, "only required when the NextToken isn't passed in the API",
+/// may be left out and is then the token's own, while one re-stated for another stream
+/// or another range is refused HTTP 400 `InvalidArgumentException` rather than served a
+/// page of another listing. `MaxResults`, which sizes a page rather than the listing,
+/// may differ freely.
+///
+/// The rows differ along which part of the selector the continuation re-states
+/// differently, and the served rows pin that the continuation resumes at the token's own
+/// offset in the token's own listing.
+#[tokio::test]
+async fn list_fragments_refuses_a_continuation_that_names_another_listing() {
+    let harness = seeded();
+    let selector = |origin: &str, start: i64, end: i64| {
+        serde_json::json!({
+            "FragmentSelectorType": origin,
+            "TimestampRange": { "StartTimestamp": start, "EndTimestamp": end },
+        })
+    };
+    let minted = selector("PRODUCER_TIMESTAMP", T0_SECS, T0_SECS + 1000);
+    let first = serde_json::json!({
+        "StreamName": STREAM,
+        "MaxResults": 1,
+        "FragmentSelector": minted.clone(),
+    });
+    let response = harness.post("/listFragments", &first).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the first page must be served, got {} with body {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    let token = body_json(&response)["NextToken"]
+        .as_str()
+        .expect("a one-fragment page of a five-fragment archive carries a NextToken")
+        .to_string();
+    // A continuation that re-states nothing optional: the stream and the token.
+    let bare = serde_json::json!({
+        "StreamName": STREAM,
+        "MaxResults": 1,
+        "NextToken": token,
+    });
+    // (case, what the continuation states on top of the bare one, the status expected)
+    let rows: Vec<(&str, serde_json::Value, u16)> = vec![
+        ("no selector at all", serde_json::json!({}), 200),
+        (
+            "the selector the token was minted with",
+            serde_json::json!({ "FragmentSelector": minted.clone() }),
+            200,
+        ),
+        (
+            "a page size the first page did not use",
+            serde_json::json!({ "MaxResults": 2 }),
+            200,
+        ),
+        (
+            "a range that ends elsewhere",
+            serde_json::json!({
+                "FragmentSelector": selector("PRODUCER_TIMESTAMP", T0_SECS, T0_SECS + 20),
+            }),
+            400,
+        ),
+        (
+            "a range that starts elsewhere",
+            serde_json::json!({
+                "FragmentSelector": selector("PRODUCER_TIMESTAMP", T0_SECS + 1, T0_SECS + 1000),
+            }),
+            400,
+        ),
+        (
+            "the other timestamp field",
+            serde_json::json!({
+                "FragmentSelector": selector("SERVER_TIMESTAMP", T0_SECS, T0_SECS + 1000),
+            }),
+            400,
+        ),
+        (
+            "another stream",
+            serde_json::json!({ "StreamName": LIVE_STREAM }),
+            400,
+        ),
+    ];
+
+    for (case, extra, status) in rows {
+        let body = with_members(&bare, &extra);
+        let response = harness.post("/listFragments", &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "case {case}: expected HTTP {status}, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let reported = body_json(&response);
+        if status == 200 {
+            // Served from the token's own listing, resumed at the token's own offset:
+            // the second fragment of the archive the token was minted over.
+            let resumed = reported["Fragments"][0]["FragmentNumber"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                resumed,
+                fragment_number(1),
+                "case {case}: expected the page to resume at the token's next fragment, got \
+                 {:?}",
+                reported["Fragments"]
+            );
+            continue;
+        }
+        assert_eq!(
+            reported["__type"], "InvalidArgumentException",
+            "case {case}: expected InvalidArgumentException, got {reported:?}"
+        );
+        let message = reported["Message"]
+            .as_str()
+            .or_else(|| reported["message"].as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            message, LIST_TOKEN_FOR_ANOTHER_QUERY,
+            "case {case}: expected {LIST_TOKEN_FOR_ANOTHER_QUERY:?}, got {message:?}"
+        );
+    }
+}
+
 /// RULE: `GetMediaForFragmentList`'s payload is the stored media of exactly the
 /// requested fragments, concatenated in the order the request lists them.
 #[tokio::test]
