@@ -42,6 +42,26 @@ pub enum DataApiEndpointRefusal {
 pub const DATA_API_ENDPOINT_CLUSTER_TYPE_MESSAGE: &str =
     "This operation applies only to Aurora Serverless v2 and provisioned DB clusters.";
 
+/// The sentence a `ResourceNotFoundFault` carries when a `ResourceArn` names a DB cluster
+/// this account holds no record of in the request's region.
+///
+/// The fault the Data API toggles declare for a cluster they cannot resolve is
+/// `ResourceNotFoundFault` rather than the `DBClusterNotFoundFault` the cluster-identifier
+/// calls raise (`smithy_query(query="operation", operation="EnableHttpEndpoint")`), and
+/// Amazon RDS words it as a sentence ABOUT the cluster: a fixed "The DB cluster " and a
+/// fixed " wasn't found.", with the member's value as the single variable part. The value is
+/// interpolated exactly as the REQUEST carried it — the whole ARN, not the identifier inside
+/// it and not the key the store folded it to — so a caller matching the message against what
+/// it sent finds it there, the same way the identifier-addressed wordings
+/// ([`db_cluster_not_found_message`]) name the request's spelling.
+///
+/// This is a wording of its own rather than the `<resource type> not found: <named>` form
+/// ([`db_cluster_not_found_colon_message`]) that the association and snapshot calls answer
+/// `DBClusterNotFoundFault` with: one fault, one wording per API that raises it.
+pub fn data_api_cluster_not_found_message(resource_arn: &str) -> String {
+    format!("The DB cluster {resource_arn} wasn't found.")
+}
+
 /// Whether a cluster running `engine` in `engine_mode` has an HTTP endpoint these two
 /// operations toggle.
 ///
@@ -91,9 +111,8 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         // The stored key of the cluster the ARN names, folded the way every DB cluster key
         // is ("stored as a lowercase string").
         let key = (region.to_string(), parsed.identifier.to_ascii_lowercase());
-        let not_found = || {
-            DataApiEndpointRefusal::NotFound(db_cluster_not_found_colon_message(resource_arn))
-        };
+        let not_found =
+            || DataApiEndpointRefusal::NotFound(data_api_cluster_not_found_message(resource_arn));
         let Some(record) = self.db_clusters.get_mut(&key) else {
             return Err(not_found());
         };

@@ -27,7 +27,7 @@
 //! assertions read the XML the emulator itself answered with.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    db_cluster_not_available_for_modification_message, db_cluster_not_found_colon_message,
+    data_api_cluster_not_found_message, db_cluster_not_available_for_modification_message,
     DATA_API_ENDPOINT_CLUSTER_TYPE_MESSAGE, DB_CLUSTER_STATUS_AVAILABLE,
     DB_CLUSTER_STATUS_CREATING, DB_CLUSTER_STATUS_STOPPED,
 };
@@ -365,7 +365,7 @@ async fn a_resource_arn_that_names_no_cluster_in_the_region_is_not_found() {
                 "ResourceNotFoundFault",
             );
             let message = text(&refused, "Message");
-            let expected = db_cluster_not_found_colon_message(&row.resource_arn);
+            let expected = data_api_cluster_not_found_message(&row.resource_arn);
             assert_eq!(
                 message, expected,
                 "case {case:?} on {action}: expected the wording {expected:?}, got {message:?}"

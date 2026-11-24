@@ -645,11 +645,15 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// to nothing here: RDS is regional, and the only resource this request can act on is one
     /// whose own reports carry the ARN it named.
     ///
-    /// Each miss is worded the way this front door words that resource's not-found fault for a
-    /// call ADDRESSED to it by ARN — the cluster's by the ARN the request carried, as the Data
-    /// API toggles word it, and the instance's by the handle the ARN names, as the audit
-    /// policy write above words it — so the two activity-stream calls cannot drift from their
-    /// siblings.
+    /// Each miss is worded the way this front door words the FAULT the call raises for that
+    /// resource: the cluster's `DBClusterNotFoundFault` in the
+    /// `<resource type> not found: <named>` form its association and snapshot siblings answer
+    /// with ([`db_cluster_not_found_colon_message`]), carrying the ARN the request wrote, and
+    /// the instance's by the handle the ARN names, as the audit policy write above words it —
+    /// so the two activity-stream calls cannot drift from their siblings. The Data API
+    /// toggles raise a DIFFERENT fault for a cluster they cannot resolve
+    /// (`ResourceNotFoundFault`), which Amazon RDS words its own way
+    /// ([`data_api_cluster_not_found_message`]).
     fn activity_stream_subject(
         &self,
         region: &str,
