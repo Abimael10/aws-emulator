@@ -83,7 +83,7 @@ const CATALOGS: &[Catalog] = &[
     Catalog {
         service_code: "ebs",
         service_name: "Amazon Elastic Block Store (Amazon EBS)",
-        quota_count: 41,
+        quota_count: 43,
         withdrawn: &["SnapshotsPerRegion", "StorageForGeneralPurposeSSDGp3VolumesInTiB"],
     },
     Catalog {
@@ -242,7 +242,7 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum aggregated amount of storage, in TiB, that can be requested \
+        description: "The maximum aggregated amount of storage, in TiB, that can be provisioned \
                       across General Purpose SSD (gp2) volumes in this Region.",
         period: None,
         metric: Metric::None,
@@ -299,7 +299,7 @@ const ROWS: &[Row] = &[
         service_code: "eks",
         quota_code: "L-C56B9FC3",
         quota_name: "Access entries per cluster",
-        value: 100.0,
+        value: 3000.0,
         unit: "None",
         adjustable: false,
         description: "The maximum number of access entries per cluster.",
@@ -407,7 +407,7 @@ const ROWS: &[Row] = &[
         quota_name: "Load balancers per target group",
         value: 1.0,
         unit: "None",
-        adjustable: false,
+        adjustable: true,
         description: "The maximum number of load balancers one target group can be used by",
         period: None,
         metric: Metric::Resources {

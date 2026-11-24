@@ -122,7 +122,7 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "dynamodb",
         quota_code: "L-F3CA5463",
-        quota_name: "Maximum number of decreases per day",
+        quota_name: "Provisioned capacity decreases per day",
         value: 27.0,
         unit: "None",
         adjustable: true,
@@ -144,7 +144,7 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum aggregated amount of storage, in TiB, that can be requested \
+        description: "The maximum aggregated amount of storage, in TiB, that can be provisioned \
                       across General Purpose SSD (gp3) volumes in this Region.",
         period: None,
         metric: Metric::None,
@@ -156,7 +156,7 @@ const ROWS: &[Row] = &[
         value: 300_000.0,
         unit: "None",
         adjustable: true,
-        description: "The maximum aggregated amount of IOPS that can be requested across \
+        description: "The maximum aggregated amount of IOPS that can be provisioned across \
                       Provisioned IOPS SSD (io1) volumes in this Region.",
         period: None,
         metric: Metric::None,
@@ -190,7 +190,8 @@ const ROWS: &[Row] = &[
         metric: Metric::None,
     },
     // ECR publishes the `CompleteLayerUpload` rate under this code: the window, the call
-    // count of that operation and the service's own rate wording.
+    // count of that operation and the service's own rate wording, closing on the clause
+    // that states when the operation is invoked during a push.
     Row {
         service_code: "ecr",
         quota_code: "L-44194860",
@@ -199,7 +200,8 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of CompleteLayerUpload requests that you can make per \
-                      second in the current Region.",
+                      second in the current Region. This API is called once per image layer \
+                      when an image is pushed.",
         period: Some((1, "SECOND")),
         metric: Metric::Calls {
             usage_service: "ECR",
@@ -218,7 +220,8 @@ const ROWS: &[Row] = &[
         metric: Metric::None,
     },
     // The EKS rows the codes of two neighbouring planes had carried: the control-plane
-    // security groups of a cluster and the clusters of the account.
+    // security groups of a cluster and the clusters of the account. The security-group row
+    // closes on the clause that states when the allowance is set.
     Row {
         service_code: "eks",
         quota_code: "L-11427A54",
@@ -226,7 +229,8 @@ const ROWS: &[Row] = &[
         value: 4.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of control plane security groups per cluster.",
+        description: "The maximum number of control plane security groups per cluster (these \
+                      are specified when you create the cluster).",
         period: None,
         metric: Metric::None,
     },
@@ -285,7 +289,7 @@ const ROWS: &[Row] = &[
         service_code: "elasticache",
         quota_code: "L-AF354865",
         quota_name: "Nodes per cluster (cluster mode enabled)",
-        value: 500.0,
+        value: 90.0,
         unit: "None",
         adjustable: true,
         description: "The maximum number of nodes in one cluster with cluster mode enabled.",
@@ -320,7 +324,7 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum read IOPS for one file system with Elastic throughput mode \
-                      enabled.",
+                      enabled",
         period: Some((1, "SECOND")),
         metric: Metric::None,
     },
@@ -331,7 +335,8 @@ const ROWS: &[Row] = &[
         value: 65_536.0,
         unit: "None",
         adjustable: false,
-        description: "The maximum number of active users per NFS client",
+        description: "The maximum number of active users per NFS client that can have files \
+                      open at the same time",
         period: None,
         metric: Metric::None,
     },
@@ -362,16 +367,17 @@ const ROWS: &[Row] = &[
             resource: "ListenersPerApplicationLoadBalancer",
         },
     },
-    // The RESERVED capacity plane of the Region: published with nothing reserved, and not
-    // adjustable.
+    // The RESERVED capacity plane of the Region: published with nothing reserved, and
+    // adjustable, with the capacity units named the way the quota's own name capitalises
+    // them.
     Row {
         service_code: "elasticloadbalancing",
         quota_code: "L-8A66D0E6",
         quota_name: "Reserved Application Load Balancer Capacity Units (LCU) per Region",
         value: 0.0,
         unit: "None",
-        adjustable: false,
-        description: "The maximum number of reserved Application Load Balancer Capacity Units \
+        adjustable: true,
+        description: "The maximum number of Reserved Application Load Balancer Capacity Units \
                       (LCU) per Region",
         period: None,
         metric: Metric::Resources {
@@ -570,13 +576,20 @@ async fn every_row_carries_its_services_published_wording() {
                         rest.strip_suffix(" requests")
                     }) {
                         matched += 1;
-                        let wanted = format!(
+                        let class = format!(
                             "The maximum number of {api} requests that you can make per second \
                              in the current Region."
                         );
-                        assert_eq!(
-                            text, wanted,
-                            "case {case}: expected {wanted:?}, got {text:?}"
+                        // A rate of an operation a client calls on the PUSH PATH closes on
+                        // the clause that states when it is invoked during a push.
+                        let on_push = format!(
+                            "{class} This API is called once per image layer when an image is \
+                             pushed."
+                        );
+                        assert!(
+                            text == class || text == on_push,
+                            "case {case}: expected {class:?}, alone or closing on the \
+                             push-path clause, got {text:?}"
                         );
                     }
                 }
@@ -730,7 +743,7 @@ const ADJUSTABILITY: &[(&str, &str, bool)] = &[
     ("eks", "L-6D54EA21", true),
     ("es", "L-1F053E6F", false),
     ("es", "L-076D529E", true),
-    ("elasticloadbalancing", "L-8A66D0E6", false),
+    ("elasticloadbalancing", "L-8A66D0E6", true),
     ("elasticloadbalancing", "L-B6DF7632", true),
 ];
 

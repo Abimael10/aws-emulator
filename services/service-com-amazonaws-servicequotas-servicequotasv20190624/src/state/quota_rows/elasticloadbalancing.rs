@@ -70,14 +70,21 @@ fn elb_description(counted: &str) -> String {
 /// store publishes its count too ([`elb_plane_metric`]), but no window.
 ///
 /// The recorded listing publishes the listener plane of an Application Load Balancer under
-/// `L-B6DF7632`, so that is the code it is published under here, and the per-Availability
-/// Zone subnet plane this catalog had published there takes the code the listener plane
-/// vacated. `L-8A66D0E6` is the Region's RESERVED Application Load Balancer capacity, which
-/// is published with nothing reserved and as not adjustable; the per-Availability Zone
-/// target plane of a Network Load Balancer this catalog had published under it names no
-/// other code the listing states and is left to the default-quota-set gap, the way the
-/// target plane of a Gateway Load Balancer is — a code identifies ONE quota (see
-/// [`super::descriptive_quota_code`]).
+/// `L-B6DF7632`, so that is the code it is published under here, and the CERTIFICATE planes
+/// of an Application and of a Network Load Balancer under `L-9365A611` and `L-52964454`.
+/// `L-37E1617B` is the revocation ENTRIES of a trust store — the entries its lists carry
+/// together, a different quota from the lists themselves (`L-EBC0C08B`) — and `L-8A66D0E6`
+/// is the Region's RESERVED Application Load Balancer capacity, published with nothing
+/// reserved. The two Gateway Load Balancer planes the certificate bindings displaced take
+/// the codes those bindings vacated; the per-Availability Zone subnet plane of a load
+/// balancer names no other code the listing states and is left to the default-quota-set
+/// gap, the way the per-Availability Zone target plane of a Network Load Balancer is — a
+/// code identifies ONE quota (see [`super::descriptive_quota_code`]).
+///
+/// Adjustability is published PER CODE and is not a property of the plane: the recorded
+/// listing reports the trust-store, certificate, condition, security-group, tag and
+/// reserved-capacity planes as adjustable, so each row carries the adjustability the
+/// listing reports for its own code rather than the one its constructor defaults to.
 pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
     // One per-Region plane of a load-balancer type, metered like every other counted
     // plane ([`resource_count_plane`]) and worded the way this service words a plane of
@@ -143,28 +150,29 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             "TargetGroupsPerRegion",
             "target groups",
         ),
-        // The subnet plane of one Availability Zone of a load balancer, which AWS
-        // publishes as fixed and meters no count for.
+        // The revocation-ENTRY plane of a trust store — the entries the lists it holds
+        // carry together, which is a different quota from the lists themselves — published
+        // under the code the recorded listing states for it and as adjustable.
         unmetered(
             "L-37E1617B",
-            "Subnets per Availability Zone per load balancer",
-            1.0,
-            "subnets per Availability Zone per load balancer",
-        )
-        .fixed(),
+            "Revocation entries per trust store",
+            500_000.0,
+            "revocation entries per trust store",
+        ),
         unmetered(
             "L-43FE5A42",
             "Listeners per Network Load Balancer",
             50.0,
             "listeners per Network Load Balancer",
         ),
+        // The certificate plane of a Network Load Balancer, published under the code the
+        // recorded listing states for it, with that plane's own resource count.
         plane(
             "L-52964454",
-            "Listeners per Gateway Load Balancer",
-            1.0,
-            "listeners per Gateway Load Balancer",
-        )
-        .fixed(),
+            "Certificates per Network Load Balancer",
+            25.0,
+            "certificates per Network Load Balancer",
+        ),
         plane(
             "L-53DA6B97",
             "Listeners per Classic Load Balancer",
@@ -178,17 +186,20 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             "GatewayLoadBalancersPerRegion",
             "Gateway Load Balancers",
         ),
+        // The two Gateway Load Balancer planes the certificate bindings above displaced:
+        // each takes a code that binding vacated, keeping the adjustability and the
+        // resource count the recorded listing reports for THAT code.
         plane(
             "L-69A177A2",
-            "Certificates per Application Load Balancer",
-            25.0,
-            "certificates per Application Load Balancer",
+            "Listeners per Gateway Load Balancer",
+            1.0,
+            "listeners per Gateway Load Balancer",
         ),
         plane(
             "L-723DCCB6",
-            "Certificates per Network Load Balancer",
-            25.0,
-            "certificates per Network Load Balancer",
+            "Targets per Availability Zone per Gateway Load Balancer",
+            300.0,
+            "targets per Availability Zone per Gateway Load Balancer",
         ),
         unmetered(
             "L-7A15E3C5",
@@ -201,8 +212,7 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             "Target groups per action per Application Load Balancer",
             5.0,
             "target groups per action per Application Load Balancer",
-        )
-        .fixed(),
+        ),
         plane(
             "L-7E6692B2",
             "Targets per Application Load Balancer",
@@ -224,26 +234,28 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
         .fixed(),
         // The RESERVED capacity plane of the Region: the Application Load Balancer
         // capacity units held for the account rather than the balancers themselves, which
-        // AWS publishes with nothing reserved and as not adjustable. CloudWatch carries
-        // its count under a series that spells the units out rather than under the
-        // initialism the quota's own name parenthesises, so the series is named here.
+        // AWS publishes with nothing reserved. The units are named in the sentence the way
+        // the quota's own name capitalises them. CloudWatch carries its count under a
+        // series that spells the units out rather than under the initialism the quota's own
+        // name parenthesises, so the series is named here.
         quota(
             "Reserved Application Load Balancer Capacity Units (LCU) per Region",
             0.0,
         )
         .code("L-8A66D0E6")
-        .fixed()
         .metric_without_period(elb_plane_metric(
             "ReservedApplicationLoadBalancerCapacityUnitsPerRegion",
         ))
         .describe(&elb_description(
-            "reserved Application Load Balancer Capacity Units (LCU) per Region",
+            "Reserved Application Load Balancer Capacity Units (LCU) per Region",
         )),
+        // The certificate plane of an Application Load Balancer, published under the code
+        // the recorded listing states for it, with that plane's own resource count.
         plane(
             "L-9365A611",
-            "Targets per Availability Zone per Gateway Load Balancer",
-            300.0,
-            "targets per Availability Zone per Gateway Load Balancer",
+            "Certificates per Application Load Balancer",
+            25.0,
+            "certificates per Application Load Balancer",
         ),
         unmetered(
             "L-9E6F9012",
@@ -263,22 +275,19 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             1000.0,
             "instances registered with one Classic Load Balancer",
         ),
-        unmetered("L-A8F7060B", "Condition values per rule", 5.0, "condition values per rule")
-            .fixed(),
+        unmetered("L-A8F7060B", "Condition values per rule", 5.0, "condition values per rule"),
         plane(
             "L-B211E961",
             "Condition wildcards per rule",
             5.0,
             "condition wildcards per rule",
-        )
-        .fixed(),
+        ),
         plane(
             "L-B22855CB",
             "Load balancers per target group",
             1.0,
             "load balancers one target group can be used by",
-        )
-        .fixed(),
+        ),
         plane(
             "L-B6DF7632",
             "Listeners per Application Load Balancer",
@@ -308,8 +317,7 @@ pub(in crate::state) fn elasticloadbalancing_quotas() -> Vec<QuotaRow> {
             "Security groups per load balancer",
             5.0,
             "security groups per load balancer",
-        )
-        .fixed(),
-        unmetered("L-F31E307C", "Tags per load balancer", 50.0, "tags per load balancer").fixed(),
+        ),
+        unmetered("L-F31E307C", "Tags per load balancer", 50.0, "tags per load balancer"),
     ]
 }

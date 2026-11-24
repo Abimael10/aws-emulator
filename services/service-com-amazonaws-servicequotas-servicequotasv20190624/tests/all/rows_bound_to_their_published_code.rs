@@ -252,7 +252,8 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "The maximum number of BatchCheckLayerAvailability requests that you can \
-                      make per second in the current Region.",
+                      make per second in the current Region. This API is called once per image \
+                      layer when an image is pushed.",
         period: Some((1, "SECOND")),
         metric: Metric::Calls {
             usage_service: "ECR",
@@ -418,7 +419,7 @@ const ROWS: &[Row] = &[
         adjustable: false,
         description: "The maximum number of file system operations per second for a file system \
                       using General Purpose performance mode. Each read operation consumes one \
-                      file operation, and each write operation consumes five file operations.",
+                      file operation, and each write operation consumes five file operations",
         period: None,
         metric: Metric::None,
         context: None,

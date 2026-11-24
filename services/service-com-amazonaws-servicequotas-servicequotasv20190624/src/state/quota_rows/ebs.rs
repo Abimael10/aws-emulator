@@ -33,13 +33,31 @@ fn direct_api_rate(code: &str, api: &str, scope: &str, per_second: f64) -> Quota
 /// reads `The maximum aggregated amount of storage, in TiB, that can be requested in volume
 /// modifications across General Purpose SSD (gp2) volumes in this Region.` The class is that
 /// one sentence around what the plane aggregates — with the unit it is counted in where the
-/// plane states one — whether the plane is the storage itself or the modifications requested
-/// of it, and the volume type it is counted over, so it is built once here.
-fn aggregated_description(aggregated: &str, requested_for: &str, volume_type: &str) -> String {
+/// plane states one — what may be DONE with it on that plane, and the volume type it is
+/// counted over, so it is built once here.
+///
+/// The two planes of a volume type differ in that verb and in nothing else: the capacity
+/// plane itself is what may be PROVISIONED across the type's volumes, while the
+/// modification plane beside it is what may be REQUESTED in volume modifications across
+/// them ([`provisioned_description`] and [`modification_description`] are the two call
+/// forms).
+fn aggregated_description(aggregated: &str, may_be: &str, volume_type: &str) -> String {
     format!(
-        "The maximum aggregated amount of {aggregated} that can be requested \
-         {requested_for}across {volume_type} volumes in this Region."
+        "The maximum aggregated amount of {aggregated} that can be {may_be} \
+         across {volume_type} volumes in this Region."
     )
+}
+
+/// The sentence of a CAPACITY plane of one volume type: what may be provisioned across the
+/// type's volumes in the Region.
+fn provisioned_description(aggregated: &str, volume_type: &str) -> String {
+    aggregated_description(aggregated, "provisioned", volume_type)
+}
+
+/// The sentence of a MODIFICATION plane of one volume type: what may be requested in volume
+/// modifications across the type's volumes in the Region.
+fn modification_description(aggregated: &str, volume_type: &str) -> String {
+    aggregated_description(aggregated, "requested in volume modifications", volume_type)
 }
 
 /// Amazon Elastic Block Store's published default-quota catalog.
@@ -65,12 +83,15 @@ fn aggregated_description(aggregated: &str, requested_for: &str, volume_type: &s
 /// under a neighbouring code or a stand-in — a code identifies ONE quota (see
 /// [`super::descriptive_quota_code`]) — so the snapshot plane of the Region and the
 /// per-API rates whose codes are not among the recorded ones are left to the
-/// default-quota-set gap. The converse holds as well, and for the same reason: the recorded
-/// listing reports `L-C125AE42` and `L-DB2FBAA1` with members no quota this catalog can
-/// name carries (a one-second window, and the opposite adjustability), so those two codes
-/// name quotas this catalog cannot cite and are left to the gap rather than carrying the
-/// attachment plane of a Multi-Attach enabled volume and the fast-snapshot-restore plane of
-/// the Region, which are left to it with them.
+/// default-quota-set gap, which is where the `CopySnapshot`, `ModifySnapshotAttribute` and
+/// `UnlockSnapshot` rates go: the recorded listing states their codes for the io2
+/// provisioned-storage and storage-modification planes, the io1 IOPS-modification plane and
+/// the time-based snapshot-copy throughput of a destination Region, so those codes carry
+/// those planes here and the Magnetic storage plane takes the code the io2 binding vacated.
+/// `L-C125AE42` and `L-DB2FBAA1` are codes the recorded listing states in this catalog, so
+/// each answers a row — the attachment plane of a Multi-Attach enabled volume and the
+/// fast-snapshot-restore plane of the Region, the two planes this service publishes that no
+/// other code here names.
 pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
     let rate =
         |code: &str, api: &str, per_second: f64| request_rate(code, EBS_USAGE_SERVICE, api, per_second);
@@ -80,7 +101,7 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
     let storage = |code: &str, volume_type: &str, tebibytes: f64| {
         quota(format!("Storage for {volume_type} volumes, in TiB"), tebibytes)
             .code(code)
-            .describe(&aggregated_description("storage, in TiB,", "", volume_type))
+            .describe(&provisioned_description("storage, in TiB,", volume_type))
     };
     // The storage all volumes of one type may be MODIFIED to in the Region, which the
     // service publishes beside the storage plane itself. The TiB it is counted in is named
@@ -91,11 +112,7 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
             tebibytes,
         )
         .code(code)
-        .describe(&aggregated_description(
-            "storage, in TiB,",
-            "in volume modifications ",
-            volume_type,
-        ))
+        .describe(&modification_description("storage, in TiB,", volume_type))
     };
     // An IOPS plane of one volume type: the provisioned IOPS of all volumes of that
     // type in the Region.
@@ -105,13 +122,28 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
             operations_per_second,
         )
         .code(code)
-        .describe(&aggregated_description("IOPS", "", volume_type))
+        .describe(&provisioned_description("IOPS", volume_type))
+    };
+    // The IOPS all volumes of one type may be MODIFIED to in the Region, published beside
+    // the IOPS plane itself the way the storage-modification plane is published beside the
+    // storage plane.
+    let iops_modifications = |code: &str, volume_type: &str, operations_per_second: f64| {
+        quota(
+            format!("IOPS modifications for {volume_type} volumes"),
+            operations_per_second,
+        )
+        .code(code)
+        .describe(&modification_description("IOPS", volume_type))
     };
     vec![
         // The one volume-attachment rate AWS publishes as not adjustable.
         rate("L-028ACFB9", "AttachVolume", 100.0).fixed(),
         rate("L-07399329", "CompleteSnapshot", 100.0),
-        rate("L-09BD8365", "CopySnapshot", 10.0),
+        // The provisioned-storage plane of the Provisioned IOPS SSD (io2) type, published
+        // under the code the recorded listing states for it; the `CopySnapshot` rate this
+        // catalog had served here names no other code that listing states, so it is left to
+        // the default-quota-set gap.
+        storage("L-09BD8365", "Provisioned IOPS SSD (io2)", 20.0),
         // The two EBS direct-API request planes the service publishes as FIXED: the
         // block-write rate of one snapshot and the block-listing rate of the account.
         // The block-listing plane keeps the value the recorded listing reports for its
@@ -148,11 +180,20 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
         // catalog had served here names no other code that listing states, so it is left to
         // the default-quota-set gap.
         storage_modifications("L-87C9DEA6", "Throughput Optimized HDD (st1)", 500.0),
-        storage("L-8D977E7E", "Provisioned IOPS SSD (io2)", 20.0),
+        // The storage plane of the Magnetic type, the plane the io2 binding above
+        // displaced: it takes the code that binding vacated.
+        storage("L-8D977E7E", "Magnetic (standard)", 20.0),
         rate("L-915A3DBB", "ListSnapshotBlocks", 100.0).fixed(),
         rate("L-94D7AB7D", "LockSnapshot", 10.0).fixed(),
-        rate("L-98A0B26D", "ModifySnapshotAttribute", 100.0),
-        storage("L-9A0E0F82", "Magnetic (standard)", 20.0),
+        // The IOPS-modification plane of the Provisioned IOPS SSD (io1) type, published
+        // under the code the recorded listing states for it; the
+        // `ModifySnapshotAttribute` rate this catalog had served here names no other code
+        // that listing states, so it is left to the default-quota-set gap.
+        iops_modifications("L-98A0B26D", "Provisioned IOPS SSD (io1)", 500_000.0),
+        // The storage-modification plane of the Provisioned IOPS SSD (io2) type, published
+        // under the code the recorded listing states for it, with the limit that code
+        // carries.
+        storage_modifications("L-9A0E0F82", "Provisioned IOPS SSD (io2)", 20.0),
         storage("L-9CF3C2EB", "Cold HDD (sc1)", 50.0),
         rate("L-9F6E7C4E", "ModifySnapshotTier", 10.0).fixed(),
         rate("L-A37D9CF3", "ModifyVolume", 100.0),
@@ -160,6 +201,18 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
         rate("L-AFEBDF7A", "ResetSnapshotAttribute", 100.0).fixed(),
         iops("L-B3A130E6", "Provisioned IOPS SSD (io1)", 300_000.0),
         rate("L-B9F7C487", "RestoreSnapshotTier", 10.0),
+        // The attachment plane of ONE Multi-Attach enabled volume: the instances such a
+        // volume may be attached to at once, which AWS publishes as fixed. The recorded
+        // listing states this code in this service's catalog, so it answers a row rather
+        // than nothing, under the plane the "Amazon EBS quotas" page of the Amazon EBS User
+        // Guide publishes for it.
+        quota("Attachments per Multi-Attach enabled volume", 16.0)
+            .code("L-C125AE42")
+            .fixed()
+            .describe(
+                "The maximum number of instances that one Multi-Attach enabled volume can be \
+                 attached to at the same time.",
+            ),
         quota("In-progress snapshot archives per account", 5.0)
             .code("L-D0291BE3")
             .fixed()
@@ -176,7 +229,26 @@ pub(in crate::state) fn ebs_quotas() -> Vec<QuotaRow> {
                 "The maximum number of snapshot copies that can be in progress at once to a \
                  single destination Region.",
             ),
-        rate("L-E137849C", "UnlockSnapshot", 10.0),
+        // The fast-snapshot-restore plane of the Region: the snapshots fast snapshot
+        // restore may be enabled for at once. The recorded listing states this code in this
+        // service's catalog, so it answers a row rather than nothing, under the plane the
+        // Amazon EBS User Guide publishes for it.
+        quota("Snapshots with fast snapshot restore enabled per Region", 5.0)
+            .code("L-DB2FBAA1")
+            .describe(
+                "The maximum number of snapshots that can have fast snapshot restore enabled \
+                 at once in this account in the current Region.",
+            ),
+        // The snapshot-copy THROUGHPUT plane of one destination Region, published under the
+        // code the recorded listing states for it; the `UnlockSnapshot` rate this catalog
+        // had served here names no other code that listing states, so it is left to the
+        // default-quota-set gap.
+        quota("Time-based snapshot copy throughput per destination Region", 2000.0)
+            .code("L-E137849C")
+            .describe(
+                "The maximum throughput, in MiB/s, of the time-based snapshot copies running \
+                 to a single destination Region.",
+            ),
         quota("Archived snapshots per volume", 25.0)
             .code("L-E20676C1")
             .describe(

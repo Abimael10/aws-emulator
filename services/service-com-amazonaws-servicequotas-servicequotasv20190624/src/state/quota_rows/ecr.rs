@@ -17,9 +17,30 @@ const ECR_USAGE_SERVICE: &str = "ECR";
 /// one the shared rate constructor fills: the one-second window and the `AWS/Usage`
 /// `CallCount` of the throttled operation under this service's display name.
 fn ecr_request_rate(code: &str, api: &str, per_second: f64) -> QuotaRow {
-    request_rate(code, ECR_USAGE_SERVICE, api, per_second).describe(&format!(
+    request_rate(code, ECR_USAGE_SERVICE, api, per_second).describe(&ecr_rate_sentence(api))
+}
+
+/// The sentence Amazon ECR publishes for one of its per-API request rates.
+fn ecr_rate_sentence(api: &str) -> String {
+    format!(
         "The maximum number of {api} requests that you can make per second in the current \
          Region."
+    )
+}
+
+/// One Amazon ECR per-API request-rate quota of an operation a client calls ON THE PUSH
+/// PATH: the class sentence, followed by the clause that states when the operation is
+/// invoked during a push.
+///
+/// SOURCE: the recorded default-quota listing of `ecr`, whose layer-availability,
+/// layer-upload-completion and layer rate rows close with a second sentence saying that the
+/// operation is called once per image layer when an image is pushed, rather than with the
+/// class sentence alone. The clause belongs to the published text of every row of that
+/// class, so it is built once here.
+fn push_path_request_rate(code: &str, api: &str, per_second: f64) -> QuotaRow {
+    ecr_request_rate(code, api, per_second).describe(&format!(
+        "{} This API is called once per image layer when an image is pushed.",
+        ecr_rate_sentence(api)
     ))
 }
 
@@ -33,10 +54,15 @@ fn ecr_request_rate(code: &str, api: &str, per_second: f64) -> QuotaRow {
 /// than being a count, and a request-rate row carries the one-second window and the
 /// `AWS/Usage` `CallCount` of the operation it throttles ([`ecr_request_rate`]).
 ///
-/// The recorded listing publishes the `CompleteLayerUpload` rate under `L-44194860`, so
-/// that is the code it is published under here; the registry replication plane this catalog
-/// had published under that code takes the code the rate vacated rather than being dropped,
-/// because the listing reports both codes in this service's catalog.
+/// The recorded listing publishes the `CompleteLayerUpload` rate under `L-44194860` and the
+/// `PutImage` rate under `L-AD52DFB2`, so those are the codes they are published under
+/// here; the registry replication plane and the pull-path `GetDownloadUrlForLayer` rate
+/// this catalog had published under them take the codes those bindings vacated, because the
+/// listing reports every one of those codes in this service's catalog.
+///
+/// A row of a push-path operation closes on the clause stating when the operation is
+/// invoked during a push ([`push_path_request_rate`]) rather than on the class sentence
+/// alone.
 ///
 /// Adjustability is published PER CODE rather than per class: the recorded listing reports
 /// part of this service's rate planes and part of its counted planes as not adjustable, so
@@ -76,7 +102,7 @@ pub(in crate::state) fn ecr_quotas() -> Vec<QuotaRow> {
             .unit("Gigabytes")
             .fixed()
             .describe("The maximum size, in GiB, of one image layer."),
-        rate("L-44194860", "CompleteLayerUpload", 100.0),
+        push_path_request_rate("L-44194860", "CompleteLayerUpload", 100.0),
         rate("L-55A41110", "GetAuthorizationToken", 500.0),
         // The pull-through cache plane of a registry, which the service describes without
         // naming the registry: the limit is on the rules themselves.
@@ -97,11 +123,14 @@ pub(in crate::state) fn ecr_quotas() -> Vec<QuotaRow> {
         rate("L-A1670B10", "DeleteRepository", 10.0),
         rate("L-A60A366D", "DescribeImages", 100.0),
         rate("L-A71EAF5A", "DescribeRepositories", 100.0).fixed(),
-        rate("L-AD52DFB2", "GetDownloadUrlForLayer", 3000.0),
-        rate("L-B9173138", "BatchCheckLayerAvailability", 1000.0),
+        // The push-path image rate, published under the code the recorded listing states
+        // for it; the pull-path layer-download rate this catalog had served here takes the
+        // code that binding vacated.
+        rate("L-AD52DFB2", "PutImage", 10.0),
+        push_path_request_rate("L-B9173138", "BatchCheckLayerAvailability", 1000.0),
         rate("L-C0B33BA1", "InitiateLayerUpload", 100.0).fixed(),
         rate("L-CB63E564", "ListImages", 100.0).fixed(),
-        rate("L-CFEB8E8D", "PutImage", 100.0),
+        rate("L-CFEB8E8D", "GetDownloadUrlForLayer", 3000.0),
         rate("L-EF8F6F4E", "UploadLayerPart", 1000.0).fixed(),
     ]
 }

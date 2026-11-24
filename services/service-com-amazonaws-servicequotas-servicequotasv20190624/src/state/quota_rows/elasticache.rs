@@ -38,9 +38,14 @@ fn per_region_description(counted: &str) -> String {
 ///
 /// A quota this catalog can cite no code for is left to the default-quota-set gap rather
 /// than published under a neighbouring code (see [`super::descriptive_quota_code`]), which
-/// is why the node plane of the Region, the replica plane of a shard and the user-group
-/// plane are absent: `L-AF354865`, which this catalog had published the user-group plane
-/// under, is the code the per-cluster node plane is published under.
+/// is why the replica plane of a shard, the user-group plane and the manual-backup plane of
+/// the Region are absent: `L-AF354865`, which this catalog had published the user-group
+/// plane under, is the code the per-cluster node plane is published under, and
+/// `L-3F15A733` and `L-DFE45DF3`, which it had published the per-cluster Memcached node
+/// plane and the manual-backup plane under, are the codes the parameter-group plane and the
+/// node plane of the Region are published under. The Memcached node plane the first of
+/// those bindings displaced takes the code the parameter-group plane vacated, with that
+/// code's published adjustability.
 pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
     let metered = |code: &str, name: &str, value: f64, resource: &str, counted: &str| {
         resource_count_plane(code, name, value, ELASTICACHE_USAGE_SERVICE, resource, counted)
@@ -66,9 +71,16 @@ pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
             "SubnetGroup",
             "subnet groups",
         ),
-        quota("Nodes per cluster (Memcached)", 40.0)
-            .code("L-3F15A733")
-            .describe("The maximum number of nodes in one Memcached cluster."),
+        // The parameter-group plane of the Region, published under the code the recorded
+        // listing states for it, with that plane's own resource count and the window those
+        // counts are published over.
+        metered(
+            "L-3F15A733",
+            "Parameter groups per Region",
+            300.0,
+            "ParameterGroup",
+            "parameter groups",
+        ),
         // The snapshot plane of ONE serverless cache, counted inside the cache rather than
         // across the Region, which is what its own sentence names.
         inside(
@@ -80,13 +92,13 @@ pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
         .describe(
             "The maximum number of snapshots that can be taken per day per serverless cache.",
         ),
-        metered(
-            "L-7D6587E6",
-            "Parameter groups per Region",
-            150.0,
-            "ParameterGroupsPerRegion",
-            "parameter groups",
-        ),
+        // The node plane of ONE Memcached cluster, the plane the parameter-group binding
+        // above displaced: it takes the code that binding vacated, and keeps the
+        // adjustability the recorded listing reports for THAT code.
+        quota("Nodes per cluster (Memcached)", 40.0)
+            .code("L-7D6587E6")
+            .fixed()
+            .describe("The maximum number of nodes in one Memcached cluster."),
         metered(
             "L-80E085C7",
             "Users per Region",
@@ -94,9 +106,17 @@ pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
             "User",
             "users",
         ),
-        quota("Shards per cluster (cluster mode enabled)", 500.0)
-            .code("L-8C334AD1")
-            .describe("The maximum number of shards in one cluster with cluster mode enabled."),
+        // The shard plane of ONE cluster with cluster mode enabled, counted inside the
+        // cluster and metered under that plane's own series: the recorded listing publishes
+        // this code over the window a resource count is published with, which is the window
+        // every metered plane of this service carries.
+        inside(
+            "L-8C334AD1",
+            "Shards per cluster (cluster mode enabled)",
+            500.0,
+            "ShardsPerCluster",
+        )
+        .describe("The maximum number of shards in one cluster with cluster mode enabled."),
         // The user plane of ONE user group, counted inside the group. The service words
         // this one as the users a client DEFINES for the group.
         inside(
@@ -121,11 +141,12 @@ pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
             "cache security groups",
         ),
         // The node plane of ONE cluster with cluster mode enabled, counted inside the
-        // cluster and metered under that plane's own series.
+        // cluster and metered under that plane's own series, with the limit the recorded
+        // listing reports for its code.
         inside(
             "L-AF354865",
             "Nodes per cluster (cluster mode enabled)",
-            500.0,
+            90.0,
             "NodesPerCluster",
         )
         .describe("The maximum number of nodes in one cluster with cluster mode enabled."),
@@ -136,12 +157,15 @@ pub(in crate::state) fn elasticache_quotas() -> Vec<QuotaRow> {
             "ServerlessCachesPerRegion",
             "serverless caches",
         ),
+        // The node plane of the Region, published under the code the recorded listing
+        // states for it; the manual-backup plane this catalog had served here names no
+        // other code that listing states, so it is left to the default-quota-set gap.
         metered(
             "L-DFE45DF3",
-            "Manual backups per Region",
-            1000.0,
-            "ManualBackupsPerRegion",
-            "manual backups",
+            "Nodes per Region",
+            300.0,
+            "NodesPerRegion",
+            "nodes",
         ),
     ]
 }

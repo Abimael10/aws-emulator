@@ -66,6 +66,12 @@ fn throughput_description(capacity: &str, allocated_over: &str) -> String {
 /// than published under a neighbouring code (see [`super::descriptive_quota_code`]), which
 /// is why the import-job plane of the account is absent: `L-F3CA5463`, which this catalog
 /// had published it under, is the code the throughput-decrease rule is published under.
+///
+/// The recorded listing states `L-F7858A77` for the SECONDARY-INDEX plane of a table and
+/// publishes the decrease rule's name as the provisioned capacity decreases of a day, so
+/// those are the bindings and the name carried here; the export-job concurrency that
+/// binding displaced takes the code it vacated (`L-6F30DCE1`) with that code's published
+/// adjustability, which is the one member of it no source names for that plane.
 pub(in crate::state) fn dynamodb_quotas() -> Vec<QuotaRow> {
     // The account-level provisioned-throughput planes, the two DynamoDB publishes an
     // `AWS/Usage` resource count for: the capacity units provisioned across the
@@ -106,11 +112,17 @@ pub(in crate::state) fn dynamodb_quotas() -> Vec<QuotaRow> {
             )),
         account_provisioned("L-34F6A552", "read", "AccountProvisionedReadCapacityUnits"),
         account_provisioned("L-34F8CCC8", "write", "AccountProvisionedWriteCapacityUnits"),
-        // The secondary-index plane of a table, which AWS publishes as fixed.
-        quota("Global secondary indexes per table", 20.0)
+        // The export-job concurrency of the account, the plane the secondary-index binding
+        // below displaced: it takes the code that binding vacated, and keeps the
+        // adjustability the recorded listing reports for THAT code, which is the one member
+        // of it no source names for this plane.
+        quota("Concurrent export jobs", 300.0)
             .code("L-6F30DCE1")
             .fixed()
-            .describe("The maximum number of global secondary indexes for a single table."),
+            .describe(
+                "The maximum number of concurrent export jobs in this account in the current \
+                 Region.",
+            ),
         quota(
             "Account-level read throughput limit (On-demand mode)",
             40_000.0,
@@ -157,7 +169,7 @@ pub(in crate::state) fn dynamodb_quotas() -> Vec<QuotaRow> {
         // itself rather than as a count: four decreases are allowed at any time of the day
         // in the GMT zone, and an hour without one earns a further decrease, which is what
         // brings the day's maximum to the value this row carries.
-        quota("Maximum number of decreases per day", 27.0)
+        quota("Provisioned capacity decreases per day", 27.0)
             .code("L-F3CA5463")
             .describe(&format!(
                 "A decrease is allowed up to four times any time per day (GMT time zone). \
@@ -166,12 +178,12 @@ pub(in crate::state) fn dynamodb_quotas() -> Vec<QuotaRow> {
                  27 times. {}",
                 see_developer_guide("ServiceQuotas", "")
             )),
-        quota("Concurrent export jobs", 300.0)
+        // The secondary-index plane of a table, published under the code the recorded
+        // listing states for it: the plane's name, limit and sentence are its own, and the
+        // code it is bound to is the listing's.
+        quota("Global Secondary Indexes per table", 20.0)
             .code("L-F7858A77")
-            .describe(
-                "The maximum number of concurrent export jobs in this account in the current \
-                 Region.",
-            ),
+            .describe("The maximum number of global secondary indexes per table."),
         // The table plane of the account, the one DynamoDB publishes a CloudWatch
         // usage metric for (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`).
         quota("Maximum number of tables", 2500.0)

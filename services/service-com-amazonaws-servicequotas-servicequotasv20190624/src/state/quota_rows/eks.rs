@@ -15,6 +15,22 @@ fn per_cluster_description(counted: &str) -> String {
     format!("{}.", maximum_number_phrase(counted))
 }
 
+/// The sentence Amazon EKS publishes for a per-cluster plane whose allowance is SET WHEN
+/// THE CLUSTER IS CREATED (or, for a plane that can be changed afterwards, when it is
+/// created or updated): the plane's own phrase followed by the parenthetical clause that
+/// states when the quota is applied.
+///
+/// SOURCE: the recorded default-quota listing of `eks`, whose control-plane security-group
+/// row closes `… per cluster (these are specified when you create the cluster).` and whose
+/// public-endpoint CIDR row closes `… (these are specified when you create or update the
+/// cluster).` The clause belongs to the published sentence, so a row of this class carries
+/// it rather than the bare plane phrase.
+fn specified_at_description(counted: &str, specified_when: &str) -> String {
+    per_cluster_description(&format!(
+        "{counted} (these are specified when you {specified_when} the cluster)"
+    ))
+}
+
 /// The sentence Amazon EKS publishes for a plane counted across the ACCOUNT in one
 /// Region.
 ///
@@ -53,8 +69,9 @@ pub(in crate::state) fn eks_quotas() -> Vec<QuotaRow> {
         quota("Control plane security groups per cluster", 4.0)
             .code("L-11427A54")
             .fixed()
-            .describe(&per_cluster_description(
+            .describe(&specified_at_description(
                 "control plane security groups per cluster",
+                "create",
             )),
         quota("Clusters", 100.0)
             .code("L-1194D53C")
@@ -82,8 +99,9 @@ pub(in crate::state) fn eks_quotas() -> Vec<QuotaRow> {
         quota("Public endpoint access CIDR ranges per cluster", 40.0)
             .code("L-93A74D60")
             .fixed()
-            .describe(&per_cluster_description(
+            .describe(&specified_at_description(
                 "public endpoint access CIDR ranges per cluster",
+                "create or update",
             )),
         quota("Nodes per managed node group", 450.0)
             .code("L-BD136A63")
@@ -93,7 +111,7 @@ pub(in crate::state) fn eks_quotas() -> Vec<QuotaRow> {
         // are unchanged — moved whole onto the code the recorded listing states for it,
         // which is what the binding rule asks: nothing about the quota itself is restated
         // here.
-        quota("Access entries per cluster", 100.0)
+        quota("Access entries per cluster", 3000.0)
             .code("L-C56B9FC3")
             .fixed()
             .describe(&per_cluster_description("access entries per cluster")),
