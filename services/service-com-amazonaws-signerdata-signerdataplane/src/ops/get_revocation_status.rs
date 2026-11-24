@@ -6,6 +6,13 @@
 //! holds no revocation of its own: the Signer CONTROL plane's `RevokeSignature` /
 //! `RevokeSigningProfile` write that registry, and this read reports it.
 //!
+//! The VALUES a request carries are held to this route's published contract before the
+//! registry is read, by the rules the control plane owns ([`signer_input_rules`]): a
+//! `signatureTimestamp` the service's present time has not reached names no signature
+//! that can exist, and a `certificateHashes` entry that is not a certificate identifier
+//! names no certificate — so a request whose identifiers are malformed is told so rather
+//! than told that nothing it named is revoked.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -85,6 +92,12 @@ use super::types::*;
 /// publishing one IAM action namespace (`signer`), so a second reading of the caller's
 /// identity-based policies here could come to answer differently from that one.
 use ::service_com_amazonaws_signer_wallabyservice::state::authorization as signer_authorization;
+
+/// The rules the VALUES of a `GET /revocations` request are held to, and the one wording
+/// of each refusal of one, owned by that same control plane for the same reason: the two
+/// endpoints publish ONE contract for this route, so a rule stated twice could come to
+/// refuse — or admit — different requests at the two of them.
+use ::service_com_amazonaws_signer_wallabyservice::state as signer_input_rules;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -192,6 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| server_error(crate::state::NO_STORE))?;
 
+        // Every value this read is held to is judged before the registry is read, in
+        // the order the model declares the members. `signatureTimestamp` names when the
+        // artifact WAS signed, so an instant the service's present time has not reached
+        // names no signature that can exist; the rule is one-sided, since nothing here
+        // expires a signature made long ago.
+        if let Some(message) = signer_input_rules::future_signature_timestamp_refusal(
+            &input.signature_timestamp,
+            ::std::time::SystemTime::now(),
+        ) {
+            return Err(validation(message));
+        }
+
         // `certificateHashes` is `@required`, and what it requires is a certificate
         // to check — so a request that supplies the parameter but no element in it
         // is refused for the constraint it actually violated (the list is empty),
@@ -200,15 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::service::missing_member_constraint`, since on the query string
         // the two are the same request.
         if input.certificate_hashes.is_empty() {
-            return Err(GetRevocationStatusErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::service::missing_list_member_constraint(
-                        CERTIFICATE_HASHES_QUERY,
-                    )),
-                    code: Some(VALIDATION_EXCEPTION_CODE.to_string()),
-                },
-            )
-            .into());
+            return Err(validation(crate::service::missing_list_member_constraint(
+                CERTIFICATE_HASHES_QUERY,
+            )));
+        }
+
+        // The entries themselves, last, as the model declares the member last. An entry
+        // IDENTIFIES a certificate — the subject certificate's TBS hash followed by its
+        // parent CA's — so one that is not two hex digests end to end identifies none,
+        // and the rule is applied to EVERY entry rather than to the first. The number of
+        // entries one request may ask about is capped as well, so a caller learns the
+        // batch limit instead of having an oversized batch silently answered.
+        if let Some(message) =
+            signer_input_rules::certificate_hashes_refusal(&input.certificate_hashes)
+        {
+            return Err(validation(message));
         }
 
         // `@readonly`: the guard is taken, the answer is computed from what the
@@ -241,6 +272,20 @@ fn server_error(message: impl Into<String>) -> GetRevocationStatusError {
     GetRevocationStatusErrorModeled::InternalServiceErrorException(InternalServiceErrorException {
         message: Some(message.into()),
         code: Some("InternalServiceErrorException".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request this operation cannot act on: a `signatureTimestamp`
+/// the present time has not reached, or a `certificateHashes` carrying nothing, too many
+/// entries, or one that identifies no certificate.
+///
+/// `code` is the modelled shape's own name, which is what a refusal of the request's own
+/// values reports.
+fn validation(message: String) -> GetRevocationStatusError {
+    GetRevocationStatusErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        code: Some(VALIDATION_EXCEPTION_CODE.to_string()),
     })
     .into()
 }

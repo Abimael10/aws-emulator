@@ -55,9 +55,12 @@ const ACCOUNT_ID: &str = "000000000000";
 const PLATFORM: &str = "Notation-OCI-SHA384-ECDSA";
 
 /// The one `certificateHashes` entry these requests carry. This service revokes profiles
-/// and signatures rather than certificates, so no hash is ever reported: the value only has
-/// to be one the request can carry.
-const CERTIFICATE_HASH: &str = "aa";
+/// and signatures rather than certificates, so no hash is ever reported: the value only
+/// has to identify a certificate — two hex digests end to end, the subject certificate's
+/// TBS hash followed by its parent CA's.
+const CERTIFICATE_HASH: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// The instant a revocation below takes effect, in epoch seconds.
 const EFFECTIVE_EPOCH_SECS: i64 = 1_700_000_000;

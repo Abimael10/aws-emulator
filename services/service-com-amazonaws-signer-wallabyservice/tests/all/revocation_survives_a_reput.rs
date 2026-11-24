@@ -282,14 +282,17 @@ fn cases() -> Vec<Case> {
             reason: "y".repeat(500),
             effective_epoch_secs: 1_600_000_000,
         },
-        // A far-future effective instant, in a fourth region.
+        // A fourth region, and the most recent effective instant of the table.
+        // Every row's effective instant is one the present has reached, because
+        // the probes below ask about signatures made at and around it and a
+        // signature is made before its revocation is checked.
         Case {
-            name: "Revoked_Then_Recreated_Future_Effective",
+            name: "Revoked_Then_Recreated_Fourth_Region",
             region: "ap-southeast-1",
             platform: "AWSLambda-SHA384-ECDSA",
             attempts: &["Notation-OCI-SHA384-ECDSA"],
             reason: "certificate material leaked".to_string(),
-            effective_epoch_secs: 4_000_000_000,
+            effective_epoch_secs: 1_750_000_000,
         },
     ]
 }

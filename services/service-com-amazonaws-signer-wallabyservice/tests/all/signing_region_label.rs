@@ -406,12 +406,16 @@ async fn a_minted_profile_version_arn_is_served_by_the_revocation_reader() {
             case.expected_region,
             format_args!("job-{index}")
         );
+        // A `signatureTimestamp` in the past (a signature is made before it is
+        // checked) and a certificate hash of the documented shape: two hex
+        // digests end to end.
         let uri = format!(
-            "/revocations?signatureTimestamp=2026-01-01T00%3A00%3A00Z&platformId={}\
-             &profileVersionArn={}&jobArn={}&certificateHashes=abc123",
+            "/revocations?signatureTimestamp=2023-11-14T22%3A13%3A20Z&platformId={}\
+             &profileVersionArn={}&jobArn={}&certificateHashes={}",
             encode(PLATFORM_ID),
             encode(&version_arn),
             encode(&job_arn),
+            "ab".repeat(96),
         );
         let answer = call(&router, &case.scope_region, "GET", &uri, None).await;
         assert_eq!(

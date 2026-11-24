@@ -34,9 +34,19 @@
 //! A `platformId` outside the character class the route's published contract
 //! declares for it is refused for that constraint
 //! ([`crate::state::platform_id_pattern_refusal`]) before any platform is
-//! resolved, so the catalog only ever decides about ids that are platform ids:
-//! "does not exist" says the id was well formed and unknown, which a value the
-//! class excludes is not.
+//! resolved, so the catalog only ever decides about ids that are platform ids.
+//!
+//! Every other value this read cannot act on is refused for the VALUE it
+//! carried, named by the member that carried it
+//! ([`crate::state::invalid_member_message`]): an id the published catalog holds
+//! no platform for, and a `profileVersionArn` or `jobArn` that is not an ARN of
+//! the kind of resource its member names. The two members the request asks ABOUT
+//! are judged on their own values too — a `signatureTimestamp` the service's
+//! present time has not reached names no signature that can exist, and a
+//! `certificateHashes` entry that is no certificate identifier names no
+//! certificate ([`crate::state::certificate_hashes_refusal`]) — so a request
+//! whose identifiers are malformed is told so rather than told that nothing it
+//! named is revoked.
 //!
 //! ## Shape of an operation
 //!
@@ -209,14 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &authorized_resource
         )?;
 
-        // Every value this route's published contract CONSTRAINS is refused for
-        // the constraint it violated before anything it might name is resolved,
-        // in the order the model declares the members — so `platformId`, whose
-        // published character class this service checks itself, comes before
-        // `certificateHashes`. A value outside that class is not a platform id
-        // at all: it names no platform, so it is refused for the syntax it
-        // violated rather than reported as a platform that does not exist, which
-        // would say the id was well formed but unknown.
+        // Every value this read is held to is judged before anything it might
+        // name is resolved, in the order the model declares the members —
+        // `signatureTimestamp`, `platformId`, the two ARNs, then
+        // `certificateHashes` — so a request that miswrites two of them is
+        // refused for the first one the model declares.
+        //
+        // `signatureTimestamp` names when the artifact WAS signed, so an instant
+        // the service's present time has not reached names no signature that can
+        // exist; the rule is one-sided, since nothing here expires a signature
+        // made long ago.
+        if let Some(message) = crate::state::future_signature_timestamp_refusal(
+            &input.signature_timestamp,
+            ::std::time::SystemTime::now(),
+        ) {
+            return Err(validation(message));
+        }
+
+        // A `platformId` outside the character class the route's published
+        // contract declares is not a platform id at all: it names no platform, so
+        // it is refused for the syntax it violated rather than for the platform
+        // it failed to name.
         if let Some(message) =
             crate::state::platform_id_pattern_refusal(PLATFORM_ID_QUERY, &input.platform_id)
         {
@@ -239,9 +262,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `platformId` names the signing platform the signature was produced on,
         // and this service publishes the WHOLE set of platforms a signature can
         // be produced on, so an id inside the published character class but
-        // outside that catalog names no platform at all.
+        // outside that catalog names no platform at all. The ANSWER is a refusal
+        // of the request's own value — the operations that RESOLVE a platform
+        // report a missing resource for the same condition, and this read reports
+        // nothing about resources — so it is worded by the member that carried it
+        // (see this module's header).
         if crate::state::signing_platform(&input.platform_id).is_none() {
-            return Err(validation(crate::state::platform_not_found_message(
+            return Err(validation(crate::state::invalid_member_message(
+                PLATFORM_ID_QUERY,
                 &input.platform_id,
             )));
         }
@@ -262,17 +290,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some((_, profile_name, profile_version)) =
             crate::state::profile_version_in_arn(&input.profile_version_arn)
         else {
-            return Err(validation(crate::state::invalid_arn_message(
+            return Err(validation(crate::state::invalid_member_message(
                 PROFILE_VERSION_ARN_QUERY,
                 &input.profile_version_arn,
             )));
         };
         let Some((_, job_id_named)) = crate::state::job_region_and_id_in_arn(&input.job_arn) else {
-            return Err(validation(crate::state::invalid_arn_message(
+            return Err(validation(crate::state::invalid_member_message(
                 JOB_ARN_QUERY,
                 &input.job_arn,
             )));
         };
+
+        // `certificateHashes` last, as the model declares the member last. An
+        // entry IDENTIFIES a certificate — the subject certificate's TBS hash
+        // followed by its parent CA's — so an entry that is not two hex digests
+        // end to end identifies none, and the rule is applied to EVERY entry: a
+        // batch whose last entry is malformed is refused for that entry rather
+        // than answered as a signature nothing revoked. The number of entries is
+        // capped too, so a caller learns the batch limit instead of having an
+        // oversized batch silently answered.
+        if let Some(message) = crate::state::certificate_hashes_refusal(&input.certificate_hashes)
+        {
+            return Err(validation(message));
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -350,8 +391,10 @@ const PROFILE_VERSION_ARN_QUERY: &str = "profileVersionArn";
 const JOB_ARN_QUERY: &str = "jobArn";
 
 /// The modelled 400 for a request this operation cannot act on: a
-/// `certificateHashes` carrying nothing, a `platformId` naming no published
-/// signing platform, or a member that is not an ARN of the resource it names.
+/// `signatureTimestamp` the present time has not reached, a `platformId` naming
+/// no published signing platform, a member that is not an ARN of the resource it
+/// names, or a `certificateHashes` carrying nothing, too many entries, or one
+/// that identifies no certificate.
 ///
 /// `code` is the modelled shape's own name — a refusal of the request's own
 /// values, which is what that shape already says (see

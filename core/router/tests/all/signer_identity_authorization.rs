@@ -376,9 +376,10 @@ async fn given_profile(router: &MultiServiceRouter, name: &str) -> String {
 
 /// The query string `GetRevocationStatus` binds its five `@required` members to. A query
 /// carries `:` and `/` unescaped, which is how an SDK sends an ARN and an ISO 8601 instant.
+/// The instant is in the past, since a signature is made before its revocation is checked.
 fn revocation_query(profile_version_arn: &str) -> String {
     format!(
-        "/revocations?signatureTimestamp=2026-01-01T00:00:00Z&platformId={PLATFORM}\
+        "/revocations?signatureTimestamp=2023-11-14T22:13:20Z&platformId={PLATFORM}\
          &profileVersionArn={profile_version_arn}&jobArn={}&certificateHashes={}",
         job_arn(JOB_ID),
         "ab".repeat(96)

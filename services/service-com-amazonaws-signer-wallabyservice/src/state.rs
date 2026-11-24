@@ -1226,15 +1226,172 @@ pub fn job_region_and_id_in_arn(arn: &str) -> Option<(&str, &str)> {
     is_arn_resource_segment(job_id).then_some((region, job_id))
 }
 
-/// The refusal prose for a member that carries the ARN of one kind of resource
-/// and was given a value that is not a well-formed ARN of that kind.
+/// The refusal prose for a request value that addresses nothing this endpoint
+/// could answer about, named by the member that carried it.
 ///
-/// The member is named because that is what the caller has to correct, and the
-/// value is stated whole: an `Arn` member is bounded by the modelled shape's
-/// `@length(20, 2048)`, so it is already limited when the boundary validator
-/// admits it (see [`stated_value`]).
-pub fn invalid_arn_message(member: &str, value: &str) -> String {
-    format!("Invalid {member}: {value}")
+/// ONE template for every such value of the revocation read: a `platformId` that
+/// names no published signing platform, and a `profileVersionArn` or `jobArn`
+/// that is not a well-formed ARN of the kind of resource its own member names.
+/// What those share is the ANSWER: the refusal is about the request's VALUE, so
+/// it names the member the caller has to correct and states the value it sent —
+/// it does not report a resource as missing, which would say the value was the
+/// name of something that could come back.
+///
+/// The value is quoted through the one ceiling this crate states for a request
+/// value a clause carries ([`stated_value`]), which is what bounds a member the
+/// model puts no length on (a `platformId`); a member the model DOES bound (an
+/// `Arn`, `@length(20, 2048)`) is already limited when the boundary validator
+/// admits it and is quoted as it arrived.
+pub fn invalid_member_message(member: &str, value: &str) -> String {
+    format!("Invalid {member}: {}", stated_value(value))
+}
+
+/// The fewest characters a `certificateHashes` entry carries.
+///
+/// Recorded behaviour, not a model fact: neither model that declares this
+/// operation states a band, and the two do not even agree on the member's own
+/// shape (this service's `CertificateHashes` targets a bare `String`, while the
+/// data plane's `CertificateHash` carries `@length(1, 2048)`), so the band comes
+/// from what the service was recorded to admit and refuse. The size it lands on
+/// is the one an IDENTIFIER of a certificate takes: this service's own model
+/// documents the member as a composite of the subject certificate's TBS hash and
+/// its parent CA's, each rendered in hex
+/// (`smithy_query(query="doc",shape="GetRevocationStatusRequest",\
+/// member="certificateHashes",model_path="services/\
+/// service-com-amazonaws-signer-wallabyservice/smithy-model/\
+/// com-amazonaws-signer-wallabyservice.json")`), so an entry is two hex digests
+/// end to end — 128 characters for a pair of SHA-256 digests — and anything
+/// shorter identifies no certificate.
+pub const CERTIFICATE_HASH_MIN_LENGTH: usize = 128;
+
+/// The most characters a `certificateHashes` entry carries: a pair of SHA-512
+/// digests in hex (see [`CERTIFICATE_HASH_MIN_LENGTH`]).
+pub const CERTIFICATE_HASH_MAX_LENGTH: usize = 256;
+
+/// The most entries one `certificateHashes` carries: a per-request cap, so a
+/// batch of certificate identifiers is bounded however many a caller has.
+///
+/// Recorded behaviour: the model puts no `@length` on `CertificateHashes`.
+pub const MAX_CERTIFICATE_HASHES: usize = 5;
+
+/// Whether `hash` identifies a certificate: hexadecimal characters only, and
+/// between [`CERTIFICATE_HASH_MIN_LENGTH`] and [`CERTIFICATE_HASH_MAX_LENGTH`]
+/// of them.
+///
+/// Hexadecimal is case-insensitive — the digits and `a`-`f` in either case —
+/// since the digests the entry concatenates are rendered by whichever tool the
+/// caller hashed with.
+///
+/// Total over arbitrary text: the entry is CHARACTER-counted and inspected
+/// character by character, so no byte index is taken into a value that arrived
+/// off the wire and a non-ASCII entry is answered rather than panicked on. Both
+/// walks are linear in the entry (no pattern engine, no backtracking) and stop
+/// at the first character outside the class.
+fn is_certificate_hash(hash: &str) -> bool {
+    (CERTIFICATE_HASH_MIN_LENGTH..=CERTIFICATE_HASH_MAX_LENGTH).contains(&hash.chars().count())
+        && hash.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+/// How a `certificateHashes` the revocation read cannot act on is refused, or
+/// `None` when every entry identifies a certificate and there are not too many
+/// of them.
+///
+/// Two rules, judged in that order: the LIST carries at most
+/// [`MAX_CERTIFICATE_HASHES`] entries — a fact about the list itself, like the
+/// one that it carries any at all — and then EVERY entry has to be a certificate
+/// identifier ([`is_certificate_hash`]), the first one that is not being the one
+/// the refusal states. The rule is applied to every entry rather than to the
+/// first, so a well-formed batch carrying one malformed entry anywhere in it is
+/// refused for that entry.
+///
+/// The count is judged FIRST, which is also what bounds the work: a list the cap
+/// admits is at most [`MAX_CERTIFICATE_HASHES`] entries long, so the per-entry
+/// walk below runs that many times however many entries the request carried, and
+/// a longer list is refused without being walked at all. Neither message grows
+/// with the request ([`stated_value`] caps the one that quotes an entry), so no
+/// request can make the refusal as large as itself.
+pub fn certificate_hashes_refusal(hashes: &[String]) -> Option<String> {
+    if hashes.len() > MAX_CERTIFICATE_HASHES {
+        return Some(too_many_certificate_hashes_message());
+    }
+    hashes
+        .iter()
+        .find(|hash| !is_certificate_hash(hash))
+        .map(|hash| certificate_hash_message(hash))
+}
+
+/// The refusal prose for one `certificateHashes` entry that identifies no
+/// certificate: the entry, and the character class and size an entry has.
+///
+/// The sentence is the service's own, reproduced as it words this refusal — it
+/// says "bits" where the two numbers are the CHARACTER count the band is judged
+/// by ([`is_certificate_hash`]), and a client matches on the sentence rather than
+/// on its arithmetic, so the numbers are stated as the band states them.
+///
+/// The entry is quoted through the one ceiling this crate states for a request
+/// value a clause carries ([`stated_value`]), which is what bounds it where the
+/// member carrying it has no modelled length.
+pub fn certificate_hash_message(hash: &str) -> String {
+    format!(
+        "Certificate hash {} must be hexadecimal and between {CERTIFICATE_HASH_MIN_LENGTH} and \
+         {CERTIFICATE_HASH_MAX_LENGTH} bits long",
+        stated_value(hash)
+    )
+}
+
+/// The refusal prose for a `certificateHashes` carrying more entries than one
+/// request may ask about. It states the cap and NONE of the request: the
+/// condition is the number of entries, which is the same fact for every caller.
+pub fn too_many_certificate_hashes_message() -> String {
+    format!("certificateHashes must not contain more than {MAX_CERTIFICATE_HASHES} hashes")
+}
+
+/// How a `signatureTimestamp` the service's present time has not reached is
+/// refused, or `None` for one at or before it.
+///
+/// `signatureTimestamp` names when an artifact WAS signed, so an instant still
+/// in the future names no signature that can exist and the request is refused
+/// for the value it carried, before any revocation record is consulted. The rule
+/// is ONE-SIDED: a signature made decades ago is still a signature, and nothing
+/// about a revocation check expires it, so no instant is too early.
+pub fn future_signature_timestamp_refusal(
+    signature_timestamp: &::aws_smithy_types::DateTime,
+    now: SystemTime,
+) -> Option<String> {
+    if epoch_nanos_of_timestamp(signature_timestamp)
+        <= epoch_nanos_of_timestamp(&to_timestamp(now))
+    {
+        return None;
+    }
+    Some(format!(
+        "Invalid signatureTimestamp: {} must be earlier than present time",
+        whole_second_instant(signature_timestamp)
+    ))
+}
+
+/// Epoch nanoseconds of a modelled `Timestamp`, so two instants compare in one
+/// integer space whichever side of the epoch they fall on.
+///
+/// `aws_smithy_types::DateTime` holds whole epoch seconds (signed) plus a
+/// non-negative sub-second nanosecond part, so the two combine additively. The
+/// arithmetic is `i128`, which holds the widest product either field can reach,
+/// so no instant the wire can carry overflows it.
+fn epoch_nanos_of_timestamp(when: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(when.secs()) * 1_000_000_000 + i128::from(when.subsec_nanos())
+}
+
+/// `at` as a clause states an instant: ISO 8601 in UTC, to the whole second,
+/// with the `Z` zone — the rendering an `@httpQuery`-bound timestamp carries on
+/// the wire, with the sub-second part dropped rather than restated.
+///
+/// An instant outside the calendar the renderer spells (which only a value far
+/// past any date a client sends reaches) is stated as its epoch seconds, so the
+/// clause always names the instant the request carried and the renderer's refusal
+/// is handled rather than unwrapped.
+fn whole_second_instant(at: &::aws_smithy_types::DateTime) -> String {
+    ::aws_smithy_types::DateTime::from_secs(at.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.secs().to_string())
 }
 
 /// The region and the resource portion of `arn`, when `arn` is a well-formed AWS
@@ -1800,11 +1957,15 @@ pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEnt
         .find(|entry| entry.platform_id == platform_id)
 }
 
-/// The refusal prose for a `platformId` this emulator publishes no platform for.
+/// The refusal prose for a `platformId` this emulator publishes no platform for,
+/// as the operations that RESOLVE a platform word it — the platform reader and
+/// the profile create, whose answer is a missing resource (404).
 ///
 /// Says the id was WELL FORMED and unknown — a platform another endpoint may
 /// publish, or one that was withdrawn. An id that is not a platform id at all is
-/// a different answer ([`platform_id_pattern_refusal`]).
+/// a different answer ([`platform_id_pattern_refusal`]), and so is the same
+/// condition on the revocation read, whose answer is a refusal of the request's
+/// value rather than a missing resource ([`invalid_member_message`]).
 ///
 /// `PlatformId` is a bare string in the model, so a value the published
 /// character class admits reaches here at any length: the id is quoted through
@@ -1927,8 +2088,10 @@ pub fn stated_value(value: &str) -> String {
 ///
 /// A value outside a published constraint is refused for the SYNTAX it violated,
 /// which is a different answer from a catalog lookup's
-/// ([`platform_not_found_message`]): a value that is not a platform id at all
-/// names no platform, so it is never reported as a platform that does not exist.
+/// ([`invalid_member_message`] on the revocation read,
+/// [`platform_not_found_message`] on the operations that resolve a platform): a
+/// value that is not a platform id at all names no platform, so it is never
+/// reported as an id that was well formed and unknown.
 /// It is therefore decided before anything the value might name is resolved.
 ///
 /// The sentence is the one the boundary validator writes for every constraint it

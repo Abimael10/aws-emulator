@@ -53,8 +53,11 @@ const VALIDATION_SHAPE: &str = "ValidationException";
 ///
 /// `certificateHashes` is required, and this service revokes profiles and
 /// signatures rather than certificates, so no hash is ever reported revoked: the
-/// value only has to be a hash the request can carry.
-const CERTIFICATE_HASH: &str = "aa";
+/// value only has to identify a certificate — two hex digests end to end, the
+/// subject certificate's TBS hash followed by its parent CA's.
+const CERTIFICATE_HASH: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -298,13 +301,15 @@ fn request_shapes() -> Vec<RequestShape> {
             reason: "x".to_string(),
             effective_epoch_secs: 1_000_000_000,
         },
-        // The longest reason the shape admits, and an instant far in the future,
-        // in a third region.
+        // The longest reason the shape admits, and the most recent effective
+        // instant of the table, in a third region. Every row's instant is one the
+        // present has reached: the read below asks about a signature made AT the
+        // effective instant, and a signature is made before it is checked.
         RequestShape {
-            name: "longest_reason_future_instant",
+            name: "longest_reason_recent_instant",
             region: "ap-southeast-1",
             reason: "y".repeat(500),
-            effective_epoch_secs: 4_000_000_000,
+            effective_epoch_secs: 1_750_000_000,
         },
     ]
 }

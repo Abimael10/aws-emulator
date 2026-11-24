@@ -269,7 +269,8 @@ async fn a_list_member_supplied_with_nothing_is_refused_by_name() {
 }
 
 /// A request that DOES supply entries is not refused by that check, whatever the
-/// entries are and however many of them there are.
+/// entries are and however many of them there are: an entry the read cannot act
+/// on is refused for the entry, never as a member that supplied nothing.
 #[tokio::test]
 async fn a_list_member_that_carries_entries_is_served() {
     let router = emulator();
@@ -282,28 +283,47 @@ async fn a_list_member_that_carries_entries_is_served() {
     let five: Vec<String> = (0..5)
         .map(|index| certificate_hash(&format!("child-{index}"), "root"))
         .collect();
-    // An entry that is the empty string is still an ENTRY: the member carries
-    // something, so the supplied-nothing check does not fire.
-    let empty_entry = vec![String::new()];
 
-    let rows: Vec<(&str, Vec<String>)> = vec![
-        ("one hash", one),
-        ("two hashes", two),
-        ("five hashes", five),
-        ("one empty entry", empty_entry),
+    // (case, the entries, the status the read answers)
+    let rows: Vec<(&str, Vec<String>, u16)> = vec![
+        ("one hash", one, 200),
+        ("two hashes", two, 200),
+        ("five hashes", five, 200),
+        // An entry that is the empty string is still an ENTRY: the member carries
+        // something, so the supplied-nothing check does not fire — the entry is
+        // refused for being no certificate identifier instead.
+        ("one empty entry", vec![String::new()], 400),
+        // And so is a list carrying one more entry than a request may ask about.
+        (
+            "six hashes",
+            (0..6)
+                .map(|index| certificate_hash(&format!("over-{index}"), "root"))
+                .collect(),
+            400,
+        ),
     ];
 
-    for (case, hashes) in &rows {
+    for (case, hashes, status) in &rows {
         let mut params = without("certificateHashes");
         for hash in hashes {
             params.push(("certificateHashes", hash.clone()));
         }
         let answer = get_revocations(&router, &params).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected HTTP 200, got {} {:?}",
+            answer.status, *status,
+            "case {case:?}: expected HTTP {status}, got {} {:?}",
             answer.status, answer.body
         );
+        if *status == 400 {
+            assert_ne!(
+                answer.message(),
+                supplied_nothing("certificateHashes"),
+                "case {case:?}: a member that carried an entry must not be refused as one \
+                 that supplied nothing, got {:?}",
+                answer.message()
+            );
+            continue;
+        }
         let reported = answer.body["revokedEntities"]
             .as_array()
             .unwrap_or_else(|| panic!("case {case:?}: expected revokedEntities, got {:?}", answer.body));

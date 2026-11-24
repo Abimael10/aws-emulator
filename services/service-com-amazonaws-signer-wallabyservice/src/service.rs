@@ -448,8 +448,8 @@ fn is_query_bound_list_member(member_name: &str) -> bool {
 /// ([`crate::ops::get_revocation_status`]), so a member the boundary validator finds empty
 /// and one a handler finds empty are stated identically; `absent_member_constraint` states
 /// an absent single-value member in the `Invalid <member>: …` voice every refusal of this
-/// service's own rules speaks ([`crate::state::invalid_arn_message`] states a value that is
-/// not ARN-shaped in it).
+/// service's own rules speaks ([`crate::state::invalid_member_message`] states a value that
+/// addresses nothing in it).
 pub use service_common::signer_input_refusals::{
     absent_member_constraint, missing_list_member_constraint,
 };

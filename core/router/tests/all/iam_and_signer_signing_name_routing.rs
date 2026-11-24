@@ -148,11 +148,13 @@ fn revocations_query() -> String {
     );
     let job = format!("arn:aws:signer:{REGION}:000000000000:/signing-jobs/abcdef0123456789");
     // An ISO 8601 `date-time`, the rendering an `@httpQuery`-bound timestamp carries by
-    // default, and a 64-hex-character certificate hash.
+    // default, naming an instant in the past (a signature is made before it is checked),
+    // and a certificate hash of the documented shape: the subject certificate's TBS hash
+    // followed by its parent CA's, two hex digests end to end.
     format!(
         "?signatureTimestamp=2023-11-14T22:13:20Z&platformId=AWSLambda-SHA384-ECDSA\
-         &profileVersionArn={profile}&jobArn={job}\
-         &certificateHashes=0000000000000000000000000000000000000000000000000000000000000001"
+         &profileVersionArn={profile}&jobArn={job}&certificateHashes={}",
+        "ab".repeat(96)
     )
 }
 

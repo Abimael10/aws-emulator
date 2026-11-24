@@ -71,11 +71,17 @@ pub(crate) fn job_arn(name: &str) -> String {
     engine::emulator_arn("signer", REGION, &format!("/signing-jobs/{name}"))
 }
 
-/// A certificate hash (model shape `CertificateHash`, length 1..2048): the SHA-256 of
-/// `name`, which is the shape of hash the model's own example carries.
+/// A certificate hash of the size this endpoint admits: two hex digests end to end,
+/// which is the composite the control plane's model documents an entry as (the subject
+/// certificate's TBS hash followed by its parent CA's). `CertificateHash` is
+/// `@length(1, 2048)` in THIS model, which the value also satisfies.
 pub(crate) fn certificate_hash(name: &str) -> String {
     use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(name.as_bytes()))
+    format!(
+        "{}{}",
+        hex::encode(sha2::Sha384::digest(name.as_bytes())),
+        hex::encode(sha2::Sha384::digest(format!("{name}-parent").as_bytes()))
+    )
 }
 
 /// The emulator under test: the shared engine (the only store), plus a router with this
@@ -364,7 +370,7 @@ async fn nothing_revoked_is_an_empty_list_not_an_absent_member() {
         RevocationRecord::new("revoked-unrelated-job", at_offset_millis(-1)),
     );
 
-    for hash_count in [1_usize, 2, 5, 25] {
+    for hash_count in [1_usize, 2, 5] {
         let case = format!("certificateHashes count={hash_count}");
         let hashes: Vec<String> = (0..hash_count)
             .map(|i| certificate_hash(&format!("clean-{hash_count}-{i}")))
@@ -517,9 +523,10 @@ async fn a_candidate_is_looked_up_only_in_its_own_registry() {
     // one registry per row. Only the candidate of that registry's kind may be reported.
     for revoked_in in RevokedEntityKind::ALL {
         let emulator = Emulator::new();
-        // 20..2048 characters, so it is a legal `Arn` as well as a legal
-        // `CertificateHash` — which is what lets one value stand in for all three.
-        let shared = job_arn(&format!("shared-{}", revoked_in.input_member()));
+        // A certificate identifier: two hex digests end to end, which is 192
+        // characters — inside the `Arn` length band of 20..2048 as well — so one
+        // value can stand in for all three candidates.
+        let shared = certificate_hash(&format!("shared-{}", revoked_in.input_member()));
         emulator.revoke(
             revoked_in,
             &shared,
@@ -942,4 +949,176 @@ async fn a_missing_required_member_is_refused_for_the_constraint_it_violated() {
         message.contains(list_member),
         "case certificateHashes=<empty value>: the refusal must name the member, got {message:?}"
     );
+}
+
+/// RULE: a `certificateHashes` entry IDENTIFIES a certificate — the subject
+/// certificate's TBS hash followed by its parent CA's, each rendered in hex — so an entry
+/// that is not hexadecimal, or that carries fewer than 128 or more than 256 characters,
+/// identifies none and the read is refused for that entry; and one request asks about at
+/// most five entries.
+///
+/// The rows differ along what the rule generalises over: the LENGTH of the entry (each
+/// published bound, one step inside it and one step past it), WHICH character class puts
+/// it outside the band, WHERE in a batch the offending entry sits, and HOW MANY entries
+/// the batch carries (the cap, one past it, and far past it).
+#[tokio::test]
+async fn a_certificate_hash_that_identifies_no_certificate_is_refused() {
+    let emulator = Emulator::new();
+    let profile = profile_version_arn("hash-band");
+    let job = job_arn("hash-band");
+
+    // The published band, written out here so the bytes a client reads are pinned
+    // independently of the service's own constants.
+    const MIN: usize = 128;
+    const MAX: usize = 256;
+    const CAP: usize = 5;
+
+    let hex_of_length = |length: usize| "a".repeat(length);
+    let well_formed = hex_of_length(192);
+
+    // (case, the entries the request carries, the refusal — or None for an answer)
+    let mut rows: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+    for (case, entry, refused) in [
+        ("one character short of the floor", hex_of_length(MIN - 1), true),
+        ("exactly on the floor", hex_of_length(MIN), false),
+        ("inside the band", hex_of_length(192), false),
+        ("exactly on the ceiling", hex_of_length(MAX), false),
+        ("one character past the ceiling", hex_of_length(MAX + 1), true),
+        ("far past the ceiling", hex_of_length(MAX * 4), true),
+        // In-band lengths whose characters are not hexadecimal: a letter past `f`,
+        // uppercase hex (which IS hexadecimal), punctuation, and a space.
+        ("a letter outside the hex alphabet", "g".repeat(192), true),
+        ("uppercase hex digits", "AB".repeat(96), false),
+        ("mixed-case hex digits", "aF0".repeat(64), false),
+        ("a hyphen inside the value", format!("{}-{}", "a".repeat(95), "b".repeat(96)), true),
+    ] {
+        let refusal = refused.then(|| {
+            format!("Certificate hash {entry} must be hexadecimal and between {MIN} and {MAX} bits long")
+        });
+        rows.push((format!("one entry, {case}"), vec![entry], refusal));
+    }
+
+    // The same rule applied to a BATCH: the offending entry is found wherever it sits,
+    // and a batch of well-formed entries is answered.
+    let malformed = hex_of_length(MIN - 1);
+    for position in 0..CAP {
+        let mut entries = vec![well_formed.clone(); CAP];
+        entries[position] = malformed.clone();
+        rows.push((
+            format!("a batch of {CAP} whose entry {position} is malformed"),
+            entries,
+            Some(format!(
+                "Certificate hash {malformed} must be hexadecimal and between {MIN} and {MAX} \
+                 bits long"
+            )),
+        ));
+    }
+    for count in 1..=CAP {
+        rows.push((
+            format!("a batch of {count} well-formed entries"),
+            vec![well_formed.clone(); count],
+            None,
+        ));
+    }
+    for count in [CAP + 1, CAP * 4] {
+        rows.push((
+            format!("a batch of {count} well-formed entries"),
+            vec![well_formed.clone(); count],
+            Some(format!("certificateHashes must not contain more than {CAP} hashes")),
+        ));
+    }
+
+    for (case, entries, refusal) in &rows {
+        let request = params(base_instant(), PLATFORM, &profile, &job, entries);
+        let (status, body) = emulator.get(&request).await;
+        match refusal {
+            None => {
+                assert_eq!(
+                    revoked_entities(status, &body, case),
+                    Vec::<String>::new(),
+                    "case {case}: an admitted request with nothing revoked must answer an \
+                     empty list, got {body}"
+                );
+            }
+            Some(expected) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case}: expected HTTP 400, got {status} with {body}"
+                );
+                let (code, message) = error_of(&body, case);
+                assert_eq!(
+                    code, "ValidationException",
+                    "case {case}: expected ValidationException, got {body}"
+                );
+                assert_eq!(
+                    &message, expected,
+                    "case {case}: expected {expected:?}, got {message:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: `signatureTimestamp` names when the artifact WAS signed, so an instant the
+/// service's present time has not reached names no signature that can exist and the read
+/// is refused for that value; the rule is one-sided, so no instant is too early.
+///
+/// The rows differ along how far from the present the instant falls, on both sides of it:
+/// decades back, one day back, a minute ahead, a day ahead, and decades ahead.
+#[tokio::test]
+async fn a_signature_timestamp_the_present_has_not_reached_is_refused() {
+    let emulator = Emulator::new();
+    let profile = profile_version_arn("present-time");
+    let job = job_arn("present-time");
+    let hash = certificate_hash("present-time");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the present is after the epoch")
+        .as_secs();
+    let now = i64::try_from(now).expect("seconds fit in i64");
+
+    // (case, the instant's epoch second, whether the read is refused for it)
+    let rows: [(&str, i64, bool); 7] = [
+        ("decades before the present", 315_532_800, false),
+        ("a day before the present", now - 86_400, false),
+        ("a minute before the present", now - 60, false),
+        ("a minute after the present", now + 60, true),
+        ("an hour after the present", now + 3_600, true),
+        ("a day after the present", now + 86_400, true),
+        ("decades after the present", 3_031_908_245, true),
+    ];
+
+    for (case, epoch_secs, refused) in rows {
+        let at = UNIX_EPOCH + Duration::from_secs(epoch_secs.unsigned_abs());
+        let request = params(at, PLATFORM, &profile, &job, std::slice::from_ref(&hash));
+        let (status, body) = emulator.get(&request).await;
+        if !refused {
+            assert_eq!(
+                revoked_entities(status, &body, case),
+                Vec::<String>::new(),
+                "case {case}: an instant at or before the present is answered, got {status} \
+                 with {body}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with {body}"
+        );
+        let (code, message) = error_of(&body, case);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case}: expected ValidationException, got {body}"
+        );
+        // The instant as a clause states it: ISO 8601 UTC, to the whole second.
+        let stated = DateTime::from_secs(epoch_secs)
+            .fmt(Format::DateTime)
+            .expect("an epoch-based instant renders as date-time");
+        let expected = format!("Invalid signatureTimestamp: {stated} must be earlier than present time");
+        assert_eq!(
+            message, expected,
+            "case {case}: expected {expected:?}, got {message:?}"
+        );
+    }
 }

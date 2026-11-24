@@ -10,7 +10,9 @@
 //! service holds. So the two answers a `platformId` can take stay distinct: a
 //! value the class excludes is refused for its syntax (it is not a platform id
 //! at all), while a value the class admits that names no published platform is
-//! reported as a platform that does not exist (well formed, unknown).
+//! refused for the value it carried, named by the member that carried it
+//! (`Invalid platformId: <value>`) — this read reports revocations, not
+//! resources, so it states no resource as missing.
 //!
 //! The cases are tables spanning what the rule generalises over: which character
 //! puts the value outside the class (a space, `!`, `/`, `.`, `+`, `:`, a
@@ -212,9 +214,11 @@ fn pattern_refusal(value: &str) -> String {
     )
 }
 
-/// The refusal an in-class id that names no published platform takes.
-fn not_found_refusal(value: &str) -> String {
-    format!("Signing platform not found for ID {value}")
+/// The refusal an in-class id that names no published platform takes: the value
+/// it carried, named by its member, in the voice every refusal of this read's own
+/// rules speaks.
+fn unknown_platform_refusal(value: &str) -> String {
+    format!("Invalid platformId: {value}")
 }
 
 /// The expression the service states is the published one: the refusal quotes it
@@ -374,7 +378,7 @@ async fn a_platform_id_outside_the_published_class_is_refused_for_the_constraint
             answer.message()
         );
         assert!(
-            !answer.message().contains("not found for ID"),
+            !answer.message().starts_with("Invalid platformId"),
             "case {case:?}: expected the constraint refusal, not the catalog's, got {:?}",
             answer.message()
         );
@@ -382,8 +386,9 @@ async fn a_platform_id_outside_the_published_class_is_refused_for_the_constraint
 }
 
 /// A `platformId` the class ADMITS that names no published platform keeps the
-/// catalog's answer: the id was well formed and is unknown. The two classes stay
-/// separate.
+/// catalog's answer: the id is one this endpoint can serve no platform for, so it
+/// is refused for the value it carried rather than for its syntax. The two
+/// classes stay separate.
 #[tokio::test]
 async fn an_in_class_platform_id_naming_nothing_published_is_still_unknown() {
     let router = emulator();
@@ -416,9 +421,9 @@ async fn an_in_class_platform_id_naming_nothing_published_is_still_unknown() {
         );
         assert_eq!(
             answer.message(),
-            not_found_refusal(value),
+            unknown_platform_refusal(value),
             "case {case:?}: expected {:?}, got {:?}",
-            not_found_refusal(value),
+            unknown_platform_refusal(value),
             answer.message()
         );
     }

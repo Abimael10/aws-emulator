@@ -275,7 +275,7 @@ fn get_revocation_status(platform_id: &str, _revision_id: &str) -> Request {
                  1a2b3c4d-5e6f-7890-abcd-ef1234567890"
             )),
         ),
-        ("certificateHashes", "abcd".to_string()),
+        ("certificateHashes", "ab".repeat(96)),
     ]
     .iter()
     .map(|(name, value)| format!("{name}={value}"))
@@ -392,6 +392,13 @@ fn platform_not_found(value: &str, _revision_id: &str) -> String {
     format!("Signing platform not found for ID {value}")
 }
 
+/// The sentence the revocation READ words for the same condition: that read
+/// reports revocations rather than resources, so an id it can serve no platform
+/// for is refused for the value it carried, named by its member.
+fn invalid_platform_id(value: &str, _revision_id: &str) -> String {
+    format!("Invalid platformId: {value}")
+}
+
 fn no_such_tagged_profile(value: &str, _revision_id: &str) -> String {
     format!("profile with arn {value} does not exists")
 }
@@ -439,7 +446,7 @@ fn cases() -> Vec<Case> {
             carried: itself,
             request: get_revocation_status,
             status: 400,
-            clause: platform_not_found,
+            clause: invalid_platform_id,
         },
         Case {
             name: "GetSigningPlatform platformId (label)",
@@ -684,7 +691,7 @@ async fn both_refusals_of_one_platform_id_are_bounded_alike() {
     );
     assert_eq!(
         catalog.message(),
-        platform_not_found(&quoted(&in_class), ""),
+        invalid_platform_id(&quoted(&in_class), ""),
         "case \"an in-class value past the ceiling\": expected the catalog refusal to state the \
          value up to the ceiling, got a message of {} bytes",
         catalog.message().len()

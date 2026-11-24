@@ -36,6 +36,7 @@
 //! answers, and how a value misses).
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -435,9 +436,9 @@ async fn seed(
     }
 }
 
-/// The certificate-hash lists the tables carry: one hash, several, and a pair
-/// whose members differ in length, so a rule that reported hashes would show up
-/// whatever the request carries.
+/// The certificate-hash lists the tables carry: one hash, several, and a batch of
+/// entries that differ in length inside the band an entry falls in, so a rule
+/// that reported hashes would show up whatever the request carries.
 fn hash_lists() -> Vec<(&'static str, Vec<String>)> {
     vec![
         ("one hash", vec![certificate_hash("child", "root")]),
@@ -453,8 +454,8 @@ fn hash_lists() -> Vec<(&'static str, Vec<String>)> {
             "hashes of differing length",
             vec![
                 certificate_hash("child", "root"),
-                "a1b2c3".to_string(),
-                "0".repeat(2048),
+                "a1b2c3".repeat(22),
+                "0".repeat(256),
             ],
         ),
     ]
@@ -1155,4 +1156,495 @@ async fn asking_for_the_revocation_status_changes_nothing() {
         profile_before.body["status"],
         profile_after.body["status"]
     );
+}
+
+/// The published band a `certificateHashes` entry falls inside, written out here
+/// rather than imported so the bytes a client reads are pinned independently of
+/// the service's own constants: an entry IDENTIFIES a certificate by the subject
+/// certificate's TBS hash followed by its parent CA's, each in hex, so it is two
+/// hex digests end to end — 128 characters for a pair of SHA-256 digests, 256 for
+/// a pair of SHA-512.
+const HASH_MIN_LENGTH: usize = 128;
+
+/// The other end of that band (see [`HASH_MIN_LENGTH`]).
+const HASH_MAX_LENGTH: usize = 256;
+
+/// The most entries one `certificateHashes` carries.
+const HASH_COUNT_CAP: usize = 5;
+
+/// The modelled maximum of an `Arn` member (`smithy_query(query="shape",
+/// shape="Arn")`: `@length(min: 20, max: 2048)`).
+const ARN_MAX_LENGTH: usize = 2048;
+
+/// `length` hexadecimal characters: an entry of exactly that size the character
+/// class admits whole.
+fn hex_of_length(length: usize) -> String {
+    "a".repeat(length)
+}
+
+/// The refusal one entry that identifies no certificate takes.
+fn hash_refusal(entry: &str) -> String {
+    format!(
+        "Certificate hash {entry} must be hexadecimal and between {HASH_MIN_LENGTH} and \
+         {HASH_MAX_LENGTH} bits long"
+    )
+}
+
+/// The refusal a batch carrying more entries than one request may ask about
+/// takes: entirely fixed text, carrying none of the request.
+fn hash_count_refusal() -> String {
+    format!("certificateHashes must not contain more than {HASH_COUNT_CAP} hashes")
+}
+
+/// A signing-job ARN of exactly `total` characters, padded in its id segment, so
+/// a case can walk the modelled length bound with an ARN-shaped value.
+fn job_arn_of_length(total: usize) -> String {
+    let fixed = job_arn_for(REGION, ACCOUNT_ID, "").len();
+    let arn = job_arn_for(REGION, ACCOUNT_ID, &"j".repeat(total - fixed));
+    assert_eq!(arn.len(), total, "the built job ARN must be {total} bytes");
+    arn
+}
+
+/// A signing-profile VERSION ARN of exactly `total` characters, padded in its
+/// name segment, so a case can walk the same bound with a value whose SHAPE the
+/// other `Arn` member admits.
+fn profile_version_arn_of_length(total: usize) -> String {
+    let version = "aaaaaaaaaa";
+    let fixed =
+        format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles//{version}").len();
+    let arn = format!(
+        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}/{version}",
+        "n".repeat(total - fixed)
+    );
+    assert_eq!(
+        arn.len(),
+        total,
+        "the built profile version ARN must be {total} bytes"
+    );
+    arn
+}
+
+/// RULE: a `certificateHashes` entry IDENTIFIES a certificate — the subject
+/// certificate's TBS hash followed by its parent CA's, each rendered in hex — so
+/// an entry that is not hexadecimal, or that carries fewer than 128 or more than
+/// 256 characters, identifies none and the read is refused for THAT entry; and
+/// one request asks about at most five entries.
+///
+/// The rows differ along what the rule generalises over: the LENGTH of the entry
+/// (each published bound, one character inside it and one past it), WHICH
+/// character class puts the value outside the band, WHERE in a batch the
+/// offending entry sits, and HOW MANY entries the batch carries — the cap, one
+/// past it, and far past it.
+#[tokio::test]
+async fn a_certificate_hash_that_identifies_no_certificate_is_refused() {
+    let router = emulator();
+    let seeded = seed(&router, REGION, "Hash_Band_Profile", job_signing_platform(0)).await;
+    let well_formed = certificate_hash("child", "root");
+
+    // (case, the entries the request carries, the refusal — or None when the read
+    // is answered)
+    let mut rows: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+    for (case, entry, refused) in [
+        (
+            "one character short of the floor",
+            hex_of_length(HASH_MIN_LENGTH - 1),
+            true,
+        ),
+        ("exactly on the floor", hex_of_length(HASH_MIN_LENGTH), false),
+        ("inside the band", hex_of_length(192), false),
+        (
+            "exactly on the ceiling",
+            hex_of_length(HASH_MAX_LENGTH),
+            false,
+        ),
+        (
+            "one character past the ceiling",
+            hex_of_length(HASH_MAX_LENGTH + 1),
+            true,
+        ),
+        (
+            "far past the ceiling",
+            hex_of_length(HASH_MAX_LENGTH * 4),
+            true,
+        ),
+        ("no characters at all", String::new(), true),
+        // In-band lengths whose characters are not all hexadecimal — and the two
+        // rows that ARE hexadecimal in the other case, which is admitted.
+        ("a letter outside the hex alphabet", "g".repeat(192), true),
+        (
+            "a hyphen between two digests",
+            format!("{}-{}", "a".repeat(95), "b".repeat(96)),
+            true,
+        ),
+        (
+            "a dot inside the value",
+            format!("{}.{}", "a".repeat(95), "b".repeat(96)),
+            true,
+        ),
+        ("uppercase hex digits", "AB".repeat(96), false),
+        ("mixed-case hex digits", "aF0".repeat(64), false),
+    ] {
+        let refusal = refused.then(|| hash_refusal(&entry));
+        rows.push((format!("one entry, {case}"), vec![entry], refusal));
+    }
+
+    // The same rule over a BATCH: the offending entry is found wherever in the
+    // list it sits, not only first.
+    let malformed = hex_of_length(HASH_MIN_LENGTH - 1);
+    for position in 0..HASH_COUNT_CAP {
+        let mut entries = vec![well_formed.clone(); HASH_COUNT_CAP];
+        entries[position] = malformed.clone();
+        rows.push((
+            format!("a batch of {HASH_COUNT_CAP} whose entry {position} identifies nothing"),
+            entries,
+            Some(hash_refusal(&malformed)),
+        ));
+    }
+    // And the cardinality cap: every count up to it is answered, past it refused.
+    for count in 1..=HASH_COUNT_CAP {
+        rows.push((
+            format!("a batch of {count} well-formed entries"),
+            vec![well_formed.clone(); count],
+            None,
+        ));
+    }
+    for count in [HASH_COUNT_CAP + 1, HASH_COUNT_CAP * 4] {
+        rows.push((
+            format!("a batch of {count} well-formed entries"),
+            vec![well_formed.clone(); count],
+            Some(hash_count_refusal()),
+        ));
+    }
+
+    for (case, entries, refusal) in &rows {
+        let answer = get_revocation_status(
+            &router,
+            REGION,
+            at_offset_millis(0),
+            &seeded.platform_id,
+            &seeded.profile_version_arn,
+            &seeded.job_arn,
+            entries,
+        )
+        .await;
+        let Some(expected) = refusal else {
+            let reported = revoked_entities(&answer, case);
+            assert!(
+                reported.is_empty(),
+                "case {case:?}: nothing named is revoked, got {reported:?}"
+            );
+            continue;
+        };
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "ValidationException",
+            "case {case:?}: expected the modelled code, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+}
+
+/// RULE: `signatureTimestamp` names when the artifact WAS signed, so an instant
+/// the service's present time has not reached names no signature that can exist
+/// and the read is refused for that value; the rule is one-sided, so no instant
+/// is too early.
+///
+/// The rows differ along how far from the present the instant falls, on both
+/// sides of it: decades back, a day back, a minute back, then a minute, an hour,
+/// a day and decades ahead.
+#[tokio::test]
+async fn a_signature_timestamp_the_present_has_not_reached_is_refused() {
+    let router = emulator();
+    let seeded = seed(&router, REGION, "Present_Time_Profile", job_signing_platform(0)).await;
+    let hashes = vec![certificate_hash("child", "root")];
+
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the present is after the epoch")
+            .as_secs(),
+    )
+    .expect("the present in seconds fits in i64");
+
+    // (case, the instant's epoch second, whether the read is refused for it)
+    let rows: [(&str, i64, bool); 7] = [
+        // 1980-01-01T00:00:00Z and 2066-01-02T03:04:05Z: a signature does not
+        // expire from this read's point of view, and one that cannot have been
+        // made yet is refused.
+        ("decades before the present", 315_532_800, false),
+        ("a day before the present", now - 86_400, false),
+        ("a minute before the present", now - 60, false),
+        ("a minute after the present", now + 60, true),
+        ("an hour after the present", now + 3_600, true),
+        ("a day after the present", now + 86_400, true),
+        ("decades after the present", 3_031_908_245, true),
+    ];
+
+    for (case, epoch_secs, refused) in rows {
+        let at = DateTime::from_secs(epoch_secs);
+        let answer = get_revocation_status(
+            &router,
+            REGION,
+            at,
+            &seeded.platform_id,
+            &seeded.profile_version_arn,
+            &seeded.job_arn,
+            &hashes,
+        )
+        .await;
+        if !refused {
+            let reported = revoked_entities(&answer, case);
+            assert!(
+                reported.is_empty(),
+                "case {case:?}: an instant at or before the present is answered, got \
+                 {reported:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "ValidationException",
+            "case {case:?}: expected the modelled code, got {:?}",
+            answer.body
+        );
+        let expected = format!(
+            "Invalid signatureTimestamp: {} must be earlier than present time",
+            timestamp_param(at)
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+}
+
+/// RULE: a value this read cannot act on because it addresses nothing — a
+/// `platformId` the published catalog holds no platform for, a
+/// `profileVersionArn` or `jobArn` that is not an ARN of the kind of resource its
+/// own member names — is the modelled 400 worded `Invalid <member>: <value>`,
+/// naming the member the caller has to correct and stating the value it sent. It
+/// is never worded as a resource that does not exist: this read reports
+/// revocations, not resources.
+///
+/// The rows differ along which member carries the value and how the value misses
+/// (an unknown-but-well-formed platform id, a non-ARN string of a valid ARN's
+/// length, an ARN of another service, one of another resource of this service,
+/// one missing a segment), beside the positive control each member has: a value
+/// that DOES address something is answered.
+#[tokio::test]
+async fn a_value_that_addresses_nothing_is_refused_by_the_member_that_carried_it() {
+    let router = emulator();
+    let seeded = seed(&router, REGION, "Addressing_Profile", job_signing_platform(0)).await;
+    let hashes = vec![certificate_hash("child", "root")];
+
+    let not_an_arn = "a".repeat(68);
+    let other_service = format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:not-signer");
+    let other_resource = format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/Name");
+    let no_version = format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/Name/");
+    let job_without_id = format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-jobs/");
+
+    // (case, the member, the value it carries)
+    let rows: Vec<(&str, &str, &str)> = vec![
+        ("an unpublished platform id", "platformId", "NoSuchPlatform-1"),
+        ("a platform id in the wrong case", "platformId", "awslambda-sha384-ecdsa"),
+        ("the shortest in-class platform id", "platformId", "x"),
+        (
+            "a profileVersionArn that is no ARN at all",
+            "profileVersionArn",
+            &not_an_arn,
+        ),
+        (
+            "a profileVersionArn of another service",
+            "profileVersionArn",
+            &other_service,
+        ),
+        (
+            "a profileVersionArn carrying no version",
+            "profileVersionArn",
+            &other_resource,
+        ),
+        (
+            "a profileVersionArn whose version segment is empty",
+            "profileVersionArn",
+            &no_version,
+        ),
+        ("a jobArn that is no ARN at all", "jobArn", &not_an_arn),
+        ("a jobArn of another service", "jobArn", &other_service),
+        (
+            "a jobArn whose id segment is empty",
+            "jobArn",
+            &job_without_id,
+        ),
+        (
+            "a jobArn naming another resource of this service",
+            "jobArn",
+            &other_resource,
+        ),
+    ];
+
+    for (case, member, value) in &rows {
+        let platform = if *member == "platformId" {
+            (*value).to_string()
+        } else {
+            seeded.platform_id.clone()
+        };
+        let profile_version = if *member == "profileVersionArn" {
+            (*value).to_string()
+        } else {
+            seeded.profile_version_arn.clone()
+        };
+        let job = if *member == "jobArn" {
+            (*value).to_string()
+        } else {
+            seeded.job_arn.clone()
+        };
+        let answer = get_revocation_status(
+            &router,
+            REGION,
+            at_offset_millis(0),
+            &platform,
+            &profile_version,
+            &job,
+            &hashes,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer.shape().contains("ValidationException"),
+            "case {case:?}: expected a ValidationException, got {:?}",
+            answer.body
+        );
+        let expected = format!("Invalid {member}: {value}");
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+
+    // The positive control: with every value addressing something, the same read
+    // is answered.
+    let served = get_revocation_status(
+        &router,
+        REGION,
+        at_offset_millis(0),
+        &seeded.platform_id,
+        &seeded.profile_version_arn,
+        &seeded.job_arn,
+        &hashes,
+    )
+    .await;
+    let reported = revoked_entities(&served, "the addressing control");
+    assert!(
+        reported.is_empty(),
+        "case \"the addressing control\": nothing named is revoked, got {reported:?}"
+    );
+}
+
+/// RULE: a value past the modelled maximum length of the member that carried it
+/// is refused by the boundary validator in AWS's constraint sentence — the
+/// `1 validation error detected: ` opener, the whole value as the request carried
+/// it, the wire member name and the modelled maximum — while a value exactly on
+/// that maximum is admitted and answered.
+///
+/// The rows differ along the member bounded (both `Arn`-typed members of this
+/// read) and where the value falls relative to the bound: exactly on it, one
+/// character past it, and far past it.
+#[tokio::test]
+async fn a_value_past_its_modelled_maximum_states_the_constraint_sentence() {
+    let router = emulator();
+    let seeded = seed(&router, REGION, "Bound_Profile", job_signing_platform(0)).await;
+    let hashes = vec![certificate_hash("child", "root")];
+
+    for member in ["jobArn", "profileVersionArn"] {
+        for (case, length, refused) in [
+            ("exactly on the modelled maximum", ARN_MAX_LENGTH, false),
+            (
+                "one character past the modelled maximum",
+                ARN_MAX_LENGTH + 1,
+                true,
+            ),
+            ("far past the modelled maximum", ARN_MAX_LENGTH * 2, true),
+        ] {
+            let case = format!("{member} {case}");
+            // An ARN of exactly `length` characters whose SHAPE this member
+            // admits, so the ONLY rule a refused row breaks is the length
+            // ceiling and the row on the bound is answered rather than refused
+            // for its shape.
+            let value = if member == "jobArn" {
+                job_arn_of_length(length)
+            } else {
+                profile_version_arn_of_length(length)
+            };
+            let answer = get_revocation_status(
+                &router,
+                REGION,
+                at_offset_millis(0),
+                &seeded.platform_id,
+                if member == "profileVersionArn" {
+                    &value
+                } else {
+                    &seeded.profile_version_arn
+                },
+                if member == "jobArn" {
+                    &value
+                } else {
+                    &seeded.job_arn
+                },
+                &hashes,
+            )
+            .await;
+            if !refused {
+                // On the bound the value is admitted; it names a resource this
+                // endpoint holds nothing for, so nothing is revoked.
+                let reported = revoked_entities(&answer, &case);
+                assert!(
+                    reported.is_empty(),
+                    "case {case:?}: nothing named is revoked, got {reported:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            // The boundary validator's own envelope, which is what AWS answers a
+            // length violation with, so the clause is the whole requirement.
+            let expected = format!(
+                "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+                 constraint: Member must have length less than or equal to {ARN_MAX_LENGTH}"
+            );
+            assert_eq!(
+                answer.message(),
+                expected,
+                "case {case:?}: expected a message of {} characters, got one of {}",
+                expected.len(),
+                answer.message().len()
+            );
+        }
+    }
 }
