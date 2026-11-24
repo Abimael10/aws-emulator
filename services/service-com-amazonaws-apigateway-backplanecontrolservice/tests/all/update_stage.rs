@@ -466,8 +466,8 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
             "BadRequestException",
         ),
         (
-            "an add or replace carrying no value",
-            json!([{ "op": "replace", "path": "/description" }]),
+            "an add carrying no value",
+            json!([{ "op": "add", "path": "/description" }]),
             400,
             "BadRequestException",
         ),

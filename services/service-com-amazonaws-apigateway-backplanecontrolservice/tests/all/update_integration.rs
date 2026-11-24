@@ -239,6 +239,19 @@ async fn a_patched_integration_is_persisted_and_read_back_member_for_member() {
             json!({ "contentHandling": null }),
         ),
         (
+            // `value` is the member's new value and is "applicable for the add or replace
+            // operation", so a `replace` that carries none — by omitting it or by carrying
+            // no characters — names no value to set and clears the member instead.
+            "replace the content handling with no value, which clears it",
+            vec![op("replace", "/contentHandling", None)],
+            json!({ "contentHandling": null }),
+        ),
+        (
+            "replace the content handling with an empty value, which clears it too",
+            vec![replace("/contentHandling", "")],
+            json!({ "contentHandling": null }),
+        ),
+        (
             "replace the response transfer mode",
             vec![replace("/responseTransferMode", "STREAM")],
             json!({ "responseTransferMode": "STREAM" }),
@@ -668,7 +681,10 @@ async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_ch
     // `every_published_value_of_a_patched_member_is_accepted` above.
     //
     // Rows differ along the FORM the out-of-set value takes and the op that carries it, and
-    // each is driven both alone and last after an entry that would have applied.
+    // each is driven both alone and last after an entry that would have applied. The empty
+    // value rides in on an `add`, the op that only ever SETS a member: a `replace` carrying
+    // no value is the documented unset of the member rather than a value outside the set
+    // (see the `valueless_patch_replace` suite).
     let out_of_set: Vec<(&str, &str, &str)> = vec![
         ("a neighbouring spelling", "replace", "CONVERT_TO_JSON"),
         ("a declared value lowercased", "replace", "convert_to_text"),
@@ -677,7 +693,7 @@ async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_ch
             "add",
             " CONVERT_TO_TEXT ",
         ),
-        ("the empty value", "replace", ""),
+        ("the empty value", "add", ""),
         ("a bare word", "add", "TEXT"),
     ];
 

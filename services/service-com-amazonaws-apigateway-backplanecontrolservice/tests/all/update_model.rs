@@ -131,6 +131,18 @@ async fn a_patched_model_member_is_stored_and_read_back() {
             ],
         ),
         (
+            // `value` is "applicable for the add or replace operation", so a `replace`
+            // carrying none names no value to set: it CLEARS the optional member, which
+            // is how a caller unsets one through a path that publishes a `replace`.
+            "replace the description with no value, which clears it",
+            baseline_request(),
+            vec![op("replace", "/description", None)],
+            vec![
+                ("description", Value::Null),
+                ("schema", json!(json_schema("Pet", 1))),
+            ],
+        ),
+        (
             "replace the schema with another document",
             baseline_request(),
             vec![replace("/schema", &json_schema("Pet", 3))],
@@ -301,8 +313,8 @@ async fn a_patched_model_member_is_stored_and_read_back() {
 
 #[tokio::test]
 async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
-    // Rows differ along the KIND of refusal: an op no single-valued member supports, an op
-    // missing its value, an entry missing a member, a path naming a member that identifies
+    // Rows differ along the KIND of refusal: an op no single-valued member supports, an
+    // entry missing a member, a path naming a member that identifies
     // the record rather than describing the payload, a path naming no member at all, a
     // path that is not a JSON Pointer, a path reaching into a single-valued member, a
     // schema that does not describe a JSON payload (truncated, not JSON, a JSON value that
@@ -320,10 +332,6 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         (
             "test is not supported",
             vec![op("test", "/description", None)],
-        ),
-        (
-            "a replace with no value",
-            vec![op("replace", "/description", None)],
         ),
         ("an entry with no path", vec![json!({ "op": "replace" })]),
         ("an entry with no op", vec![json!({ "path": "/description" })]),

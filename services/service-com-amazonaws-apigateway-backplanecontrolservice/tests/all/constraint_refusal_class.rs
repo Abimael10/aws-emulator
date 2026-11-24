@@ -318,14 +318,15 @@ async fn a_patch_value_naming_no_record_is_a_bad_request_and_the_uri_identifier_
     let foreign = created_deployment(&gateway, &other, "another API's deployment").await;
 
     // Rows differ along WHY the patch value names no deployment of this API: an id
-    // nothing ever minted, the id of a deployment that was deleted, a deployment of
-    // another API, and the empty string — and along which member carries it, the stage's
-    // own pointer or its canary's.
-    let values: [(&str, String); 4] = [
+    // nothing ever minted, the id of a deployment that was deleted, and a deployment of
+    // another API — and along which member carries it, the stage's own pointer or its
+    // canary's. A value of no characters is NOT one of them: a `replace` carrying none
+    // names no value to set, so it is the documented unset of the member rather than an
+    // identifier that resolves to nothing (see the `valueless_patch_replace` suite).
+    let values: [(&str, String); 3] = [
         ("an id nothing minted", "zzzzzzzzzz".to_string()),
         ("a deleted deployment's id", first.clone()),
         ("another API's deployment", foreign.clone()),
-        ("the empty string", String::new()),
     ];
     for (case, value) in values {
         for member in ["/deploymentId", "/canarySettings/deploymentId"] {

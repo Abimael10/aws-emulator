@@ -424,9 +424,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for StageDataPlane<Eng> {
     }
 }
 
-/// The answer as this service renders it: an `IntegrationResponse` in it reports a content
-/// type whose mapping template is empty with a null template, which the schema-driven
-/// serialization of a `MapOfStringToString` cannot write
+/// The answer as this service renders it: an `Integration` or an `IntegrationResponse` in
+/// it reports a content type whose mapping template is empty with a null template, which
+/// the schema-driven serialization of a `MapOfStringToString` cannot write
 /// ([`rendered_templates::with_empty_templates_as_null`]).
 ///
 /// Anything else is returned untouched — status, headers and every byte of the body

@@ -163,6 +163,15 @@ async fn a_patched_domain_name_member_is_stored_and_read_back() {
             vec![("regionalCertificateName", Value::Null)],
         ),
         (
+            // `value` is "applicable for the add or replace operation", so a `replace`
+            // carrying none names no value to set: it CLEARS the optional member, which
+            // is how a caller unsets one through a path that publishes a `replace`.
+            "a replace with no value clears the optional member too",
+            regional_request(),
+            vec![op("replace", "/regionalCertificateName", None)],
+            vec![("regionalCertificateName", Value::Null)],
+        ),
+        (
             "add a member the record had none of",
             regional_request(),
             vec![op(
@@ -509,15 +518,16 @@ async fn each_enum_typed_member_takes_exactly_its_declared_value_set() {
         }
 
         // Every value OUTSIDE the declared set is a bad request, whatever shape it takes:
-        // another member's value, a value with its case changed, one with whitespace
-        // around it, and the empty string.
+        // another member's value, a value with its case changed, and one with whitespace
+        // around it. A value of no characters is not one of them: a `replace` carrying
+        // none names no value to set, so it is the documented unset of the member rather
+        // than a value outside its set (see the `valueless_patch_replace` suite).
         let outside: Vec<String> = vec![
             "TLS_1_1".to_string(),
             "NOT_A_VALUE".to_string(),
             values[0].to_lowercase(),
             values[0].to_uppercase(),
             format!(" {} ", values[0]),
-            String::new(),
         ];
         for value in &outside {
             if values.contains(&value.as_str()) {
@@ -553,10 +563,6 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         (
             "test is not supported",
             vec![op("test", "/regionalCertificateName", None)],
-        ),
-        (
-            "a replace with no value",
-            vec![op("replace", "/regionalCertificateName", None)],
         ),
         ("an entry with no path", vec![json!({ "op": "replace" })]),
         (

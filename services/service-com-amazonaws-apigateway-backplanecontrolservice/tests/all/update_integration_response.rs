@@ -684,8 +684,11 @@ async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_ch
     //
     // Rows differ along the FORM the out-of-set value takes and the OP that carries it: a
     // neighbouring spelling, a declared value in the wrong letter case, a declared value
-    // with whitespace around it, the empty value, and a bare word — each of them answered
-    // by the same fixed sentence, which is what says the sentence has no slot.
+    // with whitespace around it, an empty value under the op that only ever SETS the
+    // member, and a bare word — each of them answered by the same fixed sentence, which is
+    // what says the sentence has no slot. (A `replace` carrying no value is the documented
+    // unset of the member rather than a value outside the set; see the
+    // `valueless_patch_replace` suite.)
     let out_of_set: Vec<(&str, &str, &str)> = vec![
         ("a neighbouring spelling", "replace", "CONVERT_TO_XML"),
         ("a declared value lowercased", "replace", "convert_to_text"),
@@ -694,7 +697,7 @@ async fn an_out_of_set_content_handling_is_refused_with_the_type_sentence_and_ch
             "add",
             " CONVERT_TO_TEXT ",
         ),
-        ("the empty value", "replace", ""),
+        ("the empty value", "add", ""),
         ("a bare word", "add", "BINARY"),
     ];
 

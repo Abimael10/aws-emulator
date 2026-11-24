@@ -134,7 +134,9 @@ async fn a_format_naming_either_request_identifier_is_stored() {
             "request=$context.requestId",
             true,
         ),
-        ("the empty format", "", false),
+        // A format of no characters is NOT a row of this table: a `replace` carrying no
+        // value names no format to set, so it is the documented unset of the member rather
+        // than a format read for the request identifier (see `valueless_patch_replace`).
     ];
     for (index, (case, format, stored)) in rows.iter().enumerate() {
         // One emulator per row, so a format a row stored cannot decide the next row's answer.

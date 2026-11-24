@@ -278,6 +278,12 @@ async fn a_patched_certificate_member_is_read_by_the_rule_the_create_reads_it_by
         // leave exactly that.
         let before = get_domain(&gateway, domain_name).await.body[member].clone();
         for (case, value) in refused_certificate_arns() {
+            // A `replace` carrying no characters names no value to set at all: that is the
+            // documented UNSET of an optional member rather than a value read as an ARN
+            // (see the `valueless_patch_replace` suite), so it is no row of this table.
+            if value.is_empty() {
+                continue;
+            }
             let case = format!("patch {member}: {case}");
             let refused = patch_domain(&gateway, domain_name, &path, value).await;
             assert_bad_request(&refused, INVALID_ARN, &case);

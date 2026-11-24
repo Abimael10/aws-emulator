@@ -260,11 +260,12 @@ async fn a_logging_level_outside_the_documented_set_is_refused_and_gates_nothing
     // refusal itself for one such value; these rows are the part that belongs here — that
     // a refused gating patch leaves BOTH the stage and the account read exactly as they
     // were — over the shapes a caller most easily reaches for: a level another logging
-    // surface has, a case variant of a documented one, and no value at all.
+    // surface has and a case variant of a documented one. (A `replace` carrying no
+    // characters is no value outside the set but the documented unset of the setting; see
+    // the `valueless_patch_replace` suite.)
     let rows: &[(&str, &str)] = &[
         ("a level no API Gateway stage has", "DEBUG"),
         ("a lower-case spelling of a documented level", "info"),
-        ("the empty string", ""),
     ];
     for (case, level) in rows {
         let refused = gate_execution_logs(&gateway, &api, "/*/*", level, true).await;

@@ -194,10 +194,11 @@ async fn a_method_logging_level_outside_its_documented_values_names_the_level() 
     let before = get_stage(&gateway, &api, STAGE).await;
 
     // Rows differ along the FORM of the rejected level — an unknown word, another unknown
-    // word, a documented value in the wrong case, one carrying trailing space, one
-    // carrying a numeric level, and an empty value — and each is named back exactly as the
-    // request spelled it.
-    let levels = ["NOT_A_LEVEL", "VERBOSE", "info", "OFF ", "3", ""];
+    // word, a documented value in the wrong case, one carrying trailing space and one
+    // carrying a numeric level — and each is named back exactly as the request spelled it.
+    // (A `replace` carrying no characters names no level to set at all: that is the
+    // documented unset of the setting, see the `valueless_patch_replace` suite.)
+    let levels = ["NOT_A_LEVEL", "VERBOSE", "info", "OFF ", "3"];
     for scope in METHOD_SCOPES {
         for level in levels {
             let case = format!("replace {scope}/logging/loglevel with {level:?}");
@@ -266,10 +267,11 @@ async fn a_quota_period_outside_the_modelled_set_earns_one_fixed_sentence() {
     let plan = string_member(&plan, "id", "CreateUsagePlan(quota period sentence)");
 
     // Rows differ along the FORM of the rejected period — an unknown period, a declared
-    // value in the wrong case, one carrying trailing space, a near-miss word, and an empty
-    // value — and the sentence is byte-for-byte the same for each: it quotes neither the
-    // value nor the path that carried it.
-    for period in ["YEAR", "day", "MONTH ", "MONTHLY", ""] {
+    // value in the wrong case, one carrying trailing space and a near-miss word — and the
+    // sentence is byte-for-byte the same for each: it quotes neither the value nor the path
+    // that carried it. (A `replace` carrying no characters names no period to set at all:
+    // that is the documented unset of the member, see the `valueless_patch_replace` suite.)
+    for period in ["YEAR", "day", "MONTH ", "MONTHLY"] {
         let case = format!("replace /quota/period with {period:?}");
         let answer = update_usage_plan(&gateway, &plan, replace("/quota/period", period)).await;
         assert_refusal(&answer, BAD_REQUEST, INVALID_QUOTA_PERIOD, &case);

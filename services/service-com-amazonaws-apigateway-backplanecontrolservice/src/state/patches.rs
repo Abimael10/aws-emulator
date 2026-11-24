@@ -374,6 +374,32 @@ impl Patch {
         self.tokens.first().map_or("", String::as_str)
     }
 
+    /// Whether this patch UNSETS the single-valued member its path names rather than
+    /// setting it to a value.
+    ///
+    /// A `remove` is one such op. So is a `replace` that carries NO `value`, and one that
+    /// carries an EMPTY one: `value` is "applicable for the add or replace operation"
+    /// (`PatchOperation$value`) and is the member's new value, so a `replace` that names
+    /// none — by omitting it or by sending no characters at all — names no value to set,
+    /// and API Gateway reads it as the clear of the member the path addresses. That is how
+    /// a caller unsets an optional field through a path that publishes a `replace`, as the
+    /// recorded 200 answers to an emptied `cloudwatchRoleArn` and an emptied
+    /// `contentHandling` — each reported with the member gone — show. The member's own rule
+    /// then decides whether it CAN be unset: an optional member is cleared and a member the
+    /// service always reports a value for refuses the op, exactly as it refuses a `remove`.
+    ///
+    /// Read where a single-valued member is applied, so one answer serves every member of
+    /// every resource this service patches rather than each applier deciding again. A path
+    /// that names one ENTRY of a map or a collection is not this: such an entry is dropped
+    /// by the `remove` the service publishes for it, and its value is the entry's own.
+    pub fn unsets_member(&self) -> bool {
+        match self.op {
+            PatchOpKind::Remove => true,
+            PatchOpKind::Replace => self.value.as_deref().is_none_or(str::is_empty),
+            _ => false,
+        }
+    }
+
     /// The op's `value`, refusing an add or replace that carries none: there is nothing
     /// to set the member to.
     pub fn require_value(&self) -> Result<&str, PatchFailure> {
@@ -628,21 +654,25 @@ pub fn bounded_map_key(patch: &Patch, depth: usize) -> Result<String, PatchFailu
 /// Apply `patch` to a single-valued OPTIONAL string member.
 ///
 /// `add` and `replace` set it to the op's value — `value` is "applicable for the add or
-/// replace operation" (`PatchOperation$value`) — and `remove` clears it, which an
-/// optional member can be. Any other op is unsupported on such a member.
+/// replace operation" (`PatchOperation$value`) — and an op that names no value to set
+/// clears it ([`Patch::unsets_member`]), which an optional member can be. Any other op is
+/// unsupported on such a member.
 pub fn patch_optional_string(
     current: &mut Option<String>,
     patch: &Patch,
     max_chars: usize,
 ) -> Result<(), PatchFailure> {
     patch.require_single_valued()?;
+    if patch.unsets_member() {
+        *current = None;
+        return Ok(());
+    }
     match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => {
             let value = patch.require_value()?;
             bound_chars(&patch.path, value, max_chars).map_err(PatchFailure::BadRequest)?;
             *current = Some(value.to_string());
         }
-        PatchOpKind::Remove => *current = None,
         _ => return Err(patch.unsupported_op()),
     }
     Ok(())
@@ -724,7 +754,9 @@ pub fn patch_enum_string_refused_with(
     values: &[&str],
     refusal: impl FnOnce(&str) -> String,
 ) -> Result<(), PatchFailure> {
-    if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+    // An op that names no value to set has none to check against the declared set: it
+    // clears the member instead, which [`patch_optional_string`] below applies.
+    if !patch.unsets_member() && matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
         patch.require_single_valued()?;
         let value = patch.require_value()?;
         if !values.contains(&value) {
@@ -882,19 +914,23 @@ pub fn patch_i32_checked(
     Ok(())
 }
 
-/// Apply `patch` to a nullable integer member the service checks itself; `remove` clears
-/// it. See [`patch_i32_checked`] for what `accept` is.
+/// Apply `patch` to a nullable integer member the service checks itself; an op that names
+/// no value to set clears it ([`Patch::unsets_member`]). See [`patch_i32_checked`] for
+/// what `accept` is.
 pub fn patch_optional_i32_checked(
     current: &mut Option<i32>,
     patch: &Patch,
     accept: impl FnOnce(i32) -> Result<i32, String>,
 ) -> Result<(), PatchFailure> {
     patch.require_single_valued()?;
+    if patch.unsets_member() {
+        *current = None;
+        return Ok(());
+    }
     match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => {
             *current = Some(accept(patch.require_i32()?).map_err(PatchFailure::BadRequest)?);
         }
-        PatchOpKind::Remove => *current = None,
         _ => return Err(patch.unsupported_op()),
     }
     Ok(())

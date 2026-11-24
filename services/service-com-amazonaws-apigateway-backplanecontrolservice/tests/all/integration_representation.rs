@@ -22,7 +22,9 @@
 //!   own extension declares and none when it declares none — while the member's documented
 //!   default (INTERNET) is what the CALL that sets an integration up fills in;
 //! * a mapping template whose body is empty is no template, so the content type it is
-//!   keyed by is reported with a null value rather than an empty string.
+//!   keyed by is reported with a null value rather than an empty string — for an
+//!   integration's own `requestTemplates` as much as for an integration response's
+//!   `responseTemplates`.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::put_integration::{
@@ -71,6 +73,12 @@ type TemplateRow<'a> = (
     Value,
     Vec<(&'a str, Option<&'a str>)>,
 );
+
+/// One row of the REQUEST template table: the case, the resource's path part, the
+/// method's verb, the `requestTemplates` map the integration is created with, and the
+/// entries the reported map must hold — `None` for the null an empty template is reported
+/// as.
+type RequestTemplateRow<'a> = (&'a str, &'a str, &'a str, Value, Vec<(&'a str, Option<&'a str>)>);
 
 /// The `Integration` URI of one method, which both the integration's own operations and
 /// their PATCH are addressed at.
@@ -402,12 +410,16 @@ async fn an_integration_set_up_by_a_call_that_names_no_connection_type_reports_t
     );
 }
 
-/// Assert the `responseTemplates` map `templates` holds exactly `expected`: one entry per
+/// Assert the mapping-template map `templates` holds exactly `expected`: one entry per
 /// content type, whose value is the template body or `None` for the null an empty template
 /// is reported as.
+///
+/// One helper for both members that carry mapping templates keyed by content type — an
+/// integration's `requestTemplates` and an integration response's `responseTemplates` —
+/// because the rendering is the same rule for both.
 fn assert_templates(case: &str, reading: &str, templates: &Value, expected: &[(&str, Option<&str>)]) {
     let map = templates.as_object().unwrap_or_else(|| {
-        panic!("case {case} ({reading}): expected a responseTemplates map, got {templates:?}")
+        panic!("case {case} ({reading}): expected a map of mapping templates, got {templates:?}")
     });
     assert_eq!(
         map.len(),
@@ -586,6 +598,176 @@ async fn a_patch_that_empties_a_response_template_reports_it_as_null() {
         "fill the template back in",
         "UpdateIntegrationResponse",
         &refilled["responseTemplates"],
+        &[(JSON, Some("{\"pets\": []}"))],
+    );
+}
+
+#[tokio::test]
+async fn an_empty_request_template_is_reported_as_null_in_every_reading_of_it() {
+    // The same rule on the integration's OWN mapping templates: rows differ along how many
+    // content types the map carries, which of their templates are empty, and the content
+    // type the empty one is keyed by.
+    let rendered = "#set($inputRoot = $input.path('$'))\n{ }";
+    let cases: Vec<RequestTemplateRow> = vec![
+        (
+            "one content type whose template body is empty",
+            "empty",
+            "GET",
+            json!({ JSON: "" }),
+            vec![(JSON, None)],
+        ),
+        (
+            "an empty template beside a rendered one",
+            "mixed",
+            "POST",
+            json!({ JSON: "", "application/xml": rendered }),
+            vec![(JSON, None), ("application/xml", Some(rendered))],
+        ),
+        (
+            "two content types whose template bodies are both empty",
+            "both-empty",
+            "PUT",
+            json!({ JSON: "", "text/plain": "" }),
+            vec![(JSON, None), ("text/plain", None)],
+        ),
+        (
+            "a rendered template only",
+            "rendered",
+            "DELETE",
+            json!({ JSON: "{\"pets\": []}" }),
+            vec![(JSON, Some("{\"pets\": []}"))],
+        ),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "empty-request-templates").await;
+
+    for (case, path_part, verb, templates, expected) in &cases {
+        let resource =
+            resource_with_a_method(&gateway, &api, &root, path_part, verb, json!({})).await;
+        let created = put_integration(
+            &gateway,
+            &api,
+            &resource,
+            verb,
+            json!({
+                "type": "HTTP",
+                "httpMethod": "GET",
+                "uri": "https://example.com/pets",
+                "requestTemplates": templates.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected 201 from PutIntegration, got {} with {:?}",
+            created.status, created.body
+        );
+
+        // The templates are reported the same way by the integration's own operations and
+        // by every record that embeds it.
+        let readings: Vec<(&str, Value)> = vec![
+            ("PutIntegration", created.body["requestTemplates"].clone()),
+            (
+                "GetIntegration",
+                get_integration(&gateway, &api, &resource, verb).await.body
+                    ["requestTemplates"]
+                    .clone(),
+            ),
+            (
+                "GetMethod",
+                get_method(&gateway, &api, &resource, verb).await.body["methodIntegration"]
+                    ["requestTemplates"]
+                    .clone(),
+            ),
+            (
+                "GetResources(embed=methods)",
+                embedded_integration(&gateway, &api, &resource, verb, case).await
+                    ["requestTemplates"]
+                    .clone(),
+            ),
+            (
+                "UpdateIntegration of another member",
+                patch_ok(
+                    &gateway,
+                    case,
+                    &integration_uri(&api, &resource, verb),
+                    vec![replace("/timeoutInMillis", "1000")],
+                )
+                .await["requestTemplates"]
+                    .clone(),
+            ),
+        ];
+        for (reading, reported) in &readings {
+            assert_templates(case, reading, reported, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_patch_that_empties_a_request_template_reports_it_as_null() {
+    // The same rule over the operation that CHANGES a template: a template patched to an
+    // empty body is reported the way one created empty is, and a template patched back to
+    // a body is reported as that body.
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "patched-request-templates").await;
+    let resource = resource_with_a_method(&gateway, &api, &root, "pets", "GET", json!({})).await;
+    let created = put_integration(
+        &gateway,
+        &api,
+        &resource,
+        "GET",
+        json!({
+            "type": "HTTP",
+            "httpMethod": "GET",
+            "uri": "https://example.com/pets",
+            "requestTemplates": { JSON: "{\"pets\": []}" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 201,
+        "case the seeded integration: expected 201, got {} with {:?}",
+        created.status, created.body
+    );
+
+    let uri = integration_uri(&api, &resource, "GET");
+    let emptied = patch_ok(
+        &gateway,
+        "empty the template",
+        &uri,
+        vec![replace("/requestTemplates/application~1json", "")],
+    )
+    .await;
+    assert_templates(
+        "empty the template",
+        "UpdateIntegration",
+        &emptied["requestTemplates"],
+        &[(JSON, None)],
+    );
+    assert_templates(
+        "empty the template",
+        "GetIntegration",
+        &get_integration(&gateway, &api, &resource, "GET")
+            .await
+            .body["requestTemplates"],
+        &[(JSON, None)],
+    );
+
+    let refilled = patch_ok(
+        &gateway,
+        "fill the template back in",
+        &uri,
+        vec![replace(
+            "/requestTemplates/application~1json",
+            "{\"pets\": []}",
+        )],
+    )
+    .await;
+    assert_templates(
+        "fill the template back in",
+        "UpdateIntegration",
+        &refilled["requestTemplates"],
         &[(JSON, Some("{\"pets\": []}"))],
     );
 }

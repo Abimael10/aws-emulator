@@ -118,6 +118,19 @@ async fn a_patched_request_validator_member_is_stored_and_read_back() {
             ],
         ),
         (
+            // `value` is "applicable for the add or replace operation", so a `replace`
+            // carrying none names no value to set: it CLEARS the optional member, which
+            // is how a caller unsets one through a path that publishes a `replace`.
+            "replace the name with no value, which clears it",
+            baseline_request(),
+            vec![op("replace", "/name", None)],
+            vec![
+                ("name", Value::Null),
+                ("validateRequestBody", json!(true)),
+                ("validateRequestParameters", json!(false)),
+            ],
+        ),
+        (
             "turn the body flag off",
             baseline_request(),
             vec![replace("/validateRequestBody", "false")],
@@ -311,7 +324,10 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
             vec![json!({ "op": "copy", "path": "/name", "from": "/name" })],
         ),
         ("test is not supported", vec![op("test", "/name", None)]),
-        ("a replace with no value", vec![op("replace", "/name", None)]),
+        (
+            "a replace with no value for a flag that always has one",
+            vec![op("replace", "/validateRequestBody", None)],
+        ),
         ("an entry with no path", vec![json!({ "op": "replace" })]),
         ("an entry with no op", vec![json!({ "path": "/name" })]),
         (

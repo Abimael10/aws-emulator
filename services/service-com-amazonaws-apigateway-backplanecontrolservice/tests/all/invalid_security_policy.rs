@@ -144,15 +144,11 @@ fn out_of_set_values() -> Vec<String> {
         values.push(format!("{declared}_EXTRA"));
     }
     // Values in none of those forms: a TLS version the service does not offer, a policy
-    // family name truncated before its date, another enum's value, a name no AWS policy
-    // takes, and the empty string.
-    for free in [
-        "TLS_1_1",
-        "SecurityPolicy_TLS13",
-        "STRICT",
-        "NOT_A_POLICY",
-        "",
-    ] {
+    // family name truncated before its date, another enum's value, and a name no AWS
+    // policy takes. A value of NO characters is not one of them: a `replace` carrying none
+    // names no value to set, so it is the documented unset of the member rather than a
+    // policy outside the set (see the `valueless_patch_replace` suite).
+    for free in ["TLS_1_1", "SecurityPolicy_TLS13", "STRICT", "NOT_A_POLICY"] {
         values.push(free.to_string());
     }
     values.retain(|value| !SECURITY_POLICY_VALUES.contains(&value.as_str()));

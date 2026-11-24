@@ -159,6 +159,17 @@ async fn a_patched_api_key_member_is_stored_and_read_back() {
             vec![("description", Value::Null)],
         ),
         (
+            // `value` is "applicable for the add or replace operation", so a `replace`
+            // carrying none names no value to set: it CLEARS the optional member, which
+            // is how a caller unsets one through a path that publishes a `replace`.
+            "replace /name with no value, which clears it",
+            vec![op("replace", "/name", None)],
+            vec![
+                ("name", Value::Null),
+                ("description", json!("initial description")),
+            ],
+        ),
+        (
             "three members in one request",
             vec![
                 replace("/name", "renamed-and-described"),
@@ -289,7 +300,10 @@ async fn a_patch_this_service_cannot_apply_is_refused_and_changes_nothing() {
             vec![json!({ "op": "copy", "path": "/name", "from": "/description" })],
         ),
         ("test is not supported", vec![op("test", "/name", None)]),
-        ("a replace with no value", vec![op("replace", "/name", None)]),
+        (
+            "a replace with no value for a member that always has one",
+            vec![op("replace", "/enabled", None)],
+        ),
         ("an entry with no path", vec![json!({ "op": "replace" })]),
         ("an entry with no op", vec![json!({ "path": "/name" })]),
         (

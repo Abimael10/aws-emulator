@@ -158,6 +158,15 @@ async fn a_patched_deployment_description_is_stored_and_read_back() {
             Value::Null,
         ),
         (
+            // `value` is "applicable for the add or replace operation", so a `replace`
+            // carrying none names no value to set: it CLEARS the optional member, which
+            // is how a caller unsets one through a path that publishes a `replace`.
+            "replace a description with no value, which clears it",
+            json!({ "description": "initial description" }),
+            vec![op("replace", "/description", None)],
+            Value::Null,
+        ),
+        (
             "replace with a multibyte value",
             json!({ "description": "initial description" }),
             vec![replace("/description", "déploiement « canari » 🚀")],
@@ -359,12 +368,6 @@ async fn a_patch_the_description_cannot_take_is_refused_and_changes_nothing() {
             vec![json!({ "op": "upsert", "path": "/description", "value": "x" })],
             400,
             "ValidationException",
-        ),
-        (
-            "a replace with no value".to_string(),
-            vec![op("replace", "/description", None)],
-            400,
-            "BadRequestException",
         ),
         (
             "a path reaching into the single-valued member".to_string(),

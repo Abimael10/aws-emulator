@@ -271,6 +271,33 @@ async fn a_remove_clears_the_description_and_an_empty_list_changes_nothing() {
         "GetDocumentationVersions",
     );
 
+    // A `replace` carrying NO value clears the member just as a `remove` does: `value` is
+    // "applicable for the add or replace operation" (`PatchOperation$value`), so a replace
+    // without one names no value to set and unsets the optional member instead.
+    let case = "replace /description with no value";
+    let answer = update_version(
+        &gateway,
+        &api,
+        VERSION,
+        json!([
+            patch("replace", "/description", Some("set before the clear")),
+            patch("replace", "/description", None)
+        ]),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_description(&answer.body, None, case, "the update");
+    assert_description(
+        &read_version(&gateway, &api, VERSION, case).await,
+        None,
+        case,
+        "GetDocumentationVersion",
+    );
+
     // A list of no ops is a request that changes nothing and still reports the stored
     // snapshot.
     let case = "an empty list of ops";
@@ -454,24 +481,24 @@ async fn an_op_the_snapshot_does_not_support_is_refused_and_changes_nothing() {
         );
     }
 
-    // An `add` or `replace` carrying no value has nothing to set the member to.
-    for op in ["replace", "add"] {
-        let case = format!("op={op}, no value");
-        let answer = update_version(
-            &gateway,
-            &api,
-            VERSION,
-            json!([patch(op, "/description", None)]),
-        )
-        .await;
-        assert_failure(&answer, 400, BAD_REQUEST, &case);
-        assert_description(
-            &read_version(&gateway, &api, VERSION, &case).await,
-            Some(ORIGINAL_DESCRIPTION),
-            &case,
-            "GetDocumentationVersion",
-        );
-    }
+    // An `add` carrying no value has nothing to set the member to. (A `replace` carrying
+    // none is the documented UNSET of an optional member, asserted by
+    // `a_remove_clears_the_description_and_an_empty_list_changes_nothing`.)
+    let case = "op=add, no value";
+    let answer = update_version(
+        &gateway,
+        &api,
+        VERSION,
+        json!([patch("add", "/description", None)]),
+    )
+    .await;
+    assert_failure(&answer, 400, BAD_REQUEST, case);
+    assert_description(
+        &read_version(&gateway, &api, VERSION, case).await,
+        Some(ORIGINAL_DESCRIPTION),
+        case,
+        "GetDocumentationVersion",
+    );
 }
 
 #[tokio::test]

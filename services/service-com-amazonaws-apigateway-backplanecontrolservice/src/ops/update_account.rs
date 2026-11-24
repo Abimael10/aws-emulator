@@ -197,21 +197,16 @@ fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Resul
             }
             // The member's own rule, applied where the op is one this path takes: a value
             // that names a role has to name an IAM one, the role API Gateway assumes to
-            // write logs. An EMPTY value names no role at all: it CLEARS the member, which
-            // is how a caller takes the account's CloudWatch role off a path that takes no
-            // `remove`, and the account then reports none — as the recorded answer to such
-            // a patch, a 200 carrying no `cloudwatchRoleArn`, shows.
-            match patch.value.as_deref() {
-                Some("") => {
-                    account.cloudwatch_role_arn = None;
-                    return Ok(());
+            // write logs. An op that names NO value — one carrying no characters included —
+            // names no role at all: it CLEARS the member, which is the service's one unset
+            // of a single-valued member ([`crate::state::Patch::unsets_member`], applied by
+            // the shared applier below), and is how a caller takes the account's CloudWatch
+            // role off a path that takes no `remove` — as the recorded answer to such a
+            // patch, a 200 carrying no `cloudwatchRoleArn`, shows.
+            if let Some(role_arn) = patch.value.as_deref().filter(|_| !patch.unsets_member()) {
+                if let Some(violation) = role_arn_violation(role_arn) {
+                    return Err(PatchFailure::BadRequest(violation));
                 }
-                Some(role_arn) => {
-                    if let Some(violation) = role_arn_violation(role_arn) {
-                        return Err(PatchFailure::BadRequest(violation));
-                    }
-                }
-                None => {}
             }
             patch_optional_string(
                 &mut account.cloudwatch_role_arn,

@@ -762,6 +762,12 @@ async fn patched_integration_credentials_are_held_to_the_same_rule() {
     let mut stored = STORED.to_string();
 
     for (case, credentials, admitted) in credentials_rows() {
+        // A `replace` carrying no characters names no value to set at all: that is the
+        // documented UNSET of this optional member rather than a value read as an ARN
+        // (see the `valueless_patch_replace` suite), so it is no row of this table.
+        if credentials.is_empty() {
+            continue;
+        }
         let case = format!("patch the credentials to {case}");
         let answer = gateway
             .call(

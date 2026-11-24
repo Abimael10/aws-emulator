@@ -473,11 +473,12 @@ async fn an_access_log_destination_is_named_by_an_arn() {
     let deployment = create_deployment(&gateway, &api, "access log destination", json!({})).await;
     create_stage(&gateway, &api, &deployment, "prod", json!({})).await;
 
-    // Rows differ along the FORM of the value: a bare word, an empty value, the ARN's
-    // fields without the prefix, the prefix mis-cased, and a URL.
+    // Rows differ along the FORM of the value: a bare word, the ARN's fields without the
+    // prefix, the prefix mis-cased, and a URL. A value of no characters is not one of them:
+    // a `replace` carrying none names no destination to set, so it is the documented unset
+    // of the member rather than a value read as an ARN (see `valueless_patch_replace`).
     for value in [
         "not-an-arn",
-        "",
         "aws:logs:us-east-1:000000000000:log-group:api",
         "ARN:aws:logs:us-east-1:000000000000:log-group:api",
         "https://logs.us-east-1.amazonaws.com/api",
