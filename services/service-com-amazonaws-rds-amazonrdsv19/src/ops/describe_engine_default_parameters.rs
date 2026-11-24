@@ -848,6 +848,18 @@ const MYSQL_BINLOG_CACHE_SIZES: &str = "4096-18446744073709547520";
 /// `is_modifiable` false: `basedir` is one, and a request that tries to set one is refused
 /// (`service_common::rds_cluster_parameters::validate_known_setting`) rather than stored.
 ///
+/// An entry whose domain runs up to the largest value the engine's 64-bit build admits
+/// publishes that bound as the engine does, and these engines count a size in bytes or a
+/// tally in an UNSIGNED 64-bit word: the published upper bound of such a parameter is
+/// 18446744073709551615 (2^64-1), or the lower figure the manual states for the variable
+/// where it states one ([`MYSQL_BINLOG_CACHE_SIZES`]). The largest SIGNED 64-bit integer is
+/// half that and is no bound these variables have, so publishing it would publish a domain
+/// the engine does not have — and a client that reads `AllowedValues` as the legal range,
+/// a parameter validator or a console slider among them, would reject values the engine
+/// accepts. Such a bound is carried as the published STRING and read as a wide integer
+/// (`service_common::rds_cluster_parameters::ClusterParameterSpec::admits`), never through a
+/// signed 64-bit integer, which could not hold it.
+///
 /// A parameter the engine AUTOSIZES — one whose default it computes at startup rather than
 /// publishing — carries an empty `default_value` and reports no `ParameterValue` at all,
 /// which is what AWS reports for it. MySQL's `back_log` is the one such entry here
@@ -1361,11 +1373,16 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "innodb_buffer_pool_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "5242880-9223372036854775807",
+        // The engine's 5 MiB minimum buffer pool up to the largest size its 64-bit build
+        // admits, which is the unsigned 64-bit maximum (see this catalog's own docs).
+        "5242880-18446744073709551615",
         "{DBInstanceClassMemory*3/4}",
         true,
         "",
-        "The size in bytes of the buffer pool InnoDB caches table and index data in.",
+        // The published list's own sentence for the parameter, byte for byte: its
+        // lower-cased engine name and its missing trailing period included.
+        "The size in bytes of the memory buffer innodb uses to cache data and indexes of \
+         its tables",
     ),
     parameter(
         "innodb_change_buffer_max_size",
@@ -1596,7 +1613,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "max_connect_errors",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "1-9223372036854775807",
+        // One interrupted request up to the largest tally the engine's 64-bit build counts,
+        // which is the unsigned 64-bit maximum (see this catalog's own docs).
+        "1-18446744073709551615",
         "100",
         true,
         "",
@@ -1617,7 +1636,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "max_heap_table_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "16384-9223372036854775807",
+        // The engine's smallest MEMORY table up to the largest size its 64-bit build
+        // admits, which is the unsigned 64-bit maximum (see this catalog's own docs).
+        "16384-18446744073709551615",
         "16777216",
         true,
         "",
@@ -1680,7 +1701,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "sort_buffer_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "32768-9223372036854775807",
+        // The engine's smallest sort buffer up to the largest size its 64-bit build admits,
+        // which is the unsigned 64-bit maximum (see this catalog's own docs).
+        "32768-18446744073709551615",
         "262144",
         true,
         "",
@@ -1720,7 +1743,9 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         "tmp_table_size",
         crate::state::APPLY_TYPE_DYNAMIC,
         "integer",
-        "1024-9223372036854775807",
+        // The engine's smallest in-memory temporary table up to the largest size its 64-bit
+        // build admits, which is the unsigned 64-bit maximum (see this catalog's own docs).
+        "1024-18446744073709551615",
         "16777216",
         true,
         "",
