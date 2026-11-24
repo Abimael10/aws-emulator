@@ -38,7 +38,7 @@ use crate::query_wire::{element, form_encode};
 
 /// The Region every request below is signed for, and the one the load balancers are created
 /// in.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// Another Region, for the row whose target names a load balancer somewhere else.
 const OTHER_REGION: &str = "eu-west-1";
@@ -66,16 +66,16 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
 /// One answer: its HTTP status and its body as JSON (`Value::Null` when it is not JSON).
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 /// The emulator with the three services this suite needs, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them: API Gateway's control plane, and both Elastic Load
 /// Balancing models — the Classic one, which owns the `elasticloadbalancing` signing name the
 /// two APIs share, and the v2 one, whose load balancers a VPC link targets.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -154,7 +154,7 @@ async fn elb_ok(
 
 /// A NETWORK load balancer of this account, created through Elastic Load Balancing's own
 /// `CreateLoadBalancer`, answering the ARN that service assigned it.
-async fn create_network_load_balancer(
+pub(crate) async fn create_network_load_balancer(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -176,7 +176,7 @@ async fn create_network_load_balancer(
 
 /// Remove one load balancer through Elastic Load Balancing's own `DeleteLoadBalancer`, so the
 /// account no longer holds it.
-async fn delete_load_balancer(router: &MultiServiceRouter, region: &str, arn: &str) {
+pub(crate) async fn delete_load_balancer(router: &MultiServiceRouter, region: &str, arn: &str) {
     elb_ok(
         router,
         region,
@@ -187,7 +187,7 @@ async fn delete_load_balancer(router: &MultiServiceRouter, region: &str, arn: &s
 }
 
 /// One API Gateway control-plane call over its restJson1 wire.
-async fn apigw(
+pub(crate) async fn apigw(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -214,7 +214,7 @@ async fn apigw(
 }
 
 /// One string member of a JSON body.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {name:?}, got {body}"))
@@ -224,7 +224,7 @@ fn member(case: &str, body: &Value, name: &str) -> String {
 /// A well-formed ARN of a network load balancer in `region` that NOBODY created: the form
 /// Elastic Load Balancing writes (`loadbalancer/net/<name>/<id>`) over this emulator's own
 /// account, so only the resource it names is missing.
-fn unheld_target(region: &str, name: &str) -> String {
+pub(crate) fn unheld_target(region: &str, name: &str) -> String {
     format!(
         "arn:aws:elasticloadbalancing:{region}:{}:loadbalancer/net/{name}/0123456789abcdef",
         engine::emulator_account_id()
@@ -236,7 +236,7 @@ fn unheld_target(region: &str, name: &str) -> String {
 ///
 /// The provisioning is a transition the CLOCK owes, so this LOOKS AGAIN until the record
 /// reports it rather than waiting the span out: nothing is nudged between reads.
-async fn settled(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn settled(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let path = format!("/vpclinks/{id}");
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
