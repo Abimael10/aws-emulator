@@ -40,6 +40,12 @@
 //! document the integration's request template rendered and the answer the owning service gave,
 //! and the configuration error is the one an execution role that cannot be assumed is.
 //!
+//! The stand-up below — the table, the two methods, the invoke and the judgement of one
+//! request's trace — is `pub(crate)`, because the sibling suite that drives WHICH entry of the
+//! stage gates each of those two methods ([`crate::stage_execution_log_method_key_scope`]) gates
+//! the very same pair: one stand-up is what keeps two suites from disagreeing about the api
+//! whose execution logs they gate.
+//!
 //! Only a cross-service suite can pin this: the api, its stage's method settings and the
 //! emission of the trace are API Gateway's, the table the integration calls is Amazon
 //! DynamoDB's, both roles are AWS IAM's, and the group the trace lands in is CloudWatch Logs' —
@@ -66,10 +72,10 @@ use crate::stage_access_logging::{
 const REGION: &str = "us-east-1";
 
 /// The stage the api is deployed to.
-const STAGE: &str = "logs";
+pub(crate) const STAGE: &str = "logs";
 
 /// The table the integration writes into, and the item every call updates.
-const TABLE: &str = "counted";
+pub(crate) const TABLE: &str = "counted";
 const ITEM_KEY: &str = "counter";
 
 /// The role the served method's integration is made under, granted the one action it makes.
@@ -87,8 +93,8 @@ const CLOUDWATCH_ROLE: &str = "apigw-service-integration-logs";
 
 /// The two resources the api carries: the one whose integration is performed, and the one whose
 /// execution role does not exist.
-const SERVED_PART: &str = "count";
-const BROKEN_PART: &str = "broken";
+pub(crate) const SERVED_PART: &str = "count";
+pub(crate) const BROKEN_PART: &str = "broken";
 
 /// The expression the request template reads this call's `m` query parameter through —
 /// `$input.params(x)` "returns the method request parameter value", so the document the
@@ -109,12 +115,12 @@ const CONFIGURATION_ERROR: &str = "Execution failed due to configuration error:"
 
 /// The status a request the stage could not perform its integration for is answered with: the
 /// api's `API_CONFIGURATION_ERROR` gateway response.
-const CONFIGURATION_ERROR_STATUS: u16 = 500;
+pub(crate) const CONFIGURATION_ERROR_STATUS: u16 = 500;
 
 /// The request template the served method renders the table call's input document from, with
 /// `marker` the text the `m` parameter carries — [`MARKER_PARAMETER`] for the template as it is
 /// stored, the request's own value for the document the backend was sent.
-fn request_template(marker: &str) -> String {
+pub(crate) fn request_template(marker: &str) -> String {
     format!(
         concat!(
             r#"{{"TableName":"{table}","Key":{{"id":{{"S":"{key}"}}}},"#,
@@ -177,7 +183,13 @@ const ROWS: &[Row] = &[
 
 /// One `GET` method under the api's root whose `AWS` integration names the table's `UpdateItem`
 /// action under `role`, with the two integration responses that map what the table answered.
-async fn given_method(gateway: &Gateway, api: &str, root: &str, path_part: &str, role: &str) {
+pub(crate) async fn given_method(
+    gateway: &Gateway,
+    api: &str,
+    root: &str,
+    path_part: &str,
+    role: &str,
+) {
     let resource = resource_under(gateway, api, root, path_part).await;
     put_method(
         gateway,
@@ -238,16 +250,22 @@ async fn gate(gateway: &Gateway, api: &str, case: &str, level: &str, data_trace:
 
 /// What one invoke of the stage left behind: the records of that request's trace, the status it
 /// was answered with and the body the client holds.
-struct Served {
-    status: u16,
-    body: String,
-    trace: Vec<String>,
-    request_id: String,
+pub(crate) struct Served {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    pub(crate) trace: Vec<String>,
+    pub(crate) request_id: String,
 }
 
 /// Invoke `path_part` of the deployed stage with `marker` as its `m` parameter, and read back
 /// the records the stage's execution log group holds about THAT request.
-async fn served(gateway: &Gateway, api: &str, case: &str, path_part: &str, marker: &str) -> Served {
+pub(crate) async fn served(
+    gateway: &Gateway,
+    api: &str,
+    case: &str,
+    path_part: &str,
+    marker: &str,
+) -> Served {
     let answered = invoke(
         gateway,
         api,
@@ -273,7 +291,7 @@ async fn served(gateway: &Gateway, api: &str, case: &str, path_part: &str, marke
 /// Assert the lines of ONE request's trace against the rule: whether anything was written at
 /// all, whether the informational steps are among it, whether the failure is, and which payload
 /// lines exist.
-fn assert_trace(case: &str, request_id: &str, trace: &[String], expected: &Expected) {
+pub(crate) fn assert_trace(case: &str, request_id: &str, trace: &[String], expected: &Expected) {
     if !expected.traced {
         assert!(
             trace.is_empty(),
@@ -318,7 +336,7 @@ fn assert_trace(case: &str, request_id: &str, trace: &[String], expected: &Expec
 
 /// What the rule says one request's trace holds: computed from the settings in force and from
 /// whether the request reached a backend, never written out per row.
-struct Expected {
+pub(crate) struct Expected {
     traced: bool,
     informational: bool,
     configuration_error: bool,
@@ -329,7 +347,7 @@ struct Expected {
 impl Expected {
     /// The trace the rule owes a request answered with `status` under `level`/`data_trace`,
     /// where `reached_backend` says whether the integration was performed at all.
-    fn of(level: &str, data_trace: bool, status: u16, reached_backend: bool) -> Self {
+    pub(crate) fn of(level: &str, data_trace: bool, status: u16, reached_backend: bool) -> Self {
         let failing = status >= 400;
         let traced = match level {
             "INFO" => true,
