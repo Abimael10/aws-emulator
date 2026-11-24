@@ -838,17 +838,25 @@ fn refused_by_web_acl(
     // status, the headers and the body are the web ACL's own, and this endpoint's envelope
     // is not used, because AppSync never produced the response.
     if let Some(custom) = decision.custom_response {
-        return Some(edge_response(custom));
+        return Some(with_headers(
+            edge_response(custom),
+            &decision.response_headers,
+        ));
     }
     // A `Block` with no custom response is the refusal AppSync's own edge words. A `Captcha`
-    // or `Challenge` with none is answered with the status WAF serves its interstitial
-    // under; the interstitial ITSELF is a script WAF serves from its own endpoint, which
-    // this emulator serves none of, so the answer carries the status and the same envelope
-    // rather than a page nothing produced.
-    Some(error_response(
-        decision.action.default_status().unwrap_or(FORBIDDEN_STATUS),
-        WAF_FORBIDDEN_ERROR_TYPE,
-        WAF_FORBIDDEN_MESSAGE,
+    // or `Challenge` with none is answered out of WAF's own envelope: the status WAF serves
+    // its interstitial under, and the headers WAF stamps on a response it generates itself
+    // (`EdgeDecision::response_headers`), which is what the client's CAPTCHA or challenge
+    // integration reads. The interstitial ITSELF is a script WAF serves from its own
+    // endpoint, which this emulator serves none of, so the answer carries the status and the
+    // same envelope rather than a page nothing produced.
+    Some(with_headers(
+        error_response(
+            decision.action.default_status().unwrap_or(FORBIDDEN_STATUS),
+            WAF_FORBIDDEN_ERROR_TYPE,
+            WAF_FORBIDDEN_MESSAGE,
+        ),
+        &decision.response_headers,
     ))
 }
 
@@ -897,18 +905,30 @@ fn edge_response(custom: waf_edge::EdgeResponse) -> ::http::Response<Full<Bytes>
         ::http::header::CONTENT_LENGTH.to_string(),
         body.len().to_string(),
     ));
-    for (name, value) in fields {
+    with_headers(response, &fields)
+}
+
+/// `response` carrying `headers` as well: the headers WAF stamps on a response it
+/// generates itself, on top of whatever that response already carries.
+///
+/// A header name or value a web ACL names is not restricted to what a response can carry,
+/// so one the wire cannot hold is left off the answer rather than failing the request.
+fn with_headers(
+    mut response: ::http::Response<Full<Bytes>>,
+    headers: &[(String, String)],
+) -> ::http::Response<Full<Bytes>> {
+    for (name, value) in headers {
         match (
             ::http::HeaderName::from_bytes(name.as_bytes()),
-            ::http::HeaderValue::from_str(&value),
+            ::http::HeaderValue::from_str(value),
         ) {
             (Ok(name), Ok(value)) => {
                 response.headers_mut().insert(name, value);
             }
             _ => ::tracing::warn!(
                 %name,
-                "the web acl's custom response names a header a response cannot carry, and \
-                 it is left off the answer"
+                "the web acl's response names a header a response cannot carry, and it is \
+                 left off the answer"
             ),
         }
     }

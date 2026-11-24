@@ -26,7 +26,9 @@
 //! * any other terminating action is answered with the status WAF serves it under
 //!   (`403` for a `Block`) and no body — a body WAF renders for a blocked client is not
 //!   this emulator's to invent, exactly as the sibling statuses this plane answers with
-//!   carry none.
+//!   carry none — carrying the headers WAF stamps on a response it generates itself, which
+//!   for a `Captcha` or `Challenge` interception name the action that intercepted the
+//!   request.
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
@@ -122,13 +124,17 @@ pub fn decision<Eng: Send + Sync + 'static>(
     );
     // A terminating action that configures its own `CustomResponse` is served BY WAF: the
     // status, the headers and the body are the web ACL's own, and the listener's actions
-    // are not consulted, because the load balancer never produced the response.
+    // are not consulted, because the load balancer never produced the response. Either way
+    // the answer carries the headers WAF stamps on a response it generates itself —
+    // `EdgeDecision::response_headers`, which names the action of a `Captcha` or
+    // `Challenge` interception.
+    let stamped = decided.response_headers;
     let refused = Decision::Refused(match decided.custom_response {
         Some(custom) => EdgeAnswer {
             status: custom.status,
             content_type: custom.content_type,
             body: custom.body,
-            headers: custom.headers,
+            headers: custom.headers.into_iter().chain(stamped).collect(),
         },
         None => EdgeAnswer {
             status: decided
@@ -137,7 +143,7 @@ pub fn decision<Eng: Send + Sync + 'static>(
                 .unwrap_or(EDGE_REFUSAL_STATUS),
             content_type: None,
             body: Vec::new(),
-            headers: Vec::new(),
+            headers: stamped,
         },
     });
     (refused, logged)

@@ -95,13 +95,16 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     );
     // A terminating action that configures its own `CustomResponse` is served BY WAF: the
     // status, the headers and the body are the web ACL's own, and the edge produced none of
-    // them.
+    // them. Either way the answer carries the headers WAF stamps on a response it generates
+    // itself — `EdgeDecision::response_headers`, which names the action of a `Captcha` or
+    // `Challenge` interception.
+    let stamped = decided.response_headers;
     let refusal = match decided.custom_response {
         Some(custom) => Refusal {
             status: custom.status,
             content_type: custom.content_type,
             body: custom.body,
-            headers: custom.headers,
+            headers: custom.headers.into_iter().chain(stamped).collect(),
         },
         None => Refusal {
             status: decided
@@ -110,7 +113,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
                 .unwrap_or(EDGE_REFUSAL_STATUS),
             content_type: None,
             body: Vec::new(),
-            headers: Vec::new(),
+            headers: stamped,
         },
     };
     (Some(refusal), logged)

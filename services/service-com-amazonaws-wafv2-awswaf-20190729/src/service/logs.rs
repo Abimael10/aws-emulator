@@ -509,10 +509,18 @@ fn record(
             .map(|(name, value)| ::serde_json::json!({ "name": name, "value": value }))
             .collect::<Vec<::serde_json::Value>>());
     }
-    // The status a terminating action's own `CustomResponse` answered with: WAF served
-    // that response, so WAF is what knows the code the client was sent.
-    if let Some(custom) = decision.custom_response.as_ref() {
-        document["responseCodeSent"] = ::serde_json::json!(custom.status);
+    // The status WAF itself answered the request with: a terminating action's own
+    // `CustomResponse`, or the envelope a `Captcha` or `Challenge` interception is served
+    // out of (`EdgeAction::served_status`). WAF served that response, so WAF is what knows
+    // the code the client was sent; a refusal the protected resource's own service words
+    // reports none here.
+    if let Some(status) = decision
+        .custom_response
+        .as_ref()
+        .map(|custom| custom.status)
+        .or_else(|| decision.action.served_status())
+    {
+        document["responseCodeSent"] = ::serde_json::json!(status);
     }
     document.to_string()
 }

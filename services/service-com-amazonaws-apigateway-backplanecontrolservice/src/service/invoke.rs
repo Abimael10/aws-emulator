@@ -2426,7 +2426,10 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
     // responses are not consulted, because API Gateway never produced the response.
     if let Some(custom) = decision.custom_response {
         return (
-            EdgeOutcome::Refused(Box::new(edge_response(custom))),
+            EdgeOutcome::Refused(Box::new(with_headers(
+                edge_response(custom),
+                &decision.response_headers,
+            ))),
             logged,
         );
     }
@@ -2438,15 +2441,20 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
             let api = resolve(&store, &addressed).map(|resolved| resolved.api);
             EdgeOutcome::Refused(Box::new(refusal_response(api, WAF_FILTERED)))
         }
-        // A `Captcha` or `Challenge` action with no custom response is answered with
-        // the status WAF serves its interstitial under. The interstitial ITSELF is a
-        // script WAF serves from its own endpoint, which this emulator serves none of,
-        // so the response carries the status and no body rather than a page nothing
-        // produced.
-        action => EdgeOutcome::Refused(Box::new(response_with(
-            action.default_status().unwrap_or(403),
-            JSON_CONTENT_TYPE,
-            Vec::new(),
+        // A `Captcha` or `Challenge` action with no custom response is answered out of
+        // WAF's own envelope: the status WAF serves its interstitial under, and the
+        // headers WAF stamps on a response it generates itself
+        // (`EdgeDecision::response_headers`), which is what the client's CAPTCHA or
+        // challenge integration reads. The interstitial ITSELF is a script WAF serves
+        // from its own endpoint, which this emulator serves none of, so the response
+        // carries the status and no body rather than a page nothing produced.
+        action => EdgeOutcome::Refused(Box::new(with_headers(
+            response_with(
+                action.default_status().unwrap_or(403),
+                JSON_CONTENT_TYPE,
+                Vec::new(),
+            ),
+            &decision.response_headers,
         ))),
     };
     (refused, logged)
@@ -2524,7 +2532,7 @@ fn request_with_headers(req: &RtRequest, inserted: &[(String, String)]) -> Optio
 
 /// The response a web ACL's own `CustomResponse` serves, as it leaves the edge.
 fn edge_response(custom: waf_edge::EdgeResponse) -> RtResponse {
-    let mut response = response_with(
+    let response = response_with(
         custom.status,
         custom
             .content_type
@@ -2532,13 +2540,26 @@ fn edge_response(custom: waf_edge::EdgeResponse) -> RtResponse {
             .unwrap_or(JSON_CONTENT_TYPE),
         custom.body,
     );
-    for (name, value) in custom.headers {
-        if let Err(refused) = response.headers_mut().try_insert(name.clone(), value) {
+    with_headers(response, &custom.headers)
+}
+
+/// `response` carrying `headers` as well: the headers a web ACL's custom response
+/// configures, and the ones WAF stamps on a response it generates itself.
+///
+/// A header name and value configured on a web ACL are not restricted to what a response
+/// can carry, so each is inserted with `try_insert` rather than the panicking `insert`: a
+/// value the wire cannot carry is left off the response instead of failing the request.
+fn with_headers(mut response: RtResponse, headers: &[(String, String)]) -> RtResponse {
+    for (name, value) in headers {
+        if let Err(refused) = response
+            .headers_mut()
+            .try_insert(name.clone(), value.clone())
+        {
             tracing::warn!(
                 header = %name,
                 error = %refused,
-                "the header the web acl's custom response configures is not one a header \
-                 can carry, and is left off the response"
+                "the header the web acl's response carries is not one a header can \
+                 carry, and is left off the response"
             );
         }
     }

@@ -54,8 +54,13 @@
 //!   `CustomResponseBodyKey` names; with none, the protected resource's own service
 //!   renders its forbidden answer ([`EdgeDecision::custom_response`] is `None`).
 //! * `Captcha` and `Challenge` are terminating too, and a request carrying no
-//!   solved token is answered with the status WAF serves the puzzle under
-//!   ([`CAPTCHA_STATUS`], [`CHALLENGE_STATUS`]).
+//!   solved token is answered BY WAF, out of the envelope those two actions document:
+//!   the status WAF serves the puzzle under ([`CAPTCHA_STATUS`], [`CHALLENGE_STATUS`])
+//!   and [`ACTION_HEADER`] naming the action that intercepted the request
+//!   ([`EdgeDecision::response_headers`]), which is what a client's CAPTCHA or
+//!   challenge integration reads to tell an interception from an ordinary answer
+//!   carrying the same status. WAF's own record of the request reports that token
+//!   inspection as well ([`SampledHTTPRequest::captcha_response`]).
 //!
 //! # What this module does not inspect, and what it answers instead
 //!
@@ -114,6 +119,46 @@ pub const CAPTCHA_STATUS: u16 = 405;
 /// The status WAF serves a silent challenge under, the `Challenge` counterpart of
 /// [`CAPTCHA_STATUS`]: WAF answers with `202` and the challenge script.
 pub const CHALLENGE_STATUS: u16 = 202;
+
+/// The status a `Block` is refused under where the protected resource's own service
+/// words no refusal of its own.
+const BLOCK_STATUS: u16 = 403;
+
+/// The header WAF stamps on the response it serves ITSELF for a request a `Captcha` or
+/// a `Challenge` action intercepted.
+///
+/// `CaptchaAction` documents the whole envelope of such a response — "WAF generates a
+/// response that it sends back to the client, which includes the following: the header
+/// `x-amzn-waf-action` with a value of `captcha`" beside "the HTTP status code `405
+/// Method Not Allowed`" — and `ChallengeAction` states the same for its own token under
+/// `challenge` and `202`. The header is the fixed action token, and it is what a
+/// client's CAPTCHA or challenge integration reads, together with the status, to tell a
+/// WAF interception from an ordinary answer carrying that status.
+pub const ACTION_HEADER: &str = "x-amzn-waf-action";
+
+/// The [`ACTION_HEADER`] value of a `Captcha` interception (`CaptchaAction`: "the header
+/// `x-amzn-waf-action` with a value of `captcha`").
+pub const CAPTCHA_ACTION_TOKEN: &str = "captcha";
+
+/// The [`ACTION_HEADER`] value of a `Challenge` interception (`ChallengeAction`: "the
+/// header `x-amzn-waf-action` with a value of `challenge`").
+pub const CHALLENGE_ACTION_TOKEN: &str = "challenge";
+
+/// The cookie a client presents a WAF token in, which is the cookie WAF's own CAPTCHA
+/// and challenge scripts store the token they acquired in.
+///
+/// A request carrying none presents no token for the inspection a `Captcha` or
+/// `Challenge` action runs to evaluate, which is what that inspection reports as its
+/// `FailureReason` ([`TOKEN_MISSING_FAILURE`]).
+const TOKEN_COOKIE: &str = "aws-waf-token";
+
+/// `FailureReason$TOKEN_MISSING`: the request presented no token at all for the
+/// inspection to evaluate.
+const TOKEN_MISSING_FAILURE: &str = "TOKEN_MISSING";
+
+/// `FailureReason$TOKEN_INVALID`: the request presented a token the inspection could not
+/// verify as one WAF issued.
+const TOKEN_INVALID_FAILURE: &str = "TOKEN_INVALID";
 
 /// The most requests one web ACL's sample population holds: WAF draws a sample "from
 /// among the first 5,000 requests that your Amazon Web Services resource received
@@ -239,6 +284,23 @@ impl InspectedRequest {
             headers,
             body,
         }
+    }
+
+    /// The WAF token this request PRESENTS, out of the cookie WAF's own scripts store
+    /// the token they acquired in ([`TOKEN_COOKIE`]); `None` for a request presenting
+    /// none.
+    ///
+    /// Read through [`cookies`], the one reading of a request's `Cookie` headers in this
+    /// module, so the token inspection and a `FieldToMatch$Cookies` statement cannot
+    /// differ on what a request carries.
+    ///
+    /// Presenting one is not holding a valid one: what the token inspection a `Captcha`
+    /// or `Challenge` action runs makes of it is that inspection's own report.
+    fn presented_token(&self) -> Option<String> {
+        cookies(self)
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(TOKEN_COOKIE))
+            .map(|(_, value)| value)
     }
 
     /// The first value of the header `name` (compared case-insensitively, as HTTP
@@ -384,10 +446,47 @@ impl EdgeAction {
             // resource's own service, which words its own forbidden answer: WAF
             // serves `403` for it, and a service with a configurable refusal (API
             // Gateway's `WAF_FILTERED` gateway response) renders that instead.
-            Self::Block => Some(403),
+            Self::Block => Some(BLOCK_STATUS),
+            // The two actions WAF answers out of its own envelope, status and all.
+            Self::Captcha | Self::Challenge => self.served_status(),
+        }
+    }
+
+    /// The status WAF ITSELF answered a request this action terminated the evaluation
+    /// of with, or `None` for an action whose response the protected resource's own
+    /// service (or its origin) produced.
+    ///
+    /// `Captcha` and `Challenge` are the two actions WAF answers at the edge out of an
+    /// envelope of its own — the status and the [`ACTION_HEADER`] both documented on
+    /// `CaptchaAction` and `ChallengeAction` — so WAF knows the code the client was
+    /// sent and reports it. A `Block` with no `CustomResponse` is answered by the
+    /// protected resource's own service, which words its own refusal, and an `Allow`
+    /// is answered by the origin, so WAF sent neither of those.
+    pub fn served_status(self) -> Option<u16> {
+        match self {
             Self::Captcha => Some(CAPTCHA_STATUS),
             Self::Challenge => Some(CHALLENGE_STATUS),
+            Self::Allow | Self::Block => None,
         }
+    }
+
+    /// The [`ACTION_HEADER`] value this action is named by on the response WAF serves
+    /// itself, or `None` for an action that serves no such response.
+    pub fn action_token(self) -> Option<&'static str> {
+        match self {
+            Self::Captcha => Some(CAPTCHA_ACTION_TOKEN),
+            Self::Challenge => Some(CHALLENGE_ACTION_TOKEN),
+            Self::Allow | Self::Block => None,
+        }
+    }
+
+    /// The headers WAF puts on the response it serves ITSELF for a request this action
+    /// terminated the evaluation of: [`ACTION_HEADER`] naming the action, for the two
+    /// actions that document one, and nothing for every other action.
+    pub fn response_headers(self) -> Vec<(String, String)> {
+        self.action_token()
+            .map(|token| vec![(ACTION_HEADER.to_string(), token.to_string())])
+            .unwrap_or_default()
     }
 }
 
@@ -420,6 +519,15 @@ pub struct EdgeDecision {
     /// `CustomResponse`; `None` when the protected resource's own service words the
     /// refusal.
     pub custom_response: Option<EdgeResponse>,
+    /// The headers WAF stamps on the response it serves ITSELF for this request, on top
+    /// of whatever the refusal's own response carries: [`ACTION_HEADER`] naming the
+    /// action for a request a `Captcha` or a `Challenge` action intercepted, and nothing
+    /// at all for every other decision ([`EdgeAction::response_headers`]).
+    ///
+    /// Carried on the decision rather than left to each protected resource's own service
+    /// to know, because it is part of the response WAF generates for an interception
+    /// rather than of the resource's own answer.
+    pub response_headers: Vec<(String, String)>,
     /// The web ACL rule that decided, or `None` when the `DefaultAction` did.
     pub rule_name: Option<String>,
     /// The rule WITHIN a rule group that decided, as
@@ -1161,8 +1269,12 @@ impl Evaluation<'_> {
                 );
                 report_response_code(
                     &mut recorded.samples,
-                    custom.as_ref().map(|response| response.status),
+                    custom
+                        .as_ref()
+                        .map(|response| response.status)
+                        .or_else(|| action.served_status()),
                 );
+                report_token_inspection(&mut recorded.samples, action, self.request);
                 return (
                     EdgeDecision {
                         action,
@@ -1172,6 +1284,7 @@ impl Evaluation<'_> {
                             Vec::new()
                         },
                         custom_response: custom,
+                        response_headers: action.response_headers(),
                         rule_name: Some(rule.name.clone()),
                         rule_name_within_rule_group: group.inner_rule,
                         labels: cx.labels,
@@ -1211,8 +1324,12 @@ impl Evaluation<'_> {
         );
         report_response_code(
             &mut recorded.samples,
-            custom.as_ref().map(|response| response.status),
+            custom
+                .as_ref()
+                .map(|response| response.status)
+                .or_else(|| action.served_status()),
         );
+        report_token_inspection(&mut recorded.samples, action, self.request);
         (
             EdgeDecision {
                 action,
@@ -1222,6 +1339,7 @@ impl Evaluation<'_> {
                     Vec::new()
                 },
                 custom_response: custom,
+                response_headers: action.response_headers(),
                 rule_name: None,
                 rule_name_within_rule_group: None,
                 labels: cx.labels,
@@ -1783,11 +1901,69 @@ impl Evaluation<'_> {
 /// request", which is a property of the REQUEST rather than of the dimension a sample
 /// of it was drawn under: a rule that counted the request sent no response of its own,
 /// so what was sent is whatever the action that terminated the evaluation (or the
-/// `DefaultAction`) served. `None` where the protected resource's own origin answered,
-/// because WAF sent nothing then.
+/// `DefaultAction`) served. `None` where the protected resource's own origin or its own
+/// refusal answered, because WAF sent nothing then — which is why a `Captcha` or
+/// `Challenge` interception, answered by WAF out of its own envelope, reports the status
+/// of that envelope ([`EdgeAction::served_status`]).
 fn report_response_code(samples: &mut [SampledRequestRecord], status: Option<u16>) {
     for record in samples {
         record.sample.response_code_sent = status.map(i32::from);
+    }
+}
+
+/// Report, on every sample of the request just evaluated, what the token inspection a
+/// `Captcha` or a `Challenge` action ran made of the request.
+///
+/// `SampledHTTPRequest$CaptchaResponse` is "the result from the inspection of the web
+/// request for a valid `CAPTCHA` token" — a property of the REQUEST, like the response
+/// code above — and its `ResponseCode` is "the HTTP response code indicating the status
+/// of the `CAPTCHA` token in the web request. If the token is missing, invalid, or
+/// expired, this code is `405 Method Not Allowed`", which is the status the inspection
+/// answered the request with. `ChallengeResponse` reports the same about a challenge
+/// token under its own status. An action that inspects no token — `Allow`, `Block`,
+/// `Count` — reports neither, because no such inspection ran.
+///
+/// `FailureReason` is "the reason for failure, populated when the evaluation of the token
+/// fails": a request presenting no token ([`InspectedRequest::presented_token`]) has none
+/// to evaluate, and a token presented here is one no WAF issued, because nothing solves a
+/// CAPTCHA puzzle or runs a challenge script against this emulator. That is also why
+/// `SolveTimestamp` — "the time that the `CAPTCHA` was last solved for the supplied
+/// token" — reports nothing: no token was ever solved.
+fn report_token_inspection(
+    samples: &mut [SampledRequestRecord],
+    action: EdgeAction,
+    request: &InspectedRequest,
+) {
+    let Some(status) = action.served_status() else {
+        return;
+    };
+    let failure_reason = Some(
+        match request.presented_token() {
+            None => TOKEN_MISSING_FAILURE,
+            Some(_) => TOKEN_INVALID_FAILURE,
+        }
+        .to_string(),
+    );
+    for record in samples {
+        match action {
+            EdgeAction::Captcha => {
+                record.sample.captcha_response = Some(CaptchaResponse {
+                    response_code: Some(i32::from(status)),
+                    solve_timestamp: None,
+                    failure_reason: failure_reason.clone(),
+                });
+            }
+            EdgeAction::Challenge => {
+                record.sample.challenge_response = Some(ChallengeResponse {
+                    response_code: Some(i32::from(status)),
+                    solve_timestamp: None,
+                    failure_reason: failure_reason.clone(),
+                });
+            }
+            // Neither action inspects a token, so [`EdgeAction::served_status`]
+            // answered `None` for it above.
+            EdgeAction::Allow | EdgeAction::Block => {}
+        }
     }
 }
 
