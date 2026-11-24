@@ -1079,6 +1079,13 @@ pub const PARAMETER_METADATA_FUNCTION: &str = "metadata-function";
 pub const PARAMETER_RECORD_FUNCTION: &str = "record-function";
 /// The `Parameters` key a LAMBDA catalog names its composite function with.
 pub const PARAMETER_FUNCTION: &str = "function";
+/// The `Parameters` key naming the catalog a connector function is asked about.
+///
+/// RECORDED BEHAVIOUR: the `DataCatalog$Parameters` documentation gives the syntax a REQUEST
+/// uses and names no such key, so this one is not read from the model. It is part of the
+/// wiring a composite connector catalog resolves to ([`resolved_data_catalog_parameters`]):
+/// one function serving both roles is told which catalog it is answering for.
+pub const PARAMETER_CATALOG: &str = "catalog";
 /// The `Parameters` key a GLUE catalog names its catalog id with.
 pub const PARAMETER_CATALOG_ID: &str = "catalog-id";
 /// The `Parameters` key a FEDERATED catalog reuses an existing Glue connection with.
@@ -1405,6 +1412,45 @@ pub fn federated_connection_type(
             CONNECTION_TYPE_VALUES.join(", ")
         )),
     }
+}
+
+/// The `Parameters` a data catalog named `name` of `catalog_type` HOLDS, given the
+/// `parameters` a create or an update carried.
+///
+/// A catalog holds the connector WIRING its parameters resolve to, not the shorthand a
+/// request stated it with. `DataCatalog$Parameters` documents the LAMBDA type as taking
+/// either a function per role ([`PARAMETER_METADATA_FUNCTION`] with
+/// [`PARAMETER_RECORD_FUNCTION`]) or one composite function serving both
+/// ([`PARAMETER_FUNCTION`]); the first form already states its own wiring, so there is
+/// nothing to resolve, while the second leaves it to be worked out: the one function serves
+/// both roles, and being a function that can serve several catalogs it has to be told which
+/// catalog it is answering for. So a composite catalog holds that function under both role
+/// keys and the catalog's own name under [`PARAMETER_CATALOG`] — RECORDED BEHAVIOUR, since
+/// the documentation gives the request syntax and not what the catalog then holds.
+///
+/// Every other key the request carried is kept with the value it gave, and a request that
+/// named the catalog key itself keeps its own value: what the request states, it states.
+/// Resolving twice changes nothing, so a record read back through here — which is what an
+/// update that names no parameters of its own does — is the record it already was.
+#[must_use]
+pub fn resolved_data_catalog_parameters(
+    name: &str,
+    catalog_type: &str,
+    parameters: HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut resolved: BTreeMap<String, String> = parameters.into_iter().collect();
+    if catalog_type != DATA_CATALOG_TYPE_LAMBDA {
+        return resolved;
+    }
+    let Some(function) = resolved.remove(PARAMETER_FUNCTION) else {
+        return resolved;
+    };
+    resolved.insert(PARAMETER_METADATA_FUNCTION.to_string(), function.clone());
+    resolved.insert(PARAMETER_RECORD_FUNCTION.to_string(), function);
+    resolved
+        .entry(PARAMETER_CATALOG.to_string())
+        .or_insert_with(|| name.to_string());
+    resolved
 }
 
 /// The bytes of keys and values held in a `ParametersMap`, checked against

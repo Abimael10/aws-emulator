@@ -116,6 +116,9 @@ struct CreateCase {
     created_status: &'static str,
     /// The `ConnectionType` the catalog must report, if any.
     connection_type: Option<&'static str>,
+    /// The `Parameters` a read of the catalog must report, where they are not the map the
+    /// request carried: the wiring a composite LAMBDA function resolves to.
+    read_back_parameters: Option<Value>,
 }
 
 /// The rows: a catalog differs from the next along its type, the parameters that type
@@ -134,6 +137,7 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
+            read_back_parameters: None,
         },
         CreateCase {
             case: "a HIVE catalog with a description and an optional sdk-version",
@@ -149,6 +153,7 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
+            read_back_parameters: None,
         },
         CreateCase {
             case: "a LAMBDA catalog with one composite function",
@@ -160,6 +165,13 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
+            // The composite function is the wiring of both roles, and the catalog it is
+            // asked about is the one it was registered under.
+            read_back_parameters: Some(json!({
+                "catalog": "lambda-composite",
+                "metadata-function": "arn:aws:lambda:us-east-1:111122223333:function:both",
+                "record-function": "arn:aws:lambda:us-east-1:111122223333:function:both"
+            })),
         },
         CreateCase {
             case: "a LAMBDA catalog with split metadata and record functions, and the \
@@ -177,6 +189,7 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             created_status: DATA_CATALOG_STATUS_CREATE_COMPLETE,
             connection_type: None,
+            read_back_parameters: None,
         },
         CreateCase {
             case: "a FEDERATED catalog reusing an existing Glue connection",
@@ -191,6 +204,7 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             created_status: DATA_CATALOG_STATUS_CREATE_IN_PROGRESS,
             connection_type: None,
+            read_back_parameters: None,
         },
         CreateCase {
             case: "a FEDERATED catalog describing a new connection",
@@ -207,6 +221,7 @@ fn create_cases() -> Vec<CreateCase> {
             // `DataCatalog$ConnectionType` is "the type of connection for a FEDERATED
             // data catalog", which the create call states in `connection-type`.
             connection_type: Some("MYSQL"),
+            read_back_parameters: None,
         },
     ]
 }
@@ -243,7 +258,10 @@ async fn a_created_data_catalog_is_read_back_by_get_data_catalog() {
         // Name, Type, Description and Parameters are what the request carried; Status is
         // the one member time can move, and has its own test below.
         for member in ["Name", "Type", "Description", "Parameters"] {
-            let expected = case.request.get(member).cloned().unwrap_or(Value::Null);
+            let expected = match (member, case.read_back_parameters.as_ref()) {
+                ("Parameters", Some(resolved)) => resolved.clone(),
+                _ => case.request.get(member).cloned().unwrap_or(Value::Null),
+            };
             assert_eq!(
                 read[member], expected,
                 "case {:?}: expected {member} to read back as {expected:?}, got {:?}",

@@ -38,6 +38,10 @@ struct ParameterSetCase {
     case: &'static str,
     parameters: Value,
     accepted: bool,
+    /// What a read of the catalog named `name` must report for this map: the map itself
+    /// where it already names a function per role, and the wiring a composite function
+    /// resolves to where it names one function for both. Unused by a refused row.
+    read_back: fn(&str) -> Value,
 }
 
 /// The rows. The two sets the documentation names are accepted, on their own and beside
@@ -50,6 +54,15 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
             case: "the composite function key on its own",
             parameters: json!({ "function": lambda_arn("composite") }),
             accepted: true,
+            // One function serving both roles is held under both role keys, beside the
+            // name of the catalog it is asked about.
+            read_back: |name| {
+                json!({
+                    "catalog": name,
+                    "metadata-function": lambda_arn("composite"),
+                    "record-function": lambda_arn("composite"),
+                })
+            },
         },
         ParameterSetCase {
             case: "the composite function key beside a key of neither set",
@@ -58,6 +71,14 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
                 "sdk-version": "1.0",
             }),
             accepted: true,
+            read_back: |name| {
+                json!({
+                    "catalog": name,
+                    "metadata-function": lambda_arn("composite"),
+                    "record-function": lambda_arn("composite"),
+                    "sdk-version": "1.0",
+                })
+            },
         },
         ParameterSetCase {
             case: "the split set",
@@ -66,6 +87,12 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
                 "record-function": lambda_arn("records"),
             }),
             accepted: true,
+            read_back: |_| {
+                json!({
+                    "metadata-function": lambda_arn("metadata"),
+                    "record-function": lambda_arn("records"),
+                })
+            },
         },
         ParameterSetCase {
             case: "the split set beside two keys of neither set",
@@ -76,16 +103,28 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
                 "catalog": "analytics",
             }),
             accepted: true,
+            // Every key the request named keeps the value it gave, the catalog key
+            // included.
+            read_back: |_| {
+                json!({
+                    "metadata-function": lambda_arn("metadata"),
+                    "record-function": lambda_arn("records"),
+                    "sdk-version": "1.0",
+                    "catalog": "analytics",
+                })
+            },
         },
         ParameterSetCase {
             case: "the metadata function alone, half of the split set",
             parameters: json!({ "metadata-function": lambda_arn("metadata") }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
         ParameterSetCase {
             case: "the record function alone, the other half of the split set",
             parameters: json!({ "record-function": lambda_arn("records") }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
         ParameterSetCase {
             case: "both sets at once",
@@ -95,6 +134,7 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
                 "record-function": lambda_arn("records"),
             }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
         ParameterSetCase {
             case: "the composite key together with half of the split set",
@@ -103,16 +143,19 @@ fn parameter_set_cases() -> Vec<ParameterSetCase> {
                 "metadata-function": lambda_arn("metadata"),
             }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
         ParameterSetCase {
             case: "a map of keys that belong to neither set",
             parameters: json!({ "sdk-version": "1.0", "catalog": "analytics" }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
         ParameterSetCase {
             case: "a key whose name only contains one of the set's keys",
             parameters: json!({ "lambda-function": lambda_arn("composite") }),
             accepted: false,
+            read_back: |_| Value::Null,
         },
     ]
 }
@@ -156,10 +199,11 @@ async fn create_holds_a_lambda_catalogs_parameters_to_one_of_the_two_sets() {
                  {read:?}",
                 case.case
             );
+            let expected = (case.read_back)(&name);
             assert_eq!(
-                read["Parameters"], case.parameters,
-                "case {:?}: expected Parameters {:?}, got {:?}",
-                case.case, case.parameters, read["Parameters"]
+                read["Parameters"], expected,
+                "case {:?}: expected Parameters {expected:?}, got {:?}",
+                case.case, read["Parameters"]
             );
             continue;
         }
@@ -198,8 +242,16 @@ async fn update_holds_a_lambda_catalogs_parameters_to_the_same_two_sets() {
     let router = build_router();
 
     // The map every row starts from: one registered LAMBDA catalog per row, so a row that
-    // is accepted cannot change what the next row reads.
+    // is accepted cannot change what the next row reads. It states one composite function,
+    // so the catalog holds the wiring that resolves to (`registered_wiring`).
     let registered = json!({ "function": lambda_arn("registered") });
+    let registered_wiring = |name: &str| {
+        json!({
+            "catalog": name,
+            "metadata-function": lambda_arn("registered"),
+            "record-function": lambda_arn("registered"),
+        })
+    };
 
     for (index, case) in parameter_set_cases().into_iter().enumerate() {
         let name = format!("update-parameter-set-{index}");
@@ -244,10 +296,11 @@ async fn update_holds_a_lambda_catalogs_parameters_to_the_same_two_sets() {
                  {read:?}",
                 case.case
             );
+            let expected = (case.read_back)(&name);
             assert_eq!(
-                read["Parameters"], case.parameters,
-                "case {:?}: expected Parameters {:?}, got {:?}",
-                case.case, case.parameters, read["Parameters"]
+                read["Parameters"], expected,
+                "case {:?}: expected Parameters {expected:?}, got {:?}",
+                case.case, read["Parameters"]
             );
             continue;
         }
@@ -270,16 +323,17 @@ async fn update_holds_a_lambda_catalogs_parameters_to_the_same_two_sets() {
             case.case,
             message(&body)
         );
-        // The refused update wrote nothing: the registered map still stands.
+        // The refused update wrote nothing: the registered wiring still stands.
         let (status, read) = read_catalog(&router, &name).await;
         assert_eq!(
             status, 200,
             "case {:?}: the catalog must still be readable, got {status} with {read:?}",
             case.case
         );
+        let standing = registered_wiring(&name);
         assert_eq!(
-            read["Parameters"], registered,
-            "case {:?}: expected the registered Parameters {registered:?} to stand, got \
+            read["Parameters"], standing,
+            "case {:?}: expected the registered Parameters {standing:?} to stand, got \
              {:?}",
             case.case, read["Parameters"]
         );

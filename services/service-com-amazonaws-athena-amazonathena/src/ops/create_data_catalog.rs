@@ -236,6 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The wiring the request's parameters resolve to, which is what the catalog holds
+        // and every read of it reports.
+        let held_parameters =
+            crate::state::resolved_data_catalog_parameters(&input.name, &catalog_type, parameters);
         let record = crate::state::DataCatalogRecord {
             name: input.name.clone(),
             // A federated catalog is created asynchronously, so its completion is a
@@ -244,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_complete_at: crate::state::create_complete_at(&catalog_type, now),
             catalog_type,
             description: input.description,
-            parameters: parameters.into_iter().collect(),
+            parameters: held_parameters,
             connection_type,
             tags,
         };

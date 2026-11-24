@@ -33,6 +33,24 @@ fn lambda_arn(role: &str) -> String {
     format!("arn:aws:lambda:us-east-1:123456789012:function:{role}")
 }
 
+/// What a row writes where it means "the name this row registered the catalog under",
+/// which it cannot write out because the name is built from the row's position. Replaced
+/// by [`with_catalog_name`] before the row is asserted.
+const CATALOG_NAME_PLACEHOLDER: &str = "<catalog-name>";
+
+/// `parameters` with every [`CATALOG_NAME_PLACEHOLDER`] value replaced by `name`.
+fn with_catalog_name(parameters: &Value, name: &str) -> Value {
+    let mut filled = parameters.clone();
+    if let Some(map) = filled.as_object_mut() {
+        for value in map.values_mut() {
+            if value.as_str() == Some(CATALOG_NAME_PLACEHOLDER) {
+                *value = json!(name);
+            }
+        }
+    }
+    filled
+}
+
 /// `GetDataCatalog`'s view of one catalog: `(status, DataCatalog)`.
 async fn read_catalog(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     let (status, body) = call(router, "GetDataCatalog", &json!({ "Name": name })).await;
@@ -51,7 +69,8 @@ struct UpdateCase {
     catalog_type: &'static str,
     /// The `Description` a read must report, or `None` when it must report none.
     description: Option<&'static str>,
-    /// The whole `Parameters` map a read must report.
+    /// The whole `Parameters` map a read must report, where a
+    /// [`CATALOG_NAME_PLACEHOLDER`] value stands for the catalog's own name.
     parameters: Value,
     /// The `ConnectionType` a read must report, which follows from the parameters the
     /// update left the catalog with rather than from anything stored before it.
@@ -147,7 +166,13 @@ fn update_cases() -> Vec<UpdateCase> {
             }),
             catalog_type: DATA_CATALOG_TYPE_LAMBDA,
             description: None,
-            parameters: json!({ "function": lambda_arn("composite") }),
+            // One composite function is the wiring of both roles, beside the name of the
+            // catalog it is asked about — the name this row registered the catalog under.
+            parameters: json!({
+                "catalog": CATALOG_NAME_PLACEHOLDER,
+                "metadata-function": lambda_arn("composite"),
+                "record-function": lambda_arn("composite"),
+            }),
             connection_type: None,
         },
         UpdateCase {
@@ -260,10 +285,11 @@ async fn an_applied_update_is_what_get_data_catalog_reports() {
             case.description,
             read["Description"]
         );
+        let expected_parameters = with_catalog_name(&case.parameters, &name);
         assert_eq!(
-            read["Parameters"], case.parameters,
-            "case {:?}: expected Parameters {:?}, got {:?}",
-            case.case, case.parameters, read["Parameters"]
+            read["Parameters"], expected_parameters,
+            "case {:?}: expected Parameters {expected_parameters:?}, got {:?}",
+            case.case, read["Parameters"]
         );
         assert_eq!(
             read["ConnectionType"],
@@ -594,8 +620,12 @@ async fn an_update_whose_parameters_do_not_describe_the_stated_type_is_refused()
         );
         assert_eq!(
             read["Parameters"],
-            json!({ "function": lambda_arn("composite") }),
-            "case {:?}: expected the created parameters to stand, got {:?}",
+            json!({
+                "catalog": name,
+                "metadata-function": lambda_arn("composite"),
+                "record-function": lambda_arn("composite"),
+            }),
+            "case {:?}: expected the created wiring to stand, got {:?}",
             case.case,
             read["Parameters"]
         );

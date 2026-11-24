@@ -443,10 +443,19 @@ const ROWS: &[Row] = &[
             ),
         ],
         expected_catalog_type: "LAMBDA",
-        expected_parameters: &[(
-            "function",
-            "arn:aws:lambda:eu-west-1:000000000000:function:sales-connector",
-        )],
+        // A composite function is the wiring of both roles, beside the name of the catalog
+        // it is asked about — which is what the catalog holds, whichever path registered it.
+        expected_parameters: &[
+            ("catalog", "sales@connector-1"),
+            (
+                "metadata-function",
+                "arn:aws:lambda:eu-west-1:000000000000:function:sales-connector",
+            ),
+            (
+                "record-function",
+                "arn:aws:lambda:eu-west-1:000000000000:function:sales-connector",
+            ),
+        ],
         expected_tags: &[],
     },
     Row {

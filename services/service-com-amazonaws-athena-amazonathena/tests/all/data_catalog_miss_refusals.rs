@@ -169,6 +169,9 @@ struct LifecycleCase {
     case: &'static str,
     catalog_type: &'static str,
     created: Value,
+    /// The map a read reports for the created catalog: the created map itself, unless the
+    /// create stated a wiring the catalog resolves (a composite LAMBDA function).
+    created_read_back: Value,
     updated: Value,
 }
 
@@ -185,6 +188,10 @@ fn lifecycle_cases() -> Vec<LifecycleCase> {
                 "metadata-function": lambda_arn("hive-created"),
                 "sdk-version": "1.0",
             }),
+            created_read_back: json!({
+                "metadata-function": lambda_arn("hive-created"),
+                "sdk-version": "1.0",
+            }),
             updated: json!({
                 "metadata-function": lambda_arn("hive-updated"),
                 "sdk-version": "1.0",
@@ -194,6 +201,12 @@ fn lifecycle_cases() -> Vec<LifecycleCase> {
             case: "a LAMBDA catalog the update moves to the split parameter set",
             catalog_type: DATA_CATALOG_TYPE_LAMBDA,
             created: json!({ "function": lambda_arn("lambda-composite") }),
+            // One composite function serves both roles, for the catalog this row names.
+            created_read_back: json!({
+                "catalog": "lifecycle-lambda",
+                "metadata-function": lambda_arn("lambda-composite"),
+                "record-function": lambda_arn("lambda-composite"),
+            }),
             updated: json!({
                 "metadata-function": lambda_arn("lambda-metadata"),
                 "record-function": lambda_arn("lambda-record"),
@@ -203,6 +216,7 @@ fn lifecycle_cases() -> Vec<LifecycleCase> {
             case: "a GLUE catalog whose catalog id the update replaces",
             catalog_type: DATA_CATALOG_TYPE_GLUE,
             created: json!({ "catalog-id": "123456789012" }),
+            created_read_back: json!({ "catalog-id": "123456789012" }),
             updated: json!({ "catalog-id": "210987654321" }),
         },
     ]
@@ -254,7 +268,7 @@ async fn the_catalog_lifecycle_runs_past_the_update_step() {
             case.case
         );
 
-        // The created map round-trips unaltered, key for key and value for value.
+        // The created map is read back as the wiring it states.
         let (status, read) = read_catalog(&router, &name).await;
         assert_eq!(
             status, 200,
@@ -262,9 +276,9 @@ async fn the_catalog_lifecycle_runs_past_the_update_step() {
             case.case
         );
         assert_eq!(
-            read["Parameters"], case.created,
+            read["Parameters"], case.created_read_back,
             "case {:?}: expected the created parameters {:?}, got {:?}",
-            case.case, case.created, read["Parameters"]
+            case.case, case.created_read_back, read["Parameters"]
         );
 
         // The update is SERVED, and what it wrote is what the next read reports.

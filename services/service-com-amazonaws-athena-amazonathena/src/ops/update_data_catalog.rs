@@ -217,6 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let connection_type = crate::state::federated_connection_type(&catalog_type, &parameters)
             .map_err(invalid_request)?;
+        // The wiring those parameters resolve to, which is what the catalog holds from here
+        // on and what every read of it reports.
+        let held_parameters =
+            crate::state::resolved_data_catalog_parameters(&input.name, &catalog_type, parameters);
 
         // Only now is anything written, and only what this request names: `Name` is what
         // the catalog is addressed by rather than something an update changes, and a
@@ -236,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(description) = input.description {
             record.description = Some(description);
         }
-        record.parameters = parameters.into_iter().collect();
+        record.parameters = held_parameters;
         record.connection_type = connection_type;
 
         // `UpdateDataCatalogOutput` models no members: the updated catalog is read back
