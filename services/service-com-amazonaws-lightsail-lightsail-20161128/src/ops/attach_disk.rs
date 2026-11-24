@@ -197,17 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
-            // The disk first: it is the resource this operation acts on, and the
-            // one tag-based access control is evaluated against ("supports
-            // tag-based access control via resource tags applied to the resource
-            // identified by disk name").
-            let disk = store
-                .disk(&disk_name)
-                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, &disk_name))?;
-            let disk_state = disk.state;
-            let attached_to = disk.attached_to.clone();
-            let location = disk.location.clone();
-
+            // The INSTANCE first: the operand a refusal is about is the one the
+            // service resolves first, and Lightsail's recorded refusal of a
+            // request naming NEITHER resource is about the instance the disk was
+            // to be exposed to, not about the disk. The disk is still the
+            // resource this operation acts on, and the one tag-based access
+            // control is evaluated against ("supports tag-based access control
+            // via resource tags applied to the resource identified by disk
+            // name") — that decides which resource's tags govern the call, not
+            // which lookup miss is reported.
             let instance = store.instance(&instance_name).ok_or_else(|| {
                 not_found(crate::state::RESOURCE_TYPE_INSTANCE, &instance_name)
             })?;
@@ -227,6 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter_map(|disk| disk.path.clone()),
             )
             .collect();
+
+            let disk = store
+                .disk(&disk_name)
+                .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, &disk_name))?;
+            let disk_state = disk.state;
+            let attached_to = disk.attached_to.clone();
+            let location = disk.location.clone();
 
             // Only a disk that exists and is doing nothing can be attached: a
             // disk Lightsail is still provisioning (`pending`) has nothing to
