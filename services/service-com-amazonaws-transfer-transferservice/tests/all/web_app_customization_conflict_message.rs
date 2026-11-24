@@ -21,7 +21,9 @@
 //! operations race (two updates, two deletes, an update against a delete in both orders, and
 //! the two kinds mixed), how many writers race at once, what the losing request carried
 //! (a title, a logo, nothing at all), whether the web app held a customization already, and
-//! which of two web apps the race is on.
+//! which of two web apps the race is on. The last suite races the two kinds TOGETHER at
+//! several counts of each, where both kinds lose in one race, and also holds the race to what
+//! it leaves behind: the winner's whole outcome, its members or no customization at all.
 //!
 //! Overlap is produced the way the guard's own suite produces it, with the helpers it owns.
 
@@ -227,5 +229,150 @@ async fn every_losing_customization_write_carries_its_own_operation_sentence() {
             writers.len() - 1,
             "case {case:?}: every writer but the winner must be refused"
         );
+    }
+}
+
+/// Assert what `web_app_id` holds once a race is over: the winning update's `Title`, or no
+/// customization at all when the delete won — which `DescribeWebAppCustomization` reports
+/// as the modelled `ResourceNotFoundException` (HTTP 404) for a web app that holds none.
+async fn assert_surviving_customization(
+    emulator: &Emulator,
+    case: &str,
+    web_app_id: &str,
+    expected_title: Option<&str>,
+) {
+    let answer = emulator
+        .call("DescribeWebAppCustomization", json!({"WebAppId": web_app_id}))
+        .await;
+    match expected_title {
+        Some(title) => {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the winning update's customization to be readable, \
+                 got {} with body {}",
+                answer.status, answer.body
+            );
+            let stored = member_of(member_of(&answer.body, "WebAppCustomization"), "Title")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                stored, title,
+                "case {case:?}: expected the stored title to be the winner's {title:?}, got \
+                 {stored:?}"
+            );
+        }
+        None => {
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: the winning delete must leave no customization, got {} with \
+                 body {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException for a web app that holds no \
+                 customization, got body {}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// RULE, at the scale a client racing from a thread pool produces, with BOTH operations
+/// losing in the same race: of writes of one web app's customization that overlap, every
+/// loser is refused with the sentence for the operation IT could not carry out — so a
+/// losing delete reads "Unable to delete WebApp customization" even while updates of the
+/// same object are in flight — and what survives is the winner's WHOLE outcome, its
+/// members or no customization, never a mixture.
+///
+/// The rows differ along how many writers of each kind race at once and hence along which
+/// kind is more likely to win, each row interleaving the two kinds.
+#[tokio::test]
+async fn mixed_customization_races_refuse_each_loser_with_its_own_sentence() {
+    // (updates, deletes) racing at once.
+    for (updates, deletes) in [(4usize, 2usize), (2, 4), (1, 1), (3, 3), (5, 1)] {
+        let case = format!("{updates} updates and {deletes} deletes at once");
+        let emulator = Emulator::new();
+        let web_app_id = create_web_app(&emulator).await;
+        // A customization is in place first, so a losing delete cannot be mistaken for
+        // "there was nothing to remove".
+        let seeded = emulator
+            .call(
+                "UpdateWebAppCustomization",
+                json!({"WebAppId": &web_app_id, "Title": "seeded"}),
+            )
+            .await;
+        assert_eq!(
+            seeded.status, 200,
+            "case {case:?}: expected the seeding update to be served, got {} with body {}",
+            seeded.status, seeded.body
+        );
+
+        // The two kinds interleaved, so neither kind is always the one that arrives first.
+        let mut writers: Vec<Call> = Vec::new();
+        let mut made_updates = 0usize;
+        let mut made_deletes = 0usize;
+        while made_updates < updates || made_deletes < deletes {
+            if made_updates < updates {
+                writers.push((
+                    "UpdateWebAppCustomization",
+                    json!({"Title": format!("racer-{made_updates}")}),
+                ));
+                made_updates += 1;
+            }
+            if made_deletes < deletes {
+                writers.push(("DeleteWebAppCustomization", json!({})));
+                made_deletes += 1;
+            }
+        }
+
+        let calls = writers.iter().map(|(op, members)| {
+            let mut request = members.clone();
+            request["WebAppId"] = json!(&web_app_id);
+            emulator.call(op, request)
+        });
+        let answers = futures_of(calls).await;
+
+        let winners: Vec<usize> = answers
+            .iter()
+            .enumerate()
+            .filter(|(_, answer)| answer.status == 200)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {case:?}: expected exactly one winning write, got the statuses {:?}",
+            answers.iter().map(|answer| answer.status).collect::<Vec<_>>()
+        );
+
+        // Every value a racing request submitted, which no refusal may carry.
+        let mut submitted: Vec<&str> = vec![web_app_id.as_str(), "seeded"];
+        for (_, members) in &writers {
+            if let Some(title) = member_of(members, "Title").as_str() {
+                submitted.push(title);
+            }
+        }
+        for (index, (answer, (op, _))) in answers.iter().zip(&writers).enumerate() {
+            if index == winners[0] {
+                continue;
+            }
+            assert_conflict_wording(
+                &format!("{case} (writer {index})"),
+                op,
+                answer,
+                &submitted,
+            );
+        }
+
+        let (winning_op, winning_members) = &writers[winners[0]];
+        let expected_title = if *winning_op == "DeleteWebAppCustomization" {
+            None
+        } else {
+            member_of(winning_members, "Title").as_str()
+        };
+        assert_surviving_customization(&emulator, &case, &web_app_id, expected_title).await;
     }
 }
