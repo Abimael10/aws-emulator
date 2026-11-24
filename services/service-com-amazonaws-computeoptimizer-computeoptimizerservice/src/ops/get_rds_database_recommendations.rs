@@ -261,8 +261,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(reason));
         }
 
-        // The page token carries this operation's name and the selection it was taken with,
-        // so resuming a walk with a different selection, or with a token another operation
+        // Compute Optimizer is a regional service, so the request addresses ONE region's
+        // endpoint: the resources it asks about are that region's, and the ARNs its answer
+        // names carry that region.
+        let region = crate::state::request_region(ctx);
+
+        // The page token carries this operation's name and EVERY input that scopes the
+        // selection it was taken over — the Region the request was signed for included, since
+        // the databases analysed are that endpoint's — so resuming a walk with a different
+        // selection, at a different Region's endpoint, or with a token another operation
         // issued, is refused rather than answered with a page of a different result set.
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
@@ -270,6 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &account_id,
             &filters,
             &input.recommendation_preferences,
+            &region,
         ));
         let offset = match input.next_token.as_deref() {
             None => 0,
@@ -279,8 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(cursor) = cursor else {
                     return Err(invalid_parameter(
                         "The value supplied for parameter nextToken is not valid: it must be a \
-                         token returned by a previous GetRDSDatabaseRecommendations call for the \
-                         same resourceArns, accountIds, filters and recommendationPreferences."
+                         token returned by a previous GetRDSDatabaseRecommendations call to this \
+                         Region's endpoint for the same resourceArns, accountIds, filters and \
+                         recommendationPreferences."
                             .to_string(),
                     ));
                 };
@@ -317,10 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let store = &*guard;
-        // Compute Optimizer is a regional service, so the request addresses ONE region's
-        // endpoint: the resources it asks about are that region's, and the ARNs its answer
-        // names carry that region.
-        let region = crate::state::request_region(ctx);
 
         // The databases the request selects: those the account it asks about holds an analysis
         // for, of the named resources, whose recommendation satisfies every filter. WHICH

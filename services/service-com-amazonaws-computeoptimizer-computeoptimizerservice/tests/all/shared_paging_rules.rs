@@ -18,7 +18,9 @@
 //! * WHICH WALK a page token belongs to — a `nextToken` names a boundary of the walk that
 //!   minted it and of no other, so a reader resumes its own token and refuses one another
 //!   reader minted, or one minted for a different selection of its own, rather than answering
-//!   it with a page of a different result set.
+//!   it with a page of a different result set. The Region a request is signed for is part of
+//!   that selection wherever it scopes what the reader answers, so a token minted at one
+//!   regional endpoint does not resume a walk at another.
 //!
 //! Both are asserted over a TABLE of every reader of this service whose page the request
 //! sizes, each with its own default and ceiling (the eleven rows below), crossed with the
@@ -44,9 +46,9 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, call_ecs, create_bucket, emulator_with_analysed_services_and_engine, error_code,
-    instance_arn, make_analysis_due, opt_in, put_preference, register_analysed_functions,
-    seed_cloudwatch_series, ACCOUNT,
+    call, call_ecs, call_in_region, create_bucket, emulator_with_analysed_services_and_engine,
+    error_code, instance_arn, make_analysis_due, opt_in, put_preference,
+    register_analysed_functions, seed_cloudwatch_series, ACCOUNT, REGION,
 };
 
 /// The destination bucket the export jobs below are created against. Compute Optimizer does
@@ -547,6 +549,124 @@ async fn a_preference_token_resumes_only_the_records_it_was_minted_for() {
         Some(1),
         "the selection the token was minted for: expected the next record, got {body}"
     );
+}
+
+/// The readers whose selection the request's REGION scopes. Compute Optimizer is regional, so
+/// each of these answers for the endpoint the request was signed for: the export jobs created
+/// at it, or the resources whose ARNs it reports and matches a requested ARN against. A reader
+/// absent from this list reports records no Region scopes — the organization's member accounts
+/// (`GetEnrollmentStatusesForOrganization`) and the account's preference records
+/// (`GetRecommendationPreferences`) — so its sequence, and so its page boundaries, are the
+/// same at every endpoint.
+const REGION_SCOPED_READERS: &[&str] = &[
+    "DescribeRecommendationExportJobs",
+    "GetAutoScalingGroupRecommendations",
+    "GetEBSVolumeRecommendations",
+    "GetEC2InstanceRecommendations",
+    "GetECSServiceRecommendations",
+    "GetIdleRecommendations",
+    "GetLambdaFunctionRecommendations",
+    "GetLicenseRecommendations",
+    "GetRDSDatabaseRecommendations",
+];
+
+/// Regional endpoints other than the one the fixture's own calls address: a Region that reports
+/// the same region-free analysis under its OWN ARNs, and one nothing was created at at all. A
+/// token minted at the fixture's endpoint names a position in NEITHER of their walks.
+const OTHER_REGIONS: &[&str] = &["eu-west-1", "ap-southeast-2"];
+
+/// A `nextToken` resumes the walk of the REGIONAL ENDPOINT that minted it and of no other.
+///
+/// Compute Optimizer is regional: for every reader whose selection the request's Region scopes,
+/// the sequence a token names a position in is that endpoint's, so the token is refused at
+/// another endpoint rather than applied to its — different — sequence, which would skip items
+/// or answer an empty final page a client reads as "the walk is finished". Asserted over the
+/// whole table crossed with two other endpoints, with the two readers no Region scopes as the
+/// control rows: their records are the same at every endpoint, so their tokens still resume
+/// there.
+#[tokio::test]
+async fn a_next_token_resumes_only_the_regional_endpoint_that_minted_it() {
+    let (router, _engine) = paged_emulator().await;
+
+    for reader in readers() {
+        let region_scoped = REGION_SCOPED_READERS.contains(&reader.operation);
+        let whole = page_of(&read(&router, &reader, "the unpaged read", None, None).await, &reader);
+        assert!(
+            whole.len() >= 2,
+            "case {:?}: this fixture must hold at least two items for a token to resume at one, \
+             got {whole:?}",
+            reader.operation
+        );
+        let body = read(&router, &reader, "minting a token", Some(1), None).await;
+        let token = body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a one-item page of a longer sequence must hand out a nextToken, \
+                     got {body}",
+                    reader.operation
+                )
+            })
+            .to_string();
+
+        for other_region in OTHER_REGIONS {
+            let label = format!(
+                "{} resuming at {other_region} a token {REGION} minted",
+                reader.operation
+            );
+            let mut request = reader.request.clone();
+            request["maxResults"] = json!(1);
+            request["nextToken"] = json!(token);
+            let (status, body) =
+                call_in_region(&router, other_region, reader.operation, request.clone()).await;
+            if region_scoped {
+                assert_eq!(
+                    status, 400,
+                    "case {label:?}: expected {request} to be refused with 400, got {status}: \
+                     {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterValueException",
+                    "case {label:?}: expected InvalidParameterValueException, got {body}"
+                );
+                assert!(
+                    body[reader.items].is_null(),
+                    "case {label:?}: a refused read reports no page at all, got {body}"
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: a reader no Region scopes resumes its own token at every \
+                     endpoint, got {status}: {body}"
+                );
+                let page = page_of(&body, &reader);
+                assert_eq!(
+                    page,
+                    whole[1..2].to_vec(),
+                    "case {label:?}: expected the page {:?}, got {page:?}",
+                    &whole[1..2]
+                );
+            }
+        }
+
+        // The control for every row: at the endpoint that minted it, the same token still
+        // resumes the walk it stopped.
+        let label = format!(
+            "{} resuming at {REGION}, where it was minted",
+            reader.operation
+        );
+        let page = page_of(
+            &read(&router, &reader, &label, Some(1), Some(&token)).await,
+            &reader,
+        );
+        assert_eq!(
+            page,
+            whole[1..2].to_vec(),
+            "case {label:?}: expected the page {:?}, got {page:?}",
+            &whole[1..2]
+        );
+    }
 }
 
 /// One page of `reader`'s response, as the identities of the items it carries.

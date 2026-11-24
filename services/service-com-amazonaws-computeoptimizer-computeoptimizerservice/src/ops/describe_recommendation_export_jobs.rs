@@ -210,11 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(reason));
         }
 
-        // The page token carries this operation's name and the selection it was taken with,
-        // so resuming a walk with a different selection, or with a token another operation
+        // Compute Optimizer is regional: a request reports the export jobs created at the
+        // Region's own endpoint, which is also where the one-job-in-progress limit applies.
+        let region = crate::state::request_region(ctx);
+
+        // The page token carries this operation's name and EVERY input that scopes the
+        // selection it was taken over — the Region the request was signed for included, since
+        // the jobs reported are that endpoint's — so resuming a walk with a different
+        // selection, at a different Region's endpoint, or with a token another operation
         // issued, is refused rather than answered with a page of a different result set.
         let selection_fingerprint =
-            crate::state::fingerprint(&(Self::NAME, &job_ids, &filters));
+            crate::state::fingerprint(&(Self::NAME, &job_ids, &filters, &region));
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
@@ -223,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(cursor) = cursor else {
                     return Err(invalid_parameter(
                         "The value supplied for parameter nextToken is not valid: it must be a \
-                         token returned by a previous DescribeRecommendationExportJobs call for \
-                         the same jobIds and filters."
+                         token returned by a previous DescribeRecommendationExportJobs call to \
+                         this Region's endpoint for the same jobIds and filters."
                             .to_string(),
                     ));
                 };
@@ -243,9 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::MAX_PAGE_SIZE,
         );
 
-        // Compute Optimizer is regional: a request reports the export jobs created at the
-        // Region's own endpoint, which is also where the one-job-in-progress limit applies.
-        let region = crate::state::request_region(ctx);
         let now = crate::state::now_secs();
 
         // A job the clock has made `Complete` since the last call has its export objects

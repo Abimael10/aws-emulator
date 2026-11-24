@@ -244,15 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(reason));
         }
 
-        // The page token carries this operation's name and the selection it was taken with,
-        // so resuming a walk with a different selection, or with a token another operation
-        // issued, is refused rather than answered with a page of a different result set.
+        // The Region this request addressed: Compute Optimizer is regional, so the ARNs in
+        // its answer name the Region its SigV4 credential scope does.
+        let region = crate::state::request_region(ctx);
+
+        // The page token carries this operation's name and EVERY input that scopes the
+        // selection it was taken over — the Region the request was signed for included, since
+        // the recommendations reported are that endpoint's — so resuming a walk with a
+        // different selection, at a different Region's endpoint, or with a token another
+        // operation issued, is refused rather than answered with a page of a different result
+        // set.
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
             &resource_arns,
             &account_id,
             &filters,
             &input.order_by,
+            &region,
         ));
         let offset = match input.next_token.as_deref() {
             None => 0,
@@ -263,8 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(cursor) = cursor else {
                     return Err(invalid_parameter(
                         "The value supplied for parameter nextToken is not valid: it must be a \
-                         token returned by a previous GetIdleRecommendations call for the same \
-                         resourceArns, accountIds, filters and orderBy."
+                         token returned by a previous GetIdleRecommendations call to this \
+                         Region's endpoint for the same resourceArns, accountIds, filters and \
+                         orderBy."
                             .to_string(),
                     ));
                 };
@@ -293,10 +302,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // The Region this request addressed: Compute Optimizer is regional, so the ARNs in
-        // its answer name the Region its SigV4 credential scope does.
-        let region = crate::state::request_region(ctx);
 
         // When these recommendations were last generated: the analysis the account's
         // enrollment started, which came due one analysis span after the enrollment record
