@@ -876,9 +876,13 @@ impl Owner {
             // ([`service_discovery::removal`]).
             Self::ServiceDiscovery(_) => Ok(service_discovery::removal()),
             // `DeleteWorkGroup`, `DeleteDataCatalog` and `DeleteNamedQuery` each take the
-            // resource away as they answer, so there is nothing to wait for
+            // resource away as they answer, so there is nothing to wait for; a CAPACITY
+            // RESERVATION is removed in the two steps Athena requires — cancelled, then
+            // deleted — so that arm asks until the account no longer holds it
             // ([`athena_resources::removal`]).
-            Self::Athena(_) => Ok(athena_resources::removal()),
+            Self::Athena(kind) => {
+                athena_resources::removal(ctx, region, kind, physical_resource_id).await
+            }
             // `DeleteQueue`, `DeleteJobTemplate` and `DeletePreset` each take the resource away
             // as they answer, so there is nothing to wait for
             // ([`mediaconvert_resources::removal`]).

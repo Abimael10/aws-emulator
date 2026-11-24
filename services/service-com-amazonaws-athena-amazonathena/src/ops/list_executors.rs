@@ -177,17 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // The executors of a session are its own resources, so there are executors to report
-        // only for a session this account holds whose resources are still running: an id
-        // that names no session, and a session whose resources "are no longer running" (the
-        // documented `TERMINATED` state), are both refused the way Athena refuses every
-        // session-addressed request it will not act on
-        // (`crate::state::session_not_authorized`), which states nothing about which of the
-        // two it was.
-        let Some(record) = store
-            .sessions
-            .session(&input.session_id)
-            .filter(|record| !record.is_terminated_at(now))
-        else {
+        // for every session this account holds, whatever state it is in: a session whose
+        // resources are gone still has the roster it ran on, settled to the terminal state
+        // those resources reached (`crate::state::SessionRecord::executor_summaries`). Only
+        // an id that names NO session of this account is refused, the way Athena refuses
+        // every session-addressed request it will not act on
+        // (`crate::state::session_not_authorized`).
+        let Some(record) = store.sessions.session(&input.session_id) else {
             return Err(crate::state::session_not_authorized());
         };
 

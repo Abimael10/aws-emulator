@@ -148,7 +148,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "a large requested amount with the most tags one resource holds",
             name: "large.reservation_1".to_string(),
-            target_dpus: 10_000,
+            target_dpus: 512,
             tags: Value::Array(
                 (0..MAX_TAGS_PER_RESOURCE)
                     .map(|index| json!({ "Key": format!("key-{index}"), "Value": "v" }))
@@ -280,7 +280,9 @@ async fn the_requested_amount_is_allocated_in_whole_blocks() {
     create(&router, "updatable", SOME_TARGET_DPUS).await;
     await_reservation_status(&router, "updatable", CAPACITY_RESERVATION_STATUS_ACTIVE).await;
 
-    // (case, TargetDpus, whether the amount can be allocated)
+    // (case, TargetDpus, whether the amount can be allocated) — every allocatable row stays
+    // inside the account's Provisioned DPU quota, which a request past it is refused for
+    // instead of for this rule.
     let amounts: [(&str, i32, bool); 8] = [
         ("a negative amount", -4, false),
         ("no capacity at all", 0, false),
@@ -289,7 +291,7 @@ async fn the_requested_amount_is_allocated_in_whole_blocks() {
         ("one past a whole block", MODELLED_FLOOR_TARGET_DPUS + 1, false),
         ("two blocks", MODELLED_FLOOR_TARGET_DPUS * 2, true),
         ("an amount well above one block", SOME_TARGET_DPUS, true),
-        ("a far larger amount", 10_000, true),
+        ("a far larger amount", 400, true),
     ];
 
     for (case, target_dpus, inside) in amounts {

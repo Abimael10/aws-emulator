@@ -238,6 +238,39 @@ fn withholds_value(violation: &Violation) -> bool {
     !matches!(violation.kind, ViolationKind::MissingRequiredMember)
 }
 
+/// The sentence a value that breaks the modelled `@pattern` at `member` is refused with,
+/// in the SAME envelope and clause the framework's own constraint refusal is stated in
+/// ([`stated_refusal`]) — one validation error, naming the member and quoting the expression
+/// the model declares for it.
+///
+/// It exists because a `@pattern` the framework's boundary DECLARES is not always one it
+/// APPLIES: its walk compiles an expression with the `regex` crate and treats one that does
+/// not compile as satisfied (`vendor/smithy-schema-server/src/constraints.rs`, read-only from
+/// here), and the expression every `CatalogNameString` of this model carries is one of those —
+/// it writes the astral plane as a surrogate pair, which that crate will not compile. So the
+/// requirement reaches no request at the boundary and the handlers that take such a member
+/// state it themselves ([`crate::state::catalog_name_pattern_error`]), in these words: the
+/// refusal a client sees is the constraint refusal it would have seen, whichever layer
+/// measured the value.
+///
+/// `value` is the value the member carried; the clause states the member and the requirement
+/// and never those bytes, exactly as [`withholds_value`] states it for every clause the
+/// framework writes about a value.
+#[must_use]
+pub fn pattern_refusal(member: &str, pattern: &str, value: &str) -> Option<String> {
+    let violation = Violation {
+        path: member.to_string(),
+        kind: ViolationKind::Pattern(pattern.to_string()),
+        value: Some(value.to_string()),
+        sensitive: false,
+    };
+    service_common::validation_message::aws_validation_refusal_withholding_violations(
+        &Refusal::Invalid(vec![violation]),
+        withholds_value,
+    )
+    .map(|stated| stated.message)
+}
+
 /// The [`service_common::restated_refusal::Restatement`] [`REFUSAL_BODY`] answers through.
 ///
 /// The request and the words noted at the refusal seam are not read: the sentence is already

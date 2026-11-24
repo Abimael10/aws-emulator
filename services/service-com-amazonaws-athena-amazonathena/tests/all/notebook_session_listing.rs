@@ -4,9 +4,10 @@
 //! boots (awsJson1_1, `x-amz-target: AmazonAthena.ListNotebookSessions`), so every
 //! assertion is about what an SDK client observes.
 //!
-//! THE RULE UNDER TEST: `ListNotebookSessions` reports, newest first, exactly those sessions
-//! this account holds for the notebook the request names that are in an ACTIVE state
-//! (CREATING, CREATED, IDLE or BUSY), in pages of at most the ten entries the modelled
+//! THE RULE UNDER TEST: `ListNotebookSessions` reports, newest first, every session this
+//! account holds for the notebook the request names — whatever state each of them is in, the
+//! entries carrying only a session id and a creation instant — in pages of at most the ten
+//! entries the modelled
 //! `NotebookSessionsList` admits, each page but the last followed by a `NextToken` this
 //! service minted for THAT notebook's listing and no other value. A `NotebookId` no notebook
 //! was minted under names no notebook whose sessions could be listed and is refused with
@@ -119,8 +120,8 @@ enum Lifecycle {
     ShutDown,
 }
 
-/// Whether a session at this point of its lifecycle is in one of the ACTIVE states a
-/// notebook's listing reports.
+/// Whether a session at this point of its lifecycle is in one of the ACTIVE states — which
+/// the seeding asserts, so a mis-seeded row cannot pass by accident.
 impl Lifecycle {
     fn active(self) -> bool {
         matches!(self, Self::Started)
@@ -226,12 +227,12 @@ struct Row {
     listed: bool,
 }
 
-/// A notebook's listing reports its ACTIVE sessions, newest first, with the creation instant
-/// each record was written with — and reports neither a session that has left those states
-/// nor an active session of another notebook or of none. Listing is a READ: a second listing
+/// A notebook's listing reports every session it has held, newest first, with the creation
+/// instant each record was written with — the ones that have shut down among them — and reports
+/// no session of another notebook or of none. Listing is a READ: a second listing
 /// reports what the first one did, and the store still holds every session.
 #[tokio::test]
-async fn a_listing_reports_the_notebooks_active_sessions_newest_first() {
+async fn a_listing_reports_the_notebooks_sessions_newest_first() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "ordering.ipynb").await;
@@ -271,16 +272,19 @@ async fn a_listing_reports_the_notebooks_active_sessions_newest_first() {
         Row {
             case: "a session shutting down",
             started_in: StartedIn::This,
-            started_ago: WELL_PAST_ANY_RUN,
+            // Its own creation instant, so the newest-first order over the rows is total:
+            // two sessions created in the same instant are ordered by nothing the listing
+            // promises.
+            started_ago: WELL_PAST_ANY_RUN + Duration::from_secs(1),
             lifecycle: Lifecycle::ShuttingDown,
-            listed: false,
+            listed: true,
         },
         Row {
             case: "a session whose resources are gone",
             started_in: StartedIn::This,
             started_ago: WELL_PAST_ANY_RUN * 4,
             lifecycle: Lifecycle::ShutDown,
-            listed: false,
+            listed: true,
         },
         Row {
             case: "an active session of another notebook",
@@ -324,7 +328,7 @@ async fn a_listing_reports_the_notebooks_active_sessions_newest_first() {
     assert_eq!(
         session_ids(&listed),
         expected_ids,
-        "expected the notebook's active sessions newest first: {expected_ids:?}, got {listed:?}"
+        "expected the notebook's sessions newest first: {expected_ids:?}, got {listed:?}"
     );
 
     for (row, started_at, id) in &seeded {
@@ -533,53 +537,67 @@ async fn the_page_size_is_bounded_by_the_modelled_range_and_the_lists_own_ceilin
     }
 }
 
-/// A notebook whose sessions are all gone — and one nothing ever started a session in —
-/// reports the empty list the required member takes, and no continuation token.
+/// A notebook nothing ever started a session in reports the empty list the required member
+/// takes, and no continuation token — while a notebook whose sessions have all shut down
+/// still reports them: the roster is the notebook's over its lifetime.
 #[tokio::test]
-async fn a_notebook_with_no_active_session_lists_none() {
+async fn a_notebook_nothing_was_started_in_lists_none_and_a_finished_one_keeps_its_roster() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let untouched = given_notebook(&router, "untouched.ipynb").await;
     let finished = given_notebook(&router, "finished.ipynb").await;
 
     let run_started = SystemTime::now();
-    given_session(
+    let gone = given_session(
         &engine,
         Some(&finished),
         run_started - WELL_PAST_ANY_RUN,
         Lifecycle::ShutDown,
     );
-    given_session(
+    let shutting_down = given_session(
         &engine,
         Some(&finished),
         run_started - WELL_PAST_ANY_RUN,
         Lifecycle::ShuttingDown,
     );
 
-    // Rows differ along why the notebook has no active session, and along the page a client
-    // asks for.
-    for (case, notebook) in [
-        ("a notebook nothing started a session in", &untouched),
-        ("a notebook whose sessions have all shut down", &finished),
+    // Rows differ along the page a client asks for: the answer for a notebook nothing was
+    // started in is the empty list whichever page it asks for.
+    for request in [
+        json!({ "NotebookId": untouched }),
+        json!({ "NotebookId": untouched, "MaxResults": 1 }),
+        json!({ "NotebookId": untouched, "MaxResults": MODELLED_MAX_RESULTS }),
     ] {
-        for request in [
-            json!({ "NotebookId": notebook }),
-            json!({ "NotebookId": notebook, "MaxResults": 1 }),
-            json!({ "NotebookId": notebook, "MaxResults": MODELLED_MAX_RESULTS }),
-        ] {
-            let listed = list(&router, &request).await;
-            assert_eq!(
-                summaries(&listed),
-                Vec::<Value>::new(),
-                "case {case:?}: expected the empty list for {request}, got {listed:?}"
-            );
-            assert_eq!(
-                next_token(&listed),
-                None,
-                "case {case:?}: a page with nothing behind it hands back no token, got \
-                 {listed:?}"
-            );
-        }
+        let listed = list(&router, &request).await;
+        assert_eq!(
+            summaries(&listed),
+            Vec::<Value>::new(),
+            "case \"a notebook nothing started a session in\": expected the empty list for \
+             {request}, got {listed:?}"
+        );
+        assert_eq!(
+            next_token(&listed),
+            None,
+            "case \"a notebook nothing started a session in\": a page with nothing behind it \
+             hands back no token, got {listed:?}"
+        );
+    }
+
+    // The notebook whose sessions have all left the active states still reports both of them.
+    let listed = list(
+        &router,
+        &json!({ "NotebookId": finished, "MaxResults": MODELLED_MAX_RESULTS }),
+    )
+    .await;
+    let reported = session_ids(&listed);
+    for (case, id) in [
+        ("a session shutting down", &shutting_down),
+        ("a session whose resources are gone", &gone),
+    ] {
+        assert!(
+            reported.contains(id),
+            "case {case:?}: expected {id} to stay on the notebook's roster, got {reported:?}"
+        );
     }
 }
 

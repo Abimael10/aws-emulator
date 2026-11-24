@@ -157,6 +157,26 @@ pub fn capacity_dpus_error(target_dpus: i32) -> Option<String> {
 /// operation's own `InvalidRequestException`.
 pub const MAX_CAPACITY_RESERVATIONS: usize = 1000;
 
+/// How many data processing units this account may hold ACTIVE at once, across every
+/// reservation it holds.
+///
+/// AWS's own quota rather than this emulator's: the Provisioned DPU quota the Amazon Athena
+/// endpoints-and-quotas page publishes per account per Region, which is fixed — no request
+/// raises it — so a request for capacity past what the account has left is refused
+/// synchronously ([`account_provisioned_dpus_exceeded`]) rather than allocated.
+pub const MAX_ACCOUNT_PROVISIONED_DPUS: i32 = 1_000;
+
+/// The sentence a request for more capacity than the account's Provisioned DPU quota leaves
+/// is refused with.
+///
+/// Wholly fixed text: Athena states the quota was exceeded and where to ask for more, and
+/// names neither the amount requested, the amount left nor the quota itself.
+pub fn account_provisioned_dpus_exceeded() -> String {
+    "Exceeded the maximum number of active Data Processing Units (DPUs) allowed. If you \
+     require more DPUs for your use case, please reach out to athena-feedback@amazon.com."
+        .to_string()
+}
+
 /// One capacity reservation, as this service persists it.
 ///
 /// Neither the status nor the allocated amount is stored: both follow from the stored
@@ -453,6 +473,42 @@ impl CapacityReservationRegistry {
             .values()
             .filter(|record| !record.is_retired_at(now))
             .count()
+    }
+
+    /// How many data processing units the account has PROVISIONED at `now`, counting every
+    /// reservation it holds except `excluding` — the count
+    /// [`MAX_ACCOUNT_PROVISIONED_DPUS`] bounds.
+    ///
+    /// The amount each reservation REQUESTS ([`CapacityReservationRecord::target_dpus_at`]),
+    /// which is the capacity the account is holding for it whether the allocation has
+    /// completed yet or not, and which a cancellation releases — so capacity a cancelled
+    /// reservation gave up is capacity the next request may ask for. `excluding` is the
+    /// reservation whose own request is being weighed: an update asks for an amount that
+    /// REPLACES what that reservation already requests rather than adding to it.
+    pub fn provisioned_dpus_at(&self, now: SystemTime, excluding: Option<&str>) -> i32 {
+        self.reservations
+            .values()
+            .filter(|record| !record.is_retired_at(now))
+            .filter(|record| excluding.is_none_or(|name| record.name != name))
+            .map(|record| record.target_dpus_at(now))
+            .fold(0_i32, |held, requested| held.saturating_add(requested))
+    }
+
+    /// Whether `target_dpus` asked for by the reservation `excluding` names (`None` for a
+    /// reservation that does not exist yet) would put the account past
+    /// [`MAX_ACCOUNT_PROVISIONED_DPUS`] at `now`.
+    ///
+    /// Asked by every operation that REQUESTS capacity, so a create and an update are held
+    /// to the one account-wide quota rather than each weighing it its own way.
+    pub fn would_exceed_account_dpus(
+        &self,
+        target_dpus: i32,
+        now: SystemTime,
+        excluding: Option<&str>,
+    ) -> bool {
+        self.provisioned_dpus_at(now, excluding)
+            .saturating_add(target_dpus)
+            > MAX_ACCOUNT_PROVISIONED_DPUS
     }
 
     /// Store `record`. The one place a reservation enters the registry.

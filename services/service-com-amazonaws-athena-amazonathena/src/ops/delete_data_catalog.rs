@@ -142,6 +142,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled `@pattern` every `CatalogNameString` carries, which the framework's
+        // boundary declares and cannot apply: a value the MODEL excludes names no catalog and
+        // is refused as the constraint it broke, before anything is resolved
+        // (`crate::state::catalog_name_pattern_error`).
+        if let Some(message) = crate::state::catalog_name_pattern_error("name", &input.name) {
+            return Err(invalid_request(message));
+        }
         // The account's implicit Glue Data Catalog is Athena's own: no create registered it
         // and no delete removes it. So the reserved name is refused BEFORE anything is
         // resolved — the registry holds no record under it, and answering the miss would

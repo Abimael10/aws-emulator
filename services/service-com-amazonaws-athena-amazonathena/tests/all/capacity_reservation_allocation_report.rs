@@ -322,11 +322,12 @@ async fn a_cancellation_releases_the_requested_capacity() {
 
     // (case, the amount the create asks for) — the floor of the modelled range, a middling
     // amount and a large one, since the rule is about the amount being released rather than
-    // about its size.
+    // about its size. Each stays inside the account's Provisioned DPU quota, which a request
+    // past it is refused for instead.
     let cases: [(&str, i32); 3] = [
         ("the smallest amount the model admits", 4),
         ("a middling amount", SOME_TARGET_DPUS),
-        ("a large amount", 10_000),
+        ("a large amount", 400),
     ];
 
     for (case, target_dpus) in cases {

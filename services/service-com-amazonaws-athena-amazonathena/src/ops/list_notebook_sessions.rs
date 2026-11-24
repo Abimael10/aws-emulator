@@ -2,7 +2,7 @@
 
 //! @op ListNotebookSessions
 //!
-//! A notebook's ACTIVE sessions, newest first, out of the sessions this service persists
+//! A notebook's whole session roster, newest first, out of the sessions this service persists
 //! ([`crate::state::SessionRegistry`]): the registry is keyed by session and each record
 //! carries the notebook its start bound it to, so this listing reports what some earlier
 //! start wrote rather than anything derived from the reading request. A `NotebookId` no
@@ -168,10 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let now = ::std::time::SystemTime::now();
         // A read: nothing below writes the store. The position a `NextToken` resumes at
-        // travels inside the token, so no page is kept on the side either, and the state
-        // each session is in follows from the instants its record already holds.
+        // travels inside the token, so no page is kept on the side either.
         let store = state.lock();
 
         // The sessions reported are those "created in a notebook", so a `NotebookId` this
@@ -202,18 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The notebook's active sessions at this instant, newest first — the order and the
-        // filter the registry applies for every reader of them.
-        let active = store.sessions.notebook_sessions_at(&input.notebook_id, now);
-        let end = position.saturating_add(page_size).min(active.len());
-        let page = active.get(position..end).unwrap_or_default().to_vec();
+        // The notebook's whole session roster, newest first — the order the registry walks
+        // them in for every reader of them.
+        let roster = store.sessions.notebook_sessions(&input.notebook_id);
+        let end = position.saturating_add(page_size).min(roster.len());
+        let page = roster.get(position..end).unwrap_or_default().to_vec();
 
         // A token only where this page reported something and sessions remain behind it, so
         // a caller following tokens always makes progress and the last page of a listing
         // hands back none.
-        let more = !page.is_empty() && end < active.len();
+        let more = !page.is_empty() && end < roster.len();
         Ok(ListNotebookSessionsOutput {
-            // `NotebookSessionsList` is required, so a notebook with no active session
+            // `NotebookSessionsList` is required, so a notebook nothing was started in
             // reports the empty list rather than an absent member.
             notebook_sessions_list: page,
             next_token: more.then(|| store.notebook_sessions_page_token(&input.notebook_id, end)),

@@ -72,8 +72,14 @@ fn unallocatable_amounts() -> Vec<(String, i32)> {
 }
 
 /// The amounts a reservation CAN be allocated: one block, and whole multiples of it.
+///
+/// Every row stays inside the account's Provisioned DPU quota
+/// (`state::MAX_ACCOUNT_PROVISIONED_DPUS`), including the amounts the updates below ask for:
+/// the rule under test here is the BLOCK rule a single request is held to, and a row past the
+/// account's quota would be refused for the quota instead (which
+/// `capacity_account_dpu_quota` is about).
 fn allocatable_amounts() -> Vec<(String, i32)> {
-    [1, 2, 3, 6, 60, 2500]
+    [1, 2, 3, 6, 60, 100]
         .into_iter()
         .map(|blocks| {
             (

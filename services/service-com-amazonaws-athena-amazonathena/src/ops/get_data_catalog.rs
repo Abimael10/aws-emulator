@@ -137,6 +137,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled `@pattern` every `CatalogNameString` carries, which the framework's
+        // boundary declares and cannot apply: a value the MODEL excludes names no catalog and
+        // is refused as the constraint it broke, before any state is looked at
+        // (`crate::state::catalog_name_pattern_error`).
+        if let Some(message) = crate::state::catalog_name_pattern_error("name", &input.name) {
+            return Err(GetDataCatalogError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                message,
+            ));
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetDataCatalogErrorModeled::InternalServerException(
                 InternalServerException {

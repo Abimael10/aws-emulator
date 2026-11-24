@@ -19,6 +19,14 @@
 //! a reader having to move the record on; a shutdown is owed the same kind of span, which
 //! is what makes the documented TERMINATING state observable instead of skipped.
 //!
+//! A shutdown is owed by the CLOCK as well as by a caller: a session is started with an
+//! idle window (`StartSessionRequest$SessionIdleTimeoutInMinutes`, "the idle timeout in
+//! minutes for the session"), and a session left idle for its whole window is reclaimed —
+//! it shuts down through TERMINATING to TERMINATED with nobody asking
+//! ([`SessionRecord::idle_expires_at`]). That window is measured from the last work
+//! submitted into the session ([`SessionRecord::worked_at`]), so a session calculations are
+//! being run on is not reclaimed under its caller.
+//!
 //! The EXECUTORS are the session's own resources rather than a second registry: a session
 //! runs on a coordinator ("A coordinator is a special executor that orchestrates processing
 //! work and manages other executors in a notebook session", `EngineConfiguration$
@@ -32,9 +40,9 @@
 //! and FAILED from outcomes nothing in this service produces — so a session a calculation
 //! was submitted into still reads IDLE, because nothing in this service RUNS that
 //! calculation (see [`CalculationRegistry`]), and a session is BUSY only while one is
-//! running on it. [`ACTIVE_SESSION_STATES`] still names the four states
-//! `ListNotebookSessions` documents, because the filter a listing applies is the documented
-//! one rather than a list of what this projection happens to emit.
+//! running on it. [`ACTIVE_SESSION_STATES`] still names the four states `ListSessions`
+//! documents, because the filter that listing applies is the documented one rather than a
+//! list of what this projection happens to emit.
 //!
 //! WHICH NOTEBOOK a session belongs to is carried by the request that starts it rather than
 //! by the session's own identity. `EngineConfiguration$AdditionalConfigs` documents the
@@ -42,7 +50,10 @@
 //! specify a value for the StartSessionRequest$NotebookVersion field, and then add a key
 //! named NotebookId to AdditionalConfigs that has the value of the Athena notebook ID" — so
 //! [`NOTEBOOK_ID_CONFIG`] is the key that binds a session to a notebook, and a session
-//! started without it belongs to no notebook and is reported by no notebook's listing.
+//! started without it belongs to no notebook and is reported by no notebook's listing. A
+//! notebook's own listing is a ROSTER rather than a filtered view: its entries carry a
+//! session id and a creation instant and nothing else, so a session stays on the notebook it
+//! ran in once its resources are gone ([`SessionRegistry::notebook_sessions`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -77,12 +88,13 @@ pub const SESSION_STATE_TERMINATED: &str = "TERMINATED";
 
 /// The session states that count as ACTIVE.
 ///
-/// The two session listings name them in the same words: `ListSessions` "Lists the sessions
-/// in a workgroup that are in an active state like CREATING, CREATED, IDLE, or BUSY" and
-/// `ListNotebookSessions` "Lists, in descending order, the sessions that have been created
-/// in a notebook that are in an active state like CREATING, CREATED, IDLE or BUSY" — so a
-/// session in any other state (one shutting down, one whose resources are gone, or one that
-/// ended badly) is part of neither listing, though `GetSession` still reads it.
+/// `ListSessions` names them: "Lists the sessions in a workgroup that are in an active state
+/// like CREATING, CREATED, IDLE, or BUSY" — so a session in any other state (one shutting
+/// down, one whose resources are gone, or one that ended badly) is no part of that listing,
+/// though `GetSession` still reads it. It is also what a write THROUGH a session asks about
+/// (`UpdateNotebook$SessionId`, `CreatePresignedNotebookUrl`): a session not in one of these
+/// states is running nothing for a caller to work through. A notebook's own listing applies
+/// no such filter; see [`SessionRegistry::notebook_sessions`].
 pub const ACTIVE_SESSION_STATES: &[&str] = &[
     SESSION_STATE_CREATING,
     SESSION_STATE_CREATED,
@@ -137,11 +149,16 @@ pub const SESSION_TERMINATION: Duration = Duration::from_secs(3);
 ///
 /// CHOSEN by this emulator: `StartSessionRequest$SessionIdleTimeoutInMinutes` publishes no
 /// default, only the range the model carries (1 to 480), so a session that names none is
-/// given a timeout well inside that range rather than none at all — a session has an idle
-/// timeout in Athena whether or not the request set one, and `SessionConfiguration` reports
-/// it under both the names that shape carries. What the timeout IS to this emulator is the
-/// configuration the session runs under; see [`SessionRecord::idle_timeout_minutes`].
-pub const DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES: i32 = 20;
+/// given a window inside that range rather than none at all — a session has an idle timeout
+/// in Athena whether or not the request set one, and that window is what Athena reclaims it
+/// after ([`SessionRecord::idle_expires_at`]). The widest the range admits is the one
+/// chosen: a start that asked for no window asked for nothing to be reclaimed early, so its
+/// session keeps its resources for as long as a configured session could.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES: i32 = MAX_SESSION_IDLE_TIMEOUT_MINUTES;
+
+/// The longest idle timeout a start may ask for: the maximum of the `@range` the model
+/// carries on `StartSessionRequest$SessionIdleTimeoutInMinutes` (1 to 480).
+pub const MAX_SESSION_IDLE_TIMEOUT_MINUTES: i32 = 480;
 
 /// The number of data processing units a coordinator runs on when the request names none:
 /// "The default is 1" (`EngineConfiguration$CoordinatorDpuSize`), which is also the only
@@ -255,6 +272,10 @@ pub struct SessionRecord {
     /// When the session was asked to shut down, if it was, from which the
     /// [`SESSION_TERMINATION`] span runs.
     pub terminate_requested_at: Option<SystemTime>,
+    /// When work was last submitted INTO this session, if any was: the instant the idle
+    /// window is measured from once it has one ([`Self::idle_from`]), so a session something
+    /// is being run on is not reclaimed for having been idle.
+    pub last_activity_at: Option<SystemTime>,
     /// The executors the start provisioned: the coordinator the session runs on.
     pub executors: Vec<ExecutorRecord>,
 }
@@ -290,6 +311,7 @@ impl SessionRecord {
             created_at: now,
             resources_due_at: due_at(now, SESSION_CREATION),
             terminate_requested_at: None,
+            last_activity_at: None,
             executors: vec![ExecutorRecord {
                 id: new_executor_id(),
                 executor_type: EXECUTOR_TYPE_COORDINATOR.to_string(),
@@ -323,12 +345,63 @@ impl SessionRecord {
             && self.copy_work_group_tags == other.copy_work_group_tags
     }
 
-    /// When the shutdown this session was asked for is complete, for a session that was
-    /// asked: [`SESSION_TERMINATION`] after the request, which is also the instant
-    /// `SessionStatus$EndDateTime` reports ("The date and time that the session ended").
-    pub fn ended_at(&self) -> Option<SystemTime> {
-        self.terminate_requested_at
-            .map(|requested| due_at(requested, SESSION_TERMINATION))
+    /// When the shutdown this session was asked for is complete, for a session whose
+    /// shutdown has begun at `now`: [`SESSION_TERMINATION`] after it began, which is also the
+    /// instant `SessionStatus$EndDateTime` reports ("The date and time that the session
+    /// ended").
+    pub fn ended_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.shutdown_began_at(now)
+            .map(|began| due_at(began, SESSION_TERMINATION))
+    }
+
+    /// The idle window this session was configured with, as a span.
+    ///
+    /// `StartSessionRequest$SessionIdleTimeoutInMinutes` is "the idle timeout in minutes for
+    /// the session", resolved once when the session was started
+    /// ([`session_configuration`]) — so the window is the one the start asked for, and
+    /// [`DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES`] where it asked for none.
+    pub fn idle_timeout(&self) -> Duration {
+        let minutes = self
+            .configuration
+            .session_idle_timeout_in_minutes
+            .unwrap_or(DEFAULT_SESSION_IDLE_TIMEOUT_MINUTES)
+            .max(1);
+        Duration::from_secs(u64::from(minutes.unsigned_abs()) * SECONDS_PER_MINUTE.unsigned_abs())
+    }
+
+    /// The instant this session's idle window is measured from: when its resources came up,
+    /// or when work was last submitted into it where that is later
+    /// ([`Self::last_activity_at`]).
+    pub fn idle_from(&self) -> SystemTime {
+        match self.last_activity_at {
+            Some(at) if at > self.resources_due_at => at,
+            _ => self.resources_due_at,
+        }
+    }
+
+    /// When Athena reclaims this session for having been idle its whole window: its idle
+    /// window after [`Self::idle_from`].
+    ///
+    /// A transition the CLOCK owes, exactly as a start's own is: the instants it follows from
+    /// are stored, so a session left alone shuts itself down whether or not anybody polls it,
+    /// and no read has to write to move it on.
+    pub fn idle_expires_at(&self) -> SystemTime {
+        due_at(self.idle_from(), self.idle_timeout())
+    }
+
+    /// When this session's shutdown BEGAN, as of `now`, or `None` for one that is still
+    /// running.
+    ///
+    /// Either of two things begins it: a caller asking ([`Self::terminate`]), or the idle
+    /// window running out ([`Self::idle_expires_at`]) — and the session shuts down from
+    /// whichever came FIRST, so a caller asking after Athena already reclaimed the session
+    /// does not restart a shutdown that is over.
+    fn shutdown_began_at(&self, now: SystemTime) -> Option<SystemTime> {
+        let reclaimed = Some(self.idle_expires_at()).filter(|expiry| now >= *expiry);
+        match (self.terminate_requested_at, reclaimed) {
+            (Some(asked), Some(reclaimed)) => Some(asked.min(reclaimed)),
+            (asked, reclaimed) => asked.or(reclaimed),
+        }
     }
 
     /// The instant this session last entered the state it is in at `now`.
@@ -337,9 +410,9 @@ impl SessionRecord {
     /// time that the session was modified" (`SessionStatus$LastModifiedDateTime`) is the
     /// instant of the transition a reader is observing rather than the instant it read.
     pub fn state_changed_at(&self, now: SystemTime) -> SystemTime {
-        if let Some(requested) = self.terminate_requested_at {
-            let ended = due_at(requested, SESSION_TERMINATION);
-            return if now < ended { requested } else { ended };
+        if let Some(began) = self.shutdown_began_at(now) {
+            let ended = due_at(began, SESSION_TERMINATION);
+            return if now < ended { began } else { ended };
         }
         if now < self.resources_due_at {
             self.created_at
@@ -351,9 +424,9 @@ impl SessionRecord {
     /// When the session became idle, or `None` while it is not: "The date and time starting
     /// at which the session became idle. Can be empty if the session is not currently idle"
     /// (`SessionStatus$IdleSinceDateTime`). A session is idle from the instant its resources
-    /// were acquired.
+    /// were acquired, or from the last work submitted into it ([`Self::idle_from`]).
     pub fn idle_since(&self, now: SystemTime) -> Option<SystemTime> {
-        (self.state_at(now) == SESSION_STATE_IDLE).then_some(self.resources_due_at)
+        (self.state_at(now) == SESSION_STATE_IDLE).then(|| self.idle_from())
     }
 
     /// The record's `SessionStatus` at `now`: the state the clock puts the session in and
@@ -369,13 +442,15 @@ impl SessionRecord {
             // Reported only once the shutdown is complete: a session still shutting down
             // has not ended yet, and one nobody asked to shut down has no end.
             end_date_time: (state == SESSION_STATE_TERMINATED)
-                .then(|| self.ended_at().map(reported_time))
+                .then(|| self.ended_at(now).map(reported_time))
                 .flatten(),
             idle_since_date_time: self.idle_since(now).map(reported_time),
             state: Some(state.to_string()),
             // "The reason for the session state change": Athena states one for a state it
-            // moved the session to on its own, and every state this service derives is one
-            // the start or the caller's own shutdown asked for.
+            // moved the session to on its own, and every state this service derives — the
+            // start's own spans, the caller's shutdown, and the idle window the START asked
+            // for running out — follows from what the request that started the session asked
+            // for rather than from anything that happened to it.
             state_change_reason: None,
         }
     }
@@ -383,10 +458,11 @@ impl SessionRecord {
     /// The `SessionState` this session is in at `now`.
     ///
     /// Derived, never written: two reads at the same instant report the same state, and a
-    /// session nobody reads becomes idle exactly when one that is polled does.
+    /// session nobody reads becomes idle — and is reclaimed when its idle window runs out —
+    /// exactly when one that is polled is.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if let Some(requested) = self.terminate_requested_at {
-            return if now < due_at(requested, SESSION_TERMINATION) {
+        if let Some(began) = self.shutdown_began_at(now) {
+            return if now < due_at(began, SESSION_TERMINATION) {
                 SESSION_STATE_TERMINATING
             } else {
                 SESSION_STATE_TERMINATED
@@ -467,10 +543,8 @@ impl SessionRecord {
     /// runs, and shutting down or gone with it. Its termination instant is the session's own
     /// end, and is reported only once it has one.
     ///
-    /// The mapping is TOTAL over the session states, including the one `ListExecutors` does
-    /// not reach today: that operation refuses a session whose resources "are no longer
-    /// running" rather than listing them, so a `TERMINATED` executor is what this projects
-    /// for any other caller of it.
+    /// The mapping is TOTAL over the session states, so a session whose resources are gone
+    /// reports the roster it ran on settled to `TERMINATED` rather than no roster at all.
     pub fn executor_summaries(&self, now: SystemTime) -> Vec<ExecutorsSummary> {
         let state = match self.state_at(now) {
             SESSION_STATE_CREATING => EXECUTOR_STATE_CREATING,
@@ -480,7 +554,7 @@ impl SessionRecord {
         };
         let terminated = self
             .is_terminated_at(now)
-            .then(|| self.ended_at())
+            .then(|| self.ended_at(now))
             .flatten()
             .map(epoch_millis);
         self.executors
@@ -503,6 +577,17 @@ impl SessionRecord {
     /// documents for a session that is already inactive.
     pub fn terminate(&mut self, now: SystemTime) {
         self.terminate_requested_at = Some(self.terminate_requested_at.unwrap_or(now));
+    }
+
+    /// Record that work was submitted INTO this session at `now`, which is what makes it
+    /// not idle: its idle window ([`Self::idle_expires_at`]) is measured from this instant
+    /// from here on, so a session being worked is not reclaimed under a caller running
+    /// calculations on it. An earlier instant than the one already held changes nothing — a
+    /// session's idle window runs from the LAST work submitted into it.
+    pub fn worked_at(&mut self, now: SystemTime) {
+        if self.last_activity_at.is_none_or(|held| held < now) {
+            self.last_activity_at = Some(now);
+        }
     }
 }
 
@@ -589,26 +674,40 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// The ACTIVE sessions of the notebook `notebook_id`, newest first, as the modelled
+    /// Whether any session of the notebook `notebook_id` is ACTIVE at `now`.
+    ///
+    /// What a WRITE through a notebook asks: `UpdateNotebook$SessionId` is "the active
+    /// notebook session ID. Required if the notebook has an active session", so the question
+    /// is about the states [`ACTIVE_SESSION_STATES`] names rather than about the roster the
+    /// notebook's listing reports ([`Self::notebook_sessions`]), which is every session the
+    /// notebook has held.
+    pub fn notebook_has_active_session(&self, notebook_id: &str, now: SystemTime) -> bool {
+        self.sessions.values().any(|record| {
+            record.notebook_id.as_deref() == Some(notebook_id) && record.is_active_at(now)
+        })
+    }
+
+    /// Every session of the notebook `notebook_id`, newest first, as the modelled
     /// `NotebookSessionSummary` entries a listing reports.
     ///
-    /// The order and the filter `ListNotebookSessions` documents: "Lists, in descending
-    /// order, the sessions that have been created in a notebook that are in an active state
-    /// like CREATING, CREATED, IDLE or BUSY. Newer sessions are listed first; older
+    /// The order `ListNotebookSessions` documents: "Lists, in descending order, the sessions
+    /// that have been created in a notebook. … Newer sessions are listed first; older
     /// sessions are listed later." Sessions started in the same instant are reported
     /// most-recently-started first, so the order is total whatever the clock's resolution.
-    pub fn notebook_sessions_at(
-        &self,
-        notebook_id: &str,
-        now: SystemTime,
-    ) -> Vec<NotebookSessionSummary> {
+    ///
+    /// Every session the notebook has HELD, whatever state it is in: the entries carry only
+    /// a `SessionId` and a `CreationTime` and the operation publishes no state filter, so
+    /// what it answers with is the notebook's roster over its lifetime — a session that ran
+    /// on the notebook stays on it once its resources are gone, which is what lets a client
+    /// reconcile which sessions a notebook was worked in. (The instant a session's state is
+    /// read from is therefore not needed here, and no session is weighed against it.)
+    pub fn notebook_sessions(&self, notebook_id: &str) -> Vec<NotebookSessionSummary> {
         let mut of_notebook: Vec<&SessionRecord> = self
             .order
             .iter()
             .rev()
             .filter_map(|id| self.sessions.get(id))
             .filter(|record| record.notebook_id.as_deref() == Some(notebook_id))
-            .filter(|record| record.is_active_at(now))
             .collect();
         // A STABLE sort, over a walk that is already newest-started first, so records
         // sharing a creation instant keep that order.
@@ -962,14 +1061,79 @@ mod tests {
                  {reached}"
             );
             assert_eq!(
-                record.ended_at(),
+                record.ended_at(now),
                 Some(asked_at + SESSION_TERMINATION),
                 "case {case:?}: expected the end instant to be the first teardown's, got {:?}",
-                record.ended_at()
+                record.ended_at(now)
             );
             assert!(
                 !record.is_active_at(now),
                 "case {case:?}: a session that was asked to shut down is in no active state"
+            );
+        }
+    }
+
+    /// RULE: a session left idle for its whole configured window is reclaimed by the clock —
+    /// it passes through `TERMINATING` into `TERMINATED` with nobody asking — and work
+    /// submitted into it restarts that window.
+    #[test]
+    fn a_session_left_idle_its_whole_window_is_reclaimed() {
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // The rows differ along the window the start configured, including both published
+        // bounds of `SessionIdleTimeoutInMinutes` (1 to 480) and the window a start that
+        // configured none is given.
+        for configured in [
+            Some(1),
+            Some(5),
+            Some(MAX_SESSION_IDLE_TIMEOUT_MINUTES),
+            None,
+        ] {
+            let mut record = session("spark-wg", started_at);
+            record.configuration.session_idle_timeout_in_minutes = configured;
+            let window = record.idle_timeout();
+            let expires_at = started_at + SESSION_CREATION + window;
+            assert_eq!(
+                record.idle_expires_at(),
+                expires_at,
+                "case {configured:?}: the window runs from the instant the resources are up"
+            );
+            for (case, now, expected) in [
+                ("while the window has time left", expires_at - Duration::from_millis(1), SESSION_STATE_IDLE),
+                ("the instant the window runs out", expires_at, SESSION_STATE_TERMINATING),
+                (
+                    "while the reclamation is due",
+                    expires_at + SESSION_TERMINATION - Duration::from_millis(1),
+                    SESSION_STATE_TERMINATING,
+                ),
+                ("once it is complete", expires_at + SESSION_TERMINATION, SESSION_STATE_TERMINATED),
+            ] {
+                let reached = record.state_at(now);
+                assert_eq!(
+                    reached, expected,
+                    "case {configured:?} {case:?}: expected {expected}, got {reached}"
+                );
+            }
+
+            // Work submitted into the session restarts the window from that instant, so the
+            // session that would have been reclaimed is still idle.
+            let worked_at = expires_at - Duration::from_millis(1);
+            record.worked_at(worked_at);
+            assert_eq!(
+                record.state_at(expires_at),
+                SESSION_STATE_IDLE,
+                "case {configured:?}: work submitted into the session restarts its window"
+            );
+            assert_eq!(
+                record.state_at(worked_at + window),
+                SESSION_STATE_TERMINATING,
+                "case {configured:?}: the restarted window runs out one window after the work"
+            );
+            // An EARLIER instant than the one already held is no later work.
+            record.worked_at(started_at);
+            assert_eq!(
+                record.idle_expires_at(),
+                worked_at + window,
+                "case {configured:?}: the window runs from the LAST work submitted"
             );
         }
     }

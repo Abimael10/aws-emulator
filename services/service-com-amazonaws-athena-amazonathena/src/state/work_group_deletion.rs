@@ -116,11 +116,13 @@ impl ComAmazonawsAthenaAmazonathenaState {
 
 /// The message a delete of the account's default workgroup is refused with.
 ///
-/// Wholly fixed text, and the rule `DeleteWorkGroup` documents in its own words: "Deletes
-/// the workgroup with the specified name. The primary workgroup cannot be deleted." It
-/// interpolates nothing from the request — the workgroup that cannot be deleted is the one
-/// [`DEFAULT_WORK_GROUP`] names, the same for every account.
-pub const PRIMARY_WORK_GROUP_NOT_DELETABLE: &str = "The primary workgroup cannot be deleted.";
+/// Wholly fixed text: the sentence Athena states for the one workgroup a delete cannot take
+/// away, which `DeleteWorkGroup` documents the rule of ("Deletes the workgroup with the
+/// specified name. The primary workgroup cannot be deleted."). It interpolates nothing from
+/// the request — the workgroup that cannot be deleted is the one [`DEFAULT_WORK_GROUP`]
+/// names, the same for every account — and it is worded as the service words it, which
+/// spells the resource the way the API spells it and closes without a period.
+pub const PRIMARY_WORK_GROUP_NOT_DELETABLE: &str = "primary workGroup could not be deleted";
 
 /// The message a delete of a workgroup that still holds contents, by a request that did not
 /// ask for them to be deleted too, is refused with.

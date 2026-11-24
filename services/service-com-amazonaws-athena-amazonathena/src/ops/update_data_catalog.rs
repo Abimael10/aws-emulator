@@ -156,6 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::data_catalog_type_error(&catalog_type) {
             return Err(invalid_request(message));
         }
+        // The modelled `@pattern` on `CatalogNameString` first, which the framework's boundary
+        // declares and cannot apply: a value the MODEL excludes is refused as the constraint
+        // it broke, before the rule the service applies to the names the model admits.
+        if let Some(message) = crate::state::catalog_name_pattern_error(NAME_MEMBER, &input.name) {
+            return Err(invalid_request(message));
+        }
         // The name's documented length and character set, neither of which the model's
         // `CatalogNameString` carries.
         if let Some(message) = crate::state::data_catalog_name_error(&input.name, &catalog_type) {
@@ -248,6 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdateDataCatalogOutput {})
     }
 }
+
+/// The member path a clause about this operation's `Name` names: the lowerCamel of that
+/// member, which is how a violation's path spells it
+/// (`aws_smithy_schema_server::constraints::path::member`).
+const NAME_MEMBER: &str = "name";
 
 /// The operation's own client error (HTTP 400), carrying `message`.
 ///

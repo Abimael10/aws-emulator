@@ -309,6 +309,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::AppSync::Resolver",
     crate::state::template::APPSYNC_SOURCE_API_ASSOCIATION,
     // Amazon Athena
+    crate::state::provisioning::athena_resources::ATHENA_CAPACITY_RESERVATION,
     "AWS::Athena::DataCatalog",
     "AWS::Athena::NamedQuery",
     "AWS::Athena::WorkGroup",

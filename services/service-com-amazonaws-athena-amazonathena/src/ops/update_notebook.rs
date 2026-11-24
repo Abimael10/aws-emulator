@@ -205,10 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             None => {
-                if !store
+                if store
                     .sessions
-                    .notebook_sessions_at(&input.notebook_id, now)
-                    .is_empty()
+                    .notebook_has_active_session(&input.notebook_id, now)
                 {
                     return Err(invalid_request(
                         crate::state::NOTEBOOK_SESSION_ID_REQUIRED,

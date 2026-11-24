@@ -30,9 +30,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
     self, page_token_malformed, EXECUTOR_STATE_CREATING, EXECUTOR_STATE_REGISTERED,
-    EXECUTOR_TYPE_COORDINATOR, IDEMPOTENT_PARAMETERS_DO_NOT_MATCH, PYSPARK_ENGINE_VERSION,
-    SESSION_NOT_FOUND, SESSION_STATE_CREATING, SESSION_STATE_IDLE, SESSION_STATE_TERMINATED,
-    SESSION_STATE_TERMINATING, WORK_GROUP_NOT_FOUND,
+    EXECUTOR_STATE_TERMINATED, EXECUTOR_TYPE_COORDINATOR, IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+    PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND, SESSION_STATE_CREATING, SESSION_STATE_IDLE,
+    SESSION_STATE_TERMINATED, SESSION_STATE_TERMINATING, WORK_GROUP_NOT_FOUND,
 };
 
 use crate::harness::{call, create_work_group, error_code, message, request_token, router};
@@ -671,14 +671,22 @@ async fn a_terminate_is_idempotent_and_leaves_the_session_readable() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&executors), message(&executors)),
-        (
-            400,
-            INVALID_REQUEST.to_string(),
-            SESSION_NOT_FOUND.to_string()
-        ),
-        "the executors of a session whose resources are no longer running are not reported, \
-         got {status} with {executors:?}"
+        status, 200,
+        "the roster of a session whose resources are gone is still reported, got {status} \
+         with {executors:?}"
+    );
+    let states: Vec<String> = executors["ExecutorsSummary"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| summary["ExecutorState"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        states,
+        vec![EXECUTOR_STATE_TERMINATED.to_string()],
+        "the roster of a terminated session is settled to the terminal state its resources \
+         reached, got {executors:?}"
     );
 }
 

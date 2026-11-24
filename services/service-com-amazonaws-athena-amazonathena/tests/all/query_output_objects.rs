@@ -725,13 +725,29 @@ async fn unload_writes_its_objects_and_a_manifest_that_lists_exactly_them() {
 
         // The same manifest, read through the operation that pages it in rows.
         let rows = rows_of(&router, case, id, false).await;
-        let paged: BTreeSet<String> = athena_ok(
+        let manifest = athena_ok(
             &router,
             case,
             "GetQueryResults",
             &json!({ "QueryExecutionId": id, "QueryResultType": "DATA_MANIFEST" }),
         )
-        .await["ResultSet"]["Rows"]
+        .await;
+        // A manifest listing is the manifest FILE's lines rather than a result set the engine
+        // computed a schema for, so there is no column for the metadata to describe.
+        for member in ["ColumnInfos", "ResultSet"] {
+            let column_info = if member == "ColumnInfos" {
+                manifest["ResultSet"]["ColumnInfos"].clone()
+            } else {
+                manifest["ResultSet"]["ResultSetMetadata"]["ColumnInfo"].clone()
+            };
+            assert_eq!(
+                column_info,
+                json!([]),
+                "case {case:?}: a manifest read carries no column information under {member}, \
+                 got {manifest:?}"
+            );
+        }
+        let paged: BTreeSet<String> = manifest["ResultSet"]["Rows"]
             .as_array()
             .unwrap_or(&Vec::new())
             .iter()

@@ -526,12 +526,12 @@ async fn get_work_group_refuses_a_name_no_work_group_holds() {
 
     // Every row is a name inside the modelled `WorkGroupName` pattern that no create
     // call registered — including one that differs from the registered name only in
-    // case, and one that is a prefix of it.
+    // case, and one that is a prefix of it. (The account's own default workgroup is not
+    // among them: it is there without a create, which `work_group_bootstrap` asserts.)
     for case in [
         "no-such-workgroup",
         "The-One-That-Exists",
         "the-one-that-exist",
-        "primary",
         &name_of_length(128),
     ] {
         let (status, refused) = call(&router, "GetWorkGroup", &json!({ "WorkGroup": case })).await;

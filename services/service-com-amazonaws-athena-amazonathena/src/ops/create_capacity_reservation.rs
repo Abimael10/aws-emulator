@@ -184,6 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::too_many_capacity_reservations(),
             ));
         }
+        // The account-wide Provisioned DPU quota: capacity the account does not have left is
+        // capacity Athena will not grant, so the request is refused before any reservation is
+        // registered — nothing is created under that name, and a read of it misses.
+        if store
+            .capacity_reservations
+            .would_exceed_account_dpus(input.target_dpus, now, None)
+        {
+            return Err(invalid_request(
+                crate::state::account_provisioned_dpus_exceeded(),
+            ));
+        }
 
         store
             .capacity_reservations

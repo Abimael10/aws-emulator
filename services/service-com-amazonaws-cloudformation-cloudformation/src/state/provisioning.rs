@@ -212,8 +212,9 @@ use super::StoredResource;
 /// rules read the properties each record cannot take anew, which are the labels that
 /// service's own calls address one by).
 pub(in crate::state) mod apigateway_rest_api;
-/// The three `AWS::Athena::*` types a stack declares — the workgroup its queries run in, the
-/// data catalog they are routed through and the query it saves in that workgroup: created in
+/// The four `AWS::Athena::*` types a stack declares — the workgroup its queries run in, the
+/// data catalog they are routed through, the query it saves in that workgroup and the capacity
+/// its queries run on: created in
 /// Amazon Athena itself ([`athena_resources`]). Visible to the rest of this service's state
 /// because the saved query's own type NAME lives here, beside the arm that provisions it (the
 /// identity in force is the id that create answers, and the properties such a query cannot take
@@ -1437,10 +1438,10 @@ pub(super) enum Owner {
     /// instance registered in a service. Which of them it is travels with the owner, as it
     /// does for the types above.
     ServiceDiscovery(service_discovery::Kind),
-    /// One of the three Amazon Athena types [`athena_resources`] creates: the workgroup a
-    /// stack's queries run in, the data catalog they are routed through, and the query it saves
-    /// in that workgroup. Which of them it is travels with the owner, as it does for the types
-    /// above.
+    /// One of the four Amazon Athena types [`athena_resources`] creates: the workgroup a
+    /// stack's queries run in, the data catalog they are routed through, the query it saves
+    /// in that workgroup and the capacity reservation they run on. Which of them it is
+    /// travels with the owner, as it does for the types above.
     Athena(athena_resources::Kind),
     /// One of the three `AWS::MediaConvert::*` types [`mediaconvert_resources`] creates in AWS
     /// Elemental MediaConvert: the queue a stack's jobs run in, the job template they are

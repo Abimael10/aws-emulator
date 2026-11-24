@@ -151,9 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
-        let Some(record) = store
+        let Some(status) = store
             .capacity_reservations
-            .reservation_mut(&input.name, now)
+            .reservation(&input.name, now)
+            .map(|record| record.status_at(now))
         else {
             return Err(invalid_request(
                 crate::state::capacity_reservation_not_found(&input.name),
@@ -164,12 +165,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // allocation is still in flight, one already being updated and one being or
         // already cancelled all have an allocation of their own in progress or no capacity
         // left to change.
-        let status = record.status_at(now);
         if status != crate::state::CAPACITY_RESERVATION_STATUS_ACTIVE {
             return Err(invalid_request(
                 crate::state::capacity_reservation_wrong_state(status),
             ));
         }
+
+        // The account-wide Provisioned DPU quota, weighed against what the account holds
+        // BESIDE this reservation: the amount asked for replaces the amount this one already
+        // requests rather than adding to it. Capacity the account does not have left is
+        // capacity Athena will not grant, so the reservation keeps the amount it holds.
+        if store.capacity_reservations.would_exceed_account_dpus(
+            input.target_dpus,
+            now,
+            Some(&input.name),
+        ) {
+            return Err(invalid_request(
+                crate::state::account_provisioned_dpus_exceeded(),
+            ));
+        }
+
+        let Some(record) = store
+            .capacity_reservations
+            .reservation_mut(&input.name, now)
+        else {
+            return Err(invalid_request(
+                crate::state::capacity_reservation_not_found(&input.name),
+            ));
+        };
 
         // The new amount is requested now and allocated when the clock makes it due, so a
         // read straight after this call reports UPDATE_PENDING and the capacity the

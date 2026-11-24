@@ -178,6 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled `@pattern` every `CatalogNameString` carries, which the framework's
+        // boundary declares and cannot apply: a value the MODEL excludes names no catalog and
+        // is refused as the constraint it broke, before any store is reached
+        // (`crate::state::catalog_name_pattern_error`).
+        if let Some(message) =
+            crate::state::catalog_name_pattern_error("catalogName", &input.catalog_name)
+        {
+            return Err(invalid_request(message));
+        }
         // Where this read's metadata comes from is decided by the catalog the request
         // names and the registry this account holds, exactly as it is for the listing of
         // that database.

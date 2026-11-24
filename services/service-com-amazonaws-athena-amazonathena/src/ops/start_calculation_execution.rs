@@ -308,6 +308,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .calculations
                 .insert(record, input.client_request_token);
 
+            // Work has been submitted INTO the session, so the session is not idle: its idle
+            // window runs from this instant, which is what keeps Athena from reclaiming a
+            // session a caller is running calculations on
+            // (`crate::state::SessionRecord::worked_at`).
+            if let Some(session) = store.sessions.session_mut(&session_id) {
+                session.worked_at(now);
+            }
+
             (
                 calculation_execution_id,
                 state_reached,

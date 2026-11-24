@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `AWS::Athena::WorkGroup`, `AWS::Athena::DataCatalog` and `AWS::Athena::NamedQuery`: the
-//! workgroup a stack declares queries run in, the data catalog they are routed through, and the
-//! query a stack saves in that workgroup, created in Amazon Athena itself.
+//! `AWS::Athena::WorkGroup`, `AWS::Athena::DataCatalog`, `AWS::Athena::NamedQuery` and
+//! `AWS::Athena::CapacityReservation`: the
+//! workgroup a stack declares queries run in, the data catalog they are routed through, the
+//! query a stack saves in that workgroup, and the capacity it reserves for them to run on,
+//! created in Amazon Athena itself.
 //!
 //! This is the per-type half of provisioning for two resource types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives in
@@ -51,6 +53,17 @@
 //! under one name. The type publishes no `Tags` property and `CreateNamedQuery` takes no tag
 //! list, so CloudFormation propagates no tag to a saved query.
 //!
+//! `AWS::Athena::CapacityReservation`'s properties are `CreateCapacityReservation`'s own
+//! members under the same names — the `Name` it is created under (this resource's physical id)
+//! `TargetDpus` and `Tags` — plus the `CapacityAssignmentConfiguration` that maps workgroups
+//! onto the reservation, which is `PutCapacityAssignmentConfiguration`'s own mapping and is
+//! therefore applied by that call once the reservation exists
+//! ([`CAPACITY_RESERVATION_PROPERTIES`]). Its removal takes the two steps Athena requires: "a
+//! reservation must be cancelled before it can be deleted", and a cancellation is not complete
+//! when the call that asked for it answers, so the delete asks for the cancellation and the
+//! removal is reported finished only once the reservation has left the account
+//! ([`removal`]).
+//!
 //! A declared property this arm does not apply is REFUSED rather than dropped
 //! ([`refuse_unapplied_properties`]), at the top level and inside the workgroup configuration
 //! alike: a resource reported created with less than its declaration asked for is the shallow
@@ -77,6 +90,10 @@ pub(super) const ATHENA_DATA_CATALOG: &str = "AWS::Athena::DataCatalog";
 /// cannot take anew live beside it
 /// ([`crate::state::template::replacement_properties`]).
 pub(in crate::state) const ATHENA_NAMED_QUERY: &str = "AWS::Athena::NamedQuery";
+/// See [`ATHENA_WORK_GROUP`]. The reservation is created UNDER the name its declaration
+/// states, which is what every Athena call on one takes.
+pub(in crate::state) const ATHENA_CAPACITY_RESERVATION: &str =
+    "AWS::Athena::CapacityReservation";
 
 /// Amazon Athena's signing name, which is what routes the in-process call to its own handlers,
 /// and the service shape an awsJson `X-Amz-Target` names an operation under (that model's
@@ -98,7 +115,7 @@ const MISSING_PROPERTY: &str = "InvalidRequest";
 /// state member at all, so this is the state a declaration stating none asks for.
 const WORK_GROUP_STATE_ENABLED: &str = "ENABLED";
 
-/// Which of the two types one resource is.
+/// Which of these types one resource is.
 ///
 /// Visible to the whole of this service's state module, because it travels with
 /// [`super::Owner`]: the algorithm resolves a type's owner once and passes it back here.
@@ -110,6 +127,8 @@ pub(in crate::state) enum Kind {
     DataCatalog,
     /// `AWS::Athena::NamedQuery`.
     NamedQuery,
+    /// `AWS::Athena::CapacityReservation`.
+    CapacityReservation,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -118,6 +137,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         ATHENA_WORK_GROUP => Some(Kind::WorkGroup),
         ATHENA_DATA_CATALOG => Some(Kind::DataCatalog),
         ATHENA_NAMED_QUERY => Some(Kind::NamedQuery),
+        ATHENA_CAPACITY_RESERVATION => Some(Kind::CapacityReservation),
         _ => None,
     }
 }
@@ -231,6 +251,56 @@ const NAMED_QUERY_PROPERTIES: &[&str] =
 /// resource's identity, so none of them is held back for the identity the create answers with.
 const NAMED_QUERY_CREATE_MEMBERS: &[&str] = NAMED_QUERY_PROPERTIES;
 
+/// Every property `AWS::Athena::CapacityReservation` publishes: the `Name` the reservation is
+/// created under (this resource's physical id and what its `Ref` resolves to), the
+/// `TargetDpus` `CreateCapacityReservation` requires, its `Tags`, and the
+/// [`CAPACITY_ASSIGNMENT_CONFIGURATION`] the workgroups that run on the reservation are
+/// assigned through. A declared property this list does not carry is one no call here
+/// applies, and is refused rather than dropped.
+const CAPACITY_RESERVATION_PROPERTIES: &[&str] = &[
+    "CapacityAssignmentConfiguration",
+    "Name",
+    "Tags",
+    "TargetDpus",
+];
+
+/// The members of `CreateCapacityReservation` a declaration states beside the name it is
+/// created under: the number of data processing units it requests, which both the type and
+/// the call declare required.
+const CAPACITY_RESERVATION_CREATE_MEMBERS: &[&str] = &["TargetDpus"];
+
+/// The property, and member, carrying how much capacity the reservation requests.
+const TARGET_DPUS: &str = "TargetDpus";
+
+/// The property carrying which workgroups run on the reservation, which is applied by the one
+/// call that takes such a mapping: "a mapping between one or more workgroups and a capacity
+/// reservation" (`CapacityAssignment`), put by `PutCapacityAssignmentConfiguration`.
+const CAPACITY_ASSIGNMENT_CONFIGURATION: &str = "CapacityAssignmentConfiguration";
+
+/// The one member `CAPACITY_ASSIGNMENT_CONFIGURATION` publishes, which is also the member
+/// `PutCapacityAssignmentConfiguration` takes the mapping as.
+const CAPACITY_ASSIGNMENTS_MEMBER: &str = "CapacityAssignments";
+
+/// The member `PutCapacityAssignmentConfiguration` addresses a reservation by.
+const CAPACITY_RESERVATION_NAME_MEMBER: &str = "CapacityReservationName";
+
+/// The member a read of the account's reservations carries them under, and the member of a
+/// `CapacityReservation` reporting how far its allocation or its cancellation has got
+/// (`smithy_query(query="shape",shape="CapacityReservation")`).
+const CAPACITY_RESERVATIONS_MEMBER: &str = "CapacityReservations";
+
+/// The `CapacityReservationStatus` a reservation whose requested capacity is allocated is in —
+/// the status it is USABLE in — beside the one a cancelled reservation reaches, which is the
+/// only status `DeleteCapacityReservation` takes one away from ("a reservation must be
+/// cancelled before it can be deleted")
+/// (`smithy_query(query="shape",shape="CapacityReservationStatus")`).
+const CAPACITY_RESERVATION_ACTIVE: &str = "ACTIVE";
+/// See [`CAPACITY_RESERVATION_ACTIVE`].
+const CAPACITY_RESERVATION_CANCELLED: &str = "CANCELLED";
+/// The status a reservation whose cancellation is still in progress is in; see
+/// [`CAPACITY_RESERVATION_ACTIVE`].
+const CAPACITY_RESERVATION_CANCELLING: &str = "CANCELLING";
+
 /// The member `CreateNamedQuery` answers the saved query's minted id under, and the member
 /// `GetNamedQuery` and `DeleteNamedQuery` address one by.
 const NAMED_QUERY_ID_MEMBER: &str = "NamedQueryId";
@@ -260,8 +330,13 @@ const TAGS_PROPERTY: &str = "Tags";
 /// structure reporting how far its creation or deletion has got
 /// (`smithy_query(query="shape",shape="DataCatalog")`).
 const DATA_CATALOG_MEMBER: &str = "DataCatalog";
-/// See [`DATA_CATALOG_MEMBER`].
+/// See [`DATA_CATALOG_MEMBER`]. The same member reports a capacity reservation's own status
+/// (`smithy_query(query="shape",shape="CapacityReservation")`).
 const STATUS_MEMBER: &str = "Status";
+
+/// The member a paged listing of this service carries the cursor of the next page under, and
+/// takes that cursor back as.
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
 
 /// The status a created data catalog has reached when its creation is complete, and the marker
 /// every status reporting a creation that could not be completed carries
@@ -272,8 +347,9 @@ const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const FAILED_MARKER: &str = "FAILED";
 
 /// The members these types declare that Athena models as NUMBERS: the one data-usage limit the
-/// configuration carries (`BytesScannedCutoffPerQuery`, a `long`).
-const NUMERIC_MEMBERS: &[&str] = &["BytesScannedCutoffPerQuery"];
+/// configuration carries (`BytesScannedCutoffPerQuery`, a `long`), and the amount of capacity a
+/// reservation requests (`TargetDpus`, an integer).
+const NUMERIC_MEMBERS: &[&str] = &["BytesScannedCutoffPerQuery", "TargetDpus"];
 
 /// The members they declare that Athena models as BOOLEANS: the three configuration switches and
 /// the recursive-delete option, each a `BoxedBoolean`.
@@ -306,7 +382,89 @@ pub(super) async fn create(
         // `CreateNamedQuery` takes no tag list, so there is no call that could carry one of
         // the tags CloudFormation propagates to it.
         Kind::NamedQuery => create_named_query(ctx, region, resource).await,
+        Kind::CapacityReservation => {
+            create_capacity_reservation(ctx, region, resource, propagated).await
+        }
     }
+}
+
+/// Reserve the capacity an `AWS::Athena::CapacityReservation` declares, and assign the
+/// workgroups that are to run on it.
+///
+/// A reservation is NAMED in Athena: `GetCapacityReservation`, `UpdateCapacityReservation`,
+/// `CancelCapacityReservation` and `DeleteCapacityReservation` each address one by its name,
+/// and a workgroup's queries run on the capacity assigned to it — so a stack that reported one
+/// created while nothing reserved the capacity publishes a name that resolves to nothing, and
+/// every workgroup the declaration meant to run on provisioned capacity runs on none.
+///
+/// The workgroup mapping is a call of its own: `CreateCapacityReservation` takes no
+/// assignment, so a declaration carrying one is carried out by the single call that takes such
+/// a mapping, against the reservation just created.
+async fn create_capacity_reservation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(
+        &resource.properties,
+        &resource.resource_type,
+        CAPACITY_RESERVATION_PROPERTIES,
+    )?;
+    let name = resource.physical_resource_id.clone();
+    let mut request = declared_members(&resource.properties, CAPACITY_RESERVATION_CREATE_MEMBERS);
+    if !request.contains_key(TARGET_DPUS) {
+        return Err(Refusal {
+            code: MISSING_PROPERTY.to_string(),
+            message: format!("{} declares no {TARGET_DPUS}", resource.resource_type),
+        });
+    }
+    request.insert(NAME_MEMBER.to_string(), Value::String(name.clone()));
+    insert_tags(&mut request, &resource.properties, propagated);
+    call_athena(
+        ctx,
+        region,
+        "CreateCapacityReservation",
+        &Value::Object(request),
+    )
+    .await?;
+    put_capacity_assignments(ctx, region, &name, &resource.properties).await?;
+    // The reservation was created under the name CloudFormation decided, which is the one it
+    // answers to.
+    Ok(Created::default())
+}
+
+/// Assign the workgroups a declaration's [`CAPACITY_ASSIGNMENT_CONFIGURATION`] maps onto the
+/// reservation `name`, where it declares one. A declaration carrying none assigns nothing: the
+/// reservation holds the capacity and no workgroup runs on it yet.
+async fn put_capacity_assignments(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<(), Refusal> {
+    let Some(assignments) = declared(properties, CAPACITY_ASSIGNMENT_CONFIGURATION)
+        .and_then(|configuration| declared(configuration, CAPACITY_ASSIGNMENTS_MEMBER))
+    else {
+        return Ok(());
+    };
+    let mut request = Map::new();
+    request.insert(
+        CAPACITY_RESERVATION_NAME_MEMBER.to_string(),
+        Value::String(name.to_string()),
+    );
+    request.insert(
+        CAPACITY_ASSIGNMENTS_MEMBER.to_string(),
+        modelled(CAPACITY_ASSIGNMENTS_MEMBER, assignments),
+    );
+    call_athena(
+        ctx,
+        region,
+        "PutCapacityAssignmentConfiguration",
+        &Value::Object(request),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Create the workgroup an `AWS::Athena::WorkGroup` declares, and put it in the state its
@@ -438,6 +596,30 @@ pub(super) async fn readiness(
     kind: Kind,
     physical_resource_id: &str,
 ) -> Result<Readiness, Refusal> {
+    // A CAPACITY RESERVATION comes up over a span of its own: "when a reservation is
+    // initially created, it has no DPUs. Athena allocates DPUs until the allocated amount
+    // equals the requested amount" (`CapacityReservation`), and a workgroup's queries run on
+    // the capacity only once it is allocated — so that arm asks until Athena reports the
+    // reservation ACTIVE. A reservation that has left that path (one being cancelled, or
+    // cancelled) is not going to come up, and one the account no longer holds is a creation
+    // nothing can report ready.
+    if kind == Kind::CapacityReservation {
+        return Ok(
+            match capacity_reservation_status(ctx, region, physical_resource_id).await? {
+                None => Readiness::Failed(format!(
+                    "Amazon Athena holds no capacity reservation named {physical_resource_id}"
+                )),
+                Some(status) if status == CAPACITY_RESERVATION_ACTIVE => Readiness::Ready,
+                Some(status)
+                    if status == CAPACITY_RESERVATION_CANCELLING
+                        || status == CAPACITY_RESERVATION_CANCELLED =>
+                {
+                    Readiness::Failed(status)
+                }
+                Some(status) => Readiness::Pending(status),
+            },
+        );
+    }
     if kind != Kind::DataCatalog {
         return Ok(Readiness::Ready);
     }
@@ -467,11 +649,144 @@ pub(super) async fn readiness(
 
 /// Whether the owning service has finished removing a deleted resource.
 ///
-/// Nothing is asked: `DeleteWorkGroup`, `DeleteDataCatalog` and `DeleteNamedQuery` each take the
-/// resource away as they answer — the catalog's delete answers with the record the registry no
-/// longer holds — so Athena reports no state a removed one is still being deleted in.
-pub(super) fn removal() -> Removal {
-    Removal::Gone
+/// Nothing is asked for three of the four: `DeleteWorkGroup`, `DeleteDataCatalog` and
+/// `DeleteNamedQuery` each take the resource away as they answer — the catalog's delete
+/// answers with the record the registry no longer holds — so Athena reports no state a removed
+/// one is still being deleted in.
+///
+/// A CAPACITY RESERVATION is removed in two steps, because Athena's own rule is two steps: "a
+/// reservation must be cancelled before it can be deleted"
+/// (`DeleteCapacityReservation`), and a cancellation is not complete when the call that asked
+/// for it answers. So the delete asks for the cancellation ([`delete`]) and this reports the
+/// removal still pending until Athena reports the reservation CANCELLED, at which point the
+/// delete that takes it out of the account is made — the call that finishes the removal the
+/// stack asked for, and the one thing that makes a later `GetCapacityReservation` of that name
+/// miss.
+pub(super) async fn removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    physical_resource_id: &str,
+) -> Result<Removal, Refusal> {
+    if kind != Kind::CapacityReservation {
+        return Ok(Removal::Gone);
+    }
+    match capacity_reservation_status(ctx, region, physical_resource_id).await? {
+        // The account no longer holds it, which is what the delete below leaves behind.
+        None => Ok(Removal::Gone),
+        Some(status) if status == CAPACITY_RESERVATION_CANCELLED => {
+            delete_capacity_reservation(ctx, region, physical_resource_id).await?;
+            Ok(Removal::Gone)
+        }
+        // A reservation that reached ACTIVE after the delete was asked for — one whose
+        // allocation was still in flight then — is cancelled here, which is the step its
+        // removal is waiting on.
+        Some(status) if status == CAPACITY_RESERVATION_ACTIVE => {
+            cancel_capacity_reservation(ctx, region, physical_resource_id).await?;
+            Ok(Removal::Pending(status))
+        }
+        Some(status) => Ok(Removal::Pending(status)),
+    }
+}
+
+/// Ask for the cancellation of the reservation `name`, which "releases the capacity" it holds
+/// and is the step `DeleteCapacityReservation` requires before it will take one away.
+async fn cancel_capacity_reservation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<(), Refusal> {
+    let mut request = Map::new();
+    request.insert(NAME_MEMBER.to_string(), Value::String(name.to_string()));
+    call_athena(
+        ctx,
+        region,
+        "CancelCapacityReservation",
+        &Value::Object(request),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The status Amazon Athena reports the reservation `name` in, or `None` where the account
+/// holds no reservation under that name.
+///
+/// Read off the account's own listing rather than a read by name: `ListCapacityReservations`
+/// "lists the capacity reservations for the current account" and reports nothing for a name
+/// the account does not hold, so the ABSENCE of a reservation is an answer this read carries
+/// rather than a refusal that would have to be told apart from every other bad request (Athena
+/// models one client error for all of them).
+async fn capacity_reservation_status(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Option<String>, Refusal> {
+    let mut request = Map::new();
+    for _ in 0..MAX_RESERVATION_PAGES {
+        let answered = call_athena(
+            ctx,
+            region,
+            "ListCapacityReservations",
+            &Value::Object(request.clone()),
+        )
+        .await?;
+        let page = answered
+            .get(CAPACITY_RESERVATIONS_MEMBER)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for reservation in &page {
+            if reservation.get(NAME_MEMBER).and_then(Value::as_str) == Some(name) {
+                return Ok(reservation
+                    .get(STATUS_MEMBER)
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string));
+            }
+        }
+        // Every page of the listing is walked: the reservation this stack created is not
+        // necessarily on the first one.
+        let Some(next) = answered
+            .get(NEXT_TOKEN_MEMBER)
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+        else {
+            return Ok(None);
+        };
+        request.insert(
+            NEXT_TOKEN_MEMBER.to_string(),
+            Value::String(next.to_string()),
+        );
+    }
+    Ok(None)
+}
+
+/// How many pages of the account's capacity reservations one read of a reservation's status
+/// walks.
+///
+/// The walk follows the owning service's own cursors, so its length is that service's rather
+/// than this one's: the bound is here so a cursor that did not advance cannot spin this call
+/// forever. Far above the pages an account's reservations fill (`MaxCapacityReservationsCount`
+/// bounds one page at 50), so no reservation a stack created is out of its reach.
+const MAX_RESERVATION_PAGES: usize = 1_000;
+
+/// Take the cancelled reservation `name` out of the account: "a deleted reservation is
+/// immediately removed from your account and can no longer be referenced"
+/// (`DeleteCapacityReservation`).
+async fn delete_capacity_reservation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<(), Refusal> {
+    let mut request = Map::new();
+    request.insert(NAME_MEMBER.to_string(), Value::String(name.to_string()));
+    call_athena(
+        ctx,
+        region,
+        "DeleteCapacityReservation",
+        &Value::Object(request),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Apply a CHANGED declaration to the resource the stack already has, through the owning
@@ -504,7 +819,68 @@ pub(super) async fn update(
         // name). Reporting a change that reached here as not applied is what keeps such a
         // deployment from being called a success that left the old query in place.
         Kind::NamedQuery => Ok(None),
+        Kind::CapacityReservation => {
+            update_capacity_reservation(ctx, region, resource, declared_properties).await
+        }
     }
+}
+
+/// Apply a changed declaration to the capacity reservation the stack already has.
+///
+/// `UpdateCapacityReservation` "updates the number of requested data processing units for the
+/// capacity reservation" and takes that amount with the reservation's name, so a declaration
+/// asking for another amount is carried out by it; the workgroups that run on the reservation
+/// are re-assigned by the one call that takes such a mapping, which REPLACES the configuration
+/// it holds. A declaration that DROPS the assignment configuration is a change neither call
+/// makes — `PutCapacityAssignmentConfiguration` requires at least the mapping it is given, and
+/// Athena publishes no call that takes a reservation's assignments off — so it is reported as
+/// not applied rather than as a success that left the old workgroups running on it.
+async fn update_capacity_reservation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared_properties: &Value,
+) -> Result<Option<Created>, Refusal> {
+    refuse_unapplied_properties(
+        declared_properties,
+        &resource.resource_type,
+        CAPACITY_RESERVATION_PROPERTIES,
+    )?;
+    if dropped(
+        &resource.properties,
+        declared_properties,
+        CAPACITY_ASSIGNMENT_CONFIGURATION,
+    ) {
+        return Ok(None);
+    }
+    let mut request = declared_members(declared_properties, CAPACITY_RESERVATION_CREATE_MEMBERS);
+    if !request.contains_key(TARGET_DPUS) {
+        // The amount is required by the type and by the call alike, so a declaration stating
+        // none describes no reservation this call could leave in place.
+        return Err(Refusal {
+            code: MISSING_PROPERTY.to_string(),
+            message: format!("{} declares no {TARGET_DPUS}", resource.resource_type),
+        });
+    }
+    request.insert(
+        NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    call_athena(
+        ctx,
+        region,
+        "UpdateCapacityReservation",
+        &Value::Object(request),
+    )
+    .await?;
+    put_capacity_assignments(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        declared_properties,
+    )
+    .await?;
+    Ok(Some(Created::default()))
 }
 
 /// Apply a changed declaration to the workgroup the stack already has.
@@ -588,10 +964,18 @@ async fn update_data_catalog(
 }
 
 /// Delete the resource a stack created, addressed by the identifier it is known by: the name a
-/// workgroup and a data catalog were created under, and the id Athena minted for a saved query.
+/// workgroup, a data catalog and a capacity reservation were created under, and the id Athena
+/// minted for a saved query.
 ///
 /// A workgroup's delete carries the `RecursiveDeleteOption` its declaration asked for, which is
 /// what releases the named queries and prepared statements the workgroup holds with it.
+///
+/// A CAPACITY RESERVATION is not deleted here at all: Athena's rule is that "a reservation must
+/// be cancelled before it can be deleted", and a cancellation is not complete when the call
+/// that asked for it answers — so this asks for the cancellation and [`removal`] makes the
+/// delete once Athena reports the reservation cancelled. A reservation the account no longer
+/// holds, and one whose cancellation is already under way, need no call: asking again would
+/// restart nothing.
 pub(super) async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -613,6 +997,19 @@ pub(super) async fn delete(
         // A saved query is addressed by the id Athena minted for it, which is this resource's
         // physical id ([`create_named_query`]).
         Kind::NamedQuery => ("DeleteNamedQuery", NAMED_QUERY_ID_MEMBER),
+        Kind::CapacityReservation => {
+            // Only an ACTIVE reservation has a cancellation to ask for: one still allocating
+            // is not cancellable yet, one already cancelling or cancelled has nothing left to
+            // cancel, and one the account no longer holds is gone. [`removal`] asks for the
+            // cancellation of a reservation that reaches ACTIVE after this call, so the
+            // removal makes progress whichever status the delete found it in.
+            let held =
+                capacity_reservation_status(ctx, region, &resource.physical_resource_id).await?;
+            if held.as_deref() != Some(CAPACITY_RESERVATION_ACTIVE) {
+                return Ok(());
+            }
+            return cancel_capacity_reservation(ctx, region, &resource.physical_resource_id).await;
+        }
     };
     request.insert(
         member.to_string(),
@@ -881,6 +1278,11 @@ mod tests {
                 NAMED_QUERY_CREATE_MEMBERS,
                 NAMED_QUERY_PROPERTIES,
             ),
+            (
+                ATHENA_CAPACITY_RESERVATION,
+                CAPACITY_RESERVATION_CREATE_MEMBERS,
+                CAPACITY_RESERVATION_PROPERTIES,
+            ),
         ];
         for (resource_type, sent, published) in rows {
             for member in *sent {
@@ -907,13 +1309,18 @@ mod tests {
         }
     }
 
-    /// The three types this module owns are the three it answers for, and nothing else is.
+    /// The four types this module owns are the four it answers for, and nothing else is.
     #[test]
     fn the_kind_is_resolved_from_the_type_name() {
         let rows: &[(&str, Option<Kind>)] = &[
             (ATHENA_WORK_GROUP, Some(Kind::WorkGroup)),
             (ATHENA_DATA_CATALOG, Some(Kind::DataCatalog)),
             (ATHENA_NAMED_QUERY, Some(Kind::NamedQuery)),
+            (
+                ATHENA_CAPACITY_RESERVATION,
+                Some(Kind::CapacityReservation),
+            ),
+            ("AWS::Athena::CapacityReservationSomethingElse", None),
             ("AWS::Athena::NamedQuerySomethingElse", None),
             ("AWS::Athena::WorkGroupSomethingElse", None),
         ];

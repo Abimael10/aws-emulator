@@ -11,10 +11,12 @@
 //!
 //! A workgroup has no lifecycle the clock owes: Athena answers `CreateWorkGroup` with
 //! the workgroup already usable, so the record is stored in its terminal state and a
-//! read never has to materialise a pending transition. The one workgroup the registry
-//! holds no record for is the account's default workgroup ([`DEFAULT_WORK_GROUP`]):
-//! nothing created it, so [`default_work_group_record`] builds it from the instant the
-//! registries were opened and `ListWorkGroups` reports it beside the created ones. A data
+//! read never has to materialise a pending transition. One workgroup is there without any
+//! create call — the account's default workgroup ([`DEFAULT_WORK_GROUP`]) — so
+//! [`default_work_group_record`] builds it from the instant the registries were opened and
+//! the registry is SEEDED with it: `GetWorkGroup`, `ListWorkGroups` and every operation
+//! that resolves a workgroup answer for it out of that record, and `DeleteWorkGroup`
+//! refuses to take it away. A data
 //! catalog has one only when
 //! its creation is asynchronous (see [`DataCatalogRecord::status_at`]), and even then the
 //! due instant is stored once and every read derives the status from it rather than
@@ -359,14 +361,16 @@ impl WorkGroupRecord {
     }
 }
 
-/// The account's default workgroup, as a record a listing can report.
+/// The account's default workgroup, as the record the registry is SEEDED with.
 ///
 /// Athena gives every account one workgroup nobody created: the one
 /// [`DEFAULT_WORK_GROUP`] names, which a query that names no workgroup runs in and which
-/// `DeleteWorkGroup` documents "cannot be deleted". It is therefore not in
-/// [`ComAmazonawsAthenaAmazonathenaState::work_groups`] \u2014 no `CreateWorkGroup` call ever
-/// wrote it \u2014 and it is built here instead, from `created_at`: the instant this account's
-/// registries were opened, held once on the store so every read reports the same one.
+/// `DeleteWorkGroup` documents "cannot be deleted". It is written into
+/// [`ComAmazonawsAthenaAmazonathenaState::work_groups`] when the registries are opened,
+/// from `created_at`: the instant this account's registries were opened, held once on the
+/// store so every read reports the same one. So every operation that resolves a workgroup
+/// resolves this one the same way it resolves a created one, rather than each of them
+/// carrying a case for the workgroup no record stood for.
 ///
 /// Enabled (it is the workgroup queries run in by default), with no description of its
 /// own and the engine version Athena resolves for a workgroup that selected none. Its
@@ -1236,34 +1240,75 @@ pub fn create_complete_at(catalog_type: &str, now: SystemTime) -> SystemTime {
     }
 }
 
+/// The modelled `@pattern` every `CatalogNameString` member of this model carries, as the
+/// model wrote it (`smithy_query(query="shape",shape="CatalogNameString")`).
+///
+/// Quoted in the clause a value outside it is refused with, so the requirement a client is
+/// told to satisfy is the model's own text.
+pub const CATALOG_NAME_PATTERN: &str =
+    r"^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$";
+
+/// Whether `ch` is a character the expression on [`CATALOG_NAME_PATTERN`] admits.
+///
+/// The three ranges it states, plus the tab it names: `U+0020` to `U+D7FF`, `U+E000` to
+/// `U+FFFD`, and the astral planes, which the expression writes as the surrogate PAIR range
+/// `\uD800\uDC00-\uDBFF\uDFFF` — the characters `U+10000` to `U+10FFFF`. So what it excludes
+/// is a control character below `U+0020` other than the tab, and the two non-characters at
+/// the end of the basic plane.
+fn catalog_name_character(ch: char) -> bool {
+    ch == '\t'
+        || matches!(ch,
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
+/// The sentence a `CatalogNameString` member at `member` carrying a value the modelled
+/// `@pattern` does not admit is refused with, and `None` for a value it admits.
+///
+/// A rule about the REQUEST rather than about this account: it is measured before any state
+/// is looked at, and it is stated in the constraint envelope the framework states every other
+/// modelled requirement in ([`crate::service::input_validation::pattern_refusal`]) — which is
+/// also why it is not the service's own sentence for a name it will not register
+/// ([`data_catalog_name_invalid`]): a value the model itself excludes never reaches the rule
+/// the service applies to the names it does admit.
+///
+/// `member` is the member path a clause names, which is the lowerCamel of the member's own
+/// name — `name` for the catalog NAME both writes take, `catalogName` for the member a
+/// metadata read addresses a catalog by.
+pub fn catalog_name_pattern_error(member: &str, name: &str) -> Option<String> {
+    if name.chars().all(catalog_name_character) {
+        return None;
+    }
+    crate::service::input_validation::pattern_refusal(member, CATALOG_NAME_PATTERN, name)
+}
+
 /// Why `name` is not a usable data catalog name for `catalog_type`, if it is not.
 ///
 /// Enforces the two documented bounds quoted on [`MAX_DATA_CATALOG_NAME_CHARS`] and
 /// [`MAX_FEDERATED_DATA_CATALOG_NAME_CHARS`] plus the documented character set, none of
-/// which the model's `CatalogNameString` carries.
+/// which the model's `CatalogNameString` carries — so the name reaches a handler having
+/// passed wire validation and is refused by the SERVICE, in the one sentence Athena states
+/// a catalog name it will not take with ([`data_catalog_name_invalid`]).
 pub fn data_catalog_name_error(name: &str, catalog_type: &str) -> Option<String> {
     let limit = if catalog_type == DATA_CATALOG_TYPE_FEDERATED {
         MAX_FEDERATED_DATA_CATALOG_NAME_CHARS
     } else {
         MAX_DATA_CATALOG_NAME_CHARS
     };
-    let length = name.chars().count();
-    if length > limit {
-        return Some(format!(
-            "Name is {length} characters long, more than the {limit} characters a \
-             {catalog_type} data catalog name can use."
-        ));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|ch| !ch.is_ascii_alphanumeric() && !DATA_CATALOG_NAME_PUNCTUATION.contains(ch))
-    {
-        return Some(format!(
-            "Name contains the character '{bad}'; a data catalog name can use \
-             alphanumeric, underscore, at sign, or hyphen characters."
-        ));
-    }
-    None
+    let usable = name.chars().count() <= limit
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || DATA_CATALOG_NAME_PUNCTUATION.contains(&ch));
+    (!usable).then(|| data_catalog_name_invalid(name))
+}
+
+/// The sentence a `Name` Athena will not register a data catalog under is refused with.
+///
+/// FIXED text around the rejected name, which is the only part of it the request supplies:
+/// Athena states one sentence for a name that breaks its catalog-name rule, whichever part
+/// of that rule it breaks, rather than describing the rule back to the caller. Stated here
+/// once so the create path and the update path refuse the same name with the same words.
+pub fn data_catalog_name_invalid(name: &str) -> String {
+    format!("DataCatalog name {name} is invalid.")
 }
 
 /// How a LAMBDA catalog's `Parameters` refusal is worded.
@@ -1618,10 +1663,6 @@ pub fn result_object_uri(
 /// query results location in Amazon S3" and named after the execution, which is the object
 /// `QueryExecutionStatistics$DataManifestLocation` reports.
 pub const DATA_MANIFEST_SUFFIX: &str = "-manifest.csv";
-
-/// The column of the data manifest as a read of it in ROWS reports it: each row carries the
-/// `s3://` path of one object the statement wrote, so the column is named for what it holds.
-const MANIFEST_PATH_COLUMN: &str = "path";
 
 /// The key of the data manifest the execution `id` saves, as the `s3://` URI of the
 /// resolved results directory with that object under it, or `None` for a submission that
@@ -1986,6 +2027,10 @@ impl QueryExecutionRecord {
     /// execution whose run wrote no output of its own, and one whose manifest is not
     /// readable yet because the query is not terminal — which [`Self::writes_a_data_manifest`]
     /// tells apart, because the two are different answers to the caller.
+    ///
+    /// It carries NO column information: a manifest listing is the manifest FILE's lines
+    /// rather than a result set the engine computed a schema for, so there is no column for
+    /// `ResultSetMetadata` to describe and the metadata a read of it reports is empty.
     pub(crate) fn data_manifest_at(
         &self,
         now: SystemTime,
@@ -1994,7 +2039,7 @@ impl QueryExecutionRecord {
             return None;
         }
         Some(query_engine::StoredResultSet {
-            column_info: vec![query_engine::hive_string_column(MANIFEST_PATH_COLUMN)],
+            column_info: Vec::new(),
             rows: self
                 .written_objects()
                 .iter()
@@ -2738,10 +2783,11 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// `CreateWorkGroup` call, so its creation instant belongs to the account rather than
     /// to a request. Held once, so every read reports the same instant for it.
     opened_at: SystemTime,
-    /// Every workgroup a `CreateWorkGroup` call registered, keyed by its name. A
-    /// `BTreeMap` so a listing walks the registry in one stable order. The account's
-    /// default workgroup is NOT here \u2014 nothing created it; see
-    /// [`default_work_group_record`] and [`Self::work_group_summaries`].
+    /// Every workgroup this account holds, keyed by its name. A `BTreeMap` so a listing
+    /// walks the registry in one stable order. The account's default workgroup is here
+    /// too, SEEDED when the registries are opened ([`default_work_group_record`]): Athena
+    /// gives every account that workgroup without any `CreateWorkGroup` call, so a read of
+    /// it answers out of a record exactly as a read of a created one does.
     pub work_groups: BTreeMap<String, WorkGroupRecord>,
     /// Every data catalog this account holds, keyed by its name — the key the
     /// `CreateDataCatalogInput$Name` documentation calls unique per account. A
@@ -2823,11 +2869,16 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
 impl Default for ComAmazonawsAthenaAmazonathenaState {
     /// A store holding nothing a request wrote, opened NOW: the account's default
     /// workgroup dates from this instant (see [`Self::opened_at`]), which is why this
-    /// store is constructed rather than derived.
+    /// store is constructed rather than derived — and it is SEEDED here, because every
+    /// account has it before any request is made.
     fn default() -> Self {
+        let opened_at = SystemTime::now();
         Self {
-            opened_at: SystemTime::now(),
-            work_groups: BTreeMap::new(),
+            opened_at,
+            work_groups: BTreeMap::from([(
+                DEFAULT_WORK_GROUP.to_string(),
+                default_work_group_record(opened_at),
+            )]),
             data_catalogs: BTreeMap::new(),
             query_executions: HashMap::new(),
             query_execution_order: Vec::new(),
