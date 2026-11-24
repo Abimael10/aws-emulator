@@ -6,7 +6,9 @@
 //! the resource already carries takes the new value and every other key it carries is
 //! kept, in the one record the resource's own reader answers from
 //! ([`crate::state::with_resource_tags_mut`]). An ARN this store holds no resource for
-//! is answered as absent and nothing is written.
+//! is refused in the SAME class the resource's own reader refuses it in — an id another
+//! app environment owns is the wrong scope (400), an id no app environment holds in the
+//! ARN's collection is absent (404) — and nothing is written either way.
 //!
 //! ## Shape of an operation
 //!
@@ -164,14 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.resource_arn,
             |tags| tags.extend(input.tags),
         );
-        if written.is_none() {
-            // Nothing was written: an ARN that names no resource this store holds —
-            // including one that is not an ARN of this service at all — is absent, the
-            // modelled `ResourceNotFoundException` (404).
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
+        if let Err(miss) = written {
+            // Nothing was written. An ARN carries the (appId, environmentName, id) triple
+            // this store keys every resource by, so the miss is classified exactly as the
+            // resource's own reader classifies it; what is this operation's own is the
+            // error enum the two classes are carried in and, like a read, the reading
+            // not-found payload. An ARN naming no resource kind of this service at all
+            // names no record of any collection, so it is absent too.
+            return Err(miss
+                .refusal(
+                    TagResourceErrorModeled::InvalidParameterException,
+                    TagResourceErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
+                )
+                .into());
         }
 
         // The modelled output carries no members.

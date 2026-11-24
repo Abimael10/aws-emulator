@@ -19,12 +19,17 @@
 //!    value, every other key it carries is kept — and `UntagResource` removes exactly the
 //!    named keys and is idempotent. What either writes is what `ListTagsForResource` and
 //!    the resource's own reader read back, because there is one stored tag set, not two.
-//! 3. ABSENCE. An ARN that names no resource this store holds — an unknown id, another app
-//!    environment, a deleted resource, a collection this service names no resource kind
-//!    with, another service's ARN, or a string that is not an ARN at all — is refused on
-//!    all three operations with HTTP 404 and this service's one not-found literal, and
-//!    changes nothing.
-//! 4. The partition, region and account elements of the ARN do not decide which resource
+//! 3. ABSENCE. An ARN that names no resource this store holds under its collection — an
+//!    unknown id, a deleted resource, an id of another collection, a collection this
+//!    service names no resource kind with, another service's ARN, or a string that is not
+//!    an ARN at all — is refused on all three operations with HTTP 404 and this service's
+//!    one not-found literal, and changes nothing.
+//! 4. WRONG SCOPE. An ARN whose id names a resource of its collection that ANOTHER app
+//!    environment owns is not absent: it is a request made in the wrong scope, refused on
+//!    all three operations with HTTP 400 and this service's one wrong-scope sentence —
+//!    the same class the resource's own reader, update and delete answer over that very
+//!    (appId, environmentName, id) triple — and it changes nothing either.
+//! 5. The partition, region and account elements of the ARN do not decide which resource
 //!    it names: this store keys every resource by (appId, environmentName, id) alone and
 //!    the emulator serves a single account, so the same resource is addressed through any
 //!    of them.
@@ -33,6 +38,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::WRONG_SCOPE_MESSAGE;
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -557,8 +563,8 @@ async fn an_arn_that_names_no_resource_is_absent_on_every_tagging_operation() {
         .map(|(_, id)| id.clone())
         .expect("a live component was created");
 
-    // The rows differ along WHY the ARN names nothing: the id, the app environment, the
-    // resource's lifetime, the collection, the service, and the form of the string itself.
+    // The rows differ along WHY the ARN names nothing: the id, the resource's lifetime,
+    // the collection, the service, and the form of the string itself.
     let absent: Vec<(&str, String)> = vec![
         (
             "an id no resource of this app environment holds",
@@ -570,20 +576,19 @@ async fn an_arn_that_names_no_resource_is_absent_on_every_tagging_operation() {
             ),
         ),
         (
-            "a live id under another app",
-            arn("components", "d9999zzzz", ENVIRONMENT, &live_component),
-        ),
-        (
-            "a live id under another environment",
-            arn("components", APP_ID, "production", &live_component),
-        ),
-        (
             "a deleted resource",
             arn("components", APP_ID, ENVIRONMENT, &deleted_id),
         ),
         (
             "an id that names no resource of the ARN's collection",
             arn("codegen-jobs", APP_ID, ENVIRONMENT, &live_component),
+        ),
+        (
+            // The class is decided per COLLECTION, exactly as the resource's own reader
+            // decides it: no codegen job anywhere holds a component's id, so this names
+            // nothing rather than naming something another app environment owns.
+            "an id of another collection, under another app environment",
+            arn("codegen-jobs", "d9999zzzz", "production", &live_component),
         ),
         (
             "a collection this service names no resource kind with",
@@ -644,6 +649,87 @@ async fn an_arn_that_names_no_resource_is_absent_on_every_tagging_operation() {
             &router,
             collection,
             id,
+            &json!({"env": "test"}),
+        )
+        .await;
+    }
+}
+
+/// An ARN whose id names a resource of its collection that ANOTHER app environment owns is
+/// a request made in the wrong scope on every tagging operation: HTTP 400 with this
+/// service's one wrong-scope sentence, the same answer the resource's own reader gives for
+/// that very (appId, environmentName, id) triple, and nothing written.
+#[tokio::test]
+async fn an_id_another_app_environment_owns_is_the_wrong_scope_on_every_tagging_operation() {
+    let router = emulator();
+
+    // The rows differ in which half of the (appId, environmentName) pair the ARN gets
+    // wrong, which is what the rule generalises over.
+    let scopes = [
+        ("another app, the same environment", "d9999zzzz", ENVIRONMENT),
+        ("the same app, another environment", APP_ID, "production"),
+        ("another app and another environment", "d0mf86cg35xrtv", "dev-2"),
+    ];
+
+    for collection in COLLECTIONS {
+        let created = create(
+            &router,
+            collection,
+            APP_ID,
+            ENVIRONMENT,
+            "Owned",
+            Some(&json!({"env": "test"})),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "the {collection} create must succeed, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created.id();
+
+        for (scope, app_id, environment) in scopes {
+            let resource_arn = arn(collection, app_id, environment, &id);
+            for (operation, answer) in [
+                ("ListTagsForResource", list_tags(&router, &resource_arn).await),
+                (
+                    "TagResource",
+                    tag(&router, &resource_arn, &json!({"env": "prod"})).await,
+                ),
+                (
+                    "UntagResource",
+                    untag(&router, &resource_arn, &["env".to_string()]).await,
+                ),
+                // The resource's OWN reader, over the same triple: the two readers of one
+                // resource classify a miss the same way, which is the rule under test.
+                (
+                    "the resource's own reader",
+                    read_resource(&router, collection, app_id, environment, &id).await,
+                ),
+            ] {
+                let case = format!("{scope} on {operation} of a {collection} resource");
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: an id another app environment owns must answer HTTP 400, \
+                     got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.message(),
+                    WRONG_SCOPE_MESSAGE,
+                    "case {case:?}: expected the message {WRONG_SCOPE_MESSAGE:?}, got {:?}",
+                    answer.message()
+                );
+            }
+        }
+
+        // None of those refusals touched the resource: its owner still serves exactly the
+        // tag set its create persisted.
+        assert_tags(
+            &format!("after the wrong-scope refusals, the owned {collection} resource"),
+            &router,
+            collection,
+            &id,
             &json!({"env": "test"}),
         )
         .await;

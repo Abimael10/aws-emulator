@@ -22,8 +22,11 @@
 //! 2. `TagResource` merges into that set and `UntagResource` removes exactly the named
 //!    keys, and both readers read back what either wrote.
 //! 3. Tagging a job is not an UPDATE of it: nothing else about the record moves.
-//! 4. A `codegen-jobs` ARN that names no job this store holds is refused with HTTP 404 and
-//!    this service's one not-found literal, and changes nothing.
+//! 4. A `codegen-jobs` ARN that names no job this store holds under the app environment it
+//!    addresses is refused with HTTP 404 and this service's one not-found literal, and
+//!    changes nothing — unless the id names a job ANOTHER app environment owns, which is a
+//!    request made in the wrong scope: HTTP 400 and the wrong-scope sentence, the same
+//!    class `GetCodegenJob` answers over that triple.
 //!
 //! `resource_tagging.rs` owns the surface's rules over every kind at once; this suite is the
 //! codegen job's own end-to-end coverage, including the members a tag write must leave
@@ -34,6 +37,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::WRONG_SCOPE_MESSAGE;
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -518,8 +522,8 @@ async fn a_codegen_job_arn_naming_no_job_is_absent_on_every_tagging_operation() 
     );
     let live_id = live.id();
 
-    // The rows differ along WHY the ARN names nothing: the id, the app, the environment,
-    // and the collection the live id is addressed through.
+    // The rows differ along WHY the ARN names nothing: the id, the collection the live id
+    // is addressed through, and the form of the id itself.
     let absent: Vec<(&str, String)> = vec![
         (
             "an id no job of this app environment holds",
@@ -531,16 +535,14 @@ async fn a_codegen_job_arn_naming_no_job_is_absent_on_every_tagging_operation() 
             ),
         ),
         (
-            "a live job id under another app",
-            arn(CODEGEN_JOBS, "d9999zzzz", ENVIRONMENT, &live_id),
-        ),
-        (
-            "a live job id under another environment",
-            arn(CODEGEN_JOBS, APP_ID, "production", &live_id),
-        ),
-        (
             "a live job id under another collection of this service",
             arn("components", APP_ID, ENVIRONMENT, &live_id),
+        ),
+        (
+            // The class is decided per COLLECTION, as `GetComponent` decides it: no
+            // component anywhere holds a job's id, so this names nothing.
+            "a live job id under another collection, in another app environment",
+            arn("components", "d9999zzzz", "production", &live_id),
         ),
         (
             "an ARN with an empty job id",
@@ -578,6 +580,80 @@ async fn a_codegen_job_arn_naming_no_job_is_absent_on_every_tagging_operation() 
     // None of those refusals touched the live job's stored tag set.
     assert_tags(
         "after the refusals, the live job",
+        &router,
+        &live_id,
+        &json!({"team": "ui"}),
+    )
+    .await;
+}
+
+/// A `codegen-jobs` ARN whose id names a job ANOTHER app environment owns is not absent: it
+/// is a request made in the wrong scope on every tagging operation, exactly as it is on
+/// `GetCodegenJob`, and changes nothing.
+#[tokio::test]
+async fn a_job_id_another_app_environment_owns_is_the_wrong_scope_on_every_tagging_operation() {
+    let router = emulator();
+
+    let live = start_job(&router, APP_ID, ENVIRONMENT, Some(&json!({"team": "ui"}))).await;
+    assert_eq!(
+        live.status, 200,
+        "the start must succeed, got {} with {:?}",
+        live.status, live.body
+    );
+    let live_id = live.id();
+
+    // The rows differ in which half of the (appId, environmentName) pair the ARN gets
+    // wrong, and whether the addressed app environment holds a job of its own.
+    let own_job = start_job(&router, APP_ID, "production", Some(&json!({"team": "docs"}))).await;
+    assert_eq!(
+        own_job.status, 200,
+        "the second start must succeed, got {} with {:?}",
+        own_job.status, own_job.body
+    );
+    let scopes = [
+        ("an empty other app", "d9999zzzz", ENVIRONMENT),
+        ("an other environment holding a job of its own", APP_ID, "production"),
+        ("another app and another environment", "d0mf86cg35xrtv", "dev-2"),
+    ];
+
+    for (scope, app_id, environment) in scopes {
+        let resource_arn = arn(CODEGEN_JOBS, app_id, environment, &live_id);
+        for (operation, answer) in [
+            ("ListTagsForResource", list_tags(&router, &resource_arn).await),
+            (
+                "TagResource",
+                tag(&router, &resource_arn, &json!({"env": "prod"})).await,
+            ),
+            (
+                "UntagResource",
+                untag(&router, &resource_arn, &["team".to_string()]).await,
+            ),
+            // The job's own reader, over the same triple: the two readers of one job
+            // classify a miss the same way.
+            (
+                "GetCodegenJob",
+                get_job(&router, app_id, environment, &live_id).await,
+            ),
+        ] {
+            let case = format!("{scope} on {operation}");
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: a job id another app environment owns must answer HTTP 400, got \
+                 {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                WRONG_SCOPE_MESSAGE,
+                "case {case:?}: expected the message {WRONG_SCOPE_MESSAGE:?}, got {:?}",
+                answer.message()
+            );
+        }
+    }
+
+    // None of those refusals touched the live job's stored tag set.
+    assert_tags(
+        "after the wrong-scope refusals, the live job",
         &router,
         &live_id,
         &json!({"team": "ui"}),

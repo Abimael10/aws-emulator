@@ -5,8 +5,9 @@
 //! Reports the tag set the resource a `resourceArn` names carries. A pure read: the
 //! tags come out of the one record the resource's own reader answers from
 //! ([`crate::state::resource_tags`]), and an ARN this store holds no resource for is
-//! answered as absent — the same class every other reader of this service answers for
-//! an identifier that names nothing.
+//! refused in the SAME class that reader refuses it in — an id another app environment
+//! owns is the wrong scope (400), an id no app environment holds in the ARN's
+//! collection is absent (404).
 //!
 //! ## Shape of an operation
 //!
@@ -160,16 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A REPORTING call: the tag set is read out of the resource's own record and
         // nothing is written, so a later caller sees exactly what this one saw.
         let store = state.lock();
-        let Some(tags) = crate::state::resource_tags(&store, &input.resource_arn) else {
-            // An ARN that names no resource this store holds — including one that is not
-            // an ARN of this service at all, which names no resource either — is absent:
-            // the modelled `ResourceNotFoundException` (404), carrying the one not-found
-            // literal this service answers a read with.
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
+        let tags = crate::state::resource_tags(&store, &input.resource_arn).map_err(|miss| {
+            // An ARN carries the (appId, environmentName, id) triple this store keys
+            // every resource by, so the miss is classified exactly as the resource's own
+            // reader classifies it; what is this operation's own is which error enum
+            // carries the two classes and, for a read, that the absent payload is the
+            // reading one. An ARN naming no resource kind of this service at all names
+            // no record of any collection, so it is absent too.
+            miss.refusal(
+                ListTagsForResourceErrorModeled::InvalidParameterException,
+                ListTagsForResourceErrorModeled::ResourceNotFoundException,
+                crate::state::item_not_found,
             )
-            .into());
-        };
+        })?;
 
         // `tags` is `@required` on the output: a resource carrying no tag answers the
         // empty map, which is not the same answer as a missing member.

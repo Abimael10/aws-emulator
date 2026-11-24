@@ -52,7 +52,9 @@
 //! `tags` of the one record the resource's own reader answers from.
 //! [`parse_resource_arn`] is what resolves a `resourceArn` to that record, and
 //! [`resource_tags`] / [`with_resource_tags_mut`] are the one read and the one
-//! write over it.
+//! write over it. An ARN carries the (appId, environmentName, id) triple every
+//! reader of this store is keyed by, so a tagging miss is classified as the
+//! [`IdMiss`] every other reader of that triple classifies one into.
 //!
 //! ## The page walk
 //!
@@ -2454,24 +2456,54 @@ pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
     })
 }
 
-/// The tags the resource `arn` names carries, or `None` when this store holds no
-/// such resource.
+/// Which class a tagging miss of `resource` falls into: the one place the tagging
+/// surface classifies one, decided by the SAME per-kind test the resource's own
+/// reader consults, so the two readers of one resource cannot disagree about what
+/// kind of failure a miss is.
 ///
-/// A resource carrying no tag answers the EMPTY map: `tags` is `@required` on
-/// `ListTagsForResourceResponse`, so "no tags" is an empty map there and only "no
-/// such resource" is an absence. A pure read — the tag set every other reader of
-/// that resource reports, cloned out of the one record holding it.
-pub fn resource_tags(
+/// An ARN carries exactly the (appId, environmentName, id) triple every reader of
+/// this store is keyed by, so a tagging miss is an [`IdMiss`] like any other, told
+/// apart in the collection the ARN's own element names.
+fn classify_tagged_miss(
     state: &ComAmazonawsAmplifyuibuilderAmplifyuibuilderState,
-    arn: &str,
-) -> Option<HashMap<String, String>> {
-    let resource = parse_resource_arn(arn)?;
+    resource: &TaggedResource,
+) -> IdMiss {
     let (app, environment, id) = (
         resource.app_id.as_str(),
         resource.environment_name.as_str(),
         resource.id.as_str(),
     );
     match resource.kind {
+        TaggedKind::Component => state.classify_component_miss(app, environment, id),
+        TaggedKind::Form => state.classify_form_miss(app, environment, id),
+        TaggedKind::Theme => state.classify_theme_miss(app, environment, id),
+        TaggedKind::CodegenJob => state.classify_codegen_job_miss(app, environment, id),
+    }
+}
+
+/// The tags the resource `arn` names carries, or — when this store holds no such
+/// resource — how that miss is classified.
+///
+/// A resource carrying no tag answers the EMPTY map: `tags` is `@required` on
+/// `ListTagsForResourceResponse`, so "no tags" is an empty map there and only "no
+/// such resource" is an absence. A pure read — the tag set every other reader of
+/// that resource reports, cloned out of the one record holding it.
+///
+/// An `arn` that names no resource kind of this service at all names no record of
+/// any collection, so it is [`IdMiss::Absent`].
+pub fn resource_tags(
+    state: &ComAmazonawsAmplifyuibuilderAmplifyuibuilderState,
+    arn: &str,
+) -> Result<HashMap<String, String>, IdMiss> {
+    let Some(resource) = parse_resource_arn(arn) else {
+        return Err(IdMiss::Absent);
+    };
+    let (app, environment, id) = (
+        resource.app_id.as_str(),
+        resource.environment_name.as_str(),
+        resource.id.as_str(),
+    );
+    let held = match resource.kind {
         TaggedKind::Component => state
             .component(app, environment, id)
             .map(|component| component.tags.clone()),
@@ -2482,28 +2514,32 @@ pub fn resource_tags(
         TaggedKind::CodegenJob => state
             .codegen_job(app, environment, id)
             .map(|job| job.tags.clone()),
-    }
+    };
+    held.ok_or_else(|| classify_tagged_miss(state, &resource))
 }
 
-/// Hand the tag set of the resource `arn` names to `change`, or answer `None`
-/// when this store holds no such resource.
+/// Hand the tag set of the resource `arn` names to `change`, or — when this store
+/// holds no such resource — report how that miss is classified.
 ///
 /// The one place a tagging WRITE resolves its target, so `TagResource` and
 /// `UntagResource` change exactly the record [`resource_tags`] and the resource's
-/// own reader report. Only the tag set is touched: tagging a resource is not an
-/// update of it, so nothing else about the record moves.
+/// own reader report, and a miss is classified exactly as that read classifies
+/// it. Only the tag set is touched: tagging a resource is not an update of it, so
+/// nothing else about the record moves — and a miss changes nothing at all.
 pub fn with_resource_tags_mut<R>(
     state: &mut ComAmazonawsAmplifyuibuilderAmplifyuibuilderState,
     arn: &str,
     change: impl FnOnce(&mut HashMap<String, String>) -> R,
-) -> Option<R> {
-    let resource = parse_resource_arn(arn)?;
+) -> Result<R, IdMiss> {
+    let Some(resource) = parse_resource_arn(arn) else {
+        return Err(IdMiss::Absent);
+    };
     let (app, environment, id) = (
         resource.app_id.as_str(),
         resource.environment_name.as_str(),
         resource.id.as_str(),
     );
-    match resource.kind {
+    let changed = match resource.kind {
         TaggedKind::Component => state
             .component_mut(app, environment, id)
             .map(|component| change(&mut component.tags)),
@@ -2516,7 +2552,8 @@ pub fn with_resource_tags_mut<R>(
         TaggedKind::CodegenJob => state
             .codegen_job_mut(app, environment, id)
             .map(|job| change(&mut job.tags)),
-    }
+    };
+    changed.ok_or_else(|| classify_tagged_miss(state, &resource))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
