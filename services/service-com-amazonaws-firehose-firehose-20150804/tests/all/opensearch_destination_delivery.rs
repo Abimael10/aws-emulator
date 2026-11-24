@@ -32,6 +32,14 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state as search_st
 use crate::delivery_stream_lifecycle::{REGION, ROLE_ARN};
 use crate::destination_delivery::{base64, Emulator};
 
+/// Which documents of ONE mixed batch the destination index's mappings accept, and the
+/// vocabulary the failed ones are reported in. A child of THIS suite rather than a suite
+/// beside it, so the domain, index, stream and backup harness above is the one it drives;
+/// the `#[path]` points it into this suite's own folder, the way `destination_delivery`
+/// declares its children.
+#[path = "opensearch_destination_delivery/failed_document_error_output.rs"]
+mod failed_document_error_output;
+
 /// How long a delivery is waited for before the case fails: far longer than the
 /// emulator's delivery span, so a slow machine does not fail a case the clock would have
 /// served.
