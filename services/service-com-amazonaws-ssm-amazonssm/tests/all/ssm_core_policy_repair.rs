@@ -38,12 +38,13 @@ use crate::ec2_managed_node_registration::{
 use crate::parameter_store::{call_in_region, REGION};
 
 /// The instance type every host is launched as, a current general-purpose one.
-const INSTANCE_TYPE: &str = "t3.micro";
+pub(crate) const INSTANCE_TYPE: &str = "t3.micro";
 
 /// The public Systems Manager parameter the Amazon Linux 2 image id is resolved through —
 /// the other published Amazon Linux family beside the AL2023 one, so the rule is exercised on
 /// two different images (`published_amazon_linux_specs` publishes both aliases).
-const AL2_PARAMETER: &str = "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2";
+pub(crate) const AL2_PARAMETER: &str =
+    "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2";
 
 /// The address range of the VPC the scenario builds for itself.
 const VPC_CIDR: &str = "10.0.0.0/16";
@@ -56,7 +57,7 @@ const DEFAULT_ROUTE: &str = "0.0.0.0/0";
 
 /// The `PingStatus` a managed node whose agent is reporting carries
 /// (`InstanceInformation$PingStatus`, `PingStatusType`).
-const PING_STATUS_ONLINE: &str = "Online";
+pub(crate) const PING_STATUS_ONLINE: &str = "Online";
 
 /// When the registration grant reaches one host's role, relative to the launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,13 +126,13 @@ const ROWS: &[Row] = &[
 ];
 
 /// The public subnet every host is launched into, and the security group it carries.
-struct PublicSubnet {
-    subnet_id: String,
-    group_id: String,
+pub(crate) struct PublicSubnet {
+    pub(crate) subnet_id: String,
+    pub(crate) group_id: String,
 }
 
 /// One Amazon EC2 action that must succeed, as its XML body.
-async fn ec2_ok(
+pub(crate) async fn ec2_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -148,7 +149,7 @@ async fn ec2_ok(
 /// Build the public subnet a client builds for hosts it means to manage: its own VPC, an
 /// internet gateway with a default route to it, public addressing on launch, and one security
 /// group of its own.
-async fn public_subnet(router: &MultiServiceRouter) -> PublicSubnet {
+pub(crate) async fn public_subnet(router: &MultiServiceRouter) -> PublicSubnet {
     let case = "the public subnet";
     let body = ec2_ok(router, case, "CreateVpc", &[("CidrBlock", VPC_CIDR)]).await;
     let vpc_id = element(&body, "vpcId")
@@ -264,7 +265,7 @@ async fn launch(
 
 /// Every `InstanceInformation` this service reports for the node id `instance_id`, read the
 /// way a client asks whether one host is managed — the server-side `InstanceIds` filter.
-async fn rows_for(router: &MultiServiceRouter, instance_id: &str) -> Vec<Value> {
+pub(crate) async fn rows_for(router: &MultiServiceRouter, instance_id: &str) -> Vec<Value> {
     let (status, body) = call_in_region(
         router,
         REGION,
@@ -283,7 +284,7 @@ async fn rows_for(router: &MultiServiceRouter, instance_id: &str) -> Vec<Value> 
 }
 
 /// Look again until exactly one row is reported for `instance_id`, and answer it.
-async fn reported_when_registered(
+pub(crate) async fn reported_when_registered(
     router: &MultiServiceRouter,
     case: &str,
     instance_id: &str,
@@ -326,7 +327,7 @@ async fn reported_when_withdrawn(router: &MultiServiceRouter, case: &str, instan
 }
 
 /// Assert one reported row is this host's and reports its agent as reporting.
-fn assert_online(case: &str, instance_id: &str, reported: &Value) {
+pub(crate) fn assert_online(case: &str, instance_id: &str, reported: &Value) {
     assert_eq!(
         reported["InstanceId"].as_str(),
         Some(instance_id),
