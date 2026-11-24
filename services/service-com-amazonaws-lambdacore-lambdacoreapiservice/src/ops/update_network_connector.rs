@@ -431,8 +431,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version_arn = connector.version_arn(version);
         // The update's own answer carries the transient (`LastUpdateStatus`
         // `InProgress`, and the appended version still `PENDING`); the outcome
-        // is owed from the instant this call started the work, so the first
-        // report of the connector after it already carries `Successful`.
+        // falls due a span past the call that started the work, so every report
+        // taken while it is in flight still carries the update in flight.
         let settles_at = crate::state::settles_at(now);
         connector.versions.insert(
             version,

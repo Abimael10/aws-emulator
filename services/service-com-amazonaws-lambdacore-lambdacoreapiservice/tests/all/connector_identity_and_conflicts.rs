@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use crate::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use crate::network_connector_lifecycle::{
     assert_conflict, at, create, delete, emulator, emulator_with_engine, expected_arn, get, list,
-    list_versions, minimal_create, text, update, vpc_egress,
+    list_versions, minimal_create, provisioned, text, update, vpc_egress,
 };
 
 /// What every ARN of a connector carries before the identifier of the resource.
@@ -82,8 +82,11 @@ async fn every_arn_a_connector_is_reported_under_names_its_id() {
         );
 
         // Each extra version is appended by an update, so the qualified ARNs below span
-        // more than the first version. The create's provisioning has settled by the time
-        // the next call arrives, so the connector is ACTIVE and accepts them.
+        // more than the first version. An update needs an ACTIVE connector, so the row
+        // polls for the provisioning the create started rather than racing it.
+        if extra_versions > 0 {
+            provisioned(&router, name).await;
+        }
         for extra in 0..extra_versions {
             let subnets: Vec<String> = (0..=extra)
                 .map(|index| format!("subnet-0123456789abcde{index:01x}"))

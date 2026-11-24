@@ -341,9 +341,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The network connector starts in PENDING state while ENIs are
         // provisioned in your VPC": the clock owes it ACTIVE, and nothing a
         // caller does brings that forward or holds it back — the transient is
-        // this answer's own `State`, and the settlement is owed from the
-        // instant this call started it ([`crate::state::settles_at`]), so the
-        // first report of the connector after it already carries ACTIVE.
+        // this answer's own `State` and the one every operation reports until
+        // the provisioning falls due ([`crate::state::settles_at`]), which is
+        // what makes PENDING a state a client can poll for and the state the
+        // gates on ACTIVE are stated over.
         let provisioned = crate::state::PendingTransition {
             due: crate::state::settles_at(now),
             change: crate::state::PendingChange::State(crate::state::STATE_ACTIVE.to_string()),

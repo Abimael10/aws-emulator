@@ -23,12 +23,12 @@
 //!    own.
 //!
 //! 2. Every operation reports the state the resource has REACHED: the outcome of
-//!    asynchronous work is owed from the instant the call that started it answered, so the
-//!    FIRST call after it reports that outcome and no reached state is withheld from a
-//!    caller that polls the documented way — however often, or seldom, it looks. The
-//!    transient (`PENDING`, `InProgress`, `DELETING`) is carried by the answer of the call
-//!    that starts the work, and a deletion keeps the window the model's idempotent repeat
-//!    is stated over.
+//!    asynchronous work falls due a window past the call that started it, so a report taken
+//!    inside that window still carries the transient (`PENDING`, `InProgress`, `DELETING`)
+//!    the starting call's own answer carried, the FIRST call at or after the due instant
+//!    reports the outcome, and nothing is withheld from a caller that polls the documented
+//!    way — however often, or seldom, it looks. The window a deletion keeps open is the one
+//!    the model's idempotent repeat is stated over.
 //!
 //! The harness (router, request helpers) is the lifecycle suite's; it is `pub(crate)` there
 //! so every suite drives the emulator the same way. A case that needs a transition NOT to
@@ -43,7 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
     at, create, delete, emulator, emulator_with_engine, expected_arn, get, list,
-    minimal_configuration, minimal_create, text, update, vpc_egress, Answer, OPERATOR_ROLE,
+    minimal_configuration, minimal_create, provisioned, text, update, vpc_egress, Answer,
+    OPERATOR_ROLE,
 };
 use super::not_found_message::{expected_message, expected_update_message};
 
@@ -52,8 +53,9 @@ use super::not_found_message::{expected_message, expected_update_message};
 /// carried.
 const DELETING: &str = "DELETING";
 
-/// Create `name` and answer the connector's id. Provisioning settles from the instant the
-/// create answered, so the next call finds the connector `ACTIVE` and deletable.
+/// Create `name` and answer the connector's id, once its provisioning has fallen due: the
+/// create leaves the connector `PENDING`, and an update or a delete needs it `ACTIVE`, so
+/// the helper polls for that state rather than racing the transition.
 async fn active_connector(router: &MultiServiceRouter, name: &str, subnets: &[&str]) -> String {
     let created = create(
         router,
@@ -69,6 +71,7 @@ async fn active_connector(router: &MultiServiceRouter, name: &str, subnets: &[&s
         "creating {name:?} must succeed, got {} with {:?}",
         created.status, created.body
     );
+    provisioned(router, name).await;
     text(&created.body, "/Id")
 }
 
@@ -460,7 +463,14 @@ async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
     assert_not_found("the dead id through Delete", &repeated, &first_id);
 
     // Deleting by NAME now addresses the live connector, which is the one that goes — and
-    // it answers under its OWN ARN, whose resource segment is its own Id.
+    // it answers under its OWN ARN, whose resource segment is its own Id. A delete needs it
+    // ACTIVE, which is what the clock owes the re-created connector.
+    reschedule(
+        &engine,
+        name,
+        "the provisioning of the re-created connector",
+        SystemTime::now() - ALREADY_DUE,
+    );
     let live = delete(&router, name).await;
     assert_accepted(
         "the live connector by name",
@@ -471,12 +481,13 @@ async fn a_freed_name_rebinds_while_the_old_id_names_nothing() {
     );
 }
 
-/// RULE 2: the first call after the one that started asynchronous work already reports the
-/// value the work reached — nothing is withheld for a later call — and the transient is
-/// carried by the starting call's own answer.
+/// RULE 2: the transient a call's own answer carries is what every report inside the window
+/// the work is in flight reports, the first call at or after the due instant reports the
+/// value the work reached, and nothing is withheld for a later call.
 #[tokio::test]
 async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state() {
-    // Provisioning: the create answers PENDING, and the FIRST call after it reports ACTIVE.
+    // Provisioning: the create answers PENDING, a read inside the window still reports
+    // PENDING, and the first call once it has fallen due reports ACTIVE.
     let (router, engine) = emulator_with_engine();
     let created = create(&router, minimal_create("settling")).await;
     assert_eq!(
@@ -485,27 +496,46 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
         "the create itself carries the transient state, got {:?}",
         at(&created.body, "/State")
     );
+    let while_provisioning = get(&router, "settling").await;
+    assert_eq!(
+        text(&while_provisioning.body, "/State"),
+        "PENDING",
+        "a read taken while the provisioning is in flight reports PENDING, got {:?}",
+        at(&while_provisioning.body, "/State")
+    );
+    reschedule(
+        &engine,
+        "settling",
+        "provisioning that has fallen due",
+        SystemTime::now() - ALREADY_DUE,
+    );
     let settled = get(&router, "settling").await;
     assert_eq!(
         text(&settled.body, "/State"),
         "ACTIVE",
-        "the first read after the create reports the state provisioning reached, got {:?}",
+        "the first read after provisioning fell due reports the state it reached, got {:?}",
         at(&settled.body, "/State")
     );
 
     // The same with NO read in between: nothing was waiting for an earlier call to
     // materialise it, so a client whose budget allows a single look still sees it.
-    let (second_router, _second_engine) = emulator_with_engine();
+    let (second_router, second_engine) = emulator_with_engine();
     create(&second_router, minimal_create("unread")).await;
+    reschedule(
+        &second_engine,
+        "unread",
+        "provisioning nobody has read",
+        SystemTime::now() - ALREADY_DUE,
+    );
     let first_read = get(&second_router, "unread").await;
     assert_eq!(
         text(&first_read.body, "/State"),
         "ACTIVE",
-        "the very first read after a create reports ACTIVE, got {:?}",
+        "the very first read after provisioning fell due reports ACTIVE, got {:?}",
         at(&first_read.body, "/State")
     );
 
-    // An update's own asynchronous work, reported by the first read after it.
+    // An update's own asynchronous work, the same way.
     let updated = update(
         &router,
         "settling",
@@ -518,11 +548,24 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
         "the update itself carries the transient status, got {:?}",
         at(&updated.body, "/LastUpdateStatus")
     );
+    let during_update = get(&router, "settling").await;
+    assert_eq!(
+        text(&during_update.body, "/LastUpdateStatus"),
+        "InProgress",
+        "a read taken while the update is in flight reports InProgress, got {:?}",
+        at(&during_update.body, "/LastUpdateStatus")
+    );
+    reschedule(
+        &engine,
+        "settling",
+        "an update that has fallen due",
+        SystemTime::now() - ALREADY_DUE,
+    );
     let after_update = get(&router, "settling").await;
     assert_eq!(
         text(&after_update.body, "/LastUpdateStatus"),
         "Successful",
-        "the first read after the update reports Successful, got {:?}",
+        "the first read after the update fell due reports Successful, got {:?}",
         at(&after_update.body, "/LastUpdateStatus")
     );
 

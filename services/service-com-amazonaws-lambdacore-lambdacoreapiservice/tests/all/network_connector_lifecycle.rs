@@ -9,18 +9,16 @@
 //! change, stored, every operation computes its answer from that record, and "each
 //! configuration update creates a new immutable version".
 //!
-//! The harness below (router, request helpers, the clock wait) is `pub(crate)` so the
-//! sibling suite `timestamp_and_state_reason_wire.rs` drives the emulator the same way
-//! rather than keeping a second copy of it.
+//! The harness below (router, request helpers, the poll loops) is `pub(crate)` so the
+//! sibling suites drive the emulator the same way rather than keeping a second copy of it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::{
-    ComAmazonawsLambdacoreLambdacoreapiserviceState, DELETION_COMPLETES_AFTER,
-    MAX_IDEMPOTENCY_TOKENS,
+    ComAmazonawsLambdacoreLambdacoreapiserviceState, MAX_IDEMPOTENCY_TOKENS,
 };
 use service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -239,14 +237,80 @@ fn listed_versions(answer: &Answer) -> Vec<i64> {
         .collect()
 }
 
-/// Wait out the one span this control plane still owes to the clock — the window a deleted
-/// connector stays in the store ([`DELETION_COMPLETES_AFTER`]) — then a margin. Nothing is
-/// called here: the transition is owed by the clock, not by a request.
+/// How long the poll helpers below keep looking before they give up.
 ///
-/// Provisioning and an update settle from the instant the call that starts them answered,
-/// so a case that only needs an `ACTIVE` connector needs no wait at all.
-pub(crate) fn wait_for_the_clock() {
-    std::thread::sleep(DELETION_COMPLETES_AFTER + Duration::from_millis(250));
+/// Generous: each condition is owed by the emulator's clock, and nothing in this suite
+/// family measures how long it took to fall due — only that it does, with no call to bring
+/// it forward.
+const POLL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long those helpers wait between two looks.
+const BETWEEN_LOOKS: Duration = Duration::from_millis(25);
+
+/// Look again at what `look` answers until `condition` holds of it, and answer that. Panics
+/// naming `what` once the deadline passes.
+///
+/// Every wait in this suite family is this loop: a transition the clock owes falls due on
+/// its own, so a case looks for the CONDITION and never for a span of the wall clock.
+pub(crate) async fn poll_until<Look, Fut>(
+    what: &str,
+    look: Look,
+    condition: impl Fn(&Answer) -> bool,
+) -> Answer
+where
+    Look: Fn() -> Fut,
+    Fut: std::future::Future<Output = Answer>,
+{
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let answer = look().await;
+        if condition(&answer) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the condition never held, last answer {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        std::thread::sleep(BETWEEN_LOOKS);
+    }
+}
+
+/// The connector `identifier` names once its provisioning has finished — the convergence
+/// `CreateNetworkConnector` documents, "use `GetNetworkConnector` to poll the connector
+/// state until it reaches `ACTIVE`". A case that needs a connector an update or a delete
+/// accepts polls for it here, because the create leaves the connector `PENDING` for as long
+/// as the provisioning it started is in flight.
+pub(crate) async fn provisioned(router: &MultiServiceRouter, identifier: &str) -> Answer {
+    poll_until(
+        &format!("the connector {identifier:?} reaches ACTIVE"),
+        move || get(router, identifier),
+        |answer| answer.status == 200 && text(&answer.body, "/State") == "ACTIVE",
+    )
+    .await
+}
+
+/// The same for an update in flight: `LastUpdateStatus` "transitions through `InProgress` to
+/// `Successful`".
+pub(crate) async fn update_settled(router: &MultiServiceRouter, identifier: &str) -> Answer {
+    poll_until(
+        &format!("the update of {identifier:?} reaches Successful"),
+        move || get(router, identifier),
+        |answer| answer.status == 200 && text(&answer.body, "/LastUpdateStatus") == "Successful",
+    )
+    .await
+}
+
+/// The answer to a read taken once a deletion has completed: "after deletion completes,
+/// subsequent calls to GetNetworkConnector return `ResourceNotFoundException`".
+pub(crate) async fn forgotten(router: &MultiServiceRouter, identifier: &str) -> Answer {
+    poll_until(
+        &format!("the connector {identifier:?} is forgotten"),
+        move || get(router, identifier),
+        |answer| answer.status == 404,
+    )
+    .await
 }
 
 /// A `VpcEgressConfiguration` built from its four modelled members, so a case can vary one
@@ -501,11 +565,12 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
     }
 }
 
-/// The create's own answer carries the transient `PENDING` the model documents for it, and
-/// the connector the clock owes `ACTIVE` is reported `ACTIVE` by the FIRST call after that
-/// create — through the read, the listing and the version listing alike.
+/// The create's own answer carries the transient `PENDING` the model documents for it, the
+/// read taken straight after it still reports `PENDING` while the provisioning the create
+/// started is in flight, and once it falls due every operation that reports the connector
+/// reports `ACTIVE` — the read, the listing and the version listing alike.
 #[tokio::test]
-async fn a_new_connector_reports_pending_on_the_create_and_active_on_the_first_read() {
+async fn a_new_connector_reports_pending_until_provisioning_falls_due_then_active() {
     let router = emulator();
     let created = create(&router, minimal_create("provisioning")).await;
     assert_eq!(
@@ -518,17 +583,25 @@ async fn a_new_connector_reports_pending_on_the_create_and_active_on_the_first_r
     let immediately = get(&router, "provisioning").await;
     assert_eq!(
         at(&immediately.body, "/State"),
-        json!("ACTIVE"),
-        "the first read after the create reports the state provisioning reached, got {:?}",
+        json!("PENDING"),
+        "the read taken straight after the create reports the connector as still \
+         provisioning, got {:?}",
         at(&immediately.body, "/State")
     );
 
-    let settled = get(&router, "provisioning").await;
+    let settled = provisioned(&router, "provisioning").await;
     assert_eq!(
         at(&settled.body, "/State"),
         json!("ACTIVE"),
-        "a connector that reached ACTIVE stays ACTIVE, got {:?}",
+        "the documented poll converges on ACTIVE, got {:?}",
         at(&settled.body, "/State")
+    );
+    let again = get(&router, "provisioning").await;
+    assert_eq!(
+        at(&again.body, "/State"),
+        json!("ACTIVE"),
+        "a connector that reached ACTIVE stays ACTIVE, got {:?}",
+        at(&again.body, "/State")
     );
     let listed = list(&router, "").await;
     assert_eq!(
@@ -706,8 +779,9 @@ async fn each_configuration_change_appends_a_version_and_a_no_op_does_not() {
         created.status, created.body
     );
     let arn = expected_arn(&text(&created.body, "/Id"));
-    // An update needs an ACTIVE connector, which the clock owes the new one.
-    wait_for_the_clock();
+    // An update needs an ACTIVE connector, which the clock owes the new one once the
+    // provisioning the create started falls due.
+    provisioned(&router, "versioned").await;
 
     let mut expected_version = 1_i64;
     let mut expected_configuration = base.clone();
@@ -794,8 +868,7 @@ async fn each_configuration_change_appends_a_version_and_a_no_op_does_not() {
     }
 
     // The update's own asynchronous work is owed by the clock too.
-    wait_for_the_clock();
-    let settled = get(&router, "versioned").await;
+    let settled = update_settled(&router, "versioned").await;
     assert_eq!(
         at(&settled.body, "/LastUpdateStatus"),
         json!("Successful"),
@@ -956,7 +1029,11 @@ async fn listing_pages_without_duplicates_and_filters_by_state() {
         );
     }
 
-    wait_for_the_clock();
+    // Every one of them has provisioning the clock owes, which the filter rows below are
+    // stated over once it has fallen due: the case polls for that rather than racing it.
+    for name in names {
+        provisioned(&router, name).await;
+    }
     for (case, state, expected) in [
         ("the state they all settled in", "ACTIVE", sorted.clone()),
         ("a state none of them is in", "DELETING", Vec::new()),
@@ -987,7 +1064,9 @@ async fn deleting_removes_the_connector_and_its_versions() {
     let created = create(&router, minimal_create("doomed")).await;
     let id = text(&created.body, "/Id");
     let arn = expected_arn(&id);
-    wait_for_the_clock();
+    // The updates and the delete below need an ACTIVE connector, which the clock owes the
+    // new one.
+    provisioned(&router, "doomed").await;
 
     // Three versions, so there is a historical version to remove on its own.
     for subnets in [
@@ -1078,8 +1157,7 @@ async fn deleting_removes_the_connector_and_its_versions() {
         at(&deleted.body, "/State")
     );
 
-    wait_for_the_clock();
-    let after = get(&router, "doomed").await;
+    let after = forgotten(&router, "doomed").await;
     assert!(
         after.is_error(404, "ResourceNotFoundException"),
         "\"after deletion completes, subsequent calls to GetNetworkConnector return \
@@ -1134,7 +1212,8 @@ async fn deleting_removes_the_connector_and_its_versions() {
 async fn version_listing_pages_and_filters() {
     let router = emulator();
     create(&router, minimal_create("paged")).await;
-    wait_for_the_clock();
+    // The updates that append the versions below need an ACTIVE connector.
+    provisioned(&router, "paged").await;
     for subnets in [
         vec!["subnet-0fedcba9876543210"],
         vec!["subnet-00112233445566778"],
@@ -1183,8 +1262,15 @@ async fn version_listing_pages_and_filters() {
         );
     }
 
-    wait_for_the_clock();
-    let active = list_versions(&router, "paged", "?State=ACTIVE").await;
+    // Every version the updates appended has provisioning the clock owes; the filter rows
+    // below are stated over the versions once it has fallen due.
+    let router_ref = &router;
+    let active = poll_until(
+        "every version of \"paged\" reaches ACTIVE",
+        move || list_versions(router_ref, "paged", "?State=ACTIVE"),
+        |answer| listed_versions(answer) == vec![1, 2, 3, 4],
+    )
+    .await;
     assert_eq!(
         listed_versions(&active),
         vec![1, 2, 3, 4],
@@ -1240,8 +1326,8 @@ async fn remembered_client_tokens_stay_bounded() {
         "the create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    wait_for_the_clock();
-
+    // The updates below need an ACTIVE connector, which the clock owes the new one.
+    provisioned(&router, "bounded").await;
     // A no-op update appends no version and consumes no quota, so the token map is the
     // only thing a caller could grow by repeating it with a new token each time.
     let repeats = MAX_IDEMPOTENCY_TOKENS + 50;

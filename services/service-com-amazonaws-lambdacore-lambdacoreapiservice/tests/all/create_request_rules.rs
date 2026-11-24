@@ -23,13 +23,13 @@
 //! Every refusal is also asserted to have changed NOTHING: the account still holds exactly
 //! the connectors it held, with the configuration and identity it held them under.
 //!
-//! The harness (router, request helpers, the clock wait) is the lifecycle suite's.
+//! The harness (router, request helpers, the poll loops) is the lifecycle suite's.
 
 use serde_json::json;
 
 use super::network_connector_lifecycle::{
-    at, create, emulator, get, list, minimal_configuration, minimal_create, text, update,
-    vpc_egress, wait_for_the_clock, Answer, OPERATOR_ROLE,
+    at, create, emulator, get, list, minimal_configuration, minimal_create, provisioned, text,
+    update, vpc_egress, Answer, OPERATOR_ROLE,
 };
 
 /// The only value `NetworkConnectorType` declares
@@ -341,7 +341,7 @@ async fn an_update_token_carrying_other_parameters_is_refused() {
         created.status, created.body
     );
     // An update needs an ACTIVE connector, which the clock owes the new one.
-    wait_for_the_clock();
+    provisioned(&router, name).await;
 
     let request = json!({
         "Configuration": vpc_egress(&["subnet-0fedcba9876543210"], &[], None, None),

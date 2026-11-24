@@ -147,32 +147,41 @@ pub const MAX_VERSIONS_PER_CONNECTOR: usize = 100;
 /// workflow needs.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_000;
 
-/// The instant the outcome of the asynchronous work a call `started` falls due, for the
-/// work whose TRANSIENT that call's own answer already carries: the instant the work
-/// started, so the outcome is owed by the time the call has answered and the FIRST report
-/// of the resource after it carries the value the work reached.
+/// How long the asynchronous work a call starts stays IN FLIGHT before the clock owes its
+/// outcome ([`settles_at`]).
 ///
 /// That work is provisioning a new connector (`PENDING` -> `ACTIVE`, on the connector and
-/// on the version the create minted) and an update (`LastUpdateStatus` `InProgress` ->
-/// `Successful`, with the version it appends provisioning in turn).
+/// on the version the create minted) and a configuration update (`LastUpdateStatus`
+/// `InProgress` -> `Successful`, with the version it appends provisioning in turn).
 /// `CreateNetworkConnector` is "asynchronous", starts the connector "in `PENDING` state
-/// while ENIs are provisioned" and tells a client to "use `GetNetworkConnector` to poll the
-/// connector state until it reaches `ACTIVE`"; an update's status "transitions through
-/// `InProgress` to `Successful`". Each of those promises CONVERGENCE to a client polling on
-/// ITS OWN schedule, which may be a single look taken immediately — so the outcome cannot
-/// be withheld behind a span of this emulator's wall clock. A client whose budget allows
-/// one look would otherwise never observe the value the resource reached, and everything
-/// this service documents as gated on `ACTIVE` would be unreachable. The transient is
-/// reported where the model exposes it: in the `202` answer of the call that starts the work
-/// (`State` on the create, `LastUpdateStatus` on the update), which is built from the record
-/// as that call left it.
+/// while ENIs are provisioned in your VPC" and tells a client to "use `GetNetworkConnector`
+/// to poll the connector state until it reaches `ACTIVE`"; an update's status "transitions
+/// through `InProgress` to `Successful`".
+///
+/// A transient state a client is told to POLL for is one the service answers reads with, and
+/// the behaviours the model states OVER that window — `UpdateNetworkConnector`'s "the
+/// connector must be in `ACTIVE` state to accept updates" and `DeleteNetworkConnector`'s
+/// "you can delete connectors in `ACTIVE` or `FAILED` states", each refused with
+/// `ResourceConflictException` — are reachable only while the work is still in flight. So
+/// the window has to be long enough for the calls a client makes right after the one that
+/// started the work to land inside it. No documented duration says how long AWS takes, so
+/// the span is this emulator's own: a few seconds, short enough that the documented poll
+/// loop converges within one of its looks.
+pub const WORK_COMPLETES_AFTER: Duration = Duration::from_secs(3);
+
+/// The instant the outcome of the asynchronous work a call `started` falls due:
+/// [`WORK_COMPLETES_AFTER`] past that call.
+///
+/// The transient is reported where the model exposes it — in the `202` answer of the call
+/// that starts the work (`State` on the create, `LastUpdateStatus` on the update) — and then
+/// by every operation that reports the record, for as long as the work is in flight.
 ///
 /// Nothing sleeps, and no read advances anything: the instant is stored on the record and
 /// materialised by whichever later call reports it ([`NetworkConnector::settle`]), so the
 /// outcome is owed whether or not anybody calls, and a record carrying a due instant that
 /// has not been reached still reports its transient through every operation.
-pub const fn settles_at(started: SystemTime) -> SystemTime {
-    started
+pub fn settles_at(started: SystemTime) -> SystemTime {
+    started.checked_add(WORK_COMPLETES_AFTER).unwrap_or(started)
 }
 
 /// How long a connector a delete has been accepted for stays in the store before the clock
@@ -204,8 +213,8 @@ pub enum PendingChange {
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// When the change falls due, after which the first call that reports the record
-    /// materialises it: [`settles_at`] for work whose transient the starting call's own
-    /// answer carries, and [`DELETION_COMPLETES_AFTER`] past the delete for a removal.
+    /// materialises it: [`settles_at`] for the work a call starts and whose transient its
+    /// own answer carries, and [`DELETION_COMPLETES_AFTER`] past the delete for a removal.
     pub due: SystemTime,
     pub change: PendingChange,
     /// The human-readable narrative to record beside the status this transition sets, so

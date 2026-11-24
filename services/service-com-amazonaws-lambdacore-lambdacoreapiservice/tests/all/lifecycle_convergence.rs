@@ -14,15 +14,15 @@
 //! converges, and a client that polls nothing finds the change already made on its
 //! next call.
 //!
-//! WHEN each change falls due follows from that. Provisioning and an update settle
-//! from the instant the call that started them answered, because
-//! `CreateNetworkConnector` tells a client to "use `GetNetworkConnector` to poll the
-//! connector state until it reaches `ACTIVE`" and an update's status "transitions
-//! through `InProgress` to `Successful`" — promises made to a client polling on ITS
-//! own schedule, which may be one single look taken immediately. So a single probe
-//! converges, and the transient stays where the model exposes it: in the answer of
-//! the call that starts the work. A deletion keeps a window the record is still
-//! there for, because the model states a behaviour over it —
+//! WHEN each change falls due follows from that. Provisioning and an update stay IN FLIGHT
+//! for a window past the call that started them, because `CreateNetworkConnector` tells a
+//! client to "use `GetNetworkConnector` to poll the connector state until it reaches
+//! `ACTIVE`" and an update's status "transitions through `InProgress` to `Successful`": a
+//! transient a client is told to poll FOR is one every report of the record carries while
+//! the work is in flight, not a value only the starting call's own answer ever shows.
+//! Nothing withholds it and nothing brings it forward, and the window is short enough that
+//! the documented poll loop converges — which is what the end-to-end cases here look for. A
+//! deletion keeps a window of its own, because the model states a behaviour over it —
 //! `DeleteNetworkConnector` is idempotent, "calling delete on a connector that is
 //! already deleting ... succeeds without error", while a delete of an identifier
 //! this account holds no connector for is the modelled `ResourceNotFoundException`.
@@ -31,14 +31,16 @@
 //! state to accept updates" and `DeleteNetworkConnector`'s "you can delete
 //! connectors in `ACTIVE` or `FAILED` states") are stated over a connector whose
 //! provisioning the clock still owes, which is a record carrying a due instant it
-//! has not reached — whatever put it there.
+//! has not reached — whatever put it there. Because the window has a length, the calls a
+//! client makes straight after a create land inside it: that is what
+//! [`a_connector_is_pending_to_the_calls_that_follow_the_create`] drives, with nothing
+//! arranged.
 //!
 //! The cases below put a transition on either side of its due instant by moving the
 //! instant the record itself carries, so each assertion is decided by the rule
-//! rather than by how fast the host runs; the convergence cases take ONE call after
-//! the call under test and the end-to-end case polls for the condition, never for a
-//! span. The request helpers are the lifecycle suite's, so this suite drives the
-//! emulator over HTTP exactly as a client does.
+//! rather than by how fast the host runs; the end-to-end cases arrange nothing at all and
+//! poll for the condition, never for a span. The request helpers are the lifecycle suite's,
+//! so this suite drives the emulator over HTTP exactly as a client does.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,8 +50,8 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::service_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, emulator_with_engine, get, list, list_versions, minimal_create,
-    text, update, vpc_egress, Answer, OPERATOR_ROLE,
+    assert_conflict, at, create, delete, emulator, emulator_with_engine, get, list, list_versions,
+    minimal_create, poll_until, text, update, vpc_egress, Answer, OPERATOR_ROLE,
 };
 
 /// How far in the past a case puts a due instant it wants already reached: long
@@ -207,17 +209,32 @@ async fn poll_get(
     what: &str,
     condition: impl Fn(&Answer) -> bool,
 ) -> Answer {
+    poll_until(
+        &format!("{identifier:?} {what}"),
+        move || get(router, identifier),
+        condition,
+    )
+    .await
+}
+
+/// Look again through `report` until it reports `ACTIVE` — the convergence
+/// `CreateNetworkConnector` documents, over the emulator's own clock and with nothing
+/// arranged. Panics naming `case` when the deadline passes.
+async fn poll_report_until_active(
+    router: &MultiServiceRouter,
+    report: Report,
+    connector: &Created,
+    case: &str,
+) {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let answer = get(router, identifier).await;
-        if condition(&answer) {
-            return answer;
+        let state = reported_state(router, report, connector).await;
+        if state == "ACTIVE" {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "{identifier:?} never {what}: last answer {} with {:?}",
-            answer.status,
-            answer.body
+            "case {case:?}: the documented poll never reached ACTIVE, last report {state:?}"
         );
         std::thread::sleep(BETWEEN_LOOKS);
     }
@@ -619,110 +636,291 @@ async fn start_provisioning(
     }
 }
 
-/// CONVERGENCE, as a client with ONE probe experiences it: the single call a client takes
-/// straight after `CreateNetworkConnector` — the first since the create, with nothing in
-/// between, nothing waited for and nothing arranged — already reports the state
-/// provisioning reached.
+/// RULE, end to end with NOTHING arranged: a connector `CreateNetworkConnector` has just
+/// minted is `PENDING` to the calls that follow the create, so both refusals the model
+/// states over that window are reachable — the update is refused with the modelled 409
+/// naming the connector's `Id` and the state spelled as a word, the delete with the one
+/// stating the state's wire value — and neither refusal changes the record. Once the
+/// provisioning falls due, the very same update and the very same delete are served.
 ///
-/// The rows span what the rule generalises over: the configuration and `Name` the connector
-/// was created from ([`converging_rows`]), and which operation the one probe is, including
-/// every identifier form the read admits.
+/// This is a client's own experience of the window: no due instant is moved here, so what
+/// the rows prove is that the window a create opens has a LENGTH, and that it closes on its
+/// own. The rows span the configuration and `Name` the connector was created from
+/// ([`converging_rows`]) and the configuration the update asks for (the next row's, so no
+/// row's request shape is the one that is refused or the one that is served). The SENTENCE
+/// of each refusal over the whole state class is the `state_gate_refusal_wording` suite's.
 #[tokio::test]
-async fn one_probe_straight_after_the_create_already_reports_active() {
-    for (row, name, configuration) in converging_rows() {
-        for report in EVERY_REPORT {
-            let case = format!("{row}, probed through {report:?}");
-            let router = emulator();
-            let connector = start_provisioning(&router, &case, name, configuration.clone()).await;
+async fn a_connector_is_pending_to_the_calls_that_follow_the_create() {
+    let rows = converging_rows();
+    for (index, (row, name, configuration)) in rows.iter().enumerate() {
+        let case = format!("a connector created as {row}");
+        let router = emulator();
+        let connector = start_provisioning(&router, &case, name, configuration.clone()).await;
+        // What the update asks for: another row's configuration, never the stored one.
+        let requested = rows[(index + 1) % rows.len()].2.clone();
+        let stored_subnets = at(configuration, "/VpcEgressConfiguration/SubnetIds");
+        let asked_subnets = at(&requested, "/VpcEgressConfiguration/SubnetIds");
 
-            let first = reported_state(&router, report, &connector).await;
-            assert_eq!(
-                first, "ACTIVE",
-                "case {case:?}: the ONE call a client takes after the create must report the \
-                 state provisioning reached, got {first:?}"
-            );
-        }
+        // The read a client takes straight after the create: the ENIs are notionally still
+        // being provisioned, so the connector is still reported in the state the create's
+        // own answer carried.
+        let while_pending = get(&router, &connector.id).await;
+        assert_eq!(
+            text(&while_pending.body, "/State"),
+            "PENDING",
+            "case {case:?}: the read that follows the create reports the connector as still \
+             provisioning, got {:?}",
+            at(&while_pending.body, "/State")
+        );
+
+        // "The connector must be in ACTIVE state to accept updates."
+        let refused_update = update(
+            &router,
+            &connector.id,
+            json!({ "Configuration": requested.clone() }),
+        )
+        .await;
+        assert_conflict(
+            &format!("{case}: an update while it provisions"),
+            &refused_update,
+            &format!(
+                "Network connector {} is in state Pending and cannot be updated. Only ACTIVE \
+                 connectors can be updated.",
+                connector.id
+            ),
+        );
+        let after_update = get(&router, &connector.name).await;
+        assert_eq!(
+            text(&after_update.body, "/State"),
+            "PENDING",
+            "case {case:?}: a refused update must not move the connector, got {:?}",
+            at(&after_update.body, "/State")
+        );
+        assert_eq!(
+            at(
+                &after_update.body,
+                "/Configuration/VpcEgressConfiguration/SubnetIds"
+            ),
+            stored_subnets,
+            "case {case:?}: a refused update must leave the stored configuration standing, \
+             got {:?}",
+            at(
+                &after_update.body,
+                "/Configuration/VpcEgressConfiguration/SubnetIds"
+            )
+        );
+        assert_eq!(
+            at(&after_update.body, "/LatestVersion"),
+            json!(1),
+            "case {case:?}: a refused update appends no version, got {:?}",
+            at(&after_update.body, "/LatestVersion")
+        );
+
+        // "You can delete connectors in ACTIVE or FAILED states."
+        let refused_delete = delete(&router, &connector.id).await;
+        assert_conflict(
+            &format!("{case}: a delete while it provisions"),
+            &refused_delete,
+            "Network connector is in PENDING state and cannot be deleted",
+        );
+        let after_delete = get(&router, &connector.name).await;
+        assert_eq!(
+            text(&after_delete.body, "/State"),
+            "PENDING",
+            "case {case:?}: a refused delete must leave the connector provisioning, got {:?}",
+            at(&after_delete.body, "/State")
+        );
+
+        // The positive controls: the window closes on its own, and then the same two calls
+        // are the ones AWS serves.
+        let settled = poll_get(&router, &connector.id, "reaches ACTIVE", |answer| {
+            answer.status == 200 && text(&answer.body, "/State") == "ACTIVE"
+        })
+        .await;
+        assert_eq!(
+            text(&settled.body, "/State"),
+            "ACTIVE",
+            "case {case:?}: the documented poll converges on ACTIVE, got {:?}",
+            at(&settled.body, "/State")
+        );
+
+        let accepted = update(&router, &connector.id, json!({ "Configuration": requested })).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: an ACTIVE connector accepts the update it refused, got {} with {:?}",
+            accepted.status, accepted.body
+        );
+        assert_eq!(
+            text(&accepted.body, "/LastUpdateStatus"),
+            "InProgress",
+            "case {case:?}: the accepted update carries the transient status itself, got {:?}",
+            at(&accepted.body, "/LastUpdateStatus")
+        );
+        let converged = poll_get(
+            &router,
+            &connector.name,
+            "reports the update as Successful",
+            |answer| {
+                answer.status == 200 && text(&answer.body, "/LastUpdateStatus") == "Successful"
+            },
+        )
+        .await;
+        assert_eq!(
+            at(
+                &converged.body,
+                "/Configuration/VpcEgressConfiguration/SubnetIds"
+            ),
+            asked_subnets,
+            "case {case:?}: the accepted update is what the settled connector reports, got {:?}",
+            at(
+                &converged.body,
+                "/Configuration/VpcEgressConfiguration/SubnetIds"
+            )
+        );
+
+        let removed = delete(&router, &connector.id).await;
+        assert_eq!(
+            removed.status, 202,
+            "case {case:?}: an ACTIVE connector accepts the delete it refused, got {} with {:?}",
+            removed.status, removed.body
+        );
+        assert_eq!(
+            text(&removed.body, "/State"),
+            "DELETING",
+            "case {case:?}: the accepted delete carries the transient state itself, got {:?}",
+            at(&removed.body, "/State")
+        );
+        let gone = poll_get(&router, &connector.name, "is forgotten", |answer| {
+            answer.status == 404
+        })
+        .await;
+        let code = text(&gone.body, "/__type");
+        assert!(
+            code.ends_with("ResourceNotFoundException"),
+            "case {case:?}: a connector whose deletion completed names nothing, got {code:?} \
+             with {:?}",
+            gone.body
+        );
     }
 }
 
-/// The same for the other work a call of this control plane starts: the single call taken
-/// straight after an accepted `UpdateNetworkConnector` reports the update settled —
-/// `LastUpdateStatus` `Successful` on the connector, `ACTIVE` on the version it appended —
-/// while the update's own answer carries `InProgress`.
+/// CONVERGENCE as the documented client experiences it: the call taken straight after the
+/// create reports the connector still provisioning, and the poll
+/// `CreateNetworkConnector` prescribes — over the emulator's own clock, with nothing
+/// arranged — reaches `ACTIVE` and stays there.
+///
+/// The rows span the configuration and `Name` the connector was created from
+/// ([`converging_rows`]), each paired with a different operation to report it through.
+/// WHICH operation reports a still-provisioning or a settled connector is spanned over every
+/// form, without waiting for a window, by
+/// [`the_first_call_after_provisioning_falls_due_reports_active`] and
+/// [`no_number_of_reads_brings_provisioning_forward`].
+#[tokio::test]
+async fn a_client_that_polls_after_the_create_converges_on_active() {
+    for (index, (row, name, configuration)) in converging_rows().into_iter().enumerate() {
+        let report = EVERY_REPORT[index % EVERY_REPORT.len()];
+        let case = format!("{row}, reported through {report:?}");
+        let router = emulator();
+        let connector = start_provisioning(&router, &case, name, configuration).await;
+
+        let first = reported_state(&router, report, &connector).await;
+        assert_eq!(
+            first, "PENDING",
+            "case {case:?}: the call a client takes straight after the create reports the \
+             connector as still provisioning, got {first:?}"
+        );
+
+        poll_report_until_active(&router, report, &connector, &case).await;
+        let again = reported_state(&router, report, &connector).await;
+        assert_eq!(
+            again, "ACTIVE",
+            "case {case:?}: a connector that reached ACTIVE stays ACTIVE, got {again:?}"
+        );
+    }
+}
+
+/// The same for the other work a call of this control plane starts: an accepted
+/// `UpdateNetworkConnector` carries `InProgress` in its own answer and in the report taken
+/// straight after it, and the poll converges on `LastUpdateStatus` `Successful` with the
+/// version the update appended `ACTIVE`.
 ///
 /// The rows span the configuration the update asks for ([`converging_rows`], whose
-/// configurations are all different from the one the create stored) and which operation the
-/// one probe is.
+/// configurations all differ from the one the create stored), each paired with one of the
+/// operations that report the update.
 #[tokio::test]
-async fn one_probe_straight_after_an_update_already_reports_it_settled() {
-    for (row, name, configuration) in converging_rows() {
-        for probe in [
-            "a read by name",
-            "a read by id",
-            "the version listing",
-        ] {
-            let case = format!("{row}, probed through {probe}");
-            let router = emulator();
-            let connector = start_provisioning(
-                &router,
-                &case,
-                name,
-                vpc_egress(&["subnet-01234567890abcdef"], &[], None, None),
-            )
-            .await;
-            // One call settles the create, which is what makes the connector ACTIVE and so
-            // able to accept the update under test.
-            let provisioned = reported_state(&router, Report::GetById, &connector).await;
-            assert_eq!(
-                provisioned, "ACTIVE",
-                "case {case:?}: the update under test needs a provisioned connector, got \
-                 {provisioned:?}"
-            );
+async fn a_client_that_polls_after_an_update_converges_on_the_settled_status() {
+    let probes = ["a read by name", "a read by id", "the version listing"];
+    for (index, (row, name, configuration)) in converging_rows().into_iter().enumerate() {
+        let probe = probes[index % probes.len()];
+        let case = format!("{row}, probed through {probe}");
+        let router = emulator();
+        let connector = start_provisioning(
+            &router,
+            &case,
+            name,
+            vpc_egress(&["subnet-01234567890abcdef"], &[], None, None),
+        )
+        .await;
+        // The update under test needs an ACTIVE connector, which the clock owes the new one.
+        poll_report_until_active(&router, Report::GetById, &connector, &case).await;
 
-            let updated = update(
-                &router,
-                &connector.id,
-                json!({ "Configuration": configuration.clone() }),
-            )
-            .await;
-            assert_eq!(
-                updated.status, 202,
-                "case {case:?}: an ACTIVE connector accepts the update, got {} with {:?}",
-                updated.status, updated.body
-            );
-            assert_eq!(
-                text(&updated.body, "/LastUpdateStatus"),
-                "InProgress",
-                "case {case:?}: the update that starts the work carries the transient status \
-                 itself, got {:?}",
-                at(&updated.body, "/LastUpdateStatus")
-            );
+        let updated = update(
+            &router,
+            &connector.id,
+            json!({ "Configuration": configuration }),
+        )
+        .await;
+        assert_eq!(
+            updated.status, 202,
+            "case {case:?}: an ACTIVE connector accepts the update, got {} with {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            text(&updated.body, "/LastUpdateStatus"),
+            "InProgress",
+            "case {case:?}: the update that starts the work carries the transient status \
+             itself, got {:?}",
+            at(&updated.body, "/LastUpdateStatus")
+        );
 
-            // ONE call, the first since that update.
-            let (answer, pointer, expected) = match probe {
-                "a read by name" => (
-                    get(&router, &connector.name).await,
-                    "/LastUpdateStatus",
-                    "Successful",
-                ),
-                "a read by id" => (
-                    get(&router, &connector.id).await,
-                    "/LastUpdateStatus",
-                    "Successful",
-                ),
-                _ => (
-                    list_versions(&router, &connector.name, "").await,
-                    "/NetworkConnectorVersions/1/State",
-                    "ACTIVE",
-                ),
-            };
-            assert_eq!(
-                text(&answer.body, pointer),
-                expected,
-                "case {case:?}: the ONE call after the update must report {pointer} as \
-                 {expected:?}, got {:?}",
-                at(&answer.body, pointer)
-            );
-        }
+        // What the probe reports while the update is in flight, and what it reports once it
+        // has settled.
+        let (pointer, in_flight, settled) = match probe {
+            "the version listing" => ("/NetworkConnectorVersions/1/State", "PENDING", "ACTIVE"),
+            _ => ("/LastUpdateStatus", "InProgress", "Successful"),
+        };
+        let during = probed(&router, probe, &connector).await;
+        assert_eq!(
+            text(&during.body, pointer),
+            in_flight,
+            "case {case:?}: the report taken straight after the update must carry the work in \
+             flight at {pointer}, got {:?}",
+            at(&during.body, pointer)
+        );
+
+        let router_ref = &router;
+        let connector_ref = &connector;
+        let converged = poll_until(
+            &format!("{case}: {pointer} reaches {settled}"),
+            move || probed(router_ref, probe, connector_ref),
+            |answer| text(&answer.body, pointer) == settled,
+        )
+        .await;
+        assert_eq!(
+            text(&converged.body, pointer),
+            settled,
+            "case {case:?}: the poll must converge on {pointer} being {settled:?}, got {:?}",
+            at(&converged.body, pointer)
+        );
+    }
+}
+
+/// What `probe` reports about `connector`: one of the operations a client watches an update
+/// through.
+async fn probed(router: &MultiServiceRouter, probe: &str, connector: &Created) -> Answer {
+    match probe {
+        "a read by name" => get(router, &connector.name).await,
+        "a read by id" => get(router, &connector.id).await,
+        _ => list_versions(router, &connector.name, "").await,
     }
 }

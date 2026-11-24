@@ -45,8 +45,8 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::state::names_a_connec
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    create, delete, emulator, expected_arn, expected_arn_in, get, list_versions,
-    minimal_configuration, minimal_create, text, update, wait_for_the_clock, Answer, REGION,
+    create, delete, emulator, expected_arn, expected_arn_in, forgotten, get, list_versions,
+    minimal_configuration, minimal_create, provisioned, text, update, Answer, REGION,
 };
 
 /// The error code every one of these refusals carries
@@ -267,8 +267,8 @@ async fn a_deleted_connector_is_refused_naming_the_resource_the_identifier_deter
         created.body
     );
     // A connector is created PENDING and the clock owes it ACTIVE; a deletion is refused
-    // until then, so the row waits rather than racing the transition.
-    wait_for_the_clock();
+    // until then, so the row polls for the provisioning rather than racing the transition.
+    provisioned(&router, name).await;
 
     let removed = delete(&router, name).await;
     assert!(
@@ -278,7 +278,7 @@ async fn a_deleted_connector_is_refused_naming_the_resource_the_identifier_deter
     );
     // The deletion the call started is owed by the clock; once it falls due the record is
     // forgotten and every form of the identifier names nothing.
-    wait_for_the_clock();
+    forgotten(&router, name).await;
 
     // Every form the connector could be addressed by, including the two the handler could
     // have read off the record it no longer holds.
@@ -330,14 +330,14 @@ async fn what_the_refusal_names_follows_from_the_identifier_and_the_operation() 
     );
     let id = text(&created.body, "/Id");
     let arn = text(&created.body, "/Arn");
-    wait_for_the_clock();
+    provisioned(&router, name).await;
     let removed = delete(&router, name).await;
     assert!(
         removed.status < 300,
         "expected DeleteNetworkConnector to accept the deletion, got {} with {:?}",
         removed.status, removed.body
     );
-    wait_for_the_clock();
+    forgotten(&router, name).await;
 
     // Each row: what the request supplied. The deleted connector's own three forms (plus a
     // version-qualified one), and the same forms of a connector that never existed.
@@ -416,7 +416,7 @@ async fn a_version_the_connector_does_not_hold_is_refused_naming_the_qualified_i
         created.status, created.body
     );
     let arn = text(&created.body, "/Arn");
-    wait_for_the_clock();
+    provisioned(&router, name).await;
 
     // Version 1 is the only one a freshly created connector holds, so every higher version
     // is absent — through the ARN form and through the name form of the same qualifier.

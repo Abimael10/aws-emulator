@@ -26,7 +26,7 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::network_connector_lifecycle::{
-    at, create, get, list, text, update, vpc_egress, wait_for_the_clock, OPERATOR_ROLE,
+    at, create, get, list, provisioned, text, update, vpc_egress, OPERATOR_ROLE,
 };
 
 /// The region every case here signs for, which is the one
@@ -264,32 +264,6 @@ fn ec2_failure(call: &str, code: &str, message: &str) -> String {
     format!("Error occurred while {call}. EC2 Error Code: {code}. EC2 Error Message: {message}")
 }
 
-/// How long a poll loop here keeps looking before it gives up. Generous: the state it waits
-/// for is owed by the emulator's clock, and nothing here measures how long it took.
-const DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(120);
-
-/// How long a poll loop waits between two looks.
-const BETWEEN_LOOKS: ::std::time::Duration = ::std::time::Duration::from_millis(25);
-
-/// Look again until `GetNetworkConnector` reports `connector` as `ACTIVE`, the state an
-/// update needs it in. Panics when the deadline passes.
-async fn poll_until_active(router: &MultiServiceRouter, connector: &str) {
-    let deadline = ::std::time::Instant::now() + DEADLINE;
-    loop {
-        let answer = get(router, connector).await;
-        if answer.status == 200 && text(&answer.body, "/State") == "ACTIVE" {
-            return;
-        }
-        assert!(
-            ::std::time::Instant::now() < deadline,
-            "{connector:?} never reached ACTIVE: last answer {} with {:?}",
-            answer.status,
-            answer.body
-        );
-        ::std::thread::sleep(BETWEEN_LOOKS);
-    }
-}
-
 /// Assert that `answer` is the modelled 400 carrying exactly `message`.
 fn assert_refused(case: &str, answer: &crate::network_connector_lifecycle::Answer, message: &str) {
     assert_eq!(
@@ -490,7 +464,7 @@ async fn an_update_naming_an_ec2_resource_the_account_does_not_hold_changes_noth
     );
     // An update needs an ACTIVE connector, which the clock owes the new one: look until it
     // is there rather than waiting a fixed time for it.
-    poll_until_active(&wired.router, "updated-connector").await;
+    provisioned(&wired.router, "updated-connector").await;
 
     let rows: Vec<(&str, Value, String)> = vec![
         (
@@ -777,7 +751,8 @@ async fn an_update_is_refused_unless_iam_proves_the_new_operator_role_usable() {
         "setup: the create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    wait_for_the_clock();
+    // The update under test needs an ACTIVE connector, which the clock owes the new one.
+    provisioned(&wired.router, "role-updated").await;
 
     let refused = update(
         &wired.router,
@@ -1001,7 +976,7 @@ async fn an_update_reports_which_security_group_failure_ec2_answered() {
         "setup: the create must succeed, got {} with {:?}",
         created.status, created.body
     );
-    poll_until_active(&wired.router, "group-reading-updated").await;
+    provisioned(&wired.router, "group-reading-updated").await;
 
     // (case, the ids the update names, the message it must answer)
     let rows: Vec<(&str, Vec<String>, String)> = vec![

@@ -54,7 +54,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
     at, create, delete, emulator, emulator_with_engine, expected_arn, get, list, list_versions,
-    minimal_configuration, minimal_create, text, update, vpc_egress, Answer,
+    minimal_configuration, minimal_create, provisioned, text, update, vpc_egress, Answer,
     OPERATOR_ROLE,
 };
 
@@ -153,8 +153,9 @@ async fn every_date_time_member_is_an_iso8601_string_on_the_wire() {
     let id = text(&created.body, "/Id");
     let arn = expected_arn(name);
 
-    // An update is accepted because the create's provisioning settled the connector to
-    // ACTIVE, and it is what gives the versions list a second row.
+    // An update is accepted once the create's provisioning has fallen due and left the
+    // connector ACTIVE, and it is what gives the versions list a second row.
+    provisioned(&router, name).await;
     let updated = update(&router, name, json!({ "Configuration": changed_configuration() })).await;
     assert_eq!(
         updated.status, 202,
