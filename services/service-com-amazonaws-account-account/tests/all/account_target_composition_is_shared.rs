@@ -18,7 +18,11 @@
 //! a handler makes of its own, so a request that is both an account-target
 //! refusal and carries a member such a handler would refuse answers that same
 //! 403 — for either cause — while the identical request on an account the store
-//! holds is refused for its member.
+//! holds is refused for its member. The operations whose account-id member
+//! CREATES the record it writes are held to the same order for the cause that
+//! reaches them, the caller's own account: naming it answers that 403, while the
+//! standalone call — which lands on that very account — is refused for the
+//! member it carries.
 //!
 //! Every case goes through the router, so it exercises routing,
 //! deserialization, the handler and the persisted store: the path a client
@@ -356,6 +360,15 @@ type RefusableRow = (&'static str, &'static str, fn(&str) -> Value, &'static str
 /// boundary admits it and the handler is what refuses it.
 const UNISSUED_NEXT_TOKEN: &str = "6e6f742061207265616c20746f6b656e";
 
+/// The longest value `RegionName` admits, from its modelled
+/// `@length(min: 1, max: 50)` (`smithy_query(query="shape",
+/// shape="RegionName")`): the boundary admits it, so a refusal of it is the
+/// handler's. [`LONGEST_REGION_NAME`] is exactly this long.
+const REGION_NAME_MAX_LENGTH: usize = 50;
+
+/// A `RegionName` at that modelled maximum which names no Region.
+const LONGEST_REGION_NAME: &str = "the-longest-region-name-the-member-admits-is-fifty";
+
 /// The modelled error code and HTTP status of a refused input member:
 /// `ValidationException` at HTTP 400.
 const REFUSED_MEMBER: (u16, &str) = (400, "ValidationException");
@@ -370,8 +383,14 @@ const REFUSED_MEMBER: (u16, &str) = (400, "ValidationException");
 /// test is the handler's: a `PrimaryEmail` inside `PrimaryEmailAddress`'s
 /// modelled `@length(min: 5, max: 64)` that is not an email address by this
 /// model's own email expression (the forms come from the published expression,
-/// each row breaking a different part of its shape), and a `NextToken` inside
-/// its modelled length that names no page.
+/// each row breaking a different part of its shape), a `NextToken` inside its
+/// modelled length that names no page, and a `RegionName` inside
+/// `RegionName`'s modelled `@length(min: 1, max: 50)` that this service's Region
+/// catalog does not hold — the catalog being the commercial partition's Region
+/// codes, so the `RegionName` rows span a code-shaped value with an index no
+/// Region carries, a Region code of another partition, a word that is no Region
+/// code at all, a catalogued code in the wrong case, and a value at the member's
+/// modelled maximum length.
 fn refusable_rows() -> Vec<RefusableRow> {
     vec![
         (
@@ -429,6 +448,36 @@ fn refusable_rows() -> Vec<RefusableRow> {
             },
             "NextToken",
         ),
+        (
+            "GetRegionOptStatus for a Region code with an index no Region carries",
+            "/getRegionOptStatus",
+            |id| json!({"AccountId": id, "RegionName": "eu-west-9"}),
+            "RegionName",
+        ),
+        (
+            "GetRegionOptStatus for a Region code of another partition",
+            "/getRegionOptStatus",
+            |id| json!({"AccountId": id, "RegionName": "us-gov-west-1"}),
+            "RegionName",
+        ),
+        (
+            "GetRegionOptStatus for a word that is no Region code",
+            "/getRegionOptStatus",
+            |id| json!({"AccountId": id, "RegionName": "not-a-region"}),
+            "RegionName",
+        ),
+        (
+            "GetRegionOptStatus for a catalogued Region code upper-cased",
+            "/getRegionOptStatus",
+            |id| json!({"AccountId": id, "RegionName": "EU-NORTH-1"}),
+            "RegionName",
+        ),
+        (
+            "GetRegionOptStatus for a value at the member's maximum length",
+            "/getRegionOptStatus",
+            |id| json!({"AccountId": id, "RegionName": LONGEST_REGION_NAME}),
+            "RegionName",
+        ),
     ]
 }
 
@@ -456,6 +505,13 @@ async fn an_account_target_refusal_outranks_every_member_the_handler_refuses() {
     let own = default_account_id().to_string();
     let mut causes: Vec<String> = vec![own];
     causes.extend(UNKNOWN_ACCOUNTS.iter().map(|id| id.to_string()));
+    assert_eq!(
+        LONGEST_REGION_NAME.len(),
+        REGION_NAME_MAX_LENGTH,
+        "case {LONGEST_REGION_NAME:?}: the maximum-length row must be exactly \
+         {REGION_NAME_MAX_LENGTH} characters, got {}",
+        LONGEST_REGION_NAME.len()
+    );
 
     for account_id in causes {
         // The refusal this account id earns on its own, with nothing else in the
@@ -591,5 +647,198 @@ async fn the_composition_lands_on_the_account_the_member_names() {
          with {:?}",
         standalone.status,
         standalone.body
+    );
+}
+
+/// One row of an operation that CREATES the account record it writes, so the
+/// account-target rule reaches it as the self-target refusal alone: a label, the
+/// operation's URI, the body with the account-id member set only when the row
+/// names an account, and the member its own refusal names.
+type SelfTargetRefusableRow = (
+    &'static str,
+    &'static str,
+    fn(Option<&str>) -> Value,
+    &'static str,
+);
+
+/// The request `body` with the account-id member `member` set only when the row
+/// names an account — an absent member being the standalone call.
+fn with_account(mut body: Value, member: &str, account: Option<&str>) -> Value {
+    if let Some(account_id) = account {
+        body[member] = json!(account_id);
+    }
+    body
+}
+
+/// A primary contact structure whose every modelled constraint is satisfied, in
+/// `country_code`, carrying a state only when `state_or_region` says so: what a
+/// row varies is the part of the address this service decides by, never a
+/// modelled constraint the boundary would refuse first.
+fn contact_information(country_code: &str, state_or_region: Option<&str>) -> Value {
+    let mut contact = json!({
+        "FullName": "Ada Lovelace",
+        "AddressLine1": "1 Analytical Way",
+        "City": "Seattle",
+        "PostalCode": "98109",
+        "CountryCode": country_code,
+        "PhoneNumber": "+12065550100",
+    });
+    if let Some(state) = state_or_region {
+        contact["StateOrRegion"] = json!(state);
+    }
+    contact
+}
+
+/// The operations that decide a refusal of their OWN inside the handler and
+/// whose account-id member, when it names an account this emulator holds no
+/// record of, brings that record into existence rather than being refused — so
+/// the account-target cause that reaches them is the caller's own account.
+///
+/// The rows differ in which operation runs, in which member is at fault, in the
+/// form of the faulty value and in what else the request carries. The Region
+/// rows span both refusals of `RegionName` (a value no Region code at all, and a
+/// Region the partition turns on for every account, which neither opt call can
+/// act on); the contact rows span both rules this service decides an address by
+/// (`CountryCode` must be an assigned ISO 3166-1 alpha-2 code — `ZZ` is one the
+/// standard assigns to no country — and `StateOrRegion` is required in the
+/// countries `StateOrRegion`'s own documentation names, `smithy_query(query="doc",
+/// shape="ContactInformation", member="StateOrRegion")`, of which `US` is one).
+fn self_target_refusable_rows() -> Vec<SelfTargetRefusableRow> {
+    vec![
+        (
+            "EnableRegion for a word that is no Region code",
+            "/enableRegion",
+            |account| with_account(json!({"RegionName": "not-a-region"}), "AccountId", account),
+            "RegionName",
+        ),
+        (
+            "EnableRegion for a Region the partition turns on by default",
+            "/enableRegion",
+            |account| with_account(json!({"RegionName": "eu-west-1"}), "AccountId", account),
+            "RegionName",
+        ),
+        (
+            "DisableRegion for a Region code of another partition",
+            "/disableRegion",
+            |account| with_account(json!({"RegionName": "us-gov-west-1"}), "AccountId", account),
+            "RegionName",
+        ),
+        (
+            "DisableRegion for a Region the partition turns on by default",
+            "/disableRegion",
+            |account| with_account(json!({"RegionName": "us-east-2"}), "AccountId", account),
+            "RegionName",
+        ),
+        (
+            "PutContactInformation with a country code the standard assigns to nobody",
+            "/putContactInformation",
+            |account| {
+                with_account(
+                    json!({"ContactInformation": contact_information("ZZ", Some("WA"))}),
+                    "AccountId",
+                    account,
+                )
+            },
+            "CountryCode",
+        ),
+        (
+            "PutContactInformation with no state in a country that requires one",
+            "/putContactInformation",
+            |account| {
+                with_account(
+                    json!({"ContactInformation": contact_information("US", None)}),
+                    "AccountId",
+                    account,
+                )
+            },
+            "StateOrRegion",
+        ),
+    ]
+}
+
+/// The same precedence on the operations whose account-target cause is the
+/// caller's own account alone: naming it answers the IDENTICAL 403 the bare
+/// request for that account earns, never the 400 the member would earn, while
+/// the standalone call — which resolves to that very account — is refused for
+/// the member it carries.
+#[tokio::test]
+async fn the_self_target_refusal_outranks_every_member_those_handlers_refuse() {
+    let router = emulator();
+    let own = default_account_id().to_string();
+
+    // What the caller's own account reports before any of the refused calls
+    // below: nothing they are refused for may change it.
+    let contact_before = call(&router, "/getContactInformation", json!({})).await;
+    let regions_before = call(&router, "/listRegions", json!({})).await;
+
+    // The refusal naming the caller's own account earns on its own, with nothing
+    // else in the request to refuse: the one every row below must answer too.
+    let bare = call(&router, "/getAccountInformation", json!({"AccountId": own})).await;
+    assert_eq!(
+        (bare.status, bare.error_code()),
+        DENIED,
+        "case \"bare\": the bare request must be the account-target refusal, got {} with {:?}",
+        bare.status,
+        bare.body
+    );
+    let expected = bare.refusal(&own);
+
+    for (label, uri, body, member) in self_target_refusable_rows() {
+        let case = format!("{label} naming the caller's own account");
+        let answer = call(&router, uri, body(Some(&own))).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            DENIED,
+            "case {case:?}: expected {DENIED:?} rather than a refusal of {member}, got {} \
+             with {:?}",
+            answer.status,
+            answer.body
+        );
+        let observed = answer.refusal(&own);
+        assert_eq!(
+            observed, expected,
+            "case {case:?}: expected the same refusal as the bare request ({expected:?}), \
+             got {observed:?}"
+        );
+
+        // The other side of the precedence: the standalone call lands on that
+        // same account, so the member it carries is what refuses it.
+        let standalone = format!("{label} as the standalone call");
+        let answer = call(&router, uri, body(None)).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            REFUSED_MEMBER,
+            "case {standalone:?}: expected {REFUSED_MEMBER:?}, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            refused_members(&answer),
+            vec![member],
+            "case {standalone:?}: the refusal must name {member}, got {:?}",
+            answer.body
+        );
+    }
+
+    // Neither refusal wrote anything: the caller's own account reports exactly
+    // the primary contact and the Region statuses it reported before any of
+    // those calls.
+    let contact_after = call(&router, "/getContactInformation", json!({})).await;
+    assert_eq!(
+        (contact_after.status, &contact_after.body),
+        (contact_before.status, &contact_before.body),
+        "case \"after the refusals\": no refused put may have changed the primary contact, \
+         got {} with {:?}",
+        contact_after.status,
+        contact_after.body
+    );
+    let regions_after = call(&router, "/listRegions", json!({})).await;
+    assert_eq!(
+        (regions_after.status, &regions_after.body),
+        (regions_before.status, &regions_before.body),
+        "case \"after the refusals\": no refused opt call may have moved a Region's status, \
+         got {} with {:?}",
+        regions_after.status,
+        regions_after.body
     );
 }

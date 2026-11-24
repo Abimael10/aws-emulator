@@ -168,20 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `RegionName`'s modelled `@length(min: 1, max: 50)` and `AccountId`'s
-        // `^\d{12}$` were already enforced at the boundary. WHICH strings name a
-        // Region is not modelled, so that is refused here.
-        let Some(kind) = crate::state::region_kind(&input.region_name) else {
-            return Err(GetRegionOptStatusErrorModeled::ValidationException(
-                crate::state::unknown_region(&input.region_name),
-            )
-            .into());
-        };
-
         // The account this call acts on, through the one composition of the
         // account-target rule (`state::ComAmazonawsAccountAccountState::target_account`):
         // the caller's own account and an account this emulator holds no record
-        // of are both the modelled authorization refusal. A REPORTING
+        // of are both the modelled authorization refusal. That composition is
+        // ONE decision taken WHOLE, and it is taken BEFORE this handler decides
+        // anything of its own about another input member, so a request that is
+        // both an account-target refusal and carries a `RegionName` this service
+        // would refuse answers the authorization refusal. A REPORTING
         // operation: the store is read, never written, so no record is created
         // here and a later caller sees exactly what this one saw.
         let now = ::std::time::SystemTime::now();
@@ -189,6 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account = store
             .target_account(input.account_id.as_deref())
             .map_err(GetRegionOptStatusErrorModeled::AccessDeniedException)?;
+
+        // `RegionName`'s modelled `@length(min: 1, max: 50)` and `AccountId`'s
+        // `^\d{12}$` were already enforced at the boundary. WHICH strings name a
+        // Region is not modelled, so that is refused here — on the account the
+        // composition above resolved.
+        let Some(kind) = crate::state::region_kind(&input.region_name) else {
+            return Err(GetRegionOptStatusErrorModeled::ValidationException(
+                crate::state::unknown_region(&input.region_name),
+            )
+            .into());
+        };
         // The status as of now: a transition the CLOCK already owes reads as
         // its terminal status, whether or not anybody wrote it back.
         let status = account.region_opt_state(&input.region_name, kind, now);

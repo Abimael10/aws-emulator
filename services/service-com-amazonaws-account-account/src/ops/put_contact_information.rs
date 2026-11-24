@@ -182,6 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The account this call acts on. An absent `AccountId` is the standalone
+        // call on the caller's own account; a PRESENT one names a member account
+        // of the caller's organization, which the caller's own account is not —
+        // so naming it is the modelled authorization refusal. That decision is
+        // taken WHOLE before this handler decides anything of its own about
+        // another input member, so a request that is both an account-target
+        // refusal and carries a contact structure this service would refuse
+        // answers the authorization refusal — and before anything is written.
+        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(PutContactInformationErrorModeled::AccessDeniedException(denied).into())
+            }
+        };
+
         // Every modelled constraint on this input — the required members of
         // `ContactInformation`, their lengths, the phone number's pattern and
         // `AccountId`'s `^\d{12}$` — was already refused at the boundary. What
@@ -194,18 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutContactInformationErrorModeled::ValidationException(invalid).into());
         }
-
-        // The account this call acts on. An absent `AccountId` is the standalone
-        // call on the caller's own account; a PRESENT one names a member account
-        // of the caller's organization, which the caller's own account is not —
-        // so naming it is the modelled authorization refusal, decided before
-        // anything is written.
-        let account_id = match crate::state::target_account_id(input.account_id.as_deref()) {
-            Ok(account_id) => account_id,
-            Err(denied) => {
-                return Err(PutContactInformationErrorModeled::AccessDeniedException(denied).into())
-            }
-        };
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(account) = store.account_mut(&account_id, now) else {

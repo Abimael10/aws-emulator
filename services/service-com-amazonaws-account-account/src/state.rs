@@ -30,7 +30,14 @@
 //! [`ComAmazonawsAccountAccountState::target_account`] for a read,
 //! [`ComAmazonawsAccountAccountState::target_account_mut`] for a write that
 //! must not create a record — is what those handlers call, keeping only the
-//! mapping into their own operation's error enum.
+//! mapping into their own operation's error enum. That decision is taken WHOLE
+//! and FIRST: a handler resolves its account target before it decides any
+//! refusal of its own about another input member (which Region a `RegionName`
+//! names, which countries an address is admitted for, which page a token
+//! resumes), so a request that is both an account-target refusal and carries
+//! such a member answers the account-target refusal. A refusal the request
+//! BOUNDARY decides — an absent `@required` member, a value outside a modelled
+//! constraint — still precedes it: that request never reaches a handler.
 //!
 //! The GovCloud slice hangs off that record too:
 //! [`Account::gov_cloud_account`] holds the GovCloud account linked to the
@@ -287,8 +294,9 @@ pub fn is_country_code(country_code: &str) -> bool {
 ///
 /// The ONE statement of the rules the model cannot express about a
 /// `ContactInformation` — the counterpart of [`region_opt_target`] — so
-/// `PutContactInformation` decides through it before it resolves an account or
-/// touches the store, and a refused put writes nothing.
+/// `PutContactInformation` decides through it after the account-target rule,
+/// which is one decision taken whole before a handler decides anything of its
+/// own, and before the store is touched, so a refused put writes nothing.
 pub fn validated_contact_information(
     contact: &ContactInformation,
 ) -> Result<(), ValidationException> {
@@ -642,9 +650,11 @@ pub fn region_kind(region_name: &str) -> Option<RegionKind> {
 /// default, which neither opt call can act on.
 ///
 /// The ONE statement of that rule. `EnableRegion` and `DisableRegion` both
-/// decide through it, before either resolves an account or touches the store,
-/// so which Regions count as opt targets — and which refusal every other case
-/// earns — changes here alone and cannot drift between the two operations.
+/// decide through it — after the account-target rule, which is one decision
+/// taken whole before a handler decides anything of its own, and before the
+/// store is touched, so a refused call writes nothing — so which Regions count
+/// as opt targets, and which refusal every other case earns, changes here alone
+/// and cannot drift between the two operations.
 pub fn region_opt_target(region_name: &str) -> Result<(), ValidationException> {
     match region_kind(region_name) {
         None => Err(unknown_region(region_name)),
