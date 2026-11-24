@@ -36,7 +36,7 @@ use crate::delivery_stream_lifecycle::{error_code, error_message, s3_configurati
 use crate::delivery_stream_tags::{
     create_tagged, generated_tags, list_tags, listed, owned, MAX_TAGS,
 };
-use crate::refusal_messages::{null_at, value_at};
+use crate::refusal_messages::{absent_at, value_at};
 use crate::tag_key_pattern::{element_refusal, pattern_refusal};
 
 /// The stream name every request in this suite addresses, so what varies between the
@@ -155,7 +155,7 @@ fn invalid_requests() -> Vec<InvalidRequest> {
             "an absent required tag list",
             "TagDeliveryStream",
             json!({ "DeliveryStreamName": ADDRESSED }),
-            null_at("tags"),
+            absent_at("tags"),
         ),
         (
             "a tag key outside the modelled class, in a list of keys",
@@ -167,7 +167,7 @@ fn invalid_requests() -> Vec<InvalidRequest> {
             "an absent required key list",
             "UntagDeliveryStream",
             json!({ "DeliveryStreamName": ADDRESSED }),
-            null_at("tagKeys"),
+            absent_at("tagKeys"),
         ),
         (
             "a start key outside the modelled class",

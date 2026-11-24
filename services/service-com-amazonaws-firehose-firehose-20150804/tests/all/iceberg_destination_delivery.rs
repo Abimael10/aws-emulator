@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 
 use crate::delivery_stream_lifecycle::{error_code, error_message, REGION, ROLE_ARN};
 use crate::destination_delivery::{base64, Emulator};
+use crate::destination_delivery_errors::{authorization, form_encode};
 use crate::format_conversion_delivery::{create_database, create_table};
 
 /// How long a commit is waited for before a case fails: far longer than the emulator's
@@ -624,7 +625,9 @@ struct HintsRow {
 /// The rows differ along what the create supplied: nothing at all, each published bound of
 /// the members (`SizeInMBs` 1..128, `IntervalInSeconds` 0..900 and `DurationInSeconds`
 /// 0..7200, from `smithy_query(query="shape", shape="BufferingHints,RetryOptions")`), one
-/// member of a pair without the other, and each value of `IcebergS3BackupMode`.
+/// member of a pair without the other, and the one value of `IcebergS3BackupMode` the
+/// destination kind supports (the other is refused outright — see
+/// [`an_iceberg_destination_configuration_firehose_does_not_serve_is_refused`]).
 #[tokio::test]
 async fn an_iceberg_destination_reports_its_documented_defaults() {
     let rows: Vec<HintsRow> = vec![
@@ -656,8 +659,8 @@ async fn an_iceberg_destination_reports_its_documented_defaults() {
             reported: (128, 900),
             supplied_retry: Some(json!({ "DurationInSeconds": 7200 })),
             reported_retry: 7200,
-            supplied_backup_mode: Some("AllData"),
-            reported_backup_mode: "AllData",
+            supplied_backup_mode: Some("FailedDataOnly"),
+            reported_backup_mode: "FailedDataOnly",
             supplied_append_only: Some(true),
             reported_append_only: true,
         },
@@ -956,6 +959,23 @@ fn catalog_target(catalog: &str, tables: Option<&[(&str, &str)]>) -> Value {
     config
 }
 
+/// A `ProcessingConfiguration` that routes each record to a destination table of its own: a
+/// `MetadataExtraction` processor, which reads the record's own table out of it, with the two
+/// parameters that type cannot run without
+/// (`smithy_query(query="shape", shape="ProcessorParameterName")`).
+fn record_routing() -> Value {
+    json!({
+        "Enabled": true,
+        "Processors": [{
+            "Type": "MetadataExtraction",
+            "Parameters": [
+                { "ParameterName": "MetadataExtractionQuery", "ParameterValue": "{table:.table}" },
+                { "ParameterName": "JsonParsingEngine", "ParameterValue": "JQ-1.6" },
+            ],
+        }],
+    })
+}
+
 /// `CreateDeliveryStream` with `config` as the stream's only destination.
 async fn create_with_target(emulator: &Emulator, stream: &str, config: Value) -> (u16, Value) {
     emulator
@@ -1025,6 +1045,9 @@ struct Unreadable {
     tables: &'static [(&'static str, &'static str)],
     /// Whether the configuration names another account's Data Catalog.
     foreign_catalog: bool,
+    /// Whether the destination routes each record to a table of its own, which is what lets a
+    /// row list other than one default destination table.
+    routes_its_records: bool,
 }
 
 /// RULE: a create whose Iceberg destination names a table the Data Catalog cannot serve is
@@ -1042,18 +1065,21 @@ async fn a_create_naming_an_unreadable_destination_table_is_refused_and_register
             stream: "iceberg-absent-database",
             tables: &[(ABSENT_DATABASE, PRESENT_TABLE)],
             foreign_catalog: false,
+            routes_its_records: false,
         },
         Unreadable {
             case: "the database is there and the table is not",
             stream: "iceberg-absent-table",
             tables: &[(DATABASE, ABSENT_TABLE)],
             foreign_catalog: false,
+            routes_its_records: false,
         },
         Unreadable {
             case: "one of the two tables listed is absent",
             stream: "iceberg-one-absent-of-two",
             tables: &[(DATABASE, PRESENT_TABLE), (DATABASE, ABSENT_TABLE)],
             foreign_catalog: false,
+            routes_its_records: true,
         },
         Unreadable {
             case: "the table is held by this account and the destination names another \
@@ -1061,6 +1087,7 @@ async fn a_create_naming_an_unreadable_destination_table_is_refused_and_register
             stream: "iceberg-foreign-catalog",
             tables: &[(DATABASE, PRESENT_TABLE)],
             foreign_catalog: true,
+            routes_its_records: false,
         },
     ];
 
@@ -1078,7 +1105,13 @@ async fn a_create_naming_an_unreadable_destination_table_is_refused_and_register
         let (status, answered) = create_with_target(
             &emulator,
             row.stream,
-            catalog_target(&catalog, Some(row.tables)),
+            {
+                let mut config = catalog_target(&catalog, Some(row.tables));
+                if row.routes_its_records {
+                    config["ProcessingConfiguration"] = record_routing();
+                }
+                config
+            },
         )
         .await;
         assert_table_refusal(row.case, status, &answered);
@@ -1100,17 +1133,22 @@ struct Readable {
     tables: Option<&'static [(&'static str, &'static str)]>,
     /// Whether the destination asks Firehose to create its tables itself.
     creates_its_tables: bool,
+    /// Whether the destination routes each record to a table of its own, which is what lets it
+    /// name other than one default destination table
+    /// ([`a_destination_configuration_firehose_does_not_serve_is_refused`]).
+    routes_its_records: bool,
 }
 
 /// RULE: a create whose Iceberg destination names tables the catalog CAN serve — including one
-/// naming no table at all ("Firehose will write data with insert if table specific
-/// configuration is not provided here") and one whose tables Firehose creates itself
-/// (`TableCreationConfiguration`, "the configuration to enable automatic table creation") — is
+/// naming no table at all, which routes each record to a table of its own, and one whose tables
+/// Firehose creates itself (`TableCreationConfiguration`, "the configuration to enable automatic
+/// table creation") — is
 /// served: it answers the modelled `DeliveryStreamARN` for the name it was given, and the
 /// stream reads back under it.
 ///
-/// The rows differ along the FORM of the resolvable target: no list, one table, the same table
-/// twice, a table named in another case (the catalog stores and looks names up folded), a
+/// The rows differ along the FORM of the resolvable target: no list under per-record routing,
+/// one table, the same table twice under per-record routing, a table named in another case (the
+/// catalog stores and looks names up folded), a
 /// table that is a plain Hive row rather than an Iceberg one (what Firehose resolves is the
 /// catalog's table, not its format), and an absent table under automatic table creation.
 #[tokio::test]
@@ -1118,40 +1156,46 @@ async fn a_create_whose_destination_tables_the_catalog_serves_mints_the_modelled
     const HIVE_TABLE: &str = "hive_row";
     const ROWS: &[Readable] = &[
         Readable {
-            case: "a destination listing no table at all",
+            case: "a destination listing no table at all, routing each record to its own",
             stream: "iceberg-no-table-list",
             tables: None,
             creates_its_tables: false,
+            routes_its_records: true,
         },
         Readable {
             case: "a destination listing one table the catalog holds",
             stream: "iceberg-one-table",
             tables: Some(&[(DATABASE, PRESENT_TABLE)]),
             creates_its_tables: false,
+            routes_its_records: false,
         },
         Readable {
-            case: "a destination listing the same table twice",
+            case: "a destination listing the same table twice, routing each record to its own",
             stream: "iceberg-two-tables",
             tables: Some(&[(DATABASE, PRESENT_TABLE), (DATABASE, PRESENT_TABLE)]),
             creates_its_tables: false,
+            routes_its_records: true,
         },
         Readable {
             case: "a destination naming the table in another case, which the catalog folds",
             stream: "iceberg-folded-name",
             tables: Some(&[("ICEBERG_DELIVERY_DB", "PRESENT")]),
             creates_its_tables: false,
+            routes_its_records: false,
         },
         Readable {
             case: "a destination naming a table the catalog holds as a plain Hive row",
             stream: "iceberg-hive-row",
             tables: Some(&[(DATABASE, HIVE_TABLE)]),
             creates_its_tables: false,
+            routes_its_records: false,
         },
         Readable {
             case: "an absent table the destination asks Firehose to create itself",
             stream: "iceberg-table-creation",
             tables: Some(&[(DATABASE, ABSENT_TABLE)]),
             creates_its_tables: true,
+            routes_its_records: false,
         },
     ];
 
@@ -1165,6 +1209,9 @@ async fn a_create_whose_destination_tables_the_catalog_serves_mints_the_modelled
         let mut config = catalog_target(&catalog_arn(), row.tables);
         if row.creates_its_tables {
             config["TableCreationConfiguration"] = json!({ "Enabled": true });
+        }
+        if row.routes_its_records {
+            config["ProcessingConfiguration"] = record_routing();
         }
         let (status, created) = create_with_target(&emulator, row.stream, config).await;
         assert_eq!(
@@ -1192,6 +1239,144 @@ async fn a_create_whose_destination_tables_the_catalog_serves_mints_the_modelled
             "case {}: the created stream reads back under its ARN, got {described}",
             row.case
         );
+    }
+}
+
+/// One create whose Iceberg destination configuration Firehose does or does not serve.
+struct Configured {
+    case: &'static str,
+    /// The `(database, table)` pairs the destination lists, or `None` for a destination that
+    /// lists none at all.
+    tables: Option<&'static [(&'static str, &'static str)]>,
+    /// Whether the destination routes each record to a table of its own.
+    routes_its_records: bool,
+    /// The `S3BackupMode` the create supplies, or `None` to leave it out.
+    backup_mode: Option<&'static str>,
+    /// The sentence the create is refused with, or `None` where it is served.
+    refusal: Option<&'static str>,
+}
+
+/// The two sentences this suite's rows are refused with, as this service states them.
+const SINGLE_DEFAULT_TABLE: &str = "A single default destination table configuration must be \
+                                    provided when both Lambda and MetadataExtraction \
+                                    processors are not provided";
+const UNSUPPORTED_BACKUP_MODE: &str =
+    "S3BackupMode.AllData is not supported for Iceberg as destination.";
+
+/// RULE: Firehose serves an Apache Iceberg destination only where the configuration says which
+/// table each record goes to and asks for the one record backup it performs — so a destination
+/// that routes no record per record (no `Lambda` and no `MetadataExtraction` processor) must name
+/// exactly ONE default destination table, and an `S3BackupMode` other than the one the model
+/// documents ("Currently, S3 backup only supports `FailedDataOnly`") is refused. Both are
+/// `InvalidArgumentException` with the sentence this service states for them, and neither
+/// registers a stream.
+///
+/// The rows differ along the COUNT of destination tables (none, one, two), whether a routing
+/// processor is configured, and each value of `IcebergS3BackupMode`
+/// (`smithy_query(query="shape", shape="IcebergS3BackupMode")`).
+#[tokio::test]
+async fn an_iceberg_destination_configuration_firehose_does_not_serve_is_refused() {
+    const BOTH_TABLES: &[(&str, &str)] = &[(DATABASE, PRESENT_TABLE), (DATABASE, "second")];
+    const ONE_TABLE: &[(&str, &str)] = &[(DATABASE, PRESENT_TABLE)];
+    const ROWS: &[Configured] = &[
+        Configured {
+            case: "no destination table and no processor to route a record to one",
+            tables: None,
+            routes_its_records: false,
+            backup_mode: None,
+            refusal: Some(SINGLE_DEFAULT_TABLE),
+        },
+        Configured {
+            case: "an empty destination table list and no routing processor",
+            tables: Some(&[]),
+            routes_its_records: false,
+            backup_mode: None,
+            refusal: Some(SINGLE_DEFAULT_TABLE),
+        },
+        Configured {
+            case: "two destination tables and no routing processor",
+            tables: Some(BOTH_TABLES),
+            routes_its_records: false,
+            backup_mode: None,
+            refusal: Some(SINGLE_DEFAULT_TABLE),
+        },
+        Configured {
+            case: "one default destination table and no routing processor",
+            tables: Some(ONE_TABLE),
+            routes_its_records: false,
+            backup_mode: None,
+            refusal: None,
+        },
+        Configured {
+            case: "two destination tables under a routing processor",
+            tables: Some(BOTH_TABLES),
+            routes_its_records: true,
+            backup_mode: None,
+            refusal: None,
+        },
+        Configured {
+            case: "no destination table under a routing processor",
+            tables: None,
+            routes_its_records: true,
+            backup_mode: None,
+            refusal: None,
+        },
+        Configured {
+            case: "the backup mode the destination kind does not support",
+            tables: Some(ONE_TABLE),
+            routes_its_records: false,
+            backup_mode: Some("AllData"),
+            refusal: Some(UNSUPPORTED_BACKUP_MODE),
+        },
+        Configured {
+            case: "the one backup mode it does support",
+            tables: Some(ONE_TABLE),
+            routes_its_records: false,
+            backup_mode: Some("FailedDataOnly"),
+            refusal: None,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BUCKET).await;
+    create_database(&emulator, DATABASE).await;
+    for table in [PRESENT_TABLE, "second"] {
+        create_iceberg_table(&emulator, table, &[("id", "string")]).await;
+    }
+
+    for (ordinal, row) in ROWS.iter().enumerate() {
+        let case = row.case;
+        let stream = format!("iceberg-configured-{ordinal}");
+        let mut config = catalog_target(&catalog_arn(), row.tables);
+        if row.routes_its_records {
+            config["ProcessingConfiguration"] = record_routing();
+        }
+        if let Some(mode) = row.backup_mode {
+            config["S3BackupMode"] = json!(mode);
+        }
+        let (status, answered) = create_with_target(&emulator, &stream, config).await;
+        let Some(refusal) = row.refusal else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to be served, got {status} with {answered}"
+            );
+            continue;
+        };
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the create to be refused, got {status} with {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "InvalidArgumentException",
+            "case {case:?}: expected InvalidArgumentException, got {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            refusal,
+            "case {case:?}: expected {refusal:?}, got {answered}"
+        );
+        assert_unregistered(&emulator, case, &stream).await;
     }
 }
 
@@ -1368,4 +1553,435 @@ async fn an_update_naming_an_unreadable_destination_table_leaves_the_destination
         table_list(&[(DATABASE, repointed)]),
         "the served update repoints the destination, got {description}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The PERMISSION half of that same read.
+//
+// Firehose makes the Data Catalog read UNDER the configuration's own `RoleARN`, so what the
+// permissions in force on that role allow decides the create exactly as the catalog's contents
+// do — and Firehose states ONE sentence for both halves. These rows drive the permission half,
+// with IAM mounted beside Firehose and Glue so the decision is IAM's own.
+// ---------------------------------------------------------------------------------------
+
+/// The endpoint the requests of the permission rows reach the emulator on.
+const AUTHORIZATION_HOST: &str = "127.0.0.1:9297";
+
+/// The Glue database the permission rows' destination table lives in.
+const AUTHORIZED_DATABASE: &str = "iceberg_authorization_db";
+
+/// The destination table they name.
+const AUTHORIZED_TABLE: &str = "orders";
+
+/// Another table the catalog holds, so a row can grant the read on a table that is not the
+/// destination's.
+const OTHER_TABLE: &str = "shipments";
+
+/// Firehose, Glue and IAM on ONE shared engine, exactly as the router mounts them: the catalog
+/// read a create makes is the Data Catalog's to answer for the table's existence and IAM's to
+/// answer for the role's permission, so the question crosses all three services.
+struct CatalogAws {
+    router: ::smithy_server_runtime::MultiServiceRouter,
+}
+
+impl CatalogAws {
+    fn new() -> Self {
+        let engine: ::std::sync::Arc<engine::InMemoryEngine> =
+            ::std::sync::Arc::new(engine::InMemoryEngine::new());
+        let mut router = ::smithy_server_runtime::MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_firehose_firehose_20150804::EmulatedService::new(
+                ::std::sync::Arc::clone(&engine),
+            ),
+        );
+        router.register_service(service_com_amazonaws_glue_awsglue::EmulatedService::new(
+            ::std::sync::Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+        );
+        Self { router }
+    }
+
+    /// One `awsJson1_1` call: `service` is the routing key its requests are signed for and
+    /// `target` the prefix of its `X-Amz-Target`.
+    async fn json_rpc(
+        &self,
+        service: &str,
+        target: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", AUTHORIZATION_HOST)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("{target}.{operation}"))
+            .header("authorization", authorization(service))
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("the request body serializes"),
+            ))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// One Firehose operation.
+    async fn firehose(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.json_rpc("firehose", "Firehose_20150804", operation, body)
+            .await
+    }
+
+    /// One Glue operation that must succeed.
+    async fn glue_ok(&self, operation: &str, body: Value) {
+        let (status, answered) = self.json_rpc("glue", "AWSGlue", operation, body).await;
+        assert_eq!(status, 200, "{operation} must succeed, got {answered}");
+    }
+
+    /// One awsQuery call to IAM that must succeed.
+    async fn iam(&self, action: &str, params: &[(&str, String)]) {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://{AUTHORIZATION_HOST}/"))
+            .header("host", AUTHORIZATION_HOST)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization("iam"))
+            .body(bytes::Bytes::from(body))
+            .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "{action} must succeed, got {}",
+            String::from_utf8_lossy(response.body())
+        );
+    }
+
+    /// Create the role `name`, trusted by the Firehose service principal, with `policy` as its
+    /// one inline policy — or with none at all for `None`. Answers the role's ARN.
+    async fn create_role(&self, name: &str, policy: Option<&Value>) -> String {
+        let trust = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": "firehose.amazonaws.com" },
+                "Action": "sts:AssumeRole",
+            }],
+        })
+        .to_string();
+        self.iam(
+            "CreateRole",
+            &[
+                ("RoleName", name.to_string()),
+                ("AssumeRolePolicyDocument", trust),
+            ],
+        )
+        .await;
+        if let Some(policy) = policy {
+            self.iam(
+                "PutRolePolicy",
+                &[
+                    ("RoleName", name.to_string()),
+                    ("PolicyName", "catalog-read".to_string()),
+                    ("PolicyDocument", policy.to_string()),
+                ],
+            )
+            .await;
+        }
+        format!(
+            "arn:aws:iam::{}:role/{name}",
+            engine::emulator_account_id()
+        )
+    }
+}
+
+/// The ARN of a Data Catalog table of this account, as a policy grants the catalog read on it:
+/// `arn:<partition>:glue:<region>:<account>:table/<database>/<table>`
+/// (`smithy_query(query="shape", shape="GlueDataCatalogARN")` addresses the catalog itself, and
+/// the table resource carries its database beside its name).
+fn glue_table_arn(database: &str, table: &str) -> String {
+    format!(
+        "arn:aws:glue:{REGION}:{}:table/{database}/{table}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The ARN of a catalog RESOURCE inside this account's Data Catalog, which
+/// `GlueDataCatalogARN` admits (`catalog(?:(/[a-z0-9_-]+){1,2})?`): a catalog whose own tables
+/// this emulator's Data Catalog serves no databases of, so the read of such a destination is
+/// authorized against the catalog itself.
+fn child_catalog_arn() -> String {
+    format!(
+        "arn:aws:glue:{REGION}:{}:catalog/{CHILD_CATALOG}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The name of that catalog resource.
+const CHILD_CATALOG: &str = "lake";
+
+/// An identity-based policy document with one statement.
+fn statement(effect: &str, action: Value, resource: Value) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": effect, "Action": action, "Resource": resource }],
+    })
+}
+
+/// One permission row: what the role's policies say, and whether the create is served.
+struct Permission {
+    case: &'static str,
+    /// The role's one inline policy, or `None` for a role carrying none at all.
+    policy: Option<Value>,
+    /// Whether the destination lists its default table, or routes each record to its own and
+    /// so names no table for a grant to be written about.
+    lists_its_table: bool,
+    /// Whether the destination names a catalog RESOURCE rather than the account's own Data
+    /// Catalog. Such a destination creates its tables itself here, so what is left to decide
+    /// is the permission.
+    child_catalog: bool,
+    /// Whether the create is served under those permissions.
+    served: bool,
+}
+
+/// RULE: Firehose makes the destination table's catalog read under the configuration's own
+/// `RoleARN`, so a create is served only where the permissions in force on that role allow
+/// `glue:GetTable` on the table the destination names; where they do not, the create is refused
+/// with the same `InvalidArgumentException` and the same sentence an absent table is refused
+/// with, and nothing is registered.
+///
+/// The rows differ along WHAT the role's policies say about that one call: nothing at all, the
+/// call on every resource, the call on exactly that table, the call on another table of the same
+/// database, the whole service on every resource, an explicit deny over a grant, and a grant of
+/// another service entirely — and along WHICH resource the read addresses: the destination's own
+/// table, the catalog a destination that lists no table would read its tables from, and the
+/// catalog RESOURCE a destination inside one names.
+#[tokio::test]
+async fn a_create_whose_role_may_not_read_the_destination_table_is_refused() {
+    let rows: Vec<Permission> = vec![
+        Permission {
+            case: "a role carrying no permissions policy at all",
+            policy: None,
+            lists_its_table: true,
+            child_catalog: false,
+            served: false,
+        },
+        Permission {
+            case: "the catalog read granted on every resource",
+            policy: Some(statement("Allow", json!("glue:GetTable"), json!("*"))),
+            lists_its_table: true,
+            child_catalog: false,
+            served: true,
+        },
+        Permission {
+            case: "the catalog read granted on exactly the destination table",
+            policy: Some(statement(
+                "Allow",
+                json!("glue:GetTable"),
+                json!(glue_table_arn(AUTHORIZED_DATABASE, AUTHORIZED_TABLE)),
+            )),
+            lists_its_table: true,
+            child_catalog: false,
+            served: true,
+        },
+        Permission {
+            case: "the catalog read granted on another table of the same database",
+            policy: Some(statement(
+                "Allow",
+                json!("glue:GetTable"),
+                json!(glue_table_arn(AUTHORIZED_DATABASE, OTHER_TABLE)),
+            )),
+            lists_its_table: true,
+            child_catalog: false,
+            served: false,
+        },
+        Permission {
+            case: "the whole catalog service granted on every resource",
+            policy: Some(statement("Allow", json!("glue:*"), json!("*"))),
+            lists_its_table: true,
+            child_catalog: false,
+            served: true,
+        },
+        Permission {
+            case: "the catalog read denied over a grant of the whole service",
+            policy: Some(json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    { "Effect": "Allow", "Action": "glue:*", "Resource": "*" },
+                    { "Effect": "Deny", "Action": "glue:GetTable", "Resource": "*" },
+                ],
+            })),
+            lists_its_table: true,
+            child_catalog: false,
+            served: false,
+        },
+        Permission {
+            case: "another service granted on every resource and the catalog read on none",
+            policy: Some(statement(
+                "Allow",
+                json!(["s3:PutObject", "logs:PutLogEvents"]),
+                json!("*"),
+            )),
+            lists_its_table: true,
+            child_catalog: false,
+            served: false,
+        },
+        Permission {
+            case: "a destination listing no table, with the read granted on the catalog it \
+                   would read its tables from",
+            policy: Some(statement(
+                "Allow",
+                json!("glue:GetTable"),
+                json!(catalog_arn()),
+            )),
+            lists_its_table: false,
+            child_catalog: false,
+            served: true,
+        },
+        Permission {
+            case: "a destination listing no table, with nothing granted at all",
+            policy: None,
+            lists_its_table: false,
+            child_catalog: false,
+            served: false,
+        },
+        Permission {
+            case: "a destination inside a catalog resource, with the read granted on that \
+                   catalog",
+            policy: Some(statement(
+                "Allow",
+                json!("glue:GetTable"),
+                json!(child_catalog_arn()),
+            )),
+            lists_its_table: true,
+            child_catalog: true,
+            served: true,
+        },
+        Permission {
+            case: "a destination inside a catalog resource, with nothing granted at all",
+            policy: None,
+            lists_its_table: true,
+            child_catalog: true,
+            served: false,
+        },
+    ];
+
+    let aws = CatalogAws::new();
+    aws.glue_ok(
+        "CreateDatabase",
+        json!({ "DatabaseInput": { "Name": AUTHORIZED_DATABASE } }),
+    )
+    .await;
+    for table in [AUTHORIZED_TABLE, OTHER_TABLE] {
+        aws.glue_ok(
+            "CreateTable",
+            json!({
+                "DatabaseName": AUTHORIZED_DATABASE,
+                "TableInput": {
+                    "Name": table,
+                    "TableType": "EXTERNAL_TABLE",
+                    "StorageDescriptor": {
+                        "Columns": [{ "Name": "id", "Type": "string" }],
+                        "Location": format!("s3://{BUCKET}/iceberg/{table}/"),
+                    },
+                },
+            }),
+        )
+        .await;
+    }
+
+    for (ordinal, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let role_name = format!("firehose-catalog-reader-{ordinal}");
+        let role_arn = aws.create_role(&role_name, row.policy.as_ref()).await;
+        let stream = format!("iceberg-authorized-{ordinal}");
+        let mut destination = json!({
+            "RoleARN": role_arn,
+            "CatalogConfiguration": { "CatalogARN": catalog_arn() },
+            "S3Configuration": {
+                "RoleARN": role_arn,
+                "BucketARN": format!("arn:aws:s3:::{BUCKET}"),
+            },
+        });
+        if row.lists_its_table {
+            destination["DestinationTableConfigurationList"] =
+                table_list(&[(AUTHORIZED_DATABASE, AUTHORIZED_TABLE)]);
+        } else {
+            // A destination that names no table routes each record to its own, which is the
+            // configuration that needs no default destination table.
+            destination["ProcessingConfiguration"] = record_routing();
+        }
+        if row.child_catalog {
+            // A catalog resource inside this account's Data Catalog serves no databases here,
+            // so this destination creates its tables itself: what is left to decide is whether
+            // the role may make the catalog read at all.
+            destination["CatalogConfiguration"] = json!({ "CatalogARN": child_catalog_arn() });
+            destination["TableCreationConfiguration"] = json!({ "Enabled": true });
+        }
+        let (status, answered) = aws
+            .firehose(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": stream,
+                    "DeliveryStreamType": "DirectPut",
+                    "IcebergDestinationConfiguration": destination,
+                }),
+            )
+            .await;
+        if row.served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to be served, got {status} with {answered}"
+            );
+            assert!(
+                answered.get("DeliveryStreamARN").is_some(),
+                "case {case:?}: a served create mints the stream's ARN, got {answered}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the create to be refused, got {status} with {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "InvalidArgumentException",
+            "case {case:?}: expected InvalidArgumentException, got {answered}"
+        );
+        let expected = format!(
+            "Role {role_arn} is not authorized to perform: glue:GetTable for the given table \
+             or the table does not exist."
+        );
+        assert_eq!(
+            error_message(&answered),
+            expected,
+            "case {case:?}: expected {expected:?}, got {answered}"
+        );
+        // A refused create registers nothing, so the name it asked for is still free.
+        let (described, body) = aws
+            .firehose(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": stream }),
+            )
+            .await;
+        assert_eq!(
+            described, 400,
+            "case {case:?}: no stream of that name exists, got {body}"
+        );
+    }
 }

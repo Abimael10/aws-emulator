@@ -120,6 +120,33 @@ const SEARCH_REFUSAL: &str = "Changing the destination type to/from Elasticsearc
      supported at this time.";
 const HTTP_ENDPOINT_REFUSAL: &str =
     "Changing the destination type to or from HttpEndpoint is not supported at this time.";
+const ICEBERG_REFUSAL: &str =
+    "Changing the destination type to or from Iceberg is not supported at this time.";
+
+/// An Apache Iceberg Tables destination with every parameter its type requires, and the one
+/// default destination table a destination that routes no record per record names.
+fn iceberg_configuration() -> Value {
+    json!({
+        "RoleARN": ROLE_ARN,
+        "CatalogConfiguration": { "CatalogARN": "arn:aws:glue:us-west-2:000000000000:catalog" },
+        // The one default destination table a destination that routes no record per record has
+        // to name, created by Firehose itself — so this suite needs no Data Catalog target of
+        // its own.
+        "DestinationTableConfigurationList": [{
+            "DestinationDatabaseName": "switch_db",
+            "DestinationTableName": "events",
+        }],
+        "TableCreationConfiguration": { "Enabled": true },
+        "S3Configuration": s3_configuration(),
+    })
+}
+
+/// The same destination as an `IcebergDestinationUpdate`: every member of that shape is
+/// optional and named as the configuration names it, so a switch INTO it can carry the whole
+/// configuration a replacement would need.
+fn iceberg_update() -> Value {
+    iceberg_configuration()
+}
 
 /// One attempted destination-type switch.
 struct SwitchCase {
@@ -200,6 +227,36 @@ fn switch_cases() -> Vec<SwitchCase> {
             update: redshift_update(),
             expected: SEARCH_REFUSAL,
         },
+        // And the same rule for the Apache Iceberg Tables boundary, in both directions and
+        // however complete the new type's configuration is.
+        SwitchCase {
+            case: "into Apache Iceberg Tables with every required parameter",
+            stream: "switch-s3",
+            update_member: "IcebergDestinationUpdate",
+            update: iceberg_update(),
+            expected: ICEBERG_REFUSAL,
+        },
+        SwitchCase {
+            case: "into Apache Iceberg Tables with only a role",
+            stream: "switch-extended-s3",
+            update_member: "IcebergDestinationUpdate",
+            update: json!({ "RoleARN": ROLE_ARN }),
+            expected: ICEBERG_REFUSAL,
+        },
+        SwitchCase {
+            case: "out of Apache Iceberg Tables to Amazon S3",
+            stream: "switch-iceberg",
+            update_member: "S3DestinationUpdate",
+            update: json!({ "RoleARN": ROLE_ARN, "BucketARN": BUCKET_ARN }),
+            expected: ICEBERG_REFUSAL,
+        },
+        SwitchCase {
+            case: "out of Apache Iceberg Tables to Redshift",
+            stream: "switch-iceberg",
+            update_member: "RedshiftDestinationUpdate",
+            update: redshift_update(),
+            expected: ICEBERG_REFUSAL,
+        },
     ]
 }
 
@@ -243,7 +300,25 @@ async fn a_switch_across_a_type_that_takes_no_part_in_one_is_refused_as_unsuppor
         }),
     )
     .await;
-    tokio::time::sleep(PAST_THE_TRANSITION).await;
+    create(
+        &emulator,
+        "switch-iceberg",
+        "IcebergDestinationConfiguration",
+        iceberg_configuration(),
+    )
+    .await;
+    // Only an ACTIVE stream's destination can be updated, and the clock owes that transition:
+    // each stream is waited for by LOOKING until it reports ACTIVE rather than by waiting out a
+    // span, so nothing here depends on how fast the host runs.
+    for stream in [
+        "switch-extended-s3",
+        "switch-s3",
+        "switch-http-endpoint",
+        "switch-elasticsearch",
+        "switch-iceberg",
+    ] {
+        emulator.await_active(stream).await;
+    }
 
     for case in switch_cases() {
         let (version, destination_id) = version_and_destination(&emulator, case.stream).await;

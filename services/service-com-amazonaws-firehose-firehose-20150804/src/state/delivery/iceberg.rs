@@ -164,7 +164,7 @@ pub fn iceberg_targets(config: &DestinationConfigKind) -> Vec<IcebergTarget> {
     };
     vec![IcebergTarget {
         role_arn: config.role_arn.clone(),
-        catalog_id: catalog_account(config.catalog_configuration.catalog_arn.as_deref()),
+        catalog_id: addressed_catalog_id(config.catalog_configuration.catalog_arn.as_deref()),
         tables,
         hints: config.buffering_hints.clone(),
         logging: DestinationLogging::of(config.cloud_watch_logging_options.as_ref()),
@@ -191,11 +191,30 @@ fn destination_table(config: &DestinationTableConfiguration) -> DestinationTable
     }
 }
 
-/// The Data Catalog a `CatalogConfiguration$CatalogARN` names: the ACCOUNT of that ARN, which
-/// is how a Data Catalog is addressed (`arn:<partition>:glue:<region>:<account>:catalog`).
-pub(crate) fn catalog_account(catalog_arn: Option<&str>) -> Option<String> {
-    let account = catalog_arn?.split(':').nth(4)?;
-    (!account.is_empty()).then(|| account.to_string())
+/// The `CatalogId` a `CatalogConfiguration$CatalogARN` addresses, or `None` for a
+/// configuration that names no catalog at all (whose catalog is the account's own default).
+///
+/// `GlueDataCatalogARN`'s own pattern is
+/// `^arn:.*:glue:.*:\d{12}:catalog(?:(/[a-z0-9_-]+){1,2})?$`
+/// (`smithy_query(query="shape", shape="GlueDataCatalogARN")`), so such an ARN addresses the
+/// ACCOUNT's Data Catalog — "you must specify the ARN in the format
+/// `arn:aws:glue:region:account-id:catalog`" — and may name a catalog RESOURCE inside it after
+/// that. The two are different catalogs, and a table of one is no table of the other, so the
+/// name is read as well as the account: a resource name becomes the `CatalogId` the Data
+/// Catalog addresses that catalog by (`child_catalog_id`, the id its own `CreateCatalog`
+/// minted), which is what every reader here resolves against the store
+/// (`resolve_catalog_id`).
+pub(crate) fn addressed_catalog_id(catalog_arn: Option<&str>) -> Option<String> {
+    let fields = ::service_common::arn::parse(catalog_arn?)?;
+    let account = (!fields.account.is_empty()).then_some(fields.account)?;
+    match fields.resource.split_once('/') {
+        // The ARN names a catalog resource inside that account's Data Catalog.
+        Some((_, name)) if !name.is_empty() => Some(
+            ::service_com_amazonaws_glue_awsglue::state::child_catalog_id(account, name),
+        ),
+        // The ARN names the account's Data Catalog itself.
+        _ => Some(account.to_string()),
+    }
 }
 
 /// What one Iceberg destination's delivery writes: the objects, and the catalog pointers the

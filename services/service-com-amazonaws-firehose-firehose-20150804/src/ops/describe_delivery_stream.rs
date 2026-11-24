@@ -265,8 +265,10 @@ const DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE: &str = "FailedDocumentsOnly";
 const DEFAULT_SPLUNK_S3_BACKUP_MODE: &str = "FailedEventsOnly";
 /// `IcebergDestinationDescription$S3BackupMode`: "Describes how Firehose will backup
 /// records. Currently, Firehose only supports FailedDataOnly" — the one value the
-/// destination kind backs records up with, so that is the mode it operates under.
-const DEFAULT_ICEBERG_S3_BACKUP_MODE: &str = "FailedDataOnly";
+/// destination kind backs records up with, so that is the mode it operates under. The one
+/// spelling of it is the state module's, which is also what a create naming another value
+/// is refused against (`crate::state::unsupported_iceberg_configuration`).
+const DEFAULT_ICEBERG_S3_BACKUP_MODE: &str = crate::state::ICEBERG_BACKUP_MODE;
 /// `IcebergDestinationConfiguration$AppendOnly`: "The default value is false."
 const DEFAULT_APPEND_ONLY: bool = false;
 /// `SplunkBufferingHints$IntervalInSeconds`: "The default value is 60 (1 minute)."

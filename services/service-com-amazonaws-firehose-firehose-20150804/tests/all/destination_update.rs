@@ -341,6 +341,14 @@ fn merge_cases() -> Vec<MergeCase> {
                 "CatalogConfiguration": {
                     "CatalogARN": "arn:aws:glue:us-west-2:000000000000:catalog",
                 },
+                // The one default destination table a destination that routes no record per
+                // record has to name, created by Firehose itself — so this suite needs no
+                // Data Catalog target of its own.
+                "DestinationTableConfigurationList": [{
+                    "DestinationDatabaseName": "merge_db",
+                    "DestinationTableName": "events",
+                }],
+                "TableCreationConfiguration": { "Enabled": true },
                 "AppendOnly": true,
                 "S3Configuration": s3_configuration(),
             }),

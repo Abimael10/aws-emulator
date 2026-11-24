@@ -522,6 +522,96 @@ fn enables_cloudwatch_logs_processing(processing: &ProcessingConfiguration) -> b
         })
 }
 
+/// The `ProcessorType`s that can tell Firehose WHICH destination table a record belongs in:
+/// the function a `Lambda` processor hands each record to, which returns the record's table,
+/// and the program a `MetadataExtraction` processor runs over the record, which reads it out
+/// of the record itself.
+///
+/// A destination carrying neither has no per-record routing at all, so every record it takes
+/// goes to the one DEFAULT destination table — which is why the configuration has to name
+/// exactly one ([`undefaulted_destination_table`]).
+pub const DESTINATION_TABLE_ROUTING_PROCESSOR_TYPES: &[&str] =
+    &[LAMBDA_PROCESSOR_TYPE, delivery::METADATA_EXTRACTION_PROCESSOR];
+
+/// The refusal for an Apache Iceberg destination configuration Firehose does not support,
+/// whichever of its rules the configuration breaks; `None` for a configuration Firehose
+/// serves, and for every other destination kind.
+///
+/// The two rules of such a destination that the model states in prose rather than in a
+/// constraint: the one `S3BackupMode` it supports ([`unsupported_iceberg_backup_mode`]), and
+/// the single default destination table a configuration that routes no record needs
+/// ([`undefaulted_destination_table`]). Asked as one question by the two paths that WRITE a
+/// destination configuration (`CreateDeliveryStream`, `UpdateDestination`), which both report
+/// it as the modelled `InvalidArgumentException`, so neither path can apply one rule and skip
+/// the other.
+pub fn unsupported_iceberg_configuration(config: &DestinationConfigKind) -> Option<String> {
+    unsupported_iceberg_backup_mode(config).or_else(|| undefaulted_destination_table(config))
+}
+
+/// The refusal for an Apache Iceberg destination asking for a record backup Firehose does not
+/// perform: "Currently, S3 backup only supports `FailedDataOnly`"
+/// (`IcebergDestinationConfiguration$S3BackupMode`), so the other value the enum declares is
+/// refused however it is spelled in the request.
+///
+/// Keyed to the one SUPPORTED value rather than to a list of refused ones, so a value the
+/// model may add later is refused until this service serves it.
+fn unsupported_iceberg_backup_mode(config: &DestinationConfigKind) -> Option<String> {
+    let DestinationConfigKind::Iceberg(iceberg) = config else {
+        return None;
+    };
+    let requested = iceberg.s3_backup_mode.as_deref()?;
+    (requested != ICEBERG_BACKUP_MODE).then(|| {
+        crate::service::unsupported_iceberg_backup_mode_message(
+            ICEBERG_BACKUP_MODE_MEMBER,
+            requested,
+        )
+    })
+}
+
+/// The one `IcebergS3BackupMode` Firehose performs for an Apache Iceberg destination
+/// ("Currently, S3 backup only supports `FailedDataOnly`"), which is also the value a
+/// description reports when the create named none.
+pub const ICEBERG_BACKUP_MODE: &str = "FailedDataOnly";
+
+/// The member an Iceberg destination's backup mode is submitted at, as the refusal names it.
+const ICEBERG_BACKUP_MODE_MEMBER: &str = "S3BackupMode";
+
+/// The refusal for an Apache Iceberg destination that routes no record to a table of its own
+/// and does not name exactly one DEFAULT destination table; `None` when the configuration is
+/// one Firehose can route, and for every other destination kind.
+///
+/// An Iceberg destination delivers to TABLES of a Data Catalog, so each record it takes has to
+/// resolve to one of them. A destination carrying a routing processor
+/// ([`DESTINATION_TABLE_ROUTING_PROCESSOR_TYPES`]) resolves it per record; one carrying none
+/// has only the single default table its `DestinationTableConfigurationList` names, so a list
+/// that names no table — or more than one, none of which is the default — leaves records
+/// nowhere to go and is refused as the argument fault it is.
+///
+/// The question is about the configuration as SUBMITTED, exactly as
+/// [`incomplete_processor`] asks its own: the processors a caller NAMED are what decide the
+/// routing it asked for, whatever `Enabled` says, and a configuration is stored either way.
+fn undefaulted_destination_table(config: &DestinationConfigKind) -> Option<String> {
+    let DestinationConfigKind::Iceberg(iceberg) = config else {
+        return None;
+    };
+    let routes_records = config
+        .processing_configuration()
+        .iter()
+        .flat_map(|processing| processing.processors.iter().flatten())
+        .any(|processor| {
+            DESTINATION_TABLE_ROUTING_PROCESSOR_TYPES.contains(&processor.r#type.as_str())
+        });
+    if routes_records {
+        return None;
+    }
+    let named = iceberg
+        .destination_table_configuration_list
+        .as_deref()
+        .unwrap_or_default()
+        .len();
+    (named != 1).then(crate::service::single_default_destination_table_message)
+}
+
 /// One destination of a stream: the id Firehose assigned it and the configuration it was
 /// created with.
 #[derive(Debug, Clone)]

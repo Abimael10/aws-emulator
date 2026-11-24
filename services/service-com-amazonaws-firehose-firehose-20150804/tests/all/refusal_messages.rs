@@ -50,13 +50,13 @@ pub(crate) fn value_at(member: &str, requirement: &str) -> String {
     ))
 }
 
-/// The clause for a required member that was absent: there was no value at all, so the
-/// null the request held is what is reported.
+/// The clause for a required member that was absent: there was no value at all, so there is
+/// no value token in the clause either — the member and the requirement are all of it.
 ///
 /// `pub(crate)` beside [`value_at`], for the same reason.
-pub(crate) fn null_at(member: &str) -> String {
+pub(crate) fn absent_at(member: &str) -> String {
     one_error(format!(
-        "Value null at '{member}' failed to satisfy constraint: Member must not be null"
+        "Value at '{member}' failed to satisfy constraint: Member must not be null"
     ))
 }
 
@@ -221,7 +221,32 @@ async fn a_constraint_violation_names_the_member_and_the_constraint_but_not_the_
             "an absent required member",
             "CreateDeliveryStream",
             json!({ "S3DestinationConfiguration": s3_configuration() }),
-            null_at("deliveryStreamName"),
+            absent_at("deliveryStreamName"),
+        ),
+        (
+            "an absent required member two levels down",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "iceberg-stream",
+                "IcebergDestinationConfiguration": {
+                    "RoleARN": ROLE_ARN,
+                    "S3Configuration": s3_configuration(),
+                },
+            }),
+            absent_at("icebergDestinationConfiguration.catalogConfiguration"),
+        ),
+        (
+            "an absent required member three levels down",
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "splunk-stream",
+                "SplunkDestinationConfiguration": {
+                    "HECEndpoint": "https://splunk.example.com:8088",
+                    "HECEndpointType": "Raw",
+                    "S3Configuration": { "RoleARN": ROLE_ARN },
+                },
+            }),
+            absent_at("splunkDestinationConfiguration.s3Configuration.bucketARN"),
         ),
     ];
 
@@ -238,10 +263,11 @@ async fn a_constraint_violation_names_the_member_and_the_constraint_but_not_the_
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"
         );
-        // The value-free form has no `Value '…'` subject at all, so nothing the caller
-        // sent — a record payload, a tag value — can reach the body through it.
+        // The value-free form has no `Value '…'` subject and no `Value null` either, so
+        // nothing the caller sent — a record payload, a tag value — can reach the body
+        // through it, and an absent member is reported with no value token at all.
         assert!(
-            !message.contains("Value '"),
+            !message.contains("Value '") && !message.contains("Value null"),
             "case {case:?}: expected no rejected value in the message, got {message:?}"
         );
     }

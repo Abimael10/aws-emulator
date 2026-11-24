@@ -262,6 +262,14 @@ fn cases() -> Vec<Case> {
                 "CatalogConfiguration": {
                     "CatalogARN": format!("arn:aws:glue:{REGION}:000000000000:catalog"),
                 },
+                // The one default destination table a destination that routes no record per
+                // record has to name, created by Firehose itself — so this suite needs no
+                // Data Catalog target of its own.
+                "DestinationTableConfigurationList": [{
+                    "DestinationDatabaseName": "gate_db",
+                    "DestinationTableName": "events",
+                }],
+                "TableCreationConfiguration": { "Enabled": true },
                 "S3Configuration": s3_configuration(),
                 "ProcessingConfiguration":
                     processing(Some(true), vec![cloudwatch_log_processing()]),

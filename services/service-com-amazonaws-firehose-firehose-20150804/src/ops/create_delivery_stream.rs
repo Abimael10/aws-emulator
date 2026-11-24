@@ -417,16 +417,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("deliverystream/{}", input.delivery_stream_name),
         );
 
+        // An Apache Iceberg destination delivers to TABLES of a Data Catalog, so the records
+        // it takes have to resolve to one, and the only record backup it performs is the one
+        // its model documents: a configuration asking for another backup mode, or routing no
+        // record while naming no single default destination table, is refused before anything
+        // resolves the catalog it would have read.
+        if let Some(message) = crate::state::unsupported_iceberg_configuration(&destination) {
+            return Err(invalid_argument(message));
+        }
+
         // An Apache Iceberg destination delivers to a TABLE of a Data Catalog, which Firehose
         // reads with the configuration's own role when the configuration is submitted — so a
-        // table the catalog cannot serve is an argument fault of THIS call, refused before the
-        // name is charged against anything: a create refused for its catalog target registers
-        // nothing, which is what makes the documented order (create the table, then create the
-        // stream that delivers to it) reachable under the name the client chose.
+        // read that role may not make, or that the catalog holds no table for, is an argument
+        // fault of THIS call, refused before the name is charged against anything: a create
+        // refused for its catalog target registers nothing, which is what makes the documented
+        // order (create the table, then create the stream that delivers to it) reachable under
+        // the name the client chose.
         if let Some(message) = crate::state::iceberg_catalog::unresolvable_destination_table(
             &*self.engine,
+            ctx,
+            &region,
             &destination,
-        ) {
+        )
+        .await
+        {
             return Err(invalid_argument(message));
         }
 

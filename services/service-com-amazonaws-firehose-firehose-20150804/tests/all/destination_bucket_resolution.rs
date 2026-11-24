@@ -25,17 +25,24 @@
 
 use serde_json::{json, Value};
 
-use crate::delivery_stream_lifecycle::{
-    at, error_code, error_message, PAST_THE_TRANSITION, REGION, ROLE_ARN,
-};
+use crate::delivery_stream_lifecycle::{at, error_code, error_message, REGION, ROLE_ARN};
 // The harness, the ARN form, the nested configuration and the version/destination read are
 // the pre-flight suite's: this one adds rows, not a second way of asking.
 use crate::destination_bucket_preflight::{bucket_arn, s3_configuration, version_and_destination};
 use crate::destination_delivery::Emulator;
+// The Data Catalog target an Iceberg destination needs is created through Glue's own wire with
+// the format-conversion suite's helpers, and the wait for a created stream to reach ACTIVE is
+// the poll the Parquet suite already shares over this same harness: neither is re-spelled here.
+use crate::format_conversion_delivery::{create_database, create_table};
+use crate::parquet_serializer_parameters::await_active;
 
 /// The bucket every stream below is created against: the destination a refused update must
 /// leave in place.
 const HELD: &str = "resolution-held";
+
+/// The Glue database and table the Iceberg row's destination delivers to.
+const CATALOG_DATABASE: &str = "resolution_db";
+const CATALOG_TABLE: &str = "events";
 
 /// A SECOND bucket Amazon S3 holds, so each row can tell "this update was refused" from
 /// "no update of this member ever lands".
@@ -113,6 +120,12 @@ fn member_cases() -> Vec<MemberCase> {
                     "CatalogConfiguration": {
                         "CatalogARN": format!("arn:aws:glue:{REGION}:000000000000:catalog"),
                     },
+                    // The one default destination table a destination that routes no record
+                    // per record needs, which the test creates in the Data Catalog below.
+                    "DestinationTableConfigurationList": [{
+                        "DestinationDatabaseName": CATALOG_DATABASE,
+                        "DestinationTableName": CATALOG_TABLE,
+                    }],
                     "AppendOnly": true,
                     "S3Configuration": s3_configuration(bucket),
                 })
@@ -177,16 +190,22 @@ async fn every_bucket_member_is_resolved_whatever_form_the_absent_name_takes() {
     for bucket in [HELD, TARGET] {
         emulator.create_bucket(bucket).await;
     }
+    // The Iceberg row's destination delivers to a table of the Data Catalog, which Firehose
+    // reads when the configuration is submitted, so the catalog holds it before the creates.
+    create_database(&emulator, CATALOG_DATABASE).await;
+    create_table(&emulator, CATALOG_DATABASE, CATALOG_TABLE, &[("id", "string")]).await;
 
     let rows = member_cases();
-    // Every stream is created first, so one wait covers the clock-owed CREATING -> ACTIVE
-    // span: only an ACTIVE stream's destination can be updated.
+    // Every stream is created first, so the waits below cover the clock-owed
+    // CREATING -> ACTIVE span together: only an ACTIVE stream's destination can be updated.
     for row in &rows {
         let mut request = json!({ "DeliveryStreamName": row.stream });
         request[row.config_member] = (row.config)(HELD);
         emulator.firehose_ok("CreateDeliveryStream", request).await;
     }
-    tokio::time::sleep(PAST_THE_TRANSITION).await;
+    for row in &rows {
+        await_active(&emulator, row.stream, row.stream).await;
+    }
 
     for row in &rows {
         let (version, destination_id, _) = version_and_destination(&emulator, row.stream).await;

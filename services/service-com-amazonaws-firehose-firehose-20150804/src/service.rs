@@ -118,17 +118,14 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     if let Some(member) = tag_key_list_member(&violation.path) {
         return Some(element_clause(member, &tag_key_constraints()));
     }
-    // An absent member has no submitted value at all, so it is reported as the null it
-    // was: that is a fact of the request's shape, not a rendering of a value the caller
-    // sent. Every other violation names the member ONLY — the values this service
-    // constrains include record payloads (`Data`, up to 1,024,000 bytes) and tag values,
-    // and none of them belongs in a 400 body.
-    let subject = match &violation.kind {
-        ViolationKind::MissingRequiredMember => "Value null",
-        _ => "Value",
-    };
+    // Every clause names the member ONLY, whichever constraint was broken: the values this
+    // service constrains include record payloads (`Data`, up to 1,024,000 bytes) and tag
+    // values, and none of them belongs in a 400 body. An ABSENT member has no submitted
+    // value to name either, so no value token stands between `Value` and `at` for one — the
+    // clause states the member that was expected and the requirement it broke, and nothing
+    // of what the request did or did not carry there.
     Some(format!(
-        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        "Value at '{}' failed to satisfy constraint: {requirement}",
         violation.path
     ))
 }
@@ -1006,10 +1003,29 @@ pub const UNSUPPORTED_SEARCH_TYPE_CHANGE: &str =
 pub const UNSUPPORTED_HTTP_ENDPOINT_TYPE_CHANGE: &str =
     "Changing the destination type to or from HttpEndpoint is not supported at this time.";
 
+/// A switch into or out of the Apache Iceberg Tables destination type, which Firehose does
+/// not support either.
+///
+/// Beside the two sentences above, and the same shape of sentence: it names the destination
+/// type boundary that may not be crossed and no parameter at all, so the refusal reads as
+/// the constraint it is rather than as an invitation to supply more of the new type.
+pub const UNSUPPORTED_ICEBERG_TYPE_CHANGE: &str =
+    "Changing the destination type to or from Iceberg is not supported at this time.";
+
 /// A create of a stream type whose source configuration is absent: the configuration that
 /// type is fed by, and the type that requires it.
 pub fn mandatory_source_configuration_message(configuration: &str, stream_type: &str) -> String {
     format!("{configuration} is mandatory for {stream_type} stream type.")
+}
+
+/// An Apache Iceberg destination asking for a record backup Firehose does not perform: the
+/// member the mode was submitted at and the value the request named.
+///
+/// The fixed text states that the destination KIND does not support the mode; the variable
+/// parts are the member and the value, both read from the request, so the sentence is stated
+/// for whichever unsupported value a caller names rather than asserting one of them.
+pub fn unsupported_iceberg_backup_mode_message(member: &str, mode: &str) -> String {
+    format!("{member}.{mode} is not supported for Iceberg as destination.")
 }
 
 /// A data processor that omits a parameter its type cannot run without: the parameter, and
@@ -1019,6 +1035,19 @@ pub fn mandatory_source_configuration_message(configuration: &str, stream_type: 
 /// makes a parameter the model leaves optional in general mandatory here.
 pub fn mandatory_processor_parameter_message(parameter: &str, processor_type: &str) -> String {
     format!("{parameter} is required when {processor_type} processor is used.")
+}
+
+/// An Apache Iceberg destination that names no single DEFAULT destination table while
+/// carrying no processor that routes a record to one of its own.
+///
+/// Wholly fixed text: it names the two processor types that would have supplied the routing
+/// (`crate::state::DESTINATION_TABLE_ROUTING_PROCESSOR_TYPES`) rather than any value the
+/// request carried, because the fault is the combination the configuration asked for and not
+/// one parameter of it.
+pub fn single_default_destination_table_message() -> String {
+    "A single default destination table configuration must be provided when both Lambda and \
+     MetadataExtraction processors are not provided"
+        .to_string()
 }
 
 /// A put that resolved no stream. Same rule as [`not_found_message`] — the account, not

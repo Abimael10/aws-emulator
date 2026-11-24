@@ -19,7 +19,8 @@
 //! * some destination types take no part in a type change at all ([`FixedType`]):
 //!   "Switching between Amazon OpenSearch Service and other services is not supported. For
 //!   an Amazon OpenSearch Service destination, you can only update to another Amazon
-//!   OpenSearch Service destination", and an HTTP endpoint destination is the same. A
+//!   OpenSearch Service destination", and an HTTP endpoint destination and an Apache Iceberg
+//!   Tables destination are the same. A
 //!   switch across one of those boundaries is refused as UNSUPPORTED
 //!   (`InvalidArgumentException`), before any parameter of the new type is looked at, so
 //!   supplying more of them cannot make it succeed;
@@ -304,10 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // beside the point.
         if let Some(update) = input.iceberg_destination_update.as_ref() {
             // The configuration in force is read under THIS service's lock, which is released
-            // before the Data Catalog is read: the two stores are never held at once.
-            if let Some(stored) = stored_iceberg_destination(&state, &input) {
+            // before the Data Catalog is read: the two stores are never held at once. The read
+            // is bound to its own `let` on purpose — an `if let` would hold the guard that call
+            // takes across the `.await` below, which is the one thing this ordering avoids.
+            let stored = stored_iceberg_destination(&state, &input);
+            if let Some(stored) = stored {
                 if let Some(message) =
-                    unresolvable_update_target(&*self.engine, &stored, update)
+                    unresolvable_update_target(&*self.engine, ctx, &region, &stored, update).await
                 {
                     return Err(invalid_argument(message));
                 }
@@ -375,7 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        destination.config = applied(&destination.config, update)?;
+        let updated = applied(&destination.config, update)?;
+        // The configuration an update leaves in force answers the same Iceberg rules a
+        // created one does: the one record backup Firehose performs, and the single default
+        // destination table a destination that routes no record needs.
+        if let Some(message) = crate::state::unsupported_iceberg_configuration(&updated) {
+            return Err(invalid_argument(message));
+        }
+        destination.config = updated;
         // The configuration the update leaves behind is normalised exactly as a created
         // one is: the parameters Firehose fills in itself are materialised against the
         // role the updated destination now delivers under, in the canonical order.
@@ -431,8 +442,10 @@ fn stored_iceberg_destination(
 /// things the resolution needs — the catalog, the role Firehose reads the tables with, and
 /// whether the destination creates missing tables itself — is the update's own where it carries
 /// it and `stored`'s where it does not, which is the configuration the merge leaves in force.
-fn unresolvable_update_target<Eng: Send + Sync + 'static>(
+async fn unresolvable_update_target<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
     stored: &IcebergDestinationConfiguration,
     update: &IcebergDestinationUpdate,
 ) -> Option<String> {
@@ -449,11 +462,14 @@ fn unresolvable_update_target<Eng: Send + Sync + 'static>(
         .is_some_and(|configured| configured.enabled);
     crate::state::iceberg_catalog::unresolvable_tables(
         engine,
+        ctx,
+        region,
         update.destination_table_configuration_list.as_deref(),
         catalog_arn.as_deref(),
         &role_arn,
         creates_its_tables,
     )
+    .await
 }
 
 /// Every IAM role ARN the update names, each distinct ARN once.
@@ -754,6 +770,7 @@ impl DestinationUpdateKind {
             }
             Self::AmazonOpenSearchServerless(_) => Some(FixedType::SearchServerless),
             Self::HttpEndpoint(_) => Some(FixedType::HttpEndpoint),
+            Self::Iceberg(_) => Some(FixedType::Iceberg),
             _ => None,
         }
     }
@@ -775,6 +792,8 @@ enum FixedType {
     SearchServerless,
     /// An HTTP endpoint destination.
     HttpEndpoint,
+    /// An Apache Iceberg Tables destination.
+    Iceberg,
 }
 
 impl FixedType {
@@ -786,6 +805,7 @@ impl FixedType {
                 crate::service::UNSUPPORTED_SEARCH_TYPE_CHANGE
             }
             Self::HttpEndpoint => crate::service::UNSUPPORTED_HTTP_ENDPOINT_TYPE_CHANGE,
+            Self::Iceberg => crate::service::UNSUPPORTED_ICEBERG_TYPE_CHANGE,
         }
     }
 }
@@ -797,6 +817,7 @@ fn stored_fixed_type(config: &crate::state::DestinationConfigKind) -> Option<Fix
         Kind::Elasticsearch(_) | Kind::AmazonOpenSearchService(_) => Some(FixedType::SearchDomain),
         Kind::AmazonOpenSearchServerless(_) => Some(FixedType::SearchServerless),
         Kind::HttpEndpoint(_) => Some(FixedType::HttpEndpoint),
+        Kind::Iceberg(_) => Some(FixedType::Iceberg),
         _ => None,
     }
 }
@@ -1069,21 +1090,14 @@ fn replaced(
             merge_opensearch_serverless(&mut config, &update)?;
             Ok(Kind::AmazonOpenSearchServerless(config.into()))
         }
-        Update::Iceberg(update) => {
-            let member = "IcebergDestinationUpdate";
-            let mut config = IcebergDestinationConfiguration {
-                role_arn: required(&update.role_arn, member, "RoleARN")?,
-                catalog_configuration: required(
-                    &update.catalog_configuration,
-                    member,
-                    "CatalogConfiguration",
-                )?,
-                s3_configuration: required(&update.s3_configuration, member, "S3Configuration")?,
-                ..IcebergDestinationConfiguration::default()
-            };
-            merge_iceberg(&mut config, &update);
-            Ok(Kind::Iceberg(config.into()))
-        }
+        // A destination of another type is never REPLACED by an Apache Iceberg one, and an
+        // Iceberg one is never replaced by another type: that boundary is refused in
+        // [`applied`] before any parameter of the new type is read ([`FixedType::Iceberg`]).
+        // Stated here as well, so this function cannot word a type change Firehose does not
+        // perform as a list of parameters to supply.
+        Update::Iceberg(_) => Err(invalid_argument(
+            crate::service::UNSUPPORTED_ICEBERG_TYPE_CHANGE.to_string(),
+        )),
     }
 }
 
