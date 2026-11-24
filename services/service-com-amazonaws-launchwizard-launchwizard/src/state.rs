@@ -112,47 +112,43 @@ pub const COMPARATOR_EQUAL: &str = "Equal";
 /// See [`COMPARATOR_EQUAL`].
 pub const COMPARATOR_NOT_EQUAL: &str = "NotEqual";
 
-/// The `workloadVersionName` every seeded catalogue entry reports: the catalogue's
-/// current version, which is the newest version its deployment patterns publish.
+/// Every `DeploymentPatternVersionName` the catalogue publishes for a deployment pattern
+/// of the workload `workload`, NEWEST FIRST — the first entry is the version that
+/// workload's patterns currently deploy, which is the one `ListWorkloadDeploymentPatterns`
+/// and `GetWorkloadDeploymentPattern` report as BOTH `workloadVersionName` and
+/// `deploymentPatternVersionName`. Empty for a name the catalogue publishes no entry
+/// under.
 ///
-/// A Launch Wizard catalogue entry is published at ONE version: the workload version a
-/// deployment pattern is published at is the pattern version it reports, which is why
-/// `WorkloadDeploymentPatternData` carries the two members side by side with one value
-/// between them. Derived from the newest entry of [`CATALOGUE_PATTERN_VERSIONS`] rather
-/// than stated a second time beside it, so the two cannot drift apart.
-///
-/// The emulator seeds ONE version line for the WHOLE catalogue rather than one per
-/// workload — every seeded entry reports this value — so this is the catalogue's own
-/// version and not a claim about what AWS publishes for each application; see
-/// [`CATALOGUE_PATTERN_VERSIONS`] for where the value comes from.
-///
-/// `WorkloadVersionName` / `DeploymentPatternVersionName` are len 5..30 with pattern
-/// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`, which every entry of that list
-/// satisfies using the dotted alternative.
-pub const CATALOGUE_VERSION: &str = CATALOGUE_PATTERN_VERSIONS[0];
-
-/// The `DeploymentPatternVersionName`s the seeded catalogue publishes for EVERY
-/// deployment pattern, NEWEST FIRST — the first entry is the version the pattern
-/// currently deploys, which is the one `ListWorkloadDeploymentPatterns` and
-/// `GetWorkloadDeploymentPattern` report as its `deploymentPatternVersionName`.
+/// A version line belongs to the catalogue ENTRY, not to the catalogue: a workload is
+/// published AT a version and each of its deployment patterns is published at that
+/// version — which is why `WorkloadDeploymentPatternData` carries the two version members
+/// with one value between them — so the line is read off that entry's own catalogue row
+/// ([`SeededWorkload::versions`]) rather than from one value every entry shares. Entries
+/// version independently of each other: an application entry moves at the pace of the
+/// Launch Wizard catalogue that deploys it, and an AWS Solutions Library solution entry at
+/// the pace of the solution.
 ///
 /// Newest first is the order a version listing pages in, so the version a caller should
 /// deploy — the one every other catalogue view reports — is on the FIRST page of
 /// `ListDeploymentPatternVersions` whatever page size it is read at, rather than behind
 /// however many older versions the pattern has accumulated.
 ///
-/// The catalogue is service-owned (there is no API that creates a pattern or a version
-/// of one), so the emulator seeds it. The FIRST entry is the deployment pattern version
-/// Launch Wizard's own catalogue publishes for its SAP deployment patterns (recorded
-/// wording, like [`WORKLOAD_NOT_FOUND_MESSAGE`]), so a client that reads a version out
-/// of this catalogue addresses the version AWS publishes rather than a substitute; the
-/// entries after it are the EMULATOR's own history behind it. Each entry stays inside
-/// `DeploymentPatternVersionName` (see [`CATALOGUE_VERSION`]) using the dotted
-/// alternative. More than one version is seeded because a pattern's version operations
+/// The catalogue is service-owned (there is no API that creates a workload, a pattern or a
+/// version of one), so the emulator seeds it; each row says which of its values AWS
+/// publishes and which are the emulator's own. Every entry of every line stays inside
+/// `WorkloadVersionName` / `DeploymentPatternVersionName` (len 5..30,
+/// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`) using the dotted alternative. More
+/// than one version is published per pattern because a pattern's version operations
 /// (`GetDeploymentPatternVersion`, `ListDeploymentPatternVersions`) exist to tell the
-/// versions of ONE pattern apart, which a catalogue holding a single version per
-/// pattern cannot show.
-pub const CATALOGUE_PATTERN_VERSIONS: &[&str] = &["1.0.27", "1.0.1", "1.0.0"];
+/// versions of ONE pattern apart, which a catalogue holding a single version per pattern
+/// cannot show.
+pub fn catalogue_pattern_versions(workload: &str) -> &'static [&'static str] {
+    CATALOGUE
+        .iter()
+        .find(|entry| entry.name == workload)
+        .map(|entry| entry.versions)
+        .unwrap_or(&[])
+}
 
 /// The message an update of a deployment that is going away is refused with.
 ///
@@ -371,7 +367,7 @@ impl SpecificationField {
 pub struct PatternVersion {
     /// `DeploymentPatternVersionName`: len 5..30,
     /// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`. One of
-    /// [`CATALOGUE_PATTERN_VERSIONS`].
+    /// [`catalogue_pattern_versions`].
     pub version_name: String,
     /// `DeploymentPatternVersionDataSummary$description`.
     pub description: String,
@@ -402,10 +398,11 @@ pub struct DeploymentPattern {
     /// `WorkloadDeploymentPatternData$statusMessage`: present only when the status
     /// needs explaining, which [`PATTERN_ACTIVE`] does not.
     pub status_message: Option<String>,
-    /// `workloadVersionName`, see [`CATALOGUE_VERSION`].
+    /// `workloadVersionName`: the version the workload this pattern belongs to is
+    /// published at, see [`catalogue_pattern_versions`].
     pub workload_version_name: String,
     /// Every version of this pattern the catalogue publishes, NEWEST FIRST — see
-    /// [`CATALOGUE_PATTERN_VERSIONS`]. The pattern's current version is derived from
+    /// [`catalogue_pattern_versions`]. The pattern's current version is derived from
     /// this list ([`DeploymentPattern::current_version`]) rather than stored beside it,
     /// so the version a pattern reports is always one the catalogue holds.
     pub versions: Vec<PatternVersion>,
@@ -459,7 +456,7 @@ impl DeploymentPattern {
 
     /// EVERY version this pattern publishes as the summaries
     /// `ListDeploymentPatternVersions` pages, NEWEST FIRST — the order
-    /// [`CATALOGUE_PATTERN_VERSIONS`] publishes them in, so a page resumes in a stable
+    /// [`catalogue_pattern_versions`] publishes them in, so a page resumes in a stable
     /// order.
     ///
     /// Built from the same projection the single-version read reports
@@ -1231,12 +1228,28 @@ const FIELD_ENABLE_EBS_VOLUME_ENCRYPTION: &str = "EnableEbsVolumeEncryption";
 /// See [`FIELD_CREATE_SECURITY_GROUP`].
 const FIELD_CLUSTER_QUORUM_TYPE: &str = "ClusterQuorumType";
 
-/// The field names the required set of every seeded pattern that LAUNCHES EC2 instances
-/// holds: such a deployment always launches its instances into a VPC, and they are
-/// reached with a key pair. A pattern that launches no instances of its own
-/// ([`SeededPattern::launches_instances`]) publishes neither field, so neither is in its
-/// required set — see [`seeded_specification_fields`].
-const COMMON_REQUIRED_FIELDS: [&str; 2] = ["KeyPairName", "VpcId"];
+/// Field names a pattern's required set names, so a required name is the same string the
+/// schema publishes it under.
+const FIELD_KEY_PAIR_NAME: &str = "KeyPairName";
+/// See [`FIELD_KEY_PAIR_NAME`].
+const FIELD_VPC_ID: &str = "VpcId";
+/// See [`FIELD_KEY_PAIR_NAME`]: the address range a deployment that CREATES its network
+/// is sized with, which stands in for the id of a VPC the caller already has.
+const FIELD_VPC_CIDR: &str = "VpcCidr";
+
+/// The field names the required set of every seeded pattern that launches EC2 instances
+/// into a VPC THE CALLER ALREADY HAS holds: such a deployment launches its instances into
+/// that VPC, and they are reached with a key pair. A pattern that launches no instances of
+/// its own publishes neither field, so neither is in its required set, and one that
+/// creates its own network requires [`NEW_NETWORK_REQUIRED_FIELDS`] instead — see
+/// [`PatternNetwork`] and [`seeded_specification_fields`].
+const COMMON_REQUIRED_FIELDS: [&str; 2] = [FIELD_KEY_PAIR_NAME, FIELD_VPC_ID];
+
+/// The field names the required set of every seeded pattern that launches EC2 instances
+/// into a VPC THE DEPLOYMENT CREATES holds: there is no VPC to name, so what the caller
+/// cannot be chosen for is the address range the new network is sized with. See
+/// [`COMMON_REQUIRED_FIELDS`].
+const NEW_NETWORK_REQUIRED_FIELDS: [&str; 2] = [FIELD_KEY_PAIR_NAME, FIELD_VPC_CIDR];
 
 /// The quorum mechanisms a clustered pattern offers, and the one that needs no witness
 /// instance of its own. EMULATOR-owned vocabulary (see [`sap_hana_single_fields`]).
@@ -1328,13 +1341,13 @@ fn deployment_level_fields() -> Vec<SpecificationField> {
 fn instance_specification_fields() -> Vec<SpecificationField> {
     vec![
         spec_field(
-            "KeyPairName",
+            FIELD_KEY_PAIR_NAME,
             "The name of the EC2 key pair used to access the instances this deployment \
              launches.",
             &[],
         ),
         spec_field(
-            "VpcId",
+            FIELD_VPC_ID,
             "The id of the VPC the deployment launches its resources into.",
             &[],
         ),
@@ -1357,6 +1370,37 @@ fn instance_specification_fields() -> Vec<SpecificationField> {
             )],
         ),
     ]
+}
+
+/// The common layer of a pattern that launches EC2 instances into a VPC THE DEPLOYMENT
+/// CREATES (see [`PatternNetwork`]): the deployment-level settings, the key pair its
+/// instances are reached with, the address range the new network is sized with — there is
+/// no VPC id to name — and the notification topic.
+///
+/// A deployment that creates the network also creates the security group its instances sit
+/// in, so neither the choice of creating one nor the id of an existing one is published:
+/// there is no group in the new network to attach.
+///
+/// Published in the same order as [`common_specification_fields`], of which this is the
+/// variant for a caller that has no network yet, so the layers state one order between
+/// them.
+fn new_network_common_fields() -> Vec<SpecificationField> {
+    let mut fields = deployment_level_fields();
+    fields.extend([
+        spec_field(
+            FIELD_KEY_PAIR_NAME,
+            "The name of the EC2 key pair used to access the instances this deployment \
+             launches.",
+            &[],
+        ),
+        spec_field(
+            FIELD_VPC_CIDR,
+            "The IPv4 address range, in CIDR notation, of the VPC the deployment creates.",
+            &[],
+        ),
+    ]);
+    fields.push(notification_field());
+    fields
 }
 
 /// The topic a deployment publishes its notifications to: the last key of the model's
@@ -1448,7 +1492,7 @@ fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
                 &[],
             ),
         ],
-        SOLUTION_WORKLOAD => vec![
+        SOLUTION_WORKLOAD | LOAD_TESTING_WORKLOAD => vec![
             spec_field(
                 "SolutionVersion",
                 "The version of the solution the deployment installs.",
@@ -1501,31 +1545,102 @@ fn two_zone_fields() -> Vec<SpecificationField> {
     fields
 }
 
-/// The fields every seeded pattern that installs an SAP HANA database reads.
+/// The fields a pattern that spreads across TWO Availability Zones of a network THE
+/// DEPLOYMENT CREATES reads (see [`PatternNetwork`]): which two zones, and the address
+/// range of the private subnet the deployment creates in each — those subnets do not
+/// exist yet, so there is no subnet id to name.
+fn two_zone_new_network_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "AvailabilityZone1",
+            "The Availability Zone the deployment launches its instances into.",
+            &[],
+        ),
+        spec_field(
+            FIELD_PRIVATE_SUBNET_1_CIDR,
+            "The IPv4 address range, in CIDR notation, of the private subnet the \
+             deployment creates in the first Availability Zone.",
+            &[],
+        ),
+        spec_field(
+            "AvailabilityZone2",
+            "The second Availability Zone the deployment spreads its instances across.",
+            &[],
+        ),
+        spec_field(
+            FIELD_PRIVATE_SUBNET_2_CIDR,
+            "The IPv4 address range, in CIDR notation, of the private subnet the \
+             deployment creates in the second Availability Zone.",
+            &[],
+        ),
+    ]
+}
+
+/// The subnet-range names [`two_zone_new_network_fields`] publishes, so the required set
+/// of a pattern that creates its network names the same strings its schema publishes.
+const FIELD_PRIVATE_SUBNET_1_CIDR: &str = "PrivateSubnet1Cidr";
+/// See [`FIELD_PRIVATE_SUBNET_1_CIDR`].
+const FIELD_PRIVATE_SUBNET_2_CIDR: &str = "PrivateSubnet2Cidr";
+
+/// The fields every seeded pattern that installs an SAP database reads: the database's
+/// identifiers and whether the deployment installs its software, stated for the database
+/// `engine` that pattern deploys.
 ///
 /// The names are the SAP deployment specifications AWS documents for a Launch Wizard
 /// SAP database (`DatabaseSystemId`, `DatabaseInstanceNumber`,
 /// `InstallDatabaseSoftware`), which the model links from
 /// `CreateDeployment$specifications` ("SAP deployment specifications"), so a name a
-/// client discovers here is the name AWS reads it under.
-fn hana_database_fields() -> Vec<SpecificationField> {
+/// client discovers here is the name AWS reads it under. The engine is a parameter rather
+/// than this layer written out twice, because it is the only thing that differs between
+/// the patterns deploying one engine and those deploying another.
+fn database_fields(engine: &str) -> Vec<SpecificationField> {
     vec![
         spec_field(
             "DatabaseSystemId",
-            "The system id of the SAP HANA database the deployment installs.",
+            &format!("The system id of the {engine} database the deployment installs."),
             &[],
         ),
         spec_field(
             "DatabaseInstanceNumber",
-            "The instance number of the SAP HANA database.",
+            &format!("The instance number of the {engine} database."),
             &[],
         ),
         spec_field(
             "InstallDatabaseSoftware",
-            "Whether the deployment installs the SAP HANA database software.",
+            &format!("Whether the deployment installs the {engine} database software."),
             &[REQUIRED_YES, REQUIRED_NO],
         ),
     ]
+}
+
+/// The database engines the seeded SAP patterns deploy, as the published text names them.
+/// EMULATOR-owned text, like every description beside a seeded name (see
+/// [`sap_hana_single_fields`]).
+const ENGINE_HANA: &str = "SAP HANA";
+/// See [`ENGINE_HANA`].
+const ENGINE_ASE: &str = "SAP ASE";
+
+/// The database layer of every seeded pattern that installs an SAP HANA database — see
+/// [`database_fields`].
+fn hana_database_fields() -> Vec<SpecificationField> {
+    database_fields(ENGINE_HANA)
+}
+
+/// The database layer of every seeded pattern that installs an SAP ASE database — see
+/// [`database_fields`].
+fn ase_database_fields() -> Vec<SpecificationField> {
+    let mut fields = database_fields(ENGINE_ASE);
+    // The version of the engine is a setting of THIS engine's patterns: an SAP ASE
+    // deployment installs a version of SAP ASE the caller chooses, where a HANA one
+    // installs the database shipped with the HANA release it deploys. It is what makes
+    // the schema of an ASE pattern differ from that of the HANA pattern of the same
+    // deployment model, beyond the text beside each shared name.
+    fields.push(spec_field(
+        "AseDatabaseVersion",
+        "The version of SAP ASE the deployment installs.",
+        &[],
+    ));
+    fields
 }
 
 /// The fields ONE seeded pattern reads of its OWN, on top of the common and per-workload
@@ -1540,7 +1655,8 @@ fn hana_database_fields() -> Vec<SpecificationField> {
 ///
 /// Launch Wizard's catalogue is service-owned (no API creates a workload, a pattern or a
 /// specification), so these names and vocabularies are the EMULATOR's own for the
-/// patterns it seeds — like [`CATALOGUE_PATTERN_VERSIONS`] — rather than a claim about
+/// patterns it seeds — like the version lines of [`catalogue_pattern_versions`] — rather
+/// than a claim about
 /// which settings AWS publishes for them; the ones the model's own `CreateDeployment`
 /// example submits are named where they are used. Every name is a valid
 /// `DeploymentSpecifications` key, so a reported name can be taken straight to
@@ -1555,7 +1671,16 @@ fn sap_hana_single_fields() -> Vec<SpecificationField> {
 /// far the database is spread and what the nodes share. See [`sap_hana_single_fields`].
 fn sap_hana_multi_node_fields() -> Vec<SpecificationField> {
     let mut fields = sap_hana_single_fields();
-    fields.extend([
+    fields.extend(hana_scale_out_fields());
+    fields
+}
+
+/// What a pattern that spreads an SAP HANA database OVER SEVERAL NODES reads beyond a
+/// single-node one: how far the database is spread and what the nodes share. One layer
+/// rather than a copy per scale-out pattern, so the database engine and the application in
+/// front of it are what tell those patterns apart. See [`sap_hana_single_fields`].
+fn hana_scale_out_fields() -> Vec<SpecificationField> {
+    vec![
         spec_field(
             "HanaWorkerNodeCount",
             "How many worker nodes the scale-out SAP HANA database is spread over.",
@@ -1566,9 +1691,76 @@ fn sap_hana_multi_node_fields() -> Vec<SpecificationField> {
             "The id of the shared file system the SAP HANA nodes mount.",
             &[],
         ),
-    ]);
+    ]
+}
+
+/// What every seeded pattern that installs an SAP NetWeaver stack reads beyond the
+/// database under it: the system it installs and the instances that system runs on. See
+/// [`sap_hana_single_fields`].
+fn sap_netweaver_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "SapNWSid",
+            "The system id of the SAP NetWeaver system the deployment installs.",
+            &[],
+        ),
+        spec_field(
+            "SapNWInstanceType",
+            "The EC2 instance type of the SAP NetWeaver instances.",
+            &[],
+        ),
+    ]
+}
+
+/// The single-node SAP NetWeaver on SAP HANA pattern's own fields: a HANA database in ONE
+/// Availability Zone with the NetWeaver system scaled up on the same placement. See
+/// [`sap_hana_single_fields`].
+fn sap_nw_on_hana_single_fields() -> Vec<SpecificationField> {
+    let mut fields = hana_database_fields();
+    fields.extend(one_zone_fields());
+    fields.extend(sap_netweaver_fields());
     fields
 }
+
+/// The scale-out SAP NetWeaver on SAP HANA pattern's own fields: the single-node pattern's,
+/// plus how far the database under the NetWeaver system is spread. See
+/// [`sap_hana_single_fields`].
+fn sap_nw_on_hana_multi_fields() -> Vec<SpecificationField> {
+    let mut fields = sap_nw_on_hana_single_fields();
+    fields.extend(hana_scale_out_fields());
+    fields
+}
+
+/// The single-node SAP NetWeaver on SAP ASE pattern's own fields: the same shape as the
+/// HANA single-node pattern's, over the other database engine the SAP entry deploys. See
+/// [`sap_hana_single_fields`].
+fn sap_nw_on_ase_single_fields() -> Vec<SpecificationField> {
+    let mut fields = ase_database_fields();
+    fields.extend(one_zone_fields());
+    fields.extend(sap_netweaver_fields());
+    fields
+}
+
+/// The highly available SAP NetWeaver on SAP ASE pattern's own fields: the database across
+/// TWO Availability Zones, the NetWeaver system in front of it, and whether the database
+/// replicates to the second zone. See [`sap_hana_single_fields`].
+fn sap_nw_on_ase_ha_fields() -> Vec<SpecificationField> {
+    let mut fields = ase_database_fields();
+    fields.extend(two_zone_fields());
+    fields.extend(sap_netweaver_fields());
+    fields.push(spec_field(
+        FIELD_ENABLE_ASE_REPLICATION,
+        "Whether the SAP ASE database replicates to the second Availability Zone.",
+        &[REQUIRED_YES, REQUIRED_NO],
+    ));
+    fields
+}
+
+/// The replication choices the highly available SAP patterns publish, so their required
+/// sets name the same strings their schemas publish.
+const FIELD_ENABLE_ASE_REPLICATION: &str = "EnableAseDatabaseReplication";
+/// See [`FIELD_ENABLE_ASE_REPLICATION`].
+const FIELD_ENABLE_HANA_REPLICATION: &str = "EnableHanaSystemReplication";
 
 /// The highly available SAP HANA pattern's own fields: the database every HANA pattern
 /// installs, the second instance it replicates to and the cluster that fails over
@@ -1628,23 +1820,12 @@ fn sap_hana_ha_fields() -> Vec<SpecificationField> {
 fn sap_nw_on_hana_ha_fields() -> Vec<SpecificationField> {
     let mut fields = hana_database_fields();
     fields.extend(two_zone_fields());
-    fields.extend([
-        spec_field(
-            "SapNWSid",
-            "The system id of the SAP NetWeaver system the deployment installs.",
-            &[],
-        ),
-        spec_field(
-            "SapNWInstanceType",
-            "The EC2 instance type of the SAP NetWeaver instances.",
-            &[],
-        ),
-        spec_field(
-            "EnableHanaSystemReplication",
-            "Whether the SAP HANA database replicates to the second Availability Zone.",
-            &[REQUIRED_YES, REQUIRED_NO],
-        ),
-    ]);
+    fields.extend(sap_netweaver_fields());
+    fields.push(spec_field(
+        FIELD_ENABLE_HANA_REPLICATION,
+        "Whether the SAP HANA database replicates to the second Availability Zone.",
+        &[REQUIRED_YES, REQUIRED_NO],
+    ));
     fields
 }
 
@@ -1710,24 +1891,27 @@ fn sql_server_ha_fields() -> Vec<SpecificationField> {
     fields
 }
 
-/// The AWS Directory Service managed directory pattern's own fields: the two zones a
-/// managed directory is spread over and its edition. See [`sap_hana_single_fields`].
-fn aws_managed_ad_fields() -> Vec<SpecificationField> {
-    let mut fields = two_zone_fields();
-    fields.push(spec_field(
+/// What an AWS Directory Service MANAGED directory pattern reads beyond its placement:
+/// the edition of the directory the deployment creates. See [`sap_hana_single_fields`].
+///
+/// The directory TYPE a pattern deploys and the NETWORK it deploys into are independent
+/// dimensions of the Active Directory entry's catalogue rows, so each type states its own
+/// fields once here and each row composes them with the placement layer its network calls
+/// for ([`two_zone_fields`] or [`two_zone_new_network_fields`]) — rather than one function
+/// per (type, network) pair, which would state the type's fields twice.
+fn aws_managed_ad_own_fields() -> Vec<SpecificationField> {
+    vec![spec_field(
         "DirectoryEdition",
         "The edition of the AWS Directory Service managed directory the deployment \
          creates.",
         &DIRECTORY_EDITIONS,
-    ));
-    fields
+    )]
 }
 
-/// The self-managed Active Directory pattern's own fields: the domain controllers the
-/// caller administers, across two zones. See [`sap_hana_single_fields`].
-fn self_managed_ad_fields() -> Vec<SpecificationField> {
-    let mut fields = two_zone_fields();
-    fields.extend([
+/// What a SELF-MANAGED Active Directory pattern reads beyond its placement: the domain
+/// controllers the caller administers. See [`aws_managed_ad_own_fields`].
+fn self_managed_ad_own_fields() -> Vec<SpecificationField> {
+    vec![
         spec_field(
             "DomainControllerInstanceType",
             "The EC2 instance type of the domain controllers the deployment launches.",
@@ -1738,7 +1922,69 @@ fn self_managed_ad_fields() -> Vec<SpecificationField> {
             "How many domain controllers the deployment launches.",
             &NODE_COUNTS,
         ),
-    ]);
+    ]
+}
+
+/// What a pattern that EXTENDS an on-premises Active Directory into AWS reads beyond its
+/// placement: the controllers it launches, and where the on-premises directory they
+/// replicate with is reached. See [`aws_managed_ad_own_fields`].
+fn ad_extension_own_fields() -> Vec<SpecificationField> {
+    let mut fields = vec![spec_field(
+        "OnPremisesDomainControllerAddresses",
+        "The addresses of the on-premises domain controllers the controllers this \
+         deployment launches replicate with.",
+        &[],
+    )];
+    fields.extend(self_managed_ad_own_fields());
+    fields
+}
+
+/// The AWS-managed Active Directory pattern of a network the caller already has: its
+/// placement across two Availability Zones of that network, then the directory type's own
+/// fields. See [`aws_managed_ad_own_fields`].
+fn aws_managed_ad_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.extend(aws_managed_ad_own_fields());
+    fields
+}
+
+/// The AWS-managed Active Directory pattern of a network the DEPLOYMENT creates. See
+/// [`aws_managed_ad_own_fields`].
+fn aws_managed_ad_new_network_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_new_network_fields();
+    fields.extend(aws_managed_ad_own_fields());
+    fields
+}
+
+/// The self-managed Active Directory pattern of a network the caller already has. See
+/// [`aws_managed_ad_own_fields`].
+fn self_managed_ad_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.extend(self_managed_ad_own_fields());
+    fields
+}
+
+/// The self-managed Active Directory pattern of a network the DEPLOYMENT creates. See
+/// [`aws_managed_ad_own_fields`].
+fn self_managed_ad_new_network_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_new_network_fields();
+    fields.extend(self_managed_ad_own_fields());
+    fields
+}
+
+/// The on-premises-extension Active Directory pattern of a network the caller already
+/// has. See [`aws_managed_ad_own_fields`].
+fn ad_extension_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_fields();
+    fields.extend(ad_extension_own_fields());
+    fields
+}
+
+/// The on-premises-extension Active Directory pattern of a network the DEPLOYMENT
+/// creates. See [`aws_managed_ad_own_fields`].
+fn ad_extension_new_network_fields() -> Vec<SpecificationField> {
+    let mut fields = two_zone_new_network_fields();
+    fields.extend(ad_extension_own_fields());
     fields
 }
 
@@ -1778,6 +2024,73 @@ fn solution_lambda_fields() -> Vec<SpecificationField> {
             &[],
         ),
     ]
+}
+
+/// The load-testing solution's AWS Fargate architecture pattern's own fields: how many
+/// containers generate the load and how large each of them is. See [`solution_ecs_fields`]
+/// for why a pattern's own fields are the EMULATOR's for the patterns it seeds.
+fn load_test_fargate_fields() -> Vec<SpecificationField> {
+    vec![
+        spec_field(
+            "TestRunnerTaskCount",
+            "How many AWS Fargate tasks the solution generates the load from.",
+            &NODE_COUNTS,
+        ),
+        spec_field(
+            "TaskCpuUnits",
+            "The CPU units each task generating the load is given.",
+            &TASK_CPU_UNITS,
+        ),
+    ]
+}
+
+/// The load-testing solution's existing-network architecture pattern's own fields: the
+/// load generators of the Fargate architecture, run in a network the CALLER already has
+/// rather than one the deployment creates. See [`load_test_fargate_fields`].
+fn load_test_existing_network_fields() -> Vec<SpecificationField> {
+    let mut fields = load_test_fargate_fields();
+    fields.extend([
+        spec_field(
+            FIELD_VPC_ID,
+            "The id of the VPC the solution runs its load generators in.",
+            &[],
+        ),
+        spec_field(
+            "PrivateSubnet1Id",
+            "The id of the private subnet, in the first Availability Zone, the load \
+             generators run in.",
+            &[],
+        ),
+        spec_field(
+            "PrivateSubnet2Id",
+            "The id of the private subnet, in the second Availability Zone, the load \
+             generators run in.",
+            &[],
+        ),
+    ]);
+    fields
+}
+
+/// The load-testing solution's additional-Region architecture pattern's own fields: the
+/// load generators of the Fargate architecture, run in another Region and reporting their
+/// results to a deployment of the solution that already exists. See
+/// [`load_test_fargate_fields`].
+fn load_test_regional_fields() -> Vec<SpecificationField> {
+    let mut fields = load_test_fargate_fields();
+    fields.extend([
+        spec_field(
+            "TestRunnerRegion",
+            "The Region the solution generates the load from.",
+            &[],
+        ),
+        spec_field(
+            "MainDeploymentId",
+            "The id of the deployment of this solution the load generators report their \
+             results to.",
+            &[],
+        ),
+    ]);
+    fields
 }
 
 /// What one pattern marks `required` beyond [`COMMON_REQUIRED_FIELDS`]: the settings a
@@ -1838,7 +2151,37 @@ const SAP_NW_ON_HANA_HA_REQUIRED: &[&str] = &[
     "PrivateSubnet2Id",
     "SapNWSid",
     "SapNWInstanceType",
-    "EnableHanaSystemReplication",
+    FIELD_ENABLE_HANA_REPLICATION,
+];
+/// The settings the single-node SAP NetWeaver patterns insist on: the NetWeaver system
+/// they install, which they cannot name for the caller. The placement of a single-node
+/// deployment stays optional, like the single-node database patterns' — see
+/// [`SAP_HANA_SINGLE_REQUIRED`].
+const SAP_NW_SINGLE_REQUIRED: &[&str] = &["SapNWSid", "SapNWInstanceType"];
+/// The settings the scale-out SAP NetWeaver on SAP HANA pattern insists on: the
+/// single-node pattern's, plus how far the database under it is spread. See
+/// [`SAP_HANA_SINGLE_REQUIRED`].
+const SAP_NW_ON_HANA_MULTI_REQUIRED: &[&str] = &[
+    "DatabaseSystemId",
+    "DatabaseInstanceNumber",
+    "SapNWSid",
+    "SapNWInstanceType",
+    "HanaWorkerNodeCount",
+];
+/// The settings the highly available SAP NetWeaver on SAP ASE pattern insists on: the
+/// zones it spreads across, the NetWeaver system in front of the database, and the
+/// replication between the two database instances — the choices a cross-zone deployment
+/// cannot make for the caller. See [`SAP_HANA_SINGLE_REQUIRED`].
+const SAP_NW_ON_ASE_HA_REQUIRED: &[&str] = &[
+    "DatabaseSystemId",
+    "DatabaseInstanceNumber",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+    "SapNWSid",
+    "SapNWInstanceType",
+    FIELD_ENABLE_ASE_REPLICATION,
 ];
 /// See [`SAP_HANA_SINGLE_REQUIRED`].
 const SQL_SERVER_SINGLE_REQUIRED: &[&str] = &[
@@ -1879,6 +2222,58 @@ const SELF_MANAGED_AD_REQUIRED: &[&str] = &[
     "AvailabilityZone2",
     "PrivateSubnet2Id",
 ];
+/// The settings the Active Directory patterns that CREATE their network insist on: the
+/// same directory settings as their existing-network counterparts, with the address range
+/// of each private subnet the deployment creates standing in for the id of a subnet the
+/// caller already has — a subnet that does not exist yet has no id to name. See
+/// [`SAP_HANA_SINGLE_REQUIRED`] for why requirement is stated per pattern, and
+/// [`PatternNetwork`] for the dimension these rows differ along.
+const AWS_MANAGED_AD_NEW_NETWORK_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DirectoryEdition",
+    "AvailabilityZone1",
+    FIELD_PRIVATE_SUBNET_1_CIDR,
+    "AvailabilityZone2",
+    FIELD_PRIVATE_SUBNET_2_CIDR,
+];
+/// See [`AWS_MANAGED_AD_NEW_NETWORK_REQUIRED`].
+const SELF_MANAGED_AD_NEW_NETWORK_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DomainNetBIOSName",
+    "DomainAdminUser",
+    "DomainControllerInstanceType",
+    "AvailabilityZone1",
+    FIELD_PRIVATE_SUBNET_1_CIDR,
+    "AvailabilityZone2",
+    FIELD_PRIVATE_SUBNET_2_CIDR,
+];
+/// The settings an on-premises-extension Active Directory pattern insists on: the
+/// self-managed controllers' settings, plus where the on-premises directory they
+/// replicate with is reached — without which there is nothing to extend. See
+/// [`SAP_HANA_SINGLE_REQUIRED`].
+const AD_EXTENSION_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DomainNetBIOSName",
+    "DomainAdminUser",
+    "OnPremisesDomainControllerAddresses",
+    "DomainControllerInstanceType",
+    "AvailabilityZone1",
+    "PrivateSubnet1Id",
+    "AvailabilityZone2",
+    "PrivateSubnet2Id",
+];
+/// See [`AD_EXTENSION_REQUIRED`] and [`AWS_MANAGED_AD_NEW_NETWORK_REQUIRED`].
+const AD_EXTENSION_NEW_NETWORK_REQUIRED: &[&str] = &[
+    "DomainDNSName",
+    "DomainNetBIOSName",
+    "DomainAdminUser",
+    "OnPremisesDomainControllerAddresses",
+    "DomainControllerInstanceType",
+    "AvailabilityZone1",
+    FIELD_PRIVATE_SUBNET_1_CIDR,
+    "AvailabilityZone2",
+    FIELD_PRIVATE_SUBNET_2_CIDR,
+];
 /// The settings the solution's Amazon ECS architecture insists on, and the ones its AWS
 /// Lambda architecture does.
 ///
@@ -1889,6 +2284,27 @@ const SELF_MANAGED_AD_REQUIRED: &[&str] = &[
 const SOLUTION_ECS_REQUIRED: &[&str] = &["ClusterTaskCount", "TaskCpuUnits"];
 /// See [`SOLUTION_ECS_REQUIRED`].
 const SOLUTION_LAMBDA_REQUIRED: &[&str] = &["FunctionMemorySizeMiB"];
+/// The settings the load-testing solution's architectures insist on: how much compute
+/// generates the load, which none of them can choose for the caller, plus what each
+/// architecture adds — the network the generators run in for the one that runs in a
+/// network the caller already has, and the Region and the deployment they report to for
+/// the one that generates load from another Region. See [`SOLUTION_ECS_REQUIRED`].
+const LOAD_TEST_FARGATE_REQUIRED: &[&str] = &["TestRunnerTaskCount", "TaskCpuUnits"];
+/// See [`LOAD_TEST_FARGATE_REQUIRED`].
+const LOAD_TEST_EXISTING_NETWORK_REQUIRED: &[&str] = &[
+    "TestRunnerTaskCount",
+    "TaskCpuUnits",
+    FIELD_VPC_ID,
+    "PrivateSubnet1Id",
+    "PrivateSubnet2Id",
+];
+/// See [`LOAD_TEST_FARGATE_REQUIRED`].
+const LOAD_TEST_REGIONAL_REQUIRED: &[&str] = &[
+    "TestRunnerTaskCount",
+    "TaskCpuUnits",
+    "TestRunnerRegion",
+    "MainDeploymentId",
+];
 
 /// Apply one pattern's required set over its composed schema.
 ///
@@ -1924,22 +2340,24 @@ fn mark_required(fields: &mut [SpecificationField], required: &[&str]) {
 /// deploying it also reads) keeps the first layer's definition rather than being reported
 /// twice, which would publish two contradictory contracts for one key.
 fn seeded_specification_fields(workload: &str, pattern: &SeededPattern) -> Vec<SpecificationField> {
-    // Which common layer the pattern reads follows from what it provisions: a pattern
-    // that launches no EC2 instances publishes no key pair, VPC or security-group
-    // setting, so neither does it require one.
-    let mut fields = if pattern.launches_instances {
-        common_specification_fields()
-    } else {
-        serverless_common_fields()
+    // Which common layer the pattern reads follows from what it provisions for itself
+    // ([`PatternNetwork`]): a pattern that launches no EC2 instances publishes no key
+    // pair, VPC or security-group setting, and one that creates the network it launches
+    // into publishes the range that network is sized with instead of the id of a VPC the
+    // caller already has — so neither requires a setting it does not publish.
+    let mut fields = match pattern.network {
+        PatternNetwork::NoInstances => serverless_common_fields(),
+        PatternNetwork::ExistingVpc => common_specification_fields(),
+        PatternNetwork::NewVpc => new_network_common_fields(),
     };
     fields.extend(workload_specification_fields(workload));
     fields.extend((pattern.own_fields)());
     let mut published = BTreeSet::new();
     fields.retain(|field| published.insert(field.name.clone()));
-    let common_required: &[&str] = if pattern.launches_instances {
-        &COMMON_REQUIRED_FIELDS
-    } else {
-        &[]
+    let common_required: &[&str] = match pattern.network {
+        PatternNetwork::NoInstances => &[],
+        PatternNetwork::ExistingVpc => &COMMON_REQUIRED_FIELDS,
+        PatternNetwork::NewVpc => &NEW_NETWORK_REQUIRED_FIELDS,
     };
     let required: Vec<&str> = common_required
         .iter()
@@ -1950,10 +2368,30 @@ fn seeded_specification_fields(workload: &str, pattern: &SeededPattern) -> Vec<S
     fields
 }
 
+/// What a deployment of one seeded pattern provisions FOR ITSELF, which decides the
+/// common layer of that pattern's specification schema and the settings a deployment of
+/// it cannot be created without — see [`seeded_specification_fields`],
+/// [`COMMON_REQUIRED_FIELDS`] and [`NEW_NETWORK_REQUIRED_FIELDS`].
+///
+/// This is a dimension of the catalogue rather than of one entry: the Active Directory
+/// entry publishes each of its directory types for a network the caller already has and
+/// for one the deployment creates, and the solution entries publish architectures that
+/// launch no instances at all, so the layer is selected by the row instead of assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternNetwork {
+    /// Launches no EC2 instances of the caller's own, so publishes no key pair, VPC or
+    /// security-group setting.
+    NoInstances,
+    /// Launches instances into a VPC the CALLER already has, which the request names.
+    ExistingVpc,
+    /// Launches instances into a VPC the DEPLOYMENT creates, which the request sizes.
+    NewVpc,
+}
+
 /// One deployment pattern of the seeded catalogue, as the table in
-/// [`seeded_workloads`] spells it: its `DeploymentPatternName`, its display name, its
-/// description, the fields it reads of its own and the names it marks required beyond
-/// [`COMMON_REQUIRED_FIELDS`].
+/// [`CATALOGUE`] spells it: its `DeploymentPatternName`, its display name, its
+/// description, what it provisions for itself, the fields it reads of its own and the
+/// names it marks required beyond the common layer's.
 ///
 /// Everything the catalogue states about a pattern is in ONE row, so a pattern cannot be
 /// seeded with the schema or the required set of another, and one added here cannot be
@@ -1963,10 +2401,9 @@ struct SeededPattern {
     name: &'static str,
     display_name: &'static str,
     description: &'static str,
-    /// Whether a deployment of this pattern launches EC2 INSTANCES, which decides the
-    /// common layer of its schema: see [`seeded_specification_fields`] and
-    /// [`COMMON_REQUIRED_FIELDS`].
-    launches_instances: bool,
+    /// What a deployment of this pattern provisions for itself, which decides the common
+    /// layer of its schema: see [`PatternNetwork`].
+    network: PatternNetwork,
     /// See [`sap_hana_single_fields`].
     own_fields: fn() -> Vec<SpecificationField>,
     /// See [`SAP_HANA_SINGLE_REQUIRED`].
@@ -1979,8 +2416,8 @@ struct SeededPattern {
 /// A workload's own page is named by its catalogue row's `documentation_page`.
 const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/launchwizard/latest/userguide";
 
-/// The `WorkloadName` of the solution entry the catalogue publishes beside its
-/// application entries.
+/// The `WorkloadName` of the image-transformation solution entry the catalogue publishes
+/// beside its application entries.
 ///
 /// Launch Wizard deploys AWS Solutions Library solutions as workloads of their own, and a
 /// solution's catalogue name is its SOLUTION ID (`SO` followed by its number) rather than
@@ -1991,191 +2428,364 @@ const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/launchwizard/lates
 /// exactly what an entry missing from the catalogue made impossible.
 const SOLUTION_WORKLOAD: &str = "SO0023";
 
-/// One workload of the seeded catalogue, as the table in [`seeded_workloads`] spells it.
+/// The `WorkloadName` of the distributed load-testing solution entry, which generates load
+/// against an endpoint from containers on AWS Fargate. See [`SOLUTION_WORKLOAD`]: a
+/// solution entry is published under its solution id, and a client that names a published
+/// id must reach the entry rather than a refusal.
+const LOAD_TESTING_WORKLOAD: &str = "SO0062";
+
+/// One workload of the seeded catalogue, as the table in [`CATALOGUE`] spells it.
 ///
 /// Everything the catalogue states about a workload is in ONE row, like
-/// [`SeededPattern`]: an entry cannot be seeded with the document of another, and one
-/// added here cannot be forgotten in a second list keyed by its name.
+/// [`SeededPattern`]: an entry cannot be seeded with the document, the version line or
+/// the deployment patterns of another, and one added here cannot be forgotten in a second
+/// list keyed by its name.
 struct SeededWorkload {
     /// `WorkloadName`: len 1..100, `^[A-Za-z][a-zA-Z0-9-_]*$`.
     name: &'static str,
-    /// `WorkloadDataSummary$displayName`.
+    /// `WorkloadDataSummary$displayName`: the name this entry is PUBLISHED under, which is
+    /// what a console-like client renders for the operator choosing a workload — so it is
+    /// stated per entry rather than built out of the entry's name.
     display_name: &'static str,
     /// `WorkloadData$description`: what the workload deploys.
     description: &'static str,
     /// The page of [`DOCUMENTATION_BASE`] that documents deploying this application,
     /// without its `.html` extension — what `WorkloadData$documentationUrl` points at.
     documentation_page: &'static str,
+    /// The versions THIS entry is published at, newest first: the line
+    /// [`catalogue_pattern_versions`] reports for it, whose first entry every one of its
+    /// deployment patterns reports as both of its version members.
+    versions: &'static [&'static str],
     /// The deployment patterns this workload offers.
     patterns: &'static [SeededPattern],
 }
 
-/// The workload catalogue the emulator seeds at first touch.
+/// The workload catalogue the emulator serves, one row per entry.
 ///
-/// Launch Wizard's catalogue is service-owned (there is no API to create a workload or
-/// a deployment pattern), so the emulator seeds it. The entries are the Launch Wizard
-/// applications AWS documents — SAP, Microsoft SQL Server and Microsoft Active
-/// Directory — with the deployment patterns each of those applications offers, the
-/// specification schema each pattern accepts, and the one version of each, plus the
-/// solution entry [`SOLUTION_WORKLOAD`] describes. The model
-/// constrains the shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$`
-/// (len 1..100) and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len
-/// 1..256).
+/// Launch Wizard's catalogue is service-owned (there is no API to create a workload, a
+/// deployment pattern or a version of one), so the emulator seeds it: the Launch Wizard
+/// applications AWS documents — SAP, Microsoft SQL Server and Microsoft Active Directory —
+/// and the AWS Solutions Library solutions it deploys as workloads of their own
+/// ([`SOLUTION_WORKLOAD`], [`LOAD_TESTING_WORKLOAD`]), each with the deployment patterns
+/// that entry offers, the version line it is published at, the specification schema each
+/// of its patterns accepts and the display text it is published with. The model constrains
+/// the shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$` (len 1..100)
+/// and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len 1..256).
 ///
 /// An entry's NAME, and the name of each of its deployment patterns, is the name AWS
 /// publishes that workload or pattern under, because a name is what a client takes from
-/// one catalogue read to the next call (`GetWorkload`,
-/// `ListWorkloadDeploymentPatterns`, `GetWorkloadDeploymentPattern` and
-/// `CreateDeployment` all take one as input) — so a name seeded here addresses the same
-/// resource on the real service. The display text and the schemas beside those names are
-/// the emulator's own, as the field docs below say.
+/// one catalogue read to the next call (`GetWorkload`, `ListWorkloadDeploymentPatterns`,
+/// `GetWorkloadDeploymentPattern` and `CreateDeployment` all take one as input) — so a
+/// name seeded here addresses the same resource on the real service, and a name AWS
+/// publishes resolves here instead of being refused as unknown. A pattern's name says
+/// which of its entry's dimensions it is: which application and deployment model for an
+/// application entry, which directory type and network for the Active Directory entry,
+/// which architecture for a solution entry — two patterns of one entry can only be told
+/// apart by what their names and display text say about them.
 ///
-/// `description`, `documentation_page` and the entry's name are the per-workload
-/// metadata `WorkloadData` (and therefore `GetWorkload`) reports: what the entry's
-/// application deploys and the document that describes deploying it; each pattern
-/// carries its own display name, description, specification schema and version. The icon
-/// the catalogue publishes for an entry is addressed on this emulator's own endpoint and
-/// derived from the entry's name, so it is seeded as no value at all
-/// ([`workload_icons`]).
+/// Each row's `description`, `documentation_page` and name are the per-workload metadata
+/// `WorkloadData` (and therefore `GetWorkload`) reports, and each pattern row carries its
+/// own display name and description; the specification schemas beside those names are the
+/// emulator's own, as [`sap_hana_single_fields`] says. The icon the catalogue publishes for
+/// an entry is addressed on this emulator's own endpoint and derived from the entry's name,
+/// so it is seeded as no value at all ([`workload_icons`]).
+static CATALOGUE: &[SeededWorkload] = &[
+    SeededWorkload {
+        name: "SAP",
+        display_name: "SAP",
+        description: "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
+        documentation_page: "launch-wizard-sap",
+        // The first entry is the version Launch Wizard's own catalogue publishes for its
+        // SAP deployment patterns (recorded, like [`WORKLOAD_NOT_FOUND_MESSAGE`]'s
+        // wording); the entries behind it are this entry's own history in the emulator.
+        versions: &["1.0.27", "1.0.1", "1.0.0"],
+        // The patterns of this entry are the SAP application each one deploys — an SAP
+        // HANA database, an SAP NetWeaver stack on SAP HANA, an SAP NetWeaver stack on SAP
+        // ASE — crossed with the deployment model it deploys it under: a scale-up single
+        // node, a scale-out set of nodes, or a highly available pair across two
+        // Availability Zones. A scale-out model is published only for the engine that
+        // scales out, which is why the ASE application publishes two patterns and each
+        // HANA application three.
+        patterns: &[
+            SeededPattern {
+                name: "SapHanaHA",
+                display_name: "SAP HANA, high availability",
+                description: "Deploys an SAP HANA database as a high-availability \
+                              deployment across two Availability Zones.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_hana_ha_fields,
+                own_required: SAP_HANA_HA_REQUIRED,
+            },
+            SeededPattern {
+                // AWS publishes the scale-out SAP HANA pattern under this name (the
+                // multi-instance pattern of its SAP catalogue entry), beside the
+                // high-availability and single-instance ones.
+                name: "SapHanaMulti",
+                display_name: "SAP HANA, multi node",
+                description: "Deploys an SAP HANA database as a scale-out architecture \
+                              across several nodes.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_hana_multi_node_fields,
+                own_required: SAP_HANA_MULTI_NODE_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapHanaSingle",
+                display_name: "SAP HANA, single node",
+                description: "Deploys an SAP HANA database as a scale-up architecture on \
+                              one node.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_hana_single_fields,
+                own_required: SAP_HANA_SINGLE_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapNWOnAseHA",
+                display_name: "SAP NetWeaver on SAP ASE, high availability",
+                description: "Deploys an SAP NetWeaver stack on an SAP ASE database as a \
+                              high-availability deployment across two Availability Zones.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_nw_on_ase_ha_fields,
+                own_required: SAP_NW_ON_ASE_HA_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapNWOnAseSingle",
+                display_name: "SAP NetWeaver on SAP ASE, single node",
+                description: "Deploys an SAP NetWeaver stack on an SAP ASE database as a \
+                              scale-up architecture on one node.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_nw_on_ase_single_fields,
+                own_required: SAP_NW_SINGLE_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapNWOnHanaHA",
+                display_name: "SAP NetWeaver on SAP HANA, high availability",
+                description: "Deploys an SAP NetWeaver stack on an SAP HANA database as a \
+                              high-availability deployment across two Availability Zones.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_nw_on_hana_ha_fields,
+                own_required: SAP_NW_ON_HANA_HA_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapNWOnHanaMulti",
+                display_name: "SAP NetWeaver on SAP HANA, multi node",
+                description: "Deploys an SAP NetWeaver stack on an SAP HANA database as a \
+                              scale-out architecture across several nodes.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_nw_on_hana_multi_fields,
+                own_required: SAP_NW_ON_HANA_MULTI_REQUIRED,
+            },
+            SeededPattern {
+                name: "SapNWOnHanaSingle",
+                display_name: "SAP NetWeaver on SAP HANA, single node",
+                description: "Deploys an SAP NetWeaver stack on an SAP HANA database as a \
+                              scale-up architecture on one node.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sap_nw_on_hana_single_fields,
+                own_required: SAP_NW_SINGLE_REQUIRED,
+            },
+        ],
+    },
+    SeededWorkload {
+        name: "SQLServer",
+        display_name: "Microsoft SQL Server",
+        description: "Deploy Microsoft SQL Server, standalone or highly available, on Amazon \
+                       Web Services.",
+        documentation_page: "launch-wizard-sql",
+        // This entry's own version line. Launch Wizard publishes no version for it that
+        // the emulator can read, so the line is the EMULATOR's for this entry — what the
+        // rule fixes is that it is the entry's own rather than one every entry shares.
+        versions: &["1.0.9", "1.0.1", "1.0.0"],
+        patterns: &[
+            SeededPattern {
+                name: "SqlServerHA",
+                display_name: "Microsoft SQL Server, high availability",
+                description: "Deploys a Microsoft SQL Server Always On availability group \
+                              across two Availability Zones.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sql_server_ha_fields,
+                own_required: SQL_SERVER_HA_REQUIRED,
+            },
+            SeededPattern {
+                name: "SqlServerSingle",
+                display_name: "Microsoft SQL Server, single node",
+                description: "Deploys Microsoft SQL Server on one instance.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: sql_server_single_fields,
+                own_required: SQL_SERVER_SINGLE_REQUIRED,
+            },
+        ],
+    },
+    SeededWorkload {
+        // AWS publishes the Microsoft Active Directory entry of its catalogue under
+        // this name; "Microsoft Active Directory" is the display name beside it.
+        name: "MicrosoftActiveDirectory",
+        display_name: "Microsoft Active Directory",
+        description: "Deploy AWS Managed Microsoft AD, self-managed Active Directory, or an \
+                       extension of an on-premises directory on Amazon Web Services.",
+        documentation_page: "launch-wizard-ad",
+        // This entry's own version line, the emulator's for this entry — see the SQL
+        // Server row.
+        versions: &["1.0.5", "1.0.1", "1.0.0"],
+        // The patterns of this entry are the DIRECTORY TYPE each one deploys — an AWS
+        // Directory Service managed directory, domain controllers the caller administers,
+        // or an extension of a directory the caller runs on premises — crossed with the
+        // NETWORK it deploys into: one the deployment creates, or one the caller already
+        // has. Both dimensions are in each pattern's name, because the pattern is how a
+        // client selects the topology it needs; a pattern per type alone would leave a
+        // client unable to say which network it deploys into.
+        patterns: &[
+            SeededPattern {
+                name: "AWSManagedADExistingVPC",
+                display_name: "AWS Managed Microsoft AD in an existing VPC",
+                description: "Deploys an AWS Directory Service managed Microsoft AD \
+                              directory into a VPC you already have.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: aws_managed_ad_fields,
+                own_required: AWS_MANAGED_AD_REQUIRED,
+            },
+            SeededPattern {
+                name: "AWSManagedADNewVPC",
+                display_name: "AWS Managed Microsoft AD in a new VPC",
+                description: "Deploys an AWS Directory Service managed Microsoft AD \
+                              directory into a VPC the deployment creates.",
+                network: PatternNetwork::NewVpc,
+                own_fields: aws_managed_ad_new_network_fields,
+                own_required: AWS_MANAGED_AD_NEW_NETWORK_REQUIRED,
+            },
+            SeededPattern {
+                name: "ADExtensionExistingVPC",
+                display_name: "On-premises Active Directory extension in an existing VPC",
+                description: "Extends an Active Directory you run on premises with domain \
+                              controllers in a VPC you already have.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: ad_extension_fields,
+                own_required: AD_EXTENSION_REQUIRED,
+            },
+            SeededPattern {
+                name: "ADExtensionNewVPC",
+                display_name: "On-premises Active Directory extension in a new VPC",
+                description: "Extends an Active Directory you run on premises with domain \
+                              controllers in a VPC the deployment creates.",
+                network: PatternNetwork::NewVpc,
+                own_fields: ad_extension_new_network_fields,
+                own_required: AD_EXTENSION_NEW_NETWORK_REQUIRED,
+            },
+            SeededPattern {
+                name: "SelfManagedADExistingVPC",
+                display_name: "Self-managed Active Directory in an existing VPC",
+                description: "Deploys Active Directory domain controllers you administer \
+                              yourself into a VPC you already have.",
+                network: PatternNetwork::ExistingVpc,
+                own_fields: self_managed_ad_fields,
+                own_required: SELF_MANAGED_AD_REQUIRED,
+            },
+            SeededPattern {
+                name: "SelfManagedADNewVPC",
+                display_name: "Self-managed Active Directory in a new VPC",
+                description: "Deploys Active Directory domain controllers you administer \
+                              yourself into a VPC the deployment creates.",
+                network: PatternNetwork::NewVpc,
+                own_fields: self_managed_ad_new_network_fields,
+                own_required: SELF_MANAGED_AD_NEW_NETWORK_REQUIRED,
+            },
+        ],
+    },
+    SeededWorkload {
+        name: SOLUTION_WORKLOAD,
+        display_name: "Dynamic Image Transformation for Amazon CloudFront",
+        description: "Deploy the AWS Solutions Library image transformation solution, which \
+                       serves images stored in Amazon S3 through Amazon CloudFront, \
+                       transformed as each request asks for them.",
+        documentation_page: "launch-wizard-image-transformation",
+        // A solution entry is published at the SOLUTION's version, not at the Launch
+        // Wizard catalogue's, which is why its line looks nothing like an application
+        // entry's; the newest is the version this entry currently deploys and the two
+        // behind it are the emulator's line for it.
+        versions: &["7.0.0", "6.2.6", "6.0.0"],
+        patterns: &[
+            SeededPattern {
+                // The two architectures this solution publishes are an Amazon ECS one and
+                // an AWS Lambda one, each under the pattern name the solution publishes it
+                // as (recorded catalogue content, like the SAP version line above) rather
+                // than one built out of the architecture's name.
+                name: "ecs-deployment",
+                display_name: "Image transformation on Amazon ECS",
+                description: "Deploys the image transformation solution's services as \
+                              tasks on an Amazon ECS cluster.",
+                // A task runs on compute the cluster manages, so this pattern launches
+                // no EC2 instance of the caller's own.
+                network: PatternNetwork::NoInstances,
+                own_fields: solution_ecs_fields,
+                own_required: SOLUTION_ECS_REQUIRED,
+            },
+            SeededPattern {
+                name: "lambda-deployment",
+                display_name: "Image transformation on AWS Lambda",
+                description: "Deploys the image transformation solution's services as AWS \
+                              Lambda functions.",
+                network: PatternNetwork::NoInstances,
+                own_fields: solution_lambda_fields,
+                own_required: SOLUTION_LAMBDA_REQUIRED,
+            },
+        ],
+    },
+    SeededWorkload {
+        name: LOAD_TESTING_WORKLOAD,
+        display_name: "Distributed Load Testing on AWS",
+        description: "Deploy the AWS Solutions Library distributed load-testing solution, \
+                       which generates load against an endpoint you name from containers \
+                       running on AWS Fargate.",
+        documentation_page: "launch-wizard-distributed-load-testing",
+        // The solution's own version line, like the image-transformation row's.
+        versions: &["3.3.0", "3.2.6", "3.0.0"],
+        // The architectures this solution publishes differ in WHERE the load is generated
+        // from: a network the deployment creates, a network the caller already has, or
+        // another Region reporting to a deployment of the solution that already exists.
+        // The NAMES and display text below are the emulator's own for those three, in the
+        // hyphenated form a solution's own pattern names take (see the
+        // image-transformation row, whose two names are the recorded ones).
+        patterns: &[
+            SeededPattern {
+                name: "existing-vpc-deployment",
+                display_name: "Load testing in an existing VPC",
+                description: "Deploys the load-testing solution's generators into a VPC \
+                              you already have.",
+                network: PatternNetwork::NoInstances,
+                own_fields: load_test_existing_network_fields,
+                own_required: LOAD_TEST_EXISTING_NETWORK_REQUIRED,
+            },
+            SeededPattern {
+                name: "fargate-deployment",
+                display_name: "Load testing on AWS Fargate",
+                description: "Deploys the load-testing solution's generators as AWS \
+                              Fargate tasks in a network the deployment creates.",
+                network: PatternNetwork::NoInstances,
+                own_fields: load_test_fargate_fields,
+                own_required: LOAD_TEST_FARGATE_REQUIRED,
+            },
+            SeededPattern {
+                name: "regional-deployment",
+                display_name: "Load testing from an additional Region",
+                description: "Deploys the load-testing solution's generators in another \
+                              Region, reporting their results to a deployment of the \
+                              solution that already exists.",
+                network: PatternNetwork::NoInstances,
+                own_fields: load_test_regional_fields,
+                own_required: LOAD_TEST_REGIONAL_REQUIRED,
+            },
+        ],
+    },
+];
+
+/// The workload catalogue the emulator seeds at first touch: one [`Workload`] per row of
+/// [`CATALOGUE`], keyed by its `workloadName`, with its deployment patterns keyed by
+/// `deploymentPatternName`.
+///
+/// Every value a catalogue view reports is read off the row it is built from — the entry's
+/// own display text, its own version line and each pattern's own text and schema — so no
+/// reported value is derived from another entry's name.
 fn seeded_workloads() -> BTreeMap<String, Workload> {
-    let catalogue: [SeededWorkload; 4] = [
-        SeededWorkload {
-            name: "SAP",
-            display_name: "SAP",
-            description: "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
-            documentation_page: "launch-wizard-sap",
-            patterns: &[
-                SeededPattern {
-                    name: "SapHanaHA",
-                    display_name: "SAP HANA, highly available",
-                    description: "Deploys an SAP HANA database as a highly available pair \
-                                  across two Availability Zones.",
-                    launches_instances: true,
-                    own_fields: sap_hana_ha_fields,
-                    own_required: SAP_HANA_HA_REQUIRED,
-                },
-                SeededPattern {
-                    name: "SapHanaSingle",
-                    display_name: "SAP HANA on a single instance",
-                    description: "Deploys an SAP HANA database on one instance.",
-                    launches_instances: true,
-                    own_fields: sap_hana_single_fields,
-                    own_required: SAP_HANA_SINGLE_REQUIRED,
-                },
-                SeededPattern {
-                    // AWS publishes the scale-out SAP HANA pattern under this name (the
-                    // multi-instance pattern of its SAP catalogue entry), beside the
-                    // high-availability and single-instance ones above.
-                    name: "SapHanaMulti",
-                    display_name: "SAP HANA on multiple nodes",
-                    description: "Deploys a scale-out SAP HANA database across several \
-                                  instances.",
-                    launches_instances: true,
-                    own_fields: sap_hana_multi_node_fields,
-                    own_required: SAP_HANA_MULTI_NODE_REQUIRED,
-                },
-                SeededPattern {
-                    name: "SapNWOnHanaHA",
-                    display_name: "SAP NetWeaver on SAP HANA, highly available",
-                    description: "Deploys SAP NetWeaver on an SAP HANA database across two \
-                                  Availability Zones.",
-                    launches_instances: true,
-                    own_fields: sap_nw_on_hana_ha_fields,
-                    own_required: SAP_NW_ON_HANA_HA_REQUIRED,
-                },
-            ][..],
-        },
-        SeededWorkload {
-            name: "SQLServer",
-            display_name: "Microsoft SQL Server",
-            description: "Deploy Microsoft SQL Server, standalone or highly available, on Amazon \
-                           Web Services.",
-            documentation_page: "launch-wizard-sql",
-            patterns: &[
-                SeededPattern {
-                    name: "SqlServerSingle",
-                    display_name: "Microsoft SQL Server on a single instance",
-                    description: "Deploys Microsoft SQL Server on one instance.",
-                    launches_instances: true,
-                    own_fields: sql_server_single_fields,
-                    own_required: SQL_SERVER_SINGLE_REQUIRED,
-                },
-                SeededPattern {
-                    name: "SqlServerHA",
-                    display_name: "Microsoft SQL Server, highly available",
-                    description: "Deploys a Microsoft SQL Server Always On availability group \
-                                  across two Availability Zones.",
-                    launches_instances: true,
-                    own_fields: sql_server_ha_fields,
-                    own_required: SQL_SERVER_HA_REQUIRED,
-                },
-            ][..],
-        },
-        SeededWorkload {
-            // AWS publishes the Microsoft Active Directory entry of its catalogue under
-            // this name; "Microsoft Active Directory" is the display name beside it.
-            name: "MicrosoftActiveDirectory",
-            display_name: "Microsoft Active Directory",
-            description: "Deploy AWS Managed Microsoft AD or self-managed Active Directory on \
-                           Amazon Web Services.",
-            documentation_page: "launch-wizard-ad",
-            patterns: &[
-                SeededPattern {
-                    name: "AWSManagedAD",
-                    display_name: "AWS Managed Microsoft AD",
-                    description: "Deploys an AWS Directory Service managed Microsoft AD \
-                                  directory.",
-                    launches_instances: true,
-                    own_fields: aws_managed_ad_fields,
-                    own_required: AWS_MANAGED_AD_REQUIRED,
-                },
-                SeededPattern {
-                    name: "SelfManagedAD",
-                    display_name: "Self-managed Active Directory",
-                    description: "Deploys Active Directory domain controllers you administer \
-                                  yourself.",
-                    launches_instances: true,
-                    own_fields: self_managed_ad_fields,
-                    own_required: SELF_MANAGED_AD_REQUIRED,
-                },
-            ][..],
-        },
-        SeededWorkload {
-            name: SOLUTION_WORKLOAD,
-            display_name: "AWS Solutions Library solution SO0023",
-            description: "Deploy the AWS Solutions Library solution SO0023, on either the \
-                           Amazon ECS architecture or the AWS Lambda architecture it \
-                           publishes.",
-            documentation_page: "launch-wizard-solutions",
-            patterns: &[
-                SeededPattern {
-                    // The two architectures this solution publishes are an Amazon ECS one
-                    // and an AWS Lambda one; the NAMES below are the emulator's own for
-                    // them, like the display text of every seeded entry (see
-                    // [`sap_hana_single_fields`]).
-                    name: "EcsArchitecture",
-                    display_name: "Amazon ECS architecture",
-                    description: "Deploys the solution's services as tasks on an Amazon ECS \
-                                  cluster.",
-                    // A task runs on compute the cluster manages, so this pattern launches
-                    // no EC2 instance of the caller's own.
-                    launches_instances: false,
-                    own_fields: solution_ecs_fields,
-                    own_required: SOLUTION_ECS_REQUIRED,
-                },
-                SeededPattern {
-                    name: "LambdaArchitecture",
-                    display_name: "AWS Lambda architecture",
-                    description: "Deploys the solution's services as AWS Lambda functions.",
-                    launches_instances: false,
-                    own_fields: solution_lambda_fields,
-                    own_required: SOLUTION_LAMBDA_REQUIRED,
-                },
-            ][..],
-        },
-    ];
-    catalogue
-        .into_iter()
+    CATALOGUE
+        .iter()
         .map(|workload| {
             let workload_name = workload.name;
             // The document a catalogue entry publishes, built once per entry. The icon it
@@ -2183,6 +2793,16 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
             // as text at all: see `state::workload_icons`.
             let documentation_url =
                 format!("{DOCUMENTATION_BASE}/{}.html", workload.documentation_page);
+            // The version this entry is published AT: the newest of its own line, which
+            // every one of its patterns reports as both version members. A row with no
+            // version line publishes no version at all, which is a catalogue bug rather
+            // than an entry — caught in the test build like a required name no pattern
+            // publishes (see `mark_required`).
+            debug_assert!(
+                !workload.versions.is_empty(),
+                "every catalogue entry must publish at least one version"
+            );
+            let current_version = workload.versions.first().copied().unwrap_or_default();
             let patterns = workload
                 .patterns
                 .iter()
@@ -2196,8 +2816,11 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                             description: pattern.description.to_string(),
                             status: PATTERN_ACTIVE.to_string(),
                             status_message: None,
-                            workload_version_name: CATALOGUE_VERSION.to_string(),
-                            versions: seeded_pattern_versions(pattern.description),
+                            workload_version_name: current_version.to_string(),
+                            versions: seeded_pattern_versions(
+                                workload.versions,
+                                pattern.description,
+                            ),
                             specifications: seeded_specification_fields(workload_name, pattern),
                         },
                     )
@@ -2218,14 +2841,18 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
         .collect()
 }
 
-/// The versions the catalogue publishes for one seeded deployment pattern, newest
-/// first: one per entry of [`CATALOGUE_PATTERN_VERSIONS`].
+/// The versions the catalogue publishes for one seeded deployment pattern, newest first:
+/// one per entry of its workload's version line ([`catalogue_pattern_versions`]), which is
+/// handed in rather than read from a value every entry shares.
 ///
 /// A version's description is DERIVED from the pattern's own description and the
 /// version's name, so it says what that version of that pattern deploys without
 /// inventing per-version release notes this emulator does not have.
-fn seeded_pattern_versions(pattern_description: &str) -> Vec<PatternVersion> {
-    CATALOGUE_PATTERN_VERSIONS
+fn seeded_pattern_versions(
+    versions: &[&'static str],
+    pattern_description: &str,
+) -> Vec<PatternVersion> {
+    versions
         .iter()
         .map(|version_name| PatternVersion {
             version_name: (*version_name).to_string(),

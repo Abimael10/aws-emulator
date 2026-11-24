@@ -41,38 +41,22 @@ const STATUS: u16 = 404;
 const CODE: &str = "ResourceNotFoundException";
 
 /// `workloadName`s AWS's own Launch Wizard catalogue publishes, each with the deployment
-/// pattern names AWS publishes inside it.
+/// pattern names AWS publishes inside it — the ONE table this crate states that in,
+/// `crate::catalogue_entry_identity::PUBLISHED_PATTERNS`, so the two suites that read the
+/// published set cannot drift apart over which patterns an entry offers.
 ///
-/// Source: the catalogue AWS's Launch Wizard publishes through these same two reads — its
-/// Microsoft Active Directory application entry, its SAP application entry with the
-/// high-availability, multi-instance and single-instance SAP HANA patterns (the
-/// single-instance one is also the pair the model's own `CreateDeployment` example
-/// submits, `workloadName: SAP` with `deploymentPatternName: SapHanaSingle`), and the AWS
-/// Solutions Library solution entry it publishes under the solution's id.
-///
-/// A name is what a client carries from one call to the next — `GetWorkload`,
-/// `ListWorkloadDeploymentPatterns`, `GetWorkloadDeploymentPattern` and
-/// `CreateDeployment` all take one as required input — so these are asserted by name,
-/// while the display text beside them is the emulator's own and is only required to be
-/// non-empty below. The rows include the solution entry and the Active Directory entry,
-/// neither of which the catalogue published before. The solution entry's own two pattern
-/// NAMES are not asserted here: only the KIND of its two architectures is attested (one
-/// on Amazon ECS, one on AWS Lambda), so the names the emulator publishes for them are its
-/// own — what the row below requires is that the entry publishes exactly two patterns, in
-/// [`SOLUTION_PATTERNS`].
-const AWS_PUBLISHED: [(&str, &[&str]); 3] = [
-    (
-        "SAP",
-        &["SapHanaHA", "SapHanaMulti", "SapHanaSingle"],
-    ),
-    ("MicrosoftActiveDirectory", &[]),
-    ("SO0023", &[]),
-];
+/// There it is the WHOLE set per entry, which is what that suite asserts; here the rows
+/// are read for the half this suite is about — a name AWS publishes is a name this
+/// catalogue publishes, so a client that takes one from the real service addresses the
+/// same entry — while the display text beside those names is the emulator's own and is
+/// only required to be non-empty below.
+use crate::catalogue_entry_identity::PUBLISHED_PATTERNS as AWS_PUBLISHED;
 
-/// The solution entry of the catalogue, and how many deployment patterns it publishes: one
-/// per architecture that solution offers (an Amazon ECS one and an AWS Lambda one), which
-/// is what the recorded catalogue attests about it. The two pattern names themselves are
-/// the EMULATOR's, so they are not named here.
+/// The image-transformation solution entry of the catalogue, and how many deployment
+/// patterns it publishes: one per architecture that solution offers (an Amazon ECS one and
+/// an AWS Lambda one), which is what the recorded catalogue attests about it — so an entry
+/// that grew a third architecture, or lost one, is observable here beside the two names
+/// [`AWS_PUBLISHED`] holds.
 const SOLUTION_PATTERNS: (&str, usize) = ("SO0023", 2);
 
 /// `workloadName`s no catalogue entry is published under, each well-formed for

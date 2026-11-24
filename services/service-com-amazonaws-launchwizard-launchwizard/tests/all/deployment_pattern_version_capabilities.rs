@@ -32,7 +32,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::pattern_version_capa
     CAPABILITY_DISABLED, CAPABILITY_ENABLED,
 };
 use service_com_amazonaws_launchwizard_launchwizard::state::{
-    DeploymentPattern, PatternVersion, CATALOGUE_PATTERN_VERSIONS, PATTERN_ACTIVE,
+    catalogue_pattern_versions, DeploymentPattern, PatternVersion, PATTERN_ACTIVE,
 };
 
 use crate::deployment_pattern_versions::get_version;
@@ -100,12 +100,12 @@ async fn the_version_read_reports_the_capability_record_the_catalogue_carries() 
     // asserted by `crate::list_deployment_pattern_versions`.
     let record = published_capabilities();
     for (workload, pattern) in every_pattern(&harness).await {
-        for version in CATALOGUE_PATTERN_VERSIONS {
+        // Every version THIS entry is published at: a version line belongs to the
+        // catalogue entry, so the rows of one pattern are its own workload's line.
+        let published = catalogue_pattern_versions(&workload);
+        for version in published {
             let case = format!("{workload}/{pattern}@{version}");
-            let expected = flags_json(
-                &record,
-                &expected_path(&record, CATALOGUE_PATTERN_VERSIONS, version),
-            );
+            let expected = flags_json(&record, &expected_path(&record, published, version));
 
             let read = get_version(&harness, &case, &workload, &pattern, version).await;
             let from_read = read.get(FLAGS).cloned().unwrap_or(Value::Null);
@@ -190,18 +190,27 @@ fn pattern_publishing(versions: &[&str], record: &VersionCapabilities) -> Deploy
 
 #[test]
 fn the_block_states_the_record_the_version_carries_and_a_path_that_follows_it() {
+    // A published version line to build the synthetic patterns over: the rule is about
+    // the record a version carries rather than about one entry, so any entry's line
+    // serves — this one is the line the SAP entry is published at.
+    let line = catalogue_pattern_versions("SAP");
+    assert!(
+        line.len() >= 2,
+        "case \"SAP\": the entry must publish enough versions for the rows below to span \
+         a pattern with several, got {line:?}"
+    );
     // Rows differ along what the rule generalises over: which capabilities a version
     // publishes, whether a capability publishes a configuration and whether that
     // configuration names fields, and how many versions the pattern publishes.
     let rows: Vec<(&str, Vec<&str>, VersionCapabilities)> = vec![
         (
             "the record the seeded catalogue carries",
-            CATALOGUE_PATTERN_VERSIONS.to_vec(),
+            line.to_vec(),
             published_capabilities(),
         ),
         (
             "every capability available, none configurable",
-            CATALOGUE_PATTERN_VERSIONS.to_vec(),
+            line.to_vec(),
             VersionCapabilities {
                 cloud_formation_output: available(),
                 modify_deployments: available(),
@@ -210,7 +219,7 @@ fn the_block_states_the_record_the_version_carries_and_a_path_that_follows_it() 
         ),
         (
             "only the modify capability available",
-            CATALOGUE_PATTERN_VERSIONS.to_vec(),
+            line.to_vec(),
             VersionCapabilities {
                 cloud_formation_output: unavailable(),
                 modify_deployments: available(),
@@ -219,7 +228,7 @@ fn the_block_states_the_record_the_version_carries_and_a_path_that_follows_it() 
         ),
         (
             "an available capability configured through named fields",
-            CATALOGUE_PATTERN_VERSIONS.to_vec(),
+            line.to_vec(),
             VersionCapabilities {
                 cloud_formation_output: available()
                     .configured_through(vec!["StackName".to_string(), "OutputKey".to_string()]),
@@ -229,7 +238,7 @@ fn the_block_states_the_record_the_version_carries_and_a_path_that_follows_it() 
         ),
         (
             "a pattern publishing a single version, modifiable",
-            vec![CATALOGUE_PATTERN_VERSIONS[0]],
+            vec![line[0]],
             VersionCapabilities {
                 cloud_formation_output: unavailable(),
                 modify_deployments: available(),
@@ -238,7 +247,7 @@ fn the_block_states_the_record_the_version_carries_and_a_path_that_follows_it() 
         ),
         (
             "a pattern publishing a single version, not modifiable",
-            vec![CATALOGUE_PATTERN_VERSIONS[0]],
+            vec![line[0]],
             published_capabilities(),
         ),
     ];

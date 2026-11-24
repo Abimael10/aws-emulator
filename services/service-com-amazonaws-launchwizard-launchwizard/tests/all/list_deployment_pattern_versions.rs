@@ -35,7 +35,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::pattern_version_capa
     CAPABILITY_DISABLED, CAPABILITY_ENABLED,
 };
 use service_com_amazonaws_launchwizard_launchwizard::state::{
-    CATALOGUE_PATTERN_VERSIONS, INVALID_NEXT_TOKEN_MESSAGE,
+    catalogue_pattern_versions, INVALID_NEXT_TOKEN_MESSAGE,
 };
 
 use crate::deployment_pattern_versions::get_version;
@@ -103,9 +103,9 @@ fn names(case: &str, summaries: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// Every version the catalogue publishes per pattern, as a set.
-fn published() -> BTreeSet<String> {
-    CATALOGUE_PATTERN_VERSIONS
+/// Every version the catalogue publishes for a pattern of `workload`, as a set.
+fn published(workload: &str) -> BTreeSet<String> {
+    catalogue_pattern_versions(workload)
         .iter()
         .map(|version| (*version).to_string())
         .collect()
@@ -128,12 +128,16 @@ fn the_filter_key_and_version_set_this_suite_drives_are_the_models() {
          {DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES:?}"
     );
     // Three published versions is what makes "all but the one named" a narrowing rather
-    // than an empty page, so the filter rows below assert something.
-    assert!(
-        CATALOGUE_PATTERN_VERSIONS.len() >= 3,
-        "the catalogue must publish enough versions per pattern to span the rule, got \
-         {CATALOGUE_PATTERN_VERSIONS:?}"
-    );
+    // than an empty page, so the filter rows below assert something — of every entry's
+    // own version line, because each catalogue entry carries one.
+    for workload in ["SAP", "MicrosoftActiveDirectory", "SO0023", "SO0062"] {
+        let published = catalogue_pattern_versions(workload);
+        assert!(
+            published.len() >= 3,
+            "case {workload:?}: the entry must publish enough versions per pattern to span \
+             the rule, got {published:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -145,7 +149,7 @@ async fn an_unfiltered_page_reports_every_published_version_as_the_version_read_
         let got = names(&case, &summaries);
         assert_eq!(
             got,
-            CATALOGUE_PATTERN_VERSIONS.to_vec(),
+            catalogue_pattern_versions(&workload).to_vec(),
             "case {case:?}: expected every published version in catalogue order, got {got:?}"
         );
 
@@ -187,7 +191,7 @@ async fn an_unfiltered_page_reports_every_published_version_as_the_version_read_
         // than repeating one canned record.
         assert_eq!(
             descriptions.len(),
-            CATALOGUE_PATTERN_VERSIONS.len(),
+            catalogue_pattern_versions(&workload).len(),
             "case {case:?}: each published version must carry its own description, got \
              {descriptions:?}"
         );
@@ -212,9 +216,10 @@ async fn an_unfiltered_page_reports_every_published_version_as_the_version_read_
 #[tokio::test]
 async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
     let harness = Harness::new();
-    let total = CATALOGUE_PATTERN_VERSIONS.len();
     for (workload, pattern) in one_pattern_per_workload(&harness).await {
         let base = list_body(&workload, &pattern);
+        let whole = catalogue_pattern_versions(&workload);
+        let total = whole.len();
         // Rows differ along the page size the rule generalises over: one at a time,
         // several, exactly the whole set, and past it.
         for page_size in [1usize, 2, total, total + 1] {
@@ -223,7 +228,7 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
             let got = names(&case, &walked);
             assert_eq!(
                 got,
-                CATALOGUE_PATTERN_VERSIONS.to_vec(),
+                whole.to_vec(),
                 "case {case:?}: paging must report every published version once, in catalogue \
                  order, got {got:?}"
             );
@@ -239,7 +244,7 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
         let page = names(&case, &items(&case, &first));
         assert_eq!(
             page,
-            vec![CATALOGUE_PATTERN_VERSIONS[0].to_string()],
+            vec![whole[0].to_string()],
             "case {case:?}: the first page must name the newest published version, got {page:?}"
         );
         let token = first["nextToken"]
@@ -260,7 +265,7 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
         let got = names(&case, &resumed);
         assert_eq!(
             got,
-            vec![CATALOGUE_PATTERN_VERSIONS[1].to_string()],
+            vec![whole[1].to_string()],
             "case {case:?}: a token must resume after the version the previous page ended on, \
              got {got:?}"
         );
@@ -324,41 +329,46 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
 #[tokio::test]
 async fn update_from_version_reports_the_versions_an_update_can_move_onto() {
     let harness = Harness::new();
-    let whole = published();
-    let newest = CATALOGUE_PATTERN_VERSIONS[0];
-    let oldest = CATALOGUE_PATTERN_VERSIONS[CATALOGUE_PATTERN_VERSIONS.len() - 1];
-
-    // One row per shape the rule generalises over: each published starting version,
-    // several starting versions at once (OR-joined), a starting version the pattern does
-    // not publish, and a mix of the two.
-    let mut rows: Vec<(String, Vec<&str>, BTreeSet<String>)> = Vec::new();
-    for version in CATALOGUE_PATTERN_VERSIONS {
-        let mut expected = whole.clone();
-        expected.remove(*version);
-        rows.push((
-            format!("from the published version {version}"),
-            vec![version],
-            expected,
-        ));
-    }
-    rows.push((
-        "from the oldest or the newest, OR-joined".to_string(),
-        vec![oldest, newest],
-        whole.clone(),
-    ));
-    rows.push((
-        "from a version the pattern does not publish".to_string(),
-        vec!["9.9.9"],
-        BTreeSet::new(),
-    ));
-    rows.push((
-        "from a published version or an unpublished one".to_string(),
-        vec![oldest, "9.9.9"],
-        whole.iter().filter(|v| *v != oldest).cloned().collect(),
-    ));
 
     for (workload, pattern) in one_pattern_per_workload(&harness).await {
         let base = list_body(&workload, &pattern);
+        // The version line THIS entry is published at: the rows below are built from it,
+        // because the versions an update can move a deployment onto are the ones its own
+        // entry publishes.
+        let whole = published(&workload);
+        let line = catalogue_pattern_versions(&workload);
+        let newest = line[0];
+        let oldest = line[line.len() - 1];
+
+        // One row per shape the rule generalises over: each published starting version,
+        // several starting versions at once (OR-joined), a starting version the pattern
+        // does not publish, and a mix of the two.
+        let mut rows: Vec<(String, Vec<&str>, BTreeSet<String>)> = Vec::new();
+        for version in line {
+            let mut expected = whole.clone();
+            expected.remove(*version);
+            rows.push((
+                format!("from the published version {version}"),
+                vec![version],
+                expected,
+            ));
+        }
+        rows.push((
+            "from the oldest or the newest, OR-joined".to_string(),
+            vec![oldest, newest],
+            whole.clone(),
+        ));
+        rows.push((
+            "from a version the pattern does not publish".to_string(),
+            vec!["9.9.9"],
+            BTreeSet::new(),
+        ));
+        rows.push((
+            "from a published version or an unpublished one".to_string(),
+            vec![oldest, "9.9.9"],
+            whole.iter().filter(|v| *v != oldest).cloned().collect(),
+        ));
+
         for (label, values, expected) in &rows {
             let case = format!("{workload}/{pattern}: {label}");
             let summaries = listed(
@@ -568,7 +578,10 @@ async fn an_absent_workload_or_pattern_is_a_404_that_echoes_nothing() {
             ),
         ];
         for (label, asked_workload, asked_pattern) in rows {
-            for filters in [None, Some(update_from(&[CATALOGUE_PATTERN_VERSIONS[0]]))] {
+            // A filter naming a version the row's own entry publishes, so the refusal is
+            // about the name the request could not resolve and not about the filter.
+            let newest = catalogue_pattern_versions(&workload)[0];
+            for filters in [None, Some(update_from(&[newest]))] {
                 let case = format!(
                     "{label}: {asked_workload}/{asked_pattern}{}",
                     if filters.is_some() { " filtered" } else { "" }
@@ -753,7 +766,7 @@ async fn both_version_views_report_the_capability_block_of_every_published_versi
             list_body(&workload, &pattern),
         )
         .await;
-        for version in CATALOGUE_PATTERN_VERSIONS {
+        for version in catalogue_pattern_versions(&workload) {
             let case = format!("{workload}/{pattern}@{version}");
             let read = get_version(&harness, &case, &workload, &pattern, version).await;
             let from_read = capability_block(&case, &read);
@@ -790,7 +803,7 @@ async fn the_update_path_a_version_publishes_follows_the_capability_it_publishes
     let harness = Harness::new();
     for (workload, pattern) in every_pattern(&harness).await {
         let base = list_body(&workload, &pattern);
-        for version in CATALOGUE_PATTERN_VERSIONS {
+        for version in catalogue_pattern_versions(&workload) {
             let case = format!("{workload}/{pattern}@{version}");
             let read = get_version(&harness, &case, &workload, &pattern, version).await;
             let flags = capability_block(&case, &read);

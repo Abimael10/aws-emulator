@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // catalogue borrow ends before the store is written to below.
         let workload_version_name = pattern.workload_version_name.clone();
         // Every catalogue entry publishes at least one version
-        // (`state::CATALOGUE_PATTERN_VERSIONS`), so a pattern with none is a broken
+        // (`state::catalogue_pattern_versions`), so a pattern with none is a broken
         // store rather than a deployment with no version: answered as the modelled
         // server error instead of storing an empty version name.
         let Some(pattern_version) = pattern.current_version() else {

@@ -200,7 +200,13 @@ async fn the_seeded_workload_catalogue_is_reported_and_paged() {
     // The issue cited `SAP`; the rule is "the whole seeded catalogue is reported", so
     // the other entries are checked too.
     let names: Vec<String> = catalogue(&harness).await;
-    for expected in ["SAP", "SQLServer", "MicrosoftActiveDirectory", "SO0023"] {
+    for expected in [
+        "SAP",
+        "SQLServer",
+        "MicrosoftActiveDirectory",
+        "SO0023",
+        "SO0062",
+    ] {
         assert!(
             names.iter().any(|name| name == expected),
             "case {expected:?}: the seeded catalogue must report it, got {names:?}"
@@ -431,8 +437,9 @@ pub(crate) fn first_pattern(workload: &str) -> &'static str {
     match workload {
         "SAP" => "SapHanaSingle",
         "SQLServer" => "SqlServerSingle",
-        "MicrosoftActiveDirectory" => "AWSManagedAD",
-        "SO0023" => "EcsArchitecture",
+        "MicrosoftActiveDirectory" => "AWSManagedADExistingVPC",
+        "SO0023" => "ecs-deployment",
+        "SO0062" => "fargate-deployment",
         other => panic!("the test table does not know the patterns of workload {other:?}"),
     }
 }
@@ -508,7 +515,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
     for (workload, pattern, name) in [
         ("SAP", "SapHanaSingle", "dry-one"),
         ("SQLServer", "SqlServerHA", "dry-two"),
-        ("MicrosoftActiveDirectory", "SelfManagedAD", "dry-three"),
+        ("MicrosoftActiveDirectory", "SelfManagedADExistingVPC", "dry-three"),
     ] {
         let case = format!("dry run {workload}/{pattern}");
         let body = harness
@@ -556,7 +563,7 @@ async fn list_deployments_pages_and_filters_the_stored_deployments() {
         ("SAP", "SapHanaSingle", "page-one"),
         ("SQLServer", "SqlServerSingle", "page-two"),
         ("SAP", "SapHanaMulti", "page-three"),
-        ("MicrosoftActiveDirectory", "AWSManagedAD", "page-four"),
+        ("MicrosoftActiveDirectory", "AWSManagedADExistingVPC", "page-four"),
         ("SQLServer", "SqlServerHA", "page-five"),
     ];
     let mut ids = Vec::new();

@@ -24,7 +24,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_launchwizard_launchwizard::state::CATALOGUE_PATTERN_VERSIONS;
+use service_com_amazonaws_launchwizard_launchwizard::state::catalogue_pattern_versions;
 
 use crate::deployment_update::every_pattern;
 use crate::harness::{catalogue, Harness};
@@ -200,15 +200,16 @@ async fn the_listing_reports_no_url_member_its_summary_shape_does_not_declare() 
 #[tokio::test]
 async fn no_published_version_reports_a_document_of_its_own() {
     let harness = Harness::new();
-    assert!(
-        CATALOGUE_PATTERN_VERSIONS.len() >= 2,
-        "the catalogue must publish enough versions per pattern to span the rule, got {:?}",
-        CATALOGUE_PATTERN_VERSIONS
-    );
     // One row per (workload, pattern, version) the catalogue holds: the rule is about
     // the member being read off the stored record, so it holds for every version of
     // every pattern of every workload and not only the newest of one.
     for (workload, pattern) in every_pattern(&harness).await {
+        let published = catalogue_pattern_versions(&workload);
+        assert!(
+            published.len() >= 2,
+            "case {workload:?}: the entry must publish enough versions per pattern to span \
+             the rule, got {published:?}"
+        );
         // The document the catalogue DOES publish for the application, which the
         // workload's own view reports.
         let document = url_member(
@@ -216,7 +217,7 @@ async fn no_published_version_reports_a_document_of_its_own() {
             &workload,
             "documentationUrl",
         );
-        for version in CATALOGUE_PATTERN_VERSIONS {
+        for version in published {
             let case = format!("{workload}/{pattern}@{version}");
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
             // `DeploymentPatternVersionDataSummary$documentationUrl` is the document of

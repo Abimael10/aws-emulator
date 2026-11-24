@@ -24,12 +24,11 @@
 //! forms and both published length bounds of the shapes that carry them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_launchwizard_launchwizard::state::CATALOGUE_PATTERN_VERSIONS;
+use service_com_amazonaws_launchwizard_launchwizard::state::catalogue_pattern_versions;
 
-use crate::deployment_lifecycle::{create, get};
+use crate::deployment_lifecycle::{create, get, poll_until_status};
 use crate::deployment_pattern_versions::version_body;
 use crate::deployment_update::{
     conforming_specifications, error_message, one_pattern_per_workload, pattern_data, update_body,
@@ -37,10 +36,11 @@ use crate::deployment_update::{
 };
 use crate::harness::Harness;
 
-/// Long enough for every clock-owed step a CREATE schedules to come due (the three
-/// `state::TRANSITION_SPAN`s it walks, plus slack): a deployment whose create is still
-/// in flight refuses an update, and the update rows below need one at rest.
-const CREATE_SETTLE: Duration = Duration::from_millis(2_100);
+/// The status a deployment reaches once every clock-owed step of its CREATE has come
+/// due: a deployment whose create is still in flight refuses an update, and the update
+/// rows below need one at rest, so each row waits for THIS condition rather than for a
+/// span of time (see [`crate::deployment_lifecycle::poll_until_status`]).
+const CREATED: &str = "COMPLETED";
 
 /// A well-formed `deploymentId` no deployment has (`DeploymentId` is len 2..128,
 /// `^[a-zA-Z0-9-]+$`).
@@ -63,7 +63,7 @@ struct Row {
 /// @pattern `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$` — from
 /// smithy_query(query="shape", shape="DeploymentPatternVersionName") — so the rows span
 /// both forms it allows and each published length bound, and none of them is an entry
-/// of `state::CATALOGUE_PATTERN_VERSIONS`.
+/// of `state::catalogue_pattern_versions`.
 fn absent_versions() -> Vec<(&'static str, String)> {
     vec![
         ("a dotted version", "9.9.9".to_string()),
@@ -146,10 +146,6 @@ fn one_message_per_kind(kind: &str, collected: &BTreeMap<String, String>) -> Str
 #[tokio::test]
 async fn a_not_found_carries_the_message_of_the_kind_of_resource_that_is_missing() {
     let harness = Harness::new();
-    let published = CATALOGUE_PATTERN_VERSIONS
-        .last()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
 
     // Every row's deployment is created FIRST and the create lifecycles are waited out
     // with ONE sleep: an update is taken only by a deployment at rest, and a refused
@@ -180,7 +176,12 @@ async fn a_not_found_carries_the_message_of_the_kind_of_resource_that_is_missing
             id,
         });
     }
-    std::thread::sleep(CREATE_SETTLE);
+    // Each created deployment is waited on for the CONDITION the update rows need — its
+    // create lifecycle finished — polled for until it holds rather than waited out for a
+    // span of time.
+    for row in &rows {
+        poll_until_status(&harness, &row.case, &row.id, CREATED).await;
+    }
 
     for Row {
         case,
@@ -191,6 +192,13 @@ async fn a_not_found_carries_the_message_of_the_kind_of_resource_that_is_missing
     } in rows
     {
         let stored = get(&harness, &case, &id).await;
+        // A version the catalogue DOES publish for this row's workload — each entry is
+        // published at its own version line — so a refusal that names a published version
+        // beside an absent pattern or workload is refused for the absent one.
+        let published = catalogue_pattern_versions(&workload)
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the entry publishes no version"));
         let update = update_body(&id, &specifications);
         let mut per_kind: BTreeMap<&str, String> = BTreeMap::new();
 

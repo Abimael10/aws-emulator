@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::state::{
-    service_state, CATALOGUE_PATTERN_VERSIONS, DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE,
+    service_state, catalogue_pattern_versions, DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE,
     WORKLOAD_NOT_FOUND_MESSAGE,
 };
 
@@ -202,10 +202,6 @@ fn point_record_at(harness: &Harness, case: &str, id: &str, workload: &str, patt
 #[tokio::test]
 async fn every_catalogue_lookup_resolves_the_workload_then_the_pattern_by_the_one_rule() {
     let harness = Harness::new();
-    let published = CATALOGUE_PATTERN_VERSIONS
-        .last()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
 
     for (index, (workload, pattern)) in one_pattern_per_workload(&harness)
         .await
@@ -213,6 +209,13 @@ async fn every_catalogue_lookup_resolves_the_workload_then_the_pattern_by_the_on
         .enumerate()
     {
         let case = format!("{workload}/{pattern}");
+        // A version this row's workload IS published at: each catalogue entry carries its
+        // own version line, so the version a reader names is read off the entry under
+        // test rather than from one value shared by the catalogue.
+        let published = catalogue_pattern_versions(&workload)
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the entry publishes no version"));
 
         // The admitting half: every reader resolves names the catalogue DOES hold and
         // reports the record, so the rows below are about which name is missing and not

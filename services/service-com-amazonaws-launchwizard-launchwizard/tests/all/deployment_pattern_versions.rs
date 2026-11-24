@@ -13,28 +13,28 @@
 //! and one past it, and the versions an `UpdateDeployment` may name.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::state::{
-    CATALOGUE_PATTERN_VERSIONS, DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE,
+    catalogue_pattern_versions, DEPLOYMENT_PATTERN_VERSION_ALREADY_DEPLOYED_MESSAGE,
 };
 
-use crate::deployment_lifecycle::create;
+use crate::deployment_lifecycle::{create, poll_until_status};
 use crate::deployment_update::{
     conforming_specifications, error_message, events, every_pattern, last_update_description,
     one_pattern_per_workload, pattern_data, update_body, with_member,
 };
 use crate::harness::Harness;
 
-/// Long enough for every clock-owed step a CREATE schedules to come due (the three
-/// `state::TRANSITION_SPAN`s it walks, plus slack): a deployment whose create is still
-/// in flight refuses an update.
-const CREATE_SETTLE: Duration = Duration::from_millis(2_100);
+/// The status a deployment reaches once every clock-owed step of its CREATE has come
+/// due: a deployment whose create is still in flight refuses an update, so each row
+/// waits for THIS condition rather than for a span of time (see
+/// [`crate::deployment_lifecycle::poll_until_status`]).
+const CREATED: &str = "COMPLETED";
 
-/// Long enough for the one step an UPDATE schedules to come due, after which the
-/// deployment takes another update.
-const UPDATE_SETTLE: Duration = Duration::from_millis(1_200);
+/// The status a deployment reaches once the step its UPDATE scheduled has come due,
+/// after which it takes another update. See [`CREATED`].
+const UPDATED: &str = "UPDATE_COMPLETED";
 
 /// One workload's version suite: a deployment per published version (each accepted
 /// update leaves its own deployment mid-update, a state that takes no further update),
@@ -97,16 +97,18 @@ async fn update_description(harness: &Harness, case: &str, id: &str) -> String {
 #[tokio::test]
 async fn every_published_version_of_every_pattern_is_reported_from_state() {
     let harness = Harness::new();
-    // The catalogue publishes several versions per pattern, which is what makes this a
-    // rule over a set rather than a single lookup.
-    assert!(
-        CATALOGUE_PATTERN_VERSIONS.len() >= 2,
-        "the catalogue must publish enough versions per pattern to span the rule, got {:?}",
-        CATALOGUE_PATTERN_VERSIONS
-    );
     for (workload, pattern) in every_pattern(&harness).await {
+        // The catalogue publishes several versions per pattern — the line its workload is
+        // published at — which is what makes this a rule over a set rather than a single
+        // lookup.
+        let published = catalogue_pattern_versions(&workload);
+        assert!(
+            published.len() >= 2,
+            "case {workload:?}: the entry must publish enough versions per pattern to span \
+             the rule, got {published:?}"
+        );
         let mut descriptions: BTreeSet<String> = BTreeSet::new();
-        for version in CATALOGUE_PATTERN_VERSIONS {
+        for version in published {
             let case = format!("{workload}/{pattern}@{version}");
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
 
@@ -164,7 +166,7 @@ async fn every_published_version_of_every_pattern_is_reported_from_state() {
         // rather than answered with one canned record.
         assert_eq!(
             descriptions.len(),
-            CATALOGUE_PATTERN_VERSIONS.len(),
+            published.len(),
             "case {workload}/{pattern}: each published version must carry its own \
              description, got {descriptions:?}"
         );
@@ -174,12 +176,13 @@ async fn every_published_version_of_every_pattern_is_reported_from_state() {
 #[tokio::test]
 async fn the_version_a_pattern_reports_is_the_newest_one_the_version_read_resolves() {
     let harness = Harness::new();
-    let newest = CATALOGUE_PATTERN_VERSIONS
-        .first()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
     for (workload, pattern) in every_pattern(&harness).await {
         let case = format!("{workload}/{pattern}");
+        // The newest version the pattern's own workload is published at.
+        let newest = catalogue_pattern_versions(&workload)
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the entry publishes no version"));
         // What `GetWorkloadDeploymentPattern` reports as the pattern's current version.
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let current = data["deploymentPatternVersionName"]
@@ -214,11 +217,14 @@ async fn the_version_a_pattern_reports_is_the_newest_one_the_version_read_resolv
 #[tokio::test]
 async fn an_absent_workload_pattern_or_version_is_a_404_that_echoes_nothing() {
     let harness = Harness::new();
-    let published = CATALOGUE_PATTERN_VERSIONS
-        .last()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
     for (workload, pattern) in one_pattern_per_workload(&harness).await {
+        // A version this row's workload IS published at (each entry carries its own
+        // version line), so a row that names an absent workload or pattern is refused for
+        // that absence and not for the version.
+        let published = catalogue_pattern_versions(&workload)
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("case {workload:?}: the entry publishes no version"));
         // One row per way the request can name something the catalogue does not hold:
         // the workload, the pattern, or the version — the last in each of the two forms
         // `DeploymentPatternVersionName` allows (dotted and dashed) and at the shape's
@@ -341,10 +347,10 @@ async fn a_version_name_outside_the_modelled_shape_is_refused_at_the_boundary() 
         }
         // Every member of the input is @required, so a request that omits one is
         // refused the same way, whichever one it omits.
-        let published = CATALOGUE_PATTERN_VERSIONS
+        let published = catalogue_pattern_versions(&workload)
             .last()
             .copied()
-            .expect("the catalogue publishes at least one version per pattern");
+            .unwrap_or_else(|| panic!("case {workload:?}: the entry publishes no version"));
         let whole = version_body(&workload, &pattern, published);
         for omitted in [
             "workloadName",
@@ -373,14 +379,6 @@ async fn a_version_name_outside_the_modelled_shape_is_refused_at_the_boundary() 
 #[tokio::test]
 async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
     let harness = Harness::new();
-    let oldest = CATALOGUE_PATTERN_VERSIONS
-        .last()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
-    let newest = CATALOGUE_PATTERN_VERSIONS
-        .first()
-        .copied()
-        .expect("the catalogue publishes at least one version per pattern");
     // Each accepted update needs a deployment whose lifecycle is at rest, so every row
     // gets its own and all of them are created FIRST, then waited out with ONE sleep.
     let mut suites: Vec<VersionSuite> = Vec::new();
@@ -393,7 +391,9 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let specifications = conforming_specifications(&case, &data, false);
         let mut per_version = Vec::new();
-        for (row, _) in CATALOGUE_PATTERN_VERSIONS.iter().enumerate() {
+        // One deployment per version THIS entry publishes — each catalogue entry carries
+        // its own version line, so the rows of one workload span that line.
+        for (row, _) in catalogue_pattern_versions(&workload).iter().enumerate() {
             per_version.push(
                 create(
                     &harness,
@@ -423,7 +423,14 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
             kept,
         });
     }
-    std::thread::sleep(CREATE_SETTLE);
+    // Each created deployment is waited on for the CONDITION the rows below need — its
+    // create lifecycle finished, because a deployment still being created takes no
+    // update — polled for until it holds rather than waited out for a span of time.
+    for suite in &suites {
+        for id in suite.per_version.iter().chain(std::iter::once(&suite.kept)) {
+            poll_until_status(&harness, &suite.case, id, CREATED).await;
+        }
+    }
 
     for VersionSuite {
         case,
@@ -434,12 +441,21 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
         kept,
     } in suites
     {
+        let published = catalogue_pattern_versions(&workload);
+        let newest = published
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the entry publishes no version"));
+        let oldest = published
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: the entry publishes no version"));
         // Every version the version read reports is a version a deployment that is not
         // already on it can be moved onto, and the event the update appends records the
         // one it now deploys. The one version of the published set a deployment is
         // ALREADY on is refused instead, because moving it there moves no version at all
         // — the rule `tests/all/update_deployment_version_targets.rs` tables.
-        for (row, version) in CATALOGUE_PATTERN_VERSIONS.iter().enumerate() {
+        for (row, version) in published.iter().enumerate() {
             let id = &per_version[row];
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
             let name = summary["deploymentPatternVersionName"]
@@ -519,7 +535,16 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
             .await;
         // The second update of the same deployment waits for the first to finish: a
         // deployment that is still applying an update does not take another.
-        std::thread::sleep(UPDATE_SETTLE);
+        // The second update of the same deployment waits for the first to FINISH — a
+        // deployment that is still applying an update does not take another — so it polls
+        // for that status instead of waiting a span of time out.
+        poll_until_status(
+            &harness,
+            &format!("{case}@{oldest} (first update applied)"),
+            &kept,
+            UPDATED,
+        )
+        .await;
         harness
             .ok(
                 &format!("{case} with no version named"),
