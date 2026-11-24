@@ -198,44 +198,67 @@ pub fn query_refusal(failure: QueryFailure) -> QueryRefusal {
 /// no room left for the element is a resource limit, and a write the graph's own rules
 /// refuse is a constraint the request did not satisfy.
 fn write_refusal(refused: GraphWriteError) -> QueryRefusal {
+    let (ceiling, reason) = write_refusal_reason(&refused);
+    match ceiling {
+        WriteCeiling::Room => QueryRefusal::Memory(super::open_cypher_memory_limit(&reason)),
+        WriteCeiling::Rule => QueryRefusal::Constraint(super::open_cypher_constraint(&reason)),
+    }
+}
+
+/// WHICH kind of ceiling a write the store refused met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCeiling {
+    /// The store had no room left for the element: a resource limit of this engine.
+    Room,
+    /// The write asked for something the graph's own rules do not allow.
+    Rule,
+}
+
+/// The kind of ceiling a write the store refused met, and the sentence stating what it
+/// met.
+///
+/// The sentence is about the GRAPH rather than about either query language, so it is
+/// stated once here and each language's endpoints wrap it in their own modelled payload
+/// ([`write_refusal`] for openCypher, `super::super::gremlin_eval` for Gremlin).
+#[must_use]
+pub fn write_refusal_reason(refused: &GraphWriteError) -> (WriteCeiling, String) {
     match refused {
-        GraphWriteError::NodeLimit { ceiling } => {
-            QueryRefusal::Memory(super::open_cypher_memory_limit(&format!(
-                "this engine holds at most {ceiling} nodes"
-            )))
-        }
-        GraphWriteError::RelationshipLimit { ceiling } => {
-            QueryRefusal::Memory(super::open_cypher_memory_limit(&format!(
-                "this engine holds at most {ceiling} relationships"
-            )))
-        }
-        GraphWriteError::ByteLimit { ceiling } => {
-            QueryRefusal::Memory(super::open_cypher_memory_limit(&format!(
-                "this engine holds at most {ceiling} bytes of element data"
-            )))
-        }
-        GraphWriteError::LabelLimit { ceiling } => {
-            QueryRefusal::Constraint(super::open_cypher_constraint(&format!(
-                "A node carries at most {ceiling} labels"
-            )))
-        }
-        GraphWriteError::NameTooLong { size, ceiling } => {
-            QueryRefusal::Constraint(super::open_cypher_constraint(&format!(
+        GraphWriteError::NodeLimit { ceiling } => (
+            WriteCeiling::Room,
+            format!("this engine holds at most {ceiling} nodes"),
+        ),
+        GraphWriteError::RelationshipLimit { ceiling } => (
+            WriteCeiling::Room,
+            format!("this engine holds at most {ceiling} relationships"),
+        ),
+        GraphWriteError::ByteLimit { ceiling } => (
+            WriteCeiling::Room,
+            format!("this engine holds at most {ceiling} bytes of element data"),
+        ),
+        GraphWriteError::LabelLimit { ceiling } => (
+            WriteCeiling::Rule,
+            format!("A node carries at most {ceiling} labels"),
+        ),
+        GraphWriteError::NameTooLong { size, ceiling } => (
+            WriteCeiling::Rule,
+            format!(
                 "An id, a label and a relationship type are at most {ceiling} bytes, \
                  and this one is {size}"
-            )))
-        }
-        GraphWriteError::DuplicateId { id } => {
-            QueryRefusal::Constraint(super::open_cypher_constraint(&format!(
+            ),
+        ),
+        GraphWriteError::DuplicateId { id } => (
+            WriteCeiling::Rule,
+            format!(
                 "An element with the id {} already exists",
-                super::super::echoed(&id)
-            )))
-        }
-        GraphWriteError::MissingEndpoint { id } => {
-            QueryRefusal::Constraint(super::open_cypher_constraint(&format!(
+                super::super::echoed(id)
+            ),
+        ),
+        GraphWriteError::MissingEndpoint { id } => (
+            WriteCeiling::Rule,
+            format!(
                 "A relationship joins two nodes this graph holds, and {} is not one",
-                super::super::echoed(&id)
-            )))
-        }
+                super::super::echoed(id)
+            ),
+        ),
     }
 }

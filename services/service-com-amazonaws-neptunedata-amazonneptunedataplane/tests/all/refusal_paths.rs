@@ -671,15 +671,18 @@ async fn a_gremlin_query_that_is_not_a_traversal_is_refused_with_the_parsers_mes
 }
 
 #[tokio::test]
-async fn a_traversal_this_engine_cannot_evaluate_is_not_answered_with_a_result() {
+async fn a_gremlin_step_this_engine_does_not_evaluate_is_not_answered_with_a_result() {
     let Emulator { router, engine } = emulator();
-    // A traversal the parser READS is not refused as malformed — there is no engine here
-    // that can evaluate one, so the call is answered as not implemented rather than with a
-    // result nothing computed, and nothing is recorded as a query the engine accepted.
-    for query in [
-        "g.V().has('code','ANC')",
-        "g.addV('airport').property('code','ANC')",
-        "g.V().count()",
+    // A traversal the parser READS is evaluated against the stored graph — which
+    // `tests/all/neptune_data_plane.rs` covers — but a step the evaluation does not cover
+    // yet is answered as not implemented rather than with a result nothing computed or an
+    // empty answer that cannot be told from a traversal matching nothing. Nothing is
+    // recorded as a query the engine accepted either.
+    for (query, step) in [
+        ("g.V().order().by('code')", "order"),
+        ("g.V().as('a').select('a')", "as"),
+        ("g.V().group().by('code')", "group"),
+        ("g.V().path()", "path"),
     ] {
         let answer = call(&router, "POST", "/gremlin", Some(json!({ "gremlin": query }))).await;
         assert_eq!(
@@ -693,6 +696,11 @@ async fn a_traversal_this_engine_cannot_evaluate_is_not_answered_with_a_result()
             "NotImplemented",
             "case {query:?}: expected NotImplemented, got {:?}",
             answer.text
+        );
+        assert!(
+            answer.message().contains(step),
+            "case {query:?}: the refusal must name the step it does not evaluate, got {:?}",
+            answer.message()
         );
     }
     let store = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();

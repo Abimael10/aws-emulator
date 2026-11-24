@@ -82,8 +82,8 @@ pub use plan::{
     explain_query, BranchRun, ExplainMode, RunTrace, StepRun, OPEN_CYPHER_EXPLAIN_MODES,
 };
 pub use request::{
-    query_outcome, query_refusal, request_parameters, QueryRefusal, OPEN_CYPHER_QUERY_MEMBER,
-    PARAMETERS_MEMBER,
+    query_outcome, query_refusal, request_parameters, write_refusal_reason, QueryRefusal,
+    WriteCeiling, OPEN_CYPHER_QUERY_MEMBER, PARAMETERS_MEMBER,
 };
 pub use values::{is_aggregate, CypherValue, Row};
 
@@ -1822,8 +1822,12 @@ pub fn results_document(rows: &[Value]) -> ::aws_smithy_types::Document {
     ::aws_smithy_types::Document::Array(rows.iter().map(json_to_document).collect())
 }
 
-/// One JSON value as the `Document` the model declares for `results`.
-fn json_to_document(value: &Value) -> ::aws_smithy_types::Document {
+/// One JSON value as the `Document` a modelled document member carries.
+///
+/// The ONE conversion both query endpoints answer through: the openCypher rows above and
+/// the GraphSON the Gremlin endpoint answers with (`super::gremlin_eval`) are both built as
+/// `serde_json` values and written to the wire through here.
+pub fn json_to_document(value: &Value) -> ::aws_smithy_types::Document {
     use ::aws_smithy_types::{Document, Number};
     match value {
         Value::Null => Document::Null,

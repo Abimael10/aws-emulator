@@ -20,11 +20,11 @@
 //!   marks the record cancelled without removing it — so the cancel is idempotent and the
 //!   later reads observe one evolving record.
 //!
-//! The Gremlin endpoints that EVALUATE a traversal are deliberately still 501 (this
-//! emulator has no in-process TinkerPop engine), which
-//! [`execute_gremlin_query_is_refused_and_stores_nothing`]
-//! pins: a result for a traversal nothing ran would be a fabrication. Explaining a query
-//! needs no evaluation, and `tests/all/gremlin_explain.rs` covers that endpoint.
+//! The Gremlin endpoint that EVALUATES a traversal answers it from that same stored graph
+//! (`a_gremlin_traversal_is_answered_from_the_stored_graph` and the suites beside it): a
+//! traversal naming a step the evaluation does not cover yet is answered HTTP 501 rather
+//! than with a result nothing computed. Explaining a query needs no evaluation, and
+//! `tests/all/gremlin_explain.rs` covers that endpoint.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -997,35 +997,438 @@ async fn cancel_marks_the_record_and_a_repeated_cancel_answers_the_same() {
     );
 }
 
-/// The Gremlin EXECUTION endpoint is still a stub, and must stay one until this emulator
-/// can really evaluate a traversal: a `requestId`, a `result` or a query record for a
-/// traversal nothing ran would be fabricated. A 501 says "nobody has written it yet",
-/// which is the truth, and it must not leave anything behind in the registry.
-#[tokio::test]
-async fn execute_gremlin_query_is_refused_and_stores_nothing() {
-    let Emulator { router, .. } = emulator();
+// ---------------------------------------------------------------------------------------
+// The Gremlin query endpoint: every result comes from the stored graph.
+// ---------------------------------------------------------------------------------------
 
-    let answer = call(
-        &router,
+/// One seeded node: the id it is addressed by, the label it carries and the properties set
+/// on it.
+struct SeededNode {
+    id: &'static str,
+    label: &'static str,
+    properties: Vec<(&'static str, Value)>,
+}
+
+/// The graph the traversals below are evaluated against: two airports and a continent,
+/// with one route between the airports. Seeded straight into the store, which is where a
+/// load, an openCypher write or a Gremlin write puts it, so what the traversals read is
+/// what the store holds.
+fn seed_graph(engine: &engine::InMemoryEngine) {
+    let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+    let mut store = state.lock();
+    let seeded = [
+        SeededNode {
+            id: "a1",
+            label: "airport",
+            properties: vec![("code", Value::from("ANC")), ("runways", Value::from(3))],
+        },
+        SeededNode {
+            id: "a2",
+            label: "airport",
+            properties: vec![("code", Value::from("SEA")), ("runways", Value::from(2))],
+        },
+        SeededNode {
+            id: "c1",
+            label: "continent",
+            properties: vec![("code", Value::from("NA"))],
+        },
+    ];
+    for node in seeded {
+        store
+            .graph
+            .insert_node(
+                Some(node.id.to_string()),
+                vec![node.label.to_string()],
+                node.properties
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+            )
+            .expect("the seeded node is within every ceiling");
+    }
+    store
+        .graph
+        .insert_relationship(
+            Some("r1".to_string()),
+            "route".to_string(),
+            "a1",
+            "a2",
+            [("dist".to_string(), Value::from(1448))]
+                .into_iter()
+                .collect(),
+        )
+        .expect("the seeded relationship is within every ceiling");
+}
+
+async fn execute_gremlin(router: &MultiServiceRouter, query: &str) -> Answer {
+    call(
+        router,
         "POST",
         "/gremlin",
-        Some(serde_json::json!({"gremlin": "g.V().limit(1)"})),
+        Some(serde_json::json!({ "gremlin": query })),
+    )
+    .await
+}
+
+/// The results an answer carries, as the Gremlin endpoint nests them: `result.data` is the
+/// typed GraphSON list of what the traversal answered.
+fn gremlin_data(answer: &Answer) -> Vec<Value> {
+    answer.body["result"]["data"]["@value"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One whole number as GraphSON types it: a count is 64-bit, a property value a traversal
+/// wrote is 32-bit, which is what the Java types a traversal produces are written as.
+fn graphson_count(count: i64) -> Value {
+    serde_json::json!({ "@type": "g:Int64", "@value": count })
+}
+
+fn graphson_int(value: i64) -> Value {
+    serde_json::json!({ "@type": "g:Int32", "@value": value })
+}
+
+#[tokio::test]
+async fn a_gremlin_traversal_is_answered_from_the_stored_graph() {
+    let Emulator { router, engine } = emulator();
+    seed_graph(&engine);
+
+    // The rows differ along everything the rule generalises over: which elements a step
+    // reaches, which direction it walks, which values it reports, how a filter narrows it
+    // and which GraphSON type each result carries.
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("g.V().count()", vec![graphson_count(3)]),
+        (
+            "g.V().hasLabel('airport').count()",
+            vec![graphson_count(2)],
+        ),
+        // A label no node carries answers the count zero, not an empty answer.
+        (
+            "g.V().hasLabel('no-such-label').count()",
+            vec![graphson_count(0)],
+        ),
+        ("g.E().count()", vec![graphson_count(1)]),
+        (
+            "g.V().has('code','ANC').values('code')",
+            vec![Value::from("ANC")],
+        ),
+        (
+            "g.V().hasLabel('airport').values('runways')",
+            vec![graphson_int(3), graphson_int(2)],
+        ),
+        (
+            "g.V().has('runways', gt(2)).values('code')",
+            vec![Value::from("ANC")],
+        ),
+        // The same predicate qualified by the class it belongs to names the same
+        // predicate.
+        (
+            "g.V().has('runways', P.lt(3)).values('code')",
+            vec![Value::from("SEA")],
+        ),
+        (
+            "g.V().has('code', TextP.containing('E')).values('code')",
+            vec![Value::from("SEA")],
+        ),
+        (
+            "g.V().has('runways', between(2,3)).values('code')",
+            vec![Value::from("SEA")],
+        ),
+        (
+            "g.V().has('code', within('ANC','NA')).count()",
+            vec![graphson_count(2)],
+        ),
+        (
+            "g.V().has('code', startingWith('S')).values('code')",
+            vec![Value::from("SEA")],
+        ),
+        ("g.V('a1').id()", vec![Value::from("a1")]),
+        ("g.V('a1').label()", vec![Value::from("airport")]),
+        (
+            "g.V('a1')",
+            vec![serde_json::json!({
+                "@type": "g:Vertex",
+                "@value": { "id": "a1", "label": "airport" },
+            })],
+        ),
+        (
+            "g.V('a1').out('route').values('code')",
+            vec![Value::from("SEA")],
+        ),
+        // The same hop the other way round reaches the node the route leaves.
+        (
+            "g.V('a2').in('route').values('code')",
+            vec![Value::from("ANC")],
+        ),
+        ("g.V('a1').in('route').count()", vec![graphson_count(0)]),
+        (
+            "g.V('a1').both('route').values('code')",
+            vec![Value::from("SEA")],
+        ),
+        ("g.V('a1').outE('route').label()", vec![Value::from("route")]),
+        ("g.V('a1').outE().inV().id()", vec![Value::from("a2")]),
+        (
+            "g.V('a1').outE('route').values('dist')",
+            vec![graphson_int(1448)],
+        ),
+        (
+            "g.V('a1').valueMap('code')",
+            vec![serde_json::json!({
+                "@type": "g:Map",
+                "@value": ["code", { "@type": "g:List", "@value": ["ANC"] }],
+            })],
+        ),
+        ("g.V().limit(1).count()", vec![graphson_count(1)]),
+        // An id the graph does not hold reaches nothing, which is the empty answer.
+        ("g.V('no-such-id').values('code')", vec![]),
+        ("g.V().hasLabel('airport').id().count()", vec![graphson_count(2)]),
+        // A terminal action asks the finished traversal for its answer.
+        ("g.V().hasLabel('airport').values('code').next()", vec![Value::from("ANC")]),
+        ("g.V().hasLabel('no-such-label').hasNext()", vec![Value::Bool(false)]),
+        ("g.V().hasLabel('airport').hasNext()", vec![Value::Bool(true)]),
+    ];
+
+    for (query, expected) in cases {
+        let answer = execute_gremlin(&router, query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {query:?}: expected 200, got {} with body {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            gremlin_data(&answer),
+            expected,
+            "case {query:?}: expected {expected:?}, got {:?}",
+            answer.body["result"]
+        );
+        // Every answer carries the envelope the Gremlin endpoint answers in: the id of
+        // this answer, the status of the request and the typed GraphSON list.
+        assert_eq!(
+            answer.body["status"]["code"].as_i64(),
+            Some(200),
+            "case {query:?}: the served status must carry the code the endpoint answered \
+             with, got {:?}",
+            answer.body["status"]
+        );
+        assert_eq!(
+            answer.body["result"]["data"]["@type"].as_str(),
+            Some("g:List"),
+            "case {query:?}: the results are a typed GraphSON list, got {:?}",
+            answer.body["result"]
+        );
+        assert!(
+            answer.body["requestId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "case {query:?}: the answer must name its own request, got {:?}",
+            answer.body
+        );
+    }
+
+    // A read leaves the graph exactly as it was, so a later caller sees the same elements.
+    let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+    let held = {
+        let store = state.lock();
+        (store.graph.node_count(), store.graph.relationship_count())
+    };
+    assert_eq!(
+        held,
+        (3, 1),
+        "reading the graph must not change it, it now holds {held:?}"
+    );
+    // The id an answer reports is the id of the query the engine accepted, so the status
+    // family answers for exactly that id.
+    let answer = execute_gremlin(&router, "g.V().count()").await;
+    let reported = answer.body["requestId"]
+        .as_str()
+        .expect("an answered traversal reports the id of the query it ran")
+        .to_string();
+    let status = query_status(&router, &reported).await;
+    assert_eq!(
+        status.status, 200,
+        "the id an answer reports must be the one the status family answers for, got {} \
+         with body {:?}",
+        status.status, status.body
+    );
+    assert_eq!(
+        (
+            status.body["queryId"].as_str(),
+            status.body["queryString"].as_str()
+        ),
+        (Some(reported.as_str()), Some("g.V().count()")),
+        "the status must report the query that ran under that id, got {:?}",
+        status.body
+    );
+    // Each traversal the engine evaluated is one it accepted and FINISHED, so none of them
+    // is still accepted.
+    let listed = list_queries(&router, "?includeWaiting=true").await;
+    assert_eq!(
+        listed.body["acceptedQueryCount"].as_i64(),
+        Some(0),
+        "a traversal the engine finished is not still accepted, got {:?}",
+        listed.body
+    );
+}
+
+#[tokio::test]
+async fn a_gremlin_traversal_that_writes_changes_the_stored_graph() {
+    let Emulator { router, engine } = emulator();
+    seed_graph(&engine);
+    let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+
+    // A vertex a traversal adds is one a later traversal reads back, with the property
+    // written on it.
+    let added = execute_gremlin(&router, "g.addV('airport').property('code','JFK')").await;
+    assert_eq!(
+        added.status, 200,
+        "adding a vertex: expected 200, got {} with body {:?}",
+        added.status, added.body
+    );
+    let minted = gremlin_data(&added)
+        .first()
+        .and_then(|vertex| vertex["@value"]["id"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    assert!(
+        !minted.is_empty(),
+        "the added vertex must be answered by the id it is addressed by, got {:?}",
+        added.body["result"]
+    );
+
+    let read = execute_gremlin(&router, "g.V().has('code','JFK').label()").await;
+    assert_eq!(
+        gremlin_data(&read),
+        vec![Value::from("airport")],
+        "the added vertex must be read back through a later traversal, got {:?}",
+        read.body["result"]
+    );
+    let read_by_id = execute_gremlin(&router, &format!("g.V('{minted}').values('code')")).await;
+    assert_eq!(
+        gremlin_data(&read_by_id),
+        vec![Value::from("JFK")],
+        "the property written on the added vertex must be read back by its id, got {:?}",
+        read_by_id.body["result"]
+    );
+
+    // An edge a traversal adds joins the two nodes its from/to name.
+    let joined = execute_gremlin(&router, "g.V('a1').addE('near').to(__.V('c1'))").await;
+    assert_eq!(
+        joined.status, 200,
+        "adding an edge: expected 200, got {} with body {:?}",
+        joined.status, joined.body
+    );
+    let walked = execute_gremlin(&router, "g.V('a1').outE('near').inV().id()").await;
+    assert_eq!(
+        gremlin_data(&walked),
+        vec![Value::from("c1")],
+        "the added edge must be walked by a later traversal, got {:?}",
+        walked.body["result"]
+    );
+
+    // A drop removes the element from the store, so the count a later traversal answers
+    // is one lower and the element is gone from the graph itself.
+    let dropped = execute_gremlin(&router, "g.V().has('code','JFK').drop()").await;
+    assert_eq!(
+        (dropped.status, gremlin_data(&dropped)),
+        (200, Vec::new()),
+        "a drop answers no result, got {} with body {:?}",
+        dropped.status,
+        dropped.body
+    );
+    let after = execute_gremlin(&router, "g.V().hasLabel('airport').count()").await;
+    assert_eq!(
+        gremlin_data(&after),
+        vec![graphson_count(2)],
+        "the dropped vertex must be gone from the graph, got {:?}",
+        after.body["result"]
+    );
+    assert!(
+        state.lock().graph.node(&minted).is_none(),
+        "the dropped vertex must be gone from the store, which still holds {minted}"
+    );
+}
+
+#[tokio::test]
+async fn a_gremlin_traversal_that_cannot_be_finished_changes_nothing() {
+    let Emulator { router, engine } = emulator();
+    seed_graph(&engine);
+    let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+
+    // The write happens before the step this engine does not evaluate, so a traversal
+    // that is applied step by step would leave the vertex behind. It must not: a
+    // traversal that did not finish changes nothing.
+    let answer = execute_gremlin(
+        &router,
+        "g.addV('airport').property('code','LHR').subgraph('s')",
     )
     .await;
     assert_eq!(
         answer.status, 501,
-        "POST /gremlin: expected the scaffold's 501 while no engine can run a traversal, got {} with body {:?}",
+        "a step this engine does not evaluate must be answered as not implemented, got {} \
+         with body {:?}",
         answer.status, answer.body
     );
-
-    let listed = list_queries(&router, "?includeWaiting=true").await;
+    let counted = execute_gremlin(&router, "g.V().count()").await;
     assert_eq!(
-        (
-            listed.body["acceptedQueryCount"].as_i64(),
-            listed_ids(&listed).len()
-        ),
-        (Some(0), 0),
-        "a refused execution must not record a query, got {:?}",
-        listed.body
+        gremlin_data(&counted),
+        vec![graphson_count(3)],
+        "a traversal that did not finish must leave the graph as it was, got {:?}",
+        counted.body["result"]
+    );
+    assert_eq!(
+        state.lock().graph.node_count(),
+        3,
+        "a traversal that did not finish must write nothing to the store"
+    );
+}
+
+#[tokio::test]
+async fn a_gremlin_traversal_that_cannot_be_evaluated_as_written_is_refused() {
+    let Emulator { router, engine } = emulator();
+    seed_graph(&engine);
+
+    // Each row is a traversal the parser READ and the evaluation cannot carry out: a step
+    // applied to a result that is not an element of the graph, an argument that is not the
+    // kind the step takes. Each is a request that cannot be served rather than a gap in
+    // this emulator, so each is refused as malformed with HTTP 400.
+    for query in [
+        "g.V().values('code').out('route')",
+        "g.V().values('code').id()",
+        "g.V().values('code').has('code','ANC')",
+        "g.V().count().hasLabel('airport')",
+        "g.V().limit('two')",
+        "g.out('route')",
+    ] {
+        let answer = execute_gremlin(&router, query).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {query:?}: expected HTTP 400, got {} with body {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "MalformedQueryException",
+            "case {query:?}: expected MalformedQueryException, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.body["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "case {query:?}: the refusal must carry the text a client reads, got {:?}",
+            answer.body
+        );
+    }
+
+    let state = engine.state::<ComAmazonawsNeptunedataAmazonneptunedataplaneState>();
+    let held = {
+        let store = state.lock();
+        (store.graph.node_count(), store.gremlin_queries.len())
+    };
+    assert_eq!(
+        held,
+        (3, 0),
+        "a refused traversal must change neither the graph nor the registry, they hold \
+         {held:?}"
     );
 }

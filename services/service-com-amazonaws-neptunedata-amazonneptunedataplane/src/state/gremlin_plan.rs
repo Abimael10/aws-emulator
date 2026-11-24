@@ -46,14 +46,14 @@ const LABEL_PREDICATE: &str = "<~label>";
 const DEFAULT_GRAPH: &str = "<~>";
 
 /// The step that labels the step it follows, so that a later step can select it.
-const STEP_LABEL: &str = "as";
+pub const STEP_LABEL: &str = "as";
 
 /// The traversal ACTIONS: they ask a finished traversal for its answer rather than adding
 /// a step to it, so a plan carries none of them.
 ///
 /// Source: the terminal methods of Apache TinkerPop's `Traversal` (the TinkerPop version
 /// this engine reports in its status, [`super::gremlin_language_version`]).
-const TRAVERSAL_ACTIONS: &[&str] = &[
+pub const TRAVERSAL_ACTIONS: &[&str] = &[
     "next",
     "tryNext",
     "hasNext",
@@ -71,12 +71,12 @@ const TRAVERSAL_ACTIONS: &[&str] = &[
 /// own, so each is printed on that step rather than beside it.
 ///
 /// Source: the modulating methods of Apache TinkerPop's `GraphTraversal`.
-const MODULATORS: &[&str] = &["by", "option", "times", "until", "emit", "from", "to"];
+pub const MODULATORS: &[&str] = &["by", "option", "times", "until", "emit", "from", "to"];
 
 /// The predicates a `has`-family step may carry in place of a value.
 ///
 /// Source: the predicate methods of Apache TinkerPop's `P` and `TextP`.
-const PREDICATES: &[&str] = &[
+pub const PREDICATES: &[&str] = &[
     "eq",
     "neq",
     "lt",
@@ -102,7 +102,7 @@ const REPORT_RULE: &str = "*****************************************************
 
 /// Whether `name` configures the traversal SOURCE (`withSideEffect`, `withStrategies`,
 /// …) rather than adding a step to the traversal, so no step is printed for it.
-fn is_source_configuration(name: &str) -> bool {
+pub fn is_source_configuration(name: &str) -> bool {
     name.starts_with("with")
 }
 

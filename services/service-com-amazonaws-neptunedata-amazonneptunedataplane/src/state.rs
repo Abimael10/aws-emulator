@@ -29,19 +29,22 @@
 //!   `DeletePropertygraphStatistics` removes the record, so `GetPropertygraphStatistics`
 //!   has nothing to answer from and refuses.
 //!
-//! `ExecuteGremlinExplainQuery` is what admits a query record: it reads the submitted
-//! traversal and plans it (see [`gremlin_plan`]), which is work the engine really did, so
-//! the query it finished is recorded like any other and the status family above reports
-//! it. The Gremlin endpoints that EVALUATE a traversal (`ExecuteGremlinQuery`,
-//! `ExecuteGremlinProfileQuery`) still answer HTTP 501, because this emulator has no
-//! in-process engine that can evaluate a TinkerPop traversal — and a result, or an
-//! evaluation time, for a traversal nothing ran would be a fabrication.
+//! `ExecuteGremlinExplainQuery` is what admits a query record for an explain: it reads the
+//! submitted traversal and plans it (see [`gremlin_plan`]), which is work the engine really
+//! did, so the query it finished is recorded like any other and the status family above
+//! reports it. `ExecuteGremlinQuery` EVALUATES the traversal it reads against
+//! [`PropertyGraph`] (see [`gremlin_eval`]) and records the query it answered the same way;
+//! a traversal naming a step that evaluation does not cover yet is answered HTTP 501 rather
+//! than with a result nothing computed, and `ExecuteGremlinProfileQuery` — which reports
+//! what an evaluation MEASURED — still answers 501 for the same reason.
 //!
-//! The loader registry is in the same position: `StartLoaderJob` still answers HTTP 501,
-//! because a bulk load reads the data files its source names, and this emulator has no
-//! reader for those formats yet — so a load id for a load nothing performed would be a
-//! fabrication too. `ListLoaderJobs` therefore reports exactly the jobs the registry
-//! holds, which is nothing until a loader that really loads is wired in.
+//! The loader registry is in a different position: `StartLoaderJob` reads the request and
+//! refuses one the loader could not act on (an `iamRoleArn` whose credentials it cannot
+//! resolve), and still answers HTTP 501 for a request it would have to LOAD from, because a
+//! bulk load reads the data files its source names and this emulator has no reader for
+//! those formats yet — so a load id for a load nothing performed would be a fabrication.
+//! `ListLoaderJobs` therefore reports exactly the jobs the registry holds, which is nothing
+//! until a loader that really loads is wired in.
 //!
 //! `ExecuteOpenCypherQuery` is the one operation that both reads and writes the graph: it
 //! parses the submitted query with a real openCypher parser and evaluates it against
@@ -62,7 +65,9 @@ use crate::ops::types::{
     ServerShutdownException,
 };
 mod engine_status;
+mod gremlin_eval;
 mod gremlin_plan;
+mod loader;
 mod ml;
 mod open_cypher;
 mod parse_refusal;
@@ -70,7 +75,9 @@ mod property_graph;
 mod statistics;
 
 pub use engine_status::*;
+pub use gremlin_eval::*;
 pub use gremlin_plan::*;
+pub use loader::*;
 pub use ml::*;
 pub use open_cypher::*;
 pub use parse_refusal::*;

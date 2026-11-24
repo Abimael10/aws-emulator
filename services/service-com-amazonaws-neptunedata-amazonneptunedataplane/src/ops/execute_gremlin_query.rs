@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteGremlinQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` for a
-//! traversal it READ and cannot evaluate — this emulator has no in-process engine that
-//! evaluates an Apache TinkerPop traversal, and a result, or an evaluation time, for a
-//! traversal nothing ran would be a fabrication. What it does NOT do is answer 501 for a
-//! query that is not a traversal at all: the submitted query is read first (see
-//! [`crate::state::parse_gremlin_traversal`]), and a query the parser cannot read is
-//! refused through the modelled error that states so, with the parser's own message.
-//! Implement the evaluation here — this is the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteGremlinQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation EVALUATES the traversal it was handed against the property graph this
+//! engine stores: the query is read first (see
+//! [`crate::state::parse_gremlin_traversal`]), a query the parser cannot read is refused
+//! through the modelled error that states so with the parser's own message, and the
+//! traversal is then run step by step over that graph (see
+//! [`crate::state::run_traversal`]), so every result comes from what the store holds.
+//! A traversal naming a step the evaluation does not cover yet is answered HTTP 501
+//! `NotImplemented` naming that step — "nobody has written it yet", never a result nothing
+//! computed and never an empty answer a caller cannot tell from a traversal that really
+//! matched nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input, "store-unavailable");
+            return Err(ExecuteGremlinQueryErrorModeled::FailureByQueryException(
+                crate::state::store_unavailable_failure(),
+            )
+            .into());
+        };
+
         // The member is required, so it is here — but a blank one carries no query, and a
         // query endpoint with nothing to run is the parameter being missing.
         if input.gremlin_query.trim().is_empty() {
@@ -229,8 +233,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine can go on to do with one that is — each refusal through the modelled
         // error whose own documentation states that fact, carrying the parser's report of
         // where it stopped.
-        match crate::state::parse_gremlin_traversal(&input.gremlin_query) {
-            Ok(_traversal) => {}
+        let traversal = match crate::state::parse_gremlin_traversal(&input.gremlin_query) {
+            Ok(traversal) => traversal,
             Err(rejection @ crate::state::QueryRejection::Malformed(_)) => {
                 record_access(ctx, &input, "malformed-query");
                 return Err(ExecuteGremlinQueryErrorModeled::MalformedQueryException(
@@ -252,17 +256,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-        }
+        };
 
-        // The traversal is one this engine could read and cannot EVALUATE: there is no
-        // in-process TinkerPop engine here, so the query is answered 501 rather than with
-        // a result nothing computed. Nothing is recorded in the query registry either: no
-        // query was accepted.
-        record_access(ctx, &input, "not-implemented");
-        let _ = &self.engine;
-        Err(crate::scaffolded::Scaffolded::not_implemented(
-            "ExecuteGremlinQuery",
-        ))
+        // The evaluation is CPU-bound and takes the store's lock, so it runs on the
+        // blocking pool rather than on the worker serving this request: the `.await` below
+        // is a real yield point, so health checks, request timeouts and a graceful
+        // shutdown go on working while a traversal runs, and a second request does not
+        // park a second worker waiting for the lock. The run holds the lock for the whole
+        // traversal, which is what makes two concurrent writers apply one whole traversal
+        // at a time.
+        let store = state.clone();
+        let text = input.gremlin_query.clone();
+        let accepted_at = ::std::time::SystemTime::now();
+        // ONE id for this query: it is what the answer reports as the `requestId` the
+        // model documents as "the unique identifier of the Gremlin query", and it is the
+        // key the registry record is written under, so the id the caller is handed is the
+        // `queryId` the status family takes.
+        let query_id = crate::state::new_query_id();
+        let recorded_as = query_id.clone();
+        let answered = ::tokio::task::spawn_blocking(move || {
+            let mut held = store.lock();
+            // The span starts when the run does: neither the wait for a free thread nor
+            // the wait for the store's lock comes out of the budget the traversal is
+            // given.
+            let deadline = ::std::time::Instant::now() + crate::state::QUERY_RUN_TIMEOUT;
+            let answered = crate::state::run_traversal(&mut held.graph, &traversal, deadline);
+            // A traversal the engine EVALUATED is one it accepted and finished within this
+            // call, so it is recorded in the Gremlin registry the status family reports
+            // from — under the id this call minted and answers with. A traversal that was
+            // never run (one past a bound, one naming a step this engine does not
+            // evaluate) is not recorded: the engine accepted no such query.
+            if answered.is_ok() {
+                held.gremlin_queries.record_finished(
+                    recorded_as,
+                    text,
+                    accepted_at,
+                    ::std::time::SystemTime::now(),
+                );
+            }
+            answered
+        })
+        .await
+        .unwrap_or_else(|joined| {
+            Err(crate::state::TraversalFailure::Run(
+                crate::state::QueryFailure::Interrupted(format!(
+                    "the Gremlin engine did not finish this traversal: {joined}"
+                )),
+            ))
+        });
+
+        match answered {
+            Ok(results) => {
+                record_access(ctx, &input, "answered");
+                Ok(ExecuteGremlinQueryOutput {
+                    // The id of the query this answers, which is the one the status family
+                    // reports it under and a cancel names it by.
+                    request_id: Some(query_id),
+                    status: Some(GremlinQueryStatusAttributes {
+                        // The status of a served answer: the code the endpoint answered
+                        // with, and no message, as a successful answer carries.
+                        message: Some(String::new()),
+                        code: Some(i32::from(Self::SUCCESS_STATUS)),
+                        attributes: Some(crate::state::status_attributes()),
+                    }),
+                    // `result` carries the data the traversal answered, with the metadata
+                    // of that answer beside it.
+                    result: Some(crate::state::result_document(&results)),
+                    // The metadata of the answer is inside `result`, which is where this
+                    // endpoint reports it, so there is none to report beside it.
+                    meta: None,
+                })
+            }
+            Err(failure) => {
+                let refusal = crate::state::traversal_refusal(failure);
+                record_access(ctx, &input, outcome(&refusal));
+                Err(refused(refusal))
+            }
+        }
+    }
+}
+
+/// The modelled error one failure is reported through, lifted into this operation's error
+/// channel — or, for a step this engine does not evaluate yet, the scaffold's 501 naming
+/// that step, which is the one answer that states the truth about it.
+fn refused(refusal: crate::state::TraversalRefusal) -> ExecuteGremlinQueryError {
+    use crate::state::{QueryRefusal, TraversalRefusal};
+    let modeled = match refusal {
+        TraversalRefusal::NotEvaluated(reason) => {
+            return crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented { message: reason },
+            )
+        }
+        TraversalRefusal::Modeled(modeled) => modeled,
+    };
+    match modeled {
+        QueryRefusal::Malformed(payload) => {
+            ExecuteGremlinQueryErrorModeled::MalformedQueryException(payload)
+        }
+        QueryRefusal::Unsupported(payload) => {
+            ExecuteGremlinQueryErrorModeled::UnsupportedOperationException(payload)
+        }
+        QueryRefusal::Constraint(payload) => {
+            ExecuteGremlinQueryErrorModeled::ConstraintViolationException(payload)
+        }
+        QueryRefusal::InvalidParameter(payload) => {
+            ExecuteGremlinQueryErrorModeled::InvalidParameterException(payload)
+        }
+        QueryRefusal::TooLarge(payload) => {
+            ExecuteGremlinQueryErrorModeled::QueryTooLargeException(payload)
+        }
+        QueryRefusal::Limit(payload) => {
+            ExecuteGremlinQueryErrorModeled::QueryLimitException(payload)
+        }
+        QueryRefusal::TimeLimit(payload) => {
+            ExecuteGremlinQueryErrorModeled::TimeLimitExceededException(payload)
+        }
+        QueryRefusal::Memory(payload) => {
+            ExecuteGremlinQueryErrorModeled::MemoryLimitExceededException(payload)
+        }
+        QueryRefusal::Failure(payload) => {
+            ExecuteGremlinQueryErrorModeled::FailureByQueryException(payload)
+        }
+    }
+    .into()
+}
+
+/// How a refused traversal ended, for the access log.
+fn outcome(refusal: &crate::state::TraversalRefusal) -> &'static str {
+    use crate::state::{QueryRefusal, TraversalRefusal};
+    match refusal {
+        TraversalRefusal::NotEvaluated(_) => "step-not-evaluated",
+        TraversalRefusal::Modeled(QueryRefusal::Malformed(_)) => "malformed-query",
+        TraversalRefusal::Modeled(QueryRefusal::Unsupported(_)) => "unsupported",
+        TraversalRefusal::Modeled(QueryRefusal::Constraint(_)) => "constraint",
+        TraversalRefusal::Modeled(QueryRefusal::InvalidParameter(_)) => "invalid-parameter",
+        TraversalRefusal::Modeled(QueryRefusal::TooLarge(_)) => "query-too-large",
+        TraversalRefusal::Modeled(QueryRefusal::Limit(_)) => "query-limit",
+        TraversalRefusal::Modeled(QueryRefusal::TimeLimit(_)) => "time-limit",
+        TraversalRefusal::Modeled(QueryRefusal::Memory(_)) => "write-refused",
+        TraversalRefusal::Modeled(QueryRefusal::Failure(_)) => "engine-failure",
     }
 }
 

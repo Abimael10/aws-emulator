@@ -12,10 +12,13 @@
 //! newest admission first and at most `limit` of them. A job that has finished is not
 //! active, so its id is never listed, and nothing the registry does not hold is.
 //!
-//! The loader EXECUTION endpoint (`StartLoaderJob`) is deliberately still 501, which
-//! [`start_loader_job_is_refused_and_records_no_job`] pins: a bulk load reads data files
-//! and writes them into a graph, and this emulator has no graph store to write them into,
-//! so a load id for a load nothing performed would be a fabrication.
+//! The loader EXECUTION endpoint (`StartLoaderJob`) reads the request and refuses a load
+//! the loader could never have started — an `iamRoleArn` it can resolve no credential for
+//! ([`a_load_whose_role_resolves_no_credential_is_refused_and_admits_no_job`]) — and is
+//! deliberately still 501 for one it could have acted on, which
+//! [`start_loader_job_is_refused_and_records_no_job`] pins: a bulk load reads data files,
+//! and this emulator has no reader for those formats, so a load id for a load nothing
+//! performed would be a fabrication.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -357,10 +360,149 @@ async fn listing_the_jobs_changes_nothing_a_later_caller_sees() {
     );
 }
 
-/// The loader EXECUTION endpoint is still a stub, and must stay one until this emulator
-/// can really load data: a load id for a load nothing performed would be fabricated. A
-/// 501 says "nobody has written it yet", which is the truth, and it must leave nothing
-/// behind in the registry.
+/// One load request and what the loader answers it: the role it would run under, and
+/// whether a credential can be resolved for that value at all.
+#[derive(Debug, Clone, Copy)]
+struct LoadRequest {
+    case: &'static str,
+    source: &'static str,
+    iam_role_arn: &'static str,
+    /// Whether the value names an IAM role, which is what the loader resolves a credential
+    /// for.
+    usable: bool,
+}
+
+/// The rows differ along what the value IS: a role ARN of either account form, text that
+/// is not an ARN at all, an ARN of another service, an ARN naming another kind of IAM
+/// entity, and an empty value.
+/// Source: smithy_query(query="operation", operation="StartLoaderJob") — `iamRoleArn` is an
+/// unconstrained String, so no modelled constraint refuses any of these at the boundary.
+const LOAD_REQUESTS: &[LoadRequest] = &[
+    LoadRequest {
+        case: "an IAM role ARN",
+        source: "s3://example-bucket/vertices/",
+        iam_role_arn: "arn:aws:iam::000000000001:role/NeptuneLoadFromS3",
+        usable: true,
+    },
+    LoadRequest {
+        case: "an IAM role ARN carrying a path",
+        source: "s3://example-bucket/edges/",
+        iam_role_arn: "arn:aws:iam::000000000001:role/service-role/NeptuneLoad",
+        usable: true,
+    },
+    LoadRequest {
+        case: "an IAM role ARN of another partition",
+        source: "s3://example-bucket/data/",
+        iam_role_arn: "arn:aws-us-gov:iam::000000000001:role/NeptuneLoad",
+        usable: true,
+    },
+    LoadRequest {
+        case: "text that is not an ARN",
+        source: "s3://example-bucket/data/",
+        iam_role_arn: "not-a-valid-arn",
+        usable: false,
+    },
+    LoadRequest {
+        case: "an ARN of another service",
+        source: "s3://example-bucket/data/",
+        iam_role_arn: "arn:aws:s3:::example-bucket/data",
+        usable: false,
+    },
+    LoadRequest {
+        case: "an ARN naming an IAM user rather than a role",
+        source: "s3://another-bucket/load/",
+        iam_role_arn: "arn:aws:iam::000000000001:user/loader",
+        usable: false,
+    },
+    LoadRequest {
+        case: "an ARN with no resource",
+        source: "s3://example-bucket/data/",
+        iam_role_arn: "arn:aws:iam::000000000001:",
+        usable: false,
+    },
+    LoadRequest {
+        case: "an empty value",
+        source: "s3://example-bucket/data/",
+        iam_role_arn: "",
+        usable: false,
+    },
+];
+
+/// A load runs UNDER the role the request names, so a value the loader can resolve no
+/// credential for is a load that could never start: it is refused
+/// `InvalidParameterException` (HTTP 400) naming the source and the role, and admits no
+/// job. A request whose role IS one is a load this emulator cannot perform yet, so it is
+/// answered 501 — "nobody has written it yet" — and admits no job either.
+#[tokio::test]
+async fn a_load_whose_role_resolves_no_credential_is_refused_and_admits_no_job() {
+    let Emulator { router, engine } = emulator();
+    seed(&engine);
+    let before = listed_ids(&list_jobs(&router, "?includeQueuedLoads=true").await);
+
+    for request in LOAD_REQUESTS {
+        let answer = call(
+            &router,
+            "POST",
+            "/loader",
+            Some(serde_json::json!({
+                "source": request.source,
+                "format": "csv",
+                "region": "us-east-1",
+                "iamRoleArn": request.iam_role_arn,
+            })),
+        )
+        .await;
+        let case = request.case;
+        if request.usable {
+            assert_eq!(
+                answer.status, 501,
+                "case {case:?}: a load this emulator cannot perform must be answered as not \
+                 implemented, got {} with body {:?}",
+                answer.status, answer.body
+            );
+            continue;
+        }
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["code"].as_str(),
+            Some("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {:?}",
+            answer.body
+        );
+        let expected = format!(
+            "Failed to start new load from the source {}. Couldn't find the aws credential \
+             for iam_role_arn: {}",
+            request.source, request.iam_role_arn
+        );
+        for member in ["message", "detailedMessage"] {
+            assert_eq!(
+                answer.body[member].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}/{member}: expected {expected:?}, got {:?}",
+                answer.body[member]
+            );
+        }
+    }
+
+    // No request admitted a job, so the ids the list reports are the ones it reported
+    // before them.
+    let after = list_jobs(&router, "?includeQueuedLoads=true").await;
+    assert_eq!(
+        listed_ids(&after),
+        before,
+        "a load that was refused or not performed must add no load id, got {:?}",
+        after.body
+    );
+}
+
+/// The LOAD itself is still unwritten, and the endpoint must keep saying so until this
+/// emulator can really load data: a load id for a load nothing performed would be
+/// fabricated. A 501 says "nobody has written it yet", which is the truth, and it must
+/// leave nothing behind in the registry.
 #[tokio::test]
 async fn start_loader_job_is_refused_and_records_no_job() {
     let Emulator { router, .. } = emulator();

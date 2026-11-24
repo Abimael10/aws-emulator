@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartLoaderJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartLoaderJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` for a
+//! load it could ACT on — a bulk load reads the data files its source names, and this
+//! emulator has no reader for those formats yet, so a load id for a load nothing performed
+//! would be a fabrication. What it does NOT answer 501 for is a request the loader could
+//! never have started: the role the load would run under is read first (see
+//! [`crate::state::resolves_credentials`]), and a value no credential can be resolved for
+//! is refused through the modelled error that states so. Implement the load itself here —
+//! this is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`StartLoaderJob::handle`] with real behaviour and
@@ -274,18 +279,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartLoaderJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartLoaderJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // A load runs under the role the request names: the loader assumes it and reads
+        // the source with its credentials, so a value it can resolve no credential for is
+        // a load that could never start, and it is refused rather than admitted. The
+        // member is an unconstrained string in the model, so the request boundary admitted
+        // any text and this is where the value is read.
+        if !crate::state::resolves_credentials(&input.iam_role_arn) {
+            record_access(ctx, &input, "unusable-iam-role");
+            return Err(StartLoaderJobErrorModeled::InvalidParameterException(
+                crate::state::unusable_iam_role(&input.source, &input.iam_role_arn),
+            )
+            .into());
+        }
+
+        // The request names a load this emulator cannot PERFORM: a bulk load reads the
+        // data files the source names, and there is no reader for those formats here, so
+        // the call is answered 501 rather than with a load id for a load nothing ran.
+        // Nothing is recorded in the loader registry either — `ListLoaderJobs` reports
+        // exactly the jobs the registry holds — so a refused or unperformed load adds no
+        // load id.
+        record_access(ctx, &input, "not-implemented");
+        let _ = &self.engine;
         Err(crate::scaffolded::Scaffolded::not_implemented("StartLoaderJob"))
     }
+}
+
+/// Record one load request: what was asked (the method, the URI, the format and the region
+/// the source is in), who asked (the access key the request presented), and how it ended —
+/// refusals included.
+///
+/// The source and the role are deliberately absent: both are the caller's own values, and
+/// a log is a file. No secret is recorded either (the access key id is an identifier,
+/// never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    input: &StartLoaderJobInput,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "StartLoaderJob",
+        method = %parts.method,
+        uri = %parts.uri,
+        format = ?input.format,
+        s3_bucket_region = ?input.s3_bucket_region,
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata start loader job"
+    );
 }
