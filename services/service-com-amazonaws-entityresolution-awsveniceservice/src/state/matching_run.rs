@@ -78,6 +78,25 @@ pub const MAX_RUN_RECORDS: usize = 20_000;
 /// the output table — so this is wider than the modelled schema and still bounded.
 pub const MAX_COLUMNS: usize = 200;
 
+/// The most bytes one COLUMN NAME of an input table is read with.
+///
+/// A record is keyed by its table's column names, so a name is held once per record it
+/// keys: the width of a table bounds how many names there are ([`MAX_COLUMNS`]) and this
+/// bounds how long one may be, which together bound the keys of one record. CHOSEN for
+/// this emulator, and applied to the names a table DECLARES and to the ones read off an
+/// object's header row alike, because both come from a client.
+pub const MAX_COLUMN_NAME_BYTES: usize = 256;
+
+/// The most bytes one run HOLDS in the records it has read, counting each record's keys
+/// and values.
+///
+/// The bound on the PRODUCT of the record count and what one record costs, which neither
+/// [`MAX_RUN_RECORDS`] nor [`MAX_RUN_INPUT_BYTES`] caps: a record is keyed by its table's
+/// column names, so a wide table's names are held once for every row it has, and the bytes
+/// a run holds are therefore not bounded by the bytes it read. CHOSEN for this emulator,
+/// and applied as each record is read, before the record is allocated.
+pub const MAX_RUN_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
 /// The most bytes one run encodes its output table to. CHOSEN for this emulator.
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -354,6 +373,10 @@ pub async fn perform<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     let mut input_records = 0usize;
     let mut not_processed = 0usize;
     let mut read_bytes = 0usize;
+    // What the records read so far COST to hold, which is what [`MAX_RUN_RECORD_BYTES`]
+    // caps: the bytes read bound neither it nor the record count, because every record
+    // carries its table's column names as its keys.
+    let mut held_bytes = 0usize;
     for table in &tables {
         let keys = match object_keys(&client, table).await {
             Ok(keys) => keys,
@@ -368,7 +391,7 @@ pub async fn perform<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             if read_bytes > MAX_RUN_INPUT_BYTES {
                 return failed(run_input_too_large());
             }
-            match read_table_records(&bytes, table, &mut records) {
+            match read_table_records(&bytes, table, &mut records, &mut held_bytes) {
                 Ok(counted) => {
                     input_records = input_records.saturating_add(counted.rows);
                     not_processed = not_processed.saturating_add(counted.not_processed);
@@ -555,9 +578,7 @@ fn input_tables<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             .flatten()
             .map(|column| column.name.clone())
             .collect();
-        if columns.len() > MAX_COLUMNS {
-            return Err(too_many_columns(columns.len()));
-        }
+        bounded_columns(&columns)?;
         tables.push(TableRead {
             input_source_arn: source.input_source_arn.clone(),
             normalize: source.normalize,
@@ -744,10 +765,17 @@ struct RowCounts {
 /// header, which is what a comma-separated export carries. A record whose field count
 /// does not match the column list is counted as NOT PROCESSED rather than matched on
 /// guessed positions.
+///
+/// `held_bytes` is what the records already read cost to hold, across every object of
+/// every input source: each record's keys and values are added to it BEFORE the record is
+/// allocated, and a run past [`MAX_RUN_RECORD_BYTES`] is the stated reason the run failed.
+/// The keys of one record are bounded in turn by [`bounded_columns`], so neither how wide
+/// a table is nor how long its column names are can make a run hold an unbounded amount.
 fn read_table_records(
     bytes: &[u8],
     table: &TableRead,
     records: &mut Vec<RunRecord>,
+    held_bytes: &mut usize,
 ) -> Result<RowCounts, String> {
     let mut reader = ::csv::ReaderBuilder::new()
         .delimiter(CSV_DELIMITER)
@@ -775,10 +803,11 @@ fn read_table_records(
             continue;
         }
         if columns.is_empty() {
-            if row.len() > MAX_COLUMNS {
-                return Err(too_many_columns(row.len()));
-            }
-            columns = row.iter().map(ToString::to_string).collect();
+            // Judged by the one rule the names a table DECLARES go through, so a header
+            // row cannot name more or longer columns than a catalogued table may.
+            let header: Vec<String> = row.iter().map(ToString::to_string).collect();
+            bounded_columns(&header)?;
+            columns = header;
             first = false;
             continue;
         }
@@ -798,6 +827,14 @@ fn read_table_records(
         if records.len() == MAX_RUN_RECORDS {
             return Err(too_many_records());
         }
+        // What this record will cost to hold — its keys, its values and the input source
+        // it names — counted before it is allocated, so the ceiling is applied to the
+        // allocation it caps rather than after it.
+        *held_bytes = held_bytes
+            .saturating_add(record_footprint(&columns, &row, &table.input_source_arn));
+        if *held_bytes > MAX_RUN_RECORD_BYTES {
+            return Err(run_records_too_large());
+        }
         let attributes: HashMap<String, String> = columns
             .iter()
             .cloned()
@@ -814,6 +851,41 @@ fn read_table_records(
         });
     }
     Ok(counts)
+}
+
+/// What ONE record read from `row` under `columns` costs to hold: its keys, its values and
+/// the input source ARN it carries.
+///
+/// The keys are counted for every record, which is the amplification
+/// [`MAX_RUN_RECORD_BYTES`] exists for: a record is a map keyed by the table's column
+/// names, so a wide table's names are held once per row rather than once per table.
+fn record_footprint(columns: &[String], row: &::csv::StringRecord, input_source_arn: &str) -> usize {
+    columns
+        .iter()
+        .map(String::len)
+        .chain(row.iter().map(str::len))
+        .fold(input_source_arn.len(), |held, bytes| {
+            held.saturating_add(bytes)
+        })
+}
+
+/// Whether the column names a run would key its records by are ones this emulator reads:
+/// at most [`MAX_COLUMNS`] of them, each at most [`MAX_COLUMN_NAME_BYTES`] long.
+///
+/// ONE place for it, so the names a table DECLARES and the names read off an object's own
+/// header row — both client-supplied — are bounded the same way, before any record keyed by
+/// them is held.
+fn bounded_columns(columns: &[String]) -> Result<(), String> {
+    if columns.len() > MAX_COLUMNS {
+        return Err(too_many_columns(columns.len()));
+    }
+    if let Some(name) = columns
+        .iter()
+        .find(|name| name.len() > MAX_COLUMN_NAME_BYTES)
+    {
+        return Err(column_name_too_long(name.len()));
+    }
+    Ok(())
 }
 
 /// Whether `row` is the header of a table whose columns are `columns`: the same names,
@@ -940,6 +1012,22 @@ fn too_many_records() -> String {
     )
 }
 
+/// The reason a run fails for records costing more than [`MAX_RUN_RECORD_BYTES`] to hold.
+fn run_records_too_large() -> String {
+    format!(
+        "The workflow's input sources hold records costing more than the \
+         {MAX_RUN_RECORD_BYTES} bytes this emulator holds in one job run."
+    )
+}
+
+/// The reason a run fails for a column name longer than [`MAX_COLUMN_NAME_BYTES`].
+fn column_name_too_long(held: usize) -> String {
+    format!(
+        "An input table names a column of {held} bytes, longer than the \
+         {MAX_COLUMN_NAME_BYTES} bytes this emulator reads one column name as."
+    )
+}
+
 /// The reason a run fails for a table wider than [`MAX_COLUMNS`].
 fn too_many_columns(held: usize) -> String {
     format!(
@@ -959,34 +1047,125 @@ fn output_too_large() -> String {
 /// The Amazon S3 client a run reads its input tables and writes its output table with,
 /// addressed to `region`.
 ///
-/// The transport is the emulator's own in-process callback, so the `endpoint_url` below
-/// is an ADDRESS the in-process router reads rather than a host any resolver looks up:
-/// this client reaches the emulator's own Amazon S3 and nothing else, whatever bucket or
-/// key a caller names. The Region is narrowed to a Region label before it reaches the
+/// The ONE construction every emulated service's object-store hop shares
+/// (`service_common::s3_client`), so this run's reads and writes are configured the way every
+/// other service's are: the transport is the emulator's own in-process callback, so the
+/// address it is built from is one the in-process router reads rather than a host any
+/// resolver looks up — this client reaches the emulator's own Amazon S3 and nothing else,
+/// whatever bucket or key a caller names — and the object a write stores carries the
+/// properties the SERVICE set and no others, the transport naming neither a checksum
+/// algorithm nor a media type of its own, so the object store applies its own defaults to a
+/// write that stated none. The Region is narrowed to a Region label before it reaches the
 /// authority.
-///
-/// There is nothing to retry, time out or watch for a stalled stream, each of which
-/// would need a sleep implementation this client is not given. The same goes for caching
-/// the identity: the credentials the callback hands over are used directly, and they
-/// only sign this operation's in-process calls.
 fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
     let region = ::service_common::arn::region_label(region).unwrap_or(super::DEFAULT_REGION);
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The emulator serves one endpoint for every service, so the bucket travels in
-        // the path rather than in a per-bucket host the router could not resolve.
-        .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_s3::Client::from_conf(config)
+    ::service_common::s3_client::s3_client(ctx.callback(), region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table over `columns` whose objects hold no header to skip.
+    fn table(columns: &[&str]) -> TableRead {
+        TableRead {
+            input_source_arn: "arn:aws:glue:us-east-1:000000000000:table/crm/people".to_string(),
+            normalize: false,
+            unique_id_field: Some("id".to_string()),
+            bucket: "bucket".to_string(),
+            prefix: "in/".to_string(),
+            columns: columns.iter().map(ToString::to_string).collect(),
+            skip_header_lines: 0,
+        }
+    }
+
+    /// What one record costs to hold is its keys AND its values, so the names a wide table
+    /// declares are counted once for every row — the amplification the ceiling exists for.
+    #[test]
+    fn a_records_footprint_counts_its_keys_as_well_as_its_values() {
+        let mut records = Vec::new();
+        let mut held = 0usize;
+        let table = table(&["id", "email"]);
+        let counts = read_table_records(b"r1,ada@example.com\n", &table, &mut records, &mut held)
+            .expect("a two-column table is read");
+        let keys = "id".len() + "email".len();
+        let values = "r1".len() + "ada@example.com".len();
+        let expected = table.input_source_arn.len() + keys + values;
+        assert_eq!(
+            (counts.rows, records.len(), held),
+            (1, 1, expected),
+            "one record of two columns costs its arn, its keys and its values: expected \
+             {expected} held bytes for 1 record, got {held} for {}",
+            records.len()
+        );
+    }
+
+    /// The ceiling is on what is HELD, so a run is refused once its records cost more than
+    /// [`MAX_RUN_RECORD_BYTES`] however little was read — and it is applied before the
+    /// record is allocated, so the refused row is not in `records`.
+    #[test]
+    fn records_past_the_held_ceiling_are_the_stated_reason_the_run_failed() {
+        let mut records = Vec::new();
+        let mut held = MAX_RUN_RECORD_BYTES;
+        let table = table(&["id", "email"]);
+        let refusal = read_table_records(b"r1,ada@example.com\n", &table, &mut records, &mut held)
+            .expect_err("a run already at the ceiling holds no further record");
+        assert_eq!(
+            refusal,
+            run_records_too_large(),
+            "a record past the held ceiling must fail the run naming the bytes it holds in \
+             one run, got {refusal:?}"
+        );
+        assert!(
+            records.is_empty(),
+            "the refused record must not be held, got {records:?}"
+        );
+    }
+
+    /// Both places a column name can come FROM are bounded the same way: the names a table
+    /// declares and the names read off an object's own header row.
+    #[test]
+    fn a_column_name_past_the_ceiling_is_refused_wherever_it_came_from() {
+        let name = "n".repeat(MAX_COLUMN_NAME_BYTES + 1);
+        let longest = MAX_COLUMN_NAME_BYTES + 1;
+
+        let declared = bounded_columns(::std::slice::from_ref(&name))
+            .expect_err("a declared column name past the ceiling is refused");
+        assert_eq!(
+            declared,
+            column_name_too_long(longest),
+            "a declared column name of {longest} bytes must fail the run naming the \
+             column-name ceiling, got {declared:?}"
+        );
+
+        let mut records = Vec::new();
+        let mut held = 0usize;
+        let header = format!("id,{name}\nr1,ada\n");
+        let from_header = read_table_records(
+            header.as_bytes(),
+            // A table that declares no columns reads them off the object's first row.
+            &table(&[]),
+            &mut records,
+            &mut held,
+        )
+        .expect_err("a header column name past the ceiling is refused");
+        assert_eq!(
+            from_header,
+            column_name_too_long(longest),
+            "a header-derived name of {longest} bytes must be refused the same way, got \
+             {from_header:?}"
+        );
+        assert!(
+            records.is_empty() && held == 0,
+            "nothing is held for a refused header, got {records:?} holding {held} bytes"
+        );
+
+        // And a name AT the ceiling is read: the bound refuses what is past it, not what
+        // reaches it.
+        let at_ceiling = "n".repeat(MAX_COLUMN_NAME_BYTES);
+        bounded_columns(&[at_ceiling]).expect("a name at the ceiling is read");
+    }
 }
