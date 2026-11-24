@@ -61,8 +61,14 @@ struct Fixture {
     volume_type: &'static str,
     /// Its size, in GiB, before the modification.
     size: i32,
-    /// Its provisioned IOPS, for a type that provisions them.
+    /// Its provisioned IOPS, for a type that provisions them — what the create's `Iops`
+    /// parameter carries, and nothing for a type that takes none.
     iops: Option<i32>,
+    /// The IOPS the volume HAS before the modification, which is what the modification
+    /// records as its `original`: the ones the create provisioned, or the baseline its type
+    /// and size give it — a `gp2` volume's 3 IOPS per GiB, floored at 100 (the Amazon EBS
+    /// User Guide's General Purpose SSD figure).
+    original_iops: Option<i32>,
     /// Its throughput, in MiB/s, for the one type that carries one.
     throughput: Option<i32>,
     /// Its Multi-Attach setting, for a type that supports it.
@@ -92,7 +98,7 @@ impl Fixture {
             volume_id: Some(volume_id.to_string()),
             original_size: Some(self.size),
             original_volume_type: Some(self.volume_type.to_string()),
-            original_iops: self.iops,
+            original_iops: self.original_iops,
             original_throughput: self.throughput,
             original_multi_attach_enabled: self.multi_attach,
             target_size: Some(self.target_size),
@@ -118,6 +124,7 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "gp3",
             size: 100,
             iops: Some(3_000),
+            original_iops: Some(3_000),
             throughput: Some(125),
             multi_attach: None,
             target_size: 200,
@@ -132,6 +139,8 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "gp2",
             size: 1,
             iops: None,
+            // A 1 GiB gp2 volume's baseline is the rule's floor of 100 IOPS.
+            original_iops: Some(100),
             throughput: None,
             multi_attach: None,
             target_size: 1,
@@ -146,6 +155,7 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "io1",
             size: 4,
             iops: Some(100),
+            original_iops: Some(100),
             throughput: None,
             multi_attach: Some(false),
             target_size: 4,
@@ -160,6 +170,7 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "io2",
             size: 4,
             iops: Some(100),
+            original_iops: Some(100),
             throughput: None,
             multi_attach: Some(false),
             target_size: 8,
@@ -174,6 +185,7 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "gp3",
             size: 1,
             iops: Some(80_000),
+            original_iops: Some(80_000),
             throughput: Some(2_000),
             multi_attach: None,
             target_size: 65_536,
@@ -188,6 +200,7 @@ fn round_trip_fixtures() -> Vec<Fixture> {
             volume_type: "st1",
             size: 125,
             iops: None,
+            original_iops: None,
             throughput: None,
             multi_attach: None,
             target_size: 500,
@@ -473,7 +486,7 @@ async fn a_stored_modification_round_trips_through_the_describe() {
                 "originalVolumeType",
                 Some(fixture.volume_type.to_string()),
             ),
-            ("originalIops", fixture.iops.map(|iops| iops.to_string())),
+            ("originalIops", fixture.original_iops.map(|iops| iops.to_string())),
             (
                 "originalThroughput",
                 fixture.throughput.map(|value| value.to_string()),
@@ -648,6 +661,8 @@ fn filter_fixtures() -> Vec<Fixture> {
             volume_type: "gp2",
             size: 100,
             iops: None,
+            // A 100 GiB gp2 volume's baseline: 3 IOPS per GiB.
+            original_iops: Some(300),
             throughput: None,
             multi_attach: None,
             target_size: 200,
@@ -662,6 +677,7 @@ fn filter_fixtures() -> Vec<Fixture> {
             volume_type: "io1",
             size: 4,
             iops: Some(100),
+            original_iops: Some(100),
             throughput: None,
             multi_attach: Some(false),
             target_size: 8,
@@ -676,6 +692,7 @@ fn filter_fixtures() -> Vec<Fixture> {
             volume_type: "st1",
             size: 125,
             iops: None,
+            original_iops: None,
             throughput: None,
             multi_attach: None,
             target_size: 500,

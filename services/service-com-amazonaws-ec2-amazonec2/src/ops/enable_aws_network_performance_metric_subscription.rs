@@ -164,20 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The metric used for the enabled subscription" is one `MetricType` member and
         // "the statistic used for the enabled subscription" one `StatisticType` member. The
         // model declares both as enums, so the request walk has already refused a value
-        // outside either catalog; resolving it again here is what yields the `&'static str`
-        // the store keeps, so the stored word is a modelled member rather than the
-        // request's own text.
+        // outside either catalog — in the parameter layer's own code and clause for this
+        // surface (`crate::service`'s refusal override) — and resolving it again here is what
+        // yields the `&'static str` the store keeps, so the stored word is a modelled member
+        // rather than the request's own text. The backstop answers that same refusal, so a
+        // caller reads one code and one wording whichever side of dispatch found the value.
         let metric = state::subscription_metric(metric).ok_or_else(|| {
-            state::invalid_parameter_value(format!(
-                "Invalid value '{metric}' for Metric. It must be one of: {catalog}",
-                catalog = METRIC_TYPE_VALUES.join(", "),
-            ))
+            state::invalid_parameter_enum_value("Metric", metric, METRIC_TYPE_VALUES)
         })?;
         let statistic = state::subscription_statistic(statistic).ok_or_else(|| {
-            state::invalid_parameter_value(format!(
-                "Invalid value '{statistic}' for Statistic. It must be one of: {catalog}",
-                catalog = STATISTIC_TYPE_VALUES.join(", "),
-            ))
+            state::invalid_parameter_enum_value("Statistic", statistic, STATISTIC_TYPE_VALUES)
         })?;
 
         // "The source Region (like us-east-1) or Availability Zone ID (like use1-az1) that

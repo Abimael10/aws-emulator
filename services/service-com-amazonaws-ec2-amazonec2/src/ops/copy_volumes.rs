@@ -179,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            request_region, require_known_volume, require_service_state, system_time_to_date_time,
-            tag_list, unmanaged_operator, validate_tag_size, volume_iops_range,
-            volume_limit_exceeded,
+            default_volume_iops, request_region, require_known_volume, require_service_state,
+            system_time_to_date_time, tag_list, unmanaged_operator, validate_tag_size,
+            volume_iops_range, volume_limit_exceeded,
             volume_payload_bytes, volume_size_range, VolumeRecord, VolumeView,
-            DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT,
+            DEFAULT_GP3_THROUGHPUT,
             DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE, MAX_CLIENT_TOKEN_CHARS,
             MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_VOLUMES, MAX_TAGS_PER_RESOURCE,
             PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE, TRANSITION_DELAY,
@@ -276,9 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "iops is required for a {volume_type} volume"
                 )));
             }
-            // "gp3: 3,000 (default)"; every other type provisions none.
-            (None, Some(_)) => Some(DEFAULT_GP3_IOPS),
-            (None, None) => None,
+            // "gp3: 3,000 (default)"; a type whose IOPS are a BASELINE of its size reports
+            // that baseline instead, and every other type provisions none
+            // ([`crate::state::default_volume_iops`], the one derivation of the figure a
+            // volume of this type and size has).
+            (None, _) => default_volume_iops(&volume_type, Some(size)),
         };
 
         // "Supported for gp3 volumes only. Omit for all other volume types. Valid Range:

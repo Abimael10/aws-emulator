@@ -161,23 +161,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // server association is the connection established between a route server and a
         // VPC", `RouteServerAssociation`), and that route server then writes the routes it
         // learns into the VPC's route tables — so a route server that is already associated
-        // has no second VPC to write into: a request naming it with another VPC, or naming
-        // the association it already holds, is refused rather than written. A VPC, on the
-        // other hand, is the SUBJECT of an association rather than its holder, so one VPC may
-        // be served by more than one route server — which is what a recorded
-        // `AssociateRouteServer` of a second route server onto an already-served VPC is
-        // answered 200 for.
-        if let Some(already_serving) =
-            store.vpc_route_server_is_associated_with(&input.route_server_id)
-        {
-            return Err(route_server_already_associated(format!(
-                "The route server '{route_server_id}' is already associated with vpc \
-                 '{already_serving}'",
-                route_server_id = input.route_server_id,
-            )));
+        // has no second VPC to write into: a request naming it with ANOTHER VPC is refused
+        // rather than written. A request naming the pair this store ALREADY holds asks for
+        // the association that exists, which the call answers with (below, past the DryRun
+        // probe): an associate of a pair that is already associated changes nothing, so a
+        // retry after a timeout and two workers converging the same VPC both succeed and read
+        // one association. A VPC, on the other hand, is the SUBJECT of an association rather
+        // than its holder, so one VPC may be served by more than one route server — which is
+        // what a recorded `AssociateRouteServer` of a second route server onto an
+        // already-served VPC is answered 200 for.
+        let now = ::std::time::Instant::now();
+        let existing =
+            store.route_server_association_of_pair_at(&input.route_server_id, &input.vpc_id, now);
+        if existing.is_none() {
+            if let Some(already_serving) =
+                store.vpc_route_server_is_associated_with(&input.route_server_id)
+            {
+                return Err(route_server_already_associated(format!(
+                    "The route server '{route_server_id}' is already associated with vpc \
+                     '{already_serving}'",
+                    route_server_id = input.route_server_id,
+                )));
+            }
         }
 
-        if !store.has_route_server_association_capacity() {
+        // The store's ceiling is asked only of a call that would WRITE: answering the
+        // association the store already holds stores nothing, so it is not refused by a store
+        // that has since filled up.
+        if existing.is_none() && !store.has_route_server_association_capacity() {
             return Err(state::route_server_limit_exceeded(format!(
                 "This emulator holds {max} route server associations, which is as many as it \
                  stores",
@@ -193,11 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
+        // The association already held is answered as it stands — the pair is joined, so
+        // there is nothing to write and nothing to move.
+        if let Some(association) = existing {
+            return Ok(AssociateRouteServerOutput {
+                route_server_association: Some(association),
+            });
+        }
+
         // The association is written in `associating` with the clock owing it `associated`
         // one transition delay later, so a caller reading straight after this call still
         // sees `associating`. The answer is the record as it was stored, so this operation
         // and `GetRouteServerAssociations` cannot report one association differently.
-        let now = ::std::time::Instant::now();
         let association =
             store.insert_route_server_association(&input.route_server_id, &input.vpc_id, now);
         Ok(AssociateRouteServerOutput {
@@ -207,12 +225,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// `InvalidRouteServerId.AlreadyAssociated` (HTTP 400): the route server the request named is
-/// already associated, so the association it asks for would be that route server's second.
+/// already associated with ANOTHER VPC, so the association it asks for would be that route
+/// server's second.
 ///
 /// The code names the ROUTE SERVER because the route server is what an association is held
 /// by: it writes the routes it learns into the route tables of the one VPC it is associated
 /// with. The `message` names the pair, built from the request and from what the store already
-/// holds.
+/// holds. A request naming the pair the store already holds is NOT this refusal: it asks for
+/// an association that exists, which the operation answers with.
 fn route_server_already_associated(message: String) -> AssociateRouteServerError {
     crate::scaffolded::Scaffolded::service_error(
         "InvalidRouteServerId.AlreadyAssociated",

@@ -236,8 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             availability_zones_in_region, request_region, require_service_state, tag_list,
-            unresolvable_snapshot_id, validate_tag_size,
-            volume_iops_range, volume_limit_exceeded, volume_payload_bytes, volume_size_range,
+            validate_tag_size, volume_iops_range, volume_limit_exceeded, volume_payload_bytes,
+            volume_size_range, volume_source_snapshot_unresolvable,
             DEFAULT_GP3_IOPS,
             DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
             MAX_CLIENT_TOKEN_CHARS, MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_VOLUMES,
@@ -296,24 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "You must specify either a snapshot ID or a volume size"
-        // (`CreateVolumeRequest$Size`). This emulator stores no snapshots — every EBS
-        // snapshot operation is still a stub — so an id a caller names here can only be
-        // one no snapshot of the account has, which is the answer EC2 gives for it; an id
-        // that is not shaped like a snapshot id is answered as malformed first.
-        if let Some(snapshot_id) = input.snapshot_id.as_deref() {
-            return Err(unresolvable_snapshot_id(snapshot_id));
-        }
-        let Some(size) = input.size else {
-            return Err(Scaffolded::missing_parameter(
-                "Either size or snapshotId must be specified",
-            ));
-        };
-        if size < size_min || size > size_max {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{size}' for size. \
-                 A {volume_type} volume holds from {size_min} to {size_max} GiB"
-            )));
-        }
+        // (`CreateVolumeRequest$Size`). A request naming a snapshot is resolved against the
+        // snapshots this account holds, below, where the store is open; the size question is
+        // asked there too, because "if you specify a snapshot, the default is the snapshot
+        // size" and a request may name neither member only if there is no snapshot to take a
+        // size from.
 
         // "Required for io1 and io2 volumes. Optional for gp3 volumes. Omit for all
         // other volume types" (`CreateVolumeRequest$Iops`), with the per-type ranges
@@ -482,16 +469,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let now = ::std::time::Instant::now();
 
+        // "The snapshot from which to create the volume" (`CreateVolumeRequest$SnapshotId`):
+        // the id is resolved against the snapshots this ACCOUNT holds — the ones this store
+        // keeps and the ones the EBS direct APIs keep, which are snapshots of the same
+        // account ([`crate::state::direct_api_snapshot`]) — and a value that resolves to
+        // none is refused with this operation's own classification
+        // ([`crate::state::volume_source_snapshot_unresolvable`]) rather than restored from
+        // nothing. The snapshot's own size and encryption state are what the volume restores,
+        // so both are read here, under the guard the write below takes.
+        let source_snapshot = match input.snapshot_id.as_deref() {
+            None => None,
+            Some(snapshot_id) => {
+                let held_here = store
+                    .snapshots
+                    .get(snapshot_id)
+                    .map(|record| (record.view.volume_size, record.view.encrypted));
+                let resolved = match held_here {
+                    Some(facts) => Some(facts),
+                    None => crate::state::direct_api_snapshot(
+                        &*self.engine,
+                        snapshot_id,
+                        ::std::time::SystemTime::now(),
+                    )
+                    .map(|snapshot| (snapshot.volume_size, snapshot.encrypted)),
+                };
+                Some(
+                    resolved
+                        .ok_or_else(|| volume_source_snapshot_unresolvable(snapshot_id))?,
+                )
+            }
+        };
+        let snapshot_size = source_snapshot.and_then(|(volume_size, _)| volume_size);
+
+        // "You must specify either a snapshot ID or a volume size. If you specify a snapshot,
+        // the default is the snapshot size, and you can specify a volume size that is equal
+        // to or larger than the snapshot size" (`CreateVolumeRequest$Size`) — so a volume
+        // smaller than the snapshot it restores is refused in the words this crate words that
+        // refusal with ([`crate::ops::register_image`] refuses the same clause for an AMI's
+        // own mapping), and a request that names neither member has no size to create with.
+        let size = match (input.size, snapshot_size) {
+            (Some(size), Some(snapshot_size)) if size < snapshot_size => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Volume of size {size}GB is smaller than snapshot '{snapshot_id}', \
+                     expect size >= {snapshot_size}GB",
+                    snapshot_id = input.snapshot_id.as_deref().unwrap_or_default(),
+                )));
+            }
+            (Some(size), _) => size,
+            (None, Some(snapshot_size)) => snapshot_size,
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either size or snapshotId must be specified",
+                ));
+            }
+        };
+        if size < size_min || size > size_max {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{size}' for size. \
+                 A {volume_type} volume holds from {size_min} to {size_max} GiB"
+            )));
+        }
+
+        // The IOPS the volume will have: the ones the request provisioned, or — now that the
+        // size is resolved — the figure this type's own documented performance gives it
+        // ([`crate::state::default_volume_iops`], the one derivation the store's writer
+        // applies). Read HERE as well so the idempotency comparison below asks about the
+        // volume this request would create rather than about the members it named.
+        let iops = iops.or_else(|| crate::state::default_volume_iops(&volume_type, Some(size)));
+
         // The encryption state the volume is created in: what the request asks for, OR the
-        // account's EBS encryption-by-default setting for this Region. "After you enable
-        // encryption by default, the EBS volumes that you create are always encrypted"
-        // (`EnableEbsEncryptionByDefault`), and the Amazon EBS User Guide's "Encryption by
-        // default" adds that once it is enabled for a Region you cannot disable it for
-        // individual volumes — so the setting raises the state a request leaves unset or
-        // sets to false, and never lowers it. Read under the SAME guard the write below
-        // takes, so no enable or disable can land between the read and the write.
-        let encrypted =
-            input.encrypted.unwrap_or(false) || store.ebs_encryption_by_default(&region);
+        // state the snapshot it restores has ("volumes that are created from encrypted
+        // snapshots are also automatically encrypted", through the one reading of that
+        // question this crate has), OR the account's EBS encryption-by-default setting for
+        // this Region. "After you enable encryption by default, the EBS volumes that you
+        // create are always encrypted" (`EnableEbsEncryptionByDefault`), and the Amazon EBS
+        // User Guide's "Encryption by default" adds that once it is enabled for a Region you
+        // cannot disable it for individual volumes — so each of the three raises the state a
+        // request leaves unset or sets to false, and none lowers it. Read under the SAME
+        // guard the write below takes, so no enable or disable can land between the read and
+        // the write.
+        let encrypted = input.encrypted.unwrap_or(false)
+            || crate::state::restored_device_is_encrypted(
+                source_snapshot.and_then(|(_, encrypted)| encrypted),
+            )
+            || store.ebs_encryption_by_default(&region);
 
         // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
         // idempotency of the request" (`CreateVolumeRequest$ClientToken`) — one token
@@ -585,9 +646,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 throughput,
                 encrypted: Some(encrypted),
                 kms_key_id: input.kms_key_id.clone(),
-                // "You must specify either a snapshot ID or a volume size": a request
-                // naming a snapshot is refused above, so this volume restores none.
-                snapshot_id: None,
+                // "The snapshot from which the volume was created, if applicable"
+                // (`Volume$SnapshotId`): the snapshot resolved above, which this volume
+                // really restores.
+                snapshot_id: input.snapshot_id.clone(),
                 multi_attach_enabled: Some(multi_attach_enabled),
                 client_token: input.client_token.clone(),
                 tags: tag_list(&tags),

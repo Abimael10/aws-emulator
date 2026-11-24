@@ -160,6 +160,14 @@ fn nonexistent_instance_types(
 /// ([`crate::state::traffic_mirror_network_service_refusal_message`]), which is the sentence the
 /// handler that resolves those members answers with, so the two cannot disagree.
 ///
+/// A value outside one of the catalogs a network-performance metric SUBSCRIPTION names itself
+/// by — its metric or its statistic — is refused by the request-parameter layer that surface
+/// validates its members through: EC2's own `InvalidParameter`
+/// ([`crate::state::is_subscription_parameter_catalog`]) with that layer's own sentence for a
+/// value outside a published value set ([`crate::state::unpublished_enum_value_message`]),
+/// so a client branching on EC2's parameter-error codes matches the refusal and the handler
+/// that resolves the same member answers it identically.
+///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
@@ -372,6 +380,27 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
                 code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
                 message: crate::state::traffic_mirror_network_service_refusal_message(
                     violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_subscription_parameter_catalog(allowed) =>
+        {
+            // A value outside the catalog a network-performance metric subscription names
+            // its metric or its statistic by is refused by the request-PARAMETER layer that
+            // surface validates its members through — EC2's own `InvalidParameter`, the code
+            // that layer answers, with the sentence it words for a value outside a published
+            // value set ([`crate::state::unpublished_enum_value_message`], which the handlers
+            // that resolve those members answer with too, so a caller reads one code and one
+            // wording whichever side of dispatch refused the value). The value it names is
+            // bounded the way every echoed value of this crate is, and the member is named as
+            // the API spells it, read off the path the walk reports.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER.to_string(),
+                message: crate::state::unpublished_enum_value_message(
+                    &crate::state::parameter_member_name(&violation.path),
+                    violation.value.as_deref().unwrap_or_default(),
+                    &allowed.iter().map(String::as_str).collect::<Vec<&str>>(),
                 ),
             })
         }

@@ -853,10 +853,10 @@ async fn a_metric_or_statistic_outside_its_catalog_is_refused() {
         );
         if expected_status == 400 {
             // The refusal is built from the request: it names the value sent and the member
-            // it was sent for.
+            // it was sent for, as the API spells that member.
             let message = unescaped(&body);
             assert!(
-                message.contains(metric) && message.contains("metric"),
+                message.contains(metric) && message.contains("Metric"),
                 "case Metric={metric:?}: the refusal must name the value and the member, got \
                  {body}"
             );
@@ -875,7 +875,7 @@ async fn a_metric_or_statistic_outside_its_catalog_is_refused() {
         if expected_status == 400 {
             let message = unescaped(&body);
             assert!(
-                message.contains(statistic) && message.contains("statistic"),
+                message.contains(statistic) && message.contains("Statistic"),
                 "case Statistic={statistic:?}: the refusal must name the value and the member, \
                  got {body}"
             );

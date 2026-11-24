@@ -211,6 +211,74 @@ pub const PROVISIONED_IOPS_VOLUME_TYPES: [&str; 2] = ["io1", "io2"];
 /// (`CreateVolumeRequest$Iops`).
 pub const DEFAULT_GP3_IOPS: i32 = 3_000;
 
+/// The volume type whose IOPS are a BASELINE derived from the volume's size rather than a
+/// number the request provisions: `gp2`, the type `Iops` may not be named for at all
+/// ([`VOLUME_IOPS_RANGES`] holds no range for it) and which nevertheless has IOPS —
+/// "for gp2 volumes, this represents the baseline performance of the volume and the rate at
+/// which the volume accumulates I/O credits for bursting" (`Volume$Iops`).
+///
+/// Named here rather than spelled `gp2` beside each use, so the type whose baseline
+/// [`baseline_volume_iops`] derives and the type the size table and the default both name are
+/// one value.
+pub const BASELINE_IOPS_VOLUME_TYPE: &str = DEFAULT_VOLUME_TYPE;
+
+/// The IOPS a `gp2` volume provisions PER GiB of its size: the Amazon EBS User Guide's
+/// "General Purpose SSD volumes" baseline for gp2 — "3 IOPS/GiB".
+pub const GP2_BASELINE_IOPS_PER_GIB: i32 = 3;
+
+/// The smallest baseline a `gp2` volume has, whatever its size: the same guide's "a minimum
+/// of 100 IOPS", which is the baseline of every gp2 volume up to 33 GiB.
+pub const GP2_MINIMUM_IOPS: i32 = 100;
+
+/// The largest baseline a `gp2` volume has, whatever its size: the same guide's "a maximum of
+/// 16,000 IOPS", reached at 5,334 GiB and held for every larger gp2 volume.
+pub const GP2_MAXIMUM_IOPS: i32 = 16_000;
+
+/// The IOPS a volume of `volume_type` and `size` GiB has WITHOUT the request naming any:
+/// `None` for a type whose IOPS a request provisions (or that has none at all), and the
+/// type's derived figure for a type whose IOPS follow from its size.
+///
+/// The ONE derivation of that figure, so the volume a create stores, the volume a launch's
+/// block device mapping materialises and the volume a modify resizes all report the IOPS
+/// their type really has:
+///
+/// * `gp2` reports its baseline — [`GP2_BASELINE_IOPS_PER_GIB`] per GiB, inside
+///   [`GP2_MINIMUM_IOPS`] and [`GP2_MAXIMUM_IOPS`] — because "for gp2 volumes, this
+///   represents the baseline performance of the volume" (`Volume$Iops`), which is a fact of
+///   the size and not of the request;
+/// * `gp3` reports the documented default a request may replace, "gp3: 3,000 (default)"
+///   (`CreateVolumeRequest$Iops`);
+/// * every other type reports none: `io1` and `io2` take the IOPS the request provisions
+///   ("required for io1 and io2 volumes"), and `st1`, `sc1` and `standard` have none to
+///   report.
+///
+/// A size of `None` is a volume whose size is not known yet, which has no baseline to derive;
+/// the type's own documented default still applies.
+pub fn default_volume_iops(volume_type: &str, size: Option<i32>) -> Option<i32> {
+    if volume_type == THROUGHPUT_VOLUME_TYPE {
+        return Some(DEFAULT_GP3_IOPS);
+    }
+    baseline_volume_iops(volume_type, size)
+}
+
+/// The BASELINE IOPS a volume of `volume_type` and `size` GiB has, for the one type whose
+/// IOPS are derived from its size ([`BASELINE_IOPS_VOLUME_TYPE`]) — `None` for every other
+/// type, and for a volume whose size is not known.
+///
+/// Split out of [`default_volume_iops`] because a baseline is not a default a request could
+/// have replaced: it is recomputed whenever the volume's size or type changes, which is what
+/// a modify of a `gp2` volume reads it for.
+pub fn baseline_volume_iops(volume_type: &str, size: Option<i32>) -> Option<i32> {
+    if volume_type != BASELINE_IOPS_VOLUME_TYPE {
+        return None;
+    }
+    let size = size?;
+    Some(
+        size.saturating_mul(GP2_BASELINE_IOPS_PER_GIB)
+            .clamp(GP2_MINIMUM_IOPS, GP2_MAXIMUM_IOPS),
+    )
+}
+
 /// The one volume type `Throughput` applies to: "Supported for gp3 volumes only. Omit
 /// for all other volume types" (`CreateVolumeRequest$Throughput`).
 pub const THROUGHPUT_VOLUME_TYPE: &str = "gp3";
@@ -614,11 +682,11 @@ impl VolumeRecord {
     /// "Any Amazon Web Services Marketplace product codes from the snapshot are
     /// propagated to the volume" (`CreateVolume`) — a volume's product codes are the ones
     /// the snapshot it was restored from carries, so a volume created empty has none.
-    /// Every volume this emulator stores IS created empty: it holds no snapshots (every
-    /// EBS snapshot operation is still a stub, and `CreateVolume` refuses any `SnapshotId`
-    /// through [`unresolvable_snapshot_id`]), so no record has a source snapshot and there
-    /// is nothing to propagate. This is the one place that derivation lives: when a
-    /// snapshot store lands, look the record's own `SnapshotId` up here.
+    /// Nothing in this emulator puts a Marketplace product code on a SNAPSHOT: a snapshot is
+    /// created from a volume of the account, and this derivation is what a volume restored
+    /// from one would read ([`VolumeView::snapshot_id`]), so there is nothing to propagate
+    /// either way. This is the one place that derivation lives: when a snapshot carries
+    /// product codes, read the record's own `SnapshotId` up here.
     pub fn product_codes(&self) -> Vec<ProductCode> {
         Vec::new()
     }
@@ -1088,15 +1156,13 @@ impl ComAmazonawsEc2Amazonec2State {
             availability_zone_id: zone_id_for_zone_name(&spec.availability_zone),
             create_time: Some(system_time_to_date_time(SystemTime::now())),
             size,
-            volume_type: Some(volume_type),
-            // "gp3: 3,000 (default)" (`CreateVolumeRequest$Iops`) and the bottom of the gp3
-            // throughput range, for the one type AWS documents a default for; every other
-            // type provisions neither.
-            iops: spec.iops.or(if takes_gp3_defaults {
-                Some(DEFAULT_GP3_IOPS)
-            } else {
-                None
-            }),
+            volume_type: Some(volume_type.clone()),
+            // The IOPS the volume provisions: the ones the writer named, or — for a type
+            // whose IOPS the request does not provision — the figure that type's own
+            // documented performance gives it ([`default_volume_iops`]: the gp3 default, and
+            // the gp2 baseline derived from this volume's size). Every other type provisions
+            // only what it was given.
+            iops: spec.iops.or_else(|| default_volume_iops(&volume_type, size)),
             throughput: spec.throughput.or(if takes_gp3_defaults {
                 Some(DEFAULT_GP3_THROUGHPUT)
             } else {

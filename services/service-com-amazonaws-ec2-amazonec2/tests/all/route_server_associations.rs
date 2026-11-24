@@ -21,10 +21,11 @@
 //!    associations, and a read never creates one;
 //! 5. a route server holds at most ONE association: it writes what it learns into the route
 //!    tables of the one VPC it is associated with, so a second `AssociateRouteServer` naming
-//!    it — for another VPC or for the one it already serves — is refused with
-//!    `InvalidRouteServerId.AlreadyAssociated` and writes nothing, while a VPC already served
-//!    by one route server can be served by another; and deleting a VPC takes the association
-//!    it held with it rather than leaving one that names a VPC which no longer exists;
+//!    it for ANOTHER VPC is refused with `InvalidRouteServerId.AlreadyAssociated` and writes
+//!    nothing — while one naming the pair it ALREADY holds asks for an association that
+//!    exists and is answered with it, and a VPC already served by one route server can be
+//!    served by another; and deleting a VPC takes the association it held with it rather than
+//!    leaving one that names a VPC which no longer exists;
 //! 6. every way `AssociateRouteServer` can be refused is rendered in THIS SERVICE'S
 //!    ec2Query error envelope: the status that refusal class carries, its code, the message
 //!    AWS words for it with the request's own values in it, the envelope's media type, and
@@ -507,8 +508,10 @@ async fn a_dry_run_of_a_request_that_would_succeed_writes_nothing() {
 /// The rule: an association is the connection between one route server and one VPC, and the
 /// route server is what holds it — it writes the routes it learns into the route tables of
 /// the one VPC it is associated with — so a route server that already holds an association
-/// takes no second one, whether the request names another VPC or repeats the association it
-/// already has: that is `InvalidRouteServerId.AlreadyAssociated`, with nothing written. The
+/// takes no second one when the request names ANOTHER VPC: that is
+/// `InvalidRouteServerId.AlreadyAssociated`, with nothing written. A request that repeats the
+/// pair the route server already holds asks for an association that exists, so it is answered
+/// with that association and writes nothing new. The
 /// VPC is the association's SUBJECT rather than its holder, so a VPC already served by one
 /// route server can be served by another. An unknown VPC id is refused with the code every
 /// operation of this service refuses one with, and deleting a VPC takes the association it
@@ -548,15 +551,7 @@ async fn one_route_server_holds_at_most_one_association() {
     );
 
     // (case, the route server, the VPC, the extra parameters, the code, the message)
-    let rows: [RefusalRow<'_>; 5] = [
-        (
-            "the same pair again",
-            &first_server,
-            &associated_vpc,
-            Vec::new(),
-            "InvalidRouteServerId.AlreadyAssociated",
-            format!("The route server '{first_server}' is already associated with vpc '{associated_vpc}'"),
-        ),
+    let rows: [RefusalRow<'_>; 4] = [
         (
             "the associated route server for another VPC",
             &first_server,
@@ -627,6 +622,29 @@ async fn one_route_server_holds_at_most_one_association() {
             "case {case:?}: that association must still be with {associated_vpc}, got {first:?}"
         );
     }
+
+    // Associating the SAME pair again asks for the association that already exists, which is
+    // what the call answers with: nothing is written, and the route server still holds the one
+    // association it was given.
+    let (status, repeated) = associate(&router, &first_server, &associated_vpc, &[]).await;
+    assert_eq!(
+        status, 200,
+        "repeating the pair must be served, got {status} with body {repeated}"
+    );
+    assert_eq!(
+        (
+            element(&repeated, "routeServerId"),
+            element(&repeated, "vpcId")
+        ),
+        (Some(first_server.clone()), Some(associated_vpc.clone())),
+        "the repeated associate must answer the existing association, got {repeated}"
+    );
+    let after_repeat = reported_pairs("after repeating the pair", &router, &first_server).await;
+    assert_eq!(
+        after_repeat.len(),
+        1,
+        "repeating the pair must write no second association, got {after_repeat:?}"
+    );
 
     // A route server association is the connection between a route server and THIS VPC, so
     // deleting the VPC takes it away rather than leaving an association naming a VPC that is

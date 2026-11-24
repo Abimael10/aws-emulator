@@ -955,20 +955,22 @@ async fn an_unanswerable_request_is_refused() {
         // `Metric`, `Statistic` and `Period` target the modelled `MetricType`,
         // `StatisticType` and `PeriodType` enums, and `MaxResults` a modelled `@range`, so a
         // value outside one of them is refused by the centralized modelled-constraint walk
-        // ahead of the handler — with the boundary's own code rather than the one the handler
-        // answers for the values it checks itself. Either way the request is refused, never
-        // answered as a series with no data.
+        // ahead of the handler. The two catalogs this surface validates through EC2's
+        // request-PARAMETER layer answer that layer's own `InvalidParameter`, keyed on the
+        // value set rather than on the operation, so every operation carrying those members
+        // refuses an unpublished value identically; the rest keep the boundary's own code.
+        // Either way the request is refused, never answered as a series with no data.
         (
             "a metric outside the modelled enum".to_string(),
             with(&well_formed, "Metric", "aggregate-throughput"),
             400,
-            "ValidationError",
+            "InvalidParameter",
         ),
         (
             "a statistic outside the modelled enum".to_string(),
             with(&well_formed, "Statistic", "p99"),
             400,
-            "ValidationError",
+            "InvalidParameter",
         ),
         (
             "an aggregation period outside the modelled enum".to_string(),
@@ -1101,12 +1103,14 @@ async fn an_unanswerable_request_is_refused() {
     // nothing either. The second code is the one an EMPTY value earns: a free-form string
     // member is missing, so the handler refuses it with EC2's own `MissingParameter`, while
     // an enum member's empty value is outside its enum and so is refused by the
-    // modelled-constraint walk first, with the boundary's own code.
+    // modelled-constraint walk first — with EC2's `InvalidParameter` for the two catalogs
+    // this surface validates through the request-parameter layer, and the boundary's own code
+    // for the rest.
     for (member, empty_code) in [
         ("Source", "MissingParameter"),
         ("Destination", "MissingParameter"),
-        ("Metric", "ValidationError"),
-        ("Statistic", "ValidationError"),
+        ("Metric", "InvalidParameter"),
+        ("Statistic", "InvalidParameter"),
         ("Period", "ValidationError"),
     ] {
         cases.push((

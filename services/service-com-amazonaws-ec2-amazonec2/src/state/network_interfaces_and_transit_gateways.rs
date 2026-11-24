@@ -348,6 +348,51 @@ pub fn network_interface_spec_bytes(spec: &NetworkInterfaceSpec) -> usize {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// The Region the network interface `interface` lives in, or `None` when nothing on it
+    /// places it in one.
+    ///
+    /// An interface sits in a subnet of ONE VPC and in ONE Availability Zone of that VPC's
+    /// Region, so its Region is its ZONE's ([`region_of_zone_name`], the one reading of
+    /// "which Region is this zone in") — and, for an interface that names no zone, the Region
+    /// of the VPC it belongs to ([`Self::vpc_region`], the one reading of "which Region is
+    /// this VPC in"). The two cannot disagree: every writer of an interface takes both from
+    /// the same subnet.
+    ///
+    /// The ONE reading of "which Region is this interface in", so a report that scopes
+    /// interfaces to a Region and anything else that has to place one cannot disagree.
+    pub fn network_interface_region<'a>(
+        &'a self,
+        interface: &'a NetworkInterface,
+    ) -> Option<&'a str> {
+        if let Some(zone_name) = interface
+            .availability_zone
+            .as_deref()
+            .filter(|zone_name| !zone_name.is_empty())
+        {
+            return Some(region_of_zone_name(zone_name));
+        }
+        interface
+            .vpc_id
+            .as_deref()
+            .and_then(|vpc_id| self.vpc_region(vpc_id))
+    }
+
+    /// Whether the network interface `interface` is one a request signed for `region` can
+    /// see.
+    ///
+    /// EC2 is a REGIONAL service reached through a regional endpoint, so an interface created
+    /// in one Region is invisible to a request signed for another — the same rule
+    /// [`Self::vpc_is_in_region`] states for a VPC's own resources. An interface this store
+    /// cannot place in any Region ([`Self::network_interface_region`]) belongs to no Region's
+    /// caller.
+    pub fn network_interface_is_in_region(
+        &self,
+        interface: &NetworkInterface,
+        region: &str,
+    ) -> bool {
+        self.network_interface_region(interface) == Some(region)
+    }
+
     /// Remove the network interface `network_interface_id` and answer it as it was last
     /// reported, or `None` when the store holds no such interface.
     ///

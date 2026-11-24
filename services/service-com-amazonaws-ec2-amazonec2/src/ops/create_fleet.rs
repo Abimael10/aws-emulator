@@ -876,7 +876,7 @@ fn resolve_pools(
                 // FIRST, through the one place that rule lives, so a request that names both
                 // is told about the combination rather than about the member below.
                 if over.instance_type.is_some() && over.instance_requirements.is_some() {
-                    return Err(crate::state::instance_requirements_with_instance_type());
+                    return Err(crate::state::create_fleet_requirements_with_instance_type());
                 }
                 // The override members this launch path does not apply to the instance it
                 // launches. Refused rather than accepted and dropped: an instance that does

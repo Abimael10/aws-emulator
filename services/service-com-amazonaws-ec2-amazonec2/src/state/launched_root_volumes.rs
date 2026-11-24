@@ -32,11 +32,11 @@ use crate::ops::types::{
 };
 
 use super::{
-    ComAmazonawsEc2Amazonec2State, DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE,
+    ComAmazonawsEc2Amazonec2State, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE,
     IMAGE_ROOT_DEVICE_TYPE_EBS, ImageSpec, MAX_BLOCK_DEVICE_MAPPINGS, MAX_STORED_VOLUMES,
     THROUGHPUT_VOLUME_TYPE, TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ID_PREFIX,
-    VolumeRecord, VolumeView, region_of_zone_name, system_time_to_date_time, unmanaged_operator,
-    volume_payload_bytes, zone_id_for_zone_name,
+    VolumeRecord, VolumeView, default_volume_iops, region_of_zone_name, system_time_to_date_time,
+    unmanaged_operator, volume_payload_bytes, zone_id_for_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -392,16 +392,16 @@ impl ComAmazonawsEc2Amazonec2State {
             create_time: Some(system_time_to_date_time(now)),
             size: ebs.volume_size,
             // "The number of I/O operations per second (IOPS)" and "the throughput that the
-            // volume supports": the mapping's own, or — for the ONE type AWS documents a
-            // default for, "gp3: 3,000 (default)" and the bottom of the gp3 throughput
-            // range — that default where the mapping names none. A mapping of a type that
-            // REQUIRES provisioned IOPS and names none is left reporting none rather than
-            // given the gp3 figure, which is a different type's documented default.
-            iops: ebs.iops.or(if volume_type == THROUGHPUT_VOLUME_TYPE {
-                Some(DEFAULT_GP3_IOPS)
-            } else {
-                None
-            }),
+            // volume supports": the mapping's own, or — for a type whose IOPS the mapping
+            // does not provision — the figure that type's own documented performance gives
+            // it ([`super::default_volume_iops`]: the gp3 default, and the gp2 baseline
+            // derived from this device's size), so a volume a launch materialises reports the
+            // IOPS a volume of that type and size has. A mapping of a type that REQUIRES
+            // provisioned IOPS and names none is left reporting none rather than given
+            // another type's documented default.
+            iops: ebs
+                .iops
+                .or_else(|| default_volume_iops(&volume_type, ebs.volume_size)),
             throughput: ebs.throughput.or(if volume_type == THROUGHPUT_VOLUME_TYPE {
                 Some(DEFAULT_GP3_THROUGHPUT)
             } else {

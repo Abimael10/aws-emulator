@@ -7,7 +7,8 @@
 //! call beside the one it now holds.
 //!
 //! An instance already `stopping` or `stopped` is reported unchanged; one on its way
-//! to `terminated` is refused with `IncorrectInstanceState`. The whole batch is
+//! to `terminated` is refused with `IncorrectInstanceState`, and one whose
+//! `disableApiStop` attribute is set with `OperationNotPermitted`. The whole batch is
 //! checked before any instance is moved.
 //!
 //! ## Shape of an operation
@@ -212,6 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let instance = require_instance_record(&store, &region, instance_id)?;
             if instance.state.is_terminating() {
                 return Err(Scaffolded::incorrect_instance_state(instance_id, "stopped"));
+            }
+            // "Indicates whether stop protection is enabled for the instance"
+            // (`InstanceAttribute$DisableApiStop`, which a launch asks for through
+            // `RunInstancesRequest$DisableApiStop` and `ModifyInstanceAttribute` clears):
+            // stop protection forbids this call, so the instance stays where it is until
+            // the attribute is cleared. The whole batch is checked before anything moves,
+            // so a protected instance stops the call rather than some of the instances it
+            // names. The sentence is EC2's, ending in the full stop it ends in: the only
+            // interpolated value is the instance the REQUEST named, and the attribute it
+            // names is the one to modify — the same shape the termination-protected
+            // refusal of `crate::ops::terminate_instances` carries for its own attribute.
+            if instance.detail.disable_api_stop {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "The instance '{instance_id}' may not be stopped. Modify its \
+                     'disableApiStop' instance attribute and try again."
+                )));
             }
             if input.hibernate == Some(true) && !instance.hibernation_configured {
                 return Err(Scaffolded::unsupported_hibernation_configuration(

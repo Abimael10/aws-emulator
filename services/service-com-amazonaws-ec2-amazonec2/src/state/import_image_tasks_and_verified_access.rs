@@ -710,6 +710,35 @@ pub fn unresolvable_snapshot_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaf
     crate::scaffolded::Scaffolded::service_error(code, 400, message)
 }
 
+/// EC2's sentence for a `CreateVolume` whose `SnapshotId` names no snapshot the account
+/// holds: the fixed `Snapshot does not exist`, which names no id and ends in no full stop.
+///
+/// A create resolves the snapshot it would RESTORE, and the refusal it answers is the
+/// create's own rather than the id-bearing sentence a describe of snapshots words
+/// ([`snapshot_id_not_found_message`]): the two are different refusals, and a client matching
+/// the create's documented text would not recognise the describe's.
+pub const CREATE_VOLUME_SNAPSHOT_NOT_FOUND_MESSAGE: &str = "Snapshot does not exist";
+
+/// Refuse a `SnapshotId` a volume create cannot restore from, with that operation's own
+/// classification: a value this service cannot READ as a snapshot id is answered as malformed
+/// (the form question before the existence one, as [`unresolvable_snapshot_id_error`] orders
+/// them), and a readable id the account holds no snapshot for is
+/// [`INVALID_SNAPSHOT_ID_NOT_FOUND`] with [`CREATE_VOLUME_SNAPSHOT_NOT_FOUND_MESSAGE`].
+pub fn volume_source_snapshot_unresolvable<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    if !snapshot_id_is_well_formed(snapshot_id) {
+        return crate::scaffolded::Scaffolded::service_error(
+            INVALID_SNAPSHOT_ID_MALFORMED,
+            400,
+            snapshot_id_malformed_message(snapshot_id),
+        );
+    }
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_NOT_FOUND,
+        400,
+        CREATE_VOLUME_SNAPSHOT_NOT_FOUND_MESSAGE,
+    )
+}
+
 /// Refuse a create that would take the store past [`MAX_STORED_VOLUMES`]: HTTP 400
 /// `VolumeLimitExceeded`, EC2's own volumes-per-Region quota code.
 pub fn volume_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {

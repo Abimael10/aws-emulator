@@ -1652,6 +1652,29 @@ impl ComAmazonawsEc2Amazonec2State {
             .map(|((_, vpc_id), _)| vpc_id.as_str())
     }
 
+    /// The association of the route server `route_server_id` with the VPC `vpc_id` this store
+    /// already holds, as of `now` — `None` when no association of that PAIR still joins it.
+    ///
+    /// What an associate of a pair the store already holds answers with: associating the same
+    /// route server with the same VPC again asks for the association that already exists, so
+    /// the call reports that record rather than writing a second one or refusing. Read through
+    /// the same [`RouteServerAssociationRecord::joins_its_pair`] clause
+    /// [`Self::vpc_route_server_is_associated_with`] reads, so the question "is this pair
+    /// associated" has one answer and the view it reports is the one
+    /// `GetRouteServerAssociations` reports for it.
+    pub fn route_server_association_of_pair_at(
+        &self,
+        route_server_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> Option<RouteServerAssociation> {
+        let record = self
+            .route_server_associations
+            .get(&(route_server_id.to_string(), vpc_id.to_string()))
+            .filter(|record| record.joins_its_pair())?;
+        Some(record.view_at(route_server_id, vpc_id, now))
+    }
+
     /// Associate `route_server_id` with `vpc_id` from `now`, and answer the association as
     /// of that instant.
     ///

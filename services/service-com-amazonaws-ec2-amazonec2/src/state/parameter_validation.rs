@@ -163,6 +163,56 @@ pub fn invalid_parameter_length<E>(
     invalid_request(parameter_length_violation_message(path, value, min, max))
 }
 
+/// The member name the parameter layer's `Invalid value for …` sentence names: the member as
+/// the API spells it — upper camel — read off the path the constraint walk reports.
+///
+/// The path's LAST segment is the member (`dataQueries.1.member.metric` is a `Metric` of a
+/// query the request listed), so a member carried inside a list entry is named by its own
+/// name rather than by the list's.
+pub fn parameter_member_name(path: &str) -> String {
+    let member = path.rsplit('.').next().unwrap_or(path);
+    let mut characters = member.chars();
+    match characters.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+    }
+}
+
+/// The sentence EC2's request-parameter layer words for a value outside the VALUE SET a
+/// member publishes: the fixed `Invalid value for `, the member as the API spells it, `: `,
+/// the value the request sent, and the fixed ` Valid values are: ` with the set in brackets.
+///
+/// `allowed` is the catalog that validator publishes — the modelled enum's own value set,
+/// read off the generated catalog rather than written out here — and `value` is what the
+/// request sent, bounded the way every refusal of this crate bounds a value the caller chose
+/// the length of.
+///
+/// The ONE template for that sentence, so a refusal the boundary gives for a catalog this
+/// service states EC2's code for ([`crate::service`]) and the one the handler that resolves
+/// the same member gives cannot be worded two ways.
+pub fn unpublished_enum_value_message(member: &str, value: &str, allowed: &[&str]) -> String {
+    format!(
+        "Invalid value for {member}: {value} Valid values are: [{allowed}]",
+        value = echoed_resource_id(value),
+        allowed = allowed.join(", "),
+    )
+}
+
+/// Refuse a member whose value is outside the value set that layer holds it to: HTTP 400
+/// [`INVALID_PARAMETER`] — the code that layer answers — with the one sentence
+/// [`unpublished_enum_value_message`] words for it.
+pub fn invalid_parameter_enum_value<E>(
+    member: &str,
+    value: &str,
+    allowed: &[&str],
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        unpublished_enum_value_message(member, value, allowed),
+    )
+}
+
 /// Is `allowed` one of the value sets the VPC flow-log surface's parameters take?
 ///
 /// The flow-log operations are the ones whose members this service has recorded the parameter

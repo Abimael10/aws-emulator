@@ -10,9 +10,11 @@
 //! `FleetLaunchTemplateOverridesRequest$InstanceRequirements`). An override is one Spot pool of
 //! the fleet, and the two members are two ways of saying what that pool launches, so:
 //!
-//! * an override carrying BOTH is refused with `InvalidParameterCombinationException` and the
-//!   one sentence AWS words that refusal with, whichever fleet API it was sent to and wherever
-//!   in the overrides list it sits;
+//! * an override carrying BOTH is refused with the one sentence AWS words that refusal with,
+//!   whichever fleet API it was sent to and wherever in the overrides list it sits, under the
+//!   code that API answers it with — the Spot Fleet surface's
+//!   `InvalidParameterCombinationException` and the EC2 Fleet surface's
+//!   `InvalidParameterValue`;
 //! * an override carrying instance REQUIREMENTS alone is refused with `UnsupportedOperation`:
 //!   this service resolves no instance types from a requirement set, and a pool that quietly
 //!   launched the template's own instance type instead would not be the pool the request
@@ -26,7 +28,7 @@
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,
-    INVALID_PARAMETER_COMBINATION_EXCEPTION,
+    INVALID_PARAMETER_COMBINATION_EXCEPTION, INVALID_PARAMETER_VALUE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -204,7 +206,7 @@ const ROWS: &[Row] = &[
             instance_type: Some("t4g.small"),
             requirements: VCPU_RANGE_AND_MEMORY,
         }],
-        refusal: Some((400, INVALID_PARAMETER_COMBINATION_EXCEPTION)),
+        refusal: Some((400, INVALID_PARAMETER_VALUE)),
     },
     Row {
         case: "a Spot Fleet override naming instance requirements alone",
@@ -296,7 +298,9 @@ async fn an_override_says_what_its_pool_launches_exactly_once() {
                     "case {case:?}: expected the error code {expected_code:?}, got {code:?} \
                      in {body}"
                 );
-                if expected_code == INVALID_PARAMETER_COMBINATION_EXCEPTION {
+                if expected_code == INVALID_PARAMETER_COMBINATION_EXCEPTION
+                    || expected_code == INVALID_PARAMETER_VALUE
+                {
                     let message = error_message(&body);
                     assert_eq!(
                         message, INSTANCE_REQUIREMENTS_WITH_INSTANCE_TYPE_MESSAGE,

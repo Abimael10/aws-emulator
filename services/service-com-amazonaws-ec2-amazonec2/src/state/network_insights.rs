@@ -1605,6 +1605,26 @@ pub fn subscription_statistic(requested: &str) -> Option<&'static str> {
         .find(|statistic| *statistic == requested)
 }
 
+/// Is `allowed` one of the value sets a network-performance metric SUBSCRIPTION names itself
+/// by — the metric it measures or the statistic it reports?
+///
+/// The two catalogs those members take ([`crate::ops::types::METRIC_TYPE_VALUES`] and
+/// [`crate::ops::types::STATISTIC_TYPE_VALUES`]), which no other operation of this model
+/// carries. A value outside one of them is refused by the request-PARAMETER layer this
+/// surface validates its members through — EC2's [`INVALID_PARAMETER`] — rather than reported
+/// as a model-constraint violation, so a client branching on EC2's parameter-error codes
+/// matches it. Keyed on the TYPE's value set, the way every catalog-keyed refusal of this
+/// crate is ([`is_modelled_catalog`] records that rule), so the enable, the disable and the
+/// describe of a subscription are each refused an unpublished value identically.
+pub fn is_subscription_parameter_catalog(allowed: &[String]) -> bool {
+    [
+        crate::ops::types::METRIC_TYPE_VALUES,
+        crate::ops::types::STATISTIC_TYPE_VALUES,
+    ]
+    .iter()
+    .any(|catalog| is_modelled_catalog(allowed, catalog))
+}
+
 /// The store key — and the pagination cursor — of the subscription between `source` and
 /// `destination` for one metric and statistic.
 ///

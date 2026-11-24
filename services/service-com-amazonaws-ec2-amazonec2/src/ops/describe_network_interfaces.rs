@@ -2,9 +2,12 @@
 
 //! @op DescribeNetworkInterfaces
 //!
-//! Reports the account's network interfaces out of [`crate::state`]: the whole store by
-//! default, or the subset the request's `NetworkInterfaceIds` and `Filters` select, one
-//! `MaxResults`-sized page at a time. A reporting operation only — it writes nothing.
+//! Reports the account's network interfaces out of [`crate::state`]: every interface of the
+//! Region the request was signed for by default — EC2 being a regional service reached
+//! through a regional endpoint, an interface of another Region is invisible here and an id
+//! naming one resolves to nothing — or the subset the request's `NetworkInterfaceIds` and
+//! `Filters` select, one `MaxResults`-sized page at a time. A reporting operation only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -162,9 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it. The store
-        // is reached through the engine held on `self`.
-        let _ = ctx;
+        // EC2 is a REGIONAL service reached through a regional endpoint, so the interfaces
+        // this call reports are the ones of the Region the request was signed for: that
+        // Region is what the store is narrowed to below, and what each named id is resolved
+        // against. It is the ONE thing this operation reads off `ctx`.
+        let region = crate::state::request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the action, without
         // actually making the request, and provides an error response. If you have the
@@ -278,19 +283,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         // "The network interface IDs" (`DescribeNetworkInterfacesRequest$NetworkInterfaceIds`):
-        // an id that names no interface of the account is an error, not an absent row. Each
-        // id is looked up in the store's ordered map, so a request that names ids costs one
-        // lookup per id rather than a scan of the whole store. Repeats of one id name one
-        // interface, so the candidates are deduplicated before anything is reported.
+        // an id that names no interface of the account is an error, not an absent row — and an
+        // interface of ANOTHER Region is no interface this request can name, EC2 being reached
+        // through a regional endpoint, so such an id resolves to nothing here too. Each id is
+        // looked up in the store's ordered map, so a request that names ids costs one lookup
+        // per id rather than a scan of the whole store. Repeats of one id name one interface,
+        // so the candidates are deduplicated before anything is reported.
         let candidates: Vec<&NetworkInterface> = if requested.is_empty() {
-            store.network_interfaces.values().collect()
+            store
+                .network_interfaces
+                .values()
+                .filter(|interface| store.network_interface_is_in_region(interface, &region))
+                .collect()
         } else {
             let named = crate::state::deduplicate_ids(requested);
             let mut found: Vec<&NetworkInterface> = Vec::with_capacity(named.len());
             for id in named {
-                let Some(interface) = store.network_interfaces.get(&id) else {
-                    return Err(crate::state::invalid_network_interface_id_not_found(&id));
-                };
+                let interface = store
+                    .network_interfaces
+                    .get(&id)
+                    .filter(|interface| store.network_interface_is_in_region(interface, &region))
+                    .ok_or_else(|| crate::state::invalid_network_interface_id_not_found(&id))?;
                 found.push(interface);
             }
             found

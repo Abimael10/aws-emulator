@@ -216,9 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
             PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE,
             VOLUME_MODIFICATION_STATE_COMPLETED, VolumeModificationRecord,
-            invalid_volume_id_not_found, modify_volume_unreadable_id, require_service_state,
-            system_time_to_date_time, volume_id_is_readable, volume_iops_range,
-            volume_size_range,
+            baseline_volume_iops, invalid_volume_id_not_found, modify_volume_unreadable_id,
+            require_service_state, system_time_to_date_time, volume_id_is_readable,
+            volume_iops_range, volume_size_range,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -310,7 +310,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          A {target_type} volume does not provision IOPS"
                     )));
                 }
-                None
+                // A type that provisions no IOPS may still HAVE them: "for gp2 volumes,
+                // this represents the baseline performance of the volume"
+                // (`Volume$Iops`), which follows from the size the modification leaves the
+                // volume at rather than from any member of this request — so it is
+                // recomputed through the ONE derivation of that figure
+                // ([`crate::state::baseline_volume_iops`]) and a resized volume reports the
+                // baseline its new size has. A type with neither provisioned nor baseline
+                // IOPS reports none.
+                baseline_volume_iops(&target_type, Some(target_size))
             }
             Some((iops_min, iops_max)) => {
                 // One default serves all three types that provision IOPS: the member

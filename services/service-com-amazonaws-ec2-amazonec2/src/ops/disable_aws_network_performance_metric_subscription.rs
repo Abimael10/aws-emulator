@@ -160,19 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The metric used for the disabled subscription" is one `MetricType` member and
         // "the statistic used for the disabled subscription" one `StatisticType` member.
         // Both are modelled enums, so the request walk has already refused a value outside
-        // either catalog; resolving it again here keeps this path naming a subscription by
-        // the same catalog words the enable stored it under.
+        // either catalog — in the parameter layer's own code and clause for this surface
+        // (`crate::service`'s refusal override) — and resolving it again here keeps this path
+        // naming a subscription by the same catalog words the enable stored it under. The
+        // backstop answers that same refusal, so a caller reads one code and one wording
+        // whichever side of dispatch found the value.
         let metric = state::subscription_metric(metric).ok_or_else(|| {
-            state::invalid_parameter_value(format!(
-                "Invalid value '{metric}' for Metric. It must be one of: {catalog}",
-                catalog = METRIC_TYPE_VALUES.join(", "),
-            ))
+            state::invalid_parameter_enum_value("Metric", metric, METRIC_TYPE_VALUES)
         })?;
         let statistic = state::subscription_statistic(statistic).ok_or_else(|| {
-            state::invalid_parameter_value(format!(
-                "Invalid value '{statistic}' for Statistic. It must be one of: {catalog}",
-                catalog = STATISTIC_TYPE_VALUES.join(", "),
-            ))
+            state::invalid_parameter_enum_value("Statistic", statistic, STATISTIC_TYPE_VALUES)
         })?;
 
         // "The source Region or Availability Zone that the metric subscription is disabled

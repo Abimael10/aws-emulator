@@ -85,7 +85,11 @@ fn rows() -> Vec<Row> {
             size: 1,
             // "Default: gp2" (the Amazon EBS `CreateVolume$VolumeType`).
             volume_type: "gp2",
-            iops: None,
+            // A gp2 volume's IOPS are the baseline its SIZE gives it rather than a number a
+            // request provisions — "for gp2 volumes, this represents the baseline performance
+            // of the volume" (the Amazon EBS `Volume$Iops`), 3 IOPS per GiB floored at 100 —
+            // so the smallest gp2 volume reports that floor.
+            iops: Some(100),
             throughput: None,
             encrypted: false,
             tags: &[],
