@@ -156,6 +156,19 @@ pub(crate) async fn apigateway(
     method: &str,
     uri: &str,
 ) -> (u16, Value) {
+    apigateway_with_body(router, method, uri, None).await
+}
+
+/// [`apigateway`] carrying a request DOCUMENT: the calls of that service whose input is not
+/// entirely in the URI — `CreateRestApi`, `CreateDeployment`, `CreateStage`, `PutMethod` —
+/// take their members in a JSON body, so a suite that sets a REST API up through that
+/// service's own wire passes it here.
+pub(crate) async fn apigateway_with_body(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://apigateway.{REGION}.amazonaws.com{uri}"))
@@ -168,7 +181,10 @@ pub(crate) async fn apigateway(
                  aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
             ),
         )
-        .body(bytes::Bytes::new())
+        .body(
+            body.map(|document| bytes::Bytes::from(document.to_string()))
+                .unwrap_or_default(),
+        )
         .expect("a well-formed Amazon API Gateway request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();

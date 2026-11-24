@@ -320,14 +320,15 @@ pub(super) async fn update(
 /// owns its resources, methods, deployments and stages. The delete itself is the one both
 /// API Gateway control planes share ([`api_gateway_deleted`]).
 ///
-/// A DEPLOYMENT takes the stage its own create made with it: a declaration that states a
-/// `StageName` makes `CreateDeployment` create that stage ("the name of the Stage resource
-/// for the Deployment resource to create"), so the stage is part of what this resource put
-/// there — and API Gateway will not let a deployment go while a stage still points at it
+/// A DEPLOYMENT takes with it every stage of its api that still SERVES it
+/// ([`serving_stages`]): API Gateway will not let a deployment go while a stage points at it
 /// ("deleting a deployment will only succeed if there are no Stage resources associated with
-/// it"). The stage is taken down only while it still SERVES this deployment
-/// ([`serves_deployment`]): one that has been re-pointed at another deployment is no longer
-/// this resource's, and it is the association that this delete has to clear.
+/// it", whose refusal says the pointing stages "must be moved or deleted"), so clearing that
+/// association is part of deleting the deployment — the stage the deployment's own create
+/// made (`CreateDeployment` creates the stage a declaration's `StageName` names), a stage
+/// left in the api by an earlier replacement, and a stage anything else put there alike. A
+/// stage that has been re-pointed at another deployment serves this one no longer and is
+/// left exactly as it is: it is the ASSOCIATION this delete has to clear, not the stage.
 pub(super) async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -344,11 +345,10 @@ pub(super) async fn delete(
         Kind::Method => method_uri(resource)?,
         Kind::Deployment => {
             let api_id = required(resource, REST_API_ID)?;
-            if let Some(stage_name) = stated(resource, STAGE_NAME).map(attribute_text) {
-                let stage = stage_uri(&api_id, &stage_name);
-                if serves_deployment(ctx, region, &stage, &resource.physical_resource_id).await? {
-                    api_gateway_deleted(ctx, region, &stage).await?;
-                }
+            for stage_name in
+                serving_stages(ctx, region, &api_id, &resource.physical_resource_id).await?
+            {
+                api_gateway_deleted(ctx, region, &stage_uri(&api_id, &stage_name)).await?;
             }
             format!(
                 "{}/deployments/{}",
@@ -378,24 +378,40 @@ pub(super) async fn delete(
     api_gateway_deleted(ctx, region, &uri).await
 }
 
-/// Whether the stage at `uri` still SERVES the deployment `deployment_id`: the association
-/// API Gateway requires cleared before it will delete that deployment, read off the stage's
-/// own `deploymentId` rather than assumed from the declaration.
+/// The names of the stages of `api_id` that still SERVE the deployment `deployment_id`: the
+/// association API Gateway requires cleared before it will delete that deployment, read off
+/// that service's own listing rather than assumed from the declaration.
 ///
-/// A stage that service no longer holds serves nothing, so a stage already gone — and an api
-/// already gone with it — is not something a delete has to clear.
-async fn serves_deployment(
+/// `GetStages` narrows an api's stages by the deployment they serve — its `deploymentId`
+/// query parameter is "the stages' deployment identifiers" — so the listing answers exactly
+/// the stages that point at this deployment, each under the `stageName` that addresses it.
+///
+/// An api that service no longer holds (`NotFoundException`) has no stage left pointing
+/// anywhere, which is also what deleting the api that held them leaves behind.
+async fn serving_stages(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    uri: &str,
+    api_id: &str,
     deployment_id: &str,
-) -> Result<bool, Refusal> {
-    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", uri, None).await {
-        Ok(stage) => Ok(stage
-            .get("deploymentId")
-            .and_then(Value::as_str)
-            .is_some_and(|served| served == deployment_id)),
-        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(false),
+) -> Result<Vec<String>, Refusal> {
+    let uri = format!(
+        "{}/stages?deploymentId={}",
+        rest_api_uri(api_id),
+        percent_encoded(deployment_id)
+    );
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answered) => Ok(answered
+            .get("item")
+            .and_then(Value::as_array)
+            .map(|stages| {
+                stages
+                    .iter()
+                    .filter_map(|stage| stage.get("stageName").and_then(Value::as_str))
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(Vec::new()),
         Err(refusal) => Err(refusal),
     }
 }
