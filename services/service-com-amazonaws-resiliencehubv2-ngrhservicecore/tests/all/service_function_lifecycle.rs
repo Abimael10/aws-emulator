@@ -925,7 +925,10 @@ async fn a_resource_the_service_never_discovered_is_refused_and_associates_nothi
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body:?}"
         );
-        let expected = format!("Resource not discovered for service: {refused}");
+        let expected = format!(
+            "Resource not found: {refused}. Resource must be discovered before it can be added \
+             to a function."
+        );
         assert_eq!(
             body["message"].as_str(),
             Some(expected.as_str()),

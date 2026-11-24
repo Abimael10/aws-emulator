@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the resources a service has DISCOVERED through its input sources — each read from
+//! the component that owns it, never from a list a caller supplied — optionally narrowed to
+//! one service function's associated set, to a Region, or to a set of resource types, in
+//! pages. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A service's resources are a reading taken afresh on every call (see
+//! [`crate::state::discovered_resources`]), so this operation writes nothing and a resource
+//! appears here only while its owner still reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` must be one this service issued; anything else is a bad request,
+        // not an empty page. `None` means "start from the beginning".
+        let resume_from: Option<u64> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                // The positions this operation hands out are 1-based, so 0 is a token this
+                // service never issued.
+                Some(position) if position > 0 => Some(position),
+                _ => {
+                    return Err(
+                        ListResourcesErrorModeled::ValidationException(forged_token()).into()
+                    );
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100` with a default of 100, so the boundary
+        // refuses anything outside the range and supplies the default for a request that
+        // omits it. A value that still arrives outside the range is refused here rather
+        // than quietly served at some other page size.
+        let page_size = if (crate::state::MAX_RESULTS_MIN..=crate::state::MAX_RESULTS_MAX)
+            .contains(&input.max_results)
+        {
+            input.max_results as usize
+        } else {
+            return Err(ListResourcesErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "maxResults must be between {} and {}",
+                    crate::state::MAX_RESULTS_MIN,
+                    crate::state::MAX_RESULTS_MAX
+                ),
+                reason: Some("INVALID_FIELD_VALUE".to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "maxResults".to_string(),
+                    message: format!(
+                        "must be between {} and {}",
+                        crate::state::MAX_RESULTS_MIN,
+                        crate::state::MAX_RESULTS_MAX
+                    ),
+                }]),
+            })
+            .into());
+        };
+
+        // The service, and the function a listing is narrowed to, are resolved BEFORE
+        // anything is read elsewhere: an ARN or an id naming neither is a 404 rather than
+        // an empty list, which would claim the resource exists and holds nothing. Resolved
+        // in a scope of its own, because the discovery below asks another component over
+        // the in-process callback, which no store guard is held across.
+        let (sources, held) = {
+            let store = state.lock();
+            let Some(service) = store.services.get(&input.service_arn) else {
+                return Err(ListResourcesErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::SERVICE_RESOURCE_TYPE,
+                        &input.service_arn,
+                    ),
+                )
+                .into());
+            };
+            let held = match input.service_function_id.as_deref() {
+                None => None,
+                Some(function_id) => match service.service_functions.get(function_id) {
+                    Some(function) => Some(function.resources.clone()),
+                    None => {
+                        return Err(ListResourcesErrorModeled::ResourceNotFoundException(
+                            crate::state::service_function_not_found(function_id),
+                        )
+                        .into());
+                    }
+                },
+            };
+            (store.discovery_sources(&input.service_arn), held)
+        };
+
+        // What the service has discovered, asked of the component that owns each resource,
+        // in input-source order. A source this emulator cannot read contributes nothing, so
+        // this reports the resources really read rather than a reading nobody gave.
+        let discovery =
+            crate::state::discovered_resources::discover(ctx.callback(), &sources).await;
+
+        let matched: Vec<&crate::state::discovered_resources::DiscoveredResource> = discovery
+            .resources
+            .iter()
+            // Narrowed to one function: what that function holds are the identifiers
+            // `CreateServiceFunctionResources` associated with it, so a discovered resource
+            // it does not hold is not among its resources.
+            .filter(|resource| {
+                held.as_ref()
+                    .is_none_or(|held| held.contains(&resource.identifier))
+            })
+            // `awsRegion` — "Filter resources by AWS Region": the Region the resource's
+            // owner reports it in.
+            .filter(|resource| {
+                input
+                    .aws_region
+                    .as_deref()
+                    .is_none_or(|region| resource.aws_region == region)
+            })
+            // `resourceTypes` — "The CloudFormation resource types to include in the
+            // response": a resource whose owner reports no type is in none of them.
+            .filter(|resource| {
+                input.resource_types.as_ref().is_none_or(|wanted| {
+                    resource
+                        .resource_type
+                        .as_deref()
+                        .is_some_and(|resource_type| {
+                            wanted.iter().any(|filter| filter == resource_type)
+                        })
+                })
+            })
+            // `billable` — "Specifies whether to filter non-billable resources": this
+            // emulator's reading of a resource is whatever its owner reports, and no owner
+            // reports a resource's billability, so there is no non-billable resource here
+            // for the member to filter out and both values select the same set.
+            .collect();
+
+        // A page starts where the previous one stopped, and positions are 1-based. The set
+        // is read afresh on every call, so a token can name a position past what is
+        // discovered now — that is the last page, not a bad request.
+        let offset = (resume_from.unwrap_or(1) - 1) as usize;
+        let page: Vec<ServiceResource> = matched
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|resource| resource.to_service_resource())
+            .collect();
+        let served = offset.saturating_add(page.len());
+
+        Ok(ListResourcesOutput {
+            // The function the listing was narrowed to, echoed so a caller reading a page
+            // knows whose resources it holds; absent for a listing over the whole service.
+            service_function_id: input.service_function_id,
+            // A service that has discovered nothing answers an EMPTY list, not an absent
+            // member: "no resources" is an answer, and withholding the member would leave a
+            // caller unable to tell it from "not told".
+            service_resources: Some(page),
+            // The token names where the NEXT page resumes, and is emitted only when there
+            // is one: the last page carries no token.
+            next_token: (served < matched.len())
+                .then(|| crate::state::encode_page_token(served as u64 + 1)),
+        })
+    }
+}
+
+/// The refusal for a `nextToken` this service did not issue: the member is named and its
+/// rule stated, the way the boundary validator words a refusal.
+fn forged_token() -> ValidationException {
+    ValidationException {
+        message: "nextToken is not a token this service issued".to_string(),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: "must be a nextToken returned by a previous ListResources call".to_string(),
+        }]),
     }
 }

@@ -266,14 +266,21 @@ fn function_not_found(service_function_id: &str) -> CreateServiceFunctionResourc
 
 /// The refusal for an identifier the service has not discovered.
 ///
-/// Fixed text around ONE variable part: the identifier, taken verbatim from the request's
-/// `resources`. `reason` is `INVALID_FIELD_VALUE` — the value the request sent names a
-/// resource this service has no reading of, which is this member's value being invalid
-/// rather than missing or duplicated — and `fieldList` is left out, since nothing in the
-/// model or this service's own wording fixes the per-field sentence an entry carries.
+/// The service words this refusal `Resource not found: <identifier>. Resource must be
+/// discovered before it can be added to a function.` — fixed text around ONE variable part,
+/// the identifier, taken verbatim from the request's `resources`, so a client keying on the
+/// `Resource not found: ` lead-in tells "discovery has not reached this resource yet, await
+/// it and retry" from every other validation refusal. `reason` is `INVALID_FIELD_VALUE` —
+/// the value the request sent names a resource this service has no reading of, which is this
+/// member's value being invalid rather than missing or duplicated — and `fieldList` is left
+/// out, since nothing in the model or this service's own wording fixes the per-field sentence
+/// an entry carries.
 fn undiscovered_resource(identifier: &str) -> CreateServiceFunctionResourcesErrorModeled {
     CreateServiceFunctionResourcesErrorModeled::ValidationException(ValidationException {
-        message: format!("Resource not discovered for service: {identifier}"),
+        message: format!(
+            "Resource not found: {identifier}. Resource must be discovered before it can be \
+             added to a function."
+        ),
         reason: Some("INVALID_FIELD_VALUE".to_string()),
         field_list: None,
     })

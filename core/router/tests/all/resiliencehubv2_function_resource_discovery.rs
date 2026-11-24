@@ -43,6 +43,7 @@ const CREATE_INPUT_SOURCE: &str = "/v2/create-input-source";
 const CREATE_SERVICE_FUNCTION: &str = "/v2/create-service-function";
 const CREATE_SERVICE_FUNCTION_RESOURCES: &str = "/v2/create-service-function-resources";
 const LIST_SERVICE_FUNCTIONS: &str = "/v2/list-functions";
+const LIST_RESOURCES: &str = "/v2/list-resources";
 
 /// The emulator as it is ASSEMBLED, on one engine: Resilience Hub asks CloudFormation, which
 /// in turn needs the services owning the resources its templates declare.
@@ -196,20 +197,24 @@ async fn create_service(router: &MultiServiceRouter, name: &str) -> String {
         .to_string()
 }
 
-/// Create an input source for `service_arn` from `configuration`.
+/// Create an input source for `service_arn` from `configuration`, and answer its minted
+/// `inputSourceId` — what a `ServiceResource` names as the source that discovered it.
 async fn create_input_source(
     router: &MultiServiceRouter,
     service_arn: &str,
     configuration: Value,
-) {
-    resiliencehubv2(
+) -> String {
+    let created = resiliencehubv2(
         router,
         "POST",
         CREATE_INPUT_SOURCE,
         Some(&json!({"serviceArn": service_arn, "resourceConfiguration": configuration})),
     )
-    .await
-    .ok("the input source");
+    .await;
+    created.ok("the input source")["inputSourceId"]
+        .as_str()
+        .expect("a minted inputSourceId")
+        .to_string()
 }
 
 /// Create a service function and answer its id.
@@ -448,7 +453,10 @@ async fn only_resources_the_services_input_sources_discovered_are_associated() {
                     answered.code,
                     answered.body
                 );
-                let expected = format!("Resource not discovered for service: {identifier}");
+                let expected = format!(
+                    "Resource not found: {identifier}. Resource must be discovered before it \
+                     can be added to a function."
+                );
                 let actual = answered.message();
                 assert_eq!(
                     actual, expected,
@@ -537,7 +545,10 @@ async fn a_service_with_no_input_source_has_discovered_nothing() {
             answered.code,
             answered.body
         );
-        let expected = format!("Resource not discovered for service: {identifier}");
+        let expected = format!(
+            "Resource not found: {identifier}. Resource must be discovered before it can be \
+             added to a function."
+        );
         let actual = answered.message();
         assert_eq!(
             actual, expected,
@@ -705,5 +716,324 @@ async fn a_function_holds_at_most_the_resources_the_modelled_list_can_carry() {
         counted, 100,
         "case \"one past the ceiling\": a refused association must store nothing, got \
          {counted} resources"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ListResources: reading back what the service discovered and what a function holds
+// ---------------------------------------------------------------------------
+
+/// One `ListResources` call, with `query` as the request's query string.
+async fn list_resources(router: &MultiServiceRouter, query: &str) -> Answer {
+    resiliencehubv2(router, "GET", &format!("{LIST_RESOURCES}?{query}"), None).await
+}
+
+/// The `resourceIdentifier` of every `ServiceResource` a listing answered, in the order the
+/// listing reported them.
+fn identifiers_of(case: &str, body: &Value) -> Vec<String> {
+    body["serviceResources"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a listing must answer a serviceResources list, got {body:?}")
+        })
+        .iter()
+        .map(|resource| {
+            resource["resourceIdentifier"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a ServiceResource names its resource, got {resource:?}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// `ListResources` reports the resources the service really DISCOVERED, each projected from
+/// what its owner said, and narrows them to one function's associated set when asked.
+///
+/// The rows differ along what the rule generalises over: the scope (the whole service, one
+/// function that holds resources, one function that holds none) and the filter
+/// (`awsRegion`, `resourceTypes`, `billable`).
+#[tokio::test]
+async fn list_resources_reports_what_the_service_discovered() {
+    let router = emulator();
+    let (stack_arn, discovered) =
+        deploy(&router, "rhv2-list-resources", &discovered_template()).await;
+    let queue = discovered.get("Orders").expect("the queue's url").clone();
+    let topic = discovered.get("Events").expect("the topic's ARN").clone();
+    let audit = discovered.get("Audit").expect("the second queue's url").clone();
+
+    let service_arn = create_service(&router, "listed-resources").await;
+    let input_source_id =
+        create_input_source(&router, &service_arn, json!({"cfnStackArn": stack_arn})).await;
+    let holding = create_function(&router, &service_arn, "Checkout").await;
+    let empty = create_function(&router, &service_arn, "Ledger").await;
+    associate(&router, &service_arn, &holding, &[queue.clone(), topic.clone()])
+        .await
+        .ok("the association under test");
+
+    // Every discovered resource, whatever function holds it: the service's own set.
+    let answered = list_resources(&router, &format!("serviceArn={service_arn}")).await;
+    let body = answered.ok("the whole service").clone();
+    let mut listed = identifiers_of("the whole service", &body);
+    listed.sort();
+    let mut every = vec![queue.clone(), topic.clone(), audit.clone()];
+    every.sort();
+    assert_eq!(
+        listed, every,
+        "case \"the whole service\": expected the discovered resources {every:?}, got {listed:?}"
+    );
+    assert!(
+        body["serviceFunctionId"].is_null(),
+        "case \"the whole service\": a listing over no function names none, got {body:?}"
+    );
+
+    // Each entry is projected from what the OWNING component reported: the source that
+    // discovered it, the Region and account it lives in, and its type.
+    let projected = body["serviceResources"]
+        .as_array()
+        .expect("a serviceResources list")
+        .iter()
+        .find(|resource| resource["resourceIdentifier"] == json!(queue))
+        .unwrap_or_else(|| panic!("no entry for {queue} in {body:?}"))
+        .clone();
+    assert_eq!(
+        projected["inputSource"],
+        json!({"identifier": input_source_id, "type": "CFN_STACK"}),
+        "case \"the projection\": the entry names the source that discovered it, got {projected:?}"
+    );
+    assert_eq!(
+        projected["resource"]["identifier"],
+        json!(queue),
+        "case \"the projection\": the resource is addressed by the identifier its owner \
+         reported, got {projected:?}"
+    );
+    assert_eq!(
+        projected["resource"]["awsRegion"],
+        json!(REGION),
+        "case \"the projection\": the resource lives in its stack's Region, got {projected:?}"
+    );
+    assert_eq!(
+        projected["resource"]["resourceType"],
+        json!("AWS::SQS::Queue"),
+        "case \"the projection\": the type is the one the owner reported, got {projected:?}"
+    );
+    let account = projected["resource"]["awsAccountId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        account.len() == 12 && account.chars().all(|digit| digit.is_ascii_digit()),
+        "case \"the projection\": awsAccountId is a 12-digit account, got {account:?}"
+    );
+    // Nothing reported an Availability Zone or a topology, so those members stay absent
+    // rather than carrying a fabricated value.
+    for member in [
+        "availabilityZoneId",
+        "availabilityZoneName",
+        "containmentParentId",
+        "logicalResourceGroupId",
+    ] {
+        assert!(
+            projected["resource"][member].is_null(),
+            "case \"the projection\": {member} must stay absent, got {projected:?}"
+        );
+    }
+
+    // Narrowed to a function, and filtered: one row per input of the class the rule covers.
+    for (case, query, expected) in [
+        (
+            "a function that holds two of the discovered resources",
+            format!("serviceArn={service_arn}&serviceFunctionId={holding}"),
+            vec![queue.clone(), topic.clone()],
+        ),
+        (
+            "a function that holds none",
+            format!("serviceArn={service_arn}&serviceFunctionId={empty}"),
+            vec![],
+        ),
+        (
+            "a function's resources with billable=false",
+            format!("serviceArn={service_arn}&serviceFunctionId={holding}&billable=false"),
+            vec![queue.clone(), topic.clone()],
+        ),
+        (
+            "a function's resources with billable=true",
+            format!("serviceArn={service_arn}&serviceFunctionId={holding}&billable=true"),
+            vec![queue.clone(), topic.clone()],
+        ),
+        (
+            "the Region the resources live in",
+            format!("serviceArn={service_arn}&awsRegion={REGION}"),
+            vec![queue.clone(), topic.clone(), audit.clone()],
+        ),
+        (
+            "another Region",
+            format!("serviceArn={service_arn}&awsRegion=eu-west-2"),
+            vec![],
+        ),
+        (
+            "one resource type",
+            format!("serviceArn={service_arn}&resourceTypes=AWS%3A%3ASQS%3A%3AQueue"),
+            vec![queue.clone(), audit.clone()],
+        ),
+        (
+            "two resource types",
+            format!(
+                "serviceArn={service_arn}&resourceTypes=AWS%3A%3ASQS%3A%3AQueue\
+                 &resourceTypes=AWS%3A%3ASNS%3A%3ATopic"
+            ),
+            vec![queue.clone(), topic.clone(), audit.clone()],
+        ),
+        (
+            "a resource type nothing discovered carries",
+            format!("serviceArn={service_arn}&resourceTypes=AWS%3A%3AEC2%3A%3AInstance"),
+            vec![],
+        ),
+        (
+            "a type filter and a function, together",
+            format!(
+                "serviceArn={service_arn}&serviceFunctionId={holding}\
+                 &resourceTypes=AWS%3A%3ASQS%3A%3AQueue"
+            ),
+            vec![queue.clone()],
+        ),
+    ] {
+        let answered = list_resources(&router, &query).await;
+        let body = answered.ok(case).clone();
+        let mut listed = identifiers_of(case, &body);
+        listed.sort();
+        let mut wanted = expected.clone();
+        wanted.sort();
+        assert_eq!(
+            listed, wanted,
+            "case {case:?}: expected {wanted:?}, got {listed:?}"
+        );
+        if query.contains("serviceFunctionId=") {
+            let named = body["serviceFunctionId"].as_str().unwrap_or_default();
+            assert!(
+                query.contains(&format!("serviceFunctionId={named}")),
+                "case {case:?}: the answer must name the function the request did, got {body:?}"
+            );
+        }
+    }
+}
+
+/// A listing pages: `maxResults` is the page size, and following every `nextToken` walks the
+/// whole set once, with no entry repeated and none missed. The last page carries no token.
+#[tokio::test]
+async fn list_resources_pages_the_whole_set_once() {
+    let router = emulator();
+    let (stack_arn, discovered) = deploy(&router, "rhv2-list-pages", &discovered_template()).await;
+    let service_arn = create_service(&router, "paged-resources").await;
+    create_input_source(&router, &service_arn, json!({"cfnStackArn": stack_arn})).await;
+
+    let mut every: Vec<String> = discovered.values().cloned().collect();
+    every.sort();
+
+    for page_size in [1, 2, 3, 100] {
+        let case = format!("maxResults={page_size}");
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut query = format!("serviceArn={service_arn}&maxResults={page_size}");
+            if let Some(next) = token.as_deref() {
+                query.push_str(&format!("&nextToken={next}"));
+            }
+            let answered = list_resources(&router, &query).await;
+            let body = answered.ok(&case).clone();
+            let page = identifiers_of(&case, &body);
+            assert!(
+                page.len() <= page_size,
+                "case {case:?}: a page holds at most {page_size} entries, got {page:?}"
+            );
+            walked.extend(page);
+            pages += 1;
+            assert!(
+                pages <= every.len() + 1,
+                "case {case:?}: paging must terminate, walked {walked:?}"
+            );
+            match body["nextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, every,
+            "case {case:?}: paging must walk every discovered resource exactly once, got \
+             {walked:?}"
+        );
+    }
+}
+
+/// A listing is refused where it names no service, no function of that service, or a
+/// `nextToken` this service never issued — and never answered as an empty page, which would
+/// claim the resource exists and holds nothing.
+#[tokio::test]
+async fn a_listing_naming_nothing_stored_is_refused() {
+    let router = emulator();
+    let service_arn = create_service(&router, "refused-listing").await;
+    let function_id = create_function(&router, &service_arn, "Checkout").await;
+    let missing_service = format!("arn:aws:resiliencehub:{REGION}:000000000000:service/absent");
+
+    for (case, query, status, code, expected) in [
+        (
+            "a serviceArn naming no service",
+            format!("serviceArn={missing_service}"),
+            404,
+            "ResourceNotFoundException",
+            "Service not found: service/absent".to_string(),
+        ),
+        (
+            "a serviceFunctionId naming no function of that service",
+            format!("serviceArn={service_arn}&serviceFunctionId=absent-function"),
+            404,
+            "ResourceNotFoundException",
+            "Service function not found: absent-function".to_string(),
+        ),
+        (
+            "a nextToken this service never issued",
+            format!("serviceArn={service_arn}&nextToken=not-a-token"),
+            400,
+            "ValidationException",
+            "nextToken is not a token this service issued".to_string(),
+        ),
+    ] {
+        let answered = list_resources(&router, &query).await;
+        assert_eq!(
+            (answered.status, answered.code.as_str()),
+            (status, code),
+            "case {case:?}: expected the modelled {status} {code}, got {} {:?} {:?}",
+            answered.status,
+            answered.code,
+            answered.body
+        );
+        let actual = answered.message();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    // The function really exists, so a listing over it is served and empty.
+    let answered = list_resources(
+        &router,
+        &format!("serviceArn={service_arn}&serviceFunctionId={function_id}"),
+    )
+    .await;
+    let body = answered.ok("a function holding nothing").clone();
+    assert_eq!(
+        body["serviceResources"],
+        json!([]),
+        "case \"a function holding nothing\": expected an empty list, got {body:?}"
+    );
+    assert_eq!(
+        body["serviceFunctionId"],
+        json!(function_id),
+        "case \"a function holding nothing\": the answer names the function asked for, got \
+         {body:?}"
     );
 }

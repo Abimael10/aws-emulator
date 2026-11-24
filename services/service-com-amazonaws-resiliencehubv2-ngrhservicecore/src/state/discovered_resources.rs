@@ -30,7 +30,7 @@
 
 use ::smithy_server_runtime::EmbeddedEmulator;
 
-use crate::ops::types::ResourceConfiguration;
+use crate::ops::types::{InputSource, Resource, ResourceConfiguration, ServiceResource};
 
 use super::{ComAmazonawsResiliencehubv2NgrhservicecoreState, INPUT_SOURCE_TYPE_CFN_STACK};
 
@@ -85,6 +85,41 @@ pub struct DiscoveredResource {
     pub input_source_type: &'static str,
     /// The Region the resource lives in: the one its owning stack lives in.
     pub aws_region: String,
+    /// The account that owns the resource: the one its owning stack lives in. `None` where
+    /// the owner reports none, so a reader withholds the member rather than naming an
+    /// account nothing said.
+    pub aws_account_id: Option<String>,
+}
+
+impl DiscoveredResource {
+    /// This reading as the modelled `ServiceResource`, the shape every reader of a service's
+    /// resources answers with.
+    ///
+    /// Every member comes from what the OWNING component reported, so a listing cannot claim
+    /// more about a resource than its owner said: the members nothing reports —
+    /// the Availability Zone, the containment parent, the logical resource group — stay
+    /// absent rather than carrying a fabricated value.
+    pub fn to_service_resource(&self) -> ServiceResource {
+        ServiceResource {
+            resource_identifier: self.identifier.clone(),
+            // "The input source that discovered the resource": the source's own
+            // `inputSourceId` and the type that configuration names.
+            input_source: Some(InputSource {
+                identifier: self.input_source_id.clone(),
+                r#type: self.input_source_type.to_string(),
+            }),
+            resource: Resource {
+                identifier: self.identifier.clone(),
+                aws_region: Some(self.aws_region.clone()),
+                aws_account_id: self.aws_account_id.clone(),
+                resource_type: self.resource_type.clone(),
+                availability_zone_id: None,
+                availability_zone_name: None,
+                containment_parent_id: None,
+                logical_resource_group_id: None,
+            },
+        }
+    }
 }
 
 /// What a service has discovered, and whether every one of its input sources was answered
@@ -158,15 +193,22 @@ pub async fn discover(callback: &EmbeddedEmulator, sources: &[DiscoverySource]) 
                 input_source_id,
                 stack_arn,
             } => match stack_resources(callback, stack_arn).await {
-                Some(found) => resources.extend(found.into_iter().map(
-                    |(identifier, resource_type, aws_region)| DiscoveredResource {
-                        identifier,
-                        resource_type,
-                        input_source_id: input_source_id.clone(),
-                        input_source_type: INPUT_SOURCE_TYPE_CFN_STACK,
-                        aws_region,
-                    },
-                )),
+                Some(found) => {
+                    // A stack's resources are owned by the account the stack's own ARN
+                    // names — the only account this emulator reads a stack of.
+                    let aws_account_id = ::service_common::arn::parse(stack_arn)
+                        .map(|arn| arn.account.to_string());
+                    resources.extend(found.into_iter().map(
+                        |(identifier, resource_type, aws_region)| DiscoveredResource {
+                            identifier,
+                            resource_type,
+                            input_source_id: input_source_id.clone(),
+                            input_source_type: INPUT_SOURCE_TYPE_CFN_STACK,
+                            aws_region,
+                            aws_account_id: aws_account_id.clone(),
+                        },
+                    ));
+                }
                 None => every_source_answered = false,
             },
             DiscoverySource::Unreadable => every_source_answered = false,
@@ -286,6 +328,7 @@ mod tests {
             input_source_id: "source".to_string(),
             input_source_type: INPUT_SOURCE_TYPE_CFN_STACK,
             aws_region: "us-east-1".to_string(),
+            aws_account_id: Some(::engine::emulator_account_id().to_string()),
         }
     }
 
