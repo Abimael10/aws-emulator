@@ -1125,6 +1125,26 @@ pub enum TokenRejection {
     PasswordResetRequired,
 }
 
+/// The most groups ONE user of a pool belongs to: Amazon Cognito's published
+/// account limit "Groups per user" (Amazon Cognito Developer Guide, "Quotas in
+/// Amazon Cognito"), which the refusal of a membership past it states in full
+/// ([`groups_per_user_limit_message`]).
+///
+/// It bounds a user's own memberships rather than the pool's groups
+/// ([`crate::state::MAX_GROUPS_PER_POOL`]), so a pool may hold more groups than
+/// any one of its users can belong to.
+pub const MAX_GROUPS_PER_USER: usize = 100;
+
+/// The message the refusal of a membership past [`MAX_GROUPS_PER_USER`] carries.
+///
+/// Amazon Cognito names the API whose limit was reached and the limit itself:
+/// the fixed text is `The limit for addUserToGroup is: ` and the trailing `.`,
+/// and the one variable part is the quota, so the sentence and the ceiling the
+/// handler enforces can never drift apart.
+pub fn groups_per_user_limit_message() -> String {
+    format!("The limit for addUserToGroup is: {MAX_GROUPS_PER_USER}.")
+}
+
 /// How ONE group's `Precedence` ranks against another's, lowest first.
 ///
 /// `CreateGroup`'s `Precedence` (this service's model): "Groups with lower `Precedence`

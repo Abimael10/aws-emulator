@@ -27,9 +27,12 @@
 //!   `user.` prefix and the bound it missed as the schema declares it, each line
 //!   ending in a newline.
 //!
-//! A value that is not of its data type's form is reported by both stages in the
-//! constraint envelope naming the pattern it failed, the registration stage
-//! stating its own prefix ahead of it — except for an attribute whose values are
+//! A value that is not of its data type's form is reported by each stage in that
+//! stage's own words: the registration stage states the constraint envelope
+//! naming the pattern the value failed, behind its own prefix, while the update
+//! stage reads the value as the number the attribute holds and reports, in its
+//! per-attribute report, that no number could be parsed out of it — except for an
+//! attribute whose values are
 //! points in time (`updated_at`), which both stages report in the sentence that
 //! names the attribute and the unix timestamp its values are. A refused write
 //! stores nothing, so the
@@ -155,7 +158,7 @@ impl Row {
     fn update_refusal(&self) -> Option<String> {
         self.missed.as_ref().map(|missed| match missed {
             Missed::Bound { sentence, .. } => report_line(self.attribute, sentence),
-            Missed::NumberForm => constraint_envelope(self.attribute),
+            Missed::NumberForm => report_line(self.attribute, UNPARSEABLE_NUMBER),
             Missed::TimestampForm => timestamp_form(self.attribute),
         })
     }
@@ -208,6 +211,12 @@ fn registration_bound(attribute: &str, validation: &str) -> String {
 fn report_line(attribute: &str, sentence: &str) -> String {
     format!("user.{attribute}: {sentence}\n")
 }
+
+/// The sentence an UPDATE's report states for a `Number` attribute whose value no
+/// number can be read out of: the update stage reads the value as the number the
+/// attribute holds, so it reports that nothing could be parsed rather than the
+/// pattern the value missed.
+const UNPARSEABLE_NUMBER: &str = "Unable to parse the number";
 
 /// The constraint envelope a value that is of the wrong FORM is refused with: the
 /// position of the value and the pattern it failed to satisfy.

@@ -415,7 +415,7 @@ fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> UpdateUser
 fn refused(refusal: crate::state::AttributeUpdateRefusal) -> UpdateUserAttributesError {
     match refusal {
         crate::state::AttributeUpdateRefusal::Invalid(message) => invalid_parameter(message),
-        crate::state::AttributeUpdateRefusal::AliasTaken(name) => alias_exists(&name),
+        crate::state::AttributeUpdateRefusal::AliasTaken(_) => alias_exists(),
     }
 }
 
@@ -482,12 +482,13 @@ fn not_authorized(message: &str) -> UpdateUserAttributesError {
 }
 
 /// This operation's `AliasExistsException` for a value another user of the pool
-/// already holds as its alias. The message names the attribute the request
-/// submitted and no stored value, so it reports which submitted value collided
-/// without disclosing whose.
-fn alias_exists(name: &str) -> UpdateUserAttributesError {
+/// already holds as its alias, carrying the fixed sentence Amazon Cognito states
+/// such a refusal in ([`crate::state::ALIAS_EXISTS_MESSAGE`]) — which names
+/// neither the attribute the request submitted nor the account that holds the
+/// alias.
+fn alias_exists() -> UpdateUserAttributesError {
     UpdateUserAttributesErrorModeled::AliasExistsException(AliasExistsException {
-        message: Some(format!("An account with the given {name} already exists.")),
+        message: Some(crate::state::ALIAS_EXISTS_MESSAGE.to_string()),
     })
     .into()
 }

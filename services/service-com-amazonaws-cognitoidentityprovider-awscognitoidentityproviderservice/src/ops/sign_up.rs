@@ -557,6 +557,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         ) {
             return Err(invalid_parameter(defect));
         }
+        // A pool that ALIASES `preferred_username` signs its users in by that
+        // name, and this operation registers an account that is not confirmed
+        // yet, so the name it submits is one no unconfirmed account may hold
+        // ([`crate::state::SIGN_UP_PREFERRED_USERNAME_ALIAS_MESSAGE`]): the
+        // registration is refused and no user is created. An administrative
+        // create is not this stage, and a pool that does not alias the attribute
+        // stores the value like any other.
+        if pool.is_alias_attribute(crate::state::PREFERRED_USERNAME_ATTRIBUTE)
+            && requested_attributes.iter().any(|attribute| {
+                attribute.name == crate::state::PREFERRED_USERNAME_ATTRIBUTE
+                    && attribute
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+            })
+        {
+            return Err(invalid_parameter(
+                crate::state::SIGN_UP_PREFERRED_USERNAME_ALIAS_MESSAGE.to_string(),
+            ));
+        }
         // A submitted value also has to satisfy the constraints the pool's schema
         // declares for its attribute, the same rule every other writer of a user
         // attribute applies ([`crate::state::schema_constraint_refusal`]) — this

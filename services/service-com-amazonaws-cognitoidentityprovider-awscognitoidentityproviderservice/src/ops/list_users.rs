@@ -227,19 +227,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set a value for the attribute you request. Attributes that you can't
         // filter on, including custom attributes, must have a value set in every
         // user profile before an `AttributesToGet` parameter returns results"
-        // (`ListUsers.AttributesToGet`) — so an attribute no server-side search
-        // covers ([`SEARCHABLE_ATTRIBUTES`]) is served only while every user the
-        // search SELECTS holds a value for it. The whole selection is read, not
-        // the page about to be served, so one search answers the same whatever
-        // page of it a request asks for.
+        // (`ListUsers.AttributesToGet`) — so a projection is served only while
+        // EVERY user the search selects holds a value for every attribute it
+        // names, whether or not a server-side search covers that attribute. The
+        // whole selection is read, not the page about to be served, so one search
+        // answers the same whatever page of it a request asks for.
+        //
+        // Judged over the DISTINCT names asked for, and for each only once the
+        // POOL declares it ([`crate::state::UserPool::declares_attribute`]): an
+        // attribute a pool does not declare holds a value for no user of it, so
+        // such a name is one the results cannot serve whatever the selected users
+        // hold, and it is answered without reading them. What remains is bounded
+        // by the pool's own schema and its users rather than by the length of the
+        // list the caller sent.
         if let Some(names) = input.attributes_to_get.as_deref() {
-            if names.iter().any(|name| {
-                !searchable(name)
-                    && keys
+            let asked_for: ::std::collections::BTreeSet<&str> =
+                names.iter().map(String::as_str).collect();
+            let unservable = asked_for.iter().any(|name| {
+                !pool.declares_attribute(name)
+                    || keys
                         .iter()
                         .filter_map(|key| pool.users.get(key))
-                        .any(|user| !user.attributes.contains_key(name))
-            }) {
+                        .any(|user| !user.attributes.contains_key(*name))
+            });
+            if unservable {
                 return Err(constraints_not_satisfied());
             }
         }
@@ -284,8 +295,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// attributes for each user" (`ListUsers.AttributesToGet`). Every other member
 /// is the stored user's, rendered exactly as this pool's own reader of that one
 /// user renders it. The caller has already refused a request whose
-/// `AttributesToGet` names an attribute the results cannot serve, so a name
-/// missing from one of these users is a searchable one that user leaves unset.
+/// `AttributesToGet` names an attribute the results cannot serve, so every name
+/// it carries is one each of these users holds a value for.
 fn rendered(user: &crate::state::User, attributes_to_get: Option<&[String]>) -> UserType {
     let mut rendered = user.to_user_type();
     if let Some(names) = attributes_to_get {
@@ -345,15 +356,6 @@ const SEARCHABLE_ATTRIBUTES: [(&str, Searched); 10] = [
     ("status", Searched::Enabled),
     ("sub", Searched::Attribute("sub")),
 ];
-
-/// Whether `name` is one of the attributes [`SEARCHABLE_ATTRIBUTES`] covers,
-/// which is also the attribute an `AttributesToGet` may ask for without every
-/// user in the results holding a value for it.
-fn searchable(name: &str) -> bool {
-    SEARCHABLE_ATTRIBUTES
-        .iter()
-        .any(|(candidate, _)| *candidate == name)
-}
 
 impl Searched {
     /// This user's value of the searched attribute, or `None` when the user holds

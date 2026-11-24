@@ -305,10 +305,14 @@ pub fn plan_attribute_update(
         // it ([`verified_flag`]), so the holder's flag is what the write takes
         // away: the update is accepted and the previous holder's copy is
         // demoted out of verified status. An alias attribute that carries no
-        // such flag cannot be demoted, so there the value stays the holder's
-        // and this update is refused. Only an alias attribute of the pool is
-        // looked up, and each is looked up once, so the pool's users are walked
-        // at most once per alias attribute the pool configures.
+        // such flag cannot be moved that way, so a value the pool ALREADY
+        // RESOLVES to another user of it — that user's username, a sign-in or
+        // alias value it answers to, or its own id
+        // ([`UserPool::names_another_user`]) — stays that user's and this update
+        // is refused: the two would otherwise both answer to the one name. Only
+        // an alias attribute of the pool is looked up, and each is looked up
+        // once, so the pool's users are walked at most once per alias attribute
+        // the pool configures.
         let becomes_active_alias = !deferred
             && verified_flag
                 .is_none_or(|flag| flag_after_update(&submitted, user, flag, &stale_verified_flag));
@@ -319,7 +323,7 @@ pub fn plan_attribute_update(
                         .into_iter()
                         .map(|key| (key, flag)),
                 ),
-                None if pool.alias_taken(&name, &value, &user.username) => {
+                None if pool.names_another_user(&value, &user.username) => {
                     return Err(AttributeUpdateRefusal::AliasTaken(name));
                 }
                 None => {}
@@ -460,6 +464,16 @@ pub const INVALID_PHONE_NUMBER_MESSAGE: &str = "Invalid phone number format.";
 /// value the request submitted — the counterpart of
 /// [`INVALID_PHONE_NUMBER_MESSAGE`] for the other addressing attribute.
 pub const INVALID_EMAIL_MESSAGE: &str = "Invalid email address format.";
+
+/// The message `AliasExistsException` carries for a write refused because the
+/// value it would store already names another account of the pool as that
+/// account's alias ([`AttributeUpdateRefusal::AliasTaken`]).
+///
+/// Amazon Cognito states that an account already answers to the alias, in one
+/// fixed sentence: it names neither the attribute the request submitted, the
+/// value it carried nor the account that holds it, so the refusal discloses
+/// nothing about the pool's other users.
+pub const ALIAS_EXISTS_MESSAGE: &str = "User account already exists for the alias.";
 
 /// The ATTRIBUTE whose value is a phone number, and so has a form of its own to
 /// satisfy ([`attribute_value_defect`]).
@@ -637,11 +651,15 @@ impl SchemaValidationStage {
     /// How this stage states that the value submitted for the attribute `name` is
     /// not of the FORM its data type's values take.
     ///
-    /// The form is a constraint on the value itself rather than a bound the pool's
-    /// operator declared, so both stages report it in the envelope this service
-    /// states a member's pattern constraint in, naming the value's position by the
-    /// attribute's schema path; the registration stage states its own prefix ahead
-    /// of it, as it does for every finding of its schema validation.
+    /// The REGISTRATION stage judges the submitted value against the pool's schema
+    /// before an account exists, and reports a value of no numeric form in the
+    /// envelope this service states a member's pattern constraint in, naming the
+    /// value's position by the attribute's schema path, behind that stage's own
+    /// prefix. The UPDATE stage reads the value as the number the attribute holds,
+    /// so a value it cannot read a number out of is reported as the per-attribute
+    /// finding it is ([`SchemaValidationFinding::UnparseableNumber`]): the attribute
+    /// under the `user.` prefix and that nothing could be parsed, in that stage's
+    /// own report.
     ///
     /// An attribute whose values are POINTS IN TIME is reported in its own
     /// sentence instead ([`timestamp_form_message`]), which both stages state the
@@ -651,14 +669,16 @@ impl SchemaValidationStage {
         if let Some(message) = timestamp_form_message(name) {
             return message;
         }
-        let envelope = format!(
-            "1 validation error detected: Value at '{}' failed to satisfy constraint: Member must \
-             satisfy regular expression pattern: {NUMBER_VALUE_PATTERN}",
-            schema_path(name)
-        );
         match self {
-            Self::Registration => format!("{SCHEMA_VALIDATION_PREFIX}{envelope}"),
-            Self::Update => envelope,
+            Self::Registration => format!(
+                "{SCHEMA_VALIDATION_PREFIX}1 validation error detected: Value at '{}' failed to \
+                 satisfy constraint: Member must satisfy regular expression pattern: \
+                 {NUMBER_VALUE_PATTERN}",
+                schema_path(name)
+            ),
+            Self::Update => {
+                schema_validation_report([(name, SchemaValidationFinding::UnparseableNumber)])
+            }
         }
     }
 

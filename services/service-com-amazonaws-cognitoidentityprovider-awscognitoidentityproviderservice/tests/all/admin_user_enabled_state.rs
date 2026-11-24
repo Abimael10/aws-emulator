@@ -296,28 +296,61 @@ async fn every_username_form_is_deactivated_and_reactivated() {
 }
 
 #[tokio::test]
-async fn a_user_is_resolved_by_username_or_by_sub() {
+async fn a_user_is_resolved_by_username_and_not_by_its_sub() {
     let router = router();
     let user_pool_id = pool(&router, "resolve-pool").await;
     let sub = user(&router, &user_pool_id, "carol").await;
 
-    // `Username` "must be the sub of a local user or the username" — both name
-    // the same stored user, so a call under either identifier lands on it.
-    for (label, identifier, operation, expected) in [
-        ("deactivated by username", "carol".to_string(), "AdminDisableUser", false),
-        ("reactivated by sub", sub.clone(), "AdminEnableUser", true),
-        ("deactivated by sub", sub, "AdminDisableUser", false),
-        ("reactivated by username", "carol".to_string(), "AdminEnableUser", true),
+    // `Username` "is typically your user's username, but it can be any of their
+    // alias attributes" — a call under the stored username lands on the user,
+    // while the `sub` every read of it reports is its id rather than a name of
+    // the pool, so a call under that reaches no user and changes nothing.
+    for (label, identifier, operation, expected, enabled_after) in [
+        (
+            "deactivated by username",
+            "carol".to_string(),
+            "AdminDisableUser",
+            200,
+            false,
+        ),
+        (
+            "reactivated by the user's own sub",
+            sub.clone(),
+            "AdminEnableUser",
+            400,
+            false,
+        ),
+        (
+            "reactivated by username",
+            "carol".to_string(),
+            "AdminEnableUser",
+            200,
+            true,
+        ),
+        (
+            "deactivated by the user's own sub",
+            sub,
+            "AdminDisableUser",
+            400,
+            true,
+        ),
     ] {
         let (status, payload) = toggle(&router, operation, &user_pool_id, &identifier).await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: the user must resolve, got {status} with {payload}"
+            status, expected,
+            "case {label:?}: expected HTTP {expected}, got {status} with {payload}"
         );
+        if status != 200 {
+            assert_eq!(
+                error_code(&payload),
+                "UserNotFoundException",
+                "case {label:?}: expected UserNotFoundException, got {payload}"
+            );
+        }
         let actual = enabled(&router, &user_pool_id, "carol").await;
         assert_eq!(
-            actual, expected,
-            "case {label:?}: expected Enabled {expected}, got {actual:?}"
+            actual, enabled_after,
+            "case {label:?}: expected Enabled {enabled_after}, got {actual:?}"
         );
     }
 }

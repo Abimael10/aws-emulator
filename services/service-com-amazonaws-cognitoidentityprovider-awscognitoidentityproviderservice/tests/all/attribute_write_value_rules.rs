@@ -872,11 +872,24 @@ async fn a_name_of_an_aliased_attributes_format_is_no_name_a_user_may_take() {
                      {payload}"
                 );
             }
-            None => assert_eq!(
-                status, 200,
-                "case {case:?}: the pool admits the name, so the creation is served, got \
-                 {status} with {payload}"
-            ),
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the pool admits the name, so the creation is served, got \
+                     {status} with {payload}"
+                );
+                // That name is the created user's now, and an alias value names ONE
+                // user of the pool, so the user is removed before the same name is
+                // written as ANOTHER user's `preferred_username` below: what this row
+                // asserts there is the namespace the value lies in, not the account
+                // that would already answer to it.
+                ok(
+                    &router,
+                    "AdminDeleteUser",
+                    &json!({ "UserPoolId": user_pool_id.clone(), "Username": row.submitted }),
+                )
+                .await;
+            }
         }
 
         // A `preferred_username` is a NAME its holder answers to as well, so a

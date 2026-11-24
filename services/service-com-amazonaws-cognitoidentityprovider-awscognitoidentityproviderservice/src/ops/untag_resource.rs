@@ -167,6 +167,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_a_user_pool_arn(&input.resource_arn));
         };
 
+        // A key in the namespace Amazon Web Services keeps for its own tags is not a
+        // caller's to remove either ([`crate::state::is_reserved_tag_key`]): the
+        // request is refused and the pool's tags are left exactly as they were —
+        // decided before anything is removed, so a call naming one such key removes
+        // none of the keys it names.
+        if input
+            .tag_keys
+            .iter()
+            .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(invalid_parameter(
+                crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string(),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let Some(stored) = guard.pool_tags_mut(region, user_pool_id, now) else {
@@ -192,12 +207,17 @@ fn user_pool_not_found(user_pool_id: &str) -> UntagResourceError {
 }
 
 /// The refusal for a `ResourceArn` that is not the ARN of a user pool of this service,
-/// so it names no resource to remove tags from.
+/// so it names no resource to remove tags from
+/// ([`crate::state::invalid_user_pool_arn_message`]).
 fn not_a_user_pool_arn(resource_arn: &str) -> UntagResourceError {
+    invalid_parameter(crate::state::invalid_user_pool_arn_message(resource_arn))
+}
+
+/// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong
+/// with the request.
+fn invalid_parameter(message: String) -> UntagResourceError {
     UntagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(format!(
-            "ResourceArn '{resource_arn}' is not the ARN of an Amazon Cognito user pool."
-        )),
+        message: Some(message),
         reason_code: None,
     })
     .into()

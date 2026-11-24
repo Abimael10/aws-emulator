@@ -200,6 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = guard
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // The user the request NAMES: "the value of this parameter is typically your
+        // user's username, but it can be any of their alias attributes. If username
+        // isn't an alias attribute in your user pool, this value must be the sub of a
+        // local user or the username of a user from a third-party IdP"
+        // (`AdminGetUser.Username`) — so what this read resolves is a name of the
+        // pool's own username namespace
+        // ([`crate::state::UserPool::user_storage_key`]): the stored username, an
+        // active alias value of the pool, or the username a link to a third-party
+        // identity gives the user. A user's `sub` is the id this service holds as an
+        // ATTRIBUTE of it rather than such a name, so the value this very read
+        // reports as `sub` names no user of a pool whose users have usernames of
+        // their own, and asking under it is asking for a user that does not exist.
         let user = pool
             .user(&input.username)
             .ok_or_else(user_not_found)?;

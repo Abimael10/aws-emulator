@@ -13,13 +13,15 @@
 //!   `VerifiedAttributeType`) as `false`, and both user reads project that flag
 //!   beside the value until something confirms it.
 //! * A `Username` an administrative create submits is a DUPLICATE whenever the pool
-//!   already resolves it to one of its users — by username, by that user's `sub`, or
+//!   already resolves it to one of its users — by username, by a federated username
+//!   linked to it, or
 //!   by a value of one of the pool's sign-in or alias attributes that currently names
 //!   it — because "the username can't be a duplicate of another username in the same
 //!   user pool" (`AdminCreateUser.Username`) and a `Username` "can be any of their
-//!   alias attributes ... [or] the sub of a local user" (`AdminGetUser.Username`). A
+//!   alias attributes" (`AdminGetUser.Username`). A
 //!   sign-in value the create SUBMITS is the same duplicate, since an alias names one
-//!   user of the pool and this operation models no `AliasExistsException`.
+//!   user of the pool and this operation models no `AliasExistsException`. A user's
+//!   `sub` is no such name: it is the id the pool holds as an attribute of that user.
 //! * One pool compares usernames the way its `UsernameConfiguration` says, and a read
 //!   reports the STORED spelling whatever spelling resolved it; an alias value names
 //!   the user that holds it NOW, and the user it was migrated away from stays
@@ -561,12 +563,15 @@ async fn admin_create_user_refuses_every_name_the_pool_already_resolves() {
             Some("UsernameExistsException"),
         ),
         (
+            // The `sub` is the id the pool holds as an attribute of the user
+            // rather than a value in its username namespace, so it names no user
+            // and the create under it is a create of a fresh account.
             "the sub of the stored user",
             alias_pool.clone(),
             holder_sub.clone(),
             vec![],
-            400,
-            Some("UsernameExistsException"),
+            200,
+            None,
         ),
         (
             // A value of an aliased attribute's FORM is no username of such a pool
@@ -794,18 +799,8 @@ async fn a_migrated_alias_re_points_the_lookup_and_leaves_both_users_readable() 
             "alias-user-one",
         ),
         (
-            "the sub of the user the alias was migrated away from",
-            subs["alias-user-one"].clone(),
-            "alias-user-one",
-        ),
-        (
             "the username that claimed the alias",
             "alias-user-two".to_string(),
-            "alias-user-two",
-        ),
-        (
-            "the sub of the user that claimed the alias",
-            subs["alias-user-two"].clone(),
             "alias-user-two",
         ),
     ];

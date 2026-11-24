@@ -314,6 +314,21 @@ fn sign_in_name_shape_message(username_attributes: &[String]) -> Option<String> 
 /// ([`alias_format_wording`]).
 pub const PREFERRED_USERNAME_ATTRIBUTE: &str = "preferred_username";
 
+/// The sentence a SELF-SERVICE registration that submits a
+/// `preferred_username` to a pool that ALIASES that attribute
+/// ([`PREFERRED_USERNAME_ATTRIBUTE`]) is refused with.
+///
+/// An alias value names ONE user of the pool, and a registration creates an
+/// account that is not confirmed yet — "their user account becomes active" only
+/// once the registrant answers the code (`ConfirmSignUp` in this service's
+/// model) — so an unconfirmed registrant cannot be handed a name the pool
+/// aliases: it would hold the alias against every later owner of it. Amazon
+/// Cognito states that as the stage it refuses at and the pool configuration
+/// that refused it, in fixed text that echoes nothing the caller sent.
+pub const SIGN_UP_PREFERRED_USERNAME_ALIAS_MESSAGE: &str =
+    "Preferred username cannot be provided for unconfirmed account, since user pool is \
+     configured for preferred username alias.";
+
 /// The sentence a request whose submitted `Username` has the FORM of a value of
 /// one of the pool's alias attributes is refused with, for the alias attribute
 /// `attribute`, or `None` for an attribute whose values have no form of their own.
@@ -341,6 +356,41 @@ fn alias_format_wording(name: &str) -> Option<&'static str> {
         "phone_number" => Some("phone number"),
         _ => None,
     }
+}
+
+/// The tag-key namespace Amazon Web Services keeps for the tags it writes
+/// itself, which a caller of this service may neither assign nor remove
+/// ([`SYSTEM_TAG_MUTATION_MESSAGE`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies inside the namespace [`RESERVED_TAG_KEY_PREFIX`] keeps,
+/// compared without regard to letter case: the namespace is reserved however a
+/// request spells it, so no capitalization of the prefix is a way into it.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The message a request that would write or remove a tag key inside the
+/// reserved namespace is refused with.
+///
+/// Those tags are the system's own, so a caller of the API is not the writer of
+/// them: Amazon Cognito states exactly that, in fixed text that names neither
+/// the key the request carried nor the resource it addressed.
+pub const SYSTEM_TAG_MUTATION_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
+/// The message a tagging request whose `ResourceArn` is not the ARN of a user
+/// pool is refused with.
+///
+/// `ArnType` constrains an ARN's length and general shape, but WHICH resource an
+/// ARN names is this service's own rule: it reads the value as a user-pool ARN
+/// ([`crate::state::user_pool_arn_parts`]) and reports a value it cannot read
+/// one out of as the invalid ARN it is. The fixed text is `Invalid user pool
+/// ARN: ` and the one variable part is the value the request submitted, so the
+/// caller sees which ARN was refused.
+pub fn invalid_user_pool_arn_message(resource_arn: &str) -> String {
+    format!("Invalid user pool ARN: {resource_arn}")
 }
 
 /// The DNS zone this service's endpoints and token issuers are published in.
@@ -619,8 +669,8 @@ impl UserPool {
             .eq(submitted.chars().flat_map(char::to_lowercase))
     }
 
-    /// The stored user `username` names, by username, by `sub` or by a sign-in
-    /// name of this pool ([`UserPool::sign_in_name_holder_key`]).
+    /// The stored user `username` names: by a NAME of this pool's own namespace
+    /// ([`UserPool::user_storage_key`]).
     pub fn user(&self, username: &str) -> Option<&User> {
         let key = self.user_storage_key(username)?;
         self.users.get(&key)
@@ -629,30 +679,65 @@ impl UserPool {
     /// The key the stored user `username` names is held under, or `None` when no
     /// such user exists.
     ///
-    /// Every way a request may name one user of this pool, in the order a
-    /// stored name beats a derived one: the username itself, the user's own
-    /// `sub`, then any sign-in name of the pool the value is. A `Username` "is
-    /// typically your user's username, but it can be any of their alias
-    /// attributes. If username isn't an alias attribute in your user pool, this
-    /// value must be the sub of a local user" (`AdminGetUser.Username` in this
-    /// service's model), so all three resolve the same stored user.
+    /// Every NAME this pool resolves one of its users by, in the order a stored
+    /// name beats a derived one: the username itself, under the pool's own case
+    /// comparison ([`UserPool::user_key`]); the username a link to a third-party
+    /// identity gives it ([`UserPool::federated_user_key`]); then any sign-in or
+    /// alias value of the pool the value is
+    /// ([`UserPool::sign_in_name_holder_key`]). A `Username` "is typically your
+    /// user's username, but it can be any of their alias attributes. If username
+    /// isn't an alias attribute in your user pool, this value must be the sub of a
+    /// local user or the username of a user from a third-party IdP"
+    /// (`AdminGetUser.Username` in this service's model).
+    ///
+    /// A user's `sub` is NOT one of those names: it is the id this service holds
+    /// as an ATTRIBUTE of the user rather than a value in the pool's username
+    /// namespace, so a request carrying one reaches a user only where the pool
+    /// itself minted the username from it — a pool that signs its users in with an
+    /// attribute value, whose users' usernames ARE their `sub` and so answer the
+    /// first lookup below. The id still IDENTIFIES its user, which is what an
+    /// alias value may not take ([`UserPool::names_another_user`]), and names it
+    /// for a reader that holds an id rather than a name
+    /// ([`UserPool::user_of_sub`]).
     pub fn user_storage_key(&self, username: &str) -> Option<String> {
         let key = self.user_key(username);
         if self.users.contains_key(&key) {
             return Some(key);
         }
-        if let Some(stored_key) = self
-            .users
-            .iter()
-            .find(|(_, user)| user.sub == username)
-            .map(|(stored_key, _)| stored_key.clone())
-        {
-            return Some(stored_key);
-        }
         if let Some(stored_key) = self.federated_user_key(username) {
             return Some(stored_key);
         }
         self.sign_in_name_holder_key(username)
+    }
+
+    /// The key of the stored user `value` IDENTIFIES: the user a NAME of this
+    /// pool resolves to ([`UserPool::user_storage_key`]), or the user whose own
+    /// `sub` the value is ([`UserPool::sub_holder_key`]).
+    fn identified_user_key(&self, value: &str) -> Option<String> {
+        self.user_storage_key(value)
+            .or_else(|| self.sub_holder_key(value))
+    }
+
+    /// The key of the stored user whose own `sub` is `sub`, or `None` when this
+    /// pool holds none. The lowest-ordered key answers, so the lookup is stable
+    /// whatever order the users are held in.
+    pub fn sub_holder_key(&self, sub: &str) -> Option<String> {
+        self.users
+            .iter()
+            .filter(|(_, user)| user.sub == sub)
+            .map(|(key, _)| key.clone())
+            .min()
+    }
+
+    /// The stored user whose own `sub` is `sub`, or `None` when this pool holds
+    /// none.
+    ///
+    /// The lookup by the user's ID rather than by a name it answers to
+    /// ([`UserPool::user_storage_key`]): a token's subject claim names the user it
+    /// was issued to by that id, which no name of the pool need resolve.
+    pub fn user_of_sub(&self, sub: &str) -> Option<&User> {
+        let key = self.sub_holder_key(sub)?;
+        self.users.get(&key)
     }
 
     /// The key of the user this pool holds the THIRD-PARTY IdP username
@@ -1419,6 +1504,22 @@ impl UserPool {
             .attributes_require_verification_before_update
             .as_ref()
             .is_some_and(|names| names.iter().any(|attribute| attribute == name))
+    }
+
+    /// Whether a user of this pool OTHER than `except_username` already answers
+    /// to or is identified by `value` — so a second user cannot be given it as an
+    /// alias.
+    ///
+    /// Every name this pool resolves one of its users by
+    /// ([`UserPool::user_storage_key`]) — the username the value is, a sign-in or
+    /// alias value a user currently holds, a federated username linked to one —
+    /// and the id a user is its own ([`UserPool::sub_holder_key`]). An alias value
+    /// identifies ONE user of the pool, so a value that already identifies
+    /// another user is not one a second user may be given as its alias.
+    pub fn names_another_user(&self, value: &str, except_username: &str) -> bool {
+        let except = self.user_key(except_username);
+        self.identified_user_key(value)
+            .is_some_and(|holder| holder != except)
     }
 
     /// Whether a user of this pool OTHER than `except_username` already holds

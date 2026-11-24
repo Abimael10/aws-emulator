@@ -17,6 +17,13 @@
 //! `PaginationToken` this search never minted, are a 400
 //! `InvalidParameterException`.
 //!
+//! An `AttributesToGet` is served only while EVERY user the search selects holds
+//! a value for every attribute it names — "Amazon Cognito returns an error if not
+//! all users in the results have set a value for the attribute you request"
+//! (`ListUsers.AttributesToGet`) — whether or not a server-side search covers
+//! that attribute; otherwise the whole call is a 400
+//! `InvalidParameterException`.
+//!
 //! Each table row names the case it asserts.
 
 use std::sync::Arc;
@@ -668,6 +675,11 @@ async fn attributes_to_get_names_the_attributes_each_entry_carries() {
             Some(vec!["nickname"]),
             vec!["nickname"],
         ),
+        (
+            "a searchable attribute, set for every user in the results",
+            Some(vec!["email", "nickname"]),
+            vec!["email", "nickname"],
+        ),
         ("no attribute at all", Some(vec![]), vec![]),
     ] {
         let body = list_request(
@@ -699,35 +711,9 @@ async fn attributes_to_get_names_the_attributes_each_entry_carries() {
         );
     }
 
-    // A SEARCHABLE attribute is served whoever holds it: `email` is one, and the
-    // users that have set none simply carry no attribute at all.
-    let payload = ok(
-        &router,
-        "ListUsers",
-        &list_request(&user_pool_id, None, None, None, Some(&["email"])),
-    )
-    .await;
-    for entry in users_of(&payload, "a searchable attribute some users leave unset") {
-        let username = entry["Username"].as_str().expect("an entry names a user");
-        let expected: Vec<String> = FIXTURE_USERS
-            .iter()
-            .find(|(stored, _)| *stored == username)
-            .map(|(_, attributes)| attributes)
-            .expect("every entry is a fixture user")
-            .iter()
-            .filter(|(name, _)| *name == "email")
-            .map(|(name, _)| (*name).to_string())
-            .collect();
-        let actual = attribute_names_of(&entry, username);
-        assert_eq!(
-            actual, expected,
-            "case \"a searchable attribute some users leave unset\" ({username:?}): expected \
-             {expected:?}, got {actual:?}"
-        );
-    }
-
-    // An attribute no server-side search covers has to be set for every user in
-    // the results before it can be asked for at all.
+    // A projection is served only while every user the search selects holds a
+    // value for every attribute it names — whether or not a server-side search
+    // covers that attribute.
     for (label, filter, attributes_to_get) in [
         (
             "an attribute no user in the results holds",
@@ -743,6 +729,11 @@ async fn attributes_to_get_names_the_attributes_each_entry_carries() {
             "an attribute only some of the selected users hold",
             None,
             vec!["nickname"],
+        ),
+        (
+            "a SEARCHABLE attribute only some of the selected users hold",
+            None,
+            vec!["email"],
         ),
     ] {
         let body = list_request(

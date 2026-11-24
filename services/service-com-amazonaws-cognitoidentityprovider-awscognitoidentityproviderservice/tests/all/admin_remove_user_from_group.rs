@@ -388,7 +388,7 @@ async fn a_removal_touches_one_user_of_one_pool() {
 }
 
 #[tokio::test]
-async fn a_user_is_resolved_by_username_or_by_sub() {
+async fn a_user_is_resolved_by_username_and_not_by_its_sub() {
     let router = router();
     let user_pool_id = pool(&router, "resolve-pool").await;
     for group_name in ["by-sub", "by-username"] {
@@ -399,28 +399,36 @@ async fn a_user_is_resolved_by_username_or_by_sub() {
         add(&router, &user_pool_id, "carol", group_name).await;
     }
 
-    // `Username` "must be the sub of a local user or the username" — both name
-    // the same stored user, so a removal under either identifier lands on it.
-    for (label, identifier, group_name, expected) in [
-        (
-            "by username",
-            "carol".to_string(),
-            "by-username",
-            vec!["by-sub".to_string()],
-        ),
-        ("by sub", sub, "by-sub", Vec::<String>::new()),
-    ] {
-        let (status, payload) = remove(&router, &user_pool_id, &identifier, group_name).await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: the user must resolve, got {status} with {payload}"
-        );
-        let actual = memberships(&router, &user_pool_id, "carol").await;
-        assert_eq!(
-            actual, expected,
-            "case {label:?}: expected {expected:?}, got {actual:?}"
-        );
-    }
+    // `Username` "is typically your user's username, but it can be any of their
+    // alias attributes" — a removal under the stored username lands on the user,
+    // while the `sub` it reports is the user's id rather than a name of the pool
+    // and names no user to remove, so that membership stays.
+    let case = "by username";
+    let (status, payload) = remove(&router, &user_pool_id, "carol", "by-username").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the user must resolve, got {status} with {payload}"
+    );
+    let actual = memberships(&router, &user_pool_id, "carol").await;
+    assert_eq!(
+        actual,
+        vec!["by-sub".to_string()],
+        "case {case:?}: expected the other membership to stay, got {actual:?}"
+    );
+
+    let case = "by the user's own sub";
+    let (status, payload) = remove(&router, &user_pool_id, &sub, "by-sub").await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
+    );
+    let actual = memberships(&router, &user_pool_id, "carol").await;
+    assert_eq!(
+        actual,
+        vec!["by-sub".to_string()],
+        "case {case:?}: a refused removal must leave the membership, got {actual:?}"
+    );
 }
 
 #[tokio::test]

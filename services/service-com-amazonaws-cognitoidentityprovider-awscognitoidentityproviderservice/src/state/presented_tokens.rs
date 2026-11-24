@@ -70,7 +70,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 _ => PresentedTokenUser::Inactive,
             };
         }
-        match claimed_subject(token).and_then(|subject| pool.user(&subject)) {
+        match claimed_subject(token).and_then(|subject| pool.user_of_sub(&subject)) {
             Some(user) => user_activity(user),
             None => PresentedTokenUser::Inactive,
         }

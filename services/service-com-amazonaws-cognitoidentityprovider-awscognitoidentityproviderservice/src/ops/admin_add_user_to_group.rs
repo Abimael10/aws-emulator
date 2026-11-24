@@ -71,6 +71,11 @@
 //!   encounters an internal error.
 //! * `InvalidParameterException` (HTTP 400) — This exception is thrown when the Amazon
 //!   Cognito service encounters an invalid parameter.
+//! * `LimitExceededException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   this service models the shape — "this exception is thrown when a user exceeds the limit
+//!   for a requested Amazon Web Services resource" — while this operation's own `errors` list
+//!   does not name it, and the per-user group-membership quota is the limit this operation
+//!   refuses against.
 //! * `NotAuthorizedException` (HTTP 403) — This exception is thrown when a user isn't
 //!   authorized.
 //! * `OperationNotEnabledException` (HTTP 400) — This exception is thrown when an operation
@@ -116,11 +121,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for AdminAddUserToGroupOutpu
 // here — hence the `AdminAddUserToGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cognitoidentityprovider#AdminAddUserToGroup")]
+//
+// `LimitExceededException` is widened in through `extra_errors`: this SERVICE models that
+// shape — it is "thrown when a user exceeds the limit for a requested Amazon Web Services
+// resource" (this service's model) — while this operation's own `errors` list does not
+// name it, and the per-user membership quota is the limit this operation refuses against
+// ([`crate::state::MAX_GROUPS_PER_USER`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.cognitoidentityprovider#AdminAddUserToGroup",
+    extra_errors = ["LimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum AdminAddUserToGroupErrorModeled {
     InternalErrorException(InternalErrorException),
     InvalidParameterException(InvalidParameterException),
+    LimitExceededException(LimitExceededException),
     NotAuthorizedException(NotAuthorizedException),
     OperationNotEnabledException(OperationNotEnabledException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -198,12 +213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(group_not_found());
         }
 
-        // `Username` "can be any of their alias attributes" or "the sub of a
-        // local user" (`AdminAddUserToGroup.Username`), which is how
-        // `UserPool::user_mut` resolves a user.
+        // `Username` "can be any of their alias attributes", and where the pool
+        // signs its users in with one of those values the username it minted
+        // (`AdminAddUserToGroup.Username`), which is how `UserPool::user_mut`
+        // resolves a user.
         let user = pool
             .user_mut(&input.username)
             .ok_or_else(user_not_found)?;
+
+        // A user belongs to at most [`crate::state::MAX_GROUPS_PER_USER`] groups,
+        // so the membership past that quota is refused and the user's memberships
+        // stay as they were. Asked only of a membership this call would ADD:
+        // membership is a set, so an add of a group the user is already in stores
+        // nothing new and takes the count nowhere.
+        if !user.groups.contains(&input.group_name)
+            && user.groups.len() >= crate::state::MAX_GROUPS_PER_USER
+        {
+            return Err(groups_per_user_limit());
+        }
 
         // Membership is a set, so a repeated add stores nothing new and the user
         // belongs to the group exactly once.
@@ -237,6 +264,16 @@ fn group_not_found() -> AdminAddUserToGroupError {
 fn user_not_found() -> AdminAddUserToGroupError {
     AdminAddUserToGroupErrorModeled::UserNotFoundException(UserNotFoundException {
         message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a user already in as many groups
+/// as it may belong to, carrying the sentence that quota's refusal states
+/// ([`crate::state::groups_per_user_limit_message`]).
+fn groups_per_user_limit() -> AdminAddUserToGroupError {
+    AdminAddUserToGroupErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(crate::state::groups_per_user_limit_message()),
     })
     .into()
 }

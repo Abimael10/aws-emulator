@@ -638,9 +638,10 @@ async fn a_pool_stores_the_username_its_sign_in_configuration_implies() {
     }
 }
 
-/// A stored user answers to every name that names it: its stored username, its
-/// `sub`, an active alias value of the pool, and the federated username of an
-/// identity linked to it.
+/// A stored user answers to every name that names it: its stored username, an
+/// active alias value of the pool, and the federated username of an identity
+/// linked to it — and not to its `sub`, which is the id the pool holds as an
+/// attribute of the user rather than a value in its username namespace.
 #[tokio::test]
 async fn a_stored_user_answers_to_every_name_that_names_it() {
     let router = router();
@@ -703,7 +704,6 @@ async fn a_stored_user_answers_to_every_name_that_names_it() {
 
     for (case, name) in [
         ("the stored username", "margaret".to_string()),
-        ("the user's own sub", sub.clone()),
         (
             "a verified email alias of the pool",
             "margaret@example.com".to_string(),
@@ -730,22 +730,27 @@ async fn a_stored_user_answers_to_every_name_that_names_it() {
         );
     }
 
-    // A name no stored user answers to still resolves nothing.
-    let (status, payload) = call(
-        &router,
-        "AdminGetUser",
-        &json!({
-            "UserPoolId": user_pool_id,
-            "Username": format!("{provider_name}_unlinked-identity"),
-        }),
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&payload)),
-        (400, "UserNotFoundException"),
-        "case {:?}: expected a 400 UserNotFoundException, got {status} with {payload}",
-        "a federated username nothing is linked under"
-    );
+    // A name no stored user answers to still resolves nothing — the user's own
+    // `sub` among them.
+    for (case, name) in [
+        (
+            "a federated username nothing is linked under",
+            format!("{provider_name}_unlinked-identity"),
+        ),
+        ("the user's own sub", sub.clone()),
+    ] {
+        let (status, payload) = call(
+            &router,
+            "AdminGetUser",
+            &json!({ "UserPoolId": user_pool_id, "Username": name }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (400, "UserNotFoundException"),
+            "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
+        );
+    }
 }
 
 /// One row of the account-recovery table: what a create carries, and the

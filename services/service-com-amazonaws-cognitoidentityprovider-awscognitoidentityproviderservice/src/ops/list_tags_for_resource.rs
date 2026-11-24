@@ -192,12 +192,11 @@ fn user_pool_not_found(user_pool_id: &str) -> ListTagsForResourceError {
 }
 
 /// The refusal for a `ResourceArn` that is not the ARN of a user pool of this service,
-/// so it names no resource whose tags could be listed.
+/// so it names no resource whose tags could be listed
+/// ([`crate::state::invalid_user_pool_arn_message`]).
 fn not_a_user_pool_arn(resource_arn: &str) -> ListTagsForResourceError {
     ListTagsForResourceErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(format!(
-            "ResourceArn '{resource_arn}' is not the ARN of an Amazon Cognito user pool."
-        )),
+        message: Some(crate::state::invalid_user_pool_arn_message(resource_arn)),
         reason_code: None,
     })
     .into()

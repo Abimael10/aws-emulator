@@ -275,68 +275,51 @@ async fn assert_signed_out(
     );
 }
 
-/// Which identifier the sign-out names the user by.
-#[derive(Debug, Clone, Copy)]
-enum IdentifyBy {
-    /// The stored username.
-    Username,
-    /// The user's `sub`, which `Username` also accepts.
-    Sub,
-}
-
-/// One row: the username form, how many outstanding sign-ins the user holds when
-/// it is signed out, and the identifier the sign-out names it by.
+/// One row: the username form, and how many outstanding sign-ins the user holds
+/// when it is signed out.
 #[derive(Debug)]
 struct Row {
     case: &'static str,
     username: String,
     sign_ins: usize,
-    identify_by: IdentifyBy,
 }
 
 /// The rows differ along the FORM and LENGTH of the username (each value
 /// satisfying `UsernameType`, length 1..128 and pattern
 /// `^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`, from
-/// `smithy_query(query="operation",operation="AdminUserGlobalSignOut")`), the
-/// COUNT of outstanding sign-ins the one call has to invalidate, and the
-/// IDENTIFIER the call names the user by.
+/// `smithy_query(query="operation",operation="AdminUserGlobalSignOut")`) and the
+/// COUNT of outstanding sign-ins the one call has to invalidate.
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "one sign-in, signed out by username",
+            case: "one sign-in",
             username: "alice".to_string(),
             sign_ins: 1,
-            identify_by: IdentifyBy::Username,
         },
         Row {
-            case: "one sign-in, signed out by sub",
+            case: "one sign-in, a username of another form",
             username: "bob".to_string(),
             sign_ins: 1,
-            identify_by: IdentifyBy::Sub,
         },
         Row {
-            case: "two outstanding sign-ins, signed out by username",
+            case: "two outstanding sign-ins",
             username: "a.b-c_d+e".to_string(),
             sign_ins: 2,
-            identify_by: IdentifyBy::Username,
         },
         Row {
-            case: "three outstanding sign-ins, signed out by sub",
+            case: "three outstanding sign-ins, a non-ASCII username",
             username: "ユーザー①".to_string(),
             sign_ins: 3,
-            identify_by: IdentifyBy::Sub,
         },
         Row {
             case: "a username at the modelled length minimum 1",
             username: "u".to_string(),
             sign_ins: 2,
-            identify_by: IdentifyBy::Username,
         },
         Row {
             case: "a username at the modelled length maximum 128",
             username: "u".repeat(128),
             sign_ins: 1,
-            identify_by: IdentifyBy::Sub,
         },
     ]
 }
@@ -366,10 +349,7 @@ async fn one_call_invalidates_every_token_the_named_user_holds() {
             held.push(tokens);
         }
 
-        let identifier = match row.identify_by {
-            IdentifyBy::Username => row.username.clone(),
-            IdentifyBy::Sub => sub.clone(),
-        };
+        let identifier = row.username.clone();
         let (status, payload) = sign_out(&router, &user_pool_id, &identifier).await;
         assert_eq!(
             status, 200,
@@ -385,6 +365,16 @@ async fn one_call_invalidates_every_token_the_named_user_holds() {
             let labelled = format!("{case} (sign-in {index})");
             assert_signed_out(&router, &labelled, &client_id, tokens).await;
         }
+
+        // The `sub` the pool minted for that user is its id rather than a name in
+        // the pool's username namespace, so a sign-out naming it reaches no user.
+        let labelled = format!("{case} (named by the user's own sub)");
+        let (status, payload) = sign_out(&router, &user_pool_id, &sub).await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (400, "UserNotFoundException"),
+            "case {labelled:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
+        );
     }
 }
 

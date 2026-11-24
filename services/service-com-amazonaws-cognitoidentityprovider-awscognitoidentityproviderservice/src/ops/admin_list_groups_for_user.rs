@@ -6,8 +6,9 @@
 //! to, a page at a time. A pure READ: it renders STORED groups and stored
 //! membership, and writes nothing.
 //!
-//! * The user is resolved by username or by `sub`, the way every other `Admin*`
-//!   operation of this service resolves one ([`crate::state::UserPool::user`]).
+//! * The user is resolved by username or by a sign-in name of the pool, the way
+//!   every other `Admin*` operation of this service resolves one
+//!   ([`crate::state::UserPool::user`]).
 //! * Only groups the pool STILL HOLDS are reported — a membership of a deleted
 //!   group is not ([`crate::state::UserPool::user_group_names`]) — and each is
 //!   rendered from the stored group, so the entries carry what `CreateGroup`

@@ -381,9 +381,10 @@ impl<O: Operation, Eng: Send + Sync + 'static> Operation for ReportingTheAddress
         let outcome = self.operation.handle(input, ctx).await;
         // And AFTER it, against the state the call leaves behind: the user a create just
         // made is a user the pool holds, and the name a request used resolves the same way
-        // the operation itself resolves it (by username, by `sub` or by a sign-in name of
-        // the pool). The state after the call wins where it resolves the user, so the id
-        // reported is the one the pool answers its readers with now.
+        // the operation itself resolves it (by username, by a federated username linked to
+        // it or by a sign-in name of the pool). The state after the call wins where it
+        // resolves the user, so the id reported is the one the pool answers its readers
+        // with now.
         let held_after = addressed.as_ref().and_then(resolve);
         if let Some(sub) = held_after.or(held_before) {
             report_additional_event_data(::serde_json::json!({ RECORDED_SUB: sub }));

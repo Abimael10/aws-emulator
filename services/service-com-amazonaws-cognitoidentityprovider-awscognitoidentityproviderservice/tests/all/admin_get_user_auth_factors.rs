@@ -650,8 +650,6 @@ async fn admin_get_user_auth_factors_reports_the_factors_the_stored_user_can_sig
 enum Named {
     /// The stored username itself.
     Username,
-    /// The user's own `sub`, which `AdminGetUser` reads the same way.
-    Sub,
     /// A verified alias attribute's value, for a pool that configures that
     /// attribute as an alias.
     Alias(&'static str),
@@ -698,14 +696,12 @@ async fn admin_get_user_auth_factors_resolves_every_way_a_request_names_one_user
 
     let rows = [
         Named::Username,
-        Named::Sub,
         Named::Alias("ada.lovelace@example.com"),
         Named::Alias("+15550100007"),
     ];
     for row in rows {
         let named = match row {
             Named::Username => "ada".to_string(),
-            Named::Sub => sub.clone(),
             Named::Alias(value) => value.to_string(),
         };
         let reported = factors(&instance.router, &user_pool_id, &named).await;
@@ -725,6 +721,22 @@ async fn admin_get_user_auth_factors_resolves_every_way_a_request_names_one_user
             "case {row:?}: expected every configured factor, got {reported:?}"
         );
     }
+
+    // The `sub` every read of that user reports is its id rather than a name in
+    // the pool's username namespace, so it names no user of a pool whose users
+    // have usernames of their own.
+    let (status, payload) = dispatch(
+        &instance.router,
+        "AdminGetUserAuthFactors",
+        &json!({ "UserPoolId": user_pool_id, "Username": sub }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case \"the user's own sub\": expected a 400 UserNotFoundException, got {status} with \
+         {payload}"
+    );
 }
 
 #[tokio::test]

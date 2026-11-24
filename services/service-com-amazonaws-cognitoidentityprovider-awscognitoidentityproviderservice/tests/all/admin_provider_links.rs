@@ -595,45 +595,49 @@ async fn a_link_lands_on_one_profile_of_one_pool() {
 }
 
 #[tokio::test]
-async fn a_destination_resolves_by_username_or_by_sub() {
+async fn a_destination_resolves_by_username_and_not_by_its_sub() {
     let router = router();
     let user_pool_id = pool(&router, "destination-pool").await;
     let sub = user(&router, &user_pool_id, "carol").await;
     provider(&router, &user_pool_id, "CorpSAML", "SAML").await;
 
     // "For a native username + password user, the `ProviderAttributeValue` for
-    // the `DestinationUser` should be the username in the user pool" — and a
-    // user resolves by its username or by its `sub`, so either names the same
-    // stored profile.
-    for (label, destination_value, source_value) in [
-        ("a destination named by username", "carol".to_string(), "carol@example.com"),
-        ("a destination named by sub", sub, "carol.second@example.com"),
-    ] {
-        let source = identity("CorpSAML", "email", source_value);
-        let (status, payload) = link(
-            &router,
-            &user_pool_id,
-            &source,
-            &destination(&destination_value),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: the link must succeed, got {status} with {payload}"
-        );
-        // The link landed on the one profile: its native identity is linked,
-        // and the identity itself de-links.
-        let (status, payload) = disable(&router, &user_pool_id, &native_identity("carol")).await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: the profile must hold the link, got {status} with {payload}"
-        );
-        let (status, payload) = disable(&router, &user_pool_id, &source).await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: the identity must de-link, got {status} with {payload}"
-        );
-    }
+    // the `DestinationUser` should be the username in the user pool" — so the
+    // stored username names the profile, while the `sub` the pool minted for it
+    // is that user's id rather than a name of the pool and names no profile to
+    // link.
+    let case = "a destination named by username";
+    let source = identity("CorpSAML", "email", "carol@example.com");
+    let (status, payload) = link(&router, &user_pool_id, &source, &destination("carol")).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the link must succeed, got {status} with {payload}"
+    );
+    // The link landed on the one profile: its native identity is linked, and the
+    // identity itself de-links.
+    let (status, payload) = disable(&router, &user_pool_id, &native_identity("carol")).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the profile must hold the link, got {status} with {payload}"
+    );
+    let (status, payload) = disable(&router, &user_pool_id, &source).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the identity must de-link, got {status} with {payload}"
+    );
+
+    let case = "a destination named by the user's own sub";
+    let second_source = identity("CorpSAML", "email", "carol.second@example.com");
+    let (status, payload) = link(&router, &user_pool_id, &second_source, &destination(&sub)).await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
+    );
+    // The refused link stored nothing: the identity it named is linked to no
+    // profile at all.
+    let (status, payload) = disable(&router, &user_pool_id, &second_source).await;
+    assert_not_linked(case, status, &payload);
 }
 
 #[tokio::test]
@@ -1071,9 +1075,6 @@ struct DestinationCase {
     /// (`smithy_query(query="shape",shape="ProviderUserIdentifierType")`), and
     /// the rows walk both of its bounds.
     attribute_name: String,
-    /// Whether the destination names the profile by its generated `sub` rather
-    /// than by its username, the two values a stored profile resolves by.
-    by_sub: bool,
     /// This row's external identity value, so every row links an identity of
     /// its own and starts from a profile that holds no link.
     source_value: &'static str,
@@ -1081,14 +1082,12 @@ struct DestinationCase {
 
 /// The table. Rows differ along the destination's attribute NAME (the subject,
 /// the model's own example claim, a custom claim, and each bound of the
-/// modelled length range) and along the FORM of the value that names the
-/// profile (its username, its `sub`).
+/// modelled length range), which is the member the rule says is ignored.
 fn destination_cases() -> Vec<DestinationCase> {
     vec![
         DestinationCase {
-            case: "the subject attribute, the profile named by its username",
+            case: "the subject attribute",
             attribute_name: SUBJECT_ATTRIBUTE.to_string(),
-            by_sub: false,
             source_value: "jade+subject@example.com",
         },
         DestinationCase {
@@ -1097,25 +1096,21 @@ fn destination_cases() -> Vec<DestinationCase> {
             // (`smithy_query(query="shape",shape="ProviderUserIdentifierType")`).
             case: "the claim the model names as an example",
             attribute_name: "NameID".to_string(),
-            by_sub: false,
             source_value: "jade+nameid@example.com",
         },
         DestinationCase {
-            case: "a custom claim, the profile named by its sub",
+            case: "a custom claim",
             attribute_name: "custom:employee_number".to_string(),
-            by_sub: true,
             source_value: "jade+custom@example.com",
         },
         DestinationCase {
             case: "an empty attribute name, the modelled length minimum 0",
             attribute_name: String::new(),
-            by_sub: false,
             source_value: "jade+empty@example.com",
         },
         DestinationCase {
             case: "an attribute name at the modelled length maximum 131072",
             attribute_name: "n".repeat(131_072),
-            by_sub: true,
             source_value: "jade+max@example.com",
         },
     ]
@@ -1125,7 +1120,7 @@ fn destination_cases() -> Vec<DestinationCase> {
 async fn a_destination_is_read_as_the_value_that_names_the_profile() {
     let router = router();
     let user_pool_id = pool(&router, "destination-member-pool").await;
-    let sub = user(&router, &user_pool_id, "jade").await;
+    user(&router, &user_pool_id, "jade").await;
     provider(&router, &user_pool_id, "CorpSAML", "SAML").await;
 
     // "The `ProviderAttributeName` of the `DestinationUser` is ignored"
@@ -1135,15 +1130,10 @@ async fn a_destination_is_read_as_the_value_that_names_the_profile() {
     // the source triple alone.
     for case in destination_cases() {
         let label = case.case;
-        let destination_value = if case.by_sub {
-            sub.clone()
-        } else {
-            "jade".to_string()
-        };
         let destination_user = json!({
             "ProviderName": NATIVE_PROVIDER,
             "ProviderAttributeName": case.attribute_name,
-            "ProviderAttributeValue": destination_value,
+            "ProviderAttributeValue": "jade",
         });
         let source = identity("CorpSAML", "email", case.source_value);
 

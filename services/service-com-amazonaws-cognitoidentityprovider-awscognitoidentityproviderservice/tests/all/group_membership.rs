@@ -437,7 +437,7 @@ async fn a_membership_belongs_to_one_user_of_one_pool() {
 }
 
 #[tokio::test]
-async fn a_user_is_resolved_by_username_or_by_sub() {
+async fn a_user_is_resolved_by_username_and_not_by_its_sub() {
     let router = router();
     let (user_pool_id, client_id) = pool_with_client(&router, "resolve-pool").await;
     ok(
@@ -454,11 +454,13 @@ async fn a_user_is_resolved_by_username_or_by_sub() {
     .await;
     let sub = user(&router, &user_pool_id, "carol").await;
 
-    // `Username` "must be the sub of a local user or the username" — both
-    // resolve to the same stored user, so both memberships land on it.
-    for (label, identifier, group_name) in [
-        ("by username", "carol".to_string(), "by-username"),
-        ("by sub", sub, "by-sub"),
+    // `Username` "is typically your user's username, but it can be any of their
+    // alias attributes" — the stored username names the user, while the `sub`
+    // every read of that user reports is its id rather than a name of the pool,
+    // so an add under it reaches no user and stores no membership.
+    for (label, identifier, group_name, expected) in [
+        ("by username", "carol".to_string(), "by-username", 200),
+        ("by the user's own sub", sub, "by-sub", 400),
     ] {
         let (status, payload) = call(
             &router,
@@ -471,19 +473,27 @@ async fn a_user_is_resolved_by_username_or_by_sub() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: the user must resolve, got {status} with {payload}"
+            status, expected,
+            "case {label:?}: expected HTTP {expected}, got {status} with {payload}"
         );
+        if status != 200 {
+            assert_eq!(
+                error_code(&payload),
+                "UserNotFoundException",
+                "case {label:?}: expected UserNotFoundException, got {payload}"
+            );
+        }
     }
 
     let result = sign_in(&router, &user_pool_id, &client_id, "carol").await;
     let token = result["IdToken"].as_str().expect("an id token");
     let actual = groups_claim(token);
-    let expected: BTreeSet<String> = ["by-sub".to_string(), "by-username".to_string()].into();
+    let expected: BTreeSet<String> = ["by-username".to_string()].into();
     assert_eq!(
         actual.clone().map(BTreeSet::from_iter),
         Some(expected.clone()),
-        "both identifiers name one stored user: expected {expected:?}, got {actual:?}"
+        "only the membership the username stored is the user's: expected {expected:?}, got \
+         {actual:?}"
     );
 }
 

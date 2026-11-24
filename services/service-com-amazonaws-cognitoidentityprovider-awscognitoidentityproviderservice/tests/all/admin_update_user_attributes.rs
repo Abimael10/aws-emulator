@@ -769,27 +769,29 @@ async fn an_admin_update_records_the_code_of_each_message_it_sends() {
 }
 
 #[tokio::test]
-async fn an_admin_update_reaches_the_user_named_by_its_sub() {
+async fn an_admin_update_does_not_reach_the_user_named_by_its_sub() {
     let router = emulator();
     let user_pool_id = pool(&router, "sub-pool", PoolConfig::default()).await;
     let sub = user(&router, &user_pool_id, "ada", &[("nickname", "Ada")]).await;
 
-    // `Username` "must be the sub of a local user" where it is not a username
-    // or an alias (`AdminUpdateUserAttributes.Username`), so the same user is
-    // reachable under either name.
+    // `Username` "is typically your user's username, but it can be any of their
+    // alias attributes" (`AdminUpdateUserAttributes.Username`): the `sub` every
+    // read of that user reports is its id rather than a name in the pool's
+    // username namespace, so an update under it reaches no user and writes
+    // nothing.
+    let case = "the user named by its sub";
     let (status, payload) = update(&router, &user_pool_id, &sub, &[("nickname", "Augusta")]).await;
     assert_eq!(
-        status, 200,
-        "case {:?}: an update by sub must succeed, got {status} with {payload}",
-        "the user named by its sub"
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
     );
     let attributes = stored_attributes(&router, &user_pool_id, "ada").await;
     let nickname = attributes.get("nickname");
     assert_eq!(
         nickname.map(String::as_str),
-        Some("Augusta"),
-        "case {:?}: expected nickname Augusta, got {nickname:?} in {attributes:?}",
-        "the user named by its sub"
+        Some("Ada"),
+        "case {case:?}: a refused update writes nothing, got {nickname:?} in {attributes:?}"
     );
 }
 

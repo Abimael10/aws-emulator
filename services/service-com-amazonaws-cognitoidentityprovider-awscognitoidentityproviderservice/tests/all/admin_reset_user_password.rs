@@ -810,7 +810,7 @@ async fn the_code_a_reset_sends_completes_it_only_inside_its_validity_window() {
 
 /// RULE: a reset sends ONE code, so a second reset supersedes the first one's code; and
 /// it lands on the one user of the one pool the request names, that user resolving by its
-/// username or by its `sub`.
+/// username and not by the `sub` the pool minted for it.
 #[tokio::test]
 async fn a_reset_supersedes_the_earlier_code_and_lands_on_one_user_of_one_pool() {
     let engine = engine();
@@ -893,27 +893,30 @@ async fn a_reset_supersedes_the_earlier_code_and_lands_on_one_user_of_one_pool()
         );
     }
 
-    // `Username` "must be the sub of a local user or the username", so a reset named by
-    // the `sub` lands on the same stored user.
+    // `Username` "is typically your user's username, but it can be any of their alias
+    // attributes": the `sub` the pool minted is the user's id rather than a name in its
+    // username namespace, so a reset named by it reaches no user and writes nothing.
     let (user_pool_id, username, sub) = subs
         .iter()
         .find(|(pool, username, _)| pool == &second_pool && *username == "bob")
         .expect("the second pool holds bob")
         .clone();
+    let before = stored_status(&setup, &user_pool_id, username).await;
     let (status, payload) = admin_reset(&setup, &user_pool_id, &sub).await;
     assert_eq!(
-        status, 200,
-        "case \"a reset named by the user's sub\": expected HTTP 200, got {status} with {payload}"
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case \"a reset named by the user's sub\": expected a 400 UserNotFoundException, got \
+         {status} with {payload}"
     );
     let actual = stored_status(&setup, &user_pool_id, username).await;
     assert_eq!(
-        actual,
-        state::UserStatus::ResetRequired.as_str(),
-        "case \"a reset named by the user's sub\": expected RESET_REQUIRED, got {actual:?}"
+        actual, before,
+        "case \"a reset named by the user's sub\": a refused reset changes nothing, got {actual:?}"
     );
     assert!(
-        outstanding_reset_code(&engine, &user_pool_id, username).is_some(),
-        "case \"a reset named by the user's sub\": the stored user holds the reset code"
+        outstanding_reset_code(&engine, &user_pool_id, username).is_none(),
+        "case \"a reset named by the user's sub\": a refused reset issues no code"
     );
 }
 

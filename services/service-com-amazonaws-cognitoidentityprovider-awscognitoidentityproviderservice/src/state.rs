@@ -3821,9 +3821,9 @@ pub enum AttributeUpdateRefusal {
     /// breaks, for a client to fix the request from, and names no stored value.
     Invalid(String),
     /// The submitted value of the named attribute is one another user of the
-    /// pool already holds as its alias ([`UserPool::alias_taken`]) and which no
-    /// verified flag can take away from that user, so the two would both answer
-    /// to it.
+    /// pool already answers to or is identified by
+    /// ([`UserPool::names_another_user`]) and which no verified flag can take
+    /// away from that user, so the two would both answer to it.
     AliasTaken(String),
 }
 
@@ -3907,6 +3907,11 @@ pub enum SchemaValidationFinding {
     /// (`SchemaAttributeType.Required`), so it has to keep a value: the blank
     /// value the request submitted for it would delete it.
     RequiredNotDeletable,
+    /// The pool's schema declares the attribute `Number`
+    /// (`SchemaAttributeType.AttributeDataType`) and no number could be read out
+    /// of the submitted value at all, so there is no value of that attribute to
+    /// store and no declared bound to compare it against.
+    UnparseableNumber,
 }
 
 impl SchemaValidationFinding {
@@ -3918,6 +3923,7 @@ impl SchemaValidationFinding {
             Self::OutsideDeclaredBound(sentence) => sentence.as_str(),
             Self::NotABoolean => "The attribute is not a valid boolean.",
             Self::RequiredNotDeletable => "Required attribute cannot be deleted.",
+            Self::UnparseableNumber => "Unable to parse the number",
         }
     }
 }

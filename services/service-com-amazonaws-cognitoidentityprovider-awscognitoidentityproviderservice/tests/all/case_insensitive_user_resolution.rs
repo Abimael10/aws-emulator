@@ -408,20 +408,17 @@ async fn a_pool_resolves_its_aliases_the_way_its_case_setting_says() {
         }
     }
 
-    // A user's own `sub` names it in either pool, whatever the pool does with
-    // case: the id is the service's, not a spelling the caller chose.
+    // A user's own `sub` names it in NEITHER pool, whatever the pool does with
+    // case: the id is an attribute the service stores for the user, not a value
+    // in the pool's username namespace.
     for user_pool_id in [&insensitive, &sensitive] {
         let sub = stored_sub.get(user_pool_id).expect("a stored sub").clone();
         let (status, payload) = read_user(&router, user_pool_id, &sub).await;
         assert_eq!(
-            status, 200,
-            "case \"a lookup by the user's own sub\": expected the stored user, got {status} \
-             with {payload}"
-        );
-        assert_eq!(
-            payload["Username"].as_str(),
-            stored_username.get(user_pool_id).map(String::as_str),
-            "case \"a lookup by the user's own sub\": expected the stored username, got {payload}"
+            (status, error_code(&payload)),
+            (400, "UserNotFoundException"),
+            "case \"a lookup by the user's own sub\": expected a 400 UserNotFoundException, got \
+             {status} with {payload}"
         );
     }
 }

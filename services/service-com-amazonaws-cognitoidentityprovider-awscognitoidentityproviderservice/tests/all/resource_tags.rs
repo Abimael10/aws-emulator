@@ -11,8 +11,11 @@
 //! its own set. `TagResource` MERGES the keys it carries into that set (the call's
 //! value wins for a key already there, every other key is left as it was),
 //! `UntagResource` removes exactly the keys it names, and every reader renders the
-//! STORED set, empty for a pool nothing has tagged. An ARN that is not a user-pool
-//! ARN of this service names no resource (HTTP 400 `InvalidParameterException`), and
+//! STORED set, empty for a pool nothing has tagged. A key inside the namespace Amazon
+//! Web Services keeps for its own tags is neither written nor removed by a caller
+//! (HTTP 400 `InvalidParameterException`). An ARN that is not a user-pool
+//! ARN of this service names no resource (HTTP 400 `InvalidParameterException`, stating
+//! the ARN the request submitted), and
 //! one naming a pool this service does not hold in that Region names a missing
 //! resource (HTTP 400 `ResourceNotFoundException`); neither writes anything.
 //!
@@ -573,10 +576,11 @@ async fn an_arn_that_names_no_user_pool_of_this_service_is_refused() {
     )
     .await;
 
-    // Each row is an ARN that satisfies `ArnType`'s modelled length and pattern —
-    // so it reaches the handler — and names no user pool of this service: another
-    // service's namespace, another resource type of this one, no resource id, and
-    // fields no ARN of a user pool carries.
+    // Each row is an ARN that names no user pool of this service: another
+    // service's namespace, another resource type of this one, no resource id,
+    // fields no ARN of a user pool carries, and — since this service reads the
+    // value as a user-pool ARN rather than holding it to the form `ArnType`
+    // declares — values of no ARN shape at all.
     let rows: Vec<(&str, String)> = vec![
         (
             "another AWS service's namespace",
@@ -603,6 +607,14 @@ async fn an_arn_that_names_no_user_pool_of_this_service_is_refused() {
             "a resource id no UserPoolId could be",
             "arn:aws:cognito-idp:us-east-1:123456789012:userpool/notapoolid".to_string(),
         ),
+        (
+            "a value of no ARN shape at all, which the member's declared pattern refuses",
+            "this-is-not-an-arn-at-all".to_string(),
+        ),
+        (
+            "a value shorter than the member's declared minimum length",
+            "nope".to_string(),
+        ),
     ];
 
     for (case, resource_arn) in rows {
@@ -617,14 +629,36 @@ async fn an_arn_that_names_no_user_pool_of_this_service_is_refused() {
                  with {payload}"
             );
             let message = error_message(&payload);
-            let expected = format!(
-                "ResourceArn '{resource_arn}' is not the ARN of an Amazon Cognito user pool."
-            );
+            let expected = format!("Invalid user pool ARN: {resource_arn}");
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"
             );
         }
+    }
+
+    // A value past the LENGTH an ARN may have is refused by the member's own
+    // declared maximum instead, so a refusal of this service never quotes back
+    // more than an ARN's worth of what a caller sent.
+    let past_the_maximum = "a".repeat(2049);
+    for operation in TAGGING_OPERATIONS {
+        let case = format!("{operation} against a value past the declared length maximum");
+        let request = request_for(operation, &past_the_maximum);
+        let (status, payload) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (400, "InvalidParameterException"),
+            "case {case:?}: expected a 400 InvalidParameterException, got {status} with the \
+             body's {} characters",
+            payload.to_string().len()
+        );
+        let message = error_message(&payload);
+        assert!(
+            message.contains("Member must have length less than or equal to 2048"),
+            "case {case:?}: expected the member's declared maximum to be stated, got \
+             {} characters of message",
+            message.len()
+        );
     }
 
     // Every refusal above wrote nothing: the pool still holds the set it held.
@@ -781,4 +815,97 @@ fn request_for(operation: &str, resource_arn: &str) -> Value {
         _ => {}
     }
     Value::Object(request)
+}
+
+/// The sentence a caller's attempt to write or remove a tag key in the namespace
+/// Amazon Web Services keeps for its own tags is refused with: fixed text naming
+/// neither the key nor the resource.
+const SYSTEM_TAG_MESSAGE: &str = "Caller is an end user and not allowed to mutate system tags";
+
+#[tokio::test]
+async fn a_key_in_the_reserved_namespace_is_neither_written_nor_removed() {
+    let router = router();
+    let (user_pool_id, pool_arn) = pool(&router, "reserved-namespace-pool").await;
+    // The set the pool holds before any refused call, so every assertion below
+    // compares against stored state rather than against nothing.
+    let stored = tag_map(&[("Environment", "Production")]);
+    ok(
+        &router,
+        "TagResource",
+        &json!({ "ResourceArn": pool_arn, "Tags": tags_body(&stored) }),
+    )
+    .await;
+
+    // The rows span the reserved prefix however it is written and whatever
+    // follows it, beside a key that merely CARRIES it elsewhere in the name,
+    // which is outside the namespace and is a key like any other.
+    let rows: Vec<(&str, String, bool)> = vec![
+        (
+            "the reserved prefix with a name after it",
+            "aws:cloudformation:stack-name".to_string(),
+            true,
+        ),
+        ("the reserved prefix alone", "aws:".to_string(), true),
+        (
+            "the reserved prefix in another case",
+            "AWS:billing".to_string(),
+            true,
+        ),
+        (
+            "the reserved prefix mixed-cased",
+            "Aws:CostCenter".to_string(),
+            true,
+        ),
+        (
+            "a key carrying the prefix somewhere other than the start",
+            "team-aws:owner".to_string(),
+            false,
+        ),
+        (
+            "a key that only starts with the prefix's letters",
+            "awsome".to_string(),
+            false,
+        ),
+    ];
+
+    for (case, key, reserved) in rows {
+        for operation in ["TagResource", "UntagResource"] {
+            let case = format!("{operation} against {case}");
+            let body = match operation {
+                "TagResource" => json!({
+                    "ResourceArn": pool_arn,
+                    "Tags": tags_body(&tag_map(&[(key.as_str(), "forged")])),
+                }),
+                _ => json!({ "ResourceArn": pool_arn, "TagKeys": [key.clone()] }),
+            };
+            let (status, payload) = call(&router, operation, &body).await;
+            if reserved {
+                assert_eq!(
+                    (status, error_code(&payload), error_message(&payload)),
+                    (400, "InvalidParameterException", SYSTEM_TAG_MESSAGE),
+                    "case {case:?}: the reserved namespace must be refused, got {status} with \
+                     {payload}"
+                );
+            } else {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a key outside the namespace is a key like any other, got \
+                     {status} with {payload}"
+                );
+            }
+        }
+        // What the pool holds afterwards: nothing of the reserved namespace was
+        // written, and the key outside it round-trips through the write and the
+        // removal, leaving the stored set as it was.
+        let listed = listed_tags(&router, case, &pool_arn).await;
+        assert_eq!(
+            listed, stored,
+            "case {case:?}: the stored set must be unchanged, got {listed:?}"
+        );
+        let described = described_tags(&router, case, &user_pool_id).await;
+        assert_eq!(
+            described, stored,
+            "case {case:?}: the pool's own describe reports the same set, got {described:?}"
+        );
+    }
 }

@@ -811,9 +811,11 @@ async fn the_history_is_paginated_newest_first() {
         );
     }
 
-    // The same history, named by the user's own `sub` instead of its username: a
-    // `Username` "must be the sub of a local user" as well
-    // (`AdminListUserAuthEvents.Username`).
+    // The same history named by the user's own `sub` instead of its username
+    // reaches no user: a `Username` "is typically your user's username, but it can
+    // be any of their alias attributes" (`AdminListUserAuthEvents.Username`), and
+    // that id is an attribute of the user rather than a name in the pool's
+    // username namespace.
     let user = ok(
         &router,
         "AdminGetUser",
@@ -828,14 +830,18 @@ async fn the_history_is_paginated_newest_first() {
         .find(|attribute| attribute["Name"] == json!("sub"))
         .and_then(|attribute| attribute["Value"].as_str().map(str::to_string))
         .expect("a stored user carries its sub");
-    let (by_sub, _) = history(&router, &fixture.user_pool_id, &sub, None, None).await;
-    let ids_by_sub: Vec<String> = by_sub
-        .iter()
-        .map(|event| event["EventId"].as_str().unwrap_or_default().to_string())
-        .collect();
+    let payload = refused(
+        &router,
+        "named by the user's own sub",
+        "AdminListUserAuthEvents",
+        &json!({ "UserPoolId": fixture.user_pool_id, "Username": sub }),
+        true,
+    )
+    .await;
     assert_eq!(
-        ids_by_sub, ordered_ids,
-        "case \"named by sub\": expected the same history {ordered_ids:?}, got {ids_by_sub:?}"
+        error_code(&payload),
+        "UserNotFoundException",
+        "case \"named by the user's own sub\": expected UserNotFoundException, got {payload}"
     );
 
     // A token this listing did not mint resumes nothing.

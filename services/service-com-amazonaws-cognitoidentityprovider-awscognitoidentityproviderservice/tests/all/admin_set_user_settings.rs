@@ -391,10 +391,6 @@ enum NamedBy {
     /// The username in another case, which a case-insensitive pool resolves to
     /// the stored one.
     LowercasedUsername,
-    /// The user's `sub`, which "must be the sub of a local user" where the
-    /// submitted value is no alias attribute (this operation's `Username` in
-    /// this service's model).
-    Sub,
 }
 
 /// One `AdminSetUserSettings` call of an accepted row, and the configuration a
@@ -431,8 +427,7 @@ struct AcceptedCase {
 /// The rows differ along the COUNT of options one call submits (one, the same
 /// one twice, none), the ORDER of calls over one user (activate, deactivate,
 /// activate again), whether the user HOLDS a phone number at all, and the FORM
-/// the request names the user by (the stored username, another case of it, the
-/// user's `sub`).
+/// the request names the user by (the stored username, another case of it).
 const ACCEPTED_CASES: &[AcceptedCase] = &[
     AcceptedCase {
         case: "one SMS option activates SMS MFA for a user holding a phone number",
@@ -507,18 +502,6 @@ const ACCEPTED_CASES: &[AcceptedCase] = &[
             settings: &[SMS_MFA],
         }],
     },
-    AcceptedCase {
-        case: "a call that names the user by its sub configures the same stored user",
-        case_sensitive: true,
-        username: "donald",
-        named_by: NamedBy::Sub,
-        attributes: &[("phone_number", "+15550100005")],
-        steps: &[Step {
-            submitted: &[SMS_OPTION],
-            options: &[("SMS", "phone_number")],
-            settings: &[SMS_MFA],
-        }],
-    },
 ];
 
 #[tokio::test]
@@ -537,7 +520,6 @@ async fn admin_set_user_settings_stores_the_submitted_sms_mfa_configuration() {
         let named = match row.named_by {
             NamedBy::StoredUsername => user.username.clone(),
             NamedBy::LowercasedUsername => user.username.to_lowercase(),
-            NamedBy::Sub => user.sub.clone(),
         };
 
         for (step_index, step) in row.steps.iter().enumerate() {
@@ -715,7 +697,9 @@ struct AbsentCase {
 const ABSENT_POOL_ID: &str = "us-east-1_absentpool";
 
 /// The rows differ along WHICH subject is absent (the pool, the user) and the
-/// FORM the absent user is named by (a username, a value shaped like a `sub`).
+/// FORM the absent user is named by (a username, a value shaped like a `sub`) —
+/// the stored user's OWN `sub` among them, which is its id rather than a name in
+/// the pool's username namespace and so names no user either.
 const ABSENT_CASES: &[AbsentCase] = &[
     AbsentCase {
         case: "a pool id this emulator never minted",
@@ -785,4 +769,26 @@ async fn admin_set_user_settings_refuses_a_pool_or_user_the_store_does_not_hold(
             "case {case:?}: a refused request writes nothing, got {stored:?}"
         );
     }
+
+    // The stored user's OWN `sub` is no name of it either: that value is the id
+    // the pool holds as an attribute of the user rather than a value in its
+    // username namespace.
+    let case = "the stored user's own sub";
+    let (status, payload) =
+        admin_set_settings(&router, &user.user_pool_id, &user.sub, &[SMS_OPTION]).await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
+    );
+    let stored = stored_mfa_state(&router, &user.user_pool_id, &user.username).await;
+    assert_eq!(
+        stored,
+        MfaState {
+            options: Vec::new(),
+            settings: Vec::new(),
+            preferred: None,
+        },
+        "case {case:?}: a refused request writes nothing, got {stored:?}"
+    );
 }

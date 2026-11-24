@@ -483,28 +483,42 @@ async fn a_listing_reports_one_user_of_one_pool() {
 }
 
 #[tokio::test]
-async fn a_user_is_resolved_by_username_or_by_sub() {
+async fn a_user_is_resolved_by_username_and_not_by_its_sub() {
     let router = router();
     let user_pool_id = pool(&router, "resolve-pool").await;
     group(&router, &user_pool_id, "admins").await;
     let sub = user(&router, &user_pool_id, "carol").await;
     add(&router, &user_pool_id, "carol", "admins").await;
 
+    let case = "the stored username";
     let by_username = ok(
         &router,
         "AdminListGroupsForUser",
         &list_request(&user_pool_id, "carol", None, None),
     )
     .await;
-    let by_sub = ok(
+    let listed = names_of(&by_username, case);
+    assert_eq!(
+        listed,
+        vec!["admins".to_string()],
+        "case {case:?}: expected the stored membership, got {listed:?}"
+    );
+
+    // The `sub` is the id this service stores as an attribute of the user, not a
+    // name in the pool's username namespace: in a pool whose users have usernames
+    // of their own it names no user at all, even though every read of that user
+    // reports it.
+    let case = "the user's own sub";
+    let (status, payload) = call(
         &router,
         "AdminListGroupsForUser",
         &list_request(&user_pool_id, &sub, None, None),
     )
     .await;
     assert_eq!(
-        by_sub, by_username,
-        "the username and the sub name ONE stored user: got {by_sub} and {by_username}"
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: expected a 400 UserNotFoundException, got {status} with {payload}"
     );
 }
 

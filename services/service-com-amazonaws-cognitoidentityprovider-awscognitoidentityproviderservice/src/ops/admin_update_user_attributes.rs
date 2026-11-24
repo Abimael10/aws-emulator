@@ -7,8 +7,8 @@
 //!
 //! * The pool is named by `UserPoolId` and the user by `Username`, which "is
 //!   typically your user's username, but it can be any of their alias
-//!   attributes" or "the sub of a local user" (this operation's own
-//!   documentation) — how [`crate::state::UserPool::user`] resolves one. An
+//!   attributes" (this operation's own documentation) — how
+//!   [`crate::state::UserPool::user`] resolves one. An
 //!   absent pool answers `ResourceNotFoundException` and an absent user
 //!   `UserNotFoundException`.
 //! * What the submitted list does to that user is
@@ -472,17 +472,18 @@ fn user_not_found() -> AdminUpdateUserAttributesError {
 fn refused(refusal: crate::state::AttributeUpdateRefusal) -> AdminUpdateUserAttributesError {
     match refusal {
         crate::state::AttributeUpdateRefusal::Invalid(message) => invalid_parameter(message),
-        crate::state::AttributeUpdateRefusal::AliasTaken(name) => alias_exists(&name),
+        crate::state::AttributeUpdateRefusal::AliasTaken(_) => alias_exists(),
     }
 }
 
 /// This operation's `AliasExistsException` for a value another user of the pool
-/// already holds as its alias. The message names the attribute the request
-/// submitted and no stored value, so it reports which submitted value collided
-/// without disclosing whose.
-fn alias_exists(name: &str) -> AdminUpdateUserAttributesError {
+/// already holds as its alias, carrying the fixed sentence Amazon Cognito states
+/// such a refusal in ([`crate::state::ALIAS_EXISTS_MESSAGE`]) — which names
+/// neither the attribute the request submitted nor the account that holds the
+/// alias.
+fn alias_exists() -> AdminUpdateUserAttributesError {
     AdminUpdateUserAttributesErrorModeled::AliasExistsException(AliasExistsException {
-        message: Some(format!("An account with the given {name} already exists.")),
+        message: Some(crate::state::ALIAS_EXISTS_MESSAGE.to_string()),
     })
     .into()
 }

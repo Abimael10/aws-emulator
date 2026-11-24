@@ -563,10 +563,10 @@ const MIXED_CASE_USERNAME: &str = "Mixed.Case-User";
 /// RULE: the confirmation resolves the `Username` the named pool resolves it
 /// to — the stored username under that pool's own case comparison
 /// (`UsernameConfigurationType.CaseSensitive`, from
-/// `smithy_query(query="shape",shape="UsernameConfigurationType")`), or the
-/// user's `sub`, which `UsernameType` documents as what the value "must be" when
-/// it is not a username or an alias — and refuses any other string as an absent
-/// user.
+/// `smithy_query(query="shape",shape="UsernameConfigurationType")`) — and refuses
+/// any other string as an absent user, the user's own `sub` included: that value
+/// is the id the pool stores as an attribute of the user rather than a name in
+/// its username namespace.
 #[tokio::test]
 async fn the_confirmation_resolves_the_user_the_named_pool_resolves() {
     let engine = engine();
@@ -593,7 +593,7 @@ async fn the_confirmation_resolves_the_user_the_named_pool_resolves() {
             "a case-sensitive pool, named by the user's immutable id",
             Some(true),
             Naming::Sub,
-            true,
+            false,
         ),
         (
             "a case-sensitive pool, named upper-cased",
@@ -629,7 +629,7 @@ async fn the_confirmation_resolves_the_user_the_named_pool_resolves() {
             "a case-insensitive pool, named by the user's immutable id",
             Some(false),
             Naming::Sub,
-            true,
+            false,
         ),
     ];
 

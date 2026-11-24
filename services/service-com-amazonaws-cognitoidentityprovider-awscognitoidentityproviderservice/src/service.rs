@@ -231,6 +231,20 @@ const USER_ATTRIBUTES_MEMBER_PATH: &str = "userAttributes";
 /// `AttributeValueType`, `@length` max 2048), as the framework spells a member path.
 const ATTRIBUTE_VALUE_MEMBER_PATH: &str = "value";
 
+/// The operations that address a user pool BY ITS ARN alone: the two tag writers and the
+/// tag reader
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource")`,
+/// each carrying `ResourceArn` as an `ArnType`). Amazon Cognito reads that value as a
+/// user-pool ARN itself and reports a value it cannot read one out of as the invalid
+/// user-pool ARN it is ([`crate::state::invalid_user_pool_arn_message`]), so a submitted
+/// value outside the member's declared EXPRESSION, and one under its minimum length, are
+/// served through to the handler (see [`served_despite`]).
+const TAGGING_OPERATIONS: [&str; 3] = ["TagResource", "UntagResource", "ListTagsForResource"];
+
+/// The validation path of the `ResourceArn` member those operations name the pool in, as the
+/// framework spells a member path.
+const RESOURCE_ARN_MEMBER_PATH: &str = "resourceArn";
+
 /// The `com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -739,6 +753,17 @@ fn absent_user_pool_id_sentence<'v>(
 /// (`crate::state::plan_attribute_update`), which has the submitted pairs and the pool's
 /// schema. Only that one member of those operations: every other value past a declared
 /// maximum keeps the constraint report.
+/// A fifth is the `ResourceArn` one of the tagging operations addresses a pool by
+/// ([`TAGGING_OPERATIONS`]): Amazon Cognito reads that value as a user-pool ARN itself
+/// rather than holding it to the FORM `ArnType` declares, and reports one it cannot read as
+/// the invalid user-pool ARN it is ([`crate::state::invalid_user_pool_arn_message`]) — a
+/// sentence that names the resource the service was asked about, where the constraint walk
+/// can only state the member position and the expression the value missed. So a value
+/// outside the member's expression, and one under its minimum length, are served through to
+/// the handler, which reads the ARN. Its declared MAXIMUM still stands: the handler quotes
+/// the value it could not read back in that sentence, so a value past the ceiling an ARN may
+/// have keeps the constraint walk's own refusal — which bounds what a refusal of this
+/// service carries — and a request that omits the member carries no value to read at all.
 fn served_despite(operation: &str, violation: &Violation) -> bool {
     let presented_value = !matches!(violation.kind, ViolationKind::MissingRequiredMember);
     (operation == DESCRIBE_USER_POOL_DOMAIN
@@ -747,6 +772,12 @@ fn served_despite(operation: &str, violation: &Violation) -> bool {
         || (operation == GET_CLIENT_TOKEN
             && violation.path == SECRET_MEMBER_PATH
             && presented_value)
+        || (TAGGING_OPERATIONS.contains(&operation)
+            && violation.path == RESOURCE_ARN_MEMBER_PATH
+            && matches!(
+                violation.kind,
+                ViolationKind::Pattern(_) | ViolationKind::MinLength(_)
+            ))
         || (operation == LIST_USER_POOL_CLIENTS
             && violation.path == MAX_RESULTS_MEMBER_PATH
             && matches!(violation.kind, ViolationKind::MinValue(_)))

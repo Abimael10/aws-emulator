@@ -380,6 +380,12 @@ struct Creating {
     /// The invitation this create sends once the account is stored, or `None` where it
     /// sends none.
     invitation: Option<Invitation>,
+    /// The OTHER users this create takes an alias value away from, as `(storage key,
+    /// verified flag)`: the alias each held is the new account's now, so the flag that
+    /// made it theirs no longer vouches for anything
+    /// (`AdminCreateUser.ForceAliasCreation`). Empty for a create that migrates nothing,
+    /// which is every create that claims no held alias value.
+    migrations: Vec<(String, &'static str)>,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<Eng> {
@@ -627,10 +633,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         // just the key the name would be stored under: "the username can't be a
         // duplicate of another username in the same user pool"
         // (`AdminCreateUser.Username`), and a `Username` "can be any of their alias
-        // attributes ... [or] the sub of a local user"
-        // (`AdminGetUser.Username`) — so a name the pool already resolves to a user
-        // (its username, its `sub`, or a value of one of the pool's sign-in or alias
-        // attributes that currently names it) names that user here too
+        // attributes" (`AdminGetUser.Username`) — so a name the pool already
+        // resolves to a user (its username, a federated username linked to it, or
+        // a value of one of the pool's sign-in or alias attributes that currently
+        // names it) names that user here too
         // ([`crate::state::UserPool::user_storage_key`]). A create under such a name
         // is the duplicate this operation refuses, and a resend addresses the user it
         // resolves to.
@@ -683,10 +689,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         // an email address or phone number as a username when they sign up" (this
         // service's model), and either way the value resolves one user
         // ([`crate::state::UserPool::sign_in_name_holder_key`]). So a create that
-        // would hand a second user a sign-in value another user already answers to is
-        // the same duplicate as a create under a taken name, and this operation —
-        // which models no `AliasExistsException` — reports the account that exists.
+        // would hand a second user a sign-in value another user already answers to
+        // either MIGRATES that value to the new account or is refused as the
+        // duplicate it is: "if this parameter is set to `True` and the phone number
+        // or email address specified in the `UserAttributes` parameter already exists
+        // as an alias with a different user, the API call will migrate the alias from
+        // the previous user to the newly created user. The previous user will no
+        // longer be able to log in using that alias. If this parameter is set to
+        // `False`, the API throws an `AliasExistsException` error if the alias already
+        // exists" (`AdminCreateUser.ForceAliasCreation`) — and this operation, which
+        // models no `AliasExistsException`, reports the account that exists.
         // An empty value is stored for no user at all, so it takes nothing.
+        //
+        // Only an ALIAS of the pool can move: an `email` or a `phone_number` is its
+        // holder's alias while that holder's verified flag vouches for the value
+        // ([`crate::state::verified_flag`]), so taking the flag away is what takes the
+        // alias away. A value of a `UsernameAttributes` attribute IS the other user's
+        // sign-in name rather than an alias of it, and an alias attribute carrying no
+        // such flag has nothing to take away, so neither moves however this request
+        // asks: both stay the duplicate this operation refuses.
         //
         // Asked of the DISTINCT attributes the pool signs users in with: `AliasAttributes`
         // takes `AliasAttributeType` values and `UsernameAttributes` takes
@@ -701,16 +722,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             .chain(pool.username_attributes.iter())
             .map(String::as_str)
             .collect();
-        let claims_a_held_sign_in_value = sign_in_attributes.iter().any(|name| {
-            requested_attributes
+        let mut migrations: Vec<(String, &'static str)> = Vec::new();
+        for name in &sign_in_attributes {
+            let Some(value) = requested_attributes
                 .iter()
                 .find(|attribute| attribute.name == **name)
                 .and_then(|attribute| attribute.value.as_deref())
                 .filter(|value| !value.is_empty())
-                .is_some_and(|value| pool.sign_in_name_holder_key(value).is_some())
-        });
-        if claims_a_held_sign_in_value {
-            return Err(username_exists());
+            else {
+                continue;
+            };
+            let Some(holder) = pool.sign_in_name_holder_key(value) else {
+                continue;
+            };
+            let movable_alias = pool
+                .is_alias_attribute(name)
+                .then(|| crate::state::verified_flag(name))
+                .flatten();
+            match movable_alias {
+                Some(flag) if input.force_alias_creation => migrations.push((holder, flag)),
+                _ => return Err(username_exists()),
+            }
         }
         // This emulator holds a pool's users in memory, so the store is bounded.
         if pool.users.len() >= crate::state::MAX_USERS_PER_POOL {
@@ -812,6 +844,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 }),
             user,
             dispatch,
+            migrations,
             registration,
         })))
     }
@@ -875,6 +908,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             user_pool_id,
             key,
             mut user,
+            migrations,
             registration,
             ..
         } = creating;
@@ -891,6 +925,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         // it is before the function is asked.
         if pool.users.contains_key(&key) {
             return Err(username_exists());
+        }
+        // The migrated alias is no longer the previous holders': each value stays, but the
+        // flag that made it an alias no longer vouches for it, so the value names this
+        // account alone (`AdminCreateUser.ForceAliasCreation`). A holder another call
+        // removed in the meantime has nothing left to lose.
+        for (holder_key, flag) in &migrations {
+            if let Some(previous) = pool.users.get_mut(holder_key) {
+                previous
+                    .attributes
+                    .insert((*flag).to_string(), crate::state::FLAG_UNCONFIRMED.to_string());
+                previous.user_last_modified_date = user.user_last_modified_date;
+            }
         }
         pool.users.insert(key.clone(), user);
 
