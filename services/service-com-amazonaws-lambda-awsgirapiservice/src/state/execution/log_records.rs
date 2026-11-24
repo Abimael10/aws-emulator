@@ -496,20 +496,22 @@ fn platform_record(message: &str) -> Option<(String, ::serde_json::Value)> {
 ///
 /// The system level sends "system logs at the selected level of detail and lower, where
 /// `DEBUG` is the highest level and `WARN` is the lowest", so each kind sits at the level the
-/// detail IT carries is stated at. What EVERY invocation is reported by — that one happened,
-/// and what it spent — is the envelope of the run, stated at the middle level; the records of
-/// one PHASE inside that envelope (the initialization of the execution environment starting,
-/// the runtime reporting a phase of its own done, and that phase's report) and the record that
-/// closes the runtime's work on the invocation are the DETAIL of how the run was served, which
-/// only the highest level admits; and a record about a log Lambda could not deliver is a
-/// warning about the log itself, which even the lowest level admits.
+/// detail IT carries is stated at. What a client is reported every unit of work by — that an
+/// execution environment was built, that an invocation happened, and what that invocation
+/// spent — is the ENVELOPE of the work: the record that OPENS an environment's log, the one
+/// that opens an invocation's, and the invocation's own report, all stated at the middle level.
+/// The records that CLOSE a phase INSIDE that envelope (the runtime reporting its half of the
+/// initialization done, that phase's own report, and the record that closes the runtime's work
+/// on the invocation) are the DETAIL of how the work was served, which only the highest level
+/// admits; and a record about a log Lambda could not deliver is a warning about the log itself,
+/// which even the lowest level admits.
 ///
 /// Source: the levels AWS states for the system records of a run
 /// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>,
 /// the page the sentence above is on), against the platform record kinds this module writes
 /// ([`init_start`], [`init_done`], [`start`], [`runtime_done`], [`report`]).
 const PLATFORM_RECORD_LEVELS: &[(&str, &str)] = &[
-    ("platform.initStart", "DEBUG"),
+    ("platform.initStart", "INFO"),
     ("platform.initRuntimeDone", "DEBUG"),
     ("platform.initReport", "DEBUG"),
     ("platform.start", "INFO"),
@@ -964,13 +966,12 @@ mod tests {
 
     /// RULE: `SystemLogLevel` filters the PLATFORM records of a run independently of the level
     /// the application records are filtered at, and each platform record is judged at the level
-    /// of what IT reports — the frames that state an invocation happened and what it spent at
-    /// the level of that envelope, the records of one phase of the environment and of the
-    /// runtime's work on the invocation at the level their detail is stated at, and a record of
-    /// a run that did not succeed as a warning about that run — one row per level the model
-    /// declares for it, at and around each record's own level, the records that close a run for
-    /// every outcome a run comes to, plus an application record, which this filter never
-    /// withholds.
+    /// of what IT reports — the frames that state an execution environment was built, that an
+    /// invocation happened and what it spent at the level of that envelope, the records that
+    /// close a phase inside it at the level their detail is stated at, and a record of a run
+    /// that did not succeed as a warning about that run — one row per level the model declares
+    /// for it, at and around each record's own level, the records that close a run for every
+    /// outcome a run comes to, plus an application record, which this filter never withholds.
     #[test]
     fn a_platform_record_is_sent_only_at_the_selected_system_level_and_lower() {
         let completion = Completion::Returned("{}".to_string());
@@ -1002,10 +1003,10 @@ mod tests {
                 true,
             ),
             (
-                "the same frame one level lower in detail than the phase records it belongs to",
+                "the same frame at the level the envelope of a unit of work is stated at",
                 init_start(true, at(), &initializing("on-demand")),
                 Some("INFO"),
-                false,
+                true,
             ),
             (
                 "the frame that opens an invocation, at its own level",

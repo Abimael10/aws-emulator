@@ -462,8 +462,9 @@ async fn the_application_log_level_decides_which_records_reach_cloudwatch_logs()
         // Whatever the APPLICATION filter withholds, the platform's own frames of the run are
         // delivered: the group and its stream exist for every invocation. Which of them reach
         // it is the other level's doing — these rows name none, so they are filtered at the
-        // documented default, which admits the two frames that state the invocation happened
-        // and what it spent ([`crate::invocation_system_record_levels`] owns that rule).
+        // documented default, which admits the three frames that state the execution
+        // environment was built, that the invocation happened and what it spent
+        // ([`crate::invocation_system_record_levels`] owns that rule).
         let frames: Vec<String> = lines
             .iter()
             .filter_map(|line| record(line))
@@ -476,7 +477,11 @@ async fn the_application_log_level_decides_which_records_reach_cloudwatch_logs()
             .collect();
         assert_eq!(
             frames,
-            vec!["platform.start".to_string(), "platform.report".to_string()],
+            vec![
+                "platform.initStart".to_string(),
+                "platform.start".to_string(),
+                "platform.report".to_string()
+            ],
             "case {case:?}: expected the frames the default system level admits, got {frames:?} \
              out of {lines:?}"
         );

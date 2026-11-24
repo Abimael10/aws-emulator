@@ -88,13 +88,18 @@ const EVERY_PLATFORM_KIND: [&str; 6] = [
 ];
 
 /// The kinds a function filtered at the DOCUMENTED DEFAULT system level is sent: the envelope
-/// every invocation is reported by — that one happened, and what it spent. The records of the
-/// environment's phases and the one closing the runtime's work on the invocation state the
-/// detail of HOW the run was served, which the level above alone admits.
+/// every unit of work is reported by — that the execution environment was built, that an
+/// invocation happened, and what it spent. The records that CLOSE a phase inside that envelope,
+/// and the one closing the runtime's work on the invocation, state the detail of HOW the run was
+/// served, which the level above alone admits.
 ///
 /// Source: the levels AWS states for the system records of a run
 /// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>).
-const ENVELOPE_PLATFORM_KINDS: [&str; 2] = ["platform.start", "platform.report"];
+const ENVELOPE_PLATFORM_KINDS: [&str; 3] = [
+    "platform.initStart",
+    "platform.start",
+    "platform.report",
+];
 
 /// The node handler the node rows deploy. It reports the same text four ways, so one row shows
 /// every form of write the rule distinguishes:

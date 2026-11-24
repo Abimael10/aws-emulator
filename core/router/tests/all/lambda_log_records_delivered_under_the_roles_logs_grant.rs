@@ -103,16 +103,16 @@ pub(crate) const JSON_FORMAT: &str = "JSON";
 const TEXT_RECORDS_PER_RUN: usize = 5;
 
 /// How many it leaves under the structured format, whose system records are filtered at the
-/// documented default level: the two frames that state the invocation happened and what it spent,
-/// and the handler's own line. The records of the environment's phases and the one closing the
-/// runtime's work on the invocation state the DETAIL of how the run was served, which only the
-/// most detailed level is sent — [`crate::lambda_log_record_framing_and_system_level`] owns which
-/// level admits which record.
-const JSON_RECORDS_PER_RUN: usize = 3;
+/// documented default level: the three frames that state the execution environment was built,
+/// that the invocation happened and what it spent, and the handler's own line. The records that
+/// CLOSE a phase inside that envelope, and the one closing the runtime's work on the invocation,
+/// state the DETAIL of how the run was served, which only the most detailed level is sent —
+/// [`crate::lambda_log_record_framing_and_system_level`] owns which level admits which record.
+const JSON_RECORDS_PER_RUN: usize = 4;
 
 /// How many of the records of a structured run the PLATFORM writes itself, which are the platform
-/// records a client parses: the two frames the default level admits.
-const JSON_PLATFORM_RECORDS_PER_RUN: usize = 2;
+/// records a client parses: the three frames the default level admits.
+const JSON_PLATFORM_RECORDS_PER_RUN: usize = 3;
 
 /// The python handler every python row deploys: it prints the marker the event carries and
 /// answers it, so the record it wrote can be told from any other row's.

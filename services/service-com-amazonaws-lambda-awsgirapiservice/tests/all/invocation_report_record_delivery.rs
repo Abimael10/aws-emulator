@@ -47,17 +47,18 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// model's `SystemLogLevel` enum declares (`DEBUG | INFO | WARN`).
 const SYSTEM_LOG_LEVELS: [&str; 3] = ["DEBUG", "INFO", "WARN"];
 
-/// The level each KIND of platform record of an ordinary run is stated at: the two frames that
-/// state an invocation happened and what it spent are the envelope every invocation is reported
-/// by, while the records of one phase of the execution environment and the record that closes
-/// the runtime's work on the invocation are the DETAIL of how the run was served, which only the
-/// most detailed level admits.
+/// The level each KIND of platform record of an ordinary run is stated at: the three frames that
+/// state an execution environment was built, that an invocation happened and what it spent are
+/// the envelope every unit of work is reported by, while the records that CLOSE a phase inside
+/// that envelope — the runtime's half of the initialization, that phase's own report, and the
+/// record that closes the runtime's work on the invocation — are the DETAIL of how the run was
+/// served, which only the most detailed level admits.
 ///
 /// Source: the levels AWS states for the system records of a run
 /// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>),
 /// against the records one run of this function leaves.
 const RECORD_LEVELS: [(&str, &str); 6] = [
-    ("platform.initStart", "DEBUG"),
+    ("platform.initStart", "INFO"),
     ("platform.initRuntimeDone", "DEBUG"),
     ("platform.initReport", "DEBUG"),
     ("platform.start", "INFO"),

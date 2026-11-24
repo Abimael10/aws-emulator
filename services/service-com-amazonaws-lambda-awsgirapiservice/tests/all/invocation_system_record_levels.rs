@@ -6,13 +6,14 @@
 //! RULE: `LoggingConfig$SystemLogLevel` is "set this property to filter the system logs for your
 //! function that Lambda sends to CloudWatch. Lambda only sends system logs at the selected level
 //! of detail and lower, where `DEBUG` is the highest level and `WARN` is the lowest", and each
-//! platform record is judged at the level ITS OWN KIND is stated at: the two frames that state
-//! that an invocation happened and what it spent are the envelope every invocation is reported
-//! by, stated at the middle level, while the records of one PHASE of the execution environment
-//! and the record that closes the runtime's work on the invocation state the DETAIL of how the
-//! run was served and are stated at the most detailed level. So a record more detailed than the
-//! selected level is withheld even though the run wrote it: the filter is on what Lambda SENDS,
-//! which the invocation's own log tail — the whole log the run wrote — is the independent
+//! platform record is judged at the level ITS OWN KIND is stated at: the three frames that state
+//! that an execution environment was built, that an invocation happened and what it spent are the
+//! envelope every unit of work is reported by, stated at the middle level, while the records that
+//! CLOSE a phase inside that envelope — the runtime's half of the initialization, that phase's own
+//! report, and the record that closes the runtime's work on the invocation — state the DETAIL of
+//! how the run was served and are stated at the most detailed level. So a record more detailed
+//! than the selected level is withheld even though the run wrote it: the filter is on what Lambda
+//! SENDS, which the invocation's own log tail — the whole log the run wrote — is the independent
 //! statement of. It is applied independently of `ApplicationLogLevel`, which governs the
 //! handler's own records alone.
 //!
@@ -56,7 +57,7 @@ const DEFAULT_SYSTEM_LOG_LEVEL: &str = "INFO";
 /// (<https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-log-level.html>),
 /// against the records one COLD run of a function leaves.
 const RECORD_LEVELS: [(&str, &str); 6] = [
-    ("platform.initStart", "DEBUG"),
+    ("platform.initStart", "INFO"),
     ("platform.initRuntimeDone", "DEBUG"),
     ("platform.initReport", "DEBUG"),
     ("platform.start", "INFO"),
