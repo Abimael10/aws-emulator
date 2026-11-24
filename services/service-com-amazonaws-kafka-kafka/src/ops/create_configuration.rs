@@ -253,18 +253,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `KafkaVersions` enumerates the Apache Kafka versions this configuration
-        // may be applied to, so every entry has to BE one of the versions this
-        // service publishes — the one catalogue `ListKafkaVersions` reports and
-        // every other version-aware operation answers from. Checked before the
-        // lock, and so before anything is stored: a list carrying an unknown entry
-        // registers no configuration at all, whichever position it is in. The
-        // FIRST offending entry is the one the refusal names, followed by the
-        // versions the service does offer — the actionable half of the sentence.
+        // may be applied to, so every entry has to be one of the versions this
+        // service TAKES for a configuration — a narrower set than the catalogue
+        // `ListKafkaVersions` publishes, which goes on publishing a version the
+        // service no longer takes for a new resource. Checked before the lock, and
+        // so before anything is stored: a list carrying an entry outside that
+        // offering registers no configuration at all, whichever position it is in.
+        // The FIRST offending entry is the one the refusal names, followed by the
+        // versions the service does offer — the actionable half of the sentence,
+        // and the very set this gate admits.
         let unknown = input
             .kafka_versions
             .iter()
             .flatten()
-            .find(|version| crate::state::kafka_version_index(version).is_none());
+            .find(|version| !crate::state::is_configuration_kafka_version(version));
         if let Some(unknown) = unknown {
             return Err(
                 CreateConfigurationErrorModeled::BadRequestException(BadRequestException {

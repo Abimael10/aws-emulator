@@ -49,17 +49,26 @@ pub const KAFKA_VERSION_VARIANT_TIERED: &str = "tiered";
 /// Source: the Amazon MSK Developer Guide, "Supported Apache Kafka versions"
 /// (<https://docs.aws.amazon.com/msk/latest/developerguide/supported-kafka-versions.html>),
 /// which lists the versions MSK offers, the variants it offers them in (the
-/// `.kraft` metadata-mode lines, the `.tiered` storage line) and the ones it has
-/// deprecated, together with the catalog the service itself publishes, which this
-/// table reproduces ROW FOR ROW. A deprecated version is still a valid SOURCE
-/// version — a cluster already running it can be upgraded away from it — but
-/// never a target.
+/// `.kraft` metadata-mode lines, the `.tiered` storage line, the `link` line) and
+/// the ones it has deprecated, together with the catalog the service itself
+/// publishes, which this table reproduces ROW FOR ROW. A deprecated version is
+/// still a valid SOURCE version — a cluster already running it can be upgraded
+/// away from it — but never a target.
 ///
 /// Nothing outside that catalog belongs here: a version string the service does
 /// not publish names no broker software, so this table holds EXACTLY the versions
-/// MSK publishes and no spelling of its own. Every version gate reads this table
-/// ([`kafka_version_index`]), so an entry the service does not publish would be
-/// accepted by a create and advertised as retryable by a refusal.
+/// MSK publishes and no spelling of its own. Nothing is MISSING from it either: a
+/// row the service publishes and this table drops is a version a client cannot
+/// discover, and the rows are what `ListKafkaVersions` and the published
+/// compatibility matrix serve.
+///
+/// Publishing a row is NOT admitting a version. Which versions an operation takes
+/// for a new resource is that operation's own recorded offering — a
+/// configuration's ([`valid_kafka_versions`]) and a broker category's
+/// ([`new_cluster_kafka_versions`]) — and each is narrower than this catalog,
+/// which goes on publishing a version after the service has stopped taking it. So
+/// a row added here is published without becoming a value any create accepts, and
+/// an offering never names a version this table does not publish.
 ///
 /// A row is a version together with ONE status the service publishes it under,
 /// and a version may be published on MORE THAN ONE row: the guide lists a
@@ -117,6 +126,12 @@ pub const KAFKA_VERSION_CATALOG: &[KafkaVersionEntry] = &[
     KafkaVersionEntry { version: "3.7.x.kraft", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.8.x", status: KAFKA_VERSION_ACTIVE },
     KafkaVersionEntry { version: "3.8.x.kraft", status: KAFKA_VERSION_ACTIVE },
+    // The `link` line of that same release: a spelling the service publishes a
+    // row for and has deprecated, on no upgradable line of its own
+    // ([`KafkaVersionLine::Other`]). It is published and nothing more — no
+    // operation takes it for a new resource — which is why publishing it is a row
+    // of this table and never a widening of a gate.
+    KafkaVersionEntry { version: "3.8.link", status: KAFKA_VERSION_DEPRECATED },
     // The deprecation row of a version the catalog also publishes as offered,
     // ahead of the row offering it and beside it: the LAST row the catalog
     // publishes for a version carries the status the service offers that version
@@ -318,8 +333,14 @@ pub fn kafka_version_release(version: &str) -> Vec<u32> {
 }
 
 /// Where `version` is FIRST published in [`KAFKA_VERSION_CATALOG`], or `None`
-/// when MSK knows no such version — the membership lookup every version gate
-/// reads, which is about the version and not about any one of its rows.
+/// when MSK knows no such version — the PUBLICATION lookup, which is about the
+/// version and not about any one of its rows.
+///
+/// Publication is not admission: whether an operation TAKES a version is that
+/// operation's own recorded offering ([`valid_kafka_versions`],
+/// [`new_cluster_kafka_versions`]), which is narrower. This answers only whether
+/// the service publishes the version at all, which is what narrows those
+/// offerings to versions a reader of this service knows.
 ///
 /// A pagination token does NOT resolve through this: a version string names a
 /// version and not a position, and a page resumes after a row
@@ -359,10 +380,20 @@ pub fn kafka_version_status(version: &str) -> Option<&'static str> {
     published
 }
 
-/// The order Amazon MSK names the Apache Kafka versions in when the
-/// unsupported-version refusal below reports which versions ARE valid.
+/// The Apache Kafka versions Amazon MSK takes for a CONFIGURATION, in the order
+/// it names them in when it refuses one it does not take
+/// ([`unsupported_kafka_version_message`]).
 ///
-/// That sequence is the service's OWN: it is not sorted by release, and it is
+/// A THIRD fact about a version, beside its membership of the published catalog
+/// and the lifecycle status that catalog publishes it under — the same kind of
+/// fact as a broker category's new-cluster offering
+/// ([`KAFKA_VERSIONS_FOR_A_NEW_CLUSTER`]) and recorded the same way: an
+/// operation's offering is NARROWER than the catalog, so a row the catalog
+/// publishes is published and nothing more. A version the service publishes but
+/// does not take here — a variant line it has retired, say — is refused by this
+/// operation while `ListKafkaVersions` goes on publishing its row.
+///
+/// The sequence is the service's OWN: it is not sorted by release, and it is
 /// not the order the catalog publishes its rows in ([`KAFKA_VERSION_CATALOG`],
 /// which `ListKafkaVersions` pages and which ascends by release) — it names the
 /// newest KRaft releases and the variant lines first and the oldest release
@@ -370,12 +401,11 @@ pub fn kafka_version_status(version: &str) -> Option<&'static str> {
 /// service states it in that message, rather than being assumed to be the
 /// catalog's.
 ///
-/// Source: the sequence the service itself renders in this refusal. It is an
-/// ORDER and not a second catalog: which versions the refusal names is still
-/// read from [`KAFKA_VERSION_CATALOG`] ([`valid_kafka_versions`]), so a version
-/// the catalog gains or loses is gained or lost in the refusal too, and a name
-/// here that the catalog does not publish names nothing.
-const KAFKA_VERSION_VALID_VALUE_ORDER: &[&str] = &[
+/// Source: the list the service itself renders in this refusal, which is both
+/// the set this operation admits and the order it names it in. Only versions the
+/// catalog publishes are offered ([`valid_kafka_versions`]), so a name here that
+/// the catalog does not publish names nothing.
+const KAFKA_VERSIONS_FOR_A_CONFIGURATION: &[&str] = &[
     "4.2.x.kraft",
     "4.1.x.kraft",
     "2.8.2.tiered",
@@ -412,36 +442,43 @@ const KAFKA_VERSION_VALID_VALUE_ORDER: &[&str] = &[
     "1.1.1",
 ];
 
-/// The versions the unsupported-version refusal reports as valid, in the order
-/// the service names them in that message.
+/// The versions a configuration may name, as the unsupported-version refusal
+/// lists them: the versions the service takes for a configuration
+/// ([`KAFKA_VERSIONS_FOR_A_CONFIGURATION`]), narrowed to the ones the catalog
+/// really publishes, each named once.
 ///
-/// The SET is the catalog's ([`catalogued_kafka_versions`]) — exactly the set the
-/// gate this refusal comes from admits ([`kafka_version_index`]), each version
-/// once — and the ORDER is the service's published sequence for this list
-/// ([`KAFKA_VERSION_VALID_VALUE_ORDER`]). A catalogued version that sequence does
-/// not name follows the ones it does, in catalog order, so a version the catalog
-/// gains is still advertised as retryable; a name in the sequence the catalog
-/// does not publish is dropped, so the list never offers a version the gate
-/// refuses.
+/// This is BOTH the admission gate of that create and the valid-value list its
+/// refusal carries ([`is_configuration_kafka_version`]), so the set a client is
+/// told to retry with is exactly the set the next request is admitted on — a
+/// list wider than the gate would name a value the same request is refused a
+/// second time, and a narrower one would hide a value it accepts.
+///
+/// Narrowing to the catalog is what keeps the list from offering a version no
+/// reader of this service knows; it never WIDENS the offering, so a row the
+/// catalog gains is published without becoming a version a configuration may
+/// name.
 ///
 /// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
 pub fn valid_kafka_versions() -> &'static [&'static str] {
     static ORDERED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-        let published = catalogued_kafka_versions();
-        let mut ordered: Vec<&'static str> = KAFKA_VERSION_VALID_VALUE_ORDER
+        KAFKA_VERSIONS_FOR_A_CONFIGURATION
             .iter()
-            .filter(|version| published.contains(*version))
+            .filter(|version| kafka_version_index(version).is_some())
             .copied()
-            .collect();
-        ordered.extend(
-            published
-                .iter()
-                .filter(|version| !KAFKA_VERSION_VALID_VALUE_ORDER.contains(*version))
-                .copied(),
-        );
-        ordered
+            .collect::<Vec<&'static str>>()
     });
     &ORDERED
+}
+
+/// Whether a configuration may name `version`: whether the service takes it for
+/// a configuration ([`valid_kafka_versions`], which is the very list that
+/// create's refusal advertises).
+///
+/// Not catalog membership ([`kafka_version_index`]): the catalog publishes every
+/// version the service has offered, and an operation's offering is narrower than
+/// what the service publishes, so this is the gate rather than the catalog.
+pub fn is_configuration_kafka_version(version: &str) -> bool {
+    valid_kafka_versions().contains(&version)
 }
 
 /// The sentence Amazon MSK answers a request naming an Apache Kafka version it
@@ -451,16 +488,16 @@ pub fn valid_kafka_versions() -> &'static [&'static str] {
 /// [`valid_kafka_versions`] in the order the service publishes that list.
 ///
 /// The listed set is exactly the set the check this refusal comes from admits
-/// ([`kafka_version_index`]): every version the catalog publishes, a deprecated
-/// one included, since a configuration may name a version existing clusters
-/// still run. A list narrower than the gate would name a value the same request
-/// is accepted with, which is worse than no list at all. Each version is named
-/// ONCE, however many rows the catalog publishes it under: the list answers which
-/// versions are valid, not how the catalog is published.
+/// ([`is_configuration_kafka_version`]): the versions the service takes for a
+/// configuration, a deprecated one included, since a configuration may name a
+/// version existing clusters still run. A list wider or narrower than the gate
+/// would name a value the same request is refused with, or hide one it accepts.
+/// Each version is named ONCE, however many rows the catalog publishes it under:
+/// the list answers which versions are valid, not how the catalog is published.
 ///
-/// The valid-value list is the actionable half of this refusal, so it is
-/// derived from the catalog rather than written out: a version the catalog gains
-/// or loses is gained or lost here too.
+/// The valid-value list is the actionable half of this refusal, so it is read
+/// from the offering rather than written out here: a version that offering gains
+/// or loses is gained or lost in this sentence too.
 pub fn unsupported_kafka_version_message(rejected: &str) -> String {
     format!(
         "Unsupported KafkaVersion [{rejected}]. Valid values: [{}]",

@@ -5,25 +5,30 @@
 //! serves from (the shared [`crate::kafka_harness`]).
 //!
 //! The RULE under test: when a request names an Apache Kafka version the service
-//! does not publish, the refusal reports which versions ARE valid as the set the
-//! same gate admits — every version the catalogue `ListKafkaVersions` publishes,
+//! does not take for a configuration, the refusal reports which versions ARE
+//! valid as the set the same gate admits — the versions the service takes,
 //! each named ONCE, and nothing outside it — rendered in the one fixed order the
 //! service names that list in, which is neither sorted by release nor the order
-//! the catalogue pages its rows in.
+//! the catalogue pages its rows in. That set is a SUBSET of the catalogue
+//! `ListKafkaVersions` publishes: the catalogue goes on publishing a version the
+//! service no longer takes for a new configuration, so a published row is not by
+//! itself a value this create accepts.
 //!
 //! Each suite asserts that over a TABLE whose rows differ along what the rule
 //! generalises over: the FORM of the rejected value (a release newer than every
 //! published one, a name that never existed, a truncated and an extended release,
 //! a padded and an empty entry, a variant spelling of a published release that
-//! the service does not publish, a case-folded one), its POSITION in the
-//! submitted list, and how many entries the list carries. The second suite walks
-//! the advertised list EXHAUSTIVELY — every version it names — because the rule
+//! the service does not publish, a case-folded one, a row the catalogue does
+//! publish but this operation does not take), its POSITION in the submitted
+//! list, and how many entries the list carries. The second suite walks the
+//! advertised list EXHAUSTIVELY — every version it names — because the rule
 //! there is an invariant: a version the refusal advertises as retryable is one
 //! the same request is then accepted with.
 //!
-//! The ORDER is pinned by this suite's own hand-written sequence, and the
-//! MEMBERSHIP against the catalogue the service publishes on the wire, so neither
-//! half of the list is asserted against the helper that builds it.
+//! The ORDER is pinned by this suite's own hand-written sequence, the MEMBERSHIP
+//! against the list the refusal itself advertises on the wire, and the
+//! containment against the catalogue the service publishes, so no half of the
+//! list is asserted against the helper that builds it.
 
 use serde_json::json;
 
@@ -35,11 +40,12 @@ use crate::kafka_harness::{pct, ConfigurationRequest, Emulator, Reply};
 /// NEITHER ascending by release NOR the order `ListKafkaVersions` pages its rows
 /// in.
 ///
-/// Source: the sequence the service itself renders in this refusal. Written out
-/// here rather than read from the service's own table, so this suite pins the
-/// order instead of the code under test pinning it; the MEMBERSHIP of the
-/// sequence is cross-checked below against the catalogue `ListKafkaVersions`
-/// publishes.
+/// Source: the list the service itself renders in this refusal, which is both the
+/// versions it takes for a configuration and the order it names them in. Written
+/// out here rather than read from the service's own table, so this suite pins the
+/// list instead of the code under test pinning it; it is cross-checked below
+/// against the list the refusal advertises and against the catalogue
+/// `ListKafkaVersions` publishes, which CONTAINS it.
 const VALID_VALUE_ORDER: &[&str] = &[
     "4.2.x.kraft",
     "4.1.x.kraft",
@@ -149,24 +155,42 @@ fn as_set(values: &[String]) -> Vec<String> {
     sorted
 }
 
-/// RULE: a `KafkaVersions` entry the service does not publish is refused HTTP 400
-/// `BadRequestException` naming `kafkaVersions`, and the refusal reports the
-/// FIRST such entry verbatim together with the versions that are valid: every
-/// version the published catalogue holds, each once, in the one fixed order the
+/// RULE: a `KafkaVersions` entry the service does not take for a configuration is
+/// refused HTTP 400 `BadRequestException` naming `kafkaVersions`, and the refusal
+/// reports the FIRST such entry verbatim together with the versions that are
+/// valid: the versions it does take, each once, in the one fixed order the
 /// service names that list in.
 #[tokio::test]
 async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
     let emulator = Emulator::new();
     let published = published_versions(&emulator).await;
 
-    // The hand-written order above must name exactly the versions the service
+    // The hand-written order above must name exactly the versions the refusal
+    // advertises, and every one of them must be a version the catalogue
     // publishes: the expectation below then pins the ORDER against this suite's
-    // sequence and the MEMBERSHIP against the catalogue on the wire.
+    // sequence, the MEMBERSHIP against the list on the wire, and the containment
+    // against the catalogue on the wire.
     let ordered: Vec<String> = VALID_VALUE_ORDER.iter().map(|v| v.to_string()).collect();
+    let probe = create(&emulator, "badver-list-probe", &["9.9.9"]).await;
+    let probe_message = probe.error_message();
     assert_eq!(
         as_set(&ordered),
-        as_set(&published),
-        "case \"the suite's sequence\": it must name exactly the published versions"
+        as_set(&advertised(probe_message, "list-probe")),
+        "case \"the suite's sequence\": it must name exactly the advertised versions"
+    );
+    for version in &ordered {
+        assert!(
+            published.contains(version),
+            "case version={version:?}: an advertised version must be one the catalogue \
+             publishes, got {published:?}"
+        );
+    }
+    // And the containment is strict: the catalogue publishes at least one version
+    // this operation does not take, so the two lists are not the same fact.
+    assert!(
+        published.iter().any(|version| !ordered.contains(version)),
+        "case \"the published catalogue\": it must publish a version the offering omits, \
+         got {published:?}"
     );
 
     let expected_list = VALID_VALUE_ORDER.join(", ");
@@ -188,10 +212,13 @@ async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
         // Variant spellings of releases the catalogue DOES publish, in variants
         // it does not: a spelling is a version of its own, so none of these is a
         // version the service knows.
-        ("unpublished-variant", vec!["3.8.link"], "3.8.link"),
+        ("unpublished-variant", vec!["3.8.kraft"], "3.8.kraft"),
         ("unpublished-tiered", vec!["3.8.x.tiered"], "3.8.x.tiered"),
         ("unpublished-kraft", vec!["4.3.x.kraft"], "4.3.x.kraft"),
-        // Position among entries that ARE published: first, middle, last.
+        // A row the catalogue PUBLISHES and this operation does not take: being
+        // published is not being admitted.
+        ("published-but-not-taken", vec!["3.8.link"], "3.8.link"),
+        // Position among entries that ARE taken: first, middle, last.
         ("first-of-three", vec!["9.9.9", "2.8.1", "3.6.0"], "9.9.9"),
         (
             "middle-of-three",
@@ -257,8 +284,9 @@ async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
 
 /// RULE: the valid-value list and the gate that produced it are the SAME set, so
 /// every version the refusal advertises is one the very same create is accepted
-/// with — and stores that version verbatim — while a version the published
-/// catalogue does not hold is advertised by no refusal and accepted by no create.
+/// with — and stores that version verbatim — while a version outside that list is
+/// advertised by no refusal and accepted by no create, whether the published
+/// catalogue holds a row for it or not.
 ///
 /// Walked EXHAUSTIVELY over the advertised list, which is the whole input space
 /// of the invariant.
@@ -280,12 +308,20 @@ async fn every_advertised_version_is_one_a_create_accepts() {
         "case \"advertised-probe\": expected the published versions, got {listed:?}"
     );
 
-    // The advertised set is the catalogue's, each version named once.
+    // The advertised set is a subset of the catalogue's, each version named once,
+    // and a proper one: the catalogue publishes a row this operation does not
+    // take.
     let published = published_versions(&emulator).await;
-    assert_eq!(
-        as_set(&listed),
-        as_set(&published),
-        "case \"advertised-probe\": the refusal must advertise exactly the published versions"
+    for version in &listed {
+        assert!(
+            published.contains(version),
+            "case version={version:?}: an advertised version must be published, got {published:?}"
+        );
+    }
+    assert!(
+        published.iter().any(|version| !listed.contains(version)),
+        "case \"advertised-probe\": the catalogue must publish a version the offering omits, \
+         got {published:?}"
     );
     let mut distinct = as_set(&listed);
     distinct.dedup();
@@ -328,20 +364,22 @@ async fn every_advertised_version_is_one_a_create_accepts() {
         );
     }
 
-    // And a version the catalogue does not publish is advertised by nothing and
-    // accepted by nothing — including a variant spelling of a release it does
-    // publish, which names a build of its own.
+    // And a version outside the advertised list is advertised by nothing and
+    // accepted by nothing — a variant spelling of a release the catalogue does
+    // publish, which names a build of its own, and a row the catalogue publishes
+    // that this operation does not take.
     for version in ["3.8.link", "3.8.x.tiered", "3.9.x.kraft.link", "9.9.9", "3.9"] {
         assert!(
             !listed.iter().any(|entry| entry == version),
-            "case version={version:?}: an unpublished version must not be advertised, got {listed:?}"
+            "case version={version:?}: a version outside the offering must not be advertised, \
+             got {listed:?}"
         );
         let name = format!("unpublished-{}", version.replace('.', "-"));
         let reply = create(&emulator, &name, &[version]).await;
         assert_eq!(
             (reply.status, reply.error_code()),
             (400, "BadRequestException"),
-            "case version={version:?}: an unpublished version must be refused, got {} {}",
+            "case version={version:?}: a version outside the offering must be refused, got {} {}",
             reply.status,
             reply.body
         );

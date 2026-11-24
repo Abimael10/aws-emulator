@@ -405,31 +405,35 @@ async fn an_unknown_or_malformed_configuration_arn_is_refused() {
 }
 
 /// RULE: `KafkaVersions` names the Apache Kafka versions a configuration may be
-/// applied to, so every entry has to BE a version this service publishes — the
-/// catalogue `ListKafkaVersions` reports. A list carrying an entry that is not is
-/// refused HTTP 400 `BadRequestException` and stores nothing, whichever position
-/// the entry is in, and the refusal states the first such entry together with
-/// the versions the service does publish; a list whose every entry is catalogued
-/// is stored and read back verbatim.
+/// applied to, so every entry has to BE a version this service TAKES for a
+/// configuration — the offering its own refusal advertises, which is narrower
+/// than the catalogue `ListKafkaVersions` publishes. A list carrying an entry
+/// that is not is refused HTTP 400 `BadRequestException` and stores nothing,
+/// whichever position the entry is in, and the refusal states the first such
+/// entry together with the versions the service does take; a list whose every
+/// entry is taken is stored and read back verbatim.
 #[tokio::test]
 async fn kafka_versions_must_name_versions_the_service_publishes() {
     let emulator = Emulator::new();
 
-    // The catalogue is the service's own, so the accepted rows below are taken
+    // The offering is the service's own, so the accepted rows below are taken
     // FROM it rather than written out again: its oldest entry, its newest, a
-    // qualified name and a `.x` patch name, plus the whole catalogue in one list.
-    let oldest = KAFKA_VERSION_CATALOG
-        .first()
-        .expect("the version catalogue is not empty")
-        .version;
-    let newest = KAFKA_VERSION_CATALOG
-        .last()
-        .expect("the version catalogue is not empty")
-        .version;
-    let every_version: Vec<String> = KAFKA_VERSION_CATALOG
+    // qualified name and a `.x` patch name, plus the whole offering in one list.
+    // Read in the order the catalogue publishes its rows, each version once, so
+    // "oldest" and "newest" are the oldest and newest release it takes.
+    let taken: Vec<&'static str> = KAFKA_VERSION_CATALOG
         .iter()
-        .map(|entry| entry.version.to_string())
-        .collect();
+        .map(|entry| entry.version)
+        .filter(|version| valid_kafka_versions().contains(version))
+        .fold(Vec::new(), |mut once, version| {
+            if !once.contains(&version) {
+                once.push(version);
+            }
+            once
+        });
+    let oldest = *taken.first().expect("the version offering is not empty");
+    let newest = *taken.last().expect("the version offering is not empty");
+    let every_version: Vec<String> = taken.iter().map(ToString::to_string).collect();
 
     let accepted: Vec<(&str, Vec<String>)> = vec![
         ("member-omitted", Vec::new()),
@@ -494,6 +498,9 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
     let refused: Vec<(&str, Vec<&str>)> = vec![
         ("only-entry-unknown", vec!["0.0.1-does-not-exist"]),
         ("newer-than-the-catalogue", vec!["9.9.9"]),
+        // A row the catalogue PUBLISHES that this operation does not take: being
+        // published is not being admitted.
+        ("published-but-not-taken", vec!["3.8.link"]),
         ("truncated-patch-name", vec!["3.9"]),
         ("extended-catalogued-name", vec!["3.6.0.9"]),
         ("padded-catalogued-name", vec![" 3.6.0"]),
@@ -529,19 +536,19 @@ async fn kafka_versions_must_name_versions_the_service_publishes() {
             "case {case}: the refusal must name the offending member, got {}",
             reply.body
         );
-        // The message is the service's template over the FIRST uncatalogued
-        // entry and the versions that ARE valid: fixed text, the rejected
-        // version verbatim from the request, and the catalogue in the order the
-        // service publishes this list in — exactly the set this check admits,
-        // deprecated entries included, since a configuration may name a version
-        // clusters still run, and each version named once however many rows the
-        // catalogue publishes it under. That ORDER is pinned against a
-        // hand-written sequence in `crate::configuration_version_valid_values`.
+        // The message is the service's template over the FIRST entry outside the
+        // offering and the versions that ARE valid: fixed text, the rejected
+        // version verbatim from the request, and the versions the service takes
+        // for a configuration in the order it names that list in — exactly the
+        // set this check admits, deprecated entries included, since a
+        // configuration may name a version clusters still run, and each version
+        // named once. That ORDER is pinned against a hand-written sequence in
+        // `crate::configuration_version_valid_values`.
         let message = reply.at("/message").as_str().unwrap_or_default();
         let first_unknown = versions
             .iter()
-            .find(|entry| !KAFKA_VERSION_CATALOG.iter().any(|row| row.version == **entry))
-            .unwrap_or_else(|| panic!("case {case}: the row names no uncatalogued version"));
+            .find(|entry| !valid_kafka_versions().contains(*entry))
+            .unwrap_or_else(|| panic!("case {case}: the row names no version outside the offering"));
         let expected = format!(
             "Unsupported KafkaVersion [{first_unknown}]. Valid values: [{}]",
             valid_kafka_versions().join(", ")
