@@ -315,7 +315,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule and name the member the same way.
         if let Some(message) = crate::state::parameter_identifier_refusal(
             "CacheClusterIdentifier",
-            "Cache Cluster ID",
             &cache_cluster_id,
             crate::state::CLUSTER_ID_MAX_LEN,
         ) {

@@ -8,12 +8,34 @@ use super::*;
 pub const REPLICATION_GROUP_ENGINES: [&str; 2] = [DEFAULT_ENGINE, ENGINE_VALKEY];
 
 /// The largest `NumCacheClusters`, as the member documents it: "The maximum
-/// permitted value for NumCacheClusters is 6 (1 primary plus 5 replicas)."
-pub const MAX_CACHE_CLUSTERS_PER_GROUP: i32 = 6;
+/// permitted value for NumCacheClusters is 6 (1 primary plus 5 replicas)." — the
+/// primary plus the replicas a node group may have, which is why it is derived
+/// from that bound rather than written out a second time.
+pub const MAX_CACHE_CLUSTERS_PER_GROUP: i32 = 1 + MAX_REPLICAS_PER_NODE_GROUP;
 
 /// The largest `ReplicasPerNodeGroup` / `NodeGroupConfiguration$ReplicaCount`,
 /// as `ReplicasPerNodeGroup` documents it: "Valid values are 0 to 5."
 pub const MAX_REPLICAS_PER_NODE_GROUP: i32 = 5;
+
+/// The smallest replica count a node group (shard) may be created with, from the
+/// same sentence: "Valid values are 0 to 5" — a group of the primary alone.
+pub const MIN_REPLICAS_PER_NODE_GROUP: i32 = 0;
+
+/// How ElastiCache refuses a create whose request asks a node group (shard) for a
+/// number of replicas outside the bounds that count documents.
+///
+/// The whole sentence is fixed text apart from the two BOUNDS, which the member
+/// publishes; nothing of the value that missed them, and nothing of the member
+/// that carried it, appears in it. Every member of a create that sets the count
+/// sets the SAME count — `ReplicasPerNodeGroup` and a shard's `ReplicaCount`
+/// state it directly, `NumCacheClusters` states it as the primary plus its
+/// replicas — so one sentence states the rule for all of them.
+pub fn replicas_per_node_group_range_message() -> String {
+    format!(
+        "The number of replicas per node group must be within \
+         {MIN_REPLICAS_PER_NODE_GROUP} and {MAX_REPLICAS_PER_NODE_GROUP}."
+    )
+}
 
 /// How many replicas a node group (shard) gets when the request asks for
 /// AUTOMATIC FAILOVER but names no replica count of its own: one per shard.

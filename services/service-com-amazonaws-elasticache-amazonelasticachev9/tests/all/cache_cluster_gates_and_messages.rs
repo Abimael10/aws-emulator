@@ -759,7 +759,8 @@ async fn a_malformed_cluster_id_is_refused_with_the_services_identifier_rule() {
     assert_eq!(
         refused.error_message(),
         format!(
-            "Cache Cluster ID cannot be longer than {} characters.",
+            "The parameter CacheClusterIdentifier is not a valid identifier because it is \
+             longer than {} characters.",
             state::CLUSTER_ID_MAX_LEN
         ),
         "the length refusal must state the published bound, got {:?}",

@@ -189,7 +189,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DeleteCacheParameterGroup` applies to this member.
         if let Some(message) = crate::state::parameter_identifier_refusal(
             "CacheParameterGroupName",
-            "Cache Parameter Group Name",
             &input.cache_parameter_group_name,
             crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
         ) {

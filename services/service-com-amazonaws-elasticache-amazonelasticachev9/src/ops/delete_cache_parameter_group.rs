@@ -180,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the constraint it broke.
         if let Some(message) = crate::state::parameter_identifier_refusal(
             "CacheParameterGroupName",
-            "Cache Parameter Group Name",
             &name,
             crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
         ) {

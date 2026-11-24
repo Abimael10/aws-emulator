@@ -36,10 +36,9 @@
 /// digits and hyphens only.
 pub fn replication_group_id_refusal(replication_group_id: &str) -> Option<String> {
     if replication_group_id.len() > crate::state::REPLICATION_GROUP_ID_MAX_LEN {
-        return Some(format!(
-            "The parameter ReplicationGroupId is not a valid identifier because it is longer \
-             than {} characters.",
-            crate::state::REPLICATION_GROUP_ID_MAX_LEN
+        return Some(crate::state::parameter_length_refusal_message(
+            "ReplicationGroupId",
+            crate::state::REPLICATION_GROUP_ID_MAX_LEN,
         ));
     }
     // Within the bound the two wordings have nothing to disagree about: what is left to

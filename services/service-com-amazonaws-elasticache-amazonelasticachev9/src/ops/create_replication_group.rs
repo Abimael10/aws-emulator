@@ -579,17 +579,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let replicas_per_node_group =
             match (input.num_cache_clusters, input.replicas_per_node_group) {
-                (Some(clusters), _) => {
-                    if !(1..=crate::state::MAX_CACHE_CLUSTERS_PER_GROUP).contains(&clusters) {
-                        return Err(invalid_value(format!(
-                            "Invalid value {clusters} for NumCacheClusters: a replication group \
-                             has between 1 and {} clusters (1 primary plus up to {} replicas).",
-                            crate::state::MAX_CACHE_CLUSTERS_PER_GROUP,
-                            crate::state::MAX_REPLICAS_PER_NODE_GROUP
-                        )));
-                    }
-                    clusters - 1
-                }
+                // `NumCacheClusters` counts the clusters of the shard — "the
+                // maximum permitted value … is 6 (1 primary plus 5 replicas)" —
+                // so what it asks for is the primary plus that many REPLICAS,
+                // and the count it sets is the one the bound below is about.
+                (Some(clusters), _) => clusters.saturating_sub(1),
                 (None, Some(replicas)) => replicas,
                 // Nothing in the request sets the count, so the SERVICE's
                 // default for the topology the request asked for applies, and it
@@ -615,6 +609,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             };
+        // Whichever member set it, the count is held to the bound a node group's
+        // replicas have ("Valid values are 0 to 5"), stated as the one sentence
+        // this service words that bound in
+        // (`crate::state::replicas_per_node_group_range_message`).
+        if !replica_count_within_bounds(replicas_per_node_group) {
+            return Err(invalid_value(
+                crate::state::replicas_per_node_group_range_message(),
+            ));
+        }
 
         // Per shard: how many replicas it has.
         let mut shard_replicas: Vec<i32> = Vec::with_capacity(num_node_groups as usize);
@@ -623,12 +626,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let replicas = config
                 .and_then(|config| config.replica_count)
                 .unwrap_or(replicas_per_node_group);
-            if !(0..=crate::state::MAX_REPLICAS_PER_NODE_GROUP).contains(&replicas) {
-                return Err(invalid_value(format!(
-                    "Invalid value {replicas} for the number of replica nodes in a node group \
-                     (shard): valid values are 0 to {}.",
-                    crate::state::MAX_REPLICAS_PER_NODE_GROUP
-                )));
+            if !replica_count_within_bounds(replicas) {
+                return Err(invalid_value(
+                    crate::state::replicas_per_node_group_range_message(),
+                ));
             }
             // "The number of Availability Zones in this list must match the
             // value of ReplicaCount or ReplicasPerNodeGroup if not specified."
@@ -691,20 +692,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Automatic failover promotes a replica, so a cluster mode DISABLED
         // group needs one: "If AutomaticFailoverEnabled is true, the value of
-        // [NumCacheClusters] must be at least 2." A cluster mode ENABLED group
-        // is governed by the OTHER half of that member's contract —
-        // AutomaticFailoverEnabled "must be enabled for Valkey or Redis OSS
-        // (cluster mode enabled) replication groups" — which holds whatever each
-        // shard's replica count is: shards without replicas are a supported
-        // cluster mode shape, so enabling failover on them is accepted and
-        // disabling it is what is refused.
+        // [NumCacheClusters] must be at least 2." Asking for Multi-AZ asks for
+        // that same promotion — "Multi-AZ … the promotion of a replica in
+        // another Availability Zone" — so a request that asks for either is held
+        // to this rule, and it is answered BEFORE the two flags are judged
+        // against each other: what the request asks the TOPOLOGY for is settled
+        // first, and a group with nothing to promote cannot be given fault
+        // tolerance by any combination of flags.
+        //
+        // A cluster mode ENABLED group is governed by the OTHER half of that
+        // member's contract — AutomaticFailoverEnabled "must be enabled for
+        // Valkey or Redis OSS (cluster mode enabled) replication groups" — which
+        // holds whatever each shard's replica count is: shards without replicas
+        // are a supported cluster mode shape, so enabling failover on them is
+        // accepted and disabling it is what is refused.
         let every_shard_has_replica = shard_replicas.iter().all(|replicas| *replicas >= 1);
+        let multi_az = input.multi_az_enabled.unwrap_or(false);
+        let asks_for_promotion = input.automatic_failover_enabled == Some(true) || multi_az;
+        if asks_for_promotion && !cluster_enabled && !every_shard_has_replica {
+            return Err(invalid_combination(
+                crate::state::AUTOMATIC_FAILOVER_NEEDS_TWO_CLUSTERS_MESSAGE.to_string(),
+            ));
+        }
         let automatic_failover = match input.automatic_failover_enabled {
-            Some(true) if !cluster_enabled && !every_shard_has_replica => {
-                return Err(invalid_combination(
-                    crate::state::AUTOMATIC_FAILOVER_NEEDS_TWO_CLUSTERS_MESSAGE.to_string(),
-                ))
-            }
             Some(false) if cluster_enabled => {
                 return Err(invalid_combination(
                     "AutomaticFailoverEnabled must be enabled for a cluster mode enabled \
@@ -719,8 +729,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => cluster_enabled,
         };
         // Multi-AZ enhances fault tolerance by failing the primary over to a
-        // replica in another zone, which is the automatic failover above.
-        let multi_az = input.multi_az_enabled.unwrap_or(false);
+        // replica in another zone, which is the automatic failover above: a
+        // request that asks for one and not the other names two settings that
+        // cannot hold together.
         if multi_az && !automatic_failover {
             return Err(invalid_combination(
                 "MultiAZEnabled requires AutomaticFailoverEnabled: Multi-AZ fault tolerance is \
@@ -1432,6 +1443,18 @@ fn invalid_value(message: String) -> CreateReplicationGroupError {
         },
     )
     .into()
+}
+
+/// Whether `replicas` is a number of replicas a node group (shard) may be
+/// created with: "Valid values are 0 to 5"
+/// ([`crate::state::MIN_REPLICAS_PER_NODE_GROUP`] ..=
+/// [`crate::state::MAX_REPLICAS_PER_NODE_GROUP`]).
+///
+/// One place, so the count the request sets group-wide and the count a shard's
+/// own `ReplicaCount` overrides it with are held to the same bound.
+fn replica_count_within_bounds(replicas: i32) -> bool {
+    (crate::state::MIN_REPLICAS_PER_NODE_GROUP..=crate::state::MAX_REPLICAS_PER_NODE_GROUP)
+        .contains(&replicas)
 }
 
 /// The modelled refusal for members that cannot hold together: "Two or more

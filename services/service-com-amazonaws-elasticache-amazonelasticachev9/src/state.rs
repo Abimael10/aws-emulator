@@ -1355,9 +1355,9 @@ pub const LOOKUP_IDENTIFIER_MAX_LEN: usize = CLUSTER_ID_MAX_LEN;
 /// a member takes is that member's own and observable apart on the live service,
 /// so one template cannot serve them all.
 pub fn identifier_refusal(prose: &str, value: &str, max_len: usize) -> Option<String> {
-    form_refusal_with_lead_in(
+    identifier_rule_refusal(
         &format!("{prose} specified is not a valid identifier."),
-        prose,
+        &format!("{prose} cannot be longer than {max_len} characters."),
         value,
         max_len,
     )
@@ -1371,35 +1371,53 @@ pub fn identifier_refusal(prose: &str, value: &str, max_len: usize) -> Option<St
 /// AWS's own for that member (`CacheClusterIdentifier` for a cache cluster's id,
 /// `CacheParameterGroupName` for a parameter group's name), which is not always the wire
 /// member's name, and the members it words the other way round keep
-/// [`identifier_refusal`]. `prose` is how the service names the member in the LENGTH
-/// sentence, which is the same sentence either way.
+/// [`identifier_refusal`]. BOTH sentences of this template name that label: a value past
+/// the bound is refused by [`parameter_length_refusal_message`], so the subject a client
+/// reads is the member's label whichever half of the identifier rule the value broke.
 pub fn parameter_identifier_refusal(
     parameter: &str,
-    prose: &str,
     value: &str,
     max_len: usize,
 ) -> Option<String> {
-    form_refusal_with_lead_in(
+    identifier_rule_refusal(
         &format!("The parameter {parameter} is not a valid identifier."),
-        prose,
+        &parameter_length_refusal_message(parameter, max_len),
         value,
         max_len,
     )
 }
 
-/// The refusal behind both identifier templates: the length sentence, which they share,
+/// How ElastiCache words an identifier past the bound its member documents, for the members
+/// it names by their AWS-facing parameter LABEL: `The parameter <label> is not a valid
+/// identifier because it is longer than <n> characters.`
+///
+/// The fixed text is the sentence around them; the two variable parts are that label and
+/// the bound, both fixed by the rule — nothing of the over-long value is echoed back. Stated
+/// once here because the length clause is the same whichever member states it, and because
+/// the members whose own refusals name a label state it apart from
+/// [`parameter_identifier_refusal`] (see
+/// [`crate::service::identifier_length_rules::replication_group_id_refusal`]).
+pub fn parameter_length_refusal_message(parameter: &str, max_len: usize) -> String {
+    format!(
+        "The parameter {parameter} is not a valid identifier because it is longer than \
+         {max_len} characters."
+    )
+}
+
+/// The refusal behind both identifier templates: `over_length` for a value past the bound,
 /// then `lead_in` followed by the grammar every identifier of this service satisfies.
 ///
 /// The grammar sentence is stated once here, so the two lead-ins cannot drift apart about
-/// the rule they state.
-fn form_refusal_with_lead_in(
+/// the rule they state; each caller words the LENGTH sentence with the same subject its own
+/// lead-in names, which is how the service words it per member.
+fn identifier_rule_refusal(
     lead_in: &str,
-    prose: &str,
+    over_length: &str,
     value: &str,
     max_len: usize,
 ) -> Option<String> {
     if value.len() > max_len {
-        return Some(format!("{prose} cannot be longer than {max_len} characters."));
+        return Some(over_length.to_string());
     }
     if is_valid_identifier(value, max_len) {
         return None;

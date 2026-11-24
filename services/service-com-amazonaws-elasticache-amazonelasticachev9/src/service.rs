@@ -40,7 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Two of those seams are taken here. Both are for the reason named in
+//! Three of those seams are taken here. Two are for the reason named in
 //! [`query_error_envelope`]: an awsQuery error response carries a `<RequestId>` element
 //! in its `<ErrorResponse>` envelope, which the framework's renderers omit.
 //! `override_operation` wraps the operation the routing table names, so the element
@@ -51,6 +51,10 @@
 //! with the framework. That same operation wrapper is also where the work that belongs to
 //! no single operation is done: the notifications this call's cluster events owe their
 //! clusters' Amazon SNS topics are published once the response has been rendered.
+//!
+//! The third is `override_protocol`, for one reading of the wire that belongs to the
+//! PROTOCOL rather than to any operation: the text a boolean member is carried as, and the
+//! sentence text outside that member's lexical space is refused with (see [`xsd_boolean`]).
 //!
 //! # How this service words five of its refusals
 //!
@@ -102,10 +106,12 @@ pub mod parameter_combination;
 pub mod query_error_envelope;
 pub mod refusal_messages;
 pub mod replication_group_not_found;
+pub mod xsd_boolean;
 
 use query_error_envelope::{ElastiCacheDefinition, RequestIdEnvelopeOperation};
+use service_common::query_boolean_values::QueryBooleanValues;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -119,6 +125,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
     envelope: RequestIdEnvelopeOperation<Eng>,
+    /// The protocol this service reads a request with: the framework's `awsQuery`, reading a
+    /// boolean member's text in the lexical space the Query wire carries one in (see
+    /// [`xsd_boolean`]). Held in a field, built once, because `override_protocol` hands back
+    /// a reference to it.
+    protocol: QueryBooleanValues,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -129,6 +140,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: ElastiCacheDefinition::new(Arc::clone(&engine)),
             envelope: RequestIdEnvelopeOperation::new(engine),
+            protocol: xsd_boolean::protocol(),
         }
     }
 }
@@ -176,6 +188,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // constraint it failed.
         absent_parameter::absent_parameter_refusal(refusal)
             .or_else(|| enum_value::enum_value_refusal(refusal))
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The one thing this service reads differently from the framework's own `awsQuery`
+        // codec: the TEXT of a boolean member, whose lexical space on this wire is wider than
+        // the two words that codec reads, and whose refusal is the protocol layer's own fixed
+        // sentence rather than a reader's report of the value it was handed. Everything else
+        // about the protocol — routing, both envelopes, every other member's reading — is the
+        // framework's unchanged (see [`xsd_boolean`]).
+        Some(&self.protocol)
     }
 
     fn override_routing_error(
