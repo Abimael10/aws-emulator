@@ -441,27 +441,49 @@ async fn a_not_found_fault_names_the_resource_its_template_names() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: the client-fault status covers MODELED faults only — the framework's own
-// channels keep the status they carry, so an operation nobody has written yet still
-// answers 501 and is not flattened into a client fault.
+// Rule: the client-fault status covers every MODELED fault, including the ones the
+// tagging operations raise — a request addressed by ARN to a cluster this account does
+// not hold is answered with the modelled `ClusterNotFoundFault` at that status, never
+// with the framework's 501 "not written yet" channel.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_scaffolded_operation_still_answers_not_implemented() {
+async fn a_tagging_operation_answers_the_modelled_fault_at_the_client_fault_status() {
     let router = emulator();
-    let (status, body) = call(
-        &router,
-        "ListTags",
-        json!({ "ResourceName": format!("arn:aws:dax:{REGION}:000000000000:cache/kept") }),
-    )
-    .await;
-    assert_eq!(
-        status, 501,
-        "case ListTags: a scaffolded operation answers 501, got {status} {body:?}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "NotImplemented",
-        "case ListTags: expected NotImplemented, got {body:?}"
-    );
+    // Rows: the three operations that address a resource by ARN, each naming a cluster
+    // nothing created.
+    let cases: [(&str, Value); 3] = [
+        (
+            "ListTags",
+            json!({ "ResourceName": format!("arn:aws:dax:{REGION}:000000000000:cache/kept") }),
+        ),
+        (
+            "TagResource",
+            json!({
+                "ResourceName": format!("arn:aws:dax:{REGION}:000000000000:cache/kept"),
+                "Tags": [{ "Key": "owner", "Value": "team" }],
+            }),
+        ),
+        (
+            "UntagResource",
+            json!({
+                "ResourceName": format!("arn:aws:dax:{REGION}:000000000000:cache/kept"),
+                "TagKeys": ["owner"],
+            }),
+        ),
+    ];
+
+    for (operation, body) in cases {
+        let (status, answered) = call(&router, operation, body).await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case {operation}: a modelled fault carries the client-fault status, \
+             got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ClusterNotFoundFault",
+            "case {operation}: expected ClusterNotFoundFault, got {answered:?}"
+        );
+    }
 }

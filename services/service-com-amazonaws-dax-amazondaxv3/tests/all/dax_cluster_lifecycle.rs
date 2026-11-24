@@ -11,14 +11,15 @@
 //! bootstrap issue happened to cite are one row each.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dax_amazondaxv3::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dax_account_network::{
-    account_subnets, account_subnet_ids, an_account_subnet, call, emulator, error_code, REGION,
+    account_subnets, account_subnet_ids, an_account_subnet, call, emulator, error_code,
+    LOOK_AGAIN_AFTER, REGION, SETTLE_DEADLINE,
 };
 
 /// The canonical emulator account id every ARN carries.
@@ -30,9 +31,31 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DAXRole";
 /// A node type to pass as the required `NodeType`.
 const NODE_TYPE: &str = "dax.r4.large";
 
-/// Wait until every clock-owed status move started before the call is due.
-async fn settle() {
-    tokio::time::sleep(state::STATUS_SETTLE_DELAY + Duration::from_millis(400)).await;
+/// Look again until every clock-owed cluster status move started before this call has
+/// been made due: no cluster the store holds is in a transient status any more, and a
+/// cluster whose deletion settled is gone.
+///
+/// A CONDITION, looked for in a loop rather than waited out: what the cases assert does
+/// not depend on how fast or how loaded the host is.
+async fn settle(router: &MultiServiceRouter) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, body) = call(router, "DescribeClusters", json!({})).await;
+        let transient = body["Clusters"].as_array().is_some_and(|clusters| {
+            clusters
+                .iter()
+                .any(|cluster| cluster["Status"] != json!(state::CLUSTER_AVAILABLE))
+        });
+        if status == 200 && !transient {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clock never settled every cluster; the last DescribeClusters answered \
+             {status} {body:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
 }
 
 /// A `CreateCluster` body with the required members filled in.
@@ -49,7 +72,7 @@ fn create_cluster_body(name: &str, replication_factor: i64) -> Value {
 async fn available_cluster(router: &MultiServiceRouter, name: &str, nodes: i64) -> Value {
     let (status, body) = call(router, "CreateCluster", create_cluster_body(name, nodes)).await;
     assert_eq!(status, 200, "CreateCluster {name}: got {body:?}");
-    settle().await;
+    settle(router).await;
     let (status, body) = call(
         router,
         "DescribeClusters",
@@ -189,7 +212,7 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
     );
 
     // 4. The clock settles it: available, with every node and its endpoint.
-    settle().await;
+    settle(&router).await;
     let (status, described) = call(&router, "DescribeClusters", json!({})).await;
     assert_eq!(status, 200, "DescribeClusters: got {described:?}");
     let available = &described["Clusters"][0];
@@ -242,7 +265,7 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
     )
     .await;
     assert_eq!(status, 200, "IncreaseReplicationFactor: got {grown:?}");
-    settle().await;
+    settle(&router).await;
     let (status, described) = call(&router, "DescribeClusters", json!({})).await;
     assert_eq!(status, 200, "DescribeClusters: got {described:?}");
     let grown = &described["Clusters"][0];
@@ -299,7 +322,7 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
     );
 
     // 7. DeleteCluster: deleting first, then gone, then the name is free again.
-    settle().await;
+    settle(&router).await;
     let (status, deleted) = call(&router, "DeleteCluster", json!({ "ClusterName": "demo" })).await;
     assert_eq!(status, 200, "DeleteCluster: got {deleted:?}");
     assert_eq!(
@@ -319,7 +342,7 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
         json!(state::CLUSTER_DELETING),
         "the cluster is still reported until the clock removes it, got {described:?}"
     );
-    settle().await;
+    settle(&router).await;
     let (status, gone) = call(
         &router,
         "DescribeClusters",
@@ -417,35 +440,48 @@ async fn a_resource_name_is_stored_lower_cased_and_resolves_case_insensitively()
 }
 
 // ---------------------------------------------------------------------------
-// Rule: a `ClusterName` must be 1..=20 alphanumeric characters or hyphens, start
-// with a letter, not end with a hyphen and not contain two consecutive hyphens;
-// anything else is refused with `InvalidParameterValueException` (HTTP 400) and
-// nothing is stored.
-// Source: `CreateCluster$ClusterName`.
+// Rule: a `ClusterName` carries only alphanumeric characters or hyphens, starts with a
+// letter, does not end with a hyphen and does not contain two consecutive hyphens;
+// anything else is refused with `InvalidParameterValueException` (HTTP 400) and nothing
+// is stored. Its LENGTH is not part of the rule: the member targets the unconstrained
+// `String` shape, so a name is judged by its shape however long it is.
+// Source: `CreateCluster$ClusterName`, whose member carries no `@length`
+// (`smithy_query(query="operation",operation="CreateCluster")` reports `ClusterName` ->
+// `String`, and `smithy_query(query="shape",shape="String")` reports that shape with no
+// constraint).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_cluster_name_is_accepted_only_when_it_satisfies_the_documented_grammar() {
-    // One row per clause of the rule, each at the boundary it tests: the published
-    // length bound (20) and one past it (21), the first-character clause, the
-    // trailing-hyphen clause, the consecutive-hyphen clause and the character set.
-    let accepted = ["a", "abcdefghij1234567890", "my-cluster-1", "a-1"];
-    let refused = [
-        "abcdefghij12345678901",
-        "1abc",
-        "-abc",
-        "abc-",
-        "a--b",
-        "ab_c",
-        "ab.c",
+    // Accepted rows span the LENGTHS the rule says nothing about — the shortest name, the
+    // length the member's documentation prose happens to mention (20), one past it (21),
+    // a prefixed unique name of the shape a client generates (28), and a long one (64) —
+    // plus the hyphen and digit forms the character-set clause admits.
+    let accepted = [
+        "a".to_string(),
+        "abcdefghij1234567890".to_string(),
+        "abcdefghij12345678901".to_string(),
+        "sim2real-dax-cl-0123456789ab".to_string(),
+        format!("c{}", "x".repeat(63)),
+        "my-cluster-1".to_string(),
+        "a-1".to_string(),
     ];
+    // One row per clause that IS a rule: the first-character clause (a digit and a
+    // hyphen), the trailing-hyphen clause, the consecutive-hyphen clause, two characters
+    // outside the set, and the empty name (which begins with no letter).
+    let refused = ["1abc", "-abc", "abc-", "a--b", "ab_c", "ab.c", ""];
 
     let router = emulator();
-    for name in accepted {
+    for name in &accepted {
         let (status, body) = call(&router, "CreateCluster", create_cluster_body(name, 1)).await;
         assert_eq!(
             status, 200,
             "case {name:?}: expected the name to be accepted, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["Cluster"]["ClusterName"],
+            json!(name),
+            "case {name:?}: the created cluster must carry the name as given, got {body:?}"
         );
     }
     for name in refused {
@@ -567,7 +603,7 @@ async fn an_endpoint_speaks_the_protocol_its_encryption_type_selects() {
             status, 200,
             "case {encryption:?}: CreateCluster got {created:?}"
         );
-        settle().await;
+        settle(&router).await;
         let (status, described) = call(
             &router,
             "DescribeClusters",
@@ -898,7 +934,7 @@ async fn a_modification_is_refused_while_the_cluster_is_not_available() {
             let (status, body) = call(&router, "CreateCluster", create_cluster_body(&name, 3)).await;
             assert_eq!(status, 200, "case {operation}/{transient}: got {body:?}");
             if transient == state::CLUSTER_DELETING {
-                settle().await;
+                settle(&router).await;
                 let (status, body) =
                     call(&router, "DeleteCluster", json!({ "ClusterName": name })).await;
                 assert_eq!(
@@ -1176,7 +1212,7 @@ async fn increasing_the_replication_factor_only_grows_the_cluster() {
             status, 200,
             "case {factor}: expected the growth accepted, got {status} {body:?}"
         );
-        settle().await;
+        settle(&router).await;
         let (status, described) = call(
             &router,
             "DescribeClusters",
@@ -1238,7 +1274,7 @@ async fn availability_zones_must_match_the_replication_factor_and_place_the_node
     body["AvailabilityZones"] = json!(zones);
     let (status, created) = call(&router, "CreateCluster", body).await;
     assert_eq!(status, 200, "a matching zone list is accepted, got {created:?}");
-    settle().await;
+    settle(&router).await;
     let (status, described) = call(
         &router,
         "DescribeClusters",
@@ -1349,7 +1385,7 @@ async fn an_update_applies_only_the_members_it_was_given() {
     expected.insert("ParameterGroupName".into(), json!("group-one"));
 
     for (member, value) in patches {
-        settle().await;
+        settle(&router).await;
         let (status, updated) = call(
             &router,
             "UpdateCluster",
@@ -1385,7 +1421,7 @@ async fn an_update_applies_only_the_members_it_was_given() {
     }
 
     // Rows for the topic status: the two documented values, and one that is neither.
-    settle().await;
+    settle(&router).await;
     let (status, answered) = call(
         &router,
         "UpdateCluster",
@@ -1402,7 +1438,7 @@ async fn an_update_applies_only_the_members_it_was_given() {
         json!("active"),
         "case active: expected the topic reported active, got {answered:?}"
     );
-    settle().await;
+    settle(&router).await;
     let (status, answered) = call(
         &router,
         "UpdateCluster",
@@ -1415,7 +1451,7 @@ async fn an_update_applies_only_the_members_it_was_given() {
         json!("inactive"),
         "case inactive: expected the topic reported inactive, got {answered:?}"
     );
-    settle().await;
+    settle(&router).await;
     let (status, answered) = call(
         &router,
         "UpdateCluster",
@@ -1434,35 +1470,54 @@ async fn an_update_applies_only_the_members_it_was_given() {
 }
 
 // ---------------------------------------------------------------------------
-// The operations this slice deliberately leaves unwritten still answer 501, so a
-// client can tell "not written yet" from "implemented".
+// Rule: an operation that addresses a resource this account does not hold is answered
+// with that resource's own modelled not-found fault, whichever operation asked.
+// Source: the modelled `ClusterNotFoundFault` ("The requested cluster ID does not refer
+// to an existing DAX cluster") and `SubnetGroupNotFoundFault` ("The requested subnet
+// group name does not refer to an existing subnet group").
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_not_implemented() {
+async fn an_operation_addressing_a_resource_nothing_holds_answers_its_not_found_fault() {
     let router = emulator();
-    // Rows: one operation from each family left to its own gap issue.
-    let cases: [(&str, Value); 4] = [
+    // Rows: one operation from each family that addresses a stored resource, against a
+    // store that holds neither a cluster nor a subnet group.
+    let cases: [(&str, Value, &str); 4] = [
         (
             "DecreaseReplicationFactor",
             json!({ "ClusterName": "demo", "NewReplicationFactor": 1 }),
+            "ClusterNotFoundFault",
         ),
         (
             "RebootNode",
-            json!({ "ClusterName": "demo", "NodeId": "demo-1" }),
+            json!({ "ClusterName": "demo", "NodeId": "demo-a" }),
+            "ClusterNotFoundFault",
         ),
         (
             "TagResource",
-            json!({ "ResourceName": "arn:aws:dax:us-west-2:000000000000:cache/demo", "Tags": [] }),
+            json!({
+                "ResourceName": "arn:aws:dax:us-west-2:000000000000:cache/demo",
+                "Tags": [{ "Key": "owner", "Value": "team" }],
+            }),
+            "ClusterNotFoundFault",
         ),
-        ("DeleteSubnetGroup", json!({ "SubnetGroupName": "sg" })),
+        (
+            "DeleteSubnetGroup",
+            json!({ "SubnetGroupName": "sg" }),
+            "SubnetGroupNotFoundFault",
+        ),
     ];
 
-    for (operation, body) in cases {
+    for (operation, body, expected) in cases {
         let (status, answered) = call(&router, operation, body).await;
         assert_eq!(
-            status, 501,
-            "case {operation}: an unwritten operation answers 501, got {status} {answered:?}"
+            status, 400,
+            "case {operation}: expected a refusal, got {status} {answered:?}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            expected,
+            "case {operation}: expected {expected}, got {answered:?}"
         );
     }
 }

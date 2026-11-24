@@ -4,9 +4,12 @@
 //!
 //! Mints one DAX cluster from the request and stores it, then answers the `Cluster`
 //! built from what was stored. The name is lower-cased (`ClusterName`: "This parameter
-//! is stored as a lowercase string") after being checked against the name rule the same
-//! doc states, and the ARN, the discovery endpoint and one node per `ReplicationFactor`
-//! are all derived from it.
+//! is stored as a lowercase string") after being checked against the name SHAPE rule the
+//! same doc states (letters, digits and hyphens, a leading letter, no trailing or doubled
+//! hyphen — the member's unconstrained `String` shape states no length rule, so the only
+//! length checked is [`crate::state::MAX_STORED_CLUSTER_NAME_LEN`], the bound this
+//! emulator picks on what one request may make it store), and the ARN, the discovery
+//! endpoint and one node per `ReplicationFactor` are all derived from it.
 //!
 //! The cluster is returned in the non-terminal `creating` status, with its nodes
 //! `creating` too; the move to `available` is owed by the CLOCK and becomes due
@@ -18,7 +21,8 @@
 //! against the parameter groups this account holds (400 `ParameterGroupNotFoundFault`)
 //! and `SubnetGroupName` against the stored subnet groups (400
 //! `SubnetGroupNotFoundFault`), so no cluster is stored carrying a name that resolves to
-//! nothing.
+//! nothing. A request naming no parameter group gets the one DAX provides in every
+//! account, which is what such a cluster runs with.
 //!
 //! ## Shape of an operation
 //!
@@ -274,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The name rule the `ClusterName` doc states, refused before anything is stored.
+        // The `ClusterName` SHAPE rule, refused before anything is stored. The member
+        // targets the unconstrained `String`, so the service states no length rule: the
+        // only length checked is the bound this emulator picks on what it STORES, which
+        // is far above any identifier a client generates.
         if let Some(reason) = crate::state::cluster_name_violation(&input.cluster_name) {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
@@ -343,13 +350,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Each tag is read the same way `TagResource` reads one, so no path stores a tag
+        // the other would refuse.
+        let tags: Vec<(String, String)> = tags
+            .into_iter()
+            .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+            .collect();
+        for (key, value) in &tags {
+            if let Some(reason) = crate::state::tag_violation(key, value) {
+                return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(reason),
+                    },
+                )
+                .into());
+            }
+        }
 
         let cluster_name = input.cluster_name.to_lowercase();
         if store.clusters.contains_key(&cluster_name) {
             return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
-                ClusterAlreadyExistsFault {
-                    message: Some(format!("Cluster {cluster_name} already exists")),
-                },
+                crate::state::cluster_already_exists(),
             )
             .into());
         }
@@ -399,6 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node_type: input.node_type,
             status: crate::state::CLUSTER_CREATING.to_string(),
             nodes: Vec::new(),
+            nodes_to_remove: Vec::new(),
             discovery_endpoint: discovery,
             subnet_group: subnet_group_name,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
@@ -407,21 +429,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preferred_maintenance_window: input.preferred_maintenance_window,
             notification_topic_arn: input.notification_topic_arn,
             notification_topic_status: None,
-            parameter_group_name: input.parameter_group_name,
+            // A cluster the request names no parameter group for runs with the group DAX
+            // provides itself ([`crate::state::DEFAULT_PARAMETER_GROUP`]), so every stored
+            // cluster reports the group its nodes apply.
+            parameter_group_name: Some(input.parameter_group_name.unwrap_or_else(|| {
+                crate::state::DEFAULT_PARAMETER_GROUP.to_string()
+            })),
             sse_enabled: input.sse_specification.is_some_and(|sse| sse.enabled),
             cluster_endpoint_encryption_type: encryption_type,
             network_type,
-            tags: tags
-                .into_iter()
-                .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
-                .collect(),
+            tags,
             create_time: now,
             region,
             settles_at: Some(now + crate::state::STATUS_SETTLE_DELAY),
         };
         for _ in 0..input.replication_factor {
-            let seq = store.next_node_seq();
-            record.push_node(seq, now);
+            record.push_node(now);
         }
 
         let view = record.view();

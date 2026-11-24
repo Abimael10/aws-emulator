@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the subnet group the request names from the store, so a following
+//! `DescribeSubnetGroups` no longer reports it and the name is free again.
+//!
+//! A group a stored cluster is placed in is NOT removed: "You cannot delete a subnet group
+//! if it is associated with any DAX clusters", so such a request is refused with
+//! `SubnetGroupInUseFault` and the group stays. A name this account holds no group under
+//! is answered with `SubnetGroupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSubnetGroup"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        // `CreateSubnetGroup$SubnetGroupName` documents that the name "is stored as a
+        // lowercase string", so that form is the group's identity on every path.
+        let name = input.subnet_group_name.to_lowercase();
+
+        let mut store = state.lock();
+        // The clock's due transitions first: a cluster whose deletion was already owed
+        // holds this group no longer, so the group is free to go.
+        store.settle_due(now);
+
+        if !store.subnet_groups.contains_key(&name) {
+            return Err(DeleteSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
+                crate::state::subnet_group_does_not_exist(&name),
+            )
+            .into());
+        }
+        // "You cannot delete a subnet group if it is associated with any DAX clusters."
+        let in_use = store
+            .clusters
+            .values()
+            .any(|cluster| cluster.subnet_group.as_deref() == Some(name.as_str()));
+        if in_use {
+            return Err(DeleteSubnetGroupErrorModeled::SubnetGroupInUseFault(
+                crate::state::subnet_group_in_use(&name),
+            )
+            .into());
+        }
+
+        store.subnet_groups.remove(&name);
+        store.record_event(
+            &name,
+            crate::state::SOURCE_TYPE_SUBNET_GROUP,
+            crate::state::EVENT_SUBNET_GROUP_DELETED,
+            now,
+        );
+
+        Ok(DeleteSubnetGroupOutput {
+            deletion_message: Some(format!("Subnet group {name} has been deleted.")),
+        })
     }
 }

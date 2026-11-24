@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due(now);
 
-        let next_seqs = {
+        let nodes_to_add = {
             let Some(cluster) = store.clusters.get(&cluster_name) else {
                 return Err(IncreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
                     crate::state::cluster_not_found(),
@@ -220,9 +220,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            // Reserve one id per node to add, before the cluster is borrowed mutably.
-            let added = usize::try_from(input.new_replication_factor - current).unwrap_or(0);
-            (0..added).map(|_| store.next_node_seq()).collect::<Vec<_>>()
+            // One node to add per step up from the cluster's current count.
+            usize::try_from(input.new_replication_factor - current).unwrap_or(0)
         };
 
         let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
@@ -236,8 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(zones) = input.availability_zones.filter(|zones| !zones.is_empty()) {
             cluster.availability_zones = zones;
         }
-        for seq in next_seqs {
-            cluster.push_node(seq, now);
+        for _ in 0..nodes_to_add {
+            cluster.push_node(now);
         }
         cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
         cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);

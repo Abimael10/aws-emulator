@@ -18,6 +18,7 @@
 //! sees.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dax_amazondaxv3::EmulatedService;
@@ -102,6 +103,41 @@ pub fn error_message(body: &Value) -> String {
         .or_else(|| body["Message"].as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// How long a case waits for a status change the CLOCK owes before it gives up, and how
+/// often it looks again while it waits.
+///
+/// Generous on purpose: a case waits for the CONDITION it needs rather than for a fixed
+/// time, so what it asserts does not depend on how fast or how loaded the host is.
+pub const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+/// See [`SETTLE_DEADLINE`].
+pub const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
+
+/// The cluster `name`, read back through `DescribeClusters` once it reports `status`.
+///
+/// Looks again until the clock has made the move due, or [`SETTLE_DEADLINE`] passes. The
+/// one place this crate's suites wait for a clock-owed cluster transition.
+pub async fn cluster_in_status(router: &MultiServiceRouter, name: &str, status: &str) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (code, body) = call(
+            router,
+            "DescribeClusters",
+            json!({ "ClusterNames": [name] }),
+        )
+        .await;
+        let cluster = body["Clusters"][0].clone();
+        if code == 200 && cluster["Status"] == json!(status) {
+            return cluster;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {name:?}: the cluster never reached {status:?}; the last DescribeClusters \
+             answered {code} {body:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
 }
 
 /// An EC2 client for `region` over the in-process callback this router routes on: no

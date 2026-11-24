@@ -6,8 +6,10 @@
 //! stood. Removing it is owed by the CLOCK, due [`crate::state::STATUS_SETTLE_DELAY`]
 //! after this call: until then `DescribeClusters` still reports the cluster as
 //! `deleting`, and after it the name is free again and a describe for it answers
-//! `ClusterNotFoundFault`. An unknown name is answered with `ClusterNotFoundFault`, and
-//! a cluster that is not `available` with `InvalidClusterStateFault`.
+//! `ClusterNotFoundFault`. An unknown name is answered with `ClusterNotFoundFault`. A
+//! cluster is deleted by deleting its NODES, so a cluster holding a node that is not
+//! available is refused with `InvalidClusterStateFault` naming that node, and a cluster
+//! that is itself not `available` with the same fault worded about the cluster.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A cluster is deleted by deleting its NODES, so a cluster whose nodes are not
+        // all settled is refused for the node that blocks the deletion, named.
+        if let Some(blocking) = cluster.node_blocking_deletion() {
+            return Err(DeleteClusterErrorModeled::InvalidClusterStateFault(
+                crate::state::node_not_in_deletable_state(&blocking.node_id),
+            )
+            .into());
+        }
         if cluster.status != crate::state::CLUSTER_AVAILABLE {
             return Err(DeleteClusterErrorModeled::InvalidClusterStateFault(
                 crate::state::invalid_cluster_state(),

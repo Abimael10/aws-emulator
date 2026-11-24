@@ -15,14 +15,12 @@
 //! HTTP behaviour a DAX SDK client sees. The tables below span the CLASS each rule
 //! covers; the one request the issue reported is a single row.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 use service_com_amazonaws_dax_amazondaxv3::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dax_account_network::{
-    an_account_subnet, call, emulator, error_code, error_message,
+    an_account_subnet, call, cluster_in_status, emulator, error_code, error_message,
 };
 
 /// A role ARN to pass as the required `IamRoleArn`.
@@ -34,15 +32,6 @@ const NODE_TYPE: &str = "dax.r4.large";
 /// The status a client fault answers with on this service's JSON protocol.
 const CLIENT_FAULT_STATUS: u16 = 400;
 
-/// How long a case waits for a status change the CLOCK owes before it gives up, and how
-/// often it looks again while it waits.
-///
-/// Generous on purpose: a case waits for the CONDITION it needs rather than for a fixed
-/// time, so what it asserts does not depend on how fast or how loaded the host is.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
-/// See [`SETTLE_DEADLINE`].
-const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
-
 /// A `CreateCluster` body with the required members filled in.
 fn create_cluster_body(name: &str) -> Value {
     json!({
@@ -51,31 +40,6 @@ fn create_cluster_body(name: &str) -> Value {
         "ReplicationFactor": 1,
         "IamRoleArn": ROLE_ARN,
     })
-}
-
-/// The cluster `name`, read back through `DescribeClusters` once it reports `status`.
-///
-/// Looks again until the clock has made the move due, or [`SETTLE_DEADLINE`] passes.
-async fn cluster_in_status(router: &MultiServiceRouter, name: &str, status: &str) -> Value {
-    let deadline = Instant::now() + SETTLE_DEADLINE;
-    loop {
-        let (code, body) = call(
-            router,
-            "DescribeClusters",
-            json!({ "ClusterNames": [name] }),
-        )
-        .await;
-        let cluster = body["Clusters"][0].clone();
-        if code == 200 && cluster["Status"] == json!(status) {
-            return cluster;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {name:?}: the cluster never reached {status:?}; the last DescribeClusters \
-             answered {code} {body:?}"
-        );
-        ::tokio::time::sleep(LOOK_AGAIN_AFTER).await;
-    }
 }
 
 /// Create the parameter group `name` and assert it was stored.
@@ -194,11 +158,12 @@ async fn the_named_resources_are_resolved_before_the_cluster_name_format_rule() 
     .await;
     assert_eq!(status, 200, "CreateSubnetGroup got {status} {body:?}");
 
-    // Rows: each way `ClusterName` can break the documented rule — "A name must contain
-    // from 1 to 20 alphanumeric characters or hyphens. The first character must be a
-    // letter. A name cannot end with a hyphen or contain two consecutive hyphens."
+    // Rows: each way `ClusterName` can break the documented SHAPE rule — "The first
+    // character must be a letter. A name cannot end with a hyphen or contain two
+    // consecutive hyphens", and the character set it names. Its LENGTH is not one of
+    // those ways: `ClusterName` targets the unconstrained `String` shape, so a long name
+    // is valid and would be CREATED here rather than refused.
     let bad_names = [
-        "abcdefghijklmnopqrstu",
         "1leading-digit",
         "trailing-",
         "double--hyphen",

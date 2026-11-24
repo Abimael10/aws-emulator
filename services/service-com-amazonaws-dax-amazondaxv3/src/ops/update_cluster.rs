@@ -8,9 +8,15 @@
 //! that is not `available` with `InvalidClusterStateFault` ("The requested DAX cluster is
 //! not in the available state").
 //!
-//! The cluster moves to the non-terminal `modifying` status; the move back to
-//! `available` is owed by the CLOCK, due
-//! [`crate::state::STATUS_SETTLE_DELAY`] after this call.
+//! An update that reconfigures the cluster's NODES — the parameter group they run with,
+//! or the security groups they sit behind — is applied by the nodes, so the cluster moves
+//! to the non-terminal `modifying` status and the move back to `available` is owed by the
+//! CLOCK, due [`crate::state::STATUS_SETTLE_DELAY`] after this call. An update that only
+//! changes what the cluster REPORTS about itself (its description, its maintenance
+//! window, its notification topic) provisions nothing, so it is applied in place and the
+//! cluster never leaves `available` — which is what the recorded DAX answer for a
+//! description-only update shows: the cluster is still `available` while the new
+//! description is already readable.
 //!
 //! ## Shape of an operation
 //!
@@ -235,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // ONLY the supplied members are applied; every other stored value is kept.
+        // ONLY the supplied members are applied; every other stored value is kept. A
+        // member that reconfigures the cluster's NODES is tracked, because that is what
+        // decides whether this update provisions anything.
+        let mut reconfigures_nodes = false;
         if input.description.is_some() {
             cluster.description = input.description;
         }
@@ -254,13 +263,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 node.parameter_group_status =
                     Some(crate::state::PARAMETER_GROUP_IN_SYNC.to_string());
             }
+            reconfigures_nodes = true;
         }
         if let Some(security_group_ids) = input.security_group_ids {
             cluster.security_group_ids = security_group_ids;
+            reconfigures_nodes = true;
         }
 
-        cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
-        cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        // An update that reconfigures the NODES is applied by the nodes, so the cluster
+        // is `modifying` until the clock settles it; one that only changes what the
+        // cluster REPORTS about itself provisions nothing and is applied in place, so the
+        // cluster never leaves `available`, as the recorded answer for a description-only
+        // update shows.
+        if reconfigures_nodes {
+            cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
+            cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        }
         let view = cluster.view();
         store.record_event(
             &cluster_name,

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts one node of a stored cluster: "The reboot action takes place as soon as
+//! possible. During the reboot, the node status is set to REBOOTING." The node's endpoint
+//! and its place in the cluster are kept — a reboot "restarts the DAX engine process and
+//! does not remove the contents of the cache" — so only the status moves.
+//!
+//! The cluster is `modifying` while a node of it reboots, and the move of both back to
+//! `available` is owed by the CLOCK, due [`crate::state::STATUS_SETTLE_DELAY`] after this
+//! call. A cluster that is not `available` is refused with `InvalidClusterStateFault`, a
+//! name this account holds no cluster under with `ClusterNotFoundFault`, and a `NodeId`
+//! none of that cluster's nodes carries with `NodeNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +155,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootNode"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        let cluster_name = input.cluster_name.to_lowercase();
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
+            return Err(RebootNodeErrorModeled::ClusterNotFoundFault(
+                crate::state::cluster_not_found(),
+            )
+            .into());
+        };
+        if cluster.status != crate::state::CLUSTER_AVAILABLE {
+            return Err(RebootNodeErrorModeled::InvalidClusterStateFault(
+                crate::state::invalid_cluster_state(),
+            )
+            .into());
+        }
+        let Some(node) = cluster
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == input.node_id)
+        else {
+            return Err(RebootNodeErrorModeled::NodeNotFoundFault(
+                crate::state::node_not_found(),
+            )
+            .into());
+        };
+
+        node.node_status = crate::state::NODE_REBOOTING.to_string();
+        cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
+        cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        let view = cluster.view();
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_NODE_REBOOTING,
+            now,
+        );
+
+        Ok(RebootNodeOutput {
+            cluster: Some(view),
+        })
     }
 }

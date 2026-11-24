@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DecreaseReplicationFactor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DecreaseReplicationFactor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DecreaseReplicationFactor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gives up nodes of a stored cluster until it holds `NewReplicationFactor` of them, and
+//! answers the cluster as it now stands: the nodes being given up are reported in
+//! `deleting` and named in `Cluster$NodeIdsToRemove` ("A list of nodes to be removed from
+//! the cluster") until the CLOCK removes them, due
+//! [`crate::state::STATUS_SETTLE_DELAY`] after this call, which is also when the cluster
+//! moves from `modifying` back to `available`.
+//!
+//! WHICH nodes go is the request's to choose: `NodeIdsToRemove` names them, and a
+//! `NodeId` none of the cluster's nodes carries is refused with `NodeNotFoundFault`;
+//! `AvailabilityZones` instead names the zones to take them from. Where the request names
+//! fewer nodes than the cluster is giving up, the most recently added of the rest follow
+//! the named ones; where it names more, no node count the cluster could reach matches, so
+//! it is refused with `InvalidParameterCombinationException`. A cluster keeps at least one
+//! node — "You cannot use DecreaseReplicationFactor to remove the last node in a DAX
+//! cluster. If you need to do this, use DeleteCluster instead" — so a factor below 1, or
+//! at or above the cluster's current node count, is refused with
+//! `InvalidParameterValueException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +168,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DecreaseReplicationFactor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DecreaseReplicationFactorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DecreaseReplicationFactor"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        // "You cannot use DecreaseReplicationFactor to remove the last node in a DAX
+        // cluster. If you need to do this, use DeleteCluster instead."
+        if input.new_replication_factor < 1 {
+            return Err(
+                DecreaseReplicationFactorErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "NewReplicationFactor {} must be at least 1; use DeleteCluster to \
+                             remove the last node of a cluster",
+                            input.new_replication_factor
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster_name = input.cluster_name.to_lowercase();
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
+            return Err(DecreaseReplicationFactorErrorModeled::ClusterNotFoundFault(
+                crate::state::cluster_not_found(),
+            )
+            .into());
+        };
+        if cluster.status != crate::state::CLUSTER_AVAILABLE {
+            return Err(
+                DecreaseReplicationFactorErrorModeled::InvalidClusterStateFault(
+                    crate::state::invalid_cluster_state(),
+                )
+                .into(),
+            );
+        }
+        // This operation only REMOVES nodes: a factor at or above the current count would
+        // grow the cluster, which is `IncreaseReplicationFactor`.
+        let current = i32::try_from(cluster.nodes.len()).unwrap_or(i32::MAX);
+        if input.new_replication_factor >= current {
+            return Err(
+                DecreaseReplicationFactorErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "NewReplicationFactor {} must be less than the cluster's current \
+                             {current} nodes",
+                            input.new_replication_factor
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let giving_up = usize::try_from(current - input.new_replication_factor).unwrap_or(0);
+
+        // The nodes the request NAMES are resolved against the cluster's own nodes before
+        // any of them is removed. They are the nodes that go; when the request names fewer
+        // than the cluster is giving up, the most recently added of the rest follow them,
+        // and when it names more than that there is no node count the cluster could reach.
+        // The COUNT is read first, so the per-id resolution below is bounded by the node
+        // count before it starts.
+        let named = input.node_ids_to_remove.unwrap_or_default();
+        if named.len() > giving_up {
+            return Err(
+                DecreaseReplicationFactorErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "NodeIdsToRemove names {} nodes but the cluster is giving up \
+                             {giving_up}",
+                            named.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        for node_id in &named {
+            if !cluster.nodes.iter().any(|node| &node.node_id == node_id) {
+                return Err(DecreaseReplicationFactorErrorModeled::NodeNotFoundFault(
+                    crate::state::node_not_found(),
+                )
+                .into());
+            }
+        }
+        let mut removing: Vec<String> = named;
+        if removing.len() < giving_up {
+            let owed = giving_up - removing.len();
+            // "The Availability Zone(s) from which to remove nodes": a node in a zone the
+            // request names goes before one outside it, and the most recently added nodes
+            // go before older ones, so the node the cluster started with is the last one
+            // standing.
+            let zones = input.availability_zones.unwrap_or_default();
+            let mut candidates: Vec<&crate::state::NodeRecord> = cluster
+                .nodes
+                .iter()
+                .filter(|node| !removing.contains(&node.node_id))
+                .collect();
+            candidates.reverse();
+            candidates.sort_by_key(|node| !zones.contains(&node.availability_zone));
+            let chosen: Vec<String> = candidates
+                .into_iter()
+                .take(owed)
+                .map(|node| node.node_id.clone())
+                .collect();
+            removing.extend(chosen);
+        }
+
+        // The nodes are GIVEN UP here and removed by the CLOCK: until then the cluster
+        // reports them, in `deleting`, and names them in `NodeIdsToRemove`.
+        for node in &mut cluster.nodes {
+            if removing.contains(&node.node_id) {
+                node.node_status = crate::state::NODE_DELETING.to_string();
+            }
+        }
+        cluster.nodes_to_remove = removing;
+        cluster.status = crate::state::CLUSTER_MODIFYING.to_string();
+        cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        let view = cluster.view();
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_CLUSTER_NODES_REMOVED,
+            now,
+        );
+
+        Ok(DecreaseReplicationFactorOutput {
+            cluster: Some(view),
+        })
     }
 }

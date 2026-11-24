@@ -22,11 +22,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    Cluster, ClusterNotFoundFault, Endpoint, Event, InvalidClusterStateFault,
-    InvalidParameterCombinationException, InvalidParameterValueException, Node,
-    NotificationConfiguration, Parameter, ParameterGroup, ParameterGroupAlreadyExistsFault,
-    ParameterGroupNotFoundFault, ParameterGroupStatus, SSEDescription, SecurityGroupMembership,
-    Subnet, SubnetGroup, SubnetGroupNotFoundFault,
+    Cluster, ClusterAlreadyExistsFault, ClusterNotFoundFault, Endpoint, Event, InvalidARNFault,
+    InvalidClusterStateFault, InvalidParameterCombinationException, InvalidParameterValueException,
+    Node, NodeNotFoundFault, NotificationConfiguration, Parameter, ParameterGroup,
+    ParameterGroupAlreadyExistsFault, ParameterGroupNotFoundFault, ParameterGroupStatus,
+    SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup, SubnetGroupInUseFault,
+    SubnetGroupNotFoundFault, Tag, TagNotFoundFault,
 };
 
 /// The region an ARN or an endpoint hostname carries when the request is unsigned and
@@ -49,6 +50,9 @@ pub const NODE_CREATING: &str = "creating";
 pub const NODE_AVAILABLE: &str = "available";
 /// A node of a cluster the clock is about to remove.
 pub const NODE_DELETING: &str = "deleting";
+/// A node being restarted: "During the reboot, the node status is set to REBOOTING"
+/// (`RebootNode`), which DAX words in lower case like every other status.
+pub const NODE_REBOOTING: &str = "rebooting";
 
 /// `Node$ParameterGroupStatus` / `ParameterGroupStatus$ParameterApplyStatus`
 /// ("For example, `in-sync`").
@@ -99,10 +103,6 @@ pub const MIN_MAX_RESULTS: i32 = 20;
 /// Upper bound of the documented `MaxResults` window, and the page size used when the
 /// caller names none.
 pub const MAX_MAX_RESULTS: i32 = 100;
-
-/// The longest a `ClusterName` may be: "A name must contain from 1 to 20 alphanumeric
-/// characters or hyphens" (`CreateCluster$ClusterName`).
-pub const MAX_CLUSTER_NAME_LEN: usize = 20;
 
 /// The number of clusters this service's store may hold, and with it the bound on how
 /// far that store grows per request: a create past it is refused with the modelled
@@ -161,11 +161,29 @@ pub const MAX_SUBNETS_PER_GROUP: usize = 20;
 /// this DAX cluster").
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The longest `ClusterName` this emulator STORES. The service states no length rule — the
+/// member targets the unconstrained `String` — so this is not a fidelity bound but a
+/// resource one, like [`MAX_CLUSTERS`] and [`MAX_EVENTS`]: the name is replicated into the
+/// cluster's ARN, its discovery endpoint and, per node, a node id and a node endpoint
+/// address, so one request's name is stored many times over. The bound is far above any
+/// identifier a client generates, so it refuses nothing the live service accepts.
+pub const MAX_STORED_CLUSTER_NAME_LEN: usize = 256;
+
+/// The longest tag KEY this emulator stores, the length AWS allows a tag key across its
+/// services. With [`MAX_TAGS_PER_RESOURCE`] it bounds what one cluster's tag set holds.
+pub const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The longest tag VALUE this emulator stores, the length AWS allows a tag value across
+/// its services.
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
 /// How long after the starting call a clock-owed cluster status move becomes due
 /// (`creating`/`modifying` -> `available`, `deleting` -> gone). The emulator picks this
-/// span; AWS takes minutes. It is deliberately non-zero so a caller that acts straight
-/// after the call still observes the transient status and the state errors it causes.
-pub const STATUS_SETTLE_DELAY: Duration = Duration::from_millis(500);
+/// span; AWS takes minutes. It is deliberately long enough for a client that POLLS the
+/// resource to observe the transient status and the state errors it causes — a caller that
+/// reads a moment after the call, and again a moment later, sees `creating` before it sees
+/// `available` — and short enough that nothing waits on it for long.
+pub const STATUS_SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 /// The Availability Zone suffixes nodes are spread over when neither the request nor the
 /// cluster's subnet group names any. DAX "will spread the nodes across Availability
@@ -201,6 +219,10 @@ pub const EVENT_CLUSTER_AVAILABLE: &str = "Cluster is available.";
 pub const EVENT_CLUSTER_MODIFIED: &str = "Cluster modified.";
 /// The event an `IncreaseReplicationFactor` records.
 pub const EVENT_CLUSTER_NODES_ADDED: &str = "Added nodes to the cluster.";
+/// The event a `DecreaseReplicationFactor` records.
+pub const EVENT_CLUSTER_NODES_REMOVED: &str = "Removed nodes from the cluster.";
+/// The event a `RebootNode` records.
+pub const EVENT_NODE_REBOOTING: &str = "Rebooting cluster node.";
 /// The event a `DeleteCluster` records when the deletion starts.
 pub const EVENT_CLUSTER_DELETING: &str = "Deleting cluster.";
 /// The event recorded when the clock completes a deletion.
@@ -209,6 +231,8 @@ pub const EVENT_CLUSTER_DELETED: &str = "Cluster deleted.";
 pub const EVENT_SUBNET_GROUP_CREATED: &str = "Subnet group created.";
 /// The event an `UpdateSubnetGroup` records against the group it changed.
 pub const EVENT_SUBNET_GROUP_MODIFIED: &str = "Subnet group modified.";
+/// The event a `DeleteSubnetGroup` records against the group it removed.
+pub const EVENT_SUBNET_GROUP_DELETED: &str = "Subnet group deleted.";
 /// The event a `CreateParameterGroup` records against the group it minted.
 pub const EVENT_PARAMETER_GROUP_CREATED: &str = "Parameter group created.";
 /// The event an `UpdateParameterGroup` records against the group whose parameters it
@@ -313,6 +337,9 @@ pub struct ClusterRecord {
     pub node_type: String,
     pub status: String,
     pub nodes: Vec<NodeRecord>,
+    /// The ids of the nodes a `DecreaseReplicationFactor` gave up, which the clock owes
+    /// this cluster the removal of; empty when no removal is pending.
+    pub nodes_to_remove: Vec<String>,
     pub discovery_endpoint: EndpointRecord,
     pub subnet_group: Option<String>,
     pub security_group_ids: Vec<String>,
@@ -356,9 +383,11 @@ impl ClusterRecord {
             node_type: Some(self.node_type.clone()),
             status: Some(self.status.clone()),
             cluster_discovery_endpoint: Some(self.discovery_endpoint.view()),
-            // Only `DecreaseReplicationFactor` schedules node removals, and it is not
-            // implemented, so no stored cluster ever has one pending.
-            node_ids_to_remove: None,
+            // The nodes a `DecreaseReplicationFactor` gave up, until the clock removes
+            // them: "A list of nodes to be removed from the cluster"
+            // (`Cluster$NodeIdsToRemove`).
+            node_ids_to_remove: (!self.nodes_to_remove.is_empty())
+                .then(|| self.nodes_to_remove.clone()),
             nodes: Some(self.nodes.iter().map(NodeRecord::view).collect()),
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
             notification_configuration: self.notification_topic_arn.as_ref().map(|arn| {
@@ -432,6 +461,16 @@ impl ClusterRecord {
         view
     }
 
+    /// The node this cluster holds that is NOT in a state a deletion can take it from —
+    /// the first one still coming up or already going away — or `None` when every node is
+    /// available. A cluster is deleted by deleting its nodes, so this is what a delete of
+    /// a cluster whose nodes are not settled is refused for.
+    pub fn node_blocking_deletion(&self) -> Option<&NodeRecord> {
+        self.nodes
+            .iter()
+            .find(|node| node.node_status != NODE_AVAILABLE)
+    }
+
     /// The AZ a node at `index` of this cluster lands in: the cluster's AZ pool, cycled.
     pub fn availability_zone_for(&self, index: usize) -> String {
         if self.availability_zones.is_empty() {
@@ -441,10 +480,50 @@ impl ClusterRecord {
         }
     }
 
-    /// Mint one more node for this cluster, numbered `seq`, and append it.
-    pub fn push_node(&mut self, seq: u64, now: SystemTime) {
+    /// The modelled `Tag` list this cluster carries, in the order the tags were stored.
+    pub fn tag_views(&self) -> Vec<Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| Tag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            })
+            .collect()
+    }
+
+    /// Store `value` under `key`: "Every DAX cluster can only have one tag with the same
+    /// key. If you try to add an existing tag (same key), the existing tag value will be
+    /// updated to the new value" (`Tag$Key`).
+    pub fn set_tag(&mut self, key: String, value: String) {
+        match self.tags.iter_mut().find(|(stored, _)| *stored == key) {
+            Some(existing) => existing.1 = value,
+            None => self.tags.push((key, value)),
+        }
+    }
+
+    /// Remove the tag stored under `key`, answering whether this cluster carried one.
+    pub fn remove_tag(&mut self, key: &str) -> bool {
+        let before = self.tags.len();
+        self.tags.retain(|(stored, _)| stored != key);
+        self.tags.len() != before
+    }
+
+    /// Mint one more node for this cluster and append it.
+    ///
+    /// A node is identified by the cluster's name and a one-letter suffix — DAX names a
+    /// cluster's nodes `<ClusterName>-a`, `<ClusterName>-b`, and so on — so the id is
+    /// derived from the cluster, and the lowest suffix no node of this cluster already
+    /// carries is the one minted.
+    pub fn push_node(&mut self, now: SystemTime) {
         let index = self.nodes.len();
-        let node_id = format!("{}-{seq}", self.cluster_name);
+        let mut candidate_index = 0usize;
+        let node_id = loop {
+            let candidate = format!("{}-{}", self.cluster_name, node_id_suffix(candidate_index));
+            if !self.nodes.iter().any(|node| node.node_id == candidate) {
+                break candidate;
+            }
+            candidate_index += 1;
+        };
         let address = node_endpoint_address(&node_id, &self.cluster_name, &self.region);
         self.nodes.push(NodeRecord {
             node_id,
@@ -833,8 +912,6 @@ pub struct ComAmazonawsDaxAmazondaxv3State {
     /// provides (see [`DEFAULT_PARAMETER_GROUP`]). A `BTreeMap` so every describe pages
     /// in one stable order.
     pub parameter_groups: BTreeMap<String, ParameterGroupRecord>,
-    /// Monotonic node counter, so a node id is unique and reproducible.
-    pub next_node_seq: u64,
     /// Events recorded for this service's resources, oldest first.
     pub events: Vec<EventRecord>,
     /// Monotonic event counter, so one page token names exactly one event.
@@ -851,7 +928,6 @@ impl Default for ComAmazonawsDaxAmazondaxv3State {
             clusters: BTreeMap::new(),
             subnet_groups: BTreeMap::new(),
             parameter_groups: BTreeMap::from([(default_group.name.clone(), default_group)]),
-            next_node_seq: 0,
             events: Vec::new(),
             next_event_seq: 0,
         }
@@ -859,10 +935,34 @@ impl Default for ComAmazonawsDaxAmazondaxv3State {
 }
 
 impl ComAmazonawsDaxAmazondaxv3State {
-    /// The next node sequence number.
-    pub fn next_node_seq(&mut self) -> u64 {
-        self.next_node_seq += 1;
-        self.next_node_seq
+    /// The (lower-cased) name of the cluster a tagging operation's `ResourceName`
+    /// addresses, or why it addresses none.
+    ///
+    /// A `ResourceName` is the ARN of a DAX resource, so the value is READ as one, in two
+    /// steps: a value that does not carry [`ARN_COMPONENTS`] components is not an ARN at
+    /// all, and one that does but does not name a cluster of THIS service is not one of
+    /// this account's, both refused with `InvalidARNFault`. An ARN that names a cluster
+    /// this account does not hold is refused with `ClusterNotFoundFault`.
+    /// `CreateCluster$ClusterName` "is stored as a lowercase string", so the ARN's id is
+    /// resolved lower-cased.
+    pub fn tagged_cluster_name(&self, resource_name: &str) -> Result<String, ResourceNameRefusal> {
+        if resource_name.split([':', '/']).count() != ARN_COMPONENTS {
+            return Err(ResourceNameRefusal::InvalidArn(arn_component_count()));
+        }
+        let addressed = ::service_common::arn::parse(resource_name)
+            .filter(|arn| arn.vendor == DAX_VENDOR)
+            .and_then(|_| {
+                ::service_common::arn::resource_id_of_type(resource_name, CLUSTER_RESOURCE_TYPE)
+            })
+            .filter(|id| !id.is_empty());
+        let Some(id) = addressed else {
+            return Err(ResourceNameRefusal::InvalidArn(invalid_resource_arn()));
+        };
+        let name = id.to_lowercase();
+        if !self.clusters.contains_key(&name) {
+            return Err(ResourceNameRefusal::ClusterNotFound(cluster_not_found()));
+        }
+        Ok(name)
     }
 
     /// Record one event against `source_name` (a [`SOURCE_TYPES`] resource) at `at`.
@@ -926,6 +1026,14 @@ impl ComAmazonawsDaxAmazondaxv3State {
             }
             let mut settled = false;
             if let Some(cluster) = self.clusters.get_mut(&name) {
+                // A removal the clock owed is materialised first: the nodes a decrease
+                // gave up are gone, and what stays is available.
+                if !cluster.nodes_to_remove.is_empty() {
+                    let removing = std::mem::take(&mut cluster.nodes_to_remove);
+                    cluster
+                        .nodes
+                        .retain(|node| !removing.contains(&node.node_id));
+                }
                 cluster.status = CLUSTER_AVAILABLE.to_string();
                 for node in &mut cluster.nodes {
                     node.node_status = NODE_AVAILABLE.to_string();
@@ -976,7 +1084,89 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 
 /// The ARN of a DAX cluster: `arn:aws:dax:<region>:<account>:cache/<ClusterName>`.
 pub fn cluster_arn(region: &str, cluster_name: &str) -> String {
-    ::engine::emulator_arn("dax", region, &format!("cache/{cluster_name}"))
+    ::engine::emulator_arn(DAX_VENDOR, region, &format!("{CLUSTER_RESOURCE_TYPE}/{cluster_name}"))
+}
+
+/// The service namespace a DAX resource's ARN names, and the vendor a `ResourceName` a
+/// tagging operation carries has to be one of.
+pub const DAX_VENDOR: &str = "dax";
+
+/// The resource type a DAX cluster's ARN addresses it by, so one `ResourceName` resolves
+/// to the cluster this store holds under that id.
+pub const CLUSTER_RESOURCE_TYPE: &str = "cache";
+
+/// Why a `ResourceName` a tagging operation carries names no cluster of this account.
+///
+/// The tagging operations (`TagResource`, `UntagResource`, `ListTags`) address a resource
+/// by ARN rather than by name, and each models both refusals, so the reading is shared and
+/// each handler lifts the refusal into its own error channel.
+#[derive(Debug)]
+pub enum ResourceNameRefusal {
+    /// The value is not a well-formed ARN of a DAX cluster.
+    InvalidArn(InvalidARNFault),
+    /// It is one, but this account holds no cluster it addresses.
+    ClusterNotFound(ClusterNotFoundFault),
+}
+
+/// How many components DAX reads a resource ARN as carrying: the literal `arn`, the
+/// partition, the service namespace, the Region, the account, the resource type and the
+/// resource id — the six colon-separated ARN fields with the resource field split into its
+/// type and its id, so `arn:aws:dax:<region>:<account>:cache/<ClusterName>` has seven.
+pub const ARN_COMPONENTS: usize = 7;
+
+/// `InvalidARNFault` for a `ResourceName` whose component count is not
+/// [`ARN_COMPONENTS`]: the value cannot be read as a resource ARN at all, which is the
+/// refusal DAX words from this fixed template.
+pub fn arn_component_count() -> InvalidARNFault {
+    InvalidARNFault {
+        message: Some(format!(
+            "Input ARN string does not have {ARN_COMPONENTS} components."
+        )),
+    }
+}
+
+/// `InvalidARNFault` for a value that carries [`ARN_COMPONENTS`] components but is not an
+/// ARN of THIS service naming a cluster — another partition's syntax, another vendor's
+/// resource, or another resource type of this one. The modelled sentence for the fault
+/// ("The Amazon Resource Name (ARN) supplied in the request is not valid"), as a fixed
+/// template naming no identifier: the request already carries the only value it could mean.
+pub fn invalid_resource_arn() -> InvalidARNFault {
+    InvalidARNFault {
+        message: Some(
+            "The Amazon Resource Name (ARN) supplied in the request is not valid.".to_string(),
+        ),
+    }
+}
+
+/// `TagNotFoundFault` for an untag naming keys the resource does not carry ("The tag does
+/// not exist"), listing every key that is not present — the one part of the template taken
+/// from the request.
+pub fn tag_not_found(missing: &[String]) -> TagNotFoundFault {
+    TagNotFoundFault {
+        message: Some(format!(
+            "Failing request. These tags are not present : {}",
+            missing.join(", ")
+        )),
+    }
+}
+
+/// `NodeNotFoundFault` for a node id no node of the addressed cluster carries ("None of
+/// the nodes in the cluster have the given node ID"). DAX words this from a FIXED template
+/// that names no identifier: the request already carries the id it could mean.
+pub fn node_not_found() -> NodeNotFoundFault {
+    NodeNotFoundFault {
+        message: Some("Node not found.".to_string()),
+    }
+}
+
+/// `SubnetGroupInUseFault` for a subnet group a stored cluster is placed in ("The
+/// specified subnet group is currently in use"), naming the group the request addressed.
+pub fn subnet_group_in_use(name: &str) -> SubnetGroupInUseFault {
+    SubnetGroupInUseFault {
+        message: Some(format!(
+            "Subnet group {name} is currently in use by a cluster."
+        )),
+    }
 }
 
 /// The DNS name of a cluster's discovery endpoint.
@@ -989,21 +1179,44 @@ pub fn node_endpoint_address(node_id: &str, cluster_name: &str, region: &str) ->
     format!("{node_id}.{cluster_name}.dax-clusters.{region}.amazonaws.com")
 }
 
+/// The suffix the node at `index` of a cluster is identified by: a single letter, since
+/// DAX names a cluster's nodes `<ClusterName>-a`, `<ClusterName>-b`, and so on. Past the
+/// letters the index itself continues the sequence, so an id stays unique whatever the
+/// node count — a cluster holds at most [`MAX_NODES_PER_CLUSTER`] nodes, so that is
+/// unreachable today.
+fn node_id_suffix(index: usize) -> String {
+    match u8::try_from(index) {
+        Ok(offset) if index < 26 => char::from(b'a' + offset).to_string(),
+        _ => index.to_string(),
+    }
+}
+
 /// The AZ a node at `index` lands in when nothing named a pool: DAX spreads nodes over
 /// the region's zones.
 pub fn default_availability_zone(region: &str, index: usize) -> String {
     format!("{region}{}", AZ_SUFFIXES[index % AZ_SUFFIXES.len()])
 }
 
-/// A `ClusterName` the `CreateCluster$ClusterName` doc accepts: "A name must contain
-/// from 1 to 20 alphanumeric characters or hyphens. The first character must be a
-/// letter. A name cannot end with a hyphen or contain two consecutive hyphens."
+/// A `ClusterName` the `CreateCluster$ClusterName` doc accepts: it carries only
+/// alphanumeric characters or hyphens, "The first character must be a letter. A name
+/// cannot end with a hyphen or contain two consecutive hyphens."
+///
+/// The member's SHAPE is the rule the service states: `ClusterName` targets the
+/// unconstrained `String`, so the model states no `@length`
+/// (`smithy_query(query="operation",operation="CreateCluster")` and
+/// `smithy_query(query="shape",shape="String")`), and the service accepts names far longer
+/// than the member's documentation prose ("A name must contain from 1 to 20 alphanumeric
+/// characters or hyphens") claims. A name is therefore read for its shape, and its length
+/// only against [`MAX_STORED_CLUSTER_NAME_LEN`], the bound this emulator picks on what one
+/// request may make it store. The empty name the model's `@required` admits begins with no
+/// letter, so the first-character clause is what refuses it.
 ///
 /// Returns the reason it is refused, worded for the caller, or `None` when it is valid.
 pub fn cluster_name_violation(name: &str) -> Option<String> {
-    if name.is_empty() || name.chars().count() > MAX_CLUSTER_NAME_LEN {
+    // The bound on STORED bytes first, so no longer value is scanned or copied.
+    if name.len() > MAX_STORED_CLUSTER_NAME_LEN {
         return Some(format!(
-            "ClusterName must contain from 1 to {MAX_CLUSTER_NAME_LEN} alphanumeric characters or hyphens"
+            "ClusterName must be at most {MAX_STORED_CLUSTER_NAME_LEN} characters"
         ));
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -1019,6 +1232,30 @@ pub fn cluster_name_violation(name: &str) -> Option<String> {
     }
     if name.contains("--") {
         return Some("ClusterName cannot contain two consecutive hyphens".to_string());
+    }
+    None
+}
+
+/// Why the tag `(key, value)` cannot be stored, or `None` when it can.
+///
+/// A tag is stored UNDER its key, so a tag without one addresses nothing. Both halves are
+/// bounded by what this emulator stores per tag ([`MAX_TAG_KEY_LEN`],
+/// [`MAX_TAG_VALUE_LEN`]) which, with [`MAX_TAGS_PER_RESOURCE`], bounds one cluster's
+/// whole tag set. Every path that STORES tags — `CreateCluster$Tags` and `TagResource` —
+/// reads them this way, so one request cannot leave a tag the other path would refuse.
+pub fn tag_violation(key: &str, value: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("Tag key must not be empty.".to_string());
+    }
+    if key.len() > MAX_TAG_KEY_LEN {
+        return Some(format!(
+            "Tag key must be at most {MAX_TAG_KEY_LEN} characters"
+        ));
+    }
+    if value.len() > MAX_TAG_VALUE_LEN {
+        return Some(format!(
+            "Tag value must be at most {MAX_TAG_VALUE_LEN} characters"
+        ));
     }
     None
 }
@@ -1221,6 +1458,27 @@ pub fn subnet_group_does_not_exist(name: &str) -> SubnetGroupNotFoundFault {
 pub fn invalid_cluster_state() -> InvalidClusterStateFault {
     InvalidClusterStateFault {
         message: Some(format!("Cluster is not in the {CLUSTER_AVAILABLE} state.")),
+    }
+}
+
+/// `ClusterAlreadyExistsFault` for a create of a name the account already holds: DAX
+/// words this refusal from a FIXED template that names no identifier, because the request
+/// already carries the only name it could mean.
+pub fn cluster_already_exists() -> ClusterAlreadyExistsFault {
+    ClusterAlreadyExistsFault {
+        message: Some("Cluster with specified name already exists.".to_string()),
+    }
+}
+
+/// `InvalidClusterStateFault` for a DELETE of a cluster whose nodes are not all in a
+/// state a deletion can take them from. A cluster is deleted by deleting its NODES, so
+/// the refusal is worded about the node that blocks it and names that node's id — the one
+/// part taken from stored state — rather than about the cluster.
+pub fn node_not_in_deletable_state(node_id: &str) -> InvalidClusterStateFault {
+    InvalidClusterStateFault {
+        message: Some(format!(
+            "Node {node_id} is not in a valid state to be deleted."
+        )),
     }
 }
 
