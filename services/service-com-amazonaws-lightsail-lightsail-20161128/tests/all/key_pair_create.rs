@@ -341,9 +341,10 @@ fn assert_real_key_material(case: &str, body: &Value) -> String {
         .unwrap_or_else(|| panic!("case {case}: expected privateKeyBase64, got {body:?}"))
         .to_string();
 
-    // The public half: the base64-encoded `ssh-rsa` key the model documents —
-    // base64 text alone, checked where that rule lives.
-    let public = crate::key_pair_public_key_encoding::assert_base64_ssh_public_key(
+    // The public half: the `ssh-rsa` public key the model documents — the
+    // algorithm name and the key's base64 encoding, checked where that rule
+    // lives.
+    let public = crate::key_pair_public_key_encoding::assert_reported_ssh_public_key(
         case,
         &public_key,
     );
@@ -705,10 +706,10 @@ async fn concurrent_creates_of_one_name_elect_exactly_one_winner() {
 ///   arrived in — and the call logs ONE terminal `ImportKeyPair` operation naming
 ///   that key pair, its resource type and its location. The submitted value is
 ///   the key's own `ssh-rsa` encoding in base64, read in either rendering that
-///   encoding is published in: the base64 body alone, which is what every member
-///   of this service that reports an SSH public key carries, and the whole
-///   OpenSSH public key line a caller reads out of a `.pub` file, with or without
-///   its comment. Whitespace around the value is not key material.
+///   encoding is published in: the whole OpenSSH public key line a caller reads
+///   out of a `.pub` file — which is also what every member of this service that
+///   reports a key pair's public half carries — with or without its comment, and
+///   the base64 body alone. Whitespace around the value is not key material.
 /// * A value that carries no public key of the `ssh-rsa` type — text that is not
 ///   base64, base64 that is not an SSH public key, a truncated blob, a private
 ///   key, a real public key of another algorithm, or a line whose label disagrees
@@ -743,8 +744,8 @@ mod importing {
     /// the fingerprint is what the account that minted it publishes, which an
     /// import of the same key has to publish too.
     struct MintedKey {
-        /// The key as every member of this service that reports an SSH public key
-        /// carries it: the base64 of the key's own `ssh-rsa` encoding, alone.
+        /// The key's BODY: the base64 of its own `ssh-rsa` encoding, without the
+        /// algorithm label the reporting member carries in front of it.
         body: String,
         /// The `fingerprint` the minting account's own record publishes.
         fingerprint: String,
@@ -766,10 +767,22 @@ mod importing {
                 status, 200,
                 "case {case}: the source key pair must be created, got {created:?}"
             );
-            let body = created["publicKeyBase64"]
+            // The create reports the whole `ssh-rsa` public key; a row chooses
+            // which published rendering of it to submit, so the BODY is kept
+            // here and each rendering is built from it.
+            let reported = created["publicKeyBase64"]
                 .as_str()
                 .unwrap_or_else(|| {
                     panic!("case {case}: expected publicKeyBase64, got {created:?}")
+                });
+            let body = reported
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: expected an {SSH_RSA} public key carrying its body, got \
+                         {reported:?}"
+                    )
                 })
                 .to_string();
             let fingerprint = created["keyPair"]["fingerprint"]
@@ -793,8 +806,8 @@ mod importing {
     /// Which published rendering of the key's `ssh-rsa` encoding a row submits.
     #[derive(Clone, Copy, Debug)]
     enum Submitted {
-        /// The base64 body alone — what every member of this service that reports
-        /// an SSH public key carries.
+        /// The base64 body alone, which is the key without the algorithm label
+        /// the reporting members carry in front of it.
         Body,
         /// The body with whitespace around it, as a value read out of a file
         /// arrives.

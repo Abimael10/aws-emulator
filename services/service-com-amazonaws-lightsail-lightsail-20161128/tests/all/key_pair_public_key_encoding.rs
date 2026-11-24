@@ -9,12 +9,19 @@
 //! handlers and the awsJson error envelope are all exercised rather than
 //! bypassed.
 //!
-//! The rule under test: a member that reports an SSH public key carries the
-//! base64 of that key's own `ssh-rsa` encoding — base64 text alone, with no
-//! algorithm prefix and no whitespace — so a client base64-decodes the member
-//! to recover the key. The decoded blob names the `ssh-rsa` algorithm inside
-//! itself, and the key it describes is the one the account holds: that key's DER
-//! public key is what the stored record's `fingerprint` is the MD5 digest of.
+//! The rule under test: a member documented as "a base64-encoded public key of
+//! the `ssh-rsa` type" carries that public key as an SSH public key of its type
+//! is published — the algorithm name, one space, then the base64 of the key's
+//! own `ssh-rsa` encoding — so the value a caller is handed is usable as it
+//! stands, as an `authorized_keys` entry and as the value `ImportKeyPair` reads
+//! a key back out of. The key it carries is the one the account holds: that
+//! key's DER public key is what the stored record's `fingerprint` is the MD5
+//! digest of.
+//!
+//! "Base64-encoded" is how this service's model words every key half it
+//! publishes as text, and it does not mean the base64 alphabet alone: the
+//! sibling `privateKeyBase64` is documented with the same wording and carries a
+//! whole PEM — dashes, label and line breaks included.
 //!
 //! The rows differ along what the rule generalises over: WHICH call reports the
 //! key (a create of a pair the request names, a download of the account's
@@ -121,22 +128,68 @@ impl Row {
     }
 }
 
-/// Assert `value` is an SSH public key reported the way the rule requires —
-/// base64 text alone, carrying the key's own `ssh-rsa` encoding, which names
-/// that algorithm inside itself — and answer the key it describes.
+/// Assert `value` is a reported SSH public key in the form the rule requires —
+/// the algorithm name, one space, then the base64 of the key's own `ssh-rsa`
+/// encoding, with nothing else on the line — and answer the key it carries.
 ///
 /// `pub(crate)` so the create and download suites check the reported half the
-/// same way rather than each stating the encoding itself.
-pub(crate) fn assert_base64_ssh_public_key(case: &str, value: &str) -> ::ssh_key::PublicKey {
+/// same way rather than each stating the rendering itself.
+pub(crate) fn assert_reported_ssh_public_key(case: &str, value: &str) -> ::ssh_key::PublicKey {
+    assert!(
+        !value.is_empty(),
+        "case {case}: expected an {SSH_RSA} public key, got an empty value"
+    );
+    let fields: Vec<&str> = value.split(' ').collect();
+    assert_eq!(
+        fields.len(),
+        2,
+        "case {case}: expected the algorithm name and the key body alone, got {value:?}"
+    );
+    assert_eq!(
+        fields[0], SSH_RSA,
+        "case {case}: expected the value to name its algorithm, got {value:?}"
+    );
+    // No surrounding or trailing whitespace: the value is the line's text, not a
+    // file's contents.
+    assert_eq!(
+        value.trim(),
+        value,
+        "case {case}: expected no surrounding whitespace, got {value:?}"
+    );
+    // And the body is the key: checked where the body rule lives, and the key it
+    // decodes to is answered from there.
+    let key = assert_base64_ssh_public_key(case, fields[1]);
+    // Read back as the whole line by the crate that implements the SSH key
+    // formats, which refuses a line whose label disagrees with its body — so the
+    // reported value is an `authorized_keys` entry and not two halves that only
+    // look like one.
+    let parsed = ::ssh_key::PublicKey::from_openssh(value).unwrap_or_else(|error| {
+        panic!("case {case}: expected an OpenSSH {SSH_RSA} public key, got {value:?}: {error}")
+    });
+    assert_eq!(
+        parsed.key_data(),
+        key.key_data(),
+        "case {case}: expected the line to carry the body's key, got {value:?}"
+    );
+    parsed
+}
+
+/// Assert `body` is the base64 body of an `ssh-rsa` public key — base64 text
+/// alone, decoding to a blob that names that algorithm inside itself — and
+/// answer the key it describes.
+///
+/// `pub(crate)` so a suite that holds a key's BODY (the import suite, which
+/// submits one) checks it the same way.
+pub(crate) fn assert_base64_ssh_public_key(case: &str, body: &str) -> ::ssh_key::PublicKey {
     use ::base64::Engine;
 
+    let value = body;
     assert!(
         !value.is_empty(),
         "case {case}: expected a base64 public key, got an empty value"
     );
     // Base64 text alone: the alphabet of RFC 4648 section 4 and its padding, so
-    // an OpenSSH line's `<algorithm> ` prefix — or any whitespace — is a
-    // divergence.
+    // any whitespace in the body is a divergence.
     let offending: Vec<char> = value
         .chars()
         .filter(|c| !(c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '='))
@@ -195,12 +248,13 @@ async fn held_key_pair(
     body["keyPair"].clone()
 }
 
-/// RULE: every call that reports an SSH public key reports it as base64 text
-/// alone — the base64 of the key's own `ssh-rsa` encoding — and the key that value
-/// decodes to is the one the account holds, whose DER public key the stored
-/// record's `fingerprint` is the MD5 digest of.
+/// RULE: every call that reports an SSH public key reports it as the public key
+/// of its type is published — the algorithm name, one space, then the base64 of
+/// the key's own `ssh-rsa` encoding — and the key that value carries is the one
+/// the account holds, whose DER public key the stored record's `fingerprint` is
+/// the MD5 digest of.
 #[tokio::test]
-async fn a_reported_public_key_is_base64_text_alone() {
+async fn a_reported_public_key_is_an_ssh_rsa_public_key() {
     use ::md5::Digest;
 
     for row in ROWS {
@@ -213,9 +267,28 @@ async fn a_reported_public_key_is_base64_text_alone() {
         let reported = body["publicKeyBase64"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: expected publicKeyBase64, got {body:?}"));
-        let key = assert_base64_ssh_public_key(case, reported);
+        let key = assert_reported_ssh_public_key(case, reported);
 
-        // The key the value decodes to is the pair the account now holds: the
+        // The value is usable as it stands: this service's own reader of a
+        // submitted public key takes it, so a pair this account minted can be
+        // imported again exactly as it was reported.
+        let (import_status, imported) = emulator
+            .call_in(
+                row.region,
+                "ImportKeyPair",
+                json!({
+                    "keyPairName": format!("{}-reimported", row.key_pair_name),
+                    "publicKeyBase64": reported,
+                }),
+            )
+            .await;
+        assert_eq!(
+            import_status, 200,
+            "case {case}: expected the reported value to be importable as it stands, got \
+             {imported:?}"
+        );
+
+        // The key the value carries is the pair the account now holds: the
         // record's published fingerprint is the MD5 digest of this key's DER
         // public key.
         let held = held_key_pair(&emulator, case, row.region, row.key_pair_name).await;
@@ -246,11 +319,11 @@ async fn a_reported_public_key_is_base64_text_alone() {
     }
 }
 
-/// RULE: the encoding is a property of the member and not of the call, so the
+/// RULE: the rendering is a property of the member and not of the call, so the
 /// same account's two reporting calls — a create and the download of the
-/// default pair — both report base64 text alone, and two distinct keys.
+/// default pair — both report an `ssh-rsa` public key, and two distinct keys.
 #[tokio::test]
-async fn both_reporting_calls_of_one_account_report_base64_text_alone() {
+async fn both_reporting_calls_of_one_account_report_an_ssh_rsa_public_key() {
     let emulator = Emulator::new();
     let case = "one account, a create and a default download";
 
@@ -265,7 +338,7 @@ async fn both_reporting_calls_of_one_account_report_base64_text_alone() {
     let created_key = created["publicKeyBase64"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected publicKeyBase64, got {created:?}"));
-    assert_base64_ssh_public_key(case, created_key);
+    assert_reported_ssh_public_key(case, created_key);
 
     let downloaded = emulator
         .call_in(Some("us-east-1"), "DownloadDefaultKeyPair", json!({}))
@@ -274,7 +347,7 @@ async fn both_reporting_calls_of_one_account_report_base64_text_alone() {
     let downloaded_key = downloaded["publicKeyBase64"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected publicKeyBase64, got {downloaded:?}"));
-    assert_base64_ssh_public_key(case, downloaded_key);
+    assert_reported_ssh_public_key(case, downloaded_key);
 
     assert_ne!(
         created_key, downloaded_key,

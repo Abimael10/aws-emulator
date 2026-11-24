@@ -196,9 +196,13 @@ pub const PASSWORD_NOT_AVAILABLE: &str = "";
 /// The host key an SSH access to an instance witnesses: a real Ed25519 SSH host
 /// key, described by the crate that implements the OpenSSH key formats.
 ///
-/// `publicKey` is the key BLOB — the base64 body of the OpenSSH public key line,
-/// which is what Lightsail reports and what a `known_hosts` entry carries beside
-/// the algorithm. The fingerprints are OpenSSH's own: `SHA256:<base64>` as
+/// `publicKey` is the key BLOB alone — the base64 body of the OpenSSH public key
+/// line — because `HostKeyAttributes` reports the key's algorithm in a member of
+/// its own (`algorithm`) beside it, exactly as a `known_hosts` entry carries the
+/// two apart. That is why it is NOT the rendering the two results that report a
+/// key pair's public half carry ([`MintedKeyPairMaterial::public_key`]), where
+/// the value is the whole SSH public key and nothing names its algorithm but the
+/// value itself. The fingerprints are OpenSSH's own: `SHA256:<base64>` as
 /// `ssh-keygen -l` prints it, and the same encoding over a SHA-1 digest, the two
 /// forms `HostKeyAttributes$fingerprintSHA1`/`fingerprintSHA256` show for an SSH
 /// host key.
@@ -320,9 +324,10 @@ fn temporary_access_certificate(
 ///
 /// The body is the base64 of the key's own SSH encoding, which names the
 /// algorithm inside itself, so it is the whole key without the line's text
-/// prefix. The ONE owner of that rendering, so every SSH public key this store
-/// publishes as base64 is cut from an OpenSSH line the same way (see
-/// [`MintedKeyPairMaterial::public_key`]).
+/// prefix. The ONE owner of that split, so every member this store publishes a
+/// key blob under is cut from an OpenSSH line the same way, and the line form
+/// the two results that report a key pair's public half carry is built back from
+/// it ([`MintedKeyPairMaterial::public_key`]).
 pub fn openssh_key_body(openssh: &str) -> Option<&str> {
     openssh.split_whitespace().nth(1)
 }
