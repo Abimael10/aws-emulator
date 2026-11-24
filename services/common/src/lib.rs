@@ -1632,6 +1632,29 @@ pub fn request_path(uri: &str) -> &str {
     }
 }
 
+/// The QUERY string of a request URI — everything after the first `?` — or `None` for a URI
+/// that carries none.
+///
+/// The other half of [`request_path`], for the same reason: the runtime-API request hands over
+/// whichever form arrived, and a service that reads a query parameter off it
+/// ([`query_parameter`]) needs the raw query rather than the whole target. The value is
+/// returned as written, since a parameter's own decoding is its reader's business.
+///
+/// # Services still carrying their own copy
+///
+/// The same split is inlined in the service crates that needed it before this existed —
+/// `grep -rn 'fn request_query' services/*/src` is the authority, and it includes
+/// `services/service-com-amazonaws-mediapackagev2-mediapackagev2/src/service.rs`,
+/// `services/service-com-amazonaws-s3-amazons3/src/service/wire.rs` and
+/// `services/service-com-amazonaws-directoryservicedata-directoryservicedata/src/service.rs`.
+/// Those copies are to be MIGRATED onto this function; they are left in place because this
+/// change does not own those services' issues. Nothing new should inline the split again —
+/// call this.
+#[must_use]
+pub fn request_query(uri: &str) -> Option<&str> {
+    uri.split_once('?').map(|(_target, query)| query)
+}
+
 /// The index, in `/endpoints/{EndpointName}/<operation>`, of the segment the two
 /// SageMaker Runtime endpoints' modelled URIs differ at.
 const RUNTIME_INVOCATION_SEGMENT_INDEX: usize = 2;

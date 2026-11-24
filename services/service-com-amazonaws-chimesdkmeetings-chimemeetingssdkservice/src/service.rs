@@ -45,6 +45,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// What answers when a client dials one of the addresses a meeting's `MediaPlacement`
+/// published to it. Mounted below: claimed in `can_handle` and served from
+/// `override_operation`.
+pub mod media_plane;
+
 /// This service's own `aws.api#service$endpointPrefix`, the name that identifies it
 /// among the six services that sign as `chime`.
 ///
@@ -61,6 +66,11 @@ const OWN_ENDPOINT_PREFIX: &str = "meetings-chime";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The media plane, built once because `override_operation` hands back a reference to it.
+    media_plane: media_plane::MediaPlane<Eng>,
+    /// The one shared engine, which the media plane's CLAIM reads the store through:
+    /// `can_handle` is answered from the meetings this service holds.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,7 +79,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            media_plane: media_plane::MediaPlane::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -104,6 +116,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // endpoint is served by the family's declared tagging owner, and this service
         // serves that space at its OWN endpoint from the same shared ARN-keyed tag
         // directory, so both answer alike — see `chime_family`.)
+        //
+        // And one request that rule cannot place at all: a client opening one of the MEDIA
+        // sessions a meeting's `MediaPlacement` published to it ([`media_plane`]). Such a
+        // request names no modelled operation and carries no SigV4 credential scope — a
+        // client of a published media address has none to sign with — so neither the family's
+        // endpoint rule nor this model's path space reaches it, and the front door answered a
+        // routing failure for an address this service itself handed out. The claim is narrowed
+        // to this service's own published addresses, and to a meeting this store holds or a
+        // WebSocket handshake, so no other service's traffic is taken.
+        if media_plane::claims_parts(&*self.engine, parts) {
+            return true;
+        }
         service_common::chime_family::claims_chime_family_request(
             parts,
             OWN_ENDPOINT_PREFIX,
@@ -120,11 +144,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A meeting's MEDIA session is no modelled operation of this service by construction
+        // — no modelled route is bound at a `MediaPlacement` address — so it is served the way
+        // an emulated data plane is: claimed by `can_handle` and served here, by the one rule
+        // ([`media_plane::claims_request`]), so the claim and the serving cannot disagree.
+        if self.media_plane.claims(req) {
+            return Some(&self.media_plane as _);
+        }
+        // Every other request resolves through the generated routing table.
         None
     }
 

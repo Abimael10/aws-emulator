@@ -30,6 +30,12 @@
 //! Nothing here is ever CONNECTED to. This module formats strings into a response and holds
 //! no outbound client, socket or resolver; every address it composes is one of this
 //! process's own inbound addresses, so no value it reports leads off this machine.
+//!
+//! What ANSWERS when a client dials one of these addresses is [`crate::service::media_plane`],
+//! which reads the same path and query BACK ([`dialed_media_meeting`]) to resolve the meeting
+//! whose session was dialled. Composing and reading an address are two directions of one
+//! format, so both live here: a member whose path moved would otherwise be published at one
+//! address and served at another.
 
 use super::*;
 
@@ -41,10 +47,10 @@ const WEBSOCKET_SCHEME: &str = "wss";
 const HTTPS_SCHEME: &str = "https";
 
 /// The path a meeting's audio fallback session is dialed at, ahead of the `MeetingId`.
-const AUDIO_FALLBACK_PATH: &str = "/calls";
+pub const AUDIO_FALLBACK_PATH: &str = "/calls";
 
 /// The path a meeting's signaling (control) session is dialed at, ahead of the `MeetingId`.
-const SIGNALING_PATH: &str = "/control";
+pub const SIGNALING_PATH: &str = "/control";
 
 /// The path a TURN session is requested at. It belongs to the deployment rather than to one
 /// meeting, so it carries no `MeetingId`.
@@ -52,11 +58,11 @@ const TURN_CONTROL_PATH: &str = "/v2/turn_sessions";
 
 /// The path a meeting's screen session — the one both the screen DATA and the screen SHARING
 /// member name — is dialed at, ahead of the `MeetingId`.
-const SCREEN_PATH: &str = "/v2/screen";
+pub const SCREEN_PATH: &str = "/v2/screen";
 
 /// The path a screen VIEWER connects at, which carries its parameters in the query string
 /// rather than the `MeetingId` in the path.
-const SCREEN_VIEWING_PATH: &str = "/ws/connect";
+pub const SCREEN_VIEWING_PATH: &str = "/ws/connect";
 
 /// The query string that connect URL carries ahead of the meeting's call id: a `passcode`
 /// and a `viewer_uuid` that no caller supplies — so both read `null` — which are part of the
@@ -65,7 +71,7 @@ const SCREEN_VIEWING_PATH: &str = "/ws/connect";
 const VIEWER_CONNECT_PARAMETERS: &str = "passcode=null&viewer_uuid=null";
 
 /// The query parameter that connect URL carries the meeting's own id in.
-const CALL_ID_PARAMETER: &str = "X-BitHub-Call-Id";
+pub const CALL_ID_PARAMETER: &str = "X-BitHub-Call-Id";
 
 /// The path client events are ingested at. Deployment-wide, like [`TURN_CONTROL_PATH`].
 const EVENT_INGESTION_PATH: &str = "/v1/client-events";
@@ -125,6 +131,80 @@ pub fn media_placement(authority: &str, meeting_id: &str) -> MediaPlacement {
         )),
         event_ingestion_url: Some(format!("{HTTPS_SCHEME}://{authority}{EVENT_INGESTION_PATH}")),
     }
+}
+
+/// The `MeetingId` a DIALLED address names — read back out of the very path and query
+/// [`media_placement`] composed, for the four members a client opens a SESSION on: the
+/// signaling, audio-fallback and screen endpoints, which carry the id in their path, and the
+/// screen-viewing endpoint, which carries it in its own query parameter. (`ScreenDataUrl` and
+/// `ScreenSharingUrl` name one screen session, so they read back alike.)
+///
+/// `None` for a request that addresses no such member, which is every other path on this
+/// emulator's endpoint — the control plane's own routes among them, so this reader claims none
+/// of them — and for one whose id is not of the modelled form ([`is_meeting_id`]), which is no
+/// address this service ever published.
+///
+/// The two `https` members are not read back: `TurnControlUrl` and `EventIngestionUrl` carry no
+/// `MeetingId` at all, so a request to either names no meeting to resolve.
+///
+/// The authority is NOT compared, because it is not part of the identity of these addresses:
+/// the host a client reached this emulator at is whatever its own resolver answered
+/// ([`announced_authority`] publishes one of them), while what says WHICH session was dialled
+/// is the path — and, for the viewer endpoint, the one query parameter that carries the
+/// meeting's id.
+#[must_use]
+pub fn dialed_media_meeting<'r>(path: &'r str, query: Option<&'r str>) -> Option<&'r str> {
+    for dialed_at in [SIGNALING_PATH, AUDIO_FALLBACK_PATH, SCREEN_PATH] {
+        if let Some(meeting_id) = meeting_id_under(path, dialed_at) {
+            return Some(meeting_id);
+        }
+    }
+    if path == SCREEN_VIEWING_PATH {
+        let meeting_id = ::service_common::query_parameter(query?, CALL_ID_PARAMETER)?;
+        if is_meeting_id(meeting_id) {
+            return Some(meeting_id);
+        }
+    }
+    None
+}
+
+/// The ONE path segment `path` carries under `dialed_at`, when it is a `MeetingId`: that is
+/// where a meeting-scoped member carries one.
+///
+/// `None` when the path is not under that endpoint, carries nothing under it, or carries more
+/// than one segment: the published form is exactly `<endpoint>/<MeetingId>`, and a longer path
+/// is a different address.
+fn meeting_id_under<'r>(path: &'r str, dialed_at: &str) -> Option<&'r str> {
+    let meeting_id = path.strip_prefix(dialed_at)?.strip_prefix('/')?;
+    (!meeting_id.contains('/') && is_meeting_id(meeting_id)).then_some(meeting_id)
+}
+
+/// Whether `value` is of the form a `MeetingId` takes, which is what every address composed
+/// above carries.
+///
+/// From the model: `MeetingId` targets `GuidString`, `@length(36..36)` with the pattern
+/// `^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$`
+/// (`smithy_query(query="shape",shape="GuidString")`) — the form this store MINTS a meeting's
+/// id in. Read as the five hyphen-separated hex groups that pattern states,
+/// rather than with a regular expression, so no pattern engine runs on a caller's path.
+///
+/// It is what keeps these generic endpoint paths from reading ANY segment as a meeting of this
+/// service: a value that cannot be a `MeetingId` is no address this service published.
+#[must_use]
+pub fn is_meeting_id(value: &str) -> bool {
+    let mut groups = value.split('-');
+    let lengths = [8usize, 4, 4, 4, 12];
+    for length in lengths {
+        match groups.next() {
+            Some(group) => {
+                if group.len() != length || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    groups.next().is_none()
 }
 
 /// The `host[:port]` every address this service announces is reached at: the ONE endpoint
