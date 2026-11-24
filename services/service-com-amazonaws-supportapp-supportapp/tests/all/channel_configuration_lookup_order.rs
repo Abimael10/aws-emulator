@@ -3,35 +3,38 @@
 //! Which refusal wins when a Slack channel configuration write names a configuration
 //! the account does not hold.
 //!
-//! An operation that acts on the resource its request IDENTIFIES settles that
-//! resource's existence against the account's state before any account-level
-//! precondition: `UpdateSlackChannelConfiguration` and
-//! `DeleteSlackChannelConfiguration` name one Slack channel configuration by its
-//! `(teamId, channelId)` pair, so a pair the account holds no configuration for is the
-//! modelled `ResourceNotFoundException` (HTTP 404) — "The specified resource is missing
-//! or doesn't exist, such as an account alias, Slack channel configuration, or Slack
-//! workspace configuration"
+//! The account-level precondition comes FIRST: `ConflictException`'s documentation
+//! names "Add, update, or delete a Slack channel configuration before you add a Slack
+//! workspace to your Amazon Web Services account" as its first condition, so a write
+//! whose `teamId` the account has not registered is the modelled `ConflictException`
+//! (HTTP 409) and nothing is looked up for it. Only inside a REGISTERED workspace is a
+//! pair the account holds no configuration for the modelled `ResourceNotFoundException`
+//! (HTTP 404) — "The specified resource is missing or doesn't exist, such as an account
+//! alias, Slack channel configuration, or Slack workspace configuration"
 //! (`smithy_query(query="operation", operation="UpdateSlackChannelConfiguration,DeleteSlackChannelConfiguration",
 //! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`)
-//! — with the message template every operation of this service words a miss with, and
-//! never the modelled `ConflictException` (409) of an account that has registered no
-//! Slack workspace.
+//! — with the message template every operation of this service words a miss with. The
+//! two are what a caller branches on: one tells it to add the Slack workspace first,
+//! the other that the channel was never configured.
 //!
 //! So the tables below run the rule over what it generalises over, with the recorded
 //! "no workspace registered at all" case as a single row:
 //!
 //! * which operation is called — both that act on an existing configuration;
-//! * what the account holds ABOUT the named workspace — nothing, a registration, or a
-//!   registration it then deleted (which took that workspace's configurations with it);
+//! * what the account holds ABOUT the named workspace — nothing, a registration, a
+//!   registration it then deleted (which took that workspace's configurations with it),
+//!   or one it deleted and made again, which is what decides WHICH of the two refusals
+//!   the write draws;
 //! * how much the account holds BESIDES it — no other workspace, one, or a registry
 //!   filled to the documented workspace quota, each with its own configuration stored;
 //! * the form and length of the `teamId` and `channelId` the request names, at both
 //!   published `len 1..256` bounds;
-//! * which optional members an update carries, since the answer is about the resource
-//!   and not about the patch.
+//! * which optional members an update carries, since the answer is about the account's
+//!   state and not about the patch.
 //!
-//! The create path keeps the conflict, because the configuration it names cannot
-//! already exist: that side of the rule is [`crate::channel_configuration_workspace_precondition`].
+//! The create path draws the same two answers in the same order, with the
+//! already-configured conflict in place of the miss: that side of the rule is
+//! [`crate::channel_configuration_workspace_precondition`].
 //!
 //! Every assertion goes over the wire through the same router the production emulator
 //! mounts, reusing the harness in [`crate::slack_channel_configurations`], so an answer
@@ -40,7 +43,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
 
-use crate::channel_configuration_workspace_precondition::{create_body, update_body};
+use crate::channel_configuration_workspace_precondition::{
+    assert_workspace_conflict, create_body, update_body,
+};
 use crate::error_message_templates::{not_found, refusal};
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
 
@@ -58,6 +63,9 @@ enum Workspace {
     /// It was registered and the channel configured in it, and the account then deleted
     /// the workspace, which took that configuration with it.
     RegisteredThenRemoved,
+    /// Same as above, and the account then registered the workspace again: the registry
+    /// holds it, while the configurations that lived in it are gone.
+    RegisteredThenRemovedThenRegistered,
 }
 
 /// One row: a `(teamId, channelId)` pair the account holds no configuration for, and
@@ -151,6 +159,13 @@ fn cases() -> Vec<Case> {
             workspace: Workspace::RegisteredThenRemoved,
             other_workspaces: 0,
         },
+        Case {
+            label: "the configuration went with its workspace, which was registered again",
+            team_id: "T0123456789".to_string(),
+            channel_id: "C01234A5BCD".to_string(),
+            workspace: Workspace::RegisteredThenRemovedThenRegistered,
+            other_workspaces: 1,
+        },
     ]
 }
 
@@ -209,7 +224,7 @@ async fn arrange(case: &Case) -> Emulator {
                 case.label
             );
         }
-        Workspace::RegisteredThenRemoved => {
+        Workspace::RegisteredThenRemoved | Workspace::RegisteredThenRemovedThenRegistered => {
             assert_eq!(
                 emulator.register_workspace(&case.team_id).await.status,
                 200,
@@ -231,6 +246,14 @@ async fn arrange(case: &Case) -> Emulator {
                 "case {:?}: the named workspace must be removable",
                 case.label
             );
+            if case.workspace == Workspace::RegisteredThenRemovedThenRegistered {
+                assert_eq!(
+                    emulator.register_workspace(&case.team_id).await.status,
+                    200,
+                    "case {:?}: the named workspace must be registrable again",
+                    case.label
+                );
+            }
         }
     }
 
@@ -246,6 +269,21 @@ fn assert_miss(case: &str, team_id: &str, channel_id: &str, reply: &Reply) {
         message, expected,
         "case {case:?}: expected {expected:?}, got {message:?}"
     );
+}
+
+/// Assert the refusal `case` must draw: the documented conflict while the account has
+/// not registered the workspace the request names, and the miss once it has — the whole
+/// of the order under test, read off the row's account state rather than off the
+/// request.
+fn assert_refusal(label: &str, case: &Case, reply: &Reply) {
+    match case.workspace {
+        Workspace::Registered | Workspace::RegisteredThenRemovedThenRegistered => {
+            assert_miss(label, &case.team_id, &case.channel_id, reply)
+        }
+        Workspace::NotRegistered | Workspace::RegisteredThenRemoved => {
+            assert_workspace_conflict(label, &case.team_id, reply)
+        }
+    }
 }
 
 /// Assert the account still holds exactly the other workspaces' configurations and
@@ -280,17 +318,16 @@ async fn assert_store_untouched(emulator: &Emulator, case: &Case) {
 }
 
 #[tokio::test]
-async fn deleting_a_configuration_the_account_does_not_hold_is_the_miss() {
+async fn deleting_a_configuration_the_account_does_not_hold_is_refused_in_order() {
     for case in cases() {
         let emulator = arrange(&case).await;
 
         // Twice: the refusal changed nothing, so the second call answers the same.
         for attempt in 1..=2 {
             let reply = emulator.delete(&case.team_id, &case.channel_id).await;
-            assert_miss(
+            assert_refusal(
                 &format!("{} / delete, attempt {attempt}", case.label),
-                &case.team_id,
-                &case.channel_id,
+                &case,
                 &reply,
             );
         }
@@ -300,16 +337,15 @@ async fn deleting_a_configuration_the_account_does_not_hold_is_the_miss() {
 }
 
 #[tokio::test]
-async fn updating_a_configuration_the_account_does_not_hold_is_the_miss() {
+async fn updating_a_configuration_the_account_does_not_hold_is_refused_in_order() {
     for case in cases() {
         let emulator = arrange(&case).await;
 
         for (patch, body) in update_bodies(&case.team_id, &case.channel_id) {
             let reply = emulator.update(body).await;
-            assert_miss(
+            assert_refusal(
                 &format!("{} / update with {patch}", case.label),
-                &case.team_id,
-                &case.channel_id,
+                &case,
                 &reply,
             );
         }
@@ -319,10 +355,11 @@ async fn updating_a_configuration_the_account_does_not_hold_is_the_miss() {
 }
 
 #[tokio::test]
-async fn the_miss_is_read_from_the_store_not_assumed() {
-    // The very same calls on the very same ids answer 200 once the configuration the
-    // request names IS stored — so the 404 the tables above assert is computed from the
-    // account's state and not from the request. Rows reuse the table's id forms.
+async fn the_refusal_is_read_from_the_store_not_assumed() {
+    // The very same calls on the very same ids answer 200 once the workspace IS
+    // registered and the configuration the request names IS stored — so the refusals the
+    // tables above assert are computed from the account's state and not from the
+    // request. Rows reuse the table's id forms.
     for case in cases() {
         let label = case.label;
         let emulator = Emulator::new();

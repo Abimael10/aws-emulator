@@ -23,18 +23,17 @@
 //! is what keeps the `channelName` this operation ANSWERS with inside the same shape's
 //! declared `@pattern`.
 //!
-//! This operation acts on the configuration its `(teamId, channelId)` pair names, so
-//! whether that configuration EXISTS is the first thing settled against the account's
-//! state: a pair this account holds nothing for is the modelled
-//! `ResourceNotFoundException` (404), whatever else the account is or is not missing.
-//! The account-level precondition `ConflictException` documents ("Add, update, or
-//! delete a Slack channel configuration before you add a Slack workspace to your
-//! Amazon Web Services account") cannot add an answer here: a stored configuration
-//! always lives in a workspace this account has registered —
-//! `CreateSlackChannelConfiguration` admits no other, and
-//! `DeleteSlackWorkspaceConfiguration` takes a workspace's configurations with it — so
-//! the registry is consulted where that conflict is the applicable answer, on the
-//! create path.
+//! `ConflictException`'s documentation names this operation in the condition it states
+//! first, together with the other two channel-configuration writes: "Add, update, or
+//! delete a Slack channel configuration before you add a Slack workspace to your Amazon
+//! Web Services account." So the account's workspace registry is what is settled first
+//! against the account's state: a `teamId` the account has not registered is that
+//! documented `ConflictException` (409), and the modelled `ResourceNotFoundException`
+//! (404) is the answer only within a registered workspace, for a channel the account
+//! holds no configuration for. The two are the answers a caller branches on: one tells
+//! it to add the Slack workspace first, the other that the channel was never
+//! configured. See
+//! [`crate::state::ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`].
 //!
 //! ## Shape of an operation
 //!
@@ -291,12 +290,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The resource this update names is looked up FIRST, so an absent configuration
-        // is reported as absent rather than behind an account-level precondition: a
-        // pair this account holds nothing for is the modelled
-        // `ResourceNotFoundException`, which is what an update-or-create caller branches
-        // on. WHICH configuration the pair names, and how a miss is worded, is the state
-        // module's rule
+        // The precondition `ConflictException` documents for this very operation: "Add,
+        // update, or delete a Slack channel configuration before you add a Slack
+        // workspace to your Amazon Web Services account." A channel configuration lives
+        // inside a Slack workspace registered to this account, so a `teamId` that is not
+        // in the account's workspace registry has no workspace holding a channel
+        // configuration to update, and that is the conflict — settled after the request's
+        // own modelled rules above, as on the create path, and before the pair is looked
+        // up, so the miss below is never reported for an account that has to add the
+        // workspace first.
+        if let Some(message) = store.unregistered_workspace_conflict(&input.team_id) {
+            return Err(
+                UpdateSlackChannelConfigurationErrorModeled::ConflictException(ConflictException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        // Within a registered workspace, a pair this account holds no configuration for
+        // is the modelled `ResourceNotFoundException`, which is what an
+        // update-or-create caller branches on. WHICH configuration the pair names, and
+        // how a miss is worded, is the state module's rule
         // ([`crate::state::ComAmazonawsSupportappSupportappState::channel_configuration`]);
         // this handler only lifts the answer it gives into this operation's error enum.
         let stored = match store.channel_configuration(&input.team_id, &input.channel_id) {

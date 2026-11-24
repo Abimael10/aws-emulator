@@ -26,7 +26,8 @@
 //! id, at both published `@length` bounds, a pair whose two members are the same string,
 //! and the ORDER of the pair, which the swap rows pin by naming the mirrored pair. The
 //! sibling suites run partial matches ([`crate::channel_configuration_pair_lookup`]) and
-//! the order the lookup is settled in ([`crate::channel_configuration_lookup_order`]).
+//! the order the account-level precondition and the lookup are settled in
+//! ([`crate::channel_configuration_lookup_order`]).
 //!
 //! Every assertion goes over the wire through the same router the production emulator
 //! mounts, reusing the harness in [`crate::slack_channel_configurations`], so an answer
@@ -240,6 +241,17 @@ async fn the_two_members_of_the_pair_are_not_interchangeable() {
     for case in cases().into_iter().filter(|c| c.team_id != c.channel_id) {
         let label = case.label;
         let emulator = arrange(&case).await;
+
+        // The mirrored request names `channelId` as its workspace, so that workspace is
+        // registered too: the account-level precondition the three writes share is then
+        // satisfied for both pairs, and the ONLY thing left that can tell them apart is
+        // the order of the pair. The precondition itself is
+        // [`crate::channel_configuration_workspace_precondition`].
+        assert_eq!(
+            emulator.register_workspace(&case.channel_id).await.status,
+            200,
+            "case {label:?}: the mirrored pair's workspace must be registered"
+        );
 
         miss_message(
             &format!("{label} / update of the mirrored pair"),

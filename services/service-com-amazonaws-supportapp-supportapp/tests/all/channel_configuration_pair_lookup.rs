@@ -4,29 +4,30 @@
 //! holds a configuration that only PARTLY matches the pair the request names.
 //!
 //! `UpdateSlackChannelConfiguration` and `DeleteSlackChannelConfiguration` act on the
-//! configuration their `(teamId, channelId)` pair identifies, so each settles that
-//! configuration's existence against the account's state before any account-level
-//! precondition, and the resource is identified by the WHOLE pair: a stored
-//! configuration that shares only one member of it — the same workspace with another
-//! channel, or the same channel id in another workspace — is a different resource, so
-//! the request is the modelled `ResourceNotFoundException` (HTTP 404), "The specified
-//! resource is missing or doesn't exist, such as an account alias, Slack channel
-//! configuration, or Slack workspace configuration"
+//! configuration their `(teamId, channelId)` pair identifies, and the resource is
+//! identified by the WHOLE pair: with the account-level workspace precondition
+//! satisfied, a stored configuration that shares only one member of it — the same
+//! workspace with another channel, or the same channel id in another registered
+//! workspace — is a different resource, so the request is the modelled
+//! `ResourceNotFoundException` (HTTP 404), "The specified resource is missing or doesn't
+//! exist, such as an account alias, Slack channel configuration, or Slack workspace
+//! configuration"
 //! (`smithy_query(query="operation", operation="UpdateSlackChannelConfiguration,DeleteSlackChannelConfiguration",
-//! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`),
-//! never the modelled `ConflictException` (409) of an account-level precondition.
+//! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`).
+//! A row whose requested workspace the account has NOT registered is the documented
+//! `ConflictException` (409) instead, because that precondition is settled first.
 //!
-//! The sibling suites run that rule over an account holding nothing for the named
-//! workspace ([`crate::channel_configuration_lookup_order`]) and over the create path
-//! that keeps the conflict ([`crate::channel_configuration_workspace_precondition`]).
-//! The table here runs it over the axes those two leave open, so no row's answer can
-//! come from an account that simply holds nothing nearby:
+//! The sibling suites run that order over an account holding nothing for the named
+//! workspace ([`crate::channel_configuration_lookup_order`]) and over the three writes'
+//! shared precondition ([`crate::channel_configuration_workspace_precondition`]).
+//! The table here runs the identity rule over the axes those two leave open, so no row's
+//! answer can come from an account that simply holds nothing nearby:
 //!
 //! * how the requested pair RELATES to a configuration the account does hold — sharing
 //!   the `teamId`, sharing the `channelId`, a prefix of the stored `channelId`, the
 //!   stored `channelId` in another case, or nothing at all;
-//! * whether the workspace the request names is itself registered, since the answer is
-//!   about the configuration and not about the registry;
+//! * whether the workspace the request names is itself registered, which is what
+//!   decides whether the answer is the miss or the precondition's conflict;
 //! * whether the account also holds an account alias, the other account-level resource
 //!   this service stores.
 //!
@@ -36,7 +37,9 @@
 
 use serde_json::Value;
 
-use crate::channel_configuration_workspace_precondition::{create_body, update_body};
+use crate::channel_configuration_workspace_precondition::{
+    assert_workspace_conflict, create_body, update_body,
+};
 use crate::error_message_templates::{not_found, refusal};
 use crate::slack_channel_configurations::{Emulator, Reply};
 
@@ -55,8 +58,9 @@ struct Case {
     /// The pair the write names, which the account holds no configuration for.
     team_id: String,
     channel_id: String,
-    /// Register the requested workspace too, when it differs from the stored one: the
-    /// refusal is about the configuration, so it must not move with the registry.
+    /// Register the requested workspace too, when it differs from the stored one: with
+    /// it registered the refusal is about the configuration the pair names, and without
+    /// it the row is the precondition's conflict instead.
     register_requested_workspace: bool,
     /// The account alias the account also holds, when it holds one. `accountAlias` is
     /// `len 1..30, pattern ^[\w\- ]+$` (`smithy_query(query="shape", shape="awsAccountAlias")`).
@@ -200,6 +204,24 @@ fn assert_miss(case: &str, team_id: &str, channel_id: &str, reply: &Reply) {
     );
 }
 
+/// Whether the workspace `case` asks a write for is one the account has registered: the
+/// stored configuration's own workspace always is, and another one only when the row
+/// asked for it.
+fn requested_workspace_is_registered(case: &Case) -> bool {
+    case.team_id == case.stored_team_id || case.register_requested_workspace
+}
+
+/// Assert the refusal `case` must draw: the miss for the pair inside a workspace the
+/// account has registered, and the documented conflict when it has not registered the
+/// workspace the request names.
+fn assert_refusal(label: &str, case: &Case, reply: &Reply) {
+    if requested_workspace_is_registered(case) {
+        assert_miss(label, &case.team_id, &case.channel_id, reply);
+    } else {
+        assert_workspace_conflict(label, &case.team_id, reply);
+    }
+}
+
 /// Assert the account still holds exactly the stored configuration: a refused write
 /// writes nothing, and it took nothing with it.
 async fn assert_only_the_stored_configuration_remains(emulator: &Emulator, case: &Case) {
@@ -230,25 +252,23 @@ async fn assert_only_the_stored_configuration_remains(emulator: &Emulator, case:
 }
 
 #[tokio::test]
-async fn a_write_naming_a_partly_matching_pair_is_the_miss() {
+async fn a_write_naming_a_partly_matching_pair_is_refused() {
     for case in cases() {
         let emulator = arrange(&case).await;
 
         // Each write is driven twice: the refusal changed nothing, so the second call
         // answers exactly the same.
         for attempt in 1..=2 {
-            assert_miss(
+            assert_refusal(
                 &format!("{} / update, attempt {attempt}", case.label),
-                &case.team_id,
-                &case.channel_id,
+                &case,
                 &emulator
                     .update(update_body(&case.team_id, &case.channel_id))
                     .await,
             );
-            assert_miss(
+            assert_refusal(
                 &format!("{} / delete, attempt {attempt}", case.label),
-                &case.team_id,
-                &case.channel_id,
+                &case,
                 &emulator.delete(&case.team_id, &case.channel_id).await,
             );
         }
@@ -260,7 +280,7 @@ async fn a_write_naming_a_partly_matching_pair_is_the_miss() {
 #[tokio::test]
 async fn the_pair_the_account_does_hold_still_answers() {
     // The same two operations, on the same account, for the pair that IS stored: they
-    // answer HTTP 200. So the 404 above is read from the account's state rather than
+    // answer HTTP 200. So the refusal above is read from the account's state rather than
     // assumed from the request, and the pair the row named is the only thing that
     // differs between the two answers.
     for case in cases() {

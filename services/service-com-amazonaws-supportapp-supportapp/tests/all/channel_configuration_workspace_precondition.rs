@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The workspace precondition a Slack channel configuration CREATE enforces.
+//! The workspace precondition EVERY Slack channel configuration write enforces.
 //!
 //! A Slack channel configuration lives inside a Slack workspace registered to the
-//! account, so a request that ADDS one in a workspace this account has not registered
-//! is refused with the modelled `ConflictException` (409) — the condition
-//! `ConflictException`'s own documentation names first: "Add, update, or delete a Slack
-//! channel configuration before you add a Slack workspace to your Amazon Web Services
-//! account" (`smithy_query(query="doc", shape="ConflictException")`).
+//! account, so a request that ADDS, UPDATES or DELETES one in a workspace this account
+//! has not registered is refused with the modelled `ConflictException` (409) — the
+//! condition `ConflictException`'s own documentation names first, and names all three of
+//! those writes together: "Add, update, or delete a Slack channel configuration before
+//! you add a Slack workspace to your Amazon Web Services account"
+//! (`smithy_query(query="doc", shape="ConflictException")`).
 //!
-//! The operations that act on an EXISTING configuration — `Update` and `Delete` — settle
-//! that configuration's existence first, so a pair the account holds nothing for is the
-//! modelled `ResourceNotFoundException` (404) whether or not the workspace is
-//! registered; that ordering is the subject of
-//! [`crate::channel_configuration_lookup_order`], and the rows here pin the two answers
-//! side by side.
+//! The modelled `ResourceNotFoundException` (404) is the answer only once that
+//! precondition is satisfied: a pair the account holds no configuration for IN a
+//! workspace it has registered. The two are what a caller branches on — one tells it to
+//! add the Slack workspace first, the other that the channel was never configured — and
+//! that ordering is the subject of [`crate::channel_configuration_lookup_order`], while
+//! the rows here pin the two answers side by side.
 //!
 //! The tests are tables whose rows differ along what the rule generalises over: which
 //! of the three writing operations is called (`CreateSlackChannelConfiguration`,
@@ -40,7 +41,7 @@ const SLACK_ID_MAX_LEN: usize = 256;
 
 /// The message the unregistered-workspace conflict carries: the condition stated over
 /// the account the request was made in and the `teamId` it named.
-fn workspace_conflict(team_id: &str) -> String {
+pub(crate) fn workspace_conflict(team_id: &str) -> String {
     format!(
         "Workspace installation not found for account {account} and team {team_id}",
         account = engine::emulator_account_id()
@@ -49,7 +50,10 @@ fn workspace_conflict(team_id: &str) -> String {
 
 /// Assert `reply` is the modelled `ConflictException` for an unregistered workspace:
 /// HTTP 409, the error type on the wire, and the message built from the request.
-fn assert_workspace_conflict(case: &str, team_id: &str, reply: &Reply) {
+///
+/// `pub(crate)` so every sibling suite that drives a channel-configuration write at an
+/// unregistered workspace checks the one answer the same way.
+pub(crate) fn assert_workspace_conflict(case: &str, team_id: &str, reply: &Reply) {
     let message = refusal(case, reply, 409, "ConflictException");
     let expected = workspace_conflict(team_id);
     assert_eq!(
@@ -59,7 +63,8 @@ fn assert_workspace_conflict(case: &str, team_id: &str, reply: &Reply) {
 }
 
 /// Assert `reply` is the modelled `ResourceNotFoundException` for a channel that is not
-/// configured, which is what the operations acting on an existing configuration answer.
+/// configured in a workspace the account HAS registered, which is what the operations
+/// acting on an existing configuration answer once the precondition is satisfied.
 fn assert_channel_not_found(case: &str, team_id: &str, channel_id: &str, reply: &Reply) {
     let message = refusal(case, reply, 404, "ResourceNotFoundException");
     let expected = not_found(team_id, channel_id);
@@ -92,11 +97,14 @@ pub(crate) fn update_body(team_id: &str, channel_id: &str) -> Value {
 }
 
 /// Assert what each of the three channel-configuration writes answers for a
-/// `(team_id, channel_id)` pair that is NOT configured and whose workspace the account
-/// has not registered: the create has no workspace to add a configuration to, so it is
-/// the documented conflict, while the update and the delete name a configuration that
-/// does not exist, which is the miss.
-async fn assert_writes_on_an_unregistered_workspace(
+/// `(team_id, channel_id)` pair whose workspace the account has not registered: each of
+/// them is a write the documented sentence names, and none of them has a workspace to
+/// add a configuration to, change one in or remove one from, so each is the documented
+/// conflict.
+///
+/// `pub(crate)` so the sibling suites drive the same three writes rather than each
+/// listing them.
+pub(crate) async fn assert_writes_on_an_unregistered_workspace(
     emulator: &Emulator,
     label: &str,
     team_id: &str,
@@ -107,16 +115,14 @@ async fn assert_writes_on_an_unregistered_workspace(
         team_id,
         &emulator.create(create_body(team_id, channel_id)).await,
     );
-    assert_channel_not_found(
+    assert_workspace_conflict(
         &format!("{label} / UpdateSlackChannelConfiguration"),
         team_id,
-        channel_id,
         &emulator.update(update_body(team_id, channel_id)).await,
     );
-    assert_channel_not_found(
+    assert_workspace_conflict(
         &format!("{label} / DeleteSlackChannelConfiguration"),
         team_id,
-        channel_id,
         &emulator.delete(team_id, channel_id).await,
     );
 }
@@ -134,13 +140,12 @@ pub(crate) fn team_ids() -> Vec<(&'static str, String)> {
 }
 
 #[tokio::test]
-async fn adding_a_channel_configuration_needs_a_registered_workspace() {
+async fn writing_a_channel_configuration_needs_a_registered_workspace() {
     for (label, team_id) in team_ids() {
         let emulator = Emulator::new();
         let channel_id = "C01234A5BCD";
 
-        // Nothing is registered, so the create has no workspace to add a configuration
-        // to, and the two writes that act on an existing one report the miss.
+        // Nothing is registered, so none of the three writes has a workspace to act in.
         assert_writes_on_an_unregistered_workspace(
             &emulator,
             &format!("{label}, empty registry"),
@@ -156,9 +161,9 @@ async fn adding_a_channel_configuration_needs_a_registered_workspace() {
         );
 
         // Registering the workspace the requests name is what satisfies the
-        // create's precondition: the create is then accepted, while the two writes that
-        // need a configuration keep reporting the MISS for a channel that is not
-        // configured.
+        // precondition: the create is then accepted, and the two writes that need a
+        // configuration report the MISS for a channel that is not configured — the
+        // answer that is reachable only once the workspace is there.
         assert_eq!(
             emulator.register_workspace(&team_id).await.status,
             200,
@@ -213,9 +218,10 @@ async fn adding_a_channel_configuration_needs_a_registered_workspace() {
 #[tokio::test]
 async fn a_workspace_registered_for_another_team_does_not_satisfy_the_precondition() {
     // The precondition is per `teamId`: a registry holding some OTHER workspace does not
-    // let a channel configuration be added to the one the request names. Rows differ
-    // in which workspace is registered and which one the write asks for, including a
-    // prefix of the requested id and both published length bounds.
+    // let a channel configuration be added to, changed in or removed from the one the
+    // request names. Rows differ in which workspace is registered and which one the
+    // write asks for, including a prefix of the requested id and both published length
+    // bounds.
     let rows: [(&str, String, String); 4] = [
         (
             "an unrelated workspace is registered",
@@ -284,13 +290,11 @@ async fn a_workspace_registered_for_another_team_does_not_satisfy_the_preconditi
 }
 
 #[tokio::test]
-async fn removing_the_workspace_makes_adding_a_channel_the_conflict_again() {
-    // The precondition is read from the registry at every create, so a workspace the
-    // account REMOVES takes the precondition with it: adding a channel in it is the
-    // conflict again, whatever was configured in it before — and because the workspace
-    // delete took its configurations with it, the update and the delete of each of them
-    // report the miss. Rows differ in the team id form and in how many channels the
-    // workspace held.
+async fn removing_the_workspace_makes_every_channel_write_the_conflict_again() {
+    // The precondition is read from the registry at every write, so a workspace the
+    // account REMOVES takes the precondition with it: adding a channel in it, changing
+    // one or removing one is the conflict again, whatever was configured in it before.
+    // Rows differ in the team id form and in how many channels the workspace held.
     let rows: [(&str, String, &[&str]); 3] = [
         ("one channel", "T012ABCDEFG".to_string(), &["C01234A5BCD"]),
         (
@@ -340,7 +344,8 @@ async fn removing_the_workspace_makes_adding_a_channel_the_conflict_again() {
         }
 
         // Registering the workspace again brings back the precondition, not the
-        // configurations that lived in it: each channel is then the miss.
+        // configurations that lived in it: each channel is then the miss, the answer the
+        // satisfied precondition makes reachable.
         assert_eq!(
             emulator.register_workspace(&team_id).await.status,
             200,
