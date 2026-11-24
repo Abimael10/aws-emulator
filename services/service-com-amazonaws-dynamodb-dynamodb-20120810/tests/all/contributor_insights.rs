@@ -13,15 +13,16 @@
 //!    does not carry, which names the table and the index instead;
 //! 2. a table or index no update has named reports `DISABLED`, with no mode and no
 //!    timestamp: the feature is off until `UpdateContributorInsights` turns it on;
-//! 3. turning it ON is asynchronous, so the call and an immediate read report the transient
-//!    `ENABLING` and a read after the span reports `ENABLED`, with the mode the enable asked
-//!    for; turning it OFF is not, so the disable itself answers `DISABLED`, and the mode it
-//!    was configured with stays reported;
+//! 3. the change is asynchronous in EITHER direction, so the call and an immediate read
+//!    report the transient status of the action asked for and a read after the span reports
+//!    the settled one: an `ENABLE` reports `ENABLING` then `ENABLED` with the mode it asked
+//!    for, and a `DISABLE` reports `DISABLING` then `DISABLED`, with the mode the resource
+//!    was configured with still reported;
 //! 4. each resource carries its OWN setting — a table and each of its global secondary
 //!    indexes — and `ListContributorInsights` reports one summary per resource whose
-//!    insights are ON or still settling, paged by `MaxResults`/`NextToken`: a resource
-//!    enters the listing when an enable is accepted and drops out of it when a disable turns
-//!    its insights off.
+//!    insights are ON or still settling onto it, paged by `MaxResults`/`NextToken`: a
+//!    resource enters the listing when an enable is accepted and drops out of it when a
+//!    disable is accepted.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -372,18 +373,25 @@ async fn an_enable_is_reported_enabling_then_settles_enabled_with_the_mode_it_as
             "case {case}: the enable settled, got {settled} against now {now}"
         );
 
-        // The disable is not asynchronous: it answers the settled status at once, with the
-        // mode the resource was configured with, and a read a span later answers the same —
-        // the configuration outlives the disable.
+        // The disable is asynchronous too: it answers the transient `DISABLING`, with the
+        // mode the resource was configured with, and the clock owes the move to `DISABLED` —
+        // which a read a span later reports, the configuration outliving the disable.
         let disabled = set_insights(&router, &table, index, "DISABLE", None).await;
+        let while_disabling = describe_insights(&router, &table, index).await;
         assert_eq!(
             (
                 disabled["ContributorInsightsStatus"].clone(),
                 disabled["ContributorInsightsMode"].clone(),
+                while_disabling["ContributorInsightsStatus"].clone(),
+                while_disabling["ContributorInsightsMode"].clone(),
             ),
-            (json!("DISABLED"), json!(expected_mode)),
-            "case {case}: the disable answers the settled status with the mode in force, got \
-             {disabled}"
+            (
+                json!("DISABLING"),
+                json!(expected_mode),
+                json!("DISABLING"),
+                json!(expected_mode),
+            ),
+            "case {case}: the disable is in flight, got {disabled} then {while_disabling}"
         );
         settle().await;
         let off = describe_insights(&router, &table, index).await;
@@ -393,7 +401,7 @@ async fn an_enable_is_reported_enabling_then_settles_enabled_with_the_mode_it_as
                 off["ContributorInsightsMode"].clone(),
             ),
             (json!("DISABLED"), json!(expected_mode)),
-            "case {case}: the resource stays off with its mode still reported, got {off}"
+            "case {case}: the disable settled off with its mode still reported, got {off}"
         );
     }
 }

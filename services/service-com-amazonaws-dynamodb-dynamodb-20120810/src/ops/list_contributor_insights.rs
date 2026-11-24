@@ -6,9 +6,9 @@
 //! table and all its global secondary indexes" (the doc below) — each read from
 //! [`crate::state::ContributorInsights`], so a summary reports what the last
 //! `UpdateContributorInsights` wrote and the status the clock has made due. A resource
-//! whose status has settled `DISABLED` has no configuration to report and so no summary:
-//! it enters the listing when an enable is accepted and drops out again once the disable
-//! settles ([`crate::state::ContributorInsights::listed`]), while
+//! whose insights an accepted `DISABLE` has turned off has no configuration to report and
+//! so no summary: it enters the listing when an enable is accepted and drops out again
+//! when a disable is accepted ([`crate::state::ContributorInsights::listed`]), while
 //! `DescribeContributorInsights` answers for it either way.
 //!
 //! A `TableName` narrows the listing to that one table and its indexes, and a name that

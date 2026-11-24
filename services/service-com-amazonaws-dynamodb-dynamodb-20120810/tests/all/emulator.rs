@@ -525,8 +525,8 @@ pub async fn table_when(
 
 /// Poll `DescribeContributorInsights` until the resource's insights report `status`,
 /// answering the description it reported then — the waiter a client runs after an
-/// `UpdateContributorInsights`, whose `ENABLE` is asynchronous ("the status only becomes
-/// the settled one once the rules behind it exist").
+/// `UpdateContributorInsights`, which is asynchronous in either direction ("the status only
+/// becomes the settled one once the rules behind it are the ones the action asked for").
 ///
 /// `index` names the global secondary index the setting belongs to, or `None` for the
 /// table's own. Every poll must answer 200: the resource was addressed by a call the

@@ -114,14 +114,13 @@ async fn the_rules_the_resource_has_are_named_and_no_failure_is_reported_in_any_
     settle().await;
 
     // Rows span the statuses a setting can be read in: never set, both halves of the enable,
-    // off after the disable that turns it off, and on again after that. The action column
-    // is what this row asks for first, and whether it waits out the transient span before
-    // reading.
+    // the disable in flight, and on again after that. The action column is what this row asks
+    // for first, and whether it waits out the transient span before reading.
     let cases: [StatusRow; 5] = [
         ("never set", None, "DISABLED"),
         ("the enable in flight", Some(("ENABLE", false)), "ENABLING"),
         ("the enable settled", Some(("ENABLE", true)), "ENABLED"),
-        ("the disable", Some(("DISABLE", false)), "DISABLED"),
+        ("the disable in flight", Some(("DISABLE", false)), "DISABLING"),
         ("the enable after it", Some(("ENABLE", true)), "ENABLED"),
     ];
 

@@ -5,15 +5,17 @@
 //! or of the global secondary index it names beside it, and reports the status that
 //! leaves it in.
 //!
-//! Turning the feature ON is asynchronous, so an `ENABLE` answers `ENABLING` and the clock
-//! owes the move to `ENABLED` one [`crate::state::STATUS_TRANSITION`] later: a caller that
-//! reads straight back still sees the transient status, and `DescribeContributorInsights`
-//! reports the settled one afterwards. Turning it OFF is not: a `DISABLE` deletes the
-//! resource's insight rules there and then, so it answers the settled `DISABLED`. An
-//! `ENABLE` keeps the mode the request named, or the wider of the two the model declares
-//! where it named none, and a `DISABLE` leaves that mode in place — it is the configuration
-//! of the resource's key access insights, which both this call and the reads keep reporting
-//! once they are off.
+//! The change this operation asks for is applied asynchronously in EITHER direction, so the
+//! call answers the transient status of the action it was given and the clock owes the move to
+//! the settled one one [`crate::state::STATUS_TRANSITION`] later: an `ENABLE` answers
+//! `ENABLING` and settles `ENABLED`, a `DISABLE` answers `DISABLING` and settles `DISABLED`.
+//! A caller that reads straight back still sees the transient status, and
+//! `DescribeContributorInsights` reports the settled one afterwards — which is how a client
+//! polling for the status learns the resource's insight rules are the ones the action asked
+//! for. An `ENABLE` keeps the mode the request named, or the wider of the two the model
+//! declares where it named none, and a `DISABLE` leaves that mode in place — it is the
+//! configuration of the resource's key access insights, which both this call and the reads keep
+//! reporting once they are off.
 //!
 //! Insights can only be turned off for a resource whose insights are ON: the status a
 //! `DISABLE` is performed from has to be `ENABLED` (or `FAILED`, which this store never
@@ -251,7 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of frequently accessed items and frequently throttled items" — so the accepted action
         // is applied where those rules live: an `ENABLE` mints the rules its mode and the
         // resource's key schema call for, and a `DISABLE` deletes exactly that resource's
-        // ([`crate::state::contributor_insights`]). Done with this store's guard still held, so
+        // ([`crate::state::contributor_insights`]). Both are performed by the accepted call,
+        // the same way on either side of the action, while the status it answers is still the
+        // transient one: the rules of a resource whose status has settled are therefore the
+        // ones the last accepted action asked for. Done with this store's guard still held, so
         // the setting this call wrote and the rules behind it cannot be seen apart.
         let rules = if enable {
             crate::state::contributor_insights::mint_rules(

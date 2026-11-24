@@ -8,7 +8,10 @@
 //!
 //! A table (or index) no `UpdateContributorInsights` has ever named reports `DISABLED`
 //! with no timestamp and no mode: the feature is off until that operation turns it on, and
-//! the mode is what an enable configures. A resource whose insights were turned off keeps
+//! the mode is what an enable configures. That operation is asynchronous in either
+//! direction, so this read reports the transient `ENABLING` / `DISABLING` until the clock
+//! has made the accepted action's move due and the settled status after it — which is what a
+//! client polling this read is waiting for. A resource whose insights were turned off keeps
 //! reporting the mode that was in force, since that configuration outlives the disable. A
 //! table name that resolves to no stored table, and an `IndexName` the stored table does
 //! not carry, are both the modelled `ResourceNotFoundException` — "the operation tried to

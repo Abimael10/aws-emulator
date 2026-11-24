@@ -13,10 +13,10 @@
 //!    bare (`UpdateContributorInsightsOutput$TableName`, length 3..255, pattern
 //!    `^[a-zA-Z0-9_.-]+$`), echoing `IndexName` exactly when the request named one;
 //! 2. every accepted call REPLACES that resource's setting, so the call answers the status
-//!    it leaves the resource in with the mode then configured and a read agrees: an `ENABLE`
-//!    starts the asynchronous change again, answering the transient status and settling one
-//!    span later, while a `DISABLE` answers the settled `DISABLED` at once and leaves the
-//!    mode it was configured with in place;
+//!    it leaves the resource in with the mode then configured and a read agrees: either
+//!    action starts the asynchronous change again, answering the transient status of its own
+//!    direction and settling one span later, and a `DISABLE` leaves the mode it was
+//!    configured with in place;
 //! 3. a call reaches only the resource it names, in the region its endpoint names: a
 //!    same-named table in another region, another table in the same region and the
 //!    indexes the call did not name all keep the setting they had, and each region's
@@ -252,9 +252,9 @@ async fn each_accepted_call_replaces_the_setting() {
     for (resource, index) in [("the table", None), ("its index", Some("Replaced.Index"))] {
         for (case, action, asked, settled_mode) in steps {
             let enabling = action == "ENABLE";
-            // An enable leaves the transient status for its span; a disable leaves none, so
-            // the status it answers is the settled one straight away.
-            let answered_status = if enabling { "ENABLING" } else { "DISABLED" };
+            // Either action leaves the transient status of its own direction for its span,
+            // and the clock owes the move to the settled one after it.
+            let answered_status = if enabling { "ENABLING" } else { "DISABLING" };
             let settled_status = if enabling { "ENABLED" } else { "DISABLED" };
 
             let answered = set_insights(&router, "InsightsReplaced", index, action, asked).await;

@@ -15,10 +15,11 @@
 //!    configuration to turn off. Each refusal is HTTP 400 `ValidationException` carrying
 //!    DynamoDB's invalid-state sentence for that action, which names the statuses the action
 //!    requires; the refused call writes nothing;
-//! 2. an accepted `DISABLE` answers the SETTLED status, `DISABLED`, together with the
-//!    `ContributorInsightsMode` the resource was configured with — the configuration
-//!    outlives the disable, so every later read answers that same mode until an enable
-//!    replaces it — and the resource's CloudWatch rules are gone, so it names none.
+//! 2. an accepted `DISABLE` answers the TRANSIENT status of its direction, `DISABLING`,
+//!    together with the `ContributorInsightsMode` the resource was configured with — the
+//!    configuration outlives the disable, so every later read answers that same mode until an
+//!    enable replaces it — and the clock owes the move to `DISABLED` one span later, by which
+//!    time the resource's CloudWatch rules are gone, so it names none.
 //!
 //! Each rule is asserted over a SET of inputs: the resource addressed (a table, one of its
 //! global secondary indexes, a same-named table in another region), the status it is
@@ -150,9 +151,10 @@ async fn a_disable_of_insights_no_enable_has_configured_is_refused_and_writes_no
     }
 
     // A resource whose insights ARE on is served, and so is the SAME disable repeated against
-    // the resource that pass turned off: the configuration an enable wrote outlives the
-    // disable, so the action still has a configuration to apply to. These two rows are the
-    // resources the refusal table below then contrasts with.
+    // the resource that pass turned off once its move to `DISABLED` has fallen due: the
+    // configuration an enable wrote outlives the disable, so the action still has a
+    // configuration to apply to. These two rows are the resources the refusal table below then
+    // contrasts with.
     for (case, index) in [
         ("the configured table", None),
         ("its configured index", Some("On.Index")),
@@ -160,7 +162,7 @@ async fn a_disable_of_insights_no_enable_has_configured_is_refused_and_writes_no
         let (status, body) = disable_in(&router, REGION, "InsightsConfigured", index, None).await;
         assert_eq!(
             (status, reported(&body, "ContributorInsightsStatus")),
-            (200, json!("DISABLED")),
+            (200, json!("DISABLING")),
             "case {case}: a disable of a resource whose insights are on is served, got {status} \
              with {body}"
         );
@@ -169,11 +171,19 @@ async fn a_disable_of_insights_no_enable_has_configured_is_refused_and_writes_no
         ("the table an earlier disable has turned off", None),
         ("its index, turned off by that same pass", Some("On.Index")),
     ] {
+        insights_when(
+            &router,
+            "that disable settles",
+            "InsightsConfigured",
+            index,
+            "DISABLED",
+        )
+        .await;
         let (status, repeated) =
             disable_in(&router, REGION, "InsightsConfigured", index, None).await;
         assert_eq!(
             (status, reported(&repeated, "ContributorInsightsStatus")),
-            (200, json!("DISABLED")),
+            (200, json!("DISABLING")),
             "case {case}: the configuration an enable wrote outlives the disable, so the same \
              disable repeated is served, got {status} with {repeated}"
         );
@@ -327,7 +337,7 @@ async fn a_disable_issued_while_the_enable_is_still_in_flight_is_refused() {
             let (code, served) = disable_in(&router, REGION, "InsightsInFlight", index, None).await;
             assert_eq!(
                 (code, reported(&served, "ContributorInsightsStatus")),
-                (200, json!("DISABLED")),
+                (200, json!("DISABLING")),
                 "case {resource}: a disable from the settled status is served, got {code} with \
                  {served}"
             );
@@ -352,7 +362,7 @@ type AdmittedCase = (
 );
 
 #[tokio::test]
-async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force() {
+async fn an_accepted_disable_answers_the_transitional_status_with_the_mode_in_force() {
     let router = emulator();
 
     // Rows differ in the resource addressed (a table and one of its indexes) and in the
@@ -430,15 +440,16 @@ async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force()
                 200,
                 json!(table),
                 index.map_or(Value::Null, |index| json!(index)),
-                json!("DISABLED"),
+                json!("DISABLING"),
                 json!(expected_mode),
             ),
-            "case {case}: the disable answers the settled status with the mode in force, got \
-             {status} with {answered}"
+            "case {case}: the disable answers the transitional status with the mode in force, \
+             got {status} with {answered}"
         );
 
-        // Read back: the resource is off, still reporting the mode it was configured with,
-        // and the rules the enable minted are gone.
+        // Read back: the resource is DISABLING with the mode it was configured with, the rules
+        // the enable minted already gone, and the clock owes it the move to `DISABLED`, which
+        // a read a span later reports.
         let read_back = describe_insights(&router, &table, index).await;
         settle().await;
         let later = describe_insights(&router, &table, index).await;
@@ -451,13 +462,13 @@ async fn an_accepted_disable_answers_the_settled_status_with_the_mode_in_force()
                 reported(&later, "ContributorInsightsMode"),
             ),
             (
-                json!("DISABLED"),
+                json!("DISABLING"),
                 json!(expected_mode),
                 Value::Null,
                 json!("DISABLED"),
                 json!(expected_mode),
             ),
-            "case {case}: the resource stays off with its configuration still reported and no \
+            "case {case}: the resource settles off with its configuration still reported and no \
              rules, got {read_back} then {later}"
         );
 
@@ -567,7 +578,7 @@ async fn the_action_a_request_names_is_the_one_applied() {
             "DISABLE",
             None,
             true,
-            "DISABLED",
+            "DISABLING",
             "THROTTLED_KEYS",
         ),
         (
@@ -575,7 +586,7 @@ async fn the_action_a_request_names_is_the_one_applied() {
             "DISABLE",
             None,
             false,
-            "DISABLED",
+            "DISABLING",
             "THROTTLED_KEYS",
         ),
         (
@@ -591,7 +602,7 @@ async fn the_action_a_request_names_is_the_one_applied() {
             "DISABLE",
             None,
             true,
-            "DISABLED",
+            "DISABLING",
             "THROTTLED_KEYS",
         ),
     ];
