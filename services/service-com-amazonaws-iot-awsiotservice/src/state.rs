@@ -3546,6 +3546,16 @@ pub use thing_group_membership::{
     MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
 };
 
+// The CONNECTIVITY of one thing — which broker session belongs to a thing, what a reader
+// reports off it, and what the indexing configuration has to say for the connectivity
+// section of the index to carry it at all — lives in `state/thing_connectivity.rs`.
+pub mod thing_connectivity;
+pub use thing_connectivity::{
+    connectivity_indexing_disabled_message, connectivity_indexing_enabled, epoch_millis,
+    socket_information_enabled, thing_connectivity, ThingConnectivityReport,
+    CONNECTIVITY_DATA_API,
+};
+
 // HOW DEEP a thing-group hierarchy may go, and how a create that would go deeper is
 // refused, lives in `state/thing_group_hierarchy.rs` — beside the membership rules, since
 // both are read off the one record of the parent relation.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetThingConnectivityData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetThingConnectivityData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetThingConnectivityData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The live connectivity of ONE registered thing, read off the MQTT session its client holds
+//! in the shared message broker — the same session the IoT data plane's connection operations
+//! report on. Which session belongs to a thing, and what of it a reader reports, is
+//! [`crate::state::thing_connectivity`].
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetThingConnectivityData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetThingConnectivityDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetThingConnectivityData"))
+        let _ = ctx;
+        let internal = || {
+            GetThingConnectivityDataErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        };
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        // The sessions live in the shared message broker, NOT in this service's store: a
+        // device opens its connection on the data endpoint this service publishes, and the
+        // session that connection makes is the one the IoT data plane reports on too.
+        let broker =
+            ::service_common::iot_mqtt_broker::broker_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+
+        // The account's own index and registry decide whether this read can be answered at
+        // all, and what of a session may be reported. They are read under the service
+        // store's lock alone, which is released before the broker's is taken (the broker's
+        // store is taken LAST).
+        let (default_client_id, report_socket_information) = {
+            let store = state.lock();
+            let configuration = &store.indexing_configuration.thing;
+
+            // Connectivity data is the thing index's connectivity section, so an index that
+            // does not carry that section has nothing to serve this read from (the modelled
+            // `IndexNotReadyException`, HTTP 400), and one whose build has not finished has
+            // the section but not yet its contents — the same reading of an index's state
+            // every other operation served from a fleet index makes.
+            if !crate::state::connectivity_indexing_enabled(configuration) {
+                return Err(GetThingConnectivityDataErrorModeled::IndexNotReadyException(
+                    IndexNotReadyException {
+                        message: Some(crate::state::connectivity_indexing_disabled_message(
+                            crate::state::THING_INDEX_NAME,
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.fleet_index_availability(crate::state::THING_INDEX_NAME, now)
+                != crate::state::FleetIndexAvailability::Ready
+            {
+                return Err(GetThingConnectivityDataErrorModeled::IndexNotReadyException(
+                    IndexNotReadyException {
+                        message: Some(crate::state::index_not_ready_message(
+                            crate::state::THING_INDEX_NAME,
+                            store.fleet_index_status(crate::state::THING_INDEX_NAME, now),
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The index holds a document per REGISTERED thing, so a name the registry does
+            // not hold is this family's 404 rather than a report that something is not
+            // connected.
+            let thing = store.things.get(&input.thing_name).ok_or_else(|| {
+                GetThingConnectivityDataErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_thing_message(&input.thing_name)),
+                    },
+                )
+            })?;
+
+            // Socket information is reported only to a request that asked for it AND under a
+            // configuration that enabled its retrieval for this API: the selection
+            // `filter.connectivity.includeSocketInformation` is what enabling "socket
+            // information retrieval" for a fleet indexing API means.
+            (
+                thing.default_client_id(),
+                input.include_socket_information.unwrap_or(false)
+                    && crate::state::socket_information_enabled(configuration),
+            )
+        };
+
+        // Reporting only. The one write this takes is the broker's release of the sessions
+        // whose disconnect information is no longer reported — owed at this instant whether
+        // or not anybody called — and it never touches the session being read.
+        let connectivity = crate::state::thing_connectivity(
+            &mut broker.lock(),
+            &input.thing_name,
+            &default_client_id,
+            crate::state::epoch_millis(now),
+        );
+
+        // A device that has never connected, or whose disconnect the broker no longer
+        // reports, is answered "not connected" with NO session details — which is what the
+        // operation documents for exactly those two cases.
+        let Some(report) = connectivity else {
+            return Ok(GetThingConnectivityDataOutput {
+                thing_name: Some(input.thing_name),
+                connected: Some(false),
+                ..GetThingConnectivityDataOutput::default()
+            });
+        };
+
+        Ok(GetThingConnectivityDataOutput {
+            thing_name: Some(input.thing_name),
+            connected: Some(report.connected),
+            timestamp: Some(::aws_smithy_types::DateTime::from_millis(report.at_millis)),
+            disconnect_reason: report.disconnect_reason,
+            client_id: Some(report.client_id),
+            clean_session: Some(report.clean_session),
+            keep_alive_duration: Some(report.keep_alive_seconds),
+            session_expiry: Some(report.session_expiry_seconds),
+            source_ip: report_socket_information.then_some(report.source_ip).flatten(),
+            source_port: report_socket_information.then_some(report.source_port),
+            target_ip: report_socket_information.then_some(report.target_ip).flatten(),
+            target_port: report_socket_information.then_some(report.target_port),
+            vpc_endpoint_id: report_socket_information
+                .then_some(report.vpc_endpoint_id)
+                .flatten(),
+        })
     }
 }
