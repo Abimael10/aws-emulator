@@ -34,10 +34,10 @@ pub const IPAM_POOL_CIDR_ID_PREFIX: &str = "ipam-pool-cidr";
 /// (`DeprovisionIpamPoolCidrRequest$Cidr`), and no operation of this service takes an
 /// `IpamPoolCidrId` as a parameter at all. AWS mints this one as an opaque per-CIDR
 /// identifier of its own, wider than a resource id, which is the form the wire corpus
-/// records for it — so it is minted by [`ComAmazonawsEc2Amazonec2State::mint_ipam_pool_cidr_id`]
-/// rather than by the resource-id mint every id a caller may name goes through. An even count,
-/// which that mint fills in two halves.
-pub const IPAM_POOL_CIDR_ID_DIGITS: usize = 32;
+/// records for it — so it is minted by the crate's one mint of that form
+/// ([`ComAmazonawsEc2Amazonec2State::mint_opaque_hex_id`]) rather than by the resource-id
+/// mint every id a caller may name goes through.
+pub const IPAM_POOL_CIDR_ID_DIGITS: usize = OPAQUE_HEX_ID_DIGITS;
 
 /// A CIDR whose provisioning has been asked for and has not settled yet: the
 /// `IpamPoolCidrState` enum's `pending-provision` member
@@ -138,8 +138,9 @@ pub fn ipam_pool_cidr_payload_bytes(view: &IpamPoolCidr) -> usize {
 /// Every step is invertible — a multiplication by an odd constant and a xor with a shift of
 /// the value itself — so this is a BIJECTION of its input: two counter values can never be
 /// spread onto one value. Nothing is read off a clock or a random source, so the same sequence
-/// of calls mints the same ids.
-fn spread_counter(value: u64) -> u64 {
+/// of calls mints the same ids. `pub(super)` so the crate's one mint of an OPAQUE identifier
+/// ([`ComAmazonawsEc2Amazonec2State::mint_opaque_hex_id`]) spreads its counter this one way.
+pub(super) fn spread_counter(value: u64) -> u64 {
     let mut spread = value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     spread ^= spread >> 30;
     spread = spread.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -154,27 +155,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// AWS hands out for an `IpamPoolCidr$IpamPoolCidrId`.
     ///
     /// The ONE mint of this id, so every stored pool CIDR — a provision that settles as a
-    /// success and one that settles as a failure alike — is reported by an id of one form.
-    ///
-    /// The id is derived from the store's own monotonic counter, the source [`Self::next_id`]
-    /// draws on, so it is read off no clock and no random source and a run that provisions the
-    /// same ranges reports the same ids. Two things differ from a resource id, which is why
-    /// this does not go through that mint: the suffix is WIDER, and only its FIRST half is the
-    /// counter — the second is that counter spread across its digits ([`spread_counter`]),
-    /// because what AWS hands out here is an opaque identifier rather than a count.
-    ///
-    /// The counter leads, so the ids of one pool sort in the order the ranges were provisioned
-    /// — which is the order every reader of them reports
-    /// ([`Self::ipam_pool_cidr_records`]) and the order the page cursor of
-    /// `GetIpamPoolCidrs` names a position in.
+    /// success and one that settles as a failure alike — is reported by an id of one form. It
+    /// goes through the crate's one mint of that FORM
+    /// ([`Self::mint_opaque_hex_id`]), which is where the two ways it differs from a resource
+    /// id are explained.
     fn mint_ipam_pool_cidr_id(&mut self) -> String {
-        self.id_counter = self.id_counter.saturating_add(1);
-        let counter = self.id_counter;
-        format!(
-            "{IPAM_POOL_CIDR_ID_PREFIX}-{counter:0half$x}{spread:0half$x}",
-            spread = spread_counter(counter),
-            half = IPAM_POOL_CIDR_ID_DIGITS / 2,
-        )
+        self.mint_opaque_hex_id(IPAM_POOL_CIDR_ID_PREFIX, IPAM_POOL_CIDR_ID_DIGITS)
     }
 
     /// Whether another IPAM pool CIDR fits inside the store's ceiling

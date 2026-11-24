@@ -11,6 +11,12 @@
 use super::*;
 use crate::ops::types::NetworkInterfaceAssociation;
 
+/// How many lowercase hexadecimal digits an OPAQUE AWS identifier carries after its prefix:
+/// the width [`ComAmazonawsEc2Amazonec2State::mint_opaque_hex_id`] mints, which is the width
+/// the wire corpus records for the resources of this crate that carry one rather than an EC2
+/// resource id. An EVEN count, which that mint fills in two halves.
+pub const OPAQUE_HEX_ID_DIGITS: usize = 32;
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Mint the next id for `prefix`, e.g. `vpc-00000000000000001`.
     ///
@@ -20,6 +26,39 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.id_counter = self.id_counter.saturating_add(1);
         format!("{prefix}-{:017x}", self.id_counter)
+    }
+
+    /// Mint an id of the OPAQUE form AWS hands out for a resource that no request names by id
+    /// — `prefix`, a hyphen and `digits` lowercase hexadecimal digits
+    /// ([`OPAQUE_HEX_ID_DIGITS`]), which is WIDER than the 8- or 17-digit resource id
+    /// [`Self::next_id`] mints.
+    ///
+    /// The ONE mint of that form in this crate, so the ids of the resources that take it
+    /// cannot drift apart: an IPAM pool CIDR's own id
+    /// ([`ComAmazonawsEc2Amazonec2State::mint_ipam_pool_cidr_id`]) and an IPAM pool
+    /// allocation's ([`ComAmazonawsEc2Amazonec2State::mint_ipam_pool_allocation_id`]).
+    ///
+    /// Two things differ from a resource id, which is why those two do not go through that
+    /// mint: the suffix is wider, and only its FIRST half is the store's monotonic counter —
+    /// the second is that counter spread across its digits ([`spread_counter`]), because what
+    /// AWS hands out here is an opaque identifier rather than a count. The counter LEADS, so
+    /// the ids minted for one parent still sort in the order they were minted, which is the
+    /// order every reader of them reports and the order a page cursor names a position in.
+    /// Nothing is read off a clock or a random source, so the same sequence of calls mints the
+    /// same ids. An ODD `digits` cannot be filled in two halves, which the debug assertion
+    /// below holds callers to rather than silently minting a narrower id than asked for.
+    pub(super) fn mint_opaque_hex_id(&mut self, prefix: &str, digits: usize) -> String {
+        debug_assert!(
+            digits.is_multiple_of(2),
+            "an opaque id is minted in two halves, so {digits} digits cannot be filled"
+        );
+        self.id_counter = self.id_counter.saturating_add(1);
+        let counter = self.id_counter;
+        format!(
+            "{prefix}-{counter:0half$x}{spread:0half$x}",
+            spread = spread_counter(counter),
+            half = digits / 2,
+        )
     }
 
     /// Mint the next hosted zone id a DNS entry names, e.g. `Z0000000000001`.

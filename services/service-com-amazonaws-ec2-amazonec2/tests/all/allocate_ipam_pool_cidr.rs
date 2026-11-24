@@ -40,7 +40,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{element, emulator, error_code, error_message};
-use super::wire::{Param, child_text, document, is_long_id, param};
+use super::wire::{Param, child_text, document, is_hex_id, param};
 
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
@@ -348,7 +348,11 @@ async fn an_allocation_holds_one_range_of_the_pools_space_and_reads_back() {
             expected = row.expected,
         );
         assert!(
-            is_long_id(IPAM_POOL_ALLOCATION_ID_PREFIX, &answered.id),
+            is_hex_id(
+                IPAM_POOL_ALLOCATION_ID_PREFIX,
+                &answered.id,
+                ec2::state::IPAM_POOL_ALLOCATION_ID_DIGITS,
+            ),
             "case {case:?}: expected an {IPAM_POOL_ALLOCATION_ID_PREFIX}- id, got {answered:?}"
         );
         assert_eq!(

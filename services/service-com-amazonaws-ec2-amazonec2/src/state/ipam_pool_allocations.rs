@@ -29,6 +29,15 @@ use super::*;
 /// the wire (`IpamPoolAllocation$IpamPoolAllocationId`).
 pub const IPAM_POOL_ALLOCATION_ID_PREFIX: &str = "ipam-pool-alloc";
 
+/// How many lowercase hexadecimal digits an `IpamPoolAllocation$IpamPoolAllocationId` carries
+/// after [`IPAM_POOL_ALLOCATION_ID_PREFIX`].
+///
+/// An allocation's id is not only an EC2 resource id: AWS mints it as the opaque identifier
+/// the wire corpus records for an allocation, which is wider than the 8- and 17-digit forms a
+/// resource a request names by id carries — so it takes the width of the crate's one opaque
+/// identifier ([`OPAQUE_HEX_ID_DIGITS`]) rather than a width of its own.
+pub const IPAM_POOL_ALLOCATION_ID_DIGITS: usize = OPAQUE_HEX_ID_DIGITS;
+
 /// `InvalidIpamPoolAllocationId.NotFound` (HTTP 400): the request named an allocation id the
 /// pool holds no allocation for.
 pub const INVALID_IPAM_POOL_ALLOCATION_ID_NOT_FOUND: &str =
@@ -42,6 +51,47 @@ pub const INVALID_IPAM_POOL_ALLOCATION_ID_MALFORMED: &str =
 /// How an allocation of this kind is NAMED in a refusal that cannot resolve its id: the
 /// resource type, as EC2 words every such sentence ([`id_not_found_message`]).
 pub const IPAM_POOL_ALLOCATION_ID_KIND: &str = "ipam-pool-allocation ID";
+
+/// Whether `id` is well formed as an `IpamPoolAllocationId`.
+///
+/// An allocation's id is not only an EC2 resource id: beside the 8- and 17-digit resource-id
+/// forms every id a request names may take ([`prefixed_id_is_well_formed`]), AWS also mints
+/// this one as the WIDER opaque identifier the wire corpus records for an allocation
+/// ([`IPAM_POOL_ALLOCATION_ID_DIGITS`]). So a
+/// caller handing back an id of that form names an allocation rather than something that is
+/// not an allocation id at all, which is the one question
+/// [`INVALID_IPAM_POOL_ALLOCATION_ID_MALFORMED`] answers.
+///
+/// The ONE reading of that form, so the read of a pool's allocations and the release of one
+/// cannot disagree about which ids are ids.
+pub fn ipam_pool_allocation_id_is_well_formed(id: &str) -> bool {
+    if prefixed_id_is_well_formed(IPAM_POOL_ALLOCATION_ID_PREFIX, id) {
+        return true;
+    }
+    id.strip_prefix(IPAM_POOL_ALLOCATION_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| {
+            suffix.len() == IPAM_POOL_ALLOCATION_ID_DIGITS
+                && suffix
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// Refuse an `IpamPoolAllocationId` that is not one at all: HTTP 400
+/// [`INVALID_IPAM_POOL_ALLOCATION_ID_MALFORMED`], asked before the id is looked up, exactly
+/// as [`require_well_formed_id`] asks it of every other kind of id — this kind having a form
+/// of its own ([`ipam_pool_allocation_id_is_well_formed`]).
+pub fn require_well_formed_ipam_pool_allocation_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    if ipam_pool_allocation_id_is_well_formed(id) {
+        return Ok(());
+    }
+    Err(Scaffolded::service_error(
+        INVALID_IPAM_POOL_ALLOCATION_ID_MALFORMED,
+        400,
+        invalid_id_message(id),
+    ))
+}
 
 /// The `ResourceType` member an IPAM pool allocation is tagged under
 /// (`smithy_query(query="shape",shape="ResourceType")`), which is the only type an
@@ -111,6 +161,38 @@ impl ComAmazonawsEc2Amazonec2State {
             .values()
             .filter(|record| record.ipam_pool_id == pool_id)
             .collect()
+    }
+
+    /// The allocation the pool `pool_id` holds under the id `allocation_id`, or `None` when
+    /// the pool holds none under that id.
+    ///
+    /// The ONE lookup of one allocation, so the handler that releases an allocation and the
+    /// one that reports it resolve the same record: an id names an allocation of THIS pool,
+    /// which is what makes a pool-plus-id pair rather than an id alone the way to reach one.
+    pub fn ipam_pool_allocation(
+        &self,
+        pool_id: &str,
+        allocation_id: &str,
+    ) -> Option<&IpamPoolAllocationRecord> {
+        self.ipam_pool_allocations
+            .get(allocation_id)
+            .filter(|record| record.ipam_pool_id == pool_id)
+    }
+
+    /// Release the allocation the pool `pool_id` holds under the id `allocation_id`, and
+    /// answer whether one went.
+    ///
+    /// "Release an allocation within an IPAM pool" (`ReleaseIpamPoolAllocation`): the range
+    /// stops being assigned at once — it is free space of the pool again — so the record goes,
+    /// which is the same reading [`Self::release_ipam_pool_allocations`] takes of a released
+    /// allocation and what leaves a pool nothing is allocated out of reporting an empty
+    /// allocation set.
+    pub fn release_ipam_pool_allocation(&mut self, pool_id: &str, allocation_id: &str) -> bool {
+        if self.ipam_pool_allocation(pool_id, allocation_id).is_none() {
+            return false;
+        }
+        self.remove_ipam_pool_allocation(allocation_id);
+        true
     }
 
     /// The ranges of the pool `pool_id` names that are already ASSIGNED — the space no
@@ -213,6 +295,23 @@ impl ComAmazonawsEc2Amazonec2State {
         })
     }
 
+    /// Mint the id one allocation is reported by: [`IPAM_POOL_ALLOCATION_ID_PREFIX`] and
+    /// [`IPAM_POOL_ALLOCATION_ID_DIGITS`] lowercase hexadecimal digits, the opaque
+    /// per-allocation form AWS hands out for an
+    /// `IpamPoolAllocation$IpamPoolAllocationId`.
+    ///
+    /// The ONE mint of this id, so every allocation — one a caller asked a pool for, one a
+    /// pool within it holds, one a resource was created with — is reported by an id of one
+    /// form, under both the names a reported allocation carries it under. It goes through the
+    /// crate's one mint of that FORM ([`Self::mint_opaque_hex_id`]), which is where the two
+    /// ways it differs from a resource id are explained.
+    fn mint_ipam_pool_allocation_id(&mut self) -> String {
+        self.mint_opaque_hex_id(
+            IPAM_POOL_ALLOCATION_ID_PREFIX,
+            IPAM_POOL_ALLOCATION_ID_DIGITS,
+        )
+    }
+
     /// Allocate `view` out of the pool `pool_id` names and answer the allocation as the store
     /// then holds it — `None` when the store is at a ceiling and NOTHING was stored.
     ///
@@ -237,7 +336,7 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.has_ipam_pool_allocation_capacity() || self.would_exceed_stored_bytes(charge) {
             return None;
         }
-        let allocation_id = self.next_id(IPAM_POOL_ALLOCATION_ID_PREFIX);
+        let allocation_id = self.mint_ipam_pool_allocation_id();
         let mut view = view;
         view.ipam_pool_allocation_id = Some(allocation_id.clone());
         self.add_stored_bytes(charge);
@@ -277,7 +376,8 @@ impl ComAmazonawsEc2Amazonec2State {
         released
     }
 
-    /// Release every allocation held by the RESOURCE `resource_id` — the space a resource of    /// the account holds out of an IPAM pool — and answer how many went.
+    /// Release every allocation held by the RESOURCE `resource_id` — the space a resource of
+    /// the account holds out of an IPAM pool — and answer how many went.
     ///
     /// "In IPAM, an allocation is a CIDR assignment from an IPAM pool to another IPAM pool or
     /// to a resource" ([`IpamPoolAllocation`]): an assignment to a resource lasts exactly as

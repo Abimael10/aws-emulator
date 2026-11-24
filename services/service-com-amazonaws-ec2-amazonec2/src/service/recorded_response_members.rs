@@ -16,7 +16,10 @@
 //! `DescribeInstanceTypes` answers every instance type with `<cpuBurstModel>` and every
 //! `networkInfo` with `<trafficMirroringSupport>`, and a recorded `DescribeSubnets` answers
 //! every subnet with the `<dhcpOptionsId>` it inherits from its VPC and the
-//! `<dhcpOptionsSource>` naming where that set came from. The generated serializer walks
+//! `<dhcpOptionsSource>` naming where that set came from, and a recorded
+//! `GetIpamPoolAllocations` answers every allocation with `<allocationId>`, `<cidrBlock>`,
+//! `<resourceProvider>` and `<status>` beside the members the shape declares. The generated
+//! serializer walks
 //! the model's members and only those, so those elements are missing from this emulator's
 //! responses: a client that reads `dhcpOptionsSource` to decide whether a VPC's DHCP
 //! options are its own or the account's reads nothing, and a strict deserializer that
@@ -270,6 +273,33 @@ const ALLOCATION_ID_MEMBER: &str = "AllocationId";
 /// DECLARING shape is what says WHICH association it is ([`recorded_writer_for`]).
 const ASSOCIATION_MEMBER: &str = "Association";
 
+/// The Smithy member name an IPAM pool allocation's own id is written under, which is what
+/// says the structure being walked IS a reported allocation — and the value its
+/// `allocationId` element repeats.
+const IPAM_POOL_ALLOCATION_ID_MEMBER: &str = "IpamPoolAllocationId";
+
+/// The Smithy member name a CIDR is written under, on every shape that reports one — on a
+/// reported allocation, the range the `cidrBlock` element repeats.
+const CIDR_MEMBER: &str = "Cidr";
+
+/// `resourceProvider` of an allocation IPAM itself assigned out of one of its pools: `aws`.
+///
+/// Every allocation of this store is one IPAM made — a range a caller asked a pool for, or
+/// one a pool within it holds, or one a resource of the account was created with — so the
+/// space is provided by Amazon Web Services rather than by a provider of the account's own,
+/// which is what the element names.
+const IPAM_POOL_ALLOCATION_RESOURCE_PROVIDER_AWS: &str = "aws";
+
+/// `status` of a LIVE allocation: `active`.
+///
+/// An allocation holds its range from the instant it is made and stops holding it the instant
+/// it is released, which takes the record OUT of the store
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::release_ipam_pool_allocations_of_resource`]
+/// and the release path beside it) — the modelled shape carries no state member for a
+/// half-released one. So an allocation a response reports is one the store holds, and the
+/// status that record reports is this one.
+const IPAM_POOL_ALLOCATION_STATUS_ACTIVE: &str = "active";
+
 /// The shapes whose `Association` member is the association of a public address with a
 /// NETWORK INTERFACE (`com.amazonaws.ec2#NetworkInterfaceAssociation`): the interface itself,
 /// and the private address of it the public one is bound to — the two places one such
@@ -497,6 +527,62 @@ static NETWORK_INTERFACE_ASSOCIATION_NAT_ENABLED: Schema = Schema::new_member(
     0,
 );
 
+/// `<allocationId>` on a reported IPAM pool allocation — a member schema for the same reason
+/// as [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#IpamPoolAllocation` declares the
+/// allocation's id as `ipamPoolAllocationId` and no second spelling of it.
+static IPAM_POOL_ALLOCATION_ALLOCATION_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#IpamPoolAllocation$allocationId",
+        EC2_NAMESPACE,
+        "allocationId",
+    ),
+    ShapeType::String,
+    "allocationId",
+    0,
+);
+
+/// `<cidrBlock>` on a reported IPAM pool allocation — a member schema for the same reason as
+/// [`VPC_DHCP_OPTIONS_SOURCE`]: that shape declares the range as `cidr` and no second
+/// spelling of it.
+static IPAM_POOL_ALLOCATION_CIDR_BLOCK: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#IpamPoolAllocation$cidrBlock",
+        EC2_NAMESPACE,
+        "cidrBlock",
+    ),
+    ShapeType::String,
+    "cidrBlock",
+    0,
+);
+
+/// `<resourceProvider>` on a reported IPAM pool allocation — a member schema for the same
+/// reason as [`VPC_DHCP_OPTIONS_SOURCE`]: that shape declares what the range was assigned TO
+/// and nothing about who provides the space it came out of.
+static IPAM_POOL_ALLOCATION_RESOURCE_PROVIDER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#IpamPoolAllocation$resourceProvider",
+        EC2_NAMESPACE,
+        "resourceProvider",
+    ),
+    ShapeType::String,
+    "resourceProvider",
+    0,
+);
+
+/// `<status>` on a reported IPAM pool allocation — a member schema for the same reason as
+/// [`VPC_DHCP_OPTIONS_SOURCE`]: that shape declares no state member at all, so a client
+/// reading one to tell a live allocation from any other finds nothing.
+static IPAM_POOL_ALLOCATION_STATUS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#IpamPoolAllocation$status",
+        EC2_NAMESPACE,
+        "status",
+    ),
+    ShapeType::String,
+    "status",
+    0,
+);
+
 /// The content of the `association` element of a gateway no association has been made for:
 /// no member at all, which is what makes the element present and empty.
 struct NoAssociation;
@@ -632,6 +718,12 @@ struct WrittenMembers {
     /// public-hostname options NAME — and whose emptiness says the instance holds no public
     /// address for them to name.
     public_dns_name: Option<String>,
+    /// The IPAM pool allocation id the structure wrote for itself, which is what says it IS a
+    /// reported allocation and the value its `allocationId` element repeats.
+    ipam_pool_allocation_id: Option<String>,
+    /// The CIDR the structure wrote for itself, which on a reported allocation is the range
+    /// its `cidrBlock` element repeats.
+    cidr: Option<String>,
     /// The context the structure reported for ITSELF — the zone it is in, and whether it is
     /// a bare metal instance type — which is what the structures nested under it are handed.
     zone: EnclosingRecord,
@@ -664,6 +756,7 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
     match schema.shape_id().shape_name() {
         "Vpc" => Some(write_vpc_recorded_members),
         "Subnet" => Some(write_subnet_recorded_members),
+        "IpamPoolAllocation" => Some(write_ipam_pool_allocation_recorded_members),
         "VerifiedAccessInstance" => Some(write_verified_access_instance_recorded_members),
         "InternetGateway" => Some(write_internet_gateway_recorded_members),
         "VolumeAttachment" => Some(write_volume_attachment_recorded_members),
@@ -930,6 +1023,45 @@ fn write_network_interface_association_recorded_members(
     s.write_boolean(&NETWORK_INTERFACE_ASSOCIATION_NAT_ENABLED, true)
 }
 
+/// A reported IPAM POOL ALLOCATION's recorded elements: the allocation's id and range under
+/// the names the live wire also writes them under, the provider of the space it came out of,
+/// and its status.
+///
+/// Every one of the four follows from the record being reported: the id and the range are the
+/// two members the allocation itself wrote (`IpamPoolAllocation$IpamPoolAllocationId`,
+/// `$Cidr`), repeated here under the second name the live wire renders them under rather than
+/// resolved a second time, so the two spellings of one fact cannot disagree; the provider is
+/// Amazon Web Services for every allocation IPAM itself made
+/// ([`IPAM_POOL_ALLOCATION_RESOURCE_PROVIDER_AWS`]); and the status is `active` because a
+/// released allocation is no longer in the store to report
+/// ([`IPAM_POOL_ALLOCATION_STATUS_ACTIVE`]).
+///
+/// Written only for a structure that wrote an allocation id of its own, which is what makes it
+/// a reported allocation rather than a shape whose member merely shares the name — so it
+/// reaches `AllocateIpamPoolCidr`'s single allocation and every item of
+/// `GetIpamPoolAllocations`' set alike, the rule being the shape's rather than one handler's.
+fn write_ipam_pool_allocation_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    let Some(allocation_id) = written.ipam_pool_allocation_id.as_deref() else {
+        return Ok(());
+    };
+    s.write_string(&IPAM_POOL_ALLOCATION_ALLOCATION_ID, allocation_id)?;
+    if let Some(cidr) = written.cidr.as_deref() {
+        s.write_string(&IPAM_POOL_ALLOCATION_CIDR_BLOCK, cidr)?;
+    }
+    s.write_string(
+        &IPAM_POOL_ALLOCATION_RESOURCE_PROVIDER,
+        IPAM_POOL_ALLOCATION_RESOURCE_PROVIDER_AWS,
+    )?;
+    s.write_string(
+        &IPAM_POOL_ALLOCATION_STATUS,
+        IPAM_POOL_ALLOCATION_STATUS_ACTIVE,
+    )
+}
+
 /// A reported VPC's recorded elements: the scope its DHCP option set comes from.
 ///
 /// Written only for a VPC that reported an option set association of its own: a VPC with no
@@ -1189,9 +1321,11 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
     /// volume attachment, the zone a record reports for itself, which is the zone the
     /// records nested under it are in
     /// ([`write_volume_attachment_recorded_members`]), the instance type name and
-    /// adapter support a reported instance type and its network settings carry, and the
+    /// adapter support a reported instance type and its network settings carry, the
     /// allocation id that makes a reported association an Elastic IP address's
-    /// ([`write_network_interface_association_recorded_members`]).
+    /// ([`write_network_interface_association_recorded_members`]), and the id and range of a
+    /// reported IPAM pool allocation
+    /// ([`write_ipam_pool_allocation_recorded_members`]).
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
         if let Some(written) = self.written.as_deref_mut() {
             if schema.shape_id().namespace() == EC2_NAMESPACE {
@@ -1220,6 +1354,10 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
                     }
                     PUBLIC_DNS_NAME_MEMBER => written.public_dns_name = Some(value.to_string()),
                     ALLOCATION_ID_MEMBER => written.allocation_id = true,
+                    IPAM_POOL_ALLOCATION_ID_MEMBER => {
+                        written.ipam_pool_allocation_id = Some(value.to_string());
+                    }
+                    CIDR_MEMBER => written.cidr = Some(value.to_string()),
                     _ => {}
                 }
             }

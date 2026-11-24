@@ -203,11 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::INVALID_IPAM_POOL_ID_MALFORMED,
         )?;
         if let Some(allocation_id) = input.ipam_pool_allocation_id.as_deref() {
-            crate::state::require_well_formed_id(
-                crate::state::IPAM_POOL_ALLOCATION_ID_PREFIX,
-                allocation_id,
-                crate::state::INVALID_IPAM_POOL_ALLOCATION_ID_MALFORMED,
-            )?;
+            crate::state::require_well_formed_ipam_pool_allocation_id(allocation_id)?;
         }
 
         // "A check for whether you have the required permissions for the action without
