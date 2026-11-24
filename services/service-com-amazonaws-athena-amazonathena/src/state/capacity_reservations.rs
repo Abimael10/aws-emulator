@@ -623,6 +623,18 @@ pub fn capacity_reservation_not_cancelled(status: &str) -> String {
     )
 }
 
+/// The message the capacity-reservation listing refuses a `NextToken` it did not mint
+/// with.
+///
+/// This slice of Athena words that refusal as a verdict on the token rather than as a
+/// report of it: the whole sentence is FIXED text, so nothing of the request reaches it and
+/// the rejected value is never echoed back — two different forged tokens are refused with
+/// the very same bytes. It is deliberately NOT the sentence the query, workgroup, notebook
+/// and tag listings state the same class in (`crate::state::page_token_malformed`, which
+/// names the token): the capacity-reservation API words it its own way, so the two cannot
+/// be collapsed onto one string.
+pub const CAPACITY_RESERVATION_PAGE_TOKEN_INVALID: &str = "Invalid next token provided";
+
 /// The refusal message for a create that would take the account past
 /// [`MAX_CAPACITY_RESERVATIONS`].
 pub fn too_many_capacity_reservations() -> String {

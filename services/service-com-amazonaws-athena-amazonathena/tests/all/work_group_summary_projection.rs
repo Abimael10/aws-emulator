@@ -13,9 +13,11 @@
 //!    engine FAMILY beside the selected and effective versions, the family following from
 //!    the version the workgroup's queries actually run on.
 //! 2. A pagination token this service did not mint names no page, and the refusal says so
-//!    in Athena's own wording: the fixed text `The nextPageToken is malformed: ` followed
-//!    by the token exactly as the request carried it, the same for every paginated read of
-//!    this service.
+//!    in Athena's own wording for the API the read belongs to: the workgroup, catalog and
+//!    engine-version listings state the fixed text `The nextPageToken is malformed: `
+//!    followed by the token exactly as the request carried it, while the
+//!    capacity-reservation listing states its verdict on the token alone, naming no value
+//!    from the request.
 //!
 //! Each rule is asserted over a TABLE: the rows of the first differ along what the rule
 //! generalises over — whether a create ever registered the workgroup, whether it carried a
@@ -26,9 +28,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    page_token_malformed, DEFAULT_EFFECTIVE_ENGINE_VERSION, DEFAULT_WORK_GROUP,
-    ENGINE_CATEGORY_PRESTO, ENGINE_CATEGORY_SPARK, ENGINE_VERSION_AUTO, ERROR_CODE_INVALID_INPUT,
-    PYSPARK_ENGINE_VERSION,
+    page_token_malformed, CAPACITY_RESERVATION_PAGE_TOKEN_INVALID,
+    DEFAULT_EFFECTIVE_ENGINE_VERSION, DEFAULT_WORK_GROUP, ENGINE_CATEGORY_PRESTO,
+    ENGINE_CATEGORY_SPARK, ENGINE_VERSION_AUTO, ERROR_CODE_INVALID_INPUT, PYSPARK_ENGINE_VERSION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -245,9 +247,12 @@ async fn every_published_engine_version_reports_its_family() {
 }
 
 /// A token this service did not mint for the listing it was offered to names no page, and
-/// every paginated read refuses it in the same sentence, naming the token it was given.
+/// every paginated read refuses it with the sentence Athena words that refusal in for the
+/// API the read belongs to: the workgroup, catalog and engine-version listings name the
+/// token they would not resume from, the capacity-reservation listing states the verdict
+/// alone.
 #[tokio::test]
-async fn a_pagination_token_no_listing_minted_is_refused_naming_that_token() {
+async fn a_pagination_token_no_listing_minted_is_refused_in_that_api_s_wording() {
     let router = router();
     // Enough workgroups that a page of one leaves some behind, so this listing mints a
     // token of its own to offer to the OTHER listings.
@@ -321,18 +326,24 @@ async fn a_pagination_token_no_listing_minted_is_refused_naming_that_token() {
             .await;
             // Asserted against the wording itself, not only against the helper the
             // handlers word it with, so a change to that wording fails here rather than
-            // agreeing with itself: the fixed text is Athena's and the token the CALLER
-            // supplied is its one variable part.
-            assert_refusal(
-                &case,
-                status,
-                &refused,
-                ERROR_CODE_INVALID_INPUT,
-                &format!("The nextPageToken is malformed: {token}"),
-            );
+            // agreeing with itself. The capacity-reservation API states this class as a
+            // verdict on the token with no variable part; the other three name the token
+            // the CALLER supplied as the sentence's one variable part.
+            let (expected, stated) = if operation == "ListCapacityReservations" {
+                (
+                    "Invalid next token provided".to_string(),
+                    CAPACITY_RESERVATION_PAGE_TOKEN_INVALID.to_string(),
+                )
+            } else {
+                (
+                    format!("The nextPageToken is malformed: {token}"),
+                    page_token_malformed(&token),
+                )
+            };
+            assert_refusal(&case, status, &refused, ERROR_CODE_INVALID_INPUT, &expected);
             assert_eq!(
                 message(&refused),
-                page_token_malformed(&token),
+                stated,
                 "case {case:?}: expected the wording this service states a token refusal \
                  in, got {refused:?}"
             );

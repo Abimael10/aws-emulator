@@ -2702,11 +2702,13 @@ pub fn results_not_readable(state: &str) -> String {
 /// The message a paginated read refuses a `NextToken` it did not mint with.
 ///
 /// Amazon Athena calls that value a nextPageToken inside this sentence and words the
-/// refusal the same way for every one of its paginated reads: the fixed text
-/// `The nextPageToken is malformed: ` with the token the CALLER supplied as its one
-/// variable part, so a client — or an operator reading a log — reads back exactly the value
-/// no listing would resume from. The ONE place it is worded, so no listing of this service
-/// can drift onto a sentence of its own.
+/// refusal this way for its query, workgroup, notebook, catalog, session and tag listings:
+/// the fixed text `The nextPageToken is malformed: ` with the token the CALLER supplied as
+/// its one variable part, so a client — or an operator reading a log — reads back exactly
+/// the value no listing would resume from. The ONE place it is worded, so none of those
+/// listings can drift onto a sentence of its own. The capacity-reservation listing is the
+/// exception Athena itself makes: it states the same class without naming the token
+/// ([`crate::state::CAPACITY_RESERVATION_PAGE_TOKEN_INVALID`]).
 pub fn page_token_malformed(token: &str) -> String {
     format!("The nextPageToken is malformed: {token}")
 }
