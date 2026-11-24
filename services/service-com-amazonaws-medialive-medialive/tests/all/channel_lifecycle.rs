@@ -32,6 +32,38 @@ pub(crate) async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Val
     call(router, "GET", &format!("/prod/channels/{id}"), None).await
 }
 
+/// The channel once `DescribeChannel` reports it in `state` — a state the clock owes it —
+/// as that read reported it.
+///
+/// Polls the CONDITION rather than waiting a fixed span, and gives up only on a deadline
+/// generous enough that a loaded host cannot fail it. The one poll-until-state helper the
+/// channel suites share, so a suite that has to reach a settled channel before a write only
+/// one state accepts does not carry a loop of its own.
+pub(crate) async fn described_once_in(
+    router: &MultiServiceRouter,
+    case: &str,
+    id: &str,
+    state: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, body) = describe(router, id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeChannel: expected 200, got {status}: {body}"
+        );
+        if body["state"] == json!(state) {
+            return body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the channel to reach {state}, it still reports {:?}",
+            body["state"]
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Rule: `CreateChannel` mints a numeric `Id`, builds the `Arn` from the request's
 /// region and that id, starts the channel in `CREATING` and settles it to `IDLE`;
 /// `PipelinesRunningCount` is the channel class's pipeline count exactly while the

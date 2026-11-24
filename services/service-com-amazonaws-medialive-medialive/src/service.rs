@@ -45,11 +45,16 @@
 //! request id and completes MediaLive's error envelope — `code`, `statusCode`,
 //! `retryable`, `requestId`, `time` — on the error body the framework rendered, for the
 //! one reason named in [`error_envelope`]: those members belong to the RESPONSE rather
-//! than to any modelled error shape, so no error serializer can write them. Routing,
-//! status, `__type` and `message` all stay with the framework.
+//! than to any modelled error shape, so no error serializer can write them. The same
+//! wrapper serves a channel body the flat `maintenanceStatus` member the wire carries
+//! beside the modelled maintenance sub-structure, for the same reason: the model binds it
+//! on one channel-returning shape only, so no output serializer can write it on the others
+//! (see [`served_channel_members`]). Routing, status, `__type` and `message` all stay with
+//! the framework.
 
 pub mod error_envelope;
 pub mod request_validation;
+pub mod served_channel_members;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,

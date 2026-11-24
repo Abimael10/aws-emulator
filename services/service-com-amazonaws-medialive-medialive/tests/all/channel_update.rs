@@ -301,6 +301,14 @@ async fn an_update_replaces_only_the_members_the_request_names() {
         if patch.get("roleArn").is_none() {
             apply(&mut expected, "roleArn", &Value::Null);
         }
+        // The flat `maintenanceStatus` member a recorded channel body carries beside the
+        // modelled sub-structure is on the wire holding no deadline, whatever an update
+        // writes to that sub-structure.
+        apply(
+            &mut expected,
+            "maintenanceStatus",
+            &json!(crate::channel_maintenance_and_egress::NO_DEADLINE),
+        );
 
         let (status, response) = update_channel(&router, &id, patch.clone()).await;
         assert_eq!(

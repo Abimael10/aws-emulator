@@ -363,13 +363,13 @@ impl ErasedOperation for ErrorEnvelopeOperation {
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             let definition = svc.definition();
-            let modeled = definition
+            let routed = definition
                 .protocol()
                 .routing_key(req)
                 .ok()
-                .and_then(|key| definition.routing_table().get(key));
-            match modeled {
-                Some(op) => {
+                .and_then(|key| definition.routing_table().get(key).map(|op| (key, op)));
+            match routed {
+                Some((operation, op)) => {
                     // A value outside a modelled enum is refused in MediaLive's
                     // OWN wording rather than the shared constraint
                     // validator's, which names an error type this service does
@@ -387,7 +387,17 @@ impl ErasedOperation for ErrorEnvelopeOperation {
                             ),
                         );
                     }
-                    with_request_id_and_envelope(op.run(svc, req, ctx).await)
+                    // A channel body also reports the flat `maintenanceStatus` member the
+                    // wire carries beside the modelled maintenance sub-structure, which
+                    // the model binds on one channel-returning shape only and so no output
+                    // serializer can write (see
+                    // [`crate::service::served_channel_members`]).
+                    with_request_id_and_envelope(
+                        crate::service::served_channel_members::with_served_success_body(
+                            operation,
+                            op.run(svc, req, ctx).await,
+                        ),
+                    )
                 }
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the

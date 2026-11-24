@@ -24,8 +24,6 @@
 //! carries, how many destinations, attachments, output groups and outputs there
 //! are, and which kind of output group settings each group carries.
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -84,23 +82,12 @@ async fn summary(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
 /// The channel once the clock has settled the create into `IDLE`, which is the
 /// state a delete and an update are accepted in.
 ///
-/// Polls the CONDITION — the state the channel reports — rather than waiting a
-/// fixed time, and gives up only on a deadline generous enough that a loaded
-/// host cannot fail it.
+/// The poll itself is the one the channel suites share
+/// ([`crate::channel_lifecycle::described_once_in`]): it waits for the CONDITION — the
+/// state the channel reports — rather than a fixed time, and gives up only on a deadline
+/// generous enough that a loaded host cannot fail it.
 async fn settled(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let described = describe(router, case, id).await;
-        if described["state"] == json!("IDLE") {
-            return described;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected the created channel to settle into IDLE, it still reports {:?}",
-            described["state"]
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    crate::channel_lifecycle::described_once_in(router, case, id, "IDLE").await
 }
 
 /// The entries of one member of `body`, or an empty list when the body carries

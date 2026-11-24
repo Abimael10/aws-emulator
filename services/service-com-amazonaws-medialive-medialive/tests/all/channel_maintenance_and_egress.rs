@@ -17,7 +17,7 @@ use std::net::Ipv4Addr;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_lifecycle::{describe, wait_for_the_clock};
+use crate::channel_lifecycle::{describe, described_once_in, wait_for_the_clock};
 use crate::wire::{call, medialive};
 
 /// Every value `MaintenanceDay` declares, in the model's own order
@@ -438,4 +438,171 @@ async fn no_two_pipelines_in_an_account_share_an_egress_address() {
             "case {case:?}: expected every pipeline in the account its own egress address, got {all:?}"
         );
     }
+}
+
+/// What a channel with no pipeline-VM restart scheduled reports as its maintenance status:
+/// the member is on the wire, and holds no deadline. The emulator schedules no such event
+/// for any channel, which is why this is what every channel reports — the same reason
+/// `RestartChannelPipelines` gives for the value its own modelled member answers.
+pub(crate) const NO_DEADLINE: &str = "";
+
+/// The flat `maintenanceStatus` member one channel-shaped body reports beside the modelled
+/// `maintenance` sub-structure: present, and holding no deadline.
+fn assert_maintenance_status(case: &str, read: &str, body: &Value) {
+    assert_eq!(
+        body["maintenanceStatus"],
+        json!(NO_DEADLINE),
+        "case {case:?}: {read}: expected maintenanceStatus on the wire holding no deadline, \
+         got {:?}",
+        body["maintenanceStatus"]
+    );
+}
+
+/// Rule: a channel body reports its maintenance surface as the modelled `maintenance`
+/// sub-structure AND, beside it, the flat `maintenanceStatus` member a recorded body carries
+/// — present, holding no deadline, because this emulator schedules no pipeline-VM restart
+/// for any channel. "No deadline" is a value a client reads, not a missing key, so every
+/// channel body a recording covers carries it.
+///
+/// The rows differ along which maintenance members the create request chooses — none at all
+/// (the case the issue reports), the day alone, and both at two different days and hours,
+/// including the last hour of the day — so the member is reported whatever window the
+/// channel carries, and the window itself keeps being reported where the model declares it.
+/// Each row reads both surfaces through the create, through a describe while the channel is
+/// still being created, through a describe once it has settled, and through the delete.
+#[tokio::test]
+async fn every_recorded_channel_body_reports_the_maintenance_status() {
+    // (case, the `maintenance` the create request names)
+    let table: [(&str, Option<Value>); 4] = [
+        ("the service's own selection", None),
+        ("the day alone", Some(json!({ "maintenanceDay": "SUNDAY" }))),
+        (
+            "both, at the last hour of the day",
+            Some(json!({ "maintenanceDay": "SATURDAY", "maintenanceStartTime": "23:00" })),
+        ),
+        (
+            "both, mid-week and mid-afternoon",
+            Some(json!({ "maintenanceDay": "WEDNESDAY", "maintenanceStartTime": "15:00" })),
+        ),
+    ];
+
+    for (case, requested) in table {
+        let router = medialive();
+        let mut body = json!({ "name": format!("channel-{case}") });
+        if let Some(requested) = requested {
+            body["maintenance"] = requested;
+        }
+
+        let created = create(&router, body).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+        assert_maintenance_status(case, "CreateChannel", &created);
+        assert_window_is_well_formed(case, "CreateChannel", &maintenance(&created));
+
+        let (status, creating) = describe(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeChannel: got {status}: {creating}"
+        );
+        assert_maintenance_status(
+            case,
+            "DescribeChannel while the channel is being created",
+            &creating,
+        );
+
+        let idle = described_once_in(&router, case, &id, "IDLE").await;
+        assert_maintenance_status(case, "DescribeChannel once the channel has settled", &idle);
+        assert_eq!(
+            maintenance(&idle),
+            maintenance(&created),
+            "case {case:?}: expected the modelled window to be reported beside the status, got \
+             {:?}",
+            maintenance(&idle)
+        );
+
+        let (status, deleted) =
+            call(&router, "DELETE", &format!("/prod/channels/{id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteChannel: expected 200, got {status}: {deleted}"
+        );
+        assert_maintenance_status(case, "DeleteChannel", &deleted);
+        assert_eq!(
+            maintenance(&deleted),
+            maintenance(&created),
+            "case {case:?}: expected the delete to report the channel's window too, got {:?}",
+            maintenance(&deleted)
+        );
+    }
+}
+
+/// Rule: the maintenance a caller SCHEDULES is reported where the model declares it — the
+/// `maintenance` sub-structure's own `maintenanceScheduledDate` — and the flat member beside
+/// it still holds no deadline, because scheduling maintenance on a channel schedules no
+/// pipeline-VM restart, which is what that member reports the time of.
+///
+/// One channel, read after the update that moves its window and schedules maintenance: the
+/// update's own answer and the describe that follows it.
+#[tokio::test]
+async fn maintenance_a_caller_schedules_is_reported_where_the_model_declares_it() {
+    /// The date the update below schedules maintenance for.
+    const SCHEDULED: &str = "2031-02-03";
+
+    let case = "a channel whose window is moved and whose maintenance is scheduled";
+    let router = medialive();
+
+    let created = create(
+        &router,
+        json!({
+            "name": "channel-scheduled-maintenance",
+            "maintenance": { "maintenanceDay": "MONDAY", "maintenanceStartTime": "02:00" },
+        }),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap_or_default().to_string();
+    assert_maintenance_status(case, "CreateChannel", &created);
+    let idle = described_once_in(&router, case, &id, "IDLE").await;
+    assert_maintenance_status(case, "DescribeChannel while IDLE", &idle);
+
+    let (status, updated) = call(
+        &router,
+        "PUT",
+        &format!("/prod/channels/{id}"),
+        Some(json!({
+            "maintenance": {
+                "maintenanceDay": "FRIDAY",
+                "maintenanceStartTime": "04:00",
+                "maintenanceScheduledDate": SCHEDULED,
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: UpdateChannel: expected 200, got {status}: {updated}"
+    );
+    let window = maintenance(&updated["channel"]);
+    assert_eq!(
+        window,
+        json!({
+            "maintenanceDay": "FRIDAY",
+            "maintenanceStartTime": "04:00",
+            "maintenanceScheduledDate": SCHEDULED,
+        }),
+        "case {case:?}: expected the update to move the window and schedule the maintenance, \
+         got {window:?}"
+    );
+
+    let (status, described) = describe(&router, &id).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeChannel after the update: got {status}: {described}"
+    );
+    assert_eq!(
+        maintenance(&described),
+        window,
+        "case {case:?}: expected the scheduled maintenance to read back in the modelled \
+         sub-structure, got {:?}",
+        maintenance(&described)
+    );
+    assert_maintenance_status(case, "DescribeChannel after the update", &described);
 }
