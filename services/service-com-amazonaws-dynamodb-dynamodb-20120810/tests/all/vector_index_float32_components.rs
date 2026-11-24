@@ -12,15 +12,15 @@
 //! the decimal the write carried, and `GetItem` answers it — so the two differ exactly where
 //! the rounding does.
 //!
-//! The score is how the index's held copy is observed: a search answers "the similarity
-//! score for this item relative to the search vector" (`SearchResultItem$Score`) beside the
-//! attributes the index PROJECTS of the item (`SearchResultItem$Item`), which never include
-//! the vector it searched by — that one reaches the index as the value it is built on
-//! (`VectorIndex$VectorAttribute`) rather than as an attribute copied into it. Over
-//! `DOT_PRODUCT` against the all-ones search vector the score is the sum of the held
-//! coordinates, so a coordinate the type cannot represent and the coordinate it rounds to
-//! score IDENTICALLY while every neighbour of them scores apart — which is the rounding,
-//! observed.
+//! The held copy is observed twice over: a search answers "the similarity score for this
+//! item relative to the search vector" (`SearchResultItem$Score`) beside the attributes the
+//! index PROJECTS of the item (`SearchResultItem$Item`), the vector attribute among them —
+//! it is the index's own key attribute, and "the primary key attributes and index key
+//! attributes … are automatically projected" (`Projection`) — so a result carries the
+//! coordinates as the index holds them. Over `DOT_PRODUCT` against the all-ones search
+//! vector the score is the sum of the held coordinates, so a coordinate the type cannot
+//! represent and the coordinate it rounds to score IDENTICALLY while every neighbour of them
+//! scores apart — which is the rounding, observed.
 //!
 //! The rows span what the rule generalises over: a coordinate a 32-bit float holds exactly
 //! (a whole number, a power of two, a half), the first whole number it does NOT hold
@@ -264,22 +264,23 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
 }
 
 #[tokio::test]
-async fn a_search_reports_no_vector_attribute_of_the_index_it_searched() {
+async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
     let router = emulator();
     stored_rows(&router).await;
     let answered = search_every_row(&router).await;
 
-    // The score is the ONE thing the index's held copy is observed through: a result
-    // "contains the projected attributes and a similarity score"
-    // (`SearchVectors$SearchResults`), and the vector attribute reaches the index in its own
-    // member as the value it is built on rather than as an attribute copied into it
-    // (`VectorIndex$VectorAttribute` beside `VectorIndex$Projection`) — so no result carries
-    // it, not even from an index whose `Projection` is `ALL`.
+    // A result "contains the projected attributes and a similarity score"
+    // (`SearchVectors$SearchResults`), and the vector attribute is projected into the index
+    // as its own key attribute ("the primary key attributes and index key attributes … are
+    // automatically projected", `Projection`) — so every result carries it, in the form the
+    // INDEX holds it in: the 32-bit float each written decimal rounds to.
     for (at, row) in rows().iter().enumerate() {
         let result = result_for(&answered, &key_of(at));
-        assert!(
-            result["Item"]["emb"].is_null(),
-            "case {:?}: a search hands back no vector attribute, got {result} of {answered}",
+        assert_eq!(
+            result["Item"]["emb"]["L"][0]["N"],
+            json!(row.held),
+            "case {:?}: a search hands the coordinate back as the float32 the index holds, \
+             got {result} of {answered}",
             row.case
         );
         // Read back off the TABLE's item, the coordinate is the decimal the write carried:
@@ -298,11 +299,12 @@ async fn a_search_reports_no_vector_attribute_of_the_index_it_searched() {
         );
     }
 
-    // A `ProjectionExpression` naming the vector attribute reports nothing for it: a request
-    // may only narrow what the index projects, and the vector is not among those attributes
-    // ("only attributes projected into the vector index can be retrieved",
-    // `SearchVectors$ProjectionExpression`). The rows are still SCORED and answered — the
-    // projection decides what each result carries, not which items a search finds.
+    // A `ProjectionExpression` naming the vector attribute reports THAT attribute and
+    // nothing else: a request may only narrow what the index projects ("only attributes
+    // projected into the vector index can be retrieved",
+    // `SearchVectors$ProjectionExpression`), and the vector is one of the projected
+    // attributes. The rows are still SCORED and answered — the projection decides what each
+    // result carries, not which items a search finds.
     let narrowed = ok(
         &router,
         "SearchVectors",
@@ -348,8 +350,31 @@ async fn a_search_reports_no_vector_attribute_of_the_index_it_searched() {
          {narrowed}"
     );
     assert!(
-        reported.iter().all(Vec::is_empty),
-        "case \"a projection naming the vector attribute\": it reports nothing for it, got \
-         {reported:?} from {narrowed}"
+        reported
+            .iter()
+            .all(|names| names == &vec!["emb".to_string()]),
+        "case \"a projection naming the vector attribute\": every result carries that one \
+         attribute, got {reported:?} from {narrowed}"
+    );
+
+    // And the coordinates those narrowed results carry are the held ones, whichever order
+    // the scores put them in.
+    let mut held: Vec<String> = narrowed["SearchResults"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|result| result["Item"]["emb"]["L"][0]["N"].to_string())
+        .collect();
+    held.sort();
+    let mut expected: Vec<String> = rows()
+        .iter()
+        .map(|row| json!(row.held).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        held, expected,
+        "case \"a projection naming the vector attribute\": the coordinates are the ones \
+         the index holds, got {held:?} from {narrowed}"
     );
 }

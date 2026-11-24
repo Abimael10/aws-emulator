@@ -12,9 +12,10 @@
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
 //! 2. a result carries what the index PROJECTS of its item — "only attributes projected
 //!    into the vector index can be retrieved" (`SearchVectors$ProjectionExpression`), so the
-//!    attributes its `Projection` copies into it beside the table's key and its search
-//!    schema's attributes, which are projected automatically, and never the vector it finds
-//!    them by, which reaches the index as the value it is built on — narrowed further by a
+//!    attributes its `Projection` copies into it beside the table's key, its search schema's
+//!    attributes and the vector attribute it is keyed by, all of which are projected
+//!    automatically ("the primary key attributes and index key attributes, which are
+//!    automatically projected", `Projection`) — narrowed further by a
 //!    `ProjectionExpression`, which reports nothing for a name the index does not project;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
@@ -354,24 +355,28 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // "Only attributes projected into the vector index can be retrieved"
     // (`SearchVectors$ProjectionExpression`), and what is projected into the index is what
     // its `Projection` copies there, beside "the primary key attributes and index key
-    // attributes, which are automatically projected" (`Projection`) — the table's key and
-    // the attributes its search schema is keyed and filtered by. The vector attribute `emb`
-    // reaches the index as the value it is BUILT on rather than as an attribute copied into
-    // it, so no row reports it, whatever its `Projection` covers and whether or not the
-    // request names it.
+    // attributes, which are automatically projected" (`Projection`) — the table's key, the
+    // attributes its search schema is keyed and filtered by, and the vector attribute `emb`
+    // itself, which is the index's own key attribute — so every row reports `emb` unless the
+    // request narrows it away.
     let cases: [(&str, Value, Value, &[&str]); 9] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "note", "pk", "tenant"],
+            &["brand", "emb", "note", "pk", "tenant"],
         ),
-        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
+        (
+            "keys-index",
+            Value::Null,
+            Value::Null,
+            &["emb", "pk", "tenant"],
+        ),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "pk", "tenant"],
+            &["brand", "emb", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -386,10 +391,11 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         // hold is the same case, over an index that projects every attribute of the item as
         // much as over one that projects none.
         ("all-index", json!("absent"), Value::Null, &[]),
-        // The vector attribute cannot be retrieved through a search however the index
-        // projects it, so a projection naming it reports nothing.
-        ("all-index", json!("emb"), Value::Null, &[]),
-        ("keys-index", json!("note, emb"), Value::Null, &[]),
+        // The vector attribute is projected into every index that is keyed by it, so a
+        // projection naming it reports it — and only it.
+        ("all-index", json!("emb"), Value::Null, &["emb"]),
+        // `note` is outside what a `KEYS_ONLY` index holds, so only the vector comes back.
+        ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
     ];
     for (index, projection_expression, names, expected) in cases {
         let case = format!("{index} projecting {projection_expression}");

@@ -7,13 +7,12 @@
 //! own `Projection` copies there — "attributes that are copied (projected) from the table
 //! into the vector index" (`VectorIndex$Projection`) — beside "the primary key attributes
 //! and index key attributes, which are automatically projected" (`Projection`): the TABLE's
-//! key and the attributes its `SearchSchema` is keyed and filtered by ("an attribute
+//! key, the attributes its `SearchSchema` is keyed and filtered by ("an attribute
 //! projected into the vector index for filtering at the storage layer during search",
-//! `SearchSchemaElement$SearchSchemaElementType`). The vector attribute reaches the index
-//! through neither — it arrives in its own member (`VectorIndex$VectorAttribute`) as the
-//! value the index is BUILT on — and a result "contains the projected attributes and a
-//! similarity score" (`SearchVectors$SearchResults`), so a search never hands the vector
-//! back: the score is what a result reports of it.
+//! `SearchSchemaElement$SearchSchemaElementType`), and the VECTOR attribute, which is the
+//! index's own key attribute. So a search hands the vector back like every other projected
+//! attribute — in the form the index holds it in — and hands back nothing the table holds
+//! outside what the index projects.
 //!
 //! The table spans what the rule generalises over: every `ProjectionType` the model
 //! declares, an `INCLUDE` that names the vector attribute and one that does not, a search
@@ -30,9 +29,9 @@
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same `MultiServiceRouter`
 //! the emulator's front doors use.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-use crate::emulator::{emulator, ok, ACTIVE_DEADLINE, POLL_INTERVAL};
+use crate::emulator::{emulator, ok, search_result_attributes, ACTIVE_DEADLINE, POLL_INTERVAL};
 
 /// Poll `DescribeTable` until every vector index of `table` reports `ACTIVE` — the waiter
 /// loop a client runs before searching one, since "the index must be in the ACTIVE state"
@@ -90,16 +89,7 @@ fn index(name: &str, projection: Value, search_schema: Value) -> Value {
 
 /// The attribute names the first result of `response` carries, sorted.
 fn reported_attributes(response: &Value) -> Vec<String> {
-    let empty = Map::new();
-    let mut names: Vec<String> = response["SearchResults"]
-        .get(0)
-        .and_then(|result| result["Item"].as_object())
-        .unwrap_or(&empty)
-        .keys()
-        .cloned()
-        .collect();
-    names.sort();
-    names
+    search_result_attributes(response, 0)
 }
 
 /// One `SearchVectors` through `index` of `table`, pinning `tenant` when the index
@@ -160,9 +150,8 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
                     json!({"ProjectionType": "INCLUDE", "NonKeyAttributes": ["note"]}),
                     Value::Null,
                 ),
-                // An `INCLUDE` that names the vector attribute itself: naming it there does
-                // not make it retrievable either, since the index is built on it rather than
-                // handed it to copy.
+                // An `INCLUDE` that names the vector attribute itself: the index holds that
+                // attribute either way, since it is the index's own key attribute.
                 index(
                     "include-the-vector",
                     json!({"ProjectionType": "INCLUDE", "NonKeyAttributes": ["vec"]}),
@@ -203,32 +192,32 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
         Row {
             index: "all",
             partitioned: false,
-            whole: &["extra", "note", "pk", "tenant", "tier"],
-            narrowed: &["note"],
+            whole: &["extra", "note", "pk", "tenant", "tier", "vec"],
+            narrowed: &["note", "vec"],
         },
         Row {
             index: "keys-only",
             partitioned: false,
-            whole: &["pk"],
-            narrowed: &[],
+            whole: &["pk", "vec"],
+            narrowed: &["vec"],
         },
         Row {
             index: "include-note",
             partitioned: false,
-            whole: &["note", "pk"],
-            narrowed: &["note"],
+            whole: &["note", "pk", "vec"],
+            narrowed: &["note", "vec"],
         },
         Row {
             index: "include-the-vector",
             partitioned: false,
-            whole: &["pk"],
-            narrowed: &[],
+            whole: &["pk", "vec"],
+            narrowed: &["vec"],
         },
         Row {
             index: "include-note-filtered",
             partitioned: true,
-            whole: &["note", "pk", "tenant", "tier"],
-            narrowed: &["note"],
+            whole: &["note", "pk", "tenant", "tier", "vec"],
+            narrowed: &["note", "vec"],
         },
     ];
 
@@ -328,8 +317,9 @@ async fn a_composite_key_is_projected_into_a_vector_index_whole() {
     let reported = reported_attributes(&answered);
     assert_eq!(
         reported,
-        vec!["pk".to_string(), "sk".to_string()],
-        "case \"a composite key\": both key attributes are projected automatically and \
-         nothing else is, got {reported:?} from {answered}"
+        vec!["pk".to_string(), "sk".to_string(), "vec".to_string()],
+        "case \"a composite key\": both key attributes are projected automatically, beside \
+         the vector the index is keyed by, and nothing else is, got {reported:?} from \
+         {answered}"
     );
 }

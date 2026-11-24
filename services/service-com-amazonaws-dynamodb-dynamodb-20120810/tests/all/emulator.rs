@@ -523,6 +523,24 @@ pub async fn table_when(
     )
 }
 
+/// The attribute names the `SearchVectors` result at `at` carries, sorted — the reading every
+/// vector suite does of `SearchResultItem$Item`, shared so two suites cannot disagree about
+/// what "the attributes a result carries" means.
+///
+/// An absent result and one carrying no `Item` both read as no attributes, which is what a
+/// suite asserting an empty projection expects.
+pub fn search_result_attributes(answered: &Value, at: usize) -> Vec<String> {
+    let mut names: Vec<String> = answered["SearchResults"][at]["Item"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
 /// Poll `DescribeContributorInsights` until the resource's insights report `status`,
 /// answering the description it reported then — the waiter a client runs after an
 /// `UpdateContributorInsights`, which is asynchronous in either direction ("the status only

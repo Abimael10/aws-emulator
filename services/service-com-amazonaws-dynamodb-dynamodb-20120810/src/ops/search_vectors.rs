@@ -9,13 +9,14 @@
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
 //! index covers, carrying a vector of the index's dimensions), and each result item is the
-//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]) narrowed to
-//! what that index may hand back ([`crate::state::VectorIndex::retrieves`]) — "only
-//! attributes projected into the vector index can be retrieved"
-//! (`SearchVectors$ProjectionExpression`), so a search reports the attributes the index
-//! projects and nothing the table holds outside them; the vector it was found BY is not one
-//! of them — it reaches the index as the value it is built on rather than as an attribute
-//! copied into it — and what a result reports of it is the score computed from it.
+//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]), narrowed by
+//! the `ProjectionExpression` the request sent — "only attributes projected into the vector
+//! index can be retrieved" (`SearchVectors$ProjectionExpression`), so a search reports the
+//! attributes the index projects and nothing the table holds outside them. The vector
+//! attribute is one of those attributes: it is the index's own key attribute, and "the
+//! primary key attributes and index key attributes … are automatically projected"
+//! (`Projection`), so a result carries it as the INDEX holds it — a list of 32-bit floats
+//! ([`crate::state::stored_vector`]) — beside the score computed from it.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -475,18 +476,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::VectorIndex::index_entry`]) — narrowed by the projection
             // the request named.
             let entry = index.index_entry(item, &table.key_schema);
-            let read = match requested_attributes.as_ref() {
+            // What the search read IS what it hands back: a result "contains the projected
+            // attributes and a similarity score" (`SearchVectors$SearchResults`), and the
+            // vector attribute is projected into the index as its own key attribute ("the
+            // primary key attributes and index key attributes … are automatically
+            // projected", `Projection`), so it comes back like every other attribute the
+            // index holds — in the float32 form the index holds it in, beside the score.
+            let reported = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,
             };
-            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&read));
-            // What a search HANDS BACK of that entry is narrower: "only attributes
-            // projected into the vector index can be retrieved"
-            // (`SearchVectors$ProjectionExpression`), and the vector the index finds an
-            // item BY is not one of the attributes projected into it
-            // ([`crate::state::VectorIndex::retrieves`]) — the score is what a result
-            // reports of it.
-            let reported = index.retrievable_entry(read);
+            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&reported));
             reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&reported));
             search_results.push(SearchResultItem {
                 item: Some(reported),

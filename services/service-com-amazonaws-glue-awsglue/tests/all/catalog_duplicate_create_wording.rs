@@ -8,9 +8,9 @@
 //! THAT resource surface with, reproduced character for character — its terminal
 //! punctuation included — and interpolates nothing the sentence does not name, so each
 //! already-exists surface keeps its own wording and none of them is derived from another's.
-//! For the catalog surface the duplicate-name sentence ends on the word `exists`, with no
-//! terminal full stop, while the database surface's own sentence carries one; the suite
-//! below drives both so the wording is pinned per surface rather than blanket-punctuated.
+//! The catalog surface's duplicate-name sentence names the resource kind, withholds the
+//! requested name and ends on a full stop; the suite below drives the database surface
+//! beside it so the wording is pinned per surface rather than blanket-derived.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over: the
 //! requested name's value, length, casing and character set, and how the second create
@@ -30,8 +30,8 @@ use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID, REG
 const ALREADY_EXISTS: &str = "AlreadyExistsException";
 
 /// The whole `Message` a `CreateCatalog` for a name the account already holds answers:
-/// fixed text, no terminal full stop.
-const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+/// fixed text, ending on a full stop.
+const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// The whole `Message` the catalog read and delete answer for an id holding no catalog.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
@@ -78,11 +78,11 @@ async fn description_of(router: &MultiServiceRouter, catalog_id: &str) -> Option
 }
 
 /// A second `CreateCatalog` for a name already taken is refused with the catalog surface's
-/// own fixed sentence — which carries no terminal full stop and names nothing of the
-/// request — whatever the name is spelled like and however the second create differs from
-/// the first, and the stored catalog keeps the definition the first create wrote.
+/// own fixed sentence — which ends on a full stop and names nothing of the request —
+/// whatever the name is spelled like and however the second create differs from the first,
+/// and the stored catalog keeps the definition the first create wrote.
 #[tokio::test]
-async fn a_duplicate_catalog_name_answers_the_catalog_sentence_without_a_terminal_stop() {
+async fn a_duplicate_catalog_name_answers_the_catalog_sentence_character_for_character() {
     for (row, name) in catalog_names() {
         // A fresh emulator per row, so a name at the modelled ceiling can be taken in
         // every row without the store filling up across rows.
@@ -113,12 +113,12 @@ async fn a_duplicate_catalog_name_answers_the_catalog_sentence_without_a_termina
             )
             .await;
             let message = error_message(&answered);
-            // The divergence this suite pins: the sentence ends on its last word, so a
-            // client matching the catalog surface's text matches.
-            assert!(
-                !message.ends_with('.'),
-                "case {case}: the catalog duplicate sentence carries no terminal full stop, \
-                 got {message:?}"
+            // The sentence is reproduced character for character, terminal punctuation
+            // included, so a client matching the catalog surface's text matches.
+            assert_eq!(
+                message, CATALOG_ALREADY_EXISTS,
+                "case {case}: the catalog duplicate sentence is reproduced whole, got \
+                 {message:?}"
             );
             assert_withholds(&case, &message, &name);
         }
@@ -213,9 +213,8 @@ fn connection_body(name: &str) -> Value {
 }
 
 /// The bound of the rule: a duplicate name is worded by the surface it was asked of, so
-/// the catalog's stop-less sentence is not a stop stripped off every already-exists
-/// sentence — the database's and the connection's keep theirs, on the same request and the
-/// same error code.
+/// each of these sentences names its own resource kind — the catalog's, the database's and
+/// the connection's — on the same request and the same error code.
 #[tokio::test]
 async fn each_already_exists_surface_keeps_its_own_sentence() {
     let surfaces = [
