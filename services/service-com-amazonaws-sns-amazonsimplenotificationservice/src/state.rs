@@ -1777,7 +1777,7 @@ pub const FILTER_POLICY_SCOPES: &[&str] =
 /// The scope whose filtering reads the message BODY: "MessageBody – The filter is applied
 /// on the message body" (`GetSubscriptionAttributesResponse$Attributes` doc) — the other
 /// value of [`FILTER_POLICY_SCOPES`], and the one
-/// [`filter_policy::admits`] reads the body under.
+/// [`filter_policy::filtering`] reads the body under.
 pub const MESSAGE_BODY_FILTER_POLICY_SCOPE: &str = "MessageBody";
 
 /// The `FilterPolicyScope` a subscription REPORTS, or `None` when it reports none.

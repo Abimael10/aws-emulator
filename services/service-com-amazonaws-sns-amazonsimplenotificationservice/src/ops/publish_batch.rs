@@ -604,18 +604,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
                 // What this entry contributed to the topic's own counters: the publish
                 // itself, and the one notification each subscription the filter policy
-                // withheld it from did not get ([`state::topic_metrics`]). The outcome of
+                // withheld it from did not get — in the aggregate and under the reason it
+                // was withheld for ([`state::topic_metrics`]). The outcome of
                 // each delivery is counted where that delivery resolves.
                 deliveries.count(
                     &topic.arn,
                     state::topic_metrics::TopicActivity::MessagePublished,
                     1,
                 );
-                deliveries.count(
-                    &topic.arn,
-                    state::topic_metrics::TopicActivity::NotificationFilteredOut,
-                    withheld,
-                );
+                deliveries.count_withheld(&topic.arn, &withheld);
                 for recipient in &accepted {
                     store.record_delivery(&recipient.arn, ::std::sync::Arc::clone(&published));
                 }

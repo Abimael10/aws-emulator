@@ -4,7 +4,7 @@
 //!
 //! A `FilterPolicy` in `Attributes` is persisted with the subscription and is what
 //! decides, per published message, whether this subscription receives it: see
-//! [`crate::state::filter_policy::admits`].
+//! [`crate::state::filter_policy::filtering`].
 //!
 //! ## Shape of an operation
 //!

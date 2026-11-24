@@ -8,7 +8,9 @@
 //! A publish is not only the `MessageId` the caller is handed: Amazon SNS reports what the
 //! topic did with it as the metrics [`NUMBER_OF_MESSAGES_PUBLISHED`],
 //! [`NUMBER_OF_NOTIFICATIONS_DELIVERED`], [`NUMBER_OF_NOTIFICATIONS_FAILED`] and
-//! [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`], each dimensioned by the topic it is about
+//! [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`] — the last of them beside the sub-metrics that
+//! say WHY a notification was withheld ([`FilteredOutUnder`]) — each dimensioned by the topic
+//! it is about
 //! ([`TOPIC_NAME_DIMENSION`]). They are what an SNS dashboard plots and what a
 //! delivery-health alarm is evaluated against, and they are INDEPENDENT of one another: a
 //! message a subscription's filter policy withheld is counted as filtered out and nowhere
@@ -26,7 +28,13 @@
 //!   whatever its fan-out then came to;
 //! * one per subscription the message was OFFERED to whose filter policy did not admit it
 //!   ([`crate::state::filter_policy`]), counted for a replayed message as for a published
-//!   one, because a replay offers the archived message to the subscription the same way;
+//!   one, because a replay offers the archived message to the subscription the same way.
+//!   The same withholding is counted a SECOND time into the sub-metric of the reason the
+//!   policy withheld it ([`FilteredOutUnder`]) — the part of the message the policy was
+//!   applied on, or the absence of the attributes it would have read — so an operator can
+//!   tell a filter that rejected what it read from one that had nothing to read, rather
+//!   than only that something was withheld. The sub-metrics are series of their own, so
+//!   neither they nor the aggregate absorbs the other;
 //! * one per notification the subscribed endpoint TOOK, and one per notification it did not
 //!   — a delivery nothing granted, an endpoint that is not there, or one that refused the
 //!   message itself. The outcome is the one the fan-out resolved
@@ -74,6 +82,22 @@ pub const NUMBER_OF_NOTIFICATIONS_FAILED: &str = "NumberOfNotificationsFailed";
 /// How many messages a subscription's filter policy withheld from it.
 pub const NUMBER_OF_NOTIFICATIONS_FILTERED_OUT: &str = "NumberOfNotificationsFilteredOut";
 
+/// How many of those were withheld by a policy applied on the message ATTRIBUTES of a
+/// message that carried some: the [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`] sub-metric of the
+/// `MessageAttributes` filtering scope.
+pub const NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES: &str =
+    "NumberOfNotificationsFilteredOut-MessageAttributes";
+
+/// How many were withheld because the message carried NO message attribute for a policy
+/// applied on them to read.
+pub const NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_NO_MESSAGE_ATTRIBUTES: &str =
+    "NumberOfNotificationsFilteredOut-NoMessageAttributes";
+
+/// How many were withheld by a policy applied on the message BODY: the
+/// [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`] sub-metric of the `MessageBody` filtering scope.
+pub const NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_BODY: &str =
+    "NumberOfNotificationsFilteredOut-MessageBody";
+
 /// The unit a count of things is published in: `Count`, the `StandardUnit` value for a
 /// number of things.
 pub const COUNT_UNIT: &str = "Count";
@@ -82,6 +106,84 @@ pub const COUNT_UNIT: &str = "Count";
 /// resolution, "which CloudWatch stores at 1-minute resolution"
 /// (`MetricDatum$StorageResolution`).
 const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
+
+/// WHY one notification was withheld, which is what decides the filtered-out SUB-METRIC it
+/// is reported under beside the aggregate.
+///
+/// A withholding is reported under the part of the message the policy was applied on — the
+/// subscription's `FilterPolicyScope`, whose values are `MessageAttributes` and
+/// `MessageBody` ([`crate::state::FILTER_POLICY_SCOPES`]) — except that a policy applied on
+/// the message attributes of a message carrying NONE is reported as having had no attributes
+/// to read, which is a different operational story from a filter that read the attributes and
+/// did not admit them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilteredOutUnder {
+    /// A policy applied on the message attributes did not admit the attributes the message
+    /// carried: [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES`].
+    MessageAttributes,
+    /// A policy applied on the message attributes had none to read:
+    /// [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_NO_MESSAGE_ATTRIBUTES`].
+    NoMessageAttributes,
+    /// A policy applied on the message body did not admit it:
+    /// [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_BODY`].
+    MessageBody,
+}
+
+impl FilteredOutUnder {
+    /// The sub-metric a notification withheld for this reason is counted into.
+    #[must_use]
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Self::MessageAttributes => NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES,
+            Self::NoMessageAttributes => {
+                NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_NO_MESSAGE_ATTRIBUTES
+            }
+            Self::MessageBody => NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_BODY,
+        }
+    }
+}
+
+/// What the filter policies of ONE fan-out withheld: how many notifications in all, folded by
+/// the reason each was withheld for.
+///
+/// Folded as it is counted, so a fan-out's bookkeeping is bounded by the reasons there ARE
+/// rather than by how many subscriptions the message was offered to.
+#[derive(Debug, Clone, Default)]
+pub struct WithheldNotifications {
+    /// How many notifications each reason withheld, for the reasons that withheld any.
+    reasons: Vec<(FilteredOutUnder, usize)>,
+}
+
+impl WithheldNotifications {
+    /// The one notification `reason` withheld.
+    #[must_use]
+    pub fn one(reason: FilteredOutUnder) -> Self {
+        let mut withheld = Self::default();
+        withheld.withheld(reason);
+        withheld
+    }
+
+    /// Count one more notification withheld for `reason`.
+    pub fn withheld(&mut self, reason: FilteredOutUnder) {
+        if let Some(held) = self.reasons.iter_mut().find(|(held, _)| *held == reason) {
+            held.1 += 1;
+            return;
+        }
+        self.reasons.push((reason, 1));
+    }
+
+    /// How many notifications were withheld in all, whatever the reason — what the aggregate
+    /// [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`] counts.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.reasons.iter().map(|(_, times)| *times).sum()
+    }
+
+    /// How many were withheld for each reason that withheld any.
+    pub fn by_reason(&self) -> impl Iterator<Item = (FilteredOutUnder, usize)> + '_ {
+        self.reasons.iter().copied()
+    }
+}
 
 /// Which counter one event of the publish path is counted into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +198,9 @@ pub enum TopicActivity {
     /// A message a subscription's filter policy withheld:
     /// [`NUMBER_OF_NOTIFICATIONS_FILTERED_OUT`].
     NotificationFilteredOut,
+    /// The same withholding as the sub-metric of the reason it was withheld for, which is
+    /// what tells a filter that rejected what it read from one that had nothing to read.
+    NotificationFilteredOutUnder(FilteredOutUnder),
 }
 
 impl TopicActivity {
@@ -107,6 +212,7 @@ impl TopicActivity {
             Self::NotificationDelivered => NUMBER_OF_NOTIFICATIONS_DELIVERED,
             Self::NotificationFailed => NUMBER_OF_NOTIFICATIONS_FAILED,
             Self::NotificationFilteredOut => NUMBER_OF_NOTIFICATIONS_FILTERED_OUT,
+            Self::NotificationFilteredOutUnder(reason) => reason.metric_name(),
         }
     }
 }
@@ -160,6 +266,24 @@ impl TopicCounters {
             activity,
             count: times,
         });
+    }
+
+    /// Count everything ONE fan-out's filter policies withheld on the topic `topic_arn`
+    /// names: every withheld notification into the aggregate counter, and each of them into
+    /// the sub-metric of the reason it was withheld for ([`FilteredOutUnder`]).
+    pub fn count_withheld(&mut self, topic_arn: &str, withheld: &WithheldNotifications) {
+        self.count(
+            topic_arn,
+            TopicActivity::NotificationFilteredOut,
+            withheld.total(),
+        );
+        for (reason, times) in withheld.by_reason() {
+            self.count(
+                topic_arn,
+                TopicActivity::NotificationFilteredOutUnder(reason),
+                times,
+            );
+        }
     }
 
     /// Take on everything `other` counted.

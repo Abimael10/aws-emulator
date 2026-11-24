@@ -739,23 +739,41 @@ fn combinations(policy: &Value) -> usize {
     }
 }
 
+/// Whether `subscription` receives `published` and, when it does NOT, which filtered-out
+/// sub-metric that withholding is reported under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filtering {
+    /// The policy admits the message — or there is no policy to apply — so the subscription
+    /// receives it.
+    Admits,
+    /// The policy did not admit the message: one notification is withheld, reported under
+    /// the aggregate filtered-out counter and under this reason's sub-metric
+    /// ([`crate::state::topic_metrics`]).
+    Withholds(super::topic_metrics::FilteredOutUnder),
+}
+
 /// Whether `subscription` receives `published`: its filter policy, applied under the
 /// scope it holds, admits the message — and a subscription that holds no filter policy
 /// receives every message published to its topic.
 ///
+/// A message the policy does not admit is withheld under the part of the message the policy
+/// reads, which is what the topic's per-scope filtered-out sub-metric reports
+/// ([`withheld_under`]).
+///
 /// `budget` is what the REQUEST has left to spend on matching ([`MatchBudget`]), shared
 /// across every message and subscription of that request: a subscription the budget runs
 /// out on receives nothing.
-pub fn admits(
+pub fn filtering(
     subscription: &SubscriptionRecord,
     published: &PublishedMessage,
     budget: &mut MatchBudget,
-) -> bool {
+) -> Filtering {
     // The scope is in force only while there is a policy to apply, so the two are read
     // together through the one definition of that pairing: no policy, no filtering.
     let Some(scope) = reported_filter_policy_scope(&subscription.attributes) else {
-        return true;
+        return Filtering::Admits;
     };
+    let withheld = Filtering::Withholds(withheld_under(scope, published));
     let Some(policy) = subscription
         .attributes
         .get(FILTER_POLICY_ATTRIBUTE)
@@ -763,7 +781,7 @@ pub fn admits(
     else {
         // A policy the parse cannot read matches nothing it could be applied to; the
         // write paths refuse such a document, so no stored policy reaches this.
-        return false;
+        return withheld;
     };
     let source = match scope {
         MESSAGE_BODY_FILTER_POLICY_SCOPE => {
@@ -785,7 +803,31 @@ pub fn admits(
         // `MessageAttributes` is the documented default and the only other scope.
         _ => Source::Attributes(&published.message_attributes),
     };
-    matches_policy(&policy, &source, 0, budget)
+    if matches_policy(&policy, &source, 0, budget) {
+        return Filtering::Admits;
+    }
+    withheld
+}
+
+/// Which filtered-out sub-metric a notification a policy applied under `scope` withheld from
+/// a subscription is reported under.
+///
+/// The reason is the part of the message the policy reads — the scope — except that a policy
+/// applied on the message attributes of a message carrying NONE had no attributes to read,
+/// which is reported as such rather than as a rejection of attributes the message never had.
+fn withheld_under(
+    scope: &str,
+    published: &PublishedMessage,
+) -> super::topic_metrics::FilteredOutUnder {
+    use super::topic_metrics::FilteredOutUnder;
+
+    if scope == MESSAGE_BODY_FILTER_POLICY_SCOPE {
+        return FilteredOutUnder::MessageBody;
+    }
+    if published.message_attributes.is_empty() {
+        return FilteredOutUnder::NoMessageAttributes;
+    }
+    FilteredOutUnder::MessageAttributes
 }
 
 /// The part of a published message a policy is applied on.

@@ -16,6 +16,10 @@
 //! is what that window carried — which is what lets a client tell "the filter withheld it"
 //! from "the endpoint refused it" instead of seeing an idle topic.
 //!
+//! Its SECOND rule, with its own table at the end of the file, is WHY a notification was
+//! withheld: every withholding is counted into the aggregate filtered-out counter and into
+//! the sub-metric of the reason it was withheld for.
+//!
 //! The table spans what the rule generalises over: how many publishes are made, how they are
 //! made (one at a time or as one batch), how many subscriptions the topic has (none, one,
 //! two), whether each subscription's filter policy admits the message, and WHY a notification
@@ -35,8 +39,14 @@ use serde_json::{json, Value};
 // itself so the suite and the publisher cannot disagree about which series is meant.
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::topic_metrics::{
     COUNT_UNIT, NAMESPACE, NUMBER_OF_MESSAGES_PUBLISHED, NUMBER_OF_NOTIFICATIONS_DELIVERED,
-    NUMBER_OF_NOTIFICATIONS_FAILED, NUMBER_OF_NOTIFICATIONS_FILTERED_OUT, TOPIC_NAME_DIMENSION,
+    NUMBER_OF_NOTIFICATIONS_FAILED, NUMBER_OF_NOTIFICATIONS_FILTERED_OUT,
+    NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES,
+    NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_BODY,
+    NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_NO_MESSAGE_ATTRIBUTES, TOPIC_NAME_DIMENSION,
 };
+// The non-default `FilterPolicyScope` a row filters a subscription under, read from the
+// service's own definition of it rather than spelled again here.
+use service_com_amazonaws_sns_amazonsimplenotificationservice::state::MESSAGE_BODY_FILTER_POLICY_SCOPE as MESSAGE_BODY_SCOPE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::topics_subscriptions_publish::percent_encode;
@@ -716,12 +726,14 @@ async fn each_counted_event_is_one_observation_in_the_count_unit() {
     }
 
     // A client discovering what a topic reports finds exactly the series its traffic
-    // contributed to.
+    // contributed to — the withheld message's own reason sub-metric included, which is the
+    // second rule this suite covers (below).
     let mut expected = vec![
         NUMBER_OF_MESSAGES_PUBLISHED.to_string(),
         NUMBER_OF_NOTIFICATIONS_DELIVERED.to_string(),
         NUMBER_OF_NOTIFICATIONS_FAILED.to_string(),
         NUMBER_OF_NOTIFICATIONS_FILTERED_OUT.to_string(),
+        NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES.to_string(),
     ];
     expected.sort();
     let indexed = indexed_series(&emulator, row.topic).await;
@@ -752,6 +764,478 @@ async fn a_topic_nobody_published_to_reports_no_series_at_all() {
     assert!(
         indexed.is_empty(),
         "case {:?}: a topic nothing was published to carries no series, got {indexed:?}",
+        row.case
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// WHY a notification was withheld: the filtered-out SUB-METRICS.
+//
+// RULE under test: every notification a subscription's filter policy withholds is counted
+// into the aggregate `NumberOfNotificationsFilteredOut` AND into the sub-metric of the
+// reason it was withheld for — the part of the message the policy was applied on, as that
+// subscription's `FilterPolicyScope` names it (`NumberOfNotificationsFilteredOut-\
+// MessageAttributes` for the default attribute scope, `…-MessageBody` for the body scope) —
+// except that a policy applied on the message attributes of a message carrying NONE is
+// counted under `…-NoMessageAttributes`, the absence of anything to read rather than a
+// rejection of what was read. Each is a series of its own under dimension `TopicName`,
+// published in the same store and at the same moment as the aggregate, so a reason nothing
+// was withheld for carries NO datapoint rather than a zero, and a reason that withheld
+// anything carries at least one and at most the aggregate.
+//
+// The table spans what the rule generalises over: which scope the withholding subscription
+// filters under, whether the published message carries message attributes at all, how many
+// subscriptions withhold one message, how many messages are withheld, and whether they are
+// published one at a time or as one batch. Two complementary attribute-scoped policies and
+// two publishes, each admitted by exactly one subscription, is ONE row.
+// ---------------------------------------------------------------------------------------
+
+/// The property the policies of this section's rows select on, carried both as a message
+/// attribute and as a member of the published JSON body, so one policy document filters
+/// under either scope.
+const KIND_PROPERTY: &str = "kind";
+
+/// What one subscription of a reason row filters on.
+#[derive(Debug, Clone, Copy)]
+enum Scoped {
+    /// No filter policy at all: the subscription receives every message published.
+    Everything,
+    /// A policy on the `kind` message attribute, under the scope a subscription that sets
+    /// none is filtered under.
+    Attributes(&'static str),
+    /// The same policy document applied on the message BODY, under an explicit
+    /// `FilterPolicyScope`.
+    Body(&'static str),
+}
+
+/// One message a reason row publishes.
+#[derive(Debug, Clone, Copy)]
+struct ReasonMessage {
+    /// The value of the `kind` message attribute, or `None` for a publish carrying NO
+    /// message attribute at all.
+    attribute: Option<&'static str>,
+    /// The value of the `kind` member of the published JSON body.
+    body: &'static str,
+}
+
+/// How a reason row publishes its messages: one `Publish` each, or all as one
+/// `PublishBatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum How {
+    OneAtATime,
+    Batched,
+}
+
+/// One reason row: what the topic has subscribed to it, what is published to it, and what
+/// the aggregate filtered-out counter and each reason's sub-metric must then total — `None`
+/// where that series must carry NO datapoint.
+struct ReasonRow {
+    case: &'static str,
+    topic: &'static str,
+    subscribers: &'static [Scoped],
+    messages: &'static [ReasonMessage],
+    how: How,
+    aggregate: Option<f64>,
+    by_attributes: Option<f64>,
+    no_attributes: Option<f64>,
+    by_body: Option<f64>,
+    /// What the topic delivered, asserted beside the withholdings so a row cannot pass by
+    /// withholding what it was supposed to deliver.
+    delivered: Option<f64>,
+}
+
+fn reason_rows() -> Vec<ReasonRow> {
+    vec![
+        ReasonRow {
+            case: "an attribute policy that does not admit the attributes the message \
+                   carried is counted under the attribute scope",
+            topic: "filtered-reason-attributes",
+            subscribers: &[Scoped::Attributes("a")],
+            messages: &[ReasonMessage {
+                attribute: Some("b"),
+                body: "b",
+            }],
+            how: How::OneAtATime,
+            aggregate: Some(1.0),
+            by_attributes: Some(1.0),
+            no_attributes: None,
+            by_body: None,
+            delivered: None,
+        },
+        ReasonRow {
+            case: "a message carrying no message attribute at all leaves an attribute policy \
+                   nothing to read, counted under the no-attributes reason",
+            topic: "filtered-reason-no-attributes",
+            subscribers: &[Scoped::Attributes("a")],
+            messages: &[ReasonMessage {
+                attribute: None,
+                body: "a",
+            }],
+            how: How::OneAtATime,
+            aggregate: Some(1.0),
+            by_attributes: None,
+            no_attributes: Some(1.0),
+            by_body: None,
+            delivered: None,
+        },
+        ReasonRow {
+            case: "a policy applied on the message body is counted under the body scope",
+            topic: "filtered-reason-body",
+            subscribers: &[Scoped::Body("a")],
+            messages: &[ReasonMessage {
+                attribute: Some("a"),
+                body: "b",
+            }],
+            how: How::OneAtATime,
+            aggregate: Some(1.0),
+            by_attributes: None,
+            no_attributes: None,
+            by_body: Some(1.0),
+            delivered: None,
+        },
+        ReasonRow {
+            case: "two complementary attribute policies and two publishes, each admitted by \
+                   exactly one subscription",
+            topic: "filtered-reason-complementary",
+            subscribers: &[Scoped::Attributes("a"), Scoped::Attributes("b")],
+            messages: &[
+                ReasonMessage {
+                    attribute: Some("a"),
+                    body: "a",
+                },
+                ReasonMessage {
+                    attribute: Some("b"),
+                    body: "b",
+                },
+            ],
+            how: How::OneAtATime,
+            aggregate: Some(2.0),
+            by_attributes: Some(2.0),
+            no_attributes: None,
+            by_body: None,
+            delivered: Some(2.0),
+        },
+        ReasonRow {
+            case: "one message withheld under both scopes at once is counted once per \
+                   subscription in each reason's own series",
+            topic: "filtered-reason-both-scopes",
+            subscribers: &[Scoped::Attributes("a"), Scoped::Body("a")],
+            messages: &[ReasonMessage {
+                attribute: Some("b"),
+                body: "b",
+            }],
+            how: How::OneAtATime,
+            aggregate: Some(2.0),
+            by_attributes: Some(1.0),
+            no_attributes: None,
+            by_body: Some(1.0),
+            delivered: None,
+        },
+        ReasonRow {
+            case: "a message with no attributes and two whose attributes are not admitted \
+                   separate the two attribute reasons",
+            topic: "filtered-reason-mixed-attributes",
+            subscribers: &[Scoped::Attributes("a")],
+            messages: &[
+                ReasonMessage {
+                    attribute: None,
+                    body: "a",
+                },
+                ReasonMessage {
+                    attribute: Some("b"),
+                    body: "b",
+                },
+                ReasonMessage {
+                    attribute: Some("b"),
+                    body: "b",
+                },
+            ],
+            how: How::OneAtATime,
+            aggregate: Some(3.0),
+            by_attributes: Some(2.0),
+            no_attributes: Some(1.0),
+            by_body: None,
+            delivered: None,
+        },
+        ReasonRow {
+            case: "every entry of a batched publish is counted under its own reason",
+            topic: "filtered-reason-batch",
+            subscribers: &[Scoped::Attributes("a"), Scoped::Body("a")],
+            messages: &[
+                ReasonMessage {
+                    attribute: Some("a"),
+                    body: "a",
+                },
+                ReasonMessage {
+                    attribute: None,
+                    body: "b",
+                },
+            ],
+            how: How::Batched,
+            aggregate: Some(2.0),
+            by_attributes: None,
+            no_attributes: Some(1.0),
+            by_body: Some(1.0),
+            delivered: Some(2.0),
+        },
+        ReasonRow {
+            case: "a topic whose subscriptions admit every message reports no filtered-out \
+                   series at all",
+            topic: "filtered-reason-none-withheld",
+            subscribers: &[Scoped::Everything, Scoped::Attributes("a")],
+            messages: &[ReasonMessage {
+                attribute: Some("a"),
+                body: "a",
+            }],
+            how: How::OneAtATime,
+            aggregate: None,
+            by_attributes: None,
+            no_attributes: None,
+            by_body: None,
+            delivered: Some(2.0),
+        },
+    ]
+}
+
+/// Create a queue whose policy grants Amazon SNS the send, and answer its ARN: the endpoint
+/// a reason row's subscription names, so an admitted notification really is taken.
+async fn given_granting_queue(emulator: &Emulator, name: &str) -> String {
+    let created = sqs(emulator, "CreateQueue", &json!({"QueueName": name})).await;
+    let url = created["QueueUrl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateQueue {name}: no QueueUrl in {created}"))
+        .to_string();
+    let attributes = sqs(
+        emulator,
+        "GetQueueAttributes",
+        &json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
+    )
+    .await;
+    let arn = attributes["Attributes"]["QueueArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("GetQueueAttributes {url}: no QueueArn in {attributes}"))
+        .to_string();
+    sqs(
+        emulator,
+        "SetQueueAttributes",
+        &json!({"QueueUrl": url, "Attributes": {"Policy": grant_to_sns(&arn)}}),
+    )
+    .await;
+    arn
+}
+
+/// Create the reason row's topic and its subscriptions, and answer the topic's ARN.
+async fn given_reason_topic(emulator: &Emulator, row: &ReasonRow) -> String {
+    let topic = element(
+        &sns(emulator, "CreateTopic", &[("Name", row.topic)]).await,
+        "TopicArn",
+    );
+    for (at, scoped) in row.subscribers.iter().enumerate() {
+        let endpoint = given_granting_queue(emulator, &format!("{}-queue-{at}", row.topic)).await;
+        let mut params: Vec<(String, String)> = vec![
+            ("TopicArn".to_string(), topic.clone()),
+            ("Protocol".to_string(), "sqs".to_string()),
+            ("Endpoint".to_string(), endpoint),
+            ("ReturnSubscriptionArn".to_string(), "true".to_string()),
+        ];
+        let admitted = match scoped {
+            Scoped::Everything => None,
+            Scoped::Attributes(admitted) | Scoped::Body(admitted) => Some(*admitted),
+        };
+        if let Some(admitted) = admitted {
+            params.push((
+                "Attributes.entry.1.key".to_string(),
+                "FilterPolicy".to_string(),
+            ));
+            params.push((
+                "Attributes.entry.1.value".to_string(),
+                json!({KIND_PROPERTY: [admitted]}).to_string(),
+            ));
+        }
+        if matches!(scoped, Scoped::Body(_)) {
+            params.push((
+                "Attributes.entry.2.key".to_string(),
+                "FilterPolicyScope".to_string(),
+            ));
+            params.push((
+                "Attributes.entry.2.value".to_string(),
+                MESSAGE_BODY_SCOPE.to_string(),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        sns(emulator, "Subscribe", &borrowed).await;
+    }
+    topic
+}
+
+/// The form parameters one message contributes, under `prefix` — empty for a `Publish`, the
+/// entry's own prefix for an entry of a `PublishBatch`.
+fn reason_message_params(message: &ReasonMessage, prefix: &str) -> Vec<(String, String)> {
+    let mut params = vec![(
+        format!("{prefix}Message"),
+        json!({KIND_PROPERTY: message.body}).to_string(),
+    )];
+    if let Some(attribute) = message.attribute {
+        params.push((
+            format!("{prefix}MessageAttributes.entry.1.Name"),
+            KIND_PROPERTY.to_string(),
+        ));
+        params.push((
+            format!("{prefix}MessageAttributes.entry.1.Value.DataType"),
+            "String".to_string(),
+        ));
+        params.push((
+            format!("{prefix}MessageAttributes.entry.1.Value.StringValue"),
+            attribute.to_string(),
+        ));
+    }
+    params
+}
+
+/// Publish the reason row's messages to `topic`, the way the row asks for.
+async fn publish_reason_messages(emulator: &Emulator, topic: &str, row: &ReasonRow) {
+    match row.how {
+        How::OneAtATime => {
+            for message in row.messages {
+                let mut params: Vec<(String, String)> =
+                    vec![("TopicArn".to_string(), topic.to_string())];
+                params.extend(reason_message_params(message, ""));
+                let borrowed: Vec<(&str, &str)> = params
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect();
+                sns(emulator, "Publish", &borrowed).await;
+            }
+        }
+        How::Batched => {
+            let mut params: Vec<(String, String)> =
+                vec![("TopicArn".to_string(), topic.to_string())];
+            for (at, message) in row.messages.iter().enumerate() {
+                let prefix = format!("PublishBatchRequestEntries.member.{}.", at + 1);
+                params.push((format!("{prefix}Id"), format!("entry-{at}")));
+                params.extend(reason_message_params(message, &prefix));
+            }
+            let borrowed: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            sns(emulator, "PublishBatch", &borrowed).await;
+        }
+    }
+}
+
+/// The three reasons a notification is withheld for, paired with what one row expects of
+/// each.
+fn expected_reasons(row: &ReasonRow) -> [(&'static str, Option<f64>); 3] {
+    [
+        (
+            NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES,
+            row.by_attributes,
+        ),
+        (
+            NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_NO_MESSAGE_ATTRIBUTES,
+            row.no_attributes,
+        ),
+        (
+            NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_BODY,
+            row.by_body,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_withholding_is_counted_under_the_reason_it_was_withheld_for() {
+    for row in reason_rows() {
+        // One emulator per row, so each row's totals are its own.
+        let emulator = emulator();
+        let topic = given_reason_topic(&emulator, &row).await;
+        publish_reason_messages(&emulator, &topic, &row).await;
+
+        let published = u32::try_from(row.messages.len()).expect("a row publishes a few messages");
+        let mut read: Vec<(&'static str, Option<f64>)> = vec![
+            (NUMBER_OF_NOTIFICATIONS_FILTERED_OUT, row.aggregate),
+            // The publish and delivery counters are read too, so a row cannot pass by
+            // withholding what it was supposed to deliver.
+            (NUMBER_OF_MESSAGES_PUBLISHED, Some(f64::from(published))),
+            (NUMBER_OF_NOTIFICATIONS_DELIVERED, row.delivered),
+        ];
+        read.extend(expected_reasons(&row));
+        for (metric, expected) in read {
+            let actual = total(&emulator, row.topic, metric).await;
+            match expected {
+                Some(expected) => assert_eq!(
+                    actual,
+                    Some(expected),
+                    "case {:?}: {metric} for TopicName={} must total {expected}, got {actual:?}",
+                    row.case,
+                    row.topic
+                ),
+                None => assert_eq!(
+                    actual, None,
+                    "case {:?}: {metric} for TopicName={} must carry no datapoint at all, got \
+                     {actual:?}",
+                    row.case, row.topic
+                ),
+            }
+        }
+
+        // The invariant every reason's series is read under: a reason that withheld
+        // anything carries at least one withholding and never more than the aggregate.
+        let aggregate = total(&emulator, row.topic, NUMBER_OF_NOTIFICATIONS_FILTERED_OUT)
+            .await
+            .unwrap_or(0.0);
+        for (metric, _) in expected_reasons(&row) {
+            let Some(reason) = total(&emulator, row.topic, metric).await else {
+                continue;
+            };
+            assert!(
+                reason >= 1.0 && reason <= aggregate,
+                "case {:?}: {metric} for TopicName={} is {reason}, which must lie between 1 and \
+                 the aggregate {aggregate}",
+                row.case,
+                row.topic
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_reason_nothing_was_withheld_for_is_not_a_series_the_topic_reports() {
+    let emulator = emulator();
+    // One attribute-scoped subscription and one message its policy does not admit: the only
+    // filtered-out reason this topic has anything to report under is the attribute one.
+    let row = ReasonRow {
+        case: "an attribute policy withholds one message that carried attributes",
+        topic: "filtered-reason-indexed",
+        subscribers: &[Scoped::Attributes("a")],
+        messages: &[ReasonMessage {
+            attribute: Some("b"),
+            body: "b",
+        }],
+        how: How::OneAtATime,
+        aggregate: Some(1.0),
+        by_attributes: Some(1.0),
+        no_attributes: None,
+        by_body: None,
+        delivered: None,
+    };
+    let topic = given_reason_topic(&emulator, &row).await;
+    publish_reason_messages(&emulator, &topic, &row).await;
+
+    let mut expected = vec![
+        NUMBER_OF_MESSAGES_PUBLISHED.to_string(),
+        NUMBER_OF_NOTIFICATIONS_FILTERED_OUT.to_string(),
+        NUMBER_OF_NOTIFICATIONS_FILTERED_OUT_MESSAGE_ATTRIBUTES.to_string(),
+    ];
+    expected.sort();
+    let indexed = indexed_series(&emulator, row.topic).await;
+    assert_eq!(
+        indexed, expected,
+        "case {:?}: ListMetrics must index the aggregate and the ONE reason the topic withheld \
+         under, got {indexed:?}",
         row.case
     );
 }

@@ -613,18 +613,15 @@ fn publish_into_store(
     );
     // What this publish contributed to the topic's own counters: the publish itself, and
     // the one notification each subscription the filter policy withheld it from did not
-    // get ([`state::topic_metrics`]). The outcome of each delivery the fan-out owes is
+    // get — counted both in all and under the reason it was withheld for
+    // ([`state::topic_metrics`]). The outcome of each delivery the fan-out owes is
     // counted where that delivery resolves ([`deliver_to_endpoints`]).
     deliveries.count(
         &topic.arn,
         state::topic_metrics::TopicActivity::MessagePublished,
         1,
     );
-    deliveries.count(
-        &topic.arn,
-        state::topic_metrics::TopicActivity::NotificationFilteredOut,
-        withheld,
-    );
+    deliveries.count_withheld(&topic.arn, &withheld);
     for subscription in &subscriptions {
         store.record_delivery(&subscription.arn, ::std::sync::Arc::clone(&published));
     }
@@ -716,16 +713,31 @@ impl Deliveries {
     ) {
         self.counted.count(topic_arn, activity, times);
     }
+
+    /// Count what the filter policies of one fan-out withheld on the topic `topic_arn`
+    /// names: every withheld notification in the aggregate counter, and each under the
+    /// reason it was withheld for ([`state::topic_metrics::WithheldNotifications`]).
+    ///
+    /// `pub(crate)`: every operation that offers a message to a topic's subscriptions
+    /// reports what their filters withheld through this one accumulator, so no path can
+    /// report the aggregate without the sub-metric that says why.
+    pub(crate) fn count_withheld(
+        &mut self,
+        topic_arn: &str,
+        withheld: &state::topic_metrics::WithheldNotifications,
+    ) {
+        self.counted.count_withheld(topic_arn, withheld);
+    }
 }
 
-/// The subscriptions of `offered` that RECEIVE `published`, beside how many of them its
-/// filter policy withheld it from.
+/// The subscriptions of `offered` that RECEIVE `published`, beside what its filter policies
+/// withheld from the others — how many notifications in all, and why each was withheld.
 ///
 /// "A subscription's filter policy" decides per subscription whether the message is
 /// delivered to it at all ([`state::filter_policy`]), so the two answers come from the one
-/// pass over the candidates: the recipients, and the count of notifications that were NOT
-/// sent because the policy did not admit the message — which is what the topic's
-/// filtered-out counter counts.
+/// pass over the candidates: the recipients, and the notifications that were NOT sent
+/// because the policy did not admit the message — which is what the topic's filtered-out
+/// counter and its per-reason sub-metrics count.
 ///
 /// `pub(crate)` because every operation that fans a message out to the subscribers of a
 /// topic decides its recipients here — `Publish` and `PublishBatch` — so neither can
@@ -734,14 +746,16 @@ pub(crate) fn admitted_subscriptions<'a>(
     offered: impl Iterator<Item = &'a state::SubscriptionRecord>,
     published: &PublishedMessage,
     matching: &mut state::filter_policy::MatchBudget,
-) -> (Vec<state::SubscriptionRecord>, usize) {
+) -> (
+    Vec<state::SubscriptionRecord>,
+    state::topic_metrics::WithheldNotifications,
+) {
     let mut recipients: Vec<state::SubscriptionRecord> = Vec::new();
-    let mut withheld = 0usize;
+    let mut withheld = state::topic_metrics::WithheldNotifications::default();
     for subscription in offered {
-        if state::filter_policy::admits(subscription, published, matching) {
-            recipients.push(subscription.clone());
-        } else {
-            withheld += 1;
+        match state::filter_policy::filtering(subscription, published, matching) {
+            state::filter_policy::Filtering::Admits => recipients.push(subscription.clone()),
+            state::filter_policy::Filtering::Withholds(reason) => withheld.withheld(reason),
         }
     }
     (recipients, withheld)
@@ -1161,14 +1175,16 @@ pub(crate) fn replay_deliveries(
     let mut deliveries = Deliveries::default();
     let recipients = [subscription.clone()];
     for message in archived {
-        if !state::filter_policy::admits(&subscription, &message, &mut matching) {
+        if let state::filter_policy::Filtering::Withholds(reason) =
+            state::filter_policy::filtering(&subscription, &message, &mut matching)
+        {
             // A replay offers the archived message to the subscription the way a publish
             // offers a new one, so a filter policy that does not admit it withholds one
-            // notification here too, and that is counted as such.
-            deliveries.count(
+            // notification here too, and that is counted as such — in the aggregate and
+            // under the reason it was withheld for.
+            deliveries.count_withheld(
                 &subscription.topic_arn,
-                state::topic_metrics::TopicActivity::NotificationFilteredOut,
-                1,
+                &state::topic_metrics::WithheldNotifications::one(reason),
             );
             continue;
         }
