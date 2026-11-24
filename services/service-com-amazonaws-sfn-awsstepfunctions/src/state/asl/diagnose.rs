@@ -1179,24 +1179,30 @@ const EXCLUSIVE_FIELD_GROUPS: &[&[&str]] = &[
 /// naming the same work — which is why the one the diagnostic names is the first.
 const PROCESSOR_FIELDS_OF_A_MAP: &[&str] = &["ItemProcessor", "Iterator"];
 
-/// The fields the Amazon States Language declares on each object a `Map` state carries
-/// BESIDE its processor, in the order its schema states them, paired with the member
-/// that carries it.
+/// The fields the Amazon States Language declares on each object a STATE carries beside
+/// its own members, in the order its schema states them, paired with the member that
+/// carries it.
 ///
 /// Each set is CLOSED like every other object's here, and the source is the language's
-/// own "Map state" schema: a `ProcessorConfig` says how the processor runs (`Mode`, and
-/// the `ExecutionType` a distributed one runs its children as); an `ItemReader` names
-/// the dataset the items are read from (`Resource`, the `ReaderConfig` describing the
-/// dataset's own format, and the payload the read is made with under either query
-/// language); an `ItemBatcher` says how the items are grouped (`MaxItemsPerBatch`,
-/// `MaxInputBytesPerBatch`, each with the `*Path` that reads it, and the `BatchInput`
-/// every batch carries); and a `ResultWriter` names where the results are written
-/// (`Resource`, its payload, and the `WriterConfig` describing the output).
+/// own schema for the state that carries the object. From "Map state": a
+/// `ProcessorConfig` says how the processor runs (`Mode`, and the `ExecutionType` a
+/// distributed one runs its children as); an `ItemReader` names the dataset the items
+/// are read from (`Resource`, the `ReaderConfig` describing the dataset's own format,
+/// and the payload the read is made with under either query language); an `ItemBatcher`
+/// says how the items are grouped (`MaxItemsPerBatch`, `MaxInputBytesPerBatch`, each
+/// with the `*Path` that reads it, and the `BatchInput` every batch carries); and a
+/// `ResultWriter` names where the results are written (`Resource`, its payload, and the
+/// `WriterConfig` describing the output). From "Task state": the `Credentials` a task's
+/// call is made under, which names the role to assume for it and nothing else.
 ///
 /// A field outside the set of the object it is written in is reported as the
 /// unsupported field it is ([`unsupported_field_message`], which suggests the field a
 /// misspelling of one of these was meant to be), exactly as a state's own is.
-const MAP_OBJECT_FIELDS: &[(&str, &[&str])] = &[
+const DECLARED_OBJECT_FIELDS: &[(&str, &[&str])] = &[
+    // "Credentials": "Specify a target role ... the Amazon Resource Name (ARN) of the
+    // role" — one field, written as the ARN itself or, in JSONPath, as the reference
+    // field that reads it from the state's data.
+    ("Credentials", &["RoleArn", "RoleArn.$"]),
     ("ProcessorConfig", &["ExecutionType", "Mode"]),
     (
         "ItemReader",
@@ -1262,8 +1268,8 @@ struct NamedValues {
 }
 
 /// The fields of the objects a state carries whose values the language names
-/// ([`MAP_OBJECT_FIELDS`] declares those objects; this declares the sets their fields
-/// admit).
+/// ([`DECLARED_OBJECT_FIELDS`] declares those objects; this declares the sets their
+/// fields admit).
 ///
 /// The sets are the language's own, and this emulator's data plane reads each of them
 /// in the module that serves it — which is where each entry's source is recorded:
@@ -1371,9 +1377,9 @@ fn diagnose_named_values(
 }
 
 /// The fields the language declares on the object `member` carries, or `None` for a
-/// member whose value is not such an object ([`MAP_OBJECT_FIELDS`]).
+/// member whose value is not such an object ([`DECLARED_OBJECT_FIELDS`]).
 fn declared_object_fields(member: &str) -> Option<&'static [&'static str]> {
-    MAP_OBJECT_FIELDS
+    DECLARED_OBJECT_FIELDS
         .iter()
         .find(|(name, _)| *name == member)
         .map(|(_, fields)| *fields)
@@ -2217,7 +2223,7 @@ fn diagnose_state<'a>(
         );
     }
     // And the OBJECTS a state carries beside its own members, whose fields the language
-    // declares as closely as it declares a state's ([`MAP_OBJECT_FIELDS`]): a field
+    // declares as closely as it declares a state's ([`DECLARED_OBJECT_FIELDS`]): a field
     // outside one of those sets is reported as the unsupported field it is, located at
     // the object that carries it.
     diagnose_declared_objects(state, state_fields(state_type), &here, into);
@@ -2525,7 +2531,7 @@ fn diagnose_choice_rules(
 }
 
 /// The OBJECT rules of one state: every object it carries whose fields the language
-/// declares ([`MAP_OBJECT_FIELDS`]) carries only those fields, and so does every such
+/// declares ([`DECLARED_OBJECT_FIELDS`]) carries only those fields, and so does every such
 /// object nested inside one of them.
 ///
 /// `declared` is the state's own closed field set, so an object written at a member the
@@ -3209,23 +3215,37 @@ fn assigned_variables(state: &Map<String, Value>) -> BTreeSet<String> {
 /// The walk is the one [`walk_fields`] does for every field this module reads, so the
 /// path a field is reported at is the same one every other diagnostic about it
 /// carries.
+///
+/// A `Choice` state's own rules are entered member by member rather than as one value
+/// ([`choice_rule_roots`]), because WHICH of a rule's members resolves a path is the
+/// rule's own fact: a generic descent reads only the reference-field suffix, which a
+/// rule's `Variable` and its `*Path` operands do not carry.
 fn variable_reads(
     state: &Map<String, Value>,
     state_at: &str,
     order: &MemberOrder,
 ) -> Vec<(String, (String, bool))> {
     let mut found: BTreeSet<(String, String, bool)> = BTreeSet::new();
-    let roots: Vec<(String, &Value, bool)> = state
+    let mut roots: Vec<(String, &Value, bool)> = Vec::new();
+    for (member, value) in state
         .iter()
         .filter(|(member, _)| !NESTED_MACHINE_MEMBERS.contains(&member.as_str()))
-        .map(|(member, value)| {
-            (
-                nested_at("", format_args!("/{}", echoed(member))),
-                value,
-                reads_a_path(member),
-            )
-        })
-        .collect();
+    {
+        let at_member = nested_at("", format_args!("/{}", echoed(member)));
+        match (member.as_str(), value.as_array()) {
+            (CHOICES_MEMBER, Some(rules)) => {
+                for (index, rule) in rules.iter().enumerate() {
+                    choice_rule_roots(
+                        rule,
+                        &indexed_at(&at_member, index),
+                        MAX_EXPRESSION_DEPTH,
+                        &mut roots,
+                    );
+                }
+            }
+            _ => roots.push((at_member, value, reads_a_path(member))),
+        }
+    }
     walk_fields(roots, |path, text, reference_field| {
         let mut names = BTreeSet::new();
         for expression in jsonata_expressions(text) {
@@ -3245,6 +3265,56 @@ fn variable_reads(
     order.paths(state_at, &mut reads);
     reads
 }
+
+/// The roots one `Choice` rule contributes to [`variable_reads`]: each member of the
+/// rule, at its own position, paired with whether the language RESOLVES a path at that
+/// member ([`reads_a_path`]) — and the same for every rule nested in its `And`, `Or`
+/// and `Not`.
+///
+/// A rule names the value its comparator tests through `Variable` and reads a second
+/// operand through a `*Path` comparator, neither of which carries the reference-field
+/// suffix a generic descent reads: entering the rule member by member is what makes a
+/// variable named THERE a path the language resolves rather than a literal, exactly as
+/// it is at a state's own `*Path` member.
+///
+/// `depth` bounds the nesting this follows, as every other walk of a caller-shaped rule
+/// tree here is bounded.
+fn choice_rule_roots<'a>(
+    rule: &'a Value,
+    at_rule: &str,
+    depth: usize,
+    into: &mut Vec<(String, &'a Value, bool)>,
+) {
+    let Some(depth) = depth.checked_sub(1) else {
+        return;
+    };
+    let Some(members) = rule.as_object() else {
+        return;
+    };
+    for (member, value) in members {
+        let at_member = nested_at(at_rule, format_args!("/{}", echoed(member)));
+        match (member.as_str(), value.as_array()) {
+            (NESTED_RULE_MEMBER_AND | NESTED_RULE_MEMBER_OR, Some(nested)) => {
+                for (index, rule) in nested.iter().enumerate() {
+                    choice_rule_roots(rule, &indexed_at(&at_member, index), depth, into);
+                }
+            }
+            (NESTED_RULE_MEMBER_NOT, _) => choice_rule_roots(value, &at_member, depth, into),
+            _ => into.push((at_member, value, reads_a_path(member))),
+        }
+    }
+}
+
+/// The member a `Choice` state holds its rules in.
+const CHOICES_MEMBER: &str = "Choices";
+
+/// The three members of a `Choice` rule that carry rules of their own
+/// ([`NESTED_RULE_MEMBERS`] is the same three as the set a rule is judged against).
+const NESTED_RULE_MEMBER_AND: &str = "And";
+/// See [`NESTED_RULE_MEMBER_AND`].
+const NESTED_RULE_MEMBER_OR: &str = "Or";
+/// See [`NESTED_RULE_MEMBER_AND`].
+const NESTED_RULE_MEMBER_NOT: &str = "Not";
 
 /// Whether the value of the state member `member` is a PATH the language resolves,
 /// rather than a literal or an expression it evaluates.
@@ -3427,18 +3497,21 @@ fn diagnose_jsonata_state(
             continue;
         }
         let shown = echoed(member);
-        // A member the language declares as a DOCUMENT the state builds carries a JSON
-        // object, or one JSONata expression that evaluates to one: "Arguments […] used
-        // to pass information to the API actions of connected resources" is such a
-        // member, and a value of any other shape builds no document at all.
-        if DOCUMENT_MEMBERS.contains(&member.as_str())
-            && !(value.is_object() || value.is_string())
-        {
-            into.push(error(
-                SCHEMA_VALIDATION_FAILED,
-                at(here, &format!("/{shown}")),
-                document_member_message(member),
-            ));
+        // A member the language declares ONE SHAPE for carries a value of that shape,
+        // or one JSONata expression that evaluates to one: "Arguments […] used to pass
+        // information to the API actions of connected resources" is a document, `Items`
+        // the array a `Map` iterates, and a value of any other shape declares work the
+        // language cannot do with it. A STRING counts as the declared shape only where
+        // it IS an expression: a string that opens no expression is the literal it is
+        // written as, which is a document and an array in neither case.
+        if let Some(declared) = declared_member_shape(member) {
+            if let Some(why) = declared.unsatisfied(member, value) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(here, &format!("/{shown}")),
+                    why,
+                ));
+            }
         }
         // Every field of this member whose text OPENS a JSONata expression without
         // being one: the language embeds an expression as the WHOLE value of a field,
@@ -3522,6 +3595,19 @@ fn diagnose_jsonata_rule(
             ));
         }
         match member.as_str() {
+            CONDITION_MEMBER => {
+                // "Condition — A JSONata expression that evaluates to true or false":
+                // the member states the TEST the rule holds by, so it carries a boolean
+                // or the expression that evaluates to one, judged by the same rule every
+                // other member of a declared shape is ([`DeclaredShape`]).
+                if let Some(why) = DeclaredShape::Boolean.unsatisfied(member, value) {
+                    into.push(error(
+                        SCHEMA_VALIDATION_FAILED,
+                        at(here, &format!("/{}", echoed(member))),
+                        why,
+                    ));
+                }
+            }
             "And" | "Or" => {
                 if let Some(nested) = value.as_array() {
                     for (index, rule) in nested.iter().enumerate() {
@@ -3609,24 +3695,102 @@ fn fields_reading(
     found
 }
 
-/// The members a state builds a DOCUMENT in: a JSON object, or one JSONata expression
-/// evaluating to one.
+/// The SHAPE the Amazon States Language declares for the value of one member of a
+/// JSONata state, of which it carries a value — or one JSONata expression, which
+/// evaluates to one.
+///
+/// A member whose value may be any JSON value at all (a state's own `Output`) declares
+/// no shape and carries none of these.
+#[derive(Clone, Copy)]
+enum DeclaredShape {
+    /// A JSON OBJECT: the document the member builds.
+    Document,
+    /// A JSON ARRAY: the items the member holds.
+    Array,
+    /// A BOOLEAN: the test the member states.
+    Boolean,
+}
+
+impl DeclaredShape {
+    /// Why `value` does not satisfy this shape at the member `member`, or `None` when it
+    /// does — and `None` too for the one defect reported on its own: a string that
+    /// CARRIES the marks an expression is embedded between without being one is the
+    /// malformed expression it is written as ([`malformed_expressions`]), reported there
+    /// and not twice.
+    ///
+    /// The sentence a defect is stated by is the one its own value calls for. A STRING at
+    /// such a member is only ever the expression it is written as — a string carrying no
+    /// expression is a literal, which is of none of these shapes — so it is stated by the
+    /// sentence this service states every value that is no expression by
+    /// ([`malformed_expression_message`]); a value of any OTHER JSON type is judged by the
+    /// SHAPE the language declares ([`Self::message`]).
+    fn unsatisfied(self, member: &str, value: &Value) -> Option<String> {
+        if let Some(text) = value.as_str() {
+            if crate::state::jsonata::is_expression(text) || is_malformed_expression(text) {
+                return None;
+            }
+            return Some(malformed_expression_message(&echoed(text)));
+        }
+        (!self.admits(value)).then(|| self.message(member))
+    }
+
+    /// Whether `value` is of this shape, or is the one form the language evaluates TO a
+    /// value — a whole JSONata expression, whose own value no walk of the definition
+    /// can know.
+    ///
+    /// A string is admitted ONLY as such an expression: a string carrying no expression
+    /// is the literal it is written as, which is of none of these shapes. Whether the
+    /// expression itself is well formed and parses is judged on its own
+    /// ([`malformed_expressions`], [`unparsed_fields`]), so a value is not reported
+    /// twice.
+    fn admits(self, value: &Value) -> bool {
+        if let Some(text) = value.as_str() {
+            return crate::state::jsonata::is_expression(text);
+        }
+        match self {
+            Self::Document => value.is_object(),
+            Self::Array => value.is_array(),
+            Self::Boolean => value.is_boolean(),
+        }
+    }
+
+    /// What a schema diagnostic says about a member the definition wrote as something
+    /// else: the member, and the two shapes the language declares for it.
+    fn message(self, member: &str) -> String {
+        let shape = match self {
+            Self::Document => "a JSON object",
+            Self::Array => "a JSON array",
+            Self::Boolean => "a boolean",
+        };
+        format!(
+            "'{}' must be {shape} or a JSONata expression",
+            echoed(member)
+        )
+    }
+}
+
+/// The shape the language declares for the member `member` of a JSONata state, or
+/// `None` for a member whose value it leaves open.
 ///
 /// `Arguments` is the member a JSONata `Task`, `Map` or `Parallel` hands its work
 /// ("Arguments […] used to pass information to the API actions of connected
-/// resources"), `ItemSelector` the document a `Map` projects each item through, and
-/// `Assign` the block of variables a state assigns — whose own rule
-/// ([`diagnose_assignments`]) is the stricter one, so it is not listed here.
-const DOCUMENT_MEMBERS: &[&str] = &[ARGUMENTS_MEMBER, ITEM_SELECTOR_MEMBER];
-
-/// What a schema diagnostic says about such a member the definition wrote as something
-/// else: the member, and the two shapes the language declares for it.
-fn document_member_message(member: &str) -> String {
-    format!(
-        "'{}' must be a JSON object or a JSONata expression",
-        echoed(member)
-    )
+/// resources") and `ItemSelector` the document a `Map` projects each item through, so
+/// each builds a JSON object; `Items` is "the array that the Map state iterates over".
+/// `Assign` is absent because its own rule ([`diagnose_assignments`]) is the stricter
+/// one, and `Output` because "Output … can be any JSON value".
+fn declared_member_shape(member: &str) -> Option<DeclaredShape> {
+    match member {
+        ARGUMENTS_MEMBER | ITEM_SELECTOR_MEMBER => Some(DeclaredShape::Document),
+        ITEMS_MEMBER => Some(DeclaredShape::Array),
+        _ => None,
+    }
 }
+
+/// The member a JSONata `Map` state holds the array it iterates in: "Items".
+const ITEMS_MEMBER: &str = "Items";
+
+/// The member a JSONata `Choice` rule states its test in: "Condition".
+const CONDITION_MEMBER: &str = "Condition";
 
 /// Every FIELD inside `value` whose text CARRIES the marks a JSONata expression is
 /// embedded between without BEING one such expression: the path from the member that
@@ -3678,8 +3842,13 @@ fn is_malformed_expression(text: &str) -> bool {
 const EXPRESSION_OPEN: &str = "{%";
 const EXPRESSION_CLOSE: &str = "%}";
 
-/// What a diagnostic says about such a field: the text, quoted, and the form an
-/// embedded expression takes.
+/// What a diagnostic says about a value that is no embedded JSONata expression: the
+/// text, quoted, and the form an embedded expression takes.
+///
+/// The one sentence every such value is stated by — the text that carries the marks
+/// without being one expression ([`malformed_expressions`]) and the literal string
+/// written at a member whose value the language evaluates
+/// ([`DeclaredShape::unsatisfied`]) — so one rule is not worded two ways.
 fn malformed_expression_message(text: &str) -> String {
     format!(
         "'{text}' is not a JSONata expression: an expression is the whole value of the field, \

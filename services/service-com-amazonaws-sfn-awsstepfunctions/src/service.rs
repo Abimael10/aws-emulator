@@ -144,6 +144,11 @@ pub mod request_conditions;
 /// the one body there.
 pub(crate) mod validation;
 
+/// How this service words a boundary refusal whose clause is about a COLLECTION member:
+/// the per-operation layer that can re-read the request and so state the collection it
+/// carried, which [`Service::override_refusal`] is never handed.
+pub(crate) mod submitted_collections;
+
 /// How this service serializes a response body's NESTED structures — the SWF
 /// type discriminator every awsJson recording of this API shows on them.
 /// Public: its catalog of discriminated shapes is checked against the Smithy

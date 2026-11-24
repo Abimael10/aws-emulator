@@ -15,6 +15,23 @@ Issue-Key: stepfunctions.jsonata-fail-error-and-cause-each-get-their-own-diagnos
 
 # stepfunctions: what is left of the definition-validation and validation-clause report — six causes that still diverge
 
+## Resolution
+
+Cause 5 is closed — a clause about a non-empty list member now quotes the collection the
+request carried, and that unit replays clean — and two of cause 6's four classes have
+their rule implemented: a member the language declares ONE shape for (`Arguments`,
+`ItemSelector`, `Items`, a `Choice` rule's `Condition`) no longer accepts a literal
+string, so a definition AWS reports `FAIL` for is no longer reported `OK`, stated by the
+sentence this service already states every value that is no JSONata expression by. Cause
+2's rule gained the one object position its closed sets did not cover (a `Task` state's
+`Credentials`), and the variable-scope rule of cause 6 gained the fields of a `Choice`
+rule, which the module states the rule for and did not reach.
+
+What is NOT closed is recorded on its own, with the units that still diverge, in
+`issues/things-that-do-not-work/20261124T090000Z-stepfunctions-definition-validation-remainder-two.md`:
+causes 1, 3 and 4, the position cause 2's recorded definition misspells a field at, and
+the two sentences of cause 6 no recording at hand quotes.
+
 ## Operation
 CreateStateMachine
 

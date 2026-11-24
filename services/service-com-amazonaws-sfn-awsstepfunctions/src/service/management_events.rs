@@ -263,12 +263,50 @@ macro_rules! audited {
     }};
 }
 
+/// Serve one operation audited exactly as [`audited!`] does, behind ONE more wrapper,
+/// OUTSIDE the audited call: a refusal whose clause is about a COLLECTION member states
+/// the collection the request carried, which only a layer holding the request can
+/// ([`super::submitted_collections::QuotingSubmittedCollections`]).
+///
+/// For the operations whose MODEL declares a bounded collection member, which are the only
+/// ones such a clause can arise for: the wrapper reads the request a second time, so an
+/// operation that could never produce the clause is served without it.
+///
+/// The wrapper changes how a REFUSAL is worded and nothing a handler does, and a refusal
+/// reaches no handler, so the record the audited call writes still reports the operation's
+/// own input and output.
+macro_rules! audited_quoting_collections {
+    (
+        $table:expr, $engine:expr,
+        $( $module:ident :: $operation:ident => $kind:ident ),* $(,)?
+    ) => {{
+        $(
+            $table.serve_behind(
+                crate::ops::$module::$operation::new(::std::sync::Arc::clone($engine)),
+                $kind(),
+                |audited, _pre_dispatch| {
+                    super::submitted_collections::QuotingSubmittedCollections::new(audited)
+                },
+            );
+        )*
+    }};
+}
+
+/// A call that CHANGES the account's resources, as the rows of
+/// [`audited_quoting_collections!`] name that kind — the one kind those rows take, since
+/// the member they are served for is carried by two creates.
+const fn mutates() -> CallKind {
+    CallKind::Mutating
+}
+
 /// Every modelled operation of this service, each constructed from the shared engine and
 /// served behind the audit recorder.
 ///
 /// EVERY one is here — the 37 operations `smithy_query(query="digest")` lists — so an
 /// operation is auditable because this service serves it and not because someone
-/// remembered to add it.
+/// remembered to add it. The two whose model declares a bounded collection member are
+/// served through [`audited_quoting_collections!`] and the rest through [`audited!`];
+/// what differs is only how a REFUSAL of theirs is worded, never the record.
 ///
 /// The kind per row is the operation's own documented semantics: `reports` for the
 /// `Describe*` / `List*` readers and for `GetExecutionHistory`, which "returns the history
@@ -291,7 +329,6 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         table, engine,
         create_activity::CreateActivity => mutates,
         create_state_machine::CreateStateMachine => mutates,
-        create_state_machine_alias::CreateStateMachineAlias => mutates,
         delete_activity::DeleteActivity => mutates,
         delete_state_machine::DeleteStateMachine => mutates,
         delete_state_machine_alias::DeleteStateMachineAlias => mutates,
@@ -323,8 +360,18 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         untag_resource::UntagResource => mutates,
         update_map_run::UpdateMapRun => mutates,
         update_state_machine::UpdateStateMachine => mutates,
-        update_state_machine_alias::UpdateStateMachineAlias => mutates,
         validate_state_machine_definition::ValidateStateMachineDefinition => reports,
+    );
+    // The two operations whose model declares a BOUNDED collection member
+    // (`routingConfiguration`, `@length` 1..2 —
+    // `smithy_query(query="shape", shape="RoutingConfigurationList")`, the one such member
+    // of this model), served so that a clause about it states the collection the request
+    // carried (see [`super::submitted_collections`]). Audited exactly as the rows above
+    // are, and of the same kind.
+    audited_quoting_collections!(
+        table, engine,
+        create_state_machine_alias::CreateStateMachineAlias => mutates,
+        update_state_machine_alias::UpdateStateMachineAlias => mutates,
     );
     // This service's synchronous DATA plane: the call that runs a state machine and answers
     // the run's own data, which CloudTrail records as a data event of that machine rather
