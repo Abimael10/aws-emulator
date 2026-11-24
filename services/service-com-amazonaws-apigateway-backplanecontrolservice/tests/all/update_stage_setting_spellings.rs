@@ -15,9 +15,9 @@
 //! tokens (`/~1pets/GET/…`) or in one (`/~1pets~1GET/…`), and the setting may be addressed
 //! by its published name or by its modelled member name — both write the SAME member of
 //! the entry the path's method half keys, which is the method path that half SPELLS (a
-//! one-token method path decoded, since it has to be decoded for the method to be read out of
-//! it). A path that leaves no setting beyond the method, or whose tail names none, is refused
-//! and changes nothing.
+//! one-token method half spells it with its last escape standing for the separator before the
+//! HTTP method). A path that leaves no setting beyond the method, or whose tail names none, is
+//! refused and changes nothing.
 //!
 //! Asserted over a TABLE rather than one recorded call: every setting of the
 //! `MethodSetting` shape in both spellings, each with a value that differs from the one a
@@ -206,8 +206,8 @@ async fn either_spelling_of_a_setting_writes_the_same_method_setting() {
 async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_path_it_spells() {
     // Rows differ along how a client spells the method path: a child resource and a nested
     // one with the resource path's slashes escaped and the method in its own token, the
-    // root resource, the whole method path inside ONE token (which has to be decoded for the
-    // method to be read out of it, so the key is the method path it decodes to), and the
+    // root resource, the whole method path inside ONE token (whose last escape is the
+    // separator before the method, so the key is that separator written literally), and the
     // `*/*` wildcard `Stage$methodSettings` documents for every method of the stage.
     let cases: Vec<(&str, &str, &str)> = vec![
         (
@@ -224,7 +224,7 @@ async fn a_setting_addressed_by_its_member_name_is_keyed_by_the_method_path_it_s
         (
             "the whole method path in one token",
             "/~1pets~1POST/metricsEnabled",
-            "pets/POST",
+            "~1pets/POST",
         ),
         ("every method", "/*/*/metricsEnabled", "*/*"),
     ];

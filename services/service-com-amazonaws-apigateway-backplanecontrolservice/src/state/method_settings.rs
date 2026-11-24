@@ -12,12 +12,12 @@
 //! The key is the method path AS THE PATCH POINTER SPELLED IT — `UpdateStage` keys the entry
 //! by the reference tokens its path carried before the setting, written exactly as the request
 //! wrote them (see `crate::ops::update_stage`) — so a client reads an entry back under the
-//! very key it patched. A pointer that carries the whole method path in ONE reference token is
-//! the exception, because such a token has to be DECODED to be read as a method path at all:
-//! what it decodes to is keyed as the documented method path, the resource path without the
-//! leading separator a resource path is stated with. Two pointers that spell one method
-//! differently therefore leave two entries, which is a stage API Gateway refuses to UPDATE
-//! until one of them is taken away.
+//! very key it patched. A pointer that carries the whole method path in ONE reference token
+//! spells the separator before the HTTP method as an escape, so that one escape is written
+//! literally and the resource half keeps its own spelling ([`spelled_method_path`]): such a
+//! pointer therefore names the SAME entry as the pointer that spells the method in its own
+//! token. Two pointers that spell the RESOURCE half differently do leave two entries, which is
+//! a stage API Gateway refuses to UPDATE until one of them is taken away.
 //!
 //! What a key DENOTES is a different question from how it is spelled: the resource path with
 //! its escapes decoded and its leading separator restored, and the HTTP method after the last
@@ -69,20 +69,27 @@ pub fn accepts_method_throttle_rate(rate_limit: f64) -> bool {
     rate_limit == f64::from(UNTHROTTLED_LIMIT) || super::accepts_throttle_rate(rate_limit)
 }
 
-/// The `methodSettings` key a method path DECODED out of one reference token is reported under:
-/// the method path `Stage$methodSettings` documents, which is the resource path without the
-/// leading separator a resource path is stated with, then a literal separator and the HTTP
-/// method (`pets/GET`, `*/*`).
+/// How a JSON Pointer reference token spells a separator: "Any slash ("/") character appearing
+/// in path names must be escaped with "~1"" (`PatchOperation$path`).
+const ESCAPED_SEPARATOR: &str = "~1";
+
+/// The `methodSettings` key a pointer that carries the WHOLE method path inside ONE reference
+/// token spells.
 ///
-/// A pointer that carries the whole method path in one token has to be decoded to be read as a
-/// method path at all, so what it writes is keyed by the method path itself rather than by the
-/// token's spelling. A pointer that spells the method in its OWN tokens is keyed by those
-/// tokens as written instead (`crate::ops::update_stage`).
+/// A key is a method path, `{resource_path}/{http_method}` (`Stage$methodSettings`), and the
+/// ONE separator of that path a key writes literally is the one before the HTTP method: a
+/// pointer that carries the whole path in one token escapes that separator too, and it is the
+/// LAST one the token carries, because an HTTP method carries none. So the method path such a
+/// token spells is that last escape written as the literal separator, with the resource half
+/// left exactly as the request wrote it — the same key the pointer that spells the method in
+/// its OWN token writes ([`crate::ops::update_stage`]), so `~1pets~1GET` and `~1pets/GET` name
+/// the ONE entry rather than two the stage could not then be updated for.
+///
+/// `None` for a token carrying no escaped separator at all: it spells no method path.
 #[must_use]
-pub fn documented_method_path(method_path: &str) -> String {
-    method_path
-        .strip_prefix('/')
-        .map_or_else(|| method_path.to_string(), ToString::to_string)
+pub fn spelled_method_path(token: &str) -> Option<String> {
+    let (resource, http_method) = token.rsplit_once(ESCAPED_SEPARATOR)?;
+    Some(format!("{resource}/{http_method}"))
 }
 
 /// The METHOD a `methodSettings` key denotes: the resource path it names, and the HTTP method.
@@ -209,29 +216,31 @@ mod tests {
         }
     }
 
-    /// RULE: a method path decoded out of one reference token is keyed as the method path
-    /// `Stage$methodSettings` documents: the resource path without its leading separator, then
-    /// the HTTP method.
+    /// RULE: a method path carried whole in one reference token spells the key whose only
+    /// literal separator is the one before the HTTP method — the token's LAST escape — with
+    /// the resource half left exactly as it was written.
     #[test]
-    fn a_decoded_method_path_is_keyed_as_the_documented_one() {
-        let rows: [(&str, &str, &str); 5] = [
-            ("a child resource", "/pets/GET", "pets/GET"),
+    fn a_method_path_in_one_token_spells_the_key_its_last_escape_names() {
+        let rows: [(&str, &str, Option<&str>); 6] = [
+            ("a child resource", "~1pets~1GET", Some("~1pets/GET")),
             (
                 "a nested resource",
-                "/pets/{petId}/DELETE",
-                "pets/{petId}/DELETE",
+                "~1pets~1{petId}~1DELETE",
+                Some("~1pets~1{petId}/DELETE"),
             ),
-            ("the root resource", "//GET", "/GET"),
-            ("every method of the stage", "*/*", "*/*"),
+            ("the root resource", "~1~1GET", Some("~1/GET")),
+            ("every method of the stage", "*~1*", Some("*/*")),
             (
-                "every method of the stage, the separator included",
-                "/*/*",
-                "*/*",
+                "a resource name carrying a tilde",
+                "~1a~0b~1GET",
+                Some("~1a~0b/GET"),
             ),
+            ("a token spelling no separator at all", "pets", None),
         ];
 
-        for (case, method_path, expected) in rows {
-            let actual = documented_method_path(method_path);
+        for (case, token, expected) in rows {
+            let actual = spelled_method_path(token);
+            let expected = expected.map(ToString::to_string);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"

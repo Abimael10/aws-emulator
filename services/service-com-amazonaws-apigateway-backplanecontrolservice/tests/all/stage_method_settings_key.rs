@@ -12,11 +12,12 @@
 //! > method path the patch POINTER spelled: the pointer's reference tokens before the setting
 //! > it writes, each exactly as the request wrote it — so a client reads a setting back under
 //! > the very path it patched. A pointer carrying the whole method path in ONE reference token
-//! > is the exception, because such a token has to be DECODED to be read as a method path at
-//! > all: it is keyed as the documented method path, the resource path without the leading
-//! > separator a resource path is stated with. The method a key denotes (its resource path
-//! > decoded, with that leading separator, and the HTTP method) is what a `remove` names, and
-//! > a stage cannot be updated while two of its keys denote the one method.
+//! > spells the separator before the HTTP method as that token's LAST escape, so the key is
+//! > that one escape written literally with the resource half left as it stands — the same key
+//! > the pointer that gives the method its own token writes. The method a key denotes (its
+//! > resource path decoded, with that leading separator, and the HTTP method) is what a
+//! > `remove` names, and a stage cannot be updated while two of its keys denote the one
+//! > method.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
 //! child, a nested one), the wildcard that stands for every method, each spelling of the
@@ -74,11 +75,11 @@ const ROWS: &[Row] = &[
                 "pets/PUT",
                 "cacheDataEncrypted",
             ),
-            // The whole method path inside ONE reference token, which is decoded and keyed as
-            // the documented method path.
+            // The whole method path inside ONE reference token, whose last escape stands for
+            // the separator before the HTTP method.
             (
                 "/~1pets~1DELETE/metricsEnabled",
-                "pets/DELETE",
+                "~1pets/DELETE",
                 "metricsEnabled",
             ),
         ],
@@ -98,7 +99,7 @@ const ROWS: &[Row] = &[
             ),
             (
                 "/~1pets~1{petId}~1PUT/cacheDataEncrypted",
-                "pets/{petId}/PUT",
+                "~1pets~1{petId}/PUT",
                 "cacheDataEncrypted",
             ),
         ],
@@ -113,7 +114,7 @@ const ROWS: &[Row] = &[
     Row {
         case: "every method of the stage",
         // The wildcard names no resource path, so the spellings are its own two tokens and
-        // both of them in one — which decodes to the same method path, so it is the same key.
+        // both of them in one — which spells the same method path, so it is the same key.
         spellings: &[
             ("/*/*/metrics/enabled", "*/*", "metricsEnabled"),
             ("/*~1*/cachingEnabled", "*/*", "cachingEnabled"),

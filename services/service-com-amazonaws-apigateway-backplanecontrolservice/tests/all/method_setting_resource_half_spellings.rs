@@ -18,12 +18,12 @@
 //! > nothing in the pointer then says where the resource path stops and the method begins, so
 //! > it is the modelled `BadRequestException`.
 //! >
-//! > Two pointers that spell one method differently are two entries, and a stage cannot be
-//! > UPDATED while it carries two: the update is refused with "Update Stage failed due to
-//! > different method settings with the same resource path and http method", naming the
-//! > colliding method paths, the account and the API, and the settings the refused update
-//! > wrote stay there to be removed — so every later update of that stage earns the same
-//! > sentence until one of the two is gone.
+//! > Two pointers that spell the RESOURCE half of one method differently are two entries, and
+//! > a stage cannot be UPDATED while it carries two: the update is refused with "Update Stage
+//! > failed due to different method settings with the same resource path and http method",
+//! > naming the colliding method paths, the account and the API, and the settings the refused
+//! > update wrote stay there to be removed — so every later update of that stage earns the
+//! > same sentence until one of the two is gone.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
 //! child, a nested one), the wildcard that stands for every method, and each spelling of the
@@ -89,9 +89,9 @@ const ROWS: &[Row] = &[
         key: "/POST",
     },
     Row {
-        case: "the method path carried whole in one token, which is decoded",
+        case: "the method path carried whole in one token, whose last escape is its separator",
         path: "/~1pets~1HEAD/cachingEnabled",
-        key: "pets/HEAD",
+        key: "~1pets/HEAD",
     },
     Row {
         case: "every method of the stage",
@@ -200,11 +200,11 @@ async fn one_method_spelled_two_ways_cannot_be_updated_until_one_spelling_is_gon
             "pets/GET",
         ),
         (
-            "the method path carried whole in one token",
-            "/~1pets~1GET/cacheDataEncrypted",
-            "/~1pets/GET/metrics/enabled",
-            "~1pets/GET",
-            "pets/GET",
+            "the method path carried whole in one token against none at all",
+            "/pets/PUT/metrics/enabled",
+            "/~1pets~1PUT/cacheDataEncrypted",
+            "~1pets/PUT",
+            "pets/PUT",
         ),
         (
             "a nested resource path, both spellings",

@@ -596,9 +596,9 @@ async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
     let uri = format!("/restapis/{api}/stages/prod");
 
     // Rows span the method paths a client spells: a child resource, a nested one, the root
-    // resource, the wildcard form, and the whole method path inside ONE token — which the
-    // service has to decode to read the method out of it, so that one is keyed as the method
-    // path `Stage$methodSettings` documents rather than by the token's own spelling.
+    // resource, the wildcard form, and the whole method path inside ONE token — whose LAST
+    // escape is the separator before the HTTP method, so it spells the same key the pointer
+    // that gives the method a token of its own spells.
     let rows: [(&str, &str); 5] = [
         ("/~1pets/GET/metrics/enabled", "~1pets/GET"),
         (
@@ -607,7 +607,7 @@ async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
         ),
         ("/~1/GET/metrics/enabled", "~1/GET"),
         ("/*/*/metrics/enabled", "*/*"),
-        ("/~1pets~1POST/metricsEnabled", "pets/POST"),
+        ("/~1pets~1POST/metricsEnabled", "~1pets/POST"),
     ];
 
     let mut expected: Vec<String> = Vec::new();

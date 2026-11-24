@@ -39,9 +39,10 @@
 //!   `PatchOperation$path` requires of a path name (`~1pets/GET`), with its LEADING separator
 //!   either escaped too or left to the pointer's own (`//pets/GET/…`, the spelling
 //!   `MethodSetting$resourcePath` states a path in), and a pointer that escapes the separator
-//!   before the method too names the method in ONE token, which has to be DECODED to be read
-//!   at all and is keyed as the method path it decodes to (`pets/GET`). Two spellings of one
-//!   method are two entries, and a stage carrying both cannot be updated — see
+//!   before the method too names the method in ONE token, whose LAST escape is that separator,
+//!   so it is keyed as the method path that token SPELLS (`~1pets/GET`) — the same key the
+//!   pointer that gives the method its own token writes. Two spellings of the RESOURCE half are
+//!   two entries, and a stage carrying both cannot be updated — see
 //!   [`apply_method_setting_patch`], [`method_path_spellings`], [`duplicate_method_settings`]
 //!   and [`crate::state::method_of_settings_key`], which is what a key DENOTES and what the
 //!   data plane resolves a served call's settings by.
@@ -1003,14 +1004,17 @@ fn method_path_spellings(patch: &Patch) -> &'static [usize] {
 ///   a path in; see [`method_path_spellings`]) — and then the setting, in either spelling
 ///   [`METHOD_SETTING_NAMES`] lists;
 /// * as ONE token carrying the whole method path, `/{escaped_method_path}/{setting}`, and
-///   then the setting's own member name. That token has to be decoded for the method to be
-///   read out of it at all, and what it decodes to IS the method path.
+///   then the setting's own member name. That token escapes the separator before the method
+///   as well, so the method is read out of it by decoding that one escape.
 ///
 /// The key is the method path the pointer SPELLED: the tokens before the setting, written
 /// exactly as the request wrote them ([`addressed_method_path`]) — which is the key API
 /// Gateway reports the entry under, so a client reads a setting back under the path it
-/// patched. Two pointers that spell one method differently therefore name two entries, and a
-/// stage cannot be updated while it carries both ([`duplicate_method_settings`]).
+/// patched. A one-token method path spells the SAME key as the pointer that gives the method
+/// its own token, since the only separator a key writes literally is the one before the method
+/// ([`crate::state::spelled_method_path`]). Two pointers that spell the RESOURCE half
+/// differently do name two entries, and a stage cannot be updated while it carries both
+/// ([`duplicate_method_settings`]).
 ///
 /// A pointer that is neither — a one-token method path followed by a GROUPED setting name,
 /// a tail that names no setting, a path that stops at the method — names no setting of a
@@ -1041,17 +1045,16 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
     // one token can match. The answer is the published name either way.
     let setting = named_setting(setting)?;
     // Decoded, that one token has to BE a method path: a resource path, and then the HTTP
-    // method after the `/` the escape stood for. A token that had to be DECODED to be read at
-    // all is keyed by the method path it decodes to, as `Stage$methodSettings` documents one
-    // ([`crate::state::documented_method_path`]), rather than by the token's own spelling.
+    // method after the `/` the escape stood for. The KEY is the method path the token SPELLED
+    // all the same — its last escape written as the literal separator a key carries, the
+    // resource half as the request wrote it ([`crate::state::spelled_method_path`]) — so this
+    // spelling and the one that gives the method its own token name the ONE entry.
     let (resource_path, _) = method_path.rsplit_once('/')?;
     if !names_a_resource(resource_path) {
         return None;
     }
-    Some((
-        crate::state::documented_method_path(method_path),
-        setting,
-    ))
+    let spelled = crate::state::spelled_method_path(written_tokens(patch).first()?)?;
+    Some((spelled, setting))
 }
 
 /// Whether `resource_path` is the resource half of a method path spelled WHOLE inside one
