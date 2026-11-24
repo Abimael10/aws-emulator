@@ -833,7 +833,6 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("glue", "L-76EC689B"),
     ("glue", "L-785C1F39"),
     ("glue", "L-7DD7C33A"),
-    ("glue", "L-83192DBF"),
     ("glue", "L-83A59AA6"),
     ("glue", "L-87F5991C"),
     ("glue", "L-94D025B7"),

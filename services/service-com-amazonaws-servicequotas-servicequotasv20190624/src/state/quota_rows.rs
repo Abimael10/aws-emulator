@@ -2090,16 +2090,19 @@ pub(super) fn glacier_quotas() -> Vec<QuotaRow> {
 /// (`L-E15CE20A`), the connection plane of an account (`L-4256D6D2`), the partitions of
 /// ONE table (`L-2C3F5401`), the partitions of the whole ACCOUNT (`L-FEBBFA7A`), the spare
 /// compute capacity an account may consume at once (`L-096DBB95`), the machine-learning
-/// task runs the ACCOUNT may run at once (`L-83A59AA6`) and the Data Catalog's global path
-/// plane (`L-FB210BD9`).
+/// task runs the ACCOUNT may run at once (`L-83A59AA6`), the Data Catalog's global path
+/// plane (`L-FB210BD9`), the Data Catalog's global TAG plane (`L-785C1F39`), the
+/// development-endpoint plane of an account (`L-DBA56E2F`), its INTEGRATION plane
+/// (`L-F1AAB534`) and its data-quality-ruleset plane (`L-87F5991C`).
 ///
-/// The quotas this catalog had served under those codes — the database, workflow,
-/// development-endpoint and account-wide machine-learning-transform planes, the
-/// job-concurrency planes, the per-table table-version plane, and the `GetTable`,
-/// `StartCrawler`, `BatchCreatePartition`, `UpdatePartition` and `UpdateJob` call rates —
-/// name no code that listing states, so they are published under no code at all rather
-/// than served under another quota's; so are the codes this catalog had served the
-/// account-wide crawler plane and the account's machine-learning transforms under.
+/// The quotas this catalog had served under those codes — the database, workflow and
+/// account-wide machine-learning-transform planes, the job-concurrency planes, the
+/// per-table table-version plane, the schema-version plane, and the `GetTable`,
+/// `StartCrawler`, `BatchCreatePartition`, `UpdatePartition`, `UpdateJob`, `GetPartitions`,
+/// `StartJobRun` and `BatchDeletePartition` call rates — name no code that listing states,
+/// so they are published under no code at all rather than served under another quota's; so
+/// are the codes this catalog had served the account-wide crawler plane, the account's
+/// machine-learning transforms and its data-quality rulesets under.
 pub(super) fn glue_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
     vec![
@@ -2198,15 +2201,24 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Schemas per account", 1000.0)
             .code("L-76EC689B")
             .describe("The maximum number of schemas in your account."),
-        quota("Schema versions per account", 10_000.0)
+        // The Data Catalog's global TAG plane, under the code the recorded listing binds
+        // it to, with the terse `Catalog: …` sentence that listing carries for it. The
+        // VALUE is the one the listing publishes under this code: the replay reports this
+        // code as diverging on `QuotaName` and `Description` only, so the value served here
+        // is the recorded one. The schema-version plane this catalog had served under the
+        // code names no code the listing states, so it is left to the default-quota-set
+        // gap.
+        quota("Global max tags", 10_000.0)
             .code("L-785C1F39")
-            .describe("The maximum number of schema versions in your account."),
+            .describe("Catalog: global max tags"),
         quota("Interactive sessions per account", 100.0)
             .code("L-7DD7C33A")
             .describe("The maximum number of interactive sessions in your account."),
-        quota("Data quality rulesets per account", 1000.0)
-            .code("L-83192DBF")
-            .describe("The maximum number of data quality rulesets in your account."),
+        // NOT published here: `L-83192DBF`, the code this catalog had served the
+        // data-quality-ruleset plane of an account under. That plane is published under
+        // `L-87F5991C` below, the code the recorded listing binds it to with the name and
+        // value it carries for it, and the listing states no quota this catalog can cite
+        // under `L-83192DBF`, so that code is left to the default-quota-set gap.
         // The machine-learning task runs the WHOLE ACCOUNT may run at once, beside the
         // per-transform concurrency plane published under `L-E15CE20A`: the recorded listing
         // binds this code to that account-wide plane, so the row carries its name, value and
@@ -2221,13 +2233,27 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
             "The total number of concurrent machine learning transform task runs for machine \
              learning transforms for this account.",
         ),
-        rate("L-87F5991C", "BatchDeletePartition", 50.0),
+        // The DATA-QUALITY-RULESET plane of an account, under the code the recorded
+        // listing binds it to and with the name and value it carries for it, in the
+        // sentence form this catalog's recorded account planes are worded in. The
+        // `BatchDeletePartition` call rate this catalog had served under the code names no
+        // code the listing states, so it is left to the default-quota-set gap.
+        quota("Max data quality rulesets per account", 1_000_000.0)
+            .code("L-87F5991C")
+            .describe("The maximum number of data quality rulesets in your account."),
         rate("L-94D025B7", "BatchGetPartition", 50.0),
         // The in-flight completion requests of an account, whose published sentence the
         // service carries WITHOUT a closing period.
         quota("Maximum number of in-flight completion requests allowed per account", 10.0)
             .code("L-958728D1")
             .describe("The maximum number of in-flight completion requests allowed per account"),
+        // `L-A457CBAB` keeps the `CreateTable` call rate of the catalog-API rate class:
+        // the recorded listing names the quota it publishes under this code (the
+        // orchestration plane of an account's queued job runs) but states neither the
+        // VALUE nor the sentence it carries for it, and inheriting the rate row's limit
+        // would be exactly the carry-over the rule at the head of this module forbids
+        // — so the row is left as it stands rather than published with a limit no source
+        // states.
         rate("L-A457CBAB", "CreateTable", 10.0),
         // The DATABASE plane of one Data Catalog, under the code the recorded listing
         // binds it to, with the sentence that listing carries for it.
@@ -2259,7 +2285,14 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
             .code("L-D90AC94B")
             .describe("Catalog: global maximum administrators"),
         rate("L-D987EC31", "GetPartition", 100.0),
-        rate("L-DBA56E2F", "GetPartitions", 100.0),
+        // The DEVELOPMENT-ENDPOINT plane of an account, under the code the recorded
+        // listing binds it to and with the name and value it carries for it — a counted
+        // plane rather than the `GetPartitions` call rate this catalog had served under the
+        // code, whose own code the listing does not state, so that rate is left to the
+        // default-quota-set gap.
+        quota("Max development endpoint per account", 25.0)
+            .code("L-DBA56E2F")
+            .describe("The maximum number of development endpoints in your account."),
         // The concurrent task runs of ONE machine learning transform, under the code the
         // recorded listing binds that plane to and with the name, value and sentence it
         // carries for it: a counted concurrency plane rather than the `GetTable` call rate
@@ -2296,7 +2329,13 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Max triggers per account", 1000.0)
             .code("L-F1653A6D")
             .describe("The maximum number of triggers in your account."),
-        rate("L-F1AAB534", "StartJobRun", 50.0),
+        // The INTEGRATION plane of an account, under the code the recorded listing binds
+        // it to and with the name and value it carries for it. The `StartJobRun` call rate
+        // this catalog had served under the code names no code the listing states, so it is
+        // left to the default-quota-set gap.
+        quota("Number of integrations", 40.0)
+            .code("L-F1AAB534")
+            .describe("The maximum number of integrations in your account."),
         rate("L-F545C262", "StartWorkflowRun", 10.0),
         rate("L-F574AED9", "UpdateDatabase", 10.0),
         rate("L-F953935E", "UpdateTable", 10.0),

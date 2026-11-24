@@ -13,7 +13,9 @@
 //! counted account plane and a counted per-resource plane, a row published in a unit of its
 //! own, an adjustable row and a not-adjustable one, a per-second request rate metered by an
 //! API's call count beside planes published over no window, a description in the service's
-//! terse `Catalog: …` form beside its sentence form, and values from 3 to 10,000,000.
+//! terse `Catalog: …` form beside its sentence form, account planes named in the service's
+//! `Max … per account` form beside one named in its `Number of …` form, and values from 3
+//! to 10,000,000.
 //!
 //! Each row is read BOTH through `ListAWSDefaultServiceQuotas` and through
 //! `GetAWSDefaultServiceQuota`, because the code is the only key the single reads take.
@@ -45,9 +47,12 @@ struct Row {
 /// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response of `glue` states which
 /// quota is published under each of these codes together with that quota's name, value and
 /// sentence; the per-table partition maximum is the one the "AWS Glue endpoints and
-/// quotas" table of the AWS General Reference publishes for that plane. The rows include
-/// codes the catalog was NOT filed about (`L-B78896B9`, `L-CB69DFA0`, `L-4F4B522D`,
-/// `L-11FA2C1A`) so the rule is asserted beyond the cited cases.
+/// quotas" table of the AWS General Reference publishes for that plane, and the counted
+/// account planes whose sentence that response does not state carry the sentence form it
+/// words its counted account planes in (the connection and trigger planes it states
+/// verbatim). The rows include codes the catalog was NOT filed about (`L-B78896B9`,
+/// `L-CB69DFA0`, `L-4F4B522D`, `L-11FA2C1A`) so the rule is asserted beyond the cited
+/// cases.
 const ROWS: &[Row] = &[
     // The machine-learning planes of an account: how many transforms it may hold, and how
     // many task runs ONE of those transforms may run at once.
@@ -151,7 +156,8 @@ const ROWS: &[Row] = &[
         period: Some((1, "SECOND")),
         call_count: Some("GetJobRun"),
     },
-    // A Data Catalog plane, whose sentence the service publishes in its terse form.
+    // Two Data Catalog planes, whose sentences the service publishes in its terse form:
+    // one a length in characters, one a count of tags.
     Row {
         quota_code: "L-4F4B522D",
         quota_name: "Global s3 path max length",
@@ -159,6 +165,52 @@ const ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         description: "Catalog: global s3 path max length",
+        period: None,
+        call_count: None,
+    },
+    Row {
+        quota_code: "L-785C1F39",
+        quota_name: "Global max tags",
+        value: 10_000.0,
+        unit: "None",
+        adjustable: true,
+        description: "Catalog: global max tags",
+        period: None,
+        call_count: None,
+    },
+    // The DEVELOPMENT-ENDPOINT plane of an account, under a code this catalog had served a
+    // catalog-API call rate under: the smallest value these rows span.
+    Row {
+        quota_code: "L-DBA56E2F",
+        quota_name: "Max development endpoint per account",
+        value: 25.0,
+        unit: "None",
+        adjustable: true,
+        description: "The maximum number of development endpoints in your account.",
+        period: None,
+        call_count: None,
+    },
+    // The INTEGRATION plane of an account, whose name the service publishes in its
+    // `Number of …` form with no plane named in it.
+    Row {
+        quota_code: "L-F1AAB534",
+        quota_name: "Number of integrations",
+        value: 40.0,
+        unit: "None",
+        adjustable: true,
+        description: "The maximum number of integrations in your account.",
+        period: None,
+        call_count: None,
+    },
+    // The DATA-QUALITY-RULESET plane of an account, and the largest value of this catalog's
+    // counted account planes.
+    Row {
+        quota_code: "L-87F5991C",
+        quota_name: "Max data quality rulesets per account",
+        value: 1_000_000.0,
+        unit: "None",
+        adjustable: true,
+        description: "The maximum number of data quality rulesets in your account.",
         period: None,
         call_count: None,
     },
@@ -176,18 +228,24 @@ const DISPLACED_QUOTA_NAMES: &[&str] = &[
     "Triggers per account",
     "Partitions per table",
     "Connections per account",
+    "Schema versions per account",
+    "Data quality rulesets per account",
     "Rate of GetTable requests",
     "Rate of StartCrawler requests",
+    "Rate of GetPartitions requests",
+    "Rate of StartJobRun requests",
+    "Rate of BatchDeletePartition requests",
 ];
 
-/// The `QuotaCode` this catalog used to serve a quota that belongs under another code: no
-/// source available here binds any `glue` quota to it, so it carries no row at all rather
-/// than a second copy of the quota now published under `L-04CEE988`.
+/// The `QuotaCode`s this catalog used to serve a quota that belongs under another code: no
+/// source available here binds any `glue` quota to either, so each carries no row at all
+/// rather than a second copy of the quota now published under `L-04CEE988` and under
+/// `L-87F5991C`.
 ///
 /// The rest of the default-quota-set gap (the recorded codes whose quota no source states)
 /// is reported by the count equation and the `GAP_CODE_COUNT` tripwire of
 /// `aws_minted_catalog_coverage.rs`, so that shortfall is not asserted here as a contract.
-const GAP_CODES: &[&str] = &["L-5E4153CA"];
+const GAP_CODES: &[&str] = &["L-5E4153CA", "L-83192DBF"];
 
 /// The `glue` catalog, keyed by `QuotaCode`, asserting each code is published once.
 async fn catalog_by_code(caller: &Client) -> BTreeMap<String, Value> {

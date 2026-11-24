@@ -61,6 +61,9 @@ for member. The codes still reported:
   keeps the plane or the call rate AWS's published `glue` quota table states, under the code
   this catalog has carried it on, because no source available here states which quota the
   recording publishes under those codes.
+  (SINCE RESOLVED, see Resolution below: `L-785C1F39`, `L-87F5991C`, `L-DBA56E2F` and
+  `L-F1AAB534` are now bound to the quota the recording publishes under them, and
+  `L-83192DBF` is published under no row.)
 - published under no row at all: `L-2E9FB93F` and `L-337244C9` (the recording publishes a row
   for each, and names neither quota in anything available here), beside `L-5E4153CA`, whose
   machine-learning-transform plane the recording binds to `L-04CEE988`.
@@ -73,6 +76,25 @@ The rows the fix DID correct, and must stay corrected, are pinned in
 and in `tests/all/recorded_row_facts_under_their_quota_codes.rs`; the shortfall against AWS's
 47-row catalog is pinned in `tests/all/aws_minted_catalog_coverage.rs` (`quota_count`,
 `gap_codes`, `GAP_CODE_COUNT`).
+
+## Resolution
+The rows of this report whose recorded content the checkout states are now published under
+the codes that content belongs to, in `src/state/quota_rows.rs::glue_quotas`: `L-DBA56E2F`
+the account's development-endpoint plane, `L-F1AAB534` its integration plane, `L-87F5991C`
+its data-quality-ruleset plane and `L-785C1F39` the Data Catalog's global tag plane; the
+quotas they displaced (the `GetPartitions`, `StartJobRun` and `BatchDeletePartition` call
+rates and the schema-version plane) name no code any source states, so they are published
+under no code, and `L-83192DBF` — which had carried the data-quality-ruleset plane now
+published under `L-87F5991C` — carries no row. Those recorded rows are quoted in
+`issues/things-that-do-not-work/20261123T024600Z-service-quotas-listawsdefaultservicequotas-rows-misbound-across-events-fms-fsx-gamelift.md`
+(Cause 5 of 6), which remains open for its other five `ServiceCode`s. The bindings are
+pinned in `tests/all/glue_default_rows_under_their_published_codes.rs` and driven through
+the increase path in `tests/all/glue_capacity_planes_under_their_published_codes.rs`.
+
+The rows this report lists for which NO source in the checkout states the recorded content
+— the whole rows of `L-2E9FB93F` and `L-337244C9`, and `L-071ABE08` — are re-filed, with
+their replay keys and the reason they are blocked, as
+`issues/things-that-do-not-work/20261124T090000Z-service-quotas-listawsdefaultservicequotas-glue-codes-whose-recorded-quota-no-source-states.md`.
 
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay trace set simparity-wire-aws-v1
