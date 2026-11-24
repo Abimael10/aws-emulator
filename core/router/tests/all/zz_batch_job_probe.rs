@@ -47,24 +47,24 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::cloudformation_provisions_stack_resources::xml_texts;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account the S3 Control calls name, in `x-amz-account-id`: the caller's own, which is
 /// the only account S3 Control authorizes a request for.
-const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
 
 /// The XML namespace S3's own model declares, which a client's payload carries.
-const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The XML namespace S3 Control's model declares.
 const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
 /// The service principal S3 Batch Operations assumes a job's role as, spelled out here
 /// rather than imported from the service crate.
-const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
+pub(crate) const BATCH_OPERATIONS_PRINCIPAL: &str = "batchoperations.s3.amazonaws.com";
 
 /// The fixed text the reason of a job whose role this service was denied opens with; the
 /// role the create named is its variable part.
@@ -86,23 +86,80 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
     /// The `ETag` response header, for the write whose entity tag a manifest names.
-    etag: String,
+    pub(crate) etag: String,
 }
 
 impl Answer {
     /// The text of the first `<name>` element of the body, or the empty string.
-    fn text(&self, name: &str) -> String {
+    pub(crate) fn text(&self, name: &str) -> String {
         xml_texts(&self.body, name).into_iter().next().unwrap_or_default()
+    }
+}
+
+/// One `CreateJob` request that puts a tag on every object its manifest lists: the request
+/// shape both this suite and [`super::s3control_account_prefixed_endpoint_jobs`] submit, so
+/// the payload is written once and each suite varies what it is about.
+///
+/// The members are `CreateJob`'s own: the manifest's `ObjectArn`/`ETag`, the
+/// `S3PutObjectTagging` tag set, the completion `Report` and the `RoleArn` the job runs as.
+pub(crate) struct TaggingJobRequest<'a> {
+    /// `ClientRequestToken`, which makes a resubmission idempotent.
+    pub(crate) token: &'a str,
+    /// The bucket holding the manifest, the objects it lists and the report.
+    pub(crate) bucket: &'a str,
+    /// The key of the CSV manifest, and the entity tag the write of it answered.
+    pub(crate) manifest_key: &'a str,
+    pub(crate) manifest_etag: &'a str,
+    /// `Report$Prefix`, under which the completion report is written.
+    pub(crate) report_prefix: &'a str,
+    /// The role Batch Operations runs the job's tasks as.
+    pub(crate) role_arn: &'a str,
+    /// The tag the job's `S3PutObjectTagging` action sets.
+    pub(crate) tag: (&'a str, &'a str),
+}
+
+impl TaggingJobRequest<'_> {
+    /// The `CreateJobRequest` document, in this service's own XML namespace.
+    pub(crate) fn xml(&self) -> String {
+        let Self {
+            token,
+            bucket,
+            manifest_key,
+            manifest_etag,
+            report_prefix,
+            role_arn,
+            tag: (tag_key, tag_value),
+        } = self;
+        format!(
+            "<CreateJobRequest xmlns=\"{XMLNS}\">\
+             <ClientRequestToken>{token}</ClientRequestToken>\
+             <ConfirmationRequired>false</ConfirmationRequired>\
+             <Operation><S3PutObjectTagging><TagSet>\
+             <member><Key>{tag_key}</Key><Value>{tag_value}</Value>\
+             </member></TagSet></S3PutObjectTagging></Operation>\
+             <Report><Bucket>arn:aws:s3:::{bucket}</Bucket>\
+             <Format>Report_CSV_20180820</Format><Enabled>true</Enabled>\
+             <Prefix>{report_prefix}</Prefix>\
+             <ReportScope>AllTasks</ReportScope></Report>\
+             <Manifest><Spec>\
+             <Format>S3BatchOperations_CSV_20180820</Format>\
+             <Fields><member>Bucket</member><member>Key</member></Fields>\
+             </Spec><Location>\
+             <ObjectArn>arn:aws:s3:::{bucket}/{manifest_key}</ObjectArn>\
+             <ETag>{manifest_etag}</ETag></Location></Manifest>\
+             <Priority>1</Priority><RoleArn>{role_arn}</RoleArn>\
+             </CreateJobRequest>"
+        )
     }
 }
 
 /// The emulator this suite drives, and the credential every call it makes is signed with:
 /// the pair this process publishes once request authentication is on.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     key_id: String,
     secret: String,
@@ -112,7 +169,7 @@ impl Emulator {
     /// The whole emulator over one engine, serving as it serves traffic — with request
     /// authentication ON, so every call below, and every call the job's own run makes over
     /// the in-process callback, is verified.
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = build_router(engine);
         router.set_request_authentication(true);
@@ -170,7 +227,7 @@ impl Emulator {
     }
 
     /// Dispatch one signed request as it arrives on the wire.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         host: &str,
@@ -211,17 +268,31 @@ impl Emulator {
     }
 
     /// One Amazon S3 REST call, path-style as the emulator serves it.
-    async fn s3(&self, method: &str, path: &str, body: &str) -> Answer {
+    pub(crate) async fn s3(&self, method: &str, path: &str, body: &str) -> Answer {
         let host = format!("s3.{REGION}.amazonaws.com");
         self.send(method, &host, "s3", path, &[], body).await
     }
 
-    /// One S3 Control call for this account.
+    /// One S3 Control call for this account, at the account-prefixed form of this
+    /// service's published regional endpoint.
     async fn s3control(&self, method: &str, path: &str, body: &str) -> Answer {
         let host = format!("{ACCOUNT}.s3-control.{REGION}.amazonaws.com");
+        self.s3control_at(&host, method, path, body).await
+    }
+
+    /// One S3 Control call for this account, stating `authority` as the endpoint it was
+    /// sent to: a client prepends the modelled `{AccountId}.` host prefix to WHATEVER
+    /// endpoint authority it resolved, so that authority is a parameter.
+    pub(crate) async fn s3control_at(
+        &self,
+        authority: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Answer {
         self.send(
             method,
-            &host,
+            authority,
             "s3",
             path,
             &[
@@ -234,7 +305,7 @@ impl Emulator {
     }
 
     /// One IAM `awsQuery` call.
-    async fn iam(&self, body: &str) -> Answer {
+    pub(crate) async fn iam(&self, body: &str) -> Answer {
         self.send(
             "POST",
             "iam.amazonaws.com",
@@ -252,10 +323,22 @@ impl Emulator {
     /// Waits for the CONDITION rather than for a span, under a deadline far above the span
     /// the service holds a job for.
     async fn await_terminal(&self, case: &str, job_id: &str) -> String {
+        let host = format!("{ACCOUNT}.s3-control.{REGION}.amazonaws.com");
+        self.await_terminal_at(case, &host, job_id).await
+    }
+
+    /// [`Self::await_terminal`], polling at `authority` — the endpoint the client that
+    /// submitted the job is configured with.
+    pub(crate) async fn await_terminal_at(
+        &self,
+        case: &str,
+        authority: &str,
+        job_id: &str,
+    ) -> String {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
             let described = self
-                .s3control("GET", &format!("/v20180820/jobs/{job_id}"), "")
+                .s3control_at(authority, "GET", &format!("/v20180820/jobs/{job_id}"), "")
                 .await;
             assert_eq!(
                 described.status, 200,
@@ -442,28 +525,16 @@ fn a_submitted_batch_job_settles_as_its_role_allows() {
                         .s3control(
                             "POST",
                             "/v20180820/jobs",
-                            &format!(
-                                "<CreateJobRequest xmlns=\"{XMLNS}\">\
-                                 <ClientRequestToken>token-{label}</ClientRequestToken>\
-                                 <ConfirmationRequired>false</ConfirmationRequired>\
-                                 <Operation><S3PutObjectTagging><TagSet>\
-                                 <member><Key>{TAG_KEY}</Key><Value>{TAG_VALUE}</Value>\
-                                 </member></TagSet></S3PutObjectTagging></Operation>\
-                                 <Report><Bucket>arn:aws:s3:::{BUCKET}</Bucket>\
-                                 <Format>Report_CSV_20180820</Format><Enabled>true</Enabled>\
-                                 <Prefix>reports/{label}</Prefix>\
-                                 <ReportScope>AllTasks</ReportScope></Report>\
-                                 <Manifest><Spec>\
-                                 <Format>S3BatchOperations_CSV_20180820</Format>\
-                                 <Fields><member>Bucket</member><member>Key</member></Fields>\
-                                 </Spec><Location>\
-                                 <ObjectArn>arn:aws:s3:::{BUCKET}/{}</ObjectArn>\
-                                 <ETag>{}</ETag></Location></Manifest>\
-                                 <Priority>1</Priority><RoleArn>{role_arn}</RoleArn>\
-                                 </CreateJobRequest>",
-                                manifest_key(label),
-                                manifest.etag
-                            ),
+                            &TaggingJobRequest {
+                                token: &format!("token-{label}"),
+                                bucket: BUCKET,
+                                manifest_key: &manifest_key(label),
+                                manifest_etag: &manifest.etag,
+                                report_prefix: &format!("reports/{label}"),
+                                role_arn: &role_arn,
+                                tag: (TAG_KEY, TAG_VALUE),
+                            }
+                            .xml(),
                         )
                         .await;
                     assert_eq!(
