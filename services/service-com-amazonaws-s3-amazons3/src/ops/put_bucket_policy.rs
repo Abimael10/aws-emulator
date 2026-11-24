@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketPolicy
-//! IMPLEMENTED. Attaches a bucket policy to an existing bucket, which
-//! `GetBucketPolicy` then reports byte for byte. The `Policy` is validated as a policy
+//! IMPLEMENTED. Attaches a bucket policy to an existing bucket. What is STORED — and so what
+//! `GetBucketPolicy` reports byte for byte — is S3's own rendering of the policy the document
+//! expresses rather than the bytes the request carried
+//! ([`crate::state::stored_bucket_policy`]): the whitespace between the JSON tokens is gone,
+//! an element the policy language types "String or Array of strings" that holds one value is
+//! written as that value, and an account principal named by its account id alone is written as
+//! that account's root ARN. The rendering is a fixed point, so a re-put of a document that was
+//! read back stores the same bytes again. The `Policy` is validated as a policy
 //! document and against the published size limit
 //! ([`crate::state::MAX_BUCKET_POLICY_BYTES`]) first (`MalformedPolicy`, 400) and the
 //! bucket is resolved second (`NoSuchBucket`, 404), so a refused request leaves the
@@ -416,8 +422,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // One policy per bucket: a later put replaces the one that was there.
-        bucket.policy = Some(input.policy);
+        // One policy per bucket: a later put replaces the one that was there. What is stored
+        // is S3's own rendering of the policy the document expresses rather than the bytes the
+        // request carried ([`crate::state::stored_bucket_policy`]), so the read, the policy
+        // status and the authorization decision all read the one form.
+        bucket.policy = Some(crate::state::stored_bucket_policy(&input.policy));
 
         Ok(PutBucketPolicyOutput)
     }

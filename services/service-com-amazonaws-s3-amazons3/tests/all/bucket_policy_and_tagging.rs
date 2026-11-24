@@ -8,8 +8,11 @@
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
-//! 1. `PutBucketPolicy` stores the policy document verbatim and answers `204 No Content`
-//!    with an empty body, so `GetBucketPolicy` returns the same bytes;
+//! 1. `PutBucketPolicy` answers `204 No Content` with an empty body and stores the policy
+//!    the document expresses, so `GetBucketPolicy` returns the document S3 holds — every
+//!    document in this suite being one the rendering leaves as it arrived
+//!    (`state::stored_bucket_policy`, whose own rows are
+//!    [`super::bucket_policy_rendering`]);
 //!    `PutBucketTagging` REPLACES the tag set, so
 //!    `GetBucketTagging` reports exactly the last submitted one and nothing of the one
 //!    before it.

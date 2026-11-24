@@ -203,9 +203,9 @@ async fn deleting_a_bucket_policy_answers_204_and_leaves_the_bucket_without_one(
             let reread = get_bucket_policy(&router, bucket).await;
             assert_eq!(
                 String::from_utf8_lossy(&reread.body),
-                document.as_str(),
-                "case ({bucket:?}, {label:?}): the re-attached policy must read back byte for \
-                 byte, got {} with body {:?}",
+                service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(document),
+                "case ({bucket:?}, {label:?}): the re-attached policy must read back as the \
+                 write stored it, got {} with body {:?}",
                 reread.status,
                 String::from_utf8_lossy(&reread.body)
             );

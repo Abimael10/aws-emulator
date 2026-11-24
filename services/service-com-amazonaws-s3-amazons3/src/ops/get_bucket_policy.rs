@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketPolicy
-//! IMPLEMENTED. Reports the bucket policy `PutBucketPolicy` attached, byte for byte. A
+//! IMPLEMENTED. Reports the bucket policy `PutBucketPolicy` attached, byte for byte as that
+//! write STORED it — S3's own rendering of the policy the submitted document expresses
+//! ([`crate::state::stored_bucket_policy`]), which is where the two spellings of one grant
+//! are settled, not here. A
 //! bucket this emulator does not hold is `NoSuchBucket` (404); a bucket that exists but
 //! carries no policy is `NoSuchBucketPolicy` (404) — two distinct codes S3 sends, for
 //! two distinct states, neither declared by this operation's model.

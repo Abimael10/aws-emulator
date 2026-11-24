@@ -152,7 +152,10 @@ async fn a_successful_put_bucket_policy_answers_204_with_an_empty_body() {
                 String::from_utf8_lossy(&answer.body)
             );
 
-            // The 204 is a successful WRITE, not a no-op: the read reports the bytes.
+            // The 204 is a successful WRITE, not a no-op: the read reports the document
+            // the write stored — S3's own rendering of the policy it expresses
+            // ([`service_com_amazonaws_s3_amazons3::state::stored_bucket_policy`], whose
+            // bytes [`super::bucket_policy_rendering`] pins row by row).
             let read = get_bucket_policy(&router, bucket).await;
             assert_eq!(
                 read.status, 200,
@@ -163,8 +166,9 @@ async fn a_successful_put_bucket_policy_answers_204_with_an_empty_body() {
             );
             assert_eq!(
                 String::from_utf8_lossy(&read.body),
-                document.as_str(),
-                "case ({bucket:?}, {label:?}): the stored policy must read back byte for byte"
+                service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(document),
+                "case ({bucket:?}, {label:?}): the stored policy must read back as the write \
+                 stored it"
             );
         }
 

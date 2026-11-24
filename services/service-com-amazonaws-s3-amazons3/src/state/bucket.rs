@@ -22,7 +22,8 @@ pub struct Bucket {
     /// always records the instant. A reader reports no creation date rather than inventing
     /// one.
     pub(super) created_at: Option<SystemTime>,
-    /// The bucket policy `PutBucketPolicy` attached, verbatim, or `None` while the
+    /// The bucket policy `PutBucketPolicy` attached, in the rendering that write stores it in
+    /// ([`super::stored_bucket_policy`]), or `None` while the
     /// bucket has none. A bucket is created WITHOUT a policy, which is what makes
     /// `GetBucketPolicy` answer `NoSuchBucketPolicy` until one is put.
     pub policy: Option<String>,

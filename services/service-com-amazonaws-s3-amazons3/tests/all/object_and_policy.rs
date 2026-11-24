@@ -8,9 +8,12 @@
 //! same bucket, which is exactly what a data-plane client does before it reads anything
 //! (create the bucket, attach a policy, upload the document). That pairing is what this
 //! suite adds, and the rule it pins is their INDEPENDENCE: a bucket's policy and its
-//! objects are separate subresources, so attaching or replacing one leaves the other byte
-//! for byte — the policy document is not re-serialized by an object write, and an object's
-//! bytes and entity tag are not touched by a policy write.
+//! objects are separate subresources, so attaching or replacing one leaves the other
+//! exactly as its own write left it — an object write changes nothing about the stored
+//! policy document, and an object's bytes and entity tag are not touched by a policy write.
+//! (WHAT a policy write stores is S3's own rendering of the policy the submitted document
+//! expresses, `state::stored_bucket_policy`, whose bytes [`super::bucket_policy_rendering`]
+//! pins; this suite reads the policy back through that same rendering.)
 //!
 //! Every assertion drives a real HTTP request through the router (the harness is the one
 //! the bucket-lifecycle suite in this crate already owns), so what is pinned is the wire
@@ -52,8 +55,8 @@ async fn a_bucket_policy_and_objects_coexist_on_one_bucket_without_touching_each
 
     // The staging order a data-plane client uses: attach the policy that grants a service
     // principal access, then upload the document it will read. The document is indented
-    // JSON with newlines and tabs, which is what makes "verbatim" testable here — a
-    // policy re-serialized on the way in or out would come back without this whitespace.
+    // JSON with newlines and tabs, so what the reads below compare against is the stored
+    // rendering of it rather than the request's own bytes.
     let policy = "{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{\n\t\t\t\"Sid\": \
                   \"AllowServiceAccess\",\n\t\t\t\"Effect\": \"Allow\",\n\t\t\t\"Principal\": \
                   {\n\t\t\t\t\"Service\": \"example.amazonaws.com\"\n\t\t\t},\n\t\t\t\"Action\": \
@@ -110,8 +113,8 @@ async fn a_bucket_policy_and_objects_coexist_on_one_bucket_without_touching_each
     );
     assert_eq!(
         String::from_utf8_lossy(&read_policy.body),
-        policy,
-        "the policy must read back verbatim, got {:?}",
+        service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(policy),
+        "the policy must read back as the write stored it, got {:?}",
         String::from_utf8_lossy(&read_policy.body)
     );
 

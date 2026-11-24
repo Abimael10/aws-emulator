@@ -237,6 +237,20 @@ fn statements(document: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The first statement of `document` as AMAZON S3 holds it: that service stores the policy a
+/// submitted document expresses rather than the caller's bytes
+/// (`state::stored_bucket_policy`), so a statement written with a one-value `Action` list is
+/// held with the `Action` as that string — which is the statement the merge has to leave
+/// alone.
+fn stored_statement(document: &Value) -> Value {
+    let stored = service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(
+        &document.to_string(),
+    );
+    let held: Value = serde_json::from_str(&stored)
+        .unwrap_or_else(|error| panic!("the stored document must be JSON ({error}): {stored}"));
+    held["Statement"][0].clone()
+}
+
 /// The statements of `document` that grant the service principal `principal`.
 fn granting(document: &Value, principal: &str) -> Vec<Value> {
     statements(document)
@@ -277,7 +291,12 @@ fn assert_grants_recorder(case: &str, document: &Value, region: &str, bucket: &s
         json!("true"),
         "case {case:?}: the grant must require a secure transport, got {grant}"
     );
-    let actions = grant["Action"].as_array().cloned().unwrap_or_default();
+    // An `Action` is written as one string or as a list of them, and Amazon S3 reports a
+    // one-value list as the string, so the permission is read in either form.
+    let actions = match &grant["Action"] {
+        Value::Array(named) => named.clone(),
+        named => vec![named.clone()],
+    };
     assert!(
         actions.contains(&json!("s3:PutObject")),
         "case {case:?}: the grant must allow the recording write, got {grant}"
@@ -623,7 +642,8 @@ async fn the_grant_is_merged_into_the_policy_the_bucket_already_carries() {
             "case {case:?}: the owner's own statement must be left as it was, got {document}"
         );
         assert_eq!(
-            kept[0], owners["Statement"][0],
+            kept[0],
+            stored_statement(&owners),
             "case {case:?}: the owner's statement must be unchanged, got {}",
             kept[0]
         );

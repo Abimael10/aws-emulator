@@ -460,6 +460,12 @@ async fn the_policy_status_reports_whether_the_stored_policy_grants_public_acces
             String::from_utf8_lossy(&put.body)
         );
 
+        // What the write stored, read BEFORE the status is asked for: the comparison below
+        // is about what reading the status changed, not about the rendering the write applied
+        // (which [`super::bucket_policy_rendering`] pins byte by byte).
+        let stored = String::from_utf8_lossy(&get_bucket_policy(&router, bucket).await.body)
+            .to_string();
+
         let answer = get_bucket_policy_status(&router, bucket, &[]).await;
         assert_eq!(
             answer.status, 200,
@@ -479,7 +485,7 @@ async fn the_policy_status_reports_whether_the_stored_policy_grants_public_acces
         let read = get_bucket_policy(&router, bucket).await;
         assert_eq!(
             String::from_utf8_lossy(&read.body),
-            document.as_str(),
+            stored,
             "case {label:?}: reading the status must leave the document untouched"
         );
         let again = get_bucket_policy_status(&router, bucket, &[]).await;

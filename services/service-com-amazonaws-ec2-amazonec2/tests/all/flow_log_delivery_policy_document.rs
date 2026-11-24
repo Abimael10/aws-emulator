@@ -16,7 +16,7 @@
 //! 2. A DOCUMENT OF THE OWNER'S KEEPS WHAT THE OWNER WROTE: its own name, and every statement
 //!    of its own with the statement id it was written with.
 //! 3. THE BUCKET REPORTS THE DOCUMENT IT CARRIES: a document put afterwards reads back through
-//!    `GetBucketPolicy` byte for byte, whatever name and statement ids it carries.
+//!    `GetBucketPolicy` as Amazon S3 stored it, whatever name and statement ids it carries.
 //!
 //! EC2 and Amazon S3 are mounted on ONE shared engine, exactly as the assembled emulator
 //! mounts them, so the policy is read back from the state Amazon S3 serves `GetBucketPolicy`
@@ -378,13 +378,17 @@ async fn the_owners_own_name_and_statement_ids_survive_the_delivery_write() {
 }
 
 /// RULE 3: the bucket reports the document it carries — one put after the create reads back
-/// through `GetBucketPolicy` byte for byte, whatever name and statement ids it carries.
+/// through `GetBucketPolicy` as Amazon S3 stored it, whatever name and statement ids it
+/// carries. WHAT that write stores is Amazon S3's own rendering of the policy the document
+/// expresses (`state::stored_bucket_policy`, pinned row by row by that service's own
+/// bucket-policy rendering suite), so the delivery's grants are the only thing this suite
+/// claims about the document's content.
 ///
 /// The rows differ in the FORM of the document put: named and unnamed, statement ids with and
 /// without a trailing index, a single statement object rather than a list, and key order and
-/// whitespace a re-serialization would not reproduce.
+/// whitespace of the caller's own.
 #[tokio::test]
-async fn a_document_put_over_the_grants_reads_back_byte_for_byte() {
+async fn a_document_put_over_the_grants_reads_back_as_amazon_s3_stored_it() {
     let bucket = "flow-logs-round-trip";
 
     // (case, the document exactly as the caller writes it)
@@ -440,8 +444,10 @@ async fn a_document_put_over_the_grants_reads_back_byte_for_byte() {
             "case {case:?}: GetBucketPolicy must answer 200, got {status} with {body}"
         );
         assert_eq!(
-            body, document,
-            "case {case:?}: GetBucketPolicy must report the document as it was put, got {body}"
+            body,
+            service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(&document),
+            "case {case:?}: GetBucketPolicy must report the document as Amazon S3 stored it, \
+             got {body}"
         );
     }
 }

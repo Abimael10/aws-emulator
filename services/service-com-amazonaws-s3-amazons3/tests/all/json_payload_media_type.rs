@@ -12,8 +12,10 @@
 //! The rows differ along the SHAPE of the policy document stored: compact, indented with
 //! newlines and tabs, carrying several statements, and carrying non-ASCII text in a `Sid` —
 //! so what is pinned is the media type of the response rather than anything about one
-//! document. Each row also reads the document back byte for byte, because a media type is
-//! only right about a body that was not re-serialized on the way out.
+//! document. Each row also reads the document back as the write STORED it (S3's own
+//! rendering of the policy it expresses — `state::stored_bucket_policy`, whose bytes
+//! [`super::bucket_policy_rendering`] pins), because a media type is only right about a
+//! body served as the document it is.
 //!
 //! The control beside them is a bucket subresource whose body IS an XML document, which
 //! keeps its own media type: the rule is about the body, not about every read of a bucket.
@@ -90,8 +92,8 @@ async fn a_bucket_policy_is_served_as_the_json_document_it_is() {
         );
         assert_eq!(
             text(&read),
-            policy,
-            "case {case:?}: the document must read back byte for byte, got {:?}",
+            service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(&policy),
+            "case {case:?}: the document must read back as the write stored it, got {:?}",
             text(&read)
         );
     }

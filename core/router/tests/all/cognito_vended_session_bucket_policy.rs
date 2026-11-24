@@ -612,7 +612,9 @@ fn put_bucket_policy(
         stored.text()
     );
     // What the bucket carries is read back through the service's own reader, so a round
-    // decides against the document S3 actually stored.
+    // decides against the document S3 actually stored — which is Amazon S3's own rendering
+    // of the policy the document expresses rather than the bytes this setup sent
+    // (`state::stored_bucket_policy`: a one-value principal list is held as the string).
     let read_back = s3(
         router,
         runtime,
@@ -621,9 +623,10 @@ fn put_bucket_policy(
         &format!("/{BUCKET}?policy"),
         "",
     );
+    let held = service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(policy);
     assert_eq!(
         (read_back.status, read_back.text().as_str()),
-        (200, policy),
+        (200, held.as_str()),
         "case {case:?}: the stored policy must read back, got {} with {:?}",
         read_back.status,
         read_back.text()

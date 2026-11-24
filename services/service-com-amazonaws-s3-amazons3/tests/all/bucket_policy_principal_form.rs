@@ -298,13 +298,17 @@ async fn a_principal_of_a_published_form_is_stored() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
-        // Stored, not merely accepted: the read reports the document byte for byte.
+        // Stored, not merely accepted: the read reports the document the write stored —
+        // Amazon S3's own rendering of the policy it expresses
+        // ([`service_com_amazonaws_s3_amazons3::state::stored_bucket_policy`], whose bytes
+        // [`super::bucket_policy_rendering`] pins), which for an account named by its id
+        // alone names it by that account's root ARN.
         let read = get_bucket_policy(&router, BUCKET).await;
         assert_eq!(
             String::from_utf8_lossy(&read.body),
-            document.as_str(),
-            "case {case:?}: the stored policy must read back byte for byte, got {} with body \
-             {:?}",
+            service_com_amazonaws_s3_amazons3::state::stored_bucket_policy(&document),
+            "case {case:?}: the stored policy must read back as the write stored it, got {} \
+             with body {:?}",
             read.status,
             String::from_utf8_lossy(&read.body)
         );

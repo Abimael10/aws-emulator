@@ -4550,6 +4550,9 @@ mod policy_action_scope;
 mod policy_resource_target;
 // How a refusal of a policy document says which part of that document it is about.
 mod policy_document_detail;
+// The rendering a bucket policy is stored and reported in: S3 holds the POLICY a submitted
+// document expresses rather than the caller's bytes.
+mod policy_document;
 // Whether the values a bucket-policy statement's `Principal` element names are of a form
 // that names a principal at all.
 mod policy_principal_form;
@@ -4594,9 +4597,10 @@ pub use metadata_table_provisioning::{
 pub use notification_document::*;
 pub use object::*;
 pub use policy_action_scope::*;
-pub use policy_resource_target::*;
+pub use policy_document::*;
 pub use policy_document_detail::*;
 pub use policy_principal_form::*;
+pub use policy_resource_target::*;
 pub use read_encryption_headers::*;
 pub use refusals::*;
 pub use renames::*;
