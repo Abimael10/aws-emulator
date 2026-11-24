@@ -30,7 +30,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::FIELD_TYPE_VALUES;
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, Emulator,
+    domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, title_value,
+    Emulator,
 };
 
 /// The one account a generated emulator serves, which every ARN it mints
@@ -360,7 +361,10 @@ async fn every_field_value_of_the_wrong_variant_names_the_variant_its_field_type
                     &format!("/domains/{domain_id}/cases"),
                     json!({
                         "templateId": template_id,
-                        "fields": [{ "id": field_id, "value": value }],
+                        "fields": [
+                            title_value("a typed case"),
+                            { "id": field_id, "value": value },
+                        ],
                     }),
                 )
                 .await;
@@ -401,7 +405,10 @@ async fn the_variant_refusal_is_worded_alike_wherever_a_value_is_written() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": held }],
+                "fields": [
+                    title_value("a case to write against"),
+                    { "id": text, "value": held },
+                ],
             }),
         )
         .await;

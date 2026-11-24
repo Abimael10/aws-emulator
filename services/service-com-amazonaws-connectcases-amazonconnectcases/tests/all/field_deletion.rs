@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     domain, field_value_variants, fields_of_every_type, get_case_fields, listed_fields, read_field,
-    string_at, template, Emulator,
+    string_at, template, title_value, Emulator,
 };
 use crate::layout_lifecycle::{create_layout, get_layout, top_panel, top_panel_reported};
 
@@ -96,6 +96,7 @@ async fn create_field(
 }
 
 /// `CreateCase` against `template_id` writing `fields`, returning the case id.
+/// Every body carries the `title` the service requires of every create.
 async fn create_case(
     emulator: &Emulator,
     case: &str,
@@ -103,12 +104,14 @@ async fn create_case(
     template_id: &str,
     fields: Vec<Value>,
 ) -> String {
+    let mut values = vec![title_value("a case with a deleted field")];
+    values.extend(fields);
     let created = emulator
         .ok(
             case,
             "POST",
             &format!("/domains/{domain_id}/cases"),
-            json!({ "templateId": template_id, "fields": fields }),
+            json!({ "templateId": template_id, "fields": values }),
         )
         .await;
     string_at(&created, "caseId", case)

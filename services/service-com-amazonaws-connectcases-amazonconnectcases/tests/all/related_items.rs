@@ -29,8 +29,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::RELATED_I
 // The request plumbing and the lifecycle helpers live in `tests/all/harness.rs`,
 // shared with this crate's other suites.
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, Emulator,
-    DEFAULT_ACCESS_KEY_ID,
+    domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, title_value,
+    Emulator, DEFAULT_ACCESS_KEY_ID,
 };
 
 /// An Amazon Connect contact ARN: the external identifier a `Contact` item
@@ -221,14 +221,18 @@ async fn domain_with_a_case(
     (domain_id, template_id, case_id, fields)
 }
 
-/// Create one case of `domain_id` and return its id.
+/// Create one case of `domain_id` and return its id. The body carries the
+/// `title` the service requires of every create.
 async fn create_case(emulator: &Emulator, domain_id: &str, template_id: &str, case: &str) -> String {
     let created = emulator
         .ok(
             case,
             "POST",
             &format!("/domains/{domain_id}/cases"),
-            json!({ "templateId": template_id, "fields": [] }),
+            json!({
+                "templateId": template_id,
+                "fields": [title_value("a case with related items")],
+            }),
         )
         .await;
     string_at(&created, "caseId", case)

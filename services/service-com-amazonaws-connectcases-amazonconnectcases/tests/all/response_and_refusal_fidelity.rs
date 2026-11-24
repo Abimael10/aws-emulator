@@ -26,9 +26,10 @@
 //!    the kinds that have none of their own); the resource that could not be
 //!    resolved is reported in the error's own `resourceId` / `resourceType`
 //!    members, which the model makes required.
-//! 4. A create refused because the template it names requires a value the request
-//!    did not provide answers `ValidationException` (400) with the service's fixed
-//!    sentence naming that one field id and nothing else.
+//! 4. A create is refused when it supplies no value for a field that must have
+//!    one: `ValidationException` (400) naming the fields the SERVICE requires of
+//!    every case in one sentence, or the first field only the chosen TEMPLATE
+//!    requires on its own.
 //! 5. `CreateRelatedItem` refuses a request whose `type` contradicts the variant
 //!    its `content` carries with `ValidationException` (400), led by the declared
 //!    type upper-cased, and associates nothing.
@@ -59,12 +60,16 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 };
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, get_case_fields, instant_at, string_at, tags_path,
-    template, Emulator,
+    domain, field_of_type, fields_of_every_type, get_case_fields, instant_at,
+    mandatory_fields_refusal, string_at, tags_path, template, template_required_field_refusal,
+    title_value, Emulator,
 };
 
 /// An Amazon Connect contact ARN, as a `Contact` related item links to one.
 const CONTACT_ARN: &str = "arn:aws:connect:us-east-1:000000000000:instance/i-1/contact/c-1";
+
+/// An Amazon Connect user ARN, as the entity that performed an edit names one.
+const AGENT_ARN: &str = "arn:aws:connect:us-east-1:000000000000:instance/i-1/agent/a-1";
 
 /// One `GetCase` entry, as the wire spells it.
 fn entry(field_id: &str, value: &Value) -> Value {
@@ -284,7 +289,10 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": { "stringValue": "x" } }],
+                "fields": [
+                    title_value("the unknown-id case"),
+                    { "id": text, "value": { "stringValue": "x" } },
+                ],
             }),
         )
         .await;
@@ -829,8 +837,8 @@ async fn a_required_field_with_no_value_is_refused_with_the_services_sentence() 
         &[text.clone(), number.clone(), boolean.clone()],
     )
     .await;
-    // A template may require a reserved System field like any other, so the
-    // sentence has to render a reserved id too.
+    // A template may require a reserved System field like any other — including
+    // the one the service already requires of every case.
     let reserved = template(
         &emulator,
         &domain_id,
@@ -838,109 +846,304 @@ async fn a_required_field_with_no_value_is_refused_with_the_services_sentence() 
         &["title".to_string(), text.clone()],
     )
     .await;
+    // A template that requires nothing: the service's own mandatory set is then
+    // the only thing a create can leave unprovided.
+    let nothing = template(&emulator, &domain_id, "requires-nothing", &[]).await;
 
     let text_value = json!({ "id": text, "value": { "stringValue": "a note" } });
     let number_value = json!({ "id": number, "value": { "doubleValue": 1.5 } });
     let boolean_value = json!({ "id": boolean, "value": { "booleanValue": true } });
-    let title_value = json!({ "id": "title", "value": { "stringValue": "a title" } });
+    let title = title_value("a title");
 
-    // The rows differ in how many fields the template requires, how many of them
-    // the request provides, WHICH one it leaves out (first, middle, last) and
-    // whether the unprovided field is a Custom or a reserved System one. The
-    // field the sentence names is the first unprovided one in the order the
-    // template declares its `requiredFields`.
-    let rows: Vec<(&str, &String, Vec<Value>, Option<String>)> = vec![
-        ("one required field, none provided", &one, vec![], Some(text.clone())),
+    /// How a create is answered: accepted, refused for the fields the SERVICE
+    /// requires of every case (named together in one sentence), or refused for
+    /// the first field only the TEMPLATE requires (named on its own).
+    enum Expected {
+        Accepted,
+        Mandatory(Vec<String>),
+        TemplateRequired(String),
+    }
+    use Expected::{Accepted, Mandatory, TemplateRequired};
+
+    // The rows differ in how the body spells its field values — the member left
+    // out entirely, carried as the empty list, or carrying one, two or three of
+    // them — in how many fields the template requires, in WHICH of them the body
+    // leaves unprovided (first, middle, last, all), in whether an unprovided
+    // field is a Custom or a reserved System one, and in whether the body
+    // carries the `title` the service itself requires. `None` for the field
+    // values is a body with NO `fields` member: it supplies a value for no
+    // field, so it is these rules that refuse it rather than a complaint about
+    // the input shape.
+    type Row<'a> = (&'static str, &'a String, Option<Vec<Value>>, Expected);
+    let rows: Vec<Row<'_>> = vec![
         (
-            "one required field, provided",
+            "one required field, the fields member absent",
             &one,
-            vec![text_value.clone()],
             None,
+            Mandatory(vec!["title".to_string()]),
         ),
         (
-            "three required, none provided",
+            "one required field, the empty list",
+            &one,
+            Some(vec![]),
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "one required field provided, but no title",
+            &one,
+            Some(vec![text_value.clone()]),
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "one required field, only the title provided",
+            &one,
+            Some(vec![title.clone()]),
+            TemplateRequired(text.clone()),
+        ),
+        (
+            "one required field, provided with the title",
+            &one,
+            Some(vec![title.clone(), text_value.clone()]),
+            Accepted,
+        ),
+        (
+            "three required, the fields member absent",
             &three,
-            vec![],
-            Some(text.clone()),
+            None,
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "three required, none provided but the title",
+            &three,
+            Some(vec![title.clone()]),
+            TemplateRequired(text.clone()),
         ),
         (
             "three required, the first provided",
             &three,
-            vec![text_value.clone()],
-            Some(number.clone()),
+            Some(vec![title.clone(), text_value.clone()]),
+            TemplateRequired(number.clone()),
         ),
         (
             "three required, the last one missing",
             &three,
-            vec![text_value.clone(), number_value.clone()],
-            Some(boolean.clone()),
+            Some(vec![title.clone(), text_value.clone(), number_value.clone()]),
+            TemplateRequired(boolean.clone()),
         ),
         (
             "three required, only the middle one missing",
             &three,
-            vec![text_value.clone(), boolean_value.clone()],
-            Some(number.clone()),
+            Some(vec![
+                title.clone(),
+                text_value.clone(),
+                boolean_value.clone(),
+            ]),
+            TemplateRequired(number.clone()),
         ),
         (
             "three required, all provided",
             &three,
-            vec![
+            Some(vec![
+                title.clone(),
                 text_value.clone(),
                 number_value.clone(),
                 boolean_value.clone(),
-            ],
-            None,
+            ]),
+            Accepted,
         ),
         (
             "three required, a field it does not require provided instead",
             &three,
-            vec![title_value.clone()],
-            Some(text.clone()),
+            Some(vec![title.clone(), number_value.clone()]),
+            TemplateRequired(text.clone()),
         ),
         (
             "a reserved System field required and missing",
             &reserved,
-            vec![text_value.clone()],
-            Some("title".to_string()),
+            Some(vec![text_value.clone()]),
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "a reserved System field required, and the Custom one missing",
+            &reserved,
+            Some(vec![title.clone()]),
+            TemplateRequired(text.clone()),
         ),
         (
             "a reserved System field required and provided",
             &reserved,
-            vec![title_value.clone(), text_value.clone()],
+            Some(vec![title.clone(), text_value.clone()]),
+            Accepted,
+        ),
+        (
+            "a template that requires nothing, the fields member absent",
+            &nothing,
+            None,
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "a template that requires nothing, the empty list",
+            &nothing,
+            Some(vec![]),
+            Mandatory(vec!["title".to_string()]),
+        ),
+        (
+            "a template that requires nothing, the title alone",
+            &nothing,
+            Some(vec![title.clone()]),
+            Accepted,
+        ),
+    ];
+
+    for (case, template_id, case_fields, expected) in rows {
+        let body = match case_fields {
+            Some(case_fields) => json!({ "templateId": template_id, "fields": case_fields }),
+            None => json!({ "templateId": template_id }),
+        };
+        let path = format!("/domains/{domain_id}/cases");
+        let expected = match expected {
+            Accepted => {
+                emulator.ok(case, "POST", &path, body).await;
+                continue;
+            }
+            Mandatory(missing) => mandatory_fields_refusal(&missing),
+            TemplateRequired(field_id) => template_required_field_refusal(&field_id),
+        };
+        let (status, code, message) = emulator
+            .failure_detail(case, "POST", &path, Some(body))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(template_id.as_str()),
+            "case {case:?}: the sentence must not carry the template id, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_create_case_member_is_refused_at_the_path_the_input_shape_gives_it() {
+    // `CreateCase` reads its own request so that a body carrying no `fields` can
+    // reach the rules above, which means that reader must refuse every other
+    // malformed member exactly as the schema-driven one does: an absent required
+    // member of the input names its own member path, one absent from a shape
+    // NESTED under a member names the trail from the input inwards (the member,
+    // the element's 1-based position, the collection step, the member), and a
+    // value of the wrong type is refused rather than stored.
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "malformed-member-domain").await;
+    let fields = fields_of_every_type(&emulator, &domain_id).await;
+    let text = field_of_type(&fields, "Text");
+    let template_id = template(&emulator, &domain_id, "malformed-member-template", &[]).await;
+    let title = title_value("a title");
+    let text_value = json!({ "id": text, "value": { "stringValue": "a note" } });
+
+    /// The sentence the service states for a required member the body left out,
+    /// at the path the input shape gives that member.
+    fn absent(path: &str) -> String {
+        format!(
+            "1 validation error detected: Value null at '{path}' failed to satisfy constraint: \
+             Member must not be null"
+        )
+    }
+
+    // The rows differ in WHICH member is malformed, how deep under the input it
+    // sits, where the offending element falls in the list, and whether it is
+    // absent or of the wrong type. `None` asks only for the refusal class, for a
+    // row whose sentence is the codec's own rather than a member path.
+    let rows: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "templateId absent",
+            json!({ "fields": [title.clone()] }),
+            Some(absent("templateId")),
+        ),
+        (
+            "the only field value carries no id",
+            json!({
+                "templateId": template_id,
+                "fields": [{ "value": { "stringValue": "a note" } }],
+            }),
+            Some(absent("fields.1.member.id")),
+        ),
+        (
+            "the only field value carries no value",
+            json!({ "templateId": template_id, "fields": [{ "id": text }] }),
+            Some(absent("fields.1.member.value")),
+        ),
+        (
+            "the second field value carries no id",
+            json!({
+                "templateId": template_id,
+                "fields": [title.clone(), { "value": { "stringValue": "a note" } }],
+            }),
+            Some(absent("fields.2.member.id")),
+        ),
+        (
+            "a fields member that is not a list at all",
+            json!({ "templateId": template_id, "fields": 7 }),
+            None,
+        ),
+        (
+            "a tag value that is not a string",
+            json!({
+                "templateId": template_id,
+                "fields": [title.clone(), text_value.clone()],
+                "tags": { "team": 7 },
+            }),
+            None,
+        ),
+        (
+            "a clientToken that is not a string",
+            json!({
+                "templateId": template_id,
+                "fields": [title.clone(), text_value.clone()],
+                "clientToken": 7,
+            }),
             None,
         ),
     ];
 
-    for (case, template_id, case_fields, missing) in rows {
-        let body = json!({ "templateId": template_id, "fields": case_fields });
-        let path = format!("/domains/{domain_id}/cases");
-        match missing {
-            None => {
-                emulator.ok(case, "POST", &path, body).await;
-            }
-            Some(field_id) => {
-                let (status, code, message) = emulator
-                    .failure_detail(case, "POST", &path, Some(body))
-                    .await;
-                assert_eq!(
-                    (status, code.as_str()),
-                    (400, "ValidationException"),
-                    "case {case:?}: expected 400 ValidationException, got {status} {code}: \
-                     {message}"
-                );
-                let expected =
-                    format!("Field value is not provided for a required field: {field_id}");
-                assert_eq!(
-                    message, expected,
-                    "case {case:?}: expected {expected:?}, got {message:?}"
-                );
-                assert!(
-                    !message.contains(template_id.as_str()),
-                    "case {case:?}: the sentence must not carry the template id, got {message:?}"
-                );
-            }
+    let path = format!("/domains/{domain_id}/cases");
+    for (case, body, expected) in rows {
+        let (status, code, message) = emulator
+            .failure_detail(case, "POST", &path, Some(body))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
+        );
+        if let Some(expected) = expected {
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
         }
     }
+
+    // And a body carrying every member well-formed is accepted, so the rows
+    // above are refused for the member they malform and not for the request.
+    emulator
+        .ok(
+            "every member well-formed",
+            "POST",
+            &path,
+            json!({
+                "templateId": template_id,
+                "fields": [title, text_value],
+                "tags": { "team": "support" },
+                "clientToken": "a-token",
+                "performedBy": { "userArn": AGENT_ARN },
+            }),
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -957,7 +1160,10 @@ async fn a_related_item_whose_type_contradicts_its_content_is_refused_and_nothin
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": { "stringValue": "x" } }],
+                "fields": [
+                    title_value("the mismatch-table case"),
+                    { "id": text, "value": { "stringValue": "x" } },
+                ],
             }),
         )
         .await;
@@ -1545,7 +1751,10 @@ async fn records(emulator: &Emulator, prefix: &str, populated: bool) -> Records 
 
     let mut case_body = json!({
         "templateId": template_id,
-        "fields": [entry(&field_id, &json!({ "stringValue": "a customer note" }))],
+        "fields": [
+            title_value("a recorded case"),
+            entry(&field_id, &json!({ "stringValue": "a customer note" })),
+        ],
     });
     if populated {
         case_body["tags"] = json!({ "team": "support" });

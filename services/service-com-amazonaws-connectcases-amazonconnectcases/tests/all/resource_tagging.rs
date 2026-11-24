@@ -32,7 +32,8 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, label, string_at, tags_path, template, Emulator,
+    domain, field_of_type, fields_of_every_type, label, string_at, tags_path, template, title_value,
+    Emulator,
 };
 
 /// The service's generic not-found sentence, written out here rather than taken
@@ -289,7 +290,10 @@ async fn one_resource_of_every_kind(emulator: &Emulator, name: &str) -> Resource
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }],
+                "fields": [
+                    title_value("a tagged case"),
+                    { "id": field_id, "value": { "stringValue": "a customer note" } },
+                ],
             }),
         )
         .await;
@@ -866,7 +870,10 @@ async fn the_tags_a_create_carried_are_the_set_a_tag_write_merges_into() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }],
+                "fields": [
+                    title_value("a tagged case"),
+                    { "id": field_id, "value": { "stringValue": "a customer note" } },
+                ],
                 "tags": { "team": "support" },
             }),
         )

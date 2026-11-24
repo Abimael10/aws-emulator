@@ -33,7 +33,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 
 // The crate's shared test harness: one emulator behind the production router,
 // and the domain-creating helper every suite in this target uses.
-use crate::harness::{domain, is_minted_id, string_at, tags_path, Emulator};
+use crate::harness::{domain, is_minted_id, string_at, tags_path, title_value, Emulator};
 
 /// Create a template in `domain_id`, optionally with an explicit `status`, and
 /// hand back its id.
@@ -868,7 +868,10 @@ async fn a_case_is_created_from_the_template_identity_an_entry_reports() {
                 &format!("/domains/{domain_id}/cases"),
                 json!({
                     "templateId": id,
-                    "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }],
+                    "fields": [
+                        title_value("a case from a listed template"),
+                        { "id": field_id, "value": { "stringValue": "a customer note" } },
+                    ],
                 }),
             )
             .await;

@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, refused_as_not_found, string_at, template,
-    Emulator,
+    title_value, Emulator,
 };
 
 /// The service's generic not-found sentence, written out here rather than taken
@@ -369,7 +369,10 @@ async fn a_case_refusal_is_worded_by_the_operation_that_raises_it() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": { "stringValue": "to-delete" } }],
+                "fields": [
+                    title_value("a case to delete"),
+                    { "id": text, "value": { "stringValue": "to-delete" } },
+                ],
             }),
         )
         .await;

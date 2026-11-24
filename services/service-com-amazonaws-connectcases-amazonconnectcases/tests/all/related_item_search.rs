@@ -29,7 +29,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
 };
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, Emulator,
+    domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, title_value,
+    Emulator,
 };
 
 /// An Amazon Connect contact ARN: the external identifier a `Contact` item
@@ -137,14 +138,18 @@ impl Fixture {
     }
 }
 
-/// Create a case of `domain_id` and return its id.
+/// Create a case of `domain_id` and return its id. The body carries the `title`
+/// the service requires of every create.
 async fn create_case(emulator: &Emulator, domain_id: &str, template_id: &str, case: &str) -> String {
     let created = emulator
         .ok(
             case,
             "POST",
             &format!("/domains/{domain_id}/cases"),
-            json!({ "templateId": template_id, "fields": [] }),
+            json!({
+                "templateId": template_id,
+                "fields": [title_value("a case with related items")],
+            }),
         )
         .await;
     string_at(&created, "caseId", case)

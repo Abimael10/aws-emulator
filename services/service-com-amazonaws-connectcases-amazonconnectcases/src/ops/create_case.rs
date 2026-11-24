@@ -5,6 +5,14 @@
 //! its creation as the first entry of that case's audit history.
 //! It is the ONLY file to touch for this operation.
 //!
+//! Two rules decide whether a create carries the field values it must. The
+//! SERVICE requires a value for the case's own mandatory fields on every create
+//! ([`crate::state::MANDATORY_CASE_FIELD_IDS`]), whatever template the request
+//! names; the chosen TEMPLATE requires a value for each of its own
+//! `requiredFields`. The request is read through [`CreateCaseWireInput`], so a
+//! body carrying no `fields` at all is refused by those rules rather than as an
+//! absent input member.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -139,6 +147,167 @@ impl From<CreateCaseErrorModeled> for CreateCaseError {
     }
 }
 
+/// The Smithy member names of `CreateCaseRequest`, as
+/// `smithy_query(query="operation", operation="CreateCase")` lists them:
+/// `domainId` (`@httpLabel`, `@required`), `templateId` (`@required`), `fields`
+/// (`@required`, `FieldValueList` with `@length(max: 220)`), `clientToken`
+/// (`@idempotencyToken`), `performedBy` and `tags`.
+const DOMAIN_ID_MEMBER: &str = "domainId";
+const TEMPLATE_ID_MEMBER: &str = "templateId";
+const FIELDS_MEMBER: &str = "fields";
+const CLIENT_TOKEN_MEMBER: &str = "clientToken";
+const PERFORMED_BY_MEMBER: &str = "performedBy";
+const TAGS_MEMBER: &str = "tags";
+
+/// This operation's input, read with an ABSENT `fields` taken as the EMPTY list
+/// of field values rather than as a missing member.
+///
+/// Which fields a case MUST carry a value for is the service's rule and the
+/// chosen template's, not the input shape's: the service requires a value for
+/// the case's own mandatory fields on every create
+/// ([`crate::state::MANDATORY_CASE_FIELD_IDS`]), and a template's
+/// `requiredFields` is the "List of fields that must have a value provided to
+/// create a case" (`smithy_query(query="doc",shape="RequiredField")`). A body
+/// that names no field value supplies a value for none of either set, so it is
+/// those rules the create is refused by — and their sentences name the
+/// unprovided fields ([`crate::state::mandatory_case_fields_required`],
+/// [`crate::state::required_field_not_provided`]), which a complaint about the
+/// presence of the input member cannot say. `FieldValueList` carries no
+/// `@length(min:)` either (`@length(max: 220)` only), so the empty list is a
+/// value the model admits and "no field values at all" is what it looks like on
+/// the wire.
+///
+/// Only the ABSENT case is defaulted; every other member is read exactly as the
+/// generated deserializer reads it, `domainId` and `templateId` included — both
+/// are still refused when absent, since neither names a resource the service can
+/// resolve the template's rule against, and the constraints the centralized walk
+/// applies after this step run against the SAME input schema.
+#[derive(Debug, Clone)]
+pub struct CreateCaseWireInput(pub CreateCaseInput);
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CreateCaseWireInput {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut domain_id: Option<String> = None;
+        let mut template_id: Option<String> = None;
+        // The empty list the model admits: left as it is when the request carries
+        // no `fields`, which is how a body spells "no field values".
+        let mut fields: Vec<FieldValue> = Vec::new();
+        let mut client_token: Option<String> = None;
+        let mut performed_by: Option<UserUnion> = None;
+        let mut tags: Option<::std::collections::HashMap<String, String>> = None;
+        deserializer.read_struct(
+            super::types::CREATE_CASE_INPUT_SCHEMA,
+            &mut |member, member_deserializer| {
+                match member.member_name() {
+                    Some(DOMAIN_ID_MEMBER) => {
+                        domain_id = Some(
+                            member_deserializer.read_string(member).map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, DOMAIN_ID_MEMBER)
+                            })?,
+                        );
+                    }
+                    Some(TEMPLATE_ID_MEMBER) => {
+                        template_id = Some(
+                            member_deserializer.read_string(member).map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, TEMPLATE_ID_MEMBER)
+                            })?,
+                        );
+                    }
+                    Some(FIELDS_MEMBER) => {
+                        let mut read: Vec<FieldValue> = Vec::new();
+                        // The element being read, so a required member absent
+                        // from one field value reports its position, as the
+                        // generated reader does. The position is attached INSIDE
+                        // the element, so a `fields` that is not a list at all —
+                        // where no element is ever visited — is reported as the
+                        // member it is rather than as a position within it.
+                        let mut position = 0usize;
+                        member_deserializer
+                            .read_list(member, &mut |element| {
+                                position += 1;
+                                read.push(
+                                    <FieldValue as
+                                        ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                                        element,
+                                    )
+                                    .map_err(|error| {
+                                        ::aws_smithy_schema_server::within_list_element(
+                                            error, position,
+                                        )
+                                    })?,
+                                );
+                                Ok(())
+                            })
+                            .map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, FIELDS_MEMBER)
+                            })?;
+                        fields = read;
+                    }
+                    Some(CLIENT_TOKEN_MEMBER) => {
+                        client_token = Some(
+                            member_deserializer.read_string(member).map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, CLIENT_TOKEN_MEMBER)
+                            })?,
+                        );
+                    }
+                    Some(PERFORMED_BY_MEMBER) => {
+                        performed_by = Some(
+                            <UserUnion as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                                member_deserializer,
+                            )
+                            .map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, PERFORMED_BY_MEMBER)
+                            })?,
+                        );
+                    }
+                    Some(TAGS_MEMBER) => {
+                        let mut read: ::std::collections::HashMap<String, String> =
+                            ::std::collections::HashMap::new();
+                        member_deserializer
+                            .read_map(member, &mut |key, value_deserializer| {
+                                read.insert(key, value_deserializer.read_string(member)?);
+                                Ok(())
+                            })
+                            .map_err(|error| {
+                                ::aws_smithy_schema_server::within_member(error, TAGS_MEMBER)
+                            })?;
+                        tags = Some(read);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self(CreateCaseInput {
+            // A path label and the template reference: absent from a request
+            // that named no domain or no template at all, which stays the
+            // framework's own missing-member refusal.
+            domain_id: domain_id
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member(DOMAIN_ID_MEMBER))?,
+            template_id: template_id
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member(TEMPLATE_ID_MEMBER))?,
+            fields,
+            client_token,
+            performed_by,
+            tags,
+        }))
+    }
+}
+
+/// The modelled input's own member writing, so the centralized walk's constraint
+/// validation — which drives the input as a serializer over
+/// `CREATE_CASE_INPUT_SCHEMA` — sees exactly the members the model declares.
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateCaseWireInput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ::aws_smithy_schema::serde::SerializableStruct::serialize_members(&self.0, serializer)
+    }
+}
+
 /// The `CreateCase` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,7 +330,7 @@ impl<Eng> CreateCase<Eng> {
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateCase<Eng>
 {
-    type Input = CreateCaseInput;
+    type Input = CreateCaseWireInput;
     type Output = CreateCaseOutput;
     type Error = CreateCaseError;
 
@@ -175,6 +344,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled request, with an absent `fields` already read as the
+        // empty list of field values (see [`CreateCaseWireInput`]).
+        let input = input.0;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCaseErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -286,8 +458,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateCaseErrorModeled::ValidationException(refusal).into());
         }
 
-        // The template's `requiredFields` is the "List of fields that must have
-        // a value provided to create a case"
+        // The service requires a value for the case's own mandatory fields on
+        // every create, whatever the template says: "The following fields are
+        // required when creating a case: ... title"
+        // (`smithy_query(query="doc",shape="CreateCase")`). It is the service's
+        // rule rather than one template's, so it is stated over the whole set of
+        // mandatory fields the body left unprovided, and it is answered before
+        // the template's `requiredFields` are looked at.
+        let missing_mandatory =
+            crate::state::missing_mandatory_case_fields(input.fields.iter().map(|f| f.id.as_str()));
+        if !missing_mandatory.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(
+                crate::state::mandatory_case_fields_required(&missing_mandatory),
+            )
+            .into());
+        }
+
+        // Beyond those, the template's `requiredFields` is the "List of fields
+        // that must have a value provided to create a case"
         // (`smithy_query(query="doc",shape="RequiredField")`), so a create that
         // names no value for one of them is refused before anything is stored,
         // naming the first such field in the order the template declares them.

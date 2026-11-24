@@ -226,10 +226,17 @@ pub async fn listed_tags(emulator: &Emulator, case: &str, arn: &str) -> Value {
     })
 }
 
-/// `CreateCase` from `template_id`, writing `field_id` as a `Text` value, as the
-/// case id it minted. `fields` is `@length(1..)`
-/// (`smithy_query(query="operation", operation="CreateCase")`), so one value is
-/// the smallest body the model accepts.
+/// The `title` entry a `CreateCase` body carries: the service requires a value
+/// for `title` on every create, whatever the template declares ("The following
+/// fields are required when creating a case: ... title",
+/// `smithy_query(query="doc", shape="CreateCase")`), so every suite's create
+/// supplies one.
+pub fn title_value(title: &str) -> Value {
+    json!({ "id": "title", "value": { "stringValue": title } })
+}
+
+/// `CreateCase` from `template_id`, writing `field_id` as a `Text` value beside
+/// the `title` every create must carry, as the case id it minted.
 pub async fn create_case(
     emulator: &Emulator,
     case: &str,
@@ -244,7 +251,10 @@ pub async fn create_case(
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }]
+                "fields": [
+                    title_value("a case title"),
+                    { "id": field_id, "value": { "stringValue": "a customer note" } }
+                ]
             }),
         )
         .await;
@@ -495,6 +505,24 @@ pub async fn get_case_fields(
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("case {case:?}: GetCase returned no fields list: {response:?}"))
         .clone()
+}
+
+/// The refusal `CreateCase` answers a body that supplies no value for a field
+/// the SERVICE requires of every case — `title` — naming `missing` in the order
+/// the service's own mandatory set declares them.
+///
+/// The ids are joined the way `state::name_ids` renders a short list; that
+/// function also caps how many a refusal names, which this set is far too small
+/// to reach.
+pub fn mandatory_fields_refusal(missing: &[String]) -> String {
+    format!("Field(s) {} are required", missing.join(", "))
+}
+
+/// The refusal `CreateCase` answers a body that supplies no value for a field
+/// only the chosen TEMPLATE requires: the first such field, in the order the
+/// template declares its `requiredFields`.
+pub fn template_required_field_refusal(field_id: &str) -> String {
+    format!("Field value is not provided for a required field: {field_id}")
 }
 
 /// `true` when `id` is a server-minted resource id: the 8-4-4-4-12 lowercase

@@ -29,7 +29,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // shared with this crate's other suites.
 use crate::harness::{
     domain, field_of_type, fields_of_every_type, instant_at, is_minted_id, string_at, template,
-    Emulator, DEFAULT_ACCESS_KEY_ID,
+    title_value, Emulator, DEFAULT_ACCESS_KEY_ID,
 };
 
 /// A second caller, so an edge attributed to the caller's own credentials is
@@ -283,8 +283,10 @@ async fn the_audit_history_reports_one_entry_per_edit_of_the_case_newest_first()
     let date_time = field_of_type(&fields, "DateTime");
     let url = field_of_type(&fields, "Url");
 
-    // The values the case is created with: its first edit.
+    // The values the case is created with: its first edit — led by the `title`
+    // the service requires of every create.
     let created_writes = vec![
+        ("title".to_string(), json!({ "stringValue": "an audited case" })),
         (text.clone(), json!({ "stringValue": "a customer note" })),
         (number.clone(), json!({ "doubleValue": 42.5 })),
     ];
@@ -446,7 +448,10 @@ async fn the_audit_history_is_paged_newest_first_within_the_modelled_page_size()
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": value_of_edit(0) }],
+                "fields": [
+                    title_value("a paged-history case"),
+                    { "id": text, "value": value_of_edit(0) },
+                ],
             }),
         )
         .await;
@@ -571,7 +576,10 @@ async fn the_audit_history_resolves_its_references_and_dies_with_the_case() {
     let text = field_of_type(&fields, "Text");
     let body = json!({
         "templateId": template_id,
-        "fields": [{ "id": text, "value": { "stringValue": "a customer note" } }],
+        "fields": [
+            title_value("a case with a history"),
+            { "id": text, "value": { "stringValue": "a customer note" } },
+        ],
     });
     let first = emulator
         .ok(
@@ -689,7 +697,10 @@ async fn the_audit_history_keeps_at_most_the_most_recent_recorded_edits() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": value_of_edit(0) }],
+                "fields": [
+                    title_value("a case at the history ceiling"),
+                    { "id": text, "value": value_of_edit(0) },
+                ],
             }),
         )
         .await;

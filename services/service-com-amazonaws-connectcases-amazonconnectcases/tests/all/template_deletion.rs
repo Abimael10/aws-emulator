@@ -33,7 +33,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::{
     TAG_PROPAGATION_RESOURCE_TYPE_VALUES, TEMPLATE_STATUS_VALUES,
 };
 
-use crate::harness::{domain, string_at, Emulator};
+use crate::harness::{domain, string_at, title_value, Emulator};
 use crate::template_listing::{list, listed_ids, status_query};
 use crate::template_update::{create_template, get_template, layout, required, text_field};
 
@@ -61,9 +61,9 @@ async fn delete_template(
 
 /// `CreateCase` against `template_id`, writing `field_id`, as its answer body.
 /// The template the rows below create requires no field, so this create can only
-/// be refused over the template itself. `fields` is `@length(1..)`
-/// (`smithy_query(query="operation", operation="CreateCase")`), so one value is
-/// the smallest body the model accepts.
+/// be refused over the template itself — `fields` carries the `title` the service
+/// requires of every create beside the row's own value (see
+/// [`crate::harness::title_value`]).
 async fn create_case(
     emulator: &Emulator,
     case: &str,
@@ -86,7 +86,10 @@ async fn create_case(
 fn case_body(template_id: &str, field_id: &str) -> Value {
     json!({
         "templateId": template_id,
-        "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }]
+        "fields": [
+            title_value("a case from a template"),
+            { "id": field_id, "value": { "stringValue": "a customer note" } },
+        ]
     })
 }
 

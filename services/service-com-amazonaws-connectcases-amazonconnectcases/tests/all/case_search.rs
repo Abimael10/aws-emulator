@@ -26,7 +26,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // The request plumbing and the lifecycle helpers live in `tests/all/harness.rs`,
 // shared with this crate's other suites.
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, Emulator,
+    domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, title_value,
+    Emulator,
 };
 
 /// A user ARN written into the `User` field of the `with-a-user-arn` case; it is
@@ -167,7 +168,10 @@ impl Fixture {
     }
 }
 
-/// Create one case and return its id.
+/// Create one case and return its id. Every body carries the `title` the
+/// service requires of every create, beside the row's own values; its text
+/// carries none of the words the search terms below look for, so it narrows
+/// nothing.
 async fn create_case(
     emulator: &Emulator,
     case: &str,
@@ -176,7 +180,11 @@ async fn create_case(
     fields: Value,
     tags: Option<Value>,
 ) -> String {
-    let mut body = json!({ "templateId": template_id, "fields": fields });
+    let mut values = vec![title_value("a support request")];
+    if let Some(written) = fields.as_array() {
+        values.extend(written.iter().cloned());
+    }
+    let mut body = json!({ "templateId": template_id, "fields": values });
     if let Some(tags) = tags {
         body["tags"] = tags;
     }

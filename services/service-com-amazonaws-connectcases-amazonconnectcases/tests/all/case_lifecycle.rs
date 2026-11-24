@@ -23,7 +23,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // shared with this crate's other suites.
 use crate::harness::{
     domain, field_of_type, field_value_variants, fields_of_every_type, get_case_fields,
-    is_minted_id, string_at, template, Emulator,
+    is_minted_id, string_at, template, template_required_field_refusal, title_value, Emulator,
 };
 
 #[tokio::test]
@@ -210,11 +210,14 @@ async fn the_domain_field_template_case_lifecycle_round_trips_through_state() {
     );
 
     // 4. CreateCase persists one value per FieldValueUnion variant, each
-    //    written against a field of the type that variant carries.
-    let case_fields: Vec<Value> = written
-        .iter()
-        .map(|(id, value)| json!({ "id": id, "value": value }))
-        .collect();
+    //    written against a field of the type that variant carries — beside the
+    //    `title` the service requires of every create.
+    let mut case_fields: Vec<Value> = vec![title_value("the lifecycle case")];
+    case_fields.extend(
+        written
+            .iter()
+            .map(|(id, value)| json!({ "id": id, "value": value })),
+    );
     let case_created = emulator
         .ok(
             "CreateCase",
@@ -366,7 +369,10 @@ async fn create_case_is_idempotent_per_client_token() {
         async move {
             let mut body = json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": note } }],
+                "fields": [
+                    title_value("an idempotent case"),
+                    { "id": field_id, "value": { "stringValue": note } },
+                ],
             });
             if let Some(token) = token {
                 body["clientToken"] = json!(token);
@@ -452,7 +458,10 @@ async fn an_id_the_domain_does_not_hold_is_refused_with_the_modeled_error() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": "x" } }],
+                "fields": [
+                    title_value("the reference case"),
+                    { "id": field_id, "value": { "stringValue": "x" } },
+                ],
             }),
         )
         .await;
@@ -698,7 +707,10 @@ async fn a_client_token_is_remembered_per_domain() {
                 &format!("/domains/{domain_id}/cases"),
                 json!({
                     "templateId": template_id,
-                    "fields": [{ "id": field_id, "value": { "stringValue": name } }],
+                    "fields": [
+                        title_value("a token-scoped case"),
+                        { "id": field_id, "value": { "stringValue": name } },
+                    ],
                     "clientToken": "the-same-token",
                 }),
             )
@@ -811,7 +823,10 @@ async fn a_field_id_list_is_bounded_and_a_repeat_is_refused_only_on_a_write() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": field_id, "value": { "stringValue": "x" } }],
+                "fields": [
+                    title_value("the bounds-table case"),
+                    { "id": field_id, "value": { "stringValue": "x" } },
+                ],
             }),
         )
         .await;
@@ -1043,7 +1058,10 @@ async fn a_field_value_must_be_a_value_of_its_field_s_declared_type() {
                 &format!("/domains/{domain_id}/cases"),
                 json!({
                     "templateId": template_id,
-                    "fields": [{ "id": field_id, "value": accepted }],
+                    "fields": [
+                        title_value("a typed case"),
+                        { "id": field_id, "value": accepted },
+                    ],
                 }),
             )
             .await;
@@ -1274,7 +1292,10 @@ async fn every_minted_id_is_distinct_and_opaque() {
                 &format!("/domains/{domain_id}/cases"),
                 json!({
                     "templateId": template_id,
-                    "fields": [{ "id": field_id, "value": { "stringValue": "same value" } }],
+                    "fields": [
+                        title_value("a minted case"),
+                        { "id": field_id, "value": { "stringValue": "same value" } },
+                    ],
                 }),
             )
             .await;
@@ -1416,7 +1437,11 @@ async fn a_case_must_provide_a_value_for_every_field_its_template_requires() {
     ];
 
     for (case, template_id, case_fields, accepted, must_name) in rows {
-        let body = json!({ "templateId": template_id, "fields": case_fields });
+        // Every body carries the `title` the service requires of every create,
+        // so the rule under test is the TEMPLATE's `requiredFields` alone.
+        let mut supplied = vec![title_value("a required-fields case")];
+        supplied.extend(case_fields);
+        let body = json!({ "templateId": template_id, "fields": supplied });
         let path = format!("/domains/{domain_id}/cases");
         if accepted {
             let created = emulator.ok(case, "POST", &path, body).await;
@@ -1435,14 +1460,11 @@ async fn a_case_must_provide_a_value_for_every_field_its_template_requires() {
                 "case {case:?}: a missing required field is a 400 ValidationException, \
                  got {status} {code}: {message}"
             );
-            // The refusal is the service's fixed sentence naming the FIRST
-            // required field the request provided no value for, in the order the
-            // template declares them, and nothing else: the template is
-            // addressed by the request, so its id is not part of the message.
-            let expected = format!(
-                "Field value is not provided for a required field: {}",
-                must_name[0]
-            );
+            // The refusal names the FIRST required field the request provided
+            // no value for, in the order the template declares them, and nothing
+            // else: the template is addressed by the request, so its id is not
+            // part of the message.
+            let expected = template_required_field_refusal(&must_name[0]);
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"

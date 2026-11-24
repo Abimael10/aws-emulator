@@ -152,6 +152,33 @@ pub const RESERVED_SYSTEM_FIELDS: &[(&str, &str, &str)] = &[
     ("title", "Title", "Text"),
 ];
 
+/// The case fields a CREATE must carry a value for whatever template it names:
+/// "The following fields are required when creating a case: ... title"
+/// (`smithy_query(query="doc", shape="CreateCase")`). The service's own rule,
+/// not a template's, so it holds for every template — including one whose
+/// `requiredFields` is empty.
+///
+/// `customer_id`, which that sentence also names, is NOT in the set: a create
+/// that supplies no field value at all is refused naming `title` alone, so the
+/// profile reference is not a value the service demands of every case. An
+/// UPDATE has no such set: the fields a stored case already holds are not
+/// re-supplied to change one of them.
+pub const MANDATORY_CASE_FIELD_IDS: &[&str] = &["title"];
+
+/// The [`MANDATORY_CASE_FIELD_IDS`] that `provided` does not name, in the order
+/// the set declares them. Empty means the create carries a value for each of
+/// them, which is what lets the template's own `requiredFields` be looked at
+/// next.
+pub fn missing_mandatory_case_fields<'a, I: IntoIterator<Item = &'a str>>(
+    provided: I,
+) -> Vec<String> {
+    let mandatory: Vec<String> = MANDATORY_CASE_FIELD_IDS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect();
+    ids_not_provided(&mandatory, provided)
+}
+
 /// Most domains this emulator's store holds. EMULATOR-OWNED ceiling on
 /// request-driven growth, not an AWS-published quota: the real service's limit
 /// is an account quota a support request can raise, while this one exists so a
@@ -1292,10 +1319,28 @@ pub fn deleted_fields(ids: &[String]) -> ValidationException {
 /// The sentence names the one required field the request did not provide — the
 /// first of them, in the order the template declares its `requiredFields` — and
 /// nothing else: the template is addressed by the request, so its id is not
-/// interpolated into the refusal.
+/// interpolated into the refusal. The fields the SERVICE requires of every case,
+/// whatever the template, are refused by [`mandatory_case_fields_required`]
+/// instead, which states the whole set in one sentence.
 pub fn required_field_not_provided(field_id: &str) -> ValidationException {
     ValidationException {
         message: format!("Field value is not provided for a required field: {field_id}"),
+    }
+}
+
+/// The modelled 400 for a create that supplies no value for a field the service
+/// itself requires of every case ([`MANDATORY_CASE_FIELD_IDS`]), as
+/// [`missing_mandatory_case_fields`] reports them.
+///
+/// The service's fixed text is `Field(s) ` … ` are required`, and the one
+/// variable part is those field ids, in the order the mandatory set declares
+/// them. They are the service's own, not the request's and not the template's,
+/// and are rendered by [`name_ids`] so the refusal cannot grow without bound.
+/// A field only the TEMPLATE requires is refused by
+/// [`required_field_not_provided`] instead, one field at a time.
+pub fn mandatory_case_fields_required(field_ids: &[String]) -> ValidationException {
+    ValidationException {
+        message: format!("Field(s) {} are required", name_ids(field_ids)),
     }
 }
 

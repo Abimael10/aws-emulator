@@ -16,7 +16,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::RESOURCE_NOT_FOUND_MESSAGE;
 
-use crate::harness::{domain, field_of_type, fields_of_every_type, string_at, template, Emulator};
+use crate::harness::{
+    domain, field_of_type, fields_of_every_type, string_at, template, title_value, Emulator,
+};
 
 /// How a refusal about a case is worded, written out here rather than taken
 /// from the crate so the expectations are independent of the code under test:
@@ -160,7 +162,10 @@ async fn every_operation_that_addresses_a_missing_case_answers_the_case_sentence
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": { "stringValue": "to-delete" } }],
+                "fields": [
+                    title_value("a case to delete"),
+                    { "id": text, "value": { "stringValue": "to-delete" } },
+                ],
             }),
         )
         .await;
@@ -230,7 +235,10 @@ async fn the_case_sentence_is_about_the_case_the_request_names() {
             &format!("/domains/{domain_id}/cases"),
             json!({
                 "templateId": template_id,
-                "fields": [{ "id": text, "value": { "stringValue": "a note" } }],
+                "fields": [
+                    title_value("a surviving case"),
+                    { "id": text, "value": { "stringValue": "a note" } },
+                ],
             }),
         )
         .await;

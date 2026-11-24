@@ -26,7 +26,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::RESOURCE_NOT_F
 
 // The request plumbing lives in `tests/all/harness.rs`, shared with this crate's
 // other suites.
-use crate::harness::{is_minted_id, string_at, Emulator};
+use crate::harness::{is_minted_id, string_at, title_value, Emulator};
 
 /// `DeleteDomain`: `DELETE /domains/{domainId}`
 /// (`smithy_query(query="operation", operation="DeleteDomain")`).
@@ -363,7 +363,10 @@ async fn build(emulator: &Emulator, name: &str, content: Content) -> Built {
                     &format!("/domains/{domain_id}/cases"),
                     json!({
                         "templateId": template_id,
-                        "fields": [{ "id": field_id, "value": { "stringValue": "a customer note" } }],
+                        "fields": [
+                            title_value("a case in a doomed domain"),
+                            { "id": field_id, "value": { "stringValue": "a customer note" } },
+                        ],
                     }),
                 )
                 .await;
