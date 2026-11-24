@@ -17,8 +17,9 @@
 //! * `AnalyzeDocument` with `FORMS` reads the same page into the same `PAGE`/`LINE`/`WORD`
 //!   layer and adds the `KEY_VALUE_SET` pair of each labelled line, which exists only
 //!   because the label and its value were separated into words at all;
-//! * the `PAGE` block's box spans the page's CONTENT — every mark found on it, including a
-//!   rule that is no line of text — rather than the first line that was read;
+//! * the `PAGE` block's box is the PAGE — the whole of the raster that was submitted —
+//!   and every mark found on the page, a rule that is no line of text included, sits
+//!   inside it;
 //! * a page submitted turned a quarter, a half or three quarters of a turn reads the same
 //!   characters, reports every word where its ink sits on the page AS SUBMITTED, and
 //!   reports the turn the words are drawn at as the `RotationAngle` of every `WORD`.
@@ -728,12 +729,32 @@ async fn a_pages_blocks_describe_the_words_that_were_drawn_on_it() {
             }
         }
 
-        // The PAGE spans the page's content: every mark found on it, the rule included.
+        // The PAGE is the page: a `PAGE` block's box is the bounding box around the
+        // DETECTED PAGE, which for a submitted raster is the whole raster, whatever was
+        // drawn on it and whichever turn it was submitted at. Every mark drawn on it — the
+        // letters, and the rules and panels around them — therefore sits inside it, as
+        // does every word read off it.
         let page_box = bbox_of(case.name, of_type(&blocks, "PAGE")[0]);
+        assert!(
+            page_box.matches(
+                &Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                1e-6
+            ),
+            "case {:?}: the PAGE box must be the page itself, got {page_box:?}",
+            case.name
+        );
         let content = turned(drawn.content, case.turns, drawn_width, drawn_height);
         assert!(
-            page_box.matches(&content, tol),
-            "case {:?}: the PAGE box must span the page's content ({content:?}), got \
+            content.left >= page_box.left - tol
+                && content.top >= page_box.top - tol
+                && content.right() <= page_box.right() + tol
+                && content.bottom() <= page_box.bottom() + tol,
+            "case {:?}: every mark on the page ({content:?}) must sit inside its PAGE, got \
              {page_box:?}",
             case.name
         );

@@ -62,9 +62,9 @@
 //!    the blocks carry is the position and the size the recogniser measured rather than a
 //!    typographic grid. Each measurement is both the box around the ink and its
 //!    [`Outline`] — the four extreme marks themselves — so a block can report the
-//!    fine-grained polygon around its item as well as the coarse box. The page's own
-//!    content is measured too ([`Recognised::content`]): every mark found on it, read as
-//!    text or not.
+//!    fine-grained polygon around its item as well as the coarse box. The PAGE itself is
+//!    not measured off ink: a `PAGE` block locates the page, which is the whole of what
+//!    was submitted.
 //!
 //! No maintained Rust crate performs offline OCR: the ones that exist either bind to a
 //! C library or load neural-network weights from a file this emulator may not fetch, so
@@ -423,10 +423,6 @@ pub struct Recognised {
     /// it was submitted, and the quarter turn its characters are turned by when the page
     /// had to be turned to read them.
     pub rotation: f32,
-    /// The extent of the page's own CONTENT: every mark found on it, whether or not the
-    /// mark was read as a character, so a rule, a border or a logo is part of the content
-    /// of the page it is on. `None` on a page carrying no ink at all.
-    pub content: Option<Marks>,
 }
 
 /// Where something sits on a page, in the page-relative fractions `BoundingBox` and
@@ -619,7 +615,6 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         text: best.text,
         lines: best.lines,
         rotation: best.rotation,
-        content: ink.content(Orientation::upright(&ink)),
     })
 }
 
@@ -1104,32 +1099,6 @@ impl Ink {
             return 0;
         }
         self.ink.get(y * self.width + x).copied().unwrap_or(0)
-    }
-
-    /// The extent of the page's CONTENT: the box enclosing every mark on it and the
-    /// outline of those marks, as fractions of the page, or `None` for a page carrying no
-    /// ink.
-    ///
-    /// Every mark, not only the marks that were read as characters: a rule, a border or a
-    /// logo is part of the content of the page it is drawn on, and the `PAGE` block's
-    /// `Geometry` bounds what is on the page rather than what could be named.
-    ///
-    /// ONE pass over the page: the box and the outline are the bounds and the extremes of
-    /// the same marks, so both come out of the same scan ([`Extremes`]).
-    fn content(&self, orientation: Orientation) -> Option<Marks> {
-        let mut extremes = Extremes::default();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                if self.at(x, y) {
-                    extremes.mark(x, y);
-                }
-            }
-        }
-        let (x0, x1, y0, y1) = extremes.bounds()?;
-        Some(Marks {
-            rect: orientation.rect(x0, x1, y0, y1),
-            outline: self.outline_of(&extremes, (x0, x1, y0, y1), orientation),
-        })
     }
 
     /// Where the ink inside `x0..=x1` by `y0..=y1` sits on the submitted page: the box

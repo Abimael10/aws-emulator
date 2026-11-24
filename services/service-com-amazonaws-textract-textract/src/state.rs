@@ -64,10 +64,10 @@
 //!   columns and lengths place them on ([`bounding_box`]) and report the page's own
 //!   confidence — a per-word spread there would be a measurement nothing made;
 //! * every block above a word spans exactly the words it was read from (a `LINE`, a
-//!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), and a `PAGE` spans the page's
-//!   CONTENT — every mark found on it, whether or not it was read as a character, so a
-//!   rule, a border or a logo is part of the page it is drawn on — rather than claiming
-//!   the whole page;
+//!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), while a `PAGE` is the one block
+//!   whose item is not ink at all: `BoundingBox` is "the bounding box around the detected
+//!   page, text, …", so a `PAGE` locates the PAGE — the whole document page, which is the
+//!   whole of what was submitted — and the ink on it is located by its children;
 //! * a `WORD` reports as its `Geometry$RotationAngle` the quarter turn its characters were
 //!   read at, which [`ocr`] establishes by reading the page at each of its turns;
 //! * `BoundingBox` is "an axis-aligned COARSE representation of the location of the
@@ -1357,8 +1357,8 @@ pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
 // Reading a document
 // ---------------------------------------------------------------------------
 
-/// One page as [`ocr`] MEASURED it off the submitted pixels: its lines in reading order,
-/// the angle its characters were read at, and the extent of the page's own content.
+/// One page as [`ocr`] MEASURED it off the submitted pixels: its lines in reading order
+/// and the angle its characters were read at.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeasuredPage {
     /// Where the text of this page sits on it, one entry per line of the page's text and
@@ -1368,9 +1368,6 @@ pub struct MeasuredPage {
     /// as it was submitted — which is what its `WORD` blocks report as
     /// `Geometry$RotationAngle`.
     pub rotation: f32,
-    /// The extent of the page's CONTENT: every mark found on it, read as text or not.
-    /// `None` for a page carrying no ink at all.
-    pub content: Option<ocr::Marks>,
 }
 
 /// A document's text, one entry per page, the confidence it was read with, and where on
@@ -1605,7 +1602,6 @@ pub fn read_content(
             measured: vec![MeasuredPage {
                 lines: page.lines,
                 rotation: page.rotation,
-                content: page.content,
             }],
         });
     }
@@ -2260,25 +2256,19 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
         children.extend(table_ids);
 
         let mut page_block = new_block("PAGE", block_id(key, "PAGE", &[page_index]), page_number);
-        // A PAGE's `Geometry` bounds what is ON the page: the extent of the content the
-        // reader found there, together with the blocks it was read into. A page read off
-        // pixels reports the extent of its own marks, so a rule, a border or a logo the
-        // recogniser could not name is still part of the content the page block spans; a
-        // page whose text carries no measurement reports the box enclosing its blocks.
-        // A page nothing was found on has nothing to bound, so it reports the whole page:
-        // that IS what was examined.
-        let content_region = content
-            .measured_page(page_index)
-            .and_then(|page| page.content.as_ref())
-            .map(|marks| Region::measured(marks, rotation));
-        let page_region = Region::spanning(
-            lines
-                .iter()
-                .map(|line| &line.region)
-                .chain(content_region.iter()),
-            rotation,
-        )
-        .unwrap_or_else(|| Region::of_box(box_of(&ocr::Rect::whole_page()), rotation));
+        // A PAGE block's `Geometry` says where the DETECTED PAGE is. `Geometry` is
+        // "information about where the following items are located on a document page:
+        // detected page, text, key-value pairs, tables, table cells, and selection
+        // elements" and `BoundingBox` is "the bounding box around the detected page, text,
+        // …" — so the item a PAGE block locates is the page, and the ink that happens to
+        // be on it is what its CHILD blocks locate. A page whose text sits in one band of
+        // it is therefore still a whole page, which is why the box here does not follow
+        // the ink: every pixel submitted is page, because this service reads the document
+        // it is given as one page and looks for no smaller page inside a photograph of
+        // one. The polygon is that page's four corners, listed from the corner its
+        // characters were read from, so a page submitted turned outlines itself in the
+        // frame it was read in.
+        let page_region = Region::of_box(box_of(&ocr::Rect::whole_page()), rotation);
         page_block.geometry = Some(page_region.geometry());
         if !children.is_empty() {
             page_block.relationships = Some(vec![relationship("CHILD", children)]);

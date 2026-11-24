@@ -12,7 +12,9 @@
 //! inside that box, on each of the box's edges, and makes it follow the item's own shape
 //! rather than restate the four corners of the rectangle around it. The points run
 //! clockwise from the corner the item's characters were READ from, so a page submitted
-//! turned reports the outline of each item in the frame it was read in.
+//! turned reports the outline of each item in the frame it was read in. The one block
+//! whose item is not ink is the `PAGE`: it outlines the page, so its four points are the
+//! page's own corners.
 //!
 //! The rows of the table differ along what the rule generalises over: the size the text is
 //! drawn at, the polarity of the ink, the stroke weight, whether a rule is drawn across
@@ -160,54 +162,10 @@ fn rotation_of(block: &Value) -> Option<f64> {
         .and_then(Value::as_f64)
 }
 
-/// The four extreme marks of the ink DRAWN on `page` — the topmost, the rightmost, the
-/// bottommost and the leftmost — clockwise from the one nearest the page's top-left
-/// corner, as the page-relative points `Polygon` is expressed in.
-///
-/// A mark is a pixel the renderer put the ink level on, so this is where the ink really
-/// is: the page is lossless (PNG), and the recogniser decides ink by taking the smaller of
-/// the page's two tone classes, which is the drawn text either way round.
-fn drawn_outline(page: &GrayImage, ink: u8) -> Vec<Point> {
-    let (width, height) = (page.width() as usize, page.height() as usize);
-    let mut top: Option<(usize, usize)> = None;
-    let mut right: Option<(usize, usize)> = None;
-    let mut bottom: Option<(usize, usize)> = None;
-    let mut left: Option<(usize, usize)> = None;
-    for y in 0..height {
-        for x in 0..width {
-            if page.get_pixel(x as u32, y as u32).0[0] != ink {
-                continue;
-            }
-            if top.is_none_or(|(tx, ty)| y < ty || (y == ty && x < tx)) {
-                top = Some((x, y));
-            }
-            if right.is_none_or(|(rx, ry)| x > rx || (x == rx && y < ry)) {
-                right = Some((x, y));
-            }
-            if bottom.is_none_or(|(bx, by)| y > by || (y == by && x > bx)) {
-                bottom = Some((x, y));
-            }
-            if left.is_none_or(|(lx, ly)| x < lx || (x == lx && y > ly)) {
-                left = Some((x, y));
-            }
-        }
-    }
-    let marks = [top, right, bottom, left].map(|mark| mark.expect("the page carries ink"));
-    // A pixel covers the cell `x..x+1` by `y..y+1` of the page, so each extreme mark is
-    // taken at the corner of its own pixel that faces away from the others.
-    let point = |(x, y): (usize, usize), rightwards: bool, downwards: bool| {
-        (
-            (x + usize::from(rightwards)) as f64 / width as f64,
-            (y + usize::from(downwards)) as f64 / height as f64,
-        )
-    };
-    vec![
-        point(marks[0], false, false),
-        point(marks[1], true, false),
-        point(marks[2], true, true),
-        point(marks[3], false, true),
-    ]
-}
+/// The four corners of the PAGE, clockwise from its top-left one, as the page-relative
+/// points `Polygon` is expressed in: the page is the whole of what was submitted, so its
+/// corners are the corners of the submitted raster whatever was drawn on it.
+const PAGE_CORNERS: [Point; 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
 
 /// `outline` started at the corner a page whose characters are turned by `rotation` was
 /// read from: an upright page is read from its top-left corner, and each quarter turn
@@ -322,27 +280,29 @@ async fn a_blocks_polygon_outlines_the_marks_its_bounding_box_bounds() {
             assert_inscribed(case.name, block);
         }
 
-        // The PAGE block spans the page's content, so its polygon is the outline of every
-        // mark that was drawn on the page — read from the corner the characters were read
-        // from, which is what the WORD blocks report as their RotationAngle.
+        // The PAGE block outlines the PAGE: its item is the document page, so its polygon
+        // is the page's own four corners — read from the corner the characters were read
+        // from, which is what the WORD blocks report as their RotationAngle — rather than
+        // the outline of the marks that happen to be drawn on it. Those marks are outlined
+        // by the blocks they were read into, which the inscription rule above covers.
         let rotation = of_type(&blocks, "WORD")
             .first()
             .and_then(|word| rotation_of(word))
             .unwrap_or_else(|| panic!("case {:?}: a WORD must report its rotation", case.name));
-        let expected = read_from(&drawn_outline(&page, case.paper.ink), rotation);
+        let expected = read_from(&PAGE_CORNERS, rotation);
         let reported = polygon_of(case.name, of_type(&blocks, "PAGE")[0]);
         for (index, (point, want)) in reported.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (point.0 - want.0).abs() < 1e-5 && (point.1 - want.1).abs() < 1e-5,
-                "case {:?}: the PAGE Polygon must outline the marks drawn on the page \
-                 ({expected:?}), got {reported:?} differing at point {index}",
+                "case {:?}: the PAGE Polygon must outline the page itself ({expected:?}), \
+                 got {reported:?} differing at point {index}",
                 case.name
             );
         }
 
         // Which corner the list starts at, stated without the index arithmetic above: an
         // upright page is read from its own top-left corner, so the first point is the
-        // extreme mark nearest it, and a page read upside down starts at the diagonally
+        // corner nearest it, and a page read upside down starts at the diagonally
         // opposite corner instead.
         let diagonal = |point: &Point| point.0 + point.1;
         let nearest_top_left = reported
@@ -366,12 +326,14 @@ async fn a_blocks_polygon_outlines_the_marks_its_bounding_box_bounds() {
             _ => {}
         }
 
-        // The outline is FINER than the box: a page of printed characters has marks that
-        // do not reach the corners of the rectangle around them, so at least one block
-        // reports a polygon the box does not already state.
+        // The outline of a block read off INK is FINER than the box around it: a page of
+        // printed characters has marks that do not reach the corners of the rectangle
+        // around them, so at least one such block reports a polygon the box does not
+        // already state.
         assert!(
             blocks
                 .iter()
+                .filter(|block| block_type(block) != "PAGE")
                 .any(|block| !is_box_corners(&polygon_of(case.name, block))),
             "case {:?}: a polygon must be the fine-grained outline of its block's marks, \
              but every block restated the corners of its own box: {:?}",
