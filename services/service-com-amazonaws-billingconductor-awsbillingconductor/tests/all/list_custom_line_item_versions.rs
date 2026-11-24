@@ -9,7 +9,8 @@
 //! generation held, the billing periods it is in effect in (`StartBillingPeriod`
 //! inclusive; `EndBillingPeriod` exclusive: the end its own write named, or the period
 //! the generation that replaced it took effect in) and the instant it took effect
-//! (`StartTime`). A write that takes effect in a new billing period opens a generation
+//! (`StartTime`), which is the instant it was created (`CreationTime`). A write that
+//! takes effect in a new billing period opens a generation
 //! and closes the one before it; a write inside the current generation's billing period
 //! replaces that generation, because one billing period has one version of the item.
 //! The newest element is the item as a read of the item itself reports it, a frozen
@@ -558,7 +559,8 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
         }
 
         // Every version names the item it is a version of, and the instants are ordered:
-        // the shared creation time, then each generation's own start time.
+        // each generation reports the instant it came into being as both its creation
+        // instant and its start time, and the generations ascend by it.
         let mut previous_start_time = 0;
         for (index, version) in reported.iter().enumerate() {
             assert_eq!(
@@ -572,9 +574,9 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
                 .as_i64()
                 .unwrap_or_default();
             assert!(
-                creation_time > 0 && start_time >= creation_time,
-                "case {case:?}: expected version {index} to start at or after the item's \
-                 creation, got start {start_time} and creation {creation_time}"
+                creation_time > 0 && start_time == creation_time,
+                "case {case:?}: expected version {index} to be created at the instant it took \
+                 effect, got start {start_time} and creation {creation_time}"
             );
             assert!(
                 modified_time >= start_time,
@@ -815,8 +817,10 @@ async fn each_version_reports_the_values_that_generation_held() {
         );
 
         // Every generation of one item shares its identity: the billing group it applies
-        // to, the currency of its partition and its creation instant; and nothing in
-        // this surface sets a product code, so none is reported.
+        // to and the currency of its partition; and nothing in this surface sets a product
+        // code, so none is reported. Its creation instant is NOT shared — each generation
+        // reports the instant IT came into being, which is covered by
+        // `tests/all/custom_line_item_version_creation_time.rs`.
         for (index, version) in reported.iter().enumerate() {
             assert_eq!(
                 pluck(version, "BillingGroupArn"),
@@ -835,15 +839,32 @@ async fn each_version_reports_the_values_that_generation_held() {
                 "case {case:?}: expected no ProductCode on version {index}, got {version}"
             );
         }
-        assert_eq!(
-            pluck(&reported[0], "CreationTime"),
-            pluck(&reported[1], "CreationTime"),
-            "case {case:?}: expected every version to share the item's creation time, got \
-             {reported:?}"
+        // `CreationTime` is "the time when the custom line item version was created", so
+        // each generation reports its own: the frozen one the instant the create opened
+        // it, the newest one the instant the update that opened IT landed, which is at or
+        // after the frozen one's.
+        for (index, version) in reported.iter().enumerate() {
+            assert_eq!(
+                pluck(version, "CreationTime"),
+                pluck(version, "StartTime"),
+                "case {case:?}: expected version {index} to report the instant it came into \
+                 being, got {version}"
+            );
+        }
+        let creation_times = (
+            pluck(&reported[0], "CreationTime").as_i64().unwrap_or(-1),
+            pluck(&reported[1], "CreationTime").as_i64().unwrap_or(-1),
+        );
+        assert!(
+            creation_times.0 > 0 && creation_times.1 >= creation_times.0,
+            "case {case:?}: expected the newest version to be created at or after the frozen \
+             one, got {creation_times:?} in {reported:?}"
         );
 
         // ROUND TRIP: the newest version is the item a read of the item itself reports
-        // for the billing period that generation applies in.
+        // for the billing period that generation applies in. `CreationTime` is not among
+        // the members compared: the item's is the instant the item was created, while a
+        // version's is the instant that generation was, and this update opened a new one.
         let stored = emulator
             .item(case, &item, &period(0))
             .await
@@ -856,7 +877,6 @@ async fn each_version_reports_the_values_that_generation_held() {
             "ChargeDetails",
             "CurrencyCode",
             "AssociationSize",
-            "CreationTime",
             "LastModifiedTime",
         ] {
             assert_eq!(

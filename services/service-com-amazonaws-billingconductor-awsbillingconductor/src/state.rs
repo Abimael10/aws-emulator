@@ -2305,7 +2305,9 @@ pub struct CustomLineItemRecord {
     /// The instant the item's CURRENT generation took effect: the create that minted
     /// the item, or the later write that opened a new generation of it (see
     /// [`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
-    /// It is what a version reports as its `StartTime`.
+    /// It is what a version reports as its `StartTime`, and — since a generation comes
+    /// into being with the write that opens it — as its own `CreationTime`
+    /// ([`CustomLineItemVersion::creation_time_millis`]).
     pub version_start_time_millis: i64,
     /// The ORDINAL of the item's current generation in the item's history: the identity
     /// the store minted for that generation when the write that opened it landed (see
@@ -2469,7 +2471,6 @@ impl CustomLineItemRecord {
             computation_rule: self.computation_rule.clone(),
             presentation_service: self.presentation_service.clone(),
             spans: self.spans.clone(),
-            creation_time_millis: self.creation_time_millis,
             last_modified_time_millis: self.last_modified_time_millis,
             start_time_millis: self.version_start_time_millis,
             ordinal: self.version_ordinal,
@@ -2594,11 +2595,10 @@ pub struct CustomLineItemVersion {
     /// from the generation before it, so the generations' stretches are disjoint and
     /// one is left holding exactly the periods the write did not claim.
     pub spans: Vec<BillingPeriodSpan>,
-    /// The item's `CreationTime`, which every generation of it shares.
-    pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
     /// `StartTime`: "The inclusive start time" — the instant this generation took
-    /// effect.
+    /// effect, which is also the instant it was created
+    /// ([`Self::creation_time_millis`]).
     pub start_time_millis: i64,
     /// This generation's place in the item's history, minted ONCE by the write that
     /// opened the generation and never moved, reused or recomputed: ordinals ascend with
@@ -2657,6 +2657,21 @@ impl CustomLineItemVersion {
     /// the sibling listings of this service page over too.
     pub fn history_key(&self) -> String {
         format!("{:020}", self.ordinal)
+    }
+
+    /// `CreationTime`: "The time when the custom line item version was created" — the
+    /// instant the write that OPENED this generation landed.
+    ///
+    /// A generation of the item comes into being with that write, which is the write that
+    /// made it take effect, so the one instant the store holds for it
+    /// ([`Self::start_time_millis`]) is both. It is the ITEM's creation instant only for
+    /// the item's FIRST generation — the one the create opened — because a later write
+    /// that opens a generation leaves the generations before it holding the instants they
+    /// came into being at, and a write that merely replaces the generation in effect
+    /// keeps the instant that generation already had
+    /// ([`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
+    pub fn creation_time_millis(&self) -> i64 {
+        self.start_time_millis
     }
 
     /// `StartBillingPeriod`: the billing period this generation is in effect FROM,

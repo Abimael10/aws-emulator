@@ -180,6 +180,13 @@ fn in_filter(
 /// partition of the item's ARN, exactly as `ListCustomLineItems` derives it — so a
 /// version read reports what the item WAS, and its newest element what the item is.
 ///
+/// `CreationTime` is "the time when the custom line item version was created", so it is
+/// the generation's OWN instant — the one it came into being at
+/// ([`CustomLineItemVersion::creation_time_millis`]) — and not the item's: the item's is
+/// what the generation the create opened reports, and every later generation reports the
+/// write that opened it. The instant the item was created is reported by the reads of the
+/// ITEM (`ListCustomLineItems`), whose `CreationTime` is "the time created".
+///
 /// `AssociationSize` is the one member that is scoped to a billing period rather than to
 /// the generation as a whole, so it is derived for the period the element itself names:
 /// the `StartBillingPeriod` this generation took effect in. It is counted over the item's
@@ -203,7 +210,7 @@ fn element(
         // member — so it is reported absent rather than invented.
         product_code: None,
         billing_group_arn: Some(version.billing_group_arn.clone()),
-        creation_time: version.creation_time_millis,
+        creation_time: version.creation_time_millis(),
         last_modified_time: version.last_modified_time_millis,
         association_size: item.association_size(&start_billing_period),
         start_billing_period: Some(start_billing_period),
