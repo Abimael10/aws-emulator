@@ -213,10 +213,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         enrollments.sort_by(|a, b| a.account_id.cmp(&b.account_id));
 
         // The page this read answers, under the one pagination-token rule every
-        // paginated read of this service applies (`crate::service::page`).
+        // paginated read of this service applies (`crate::service::page`). The
+        // list it pages is the one the request's scope selects — the accounts it
+        // addresses — so those members are the identity the token is issued for
+        // and judged against.
         let page = crate::service::page(
             Self::NAME,
             PAGE_KIND,
+            &crate::state::ListScope::new()
+                .text("accountId", input.account_id.as_deref())
+                .flag("includeOrganizationInfo", input.include_organization_info),
             &enrollments,
             input.next_token.as_deref(),
             input.max_results,

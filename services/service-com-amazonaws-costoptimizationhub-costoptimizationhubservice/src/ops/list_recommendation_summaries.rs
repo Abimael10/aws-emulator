@@ -311,10 +311,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The page this read answers, under the one pagination-token rule every
-        // paginated read of this service applies (`crate::service::page`).
+        // paginated read of this service applies (`crate::service::page`). The
+        // list it pages is the one the request's grouping and narrowing select
+        // — a summary of another grouping is another list of groups — so those
+        // members are the identity the token is issued for and judged against.
         let page = crate::service::page(
             Self::NAME,
             PAGE_KIND,
+            &crate::state::ListScope::new()
+                .text(GROUP_BY, Some(&input.group_by))
+                .filter("filter", input.filter.as_ref()),
             &groups,
             input.next_token.as_deref(),
             input.max_results,

@@ -333,10 +333,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The page this read answers, under the one pagination-token rule every
         // paginated read of this service applies (`crate::service::page`). The
         // page is of GROUPS — which is what `maxResults` bounds and `nextToken`
-        // resumes — so every group it carries reports the whole series.
+        // resumes — so every group it carries reports the whole series. The list
+        // of groups is the one the request's grouping, ordering, granularity and
+        // period select, so those members are the identity the token is issued
+        // for and judged against.
         let page = crate::service::page(
             Self::NAME,
             PAGE_KIND,
+            &crate::state::ListScope::new()
+                .text("groupBy", input.group_by.as_deref())
+                .order_by("orderBy", input.order_by.as_ref())
+                .text("granularity", Some(&input.granularity))
+                .time_period("timePeriod", &input.time_period),
             &groups,
             input.next_token.as_deref(),
             input.max_results,

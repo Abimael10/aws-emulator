@@ -503,17 +503,29 @@ const NEXT_TOKEN_MEMBER: &str = "nextToken";
 /// which is the list the token has to have been issued by, so the refusal states
 /// which operation would have issued an acceptable one.
 ///
+/// The list a token belongs to is not the OPERATION, though: most of these reads
+/// answer a different list for every value of the members that select one — the
+/// grouping, the narrowing, the ordering, the period or account scope — so
+/// `scope` carries those members ([`crate::state::ListScope`]), and a token is
+/// accepted only for the list that issued it. A token presented to the same
+/// operation under a different selection names no row of the list being answered
+/// now, however many rows that list happens to have, and is refused like any
+/// other token this read did not issue. `maxResults` is no part of a list's
+/// identity: it bounds the page, not the list, so one list can be walked with a
+/// different page size per call.
+///
 /// The one place this rule's two halves — resume or refuse — are written, so
 /// every paginated operation of this service judges a token and words its
 /// refusal the same way.
 pub(crate) fn page<'a, T>(
     operation: &str,
     kind: &str,
+    scope: &crate::state::ListScope,
     all: &'a [T],
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<crate::state::Page<'a, T>, ValidationException> {
-    crate::state::paginate(kind, all, next_token, max_results).map_err(
+    crate::state::paginate(kind, scope, all, next_token, max_results).map_err(
         |crate::state::TokenNotIssued| {
             stated_validation_exception(
                 format!("Invalid nextToken specified. The token was not issued by {operation}."),

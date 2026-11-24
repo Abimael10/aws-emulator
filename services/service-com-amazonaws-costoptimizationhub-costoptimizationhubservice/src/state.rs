@@ -41,8 +41,10 @@
 //! [`opted_into_compute_optimizer`].
 
 mod compute_optimizer;
+mod page_scope;
 
 pub use compute_optimizer::opted_into_compute_optimizer;
+pub use page_scope::ListScope;
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -954,10 +956,23 @@ const PAGE_TOKEN_VERSION: &str = "cohv1";
 
 /// Encode the offset a page ends at into an opaque `nextToken`.
 ///
-/// `kind` names the list the token belongs to, so a token issued by one
-/// paginated operation is not accepted by another.
+/// `kind` names the list the token belongs to, so a token issued for one list is
+/// not accepted for another: it is the operation's list kind together with the
+/// identity of the list that operation was asked for ([`list_kind`]), because an
+/// operation answers a different list for every value of the members that select
+/// one and a position in one of them names no row of another.
 pub fn encode_page_token(kind: &str, offset: usize) -> String {
     ::hex::encode(format!("{PAGE_TOKEN_VERSION}:{kind}:{offset}"))
+}
+
+/// The list a token belongs to: the operation's own list kind narrowed by the
+/// digest of the request members that decide WHICH of the lists that operation
+/// can answer is being paged ([`ListScope`]).
+///
+/// The one place the two halves of a list's identity are put together, so the
+/// token a page issues and the token a read accepts name the list the same way.
+fn list_kind(kind: &str, scope: &ListScope) -> String {
+    format!("{kind}:{}", scope.digest())
 }
 
 /// The offset a `nextToken` carries, or `None` when the token is not in the
@@ -1010,15 +1025,23 @@ fn issued_offset(kind: &str, len: usize, token: &str) -> Result<usize, TokenNotI
 /// because it names no row of this list to resume at and serving a page in its
 /// place would answer an invalid request as a listing.
 ///
+/// `kind` is the operation's list kind and `scope` the identity of the list it
+/// was asked for — the request members that select one of the lists this
+/// operation can answer ([`ListScope`]) — because a position in one of them
+/// names no row of another, so a token is accepted only for the list that issued
+/// it and not merely for the operation that issued it.
+///
 /// `max_results` caps the page; absent, the whole remainder is returned. The
 /// token is issued only when rows remain after this page, so the last page
 /// carries none.
 pub fn paginate<'a, T>(
     kind: &str,
+    scope: &ListScope,
     all: &'a [T],
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<Page<'a, T>, TokenNotIssued> {
+    let kind = &list_kind(kind, scope);
     let start = match next_token {
         None => 0,
         Some(token) => issued_offset(kind, all.len(), token)?,

@@ -26,14 +26,25 @@
 //! name — the first row, one past the last, further past it, and a row inside
 //! the collection — including a token this service really issued for a WIDER
 //! scope of the same list and then presented to a narrower one.
+//!
+//! WHICH list a token belongs to is the other half of that: most of these reads
+//! answer a different list for every value of the members that select one — the
+//! grouping, the narrowing, the ordering, the period — so a token names a row of
+//! the list those members selected and of no other, however many rows another
+//! list of the same operation happens to have. The last two tables below span
+//! that: the members each read selects its list by, against the one member a
+//! case changes before presenting the token, and the complement, the member that
+//! selects no list at all (`maxResults`, which bounds the page rather than the
+//! list, so one list can be walked with a different page size per call).
+
 
 use serde_json::{json, Value};
 use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cost_optimization_hub::{
-    call, fields, management_account_router_with_store, ok, record_enrollment,
-    FIELD_VALIDATION_FAILED, FIELD_VALIDATION_SUMMARY,
+    call, daily_period, enrolled_router, fields, management_account_router_with_store,
+    monthly_period, ok, record_enrollment, FIELD_VALIDATION_FAILED, FIELD_VALIDATION_SUMMARY,
 };
 
 /// Member accounts of the organization the store records: twelve digits, which
@@ -394,3 +405,295 @@ async fn an_issued_token_naming_a_row_outside_the_read_it_is_given_to_is_refused
         &payload,
     );
 }
+
+// ---------------------------------------------------------------------------
+// WHICH list a token belongs to
+// ---------------------------------------------------------------------------
+
+/// The member a paginated read of this service carries its rows in, as the model
+/// paginates it (`smithy_query(query="operation", operation="…")`:
+/// `paginated.items`): `items` for the reads of records and groups of records,
+/// and `efficiencyMetricsByGroup` for the metrics read.
+const ITEMS: &str = "items";
+const EFFICIENCY_ITEMS: &str = "efficiencyMetricsByGroup";
+
+/// One case of WHICH list a token belongs to: the request that mints the token,
+/// and the request of the SAME operation it is then presented to, differing from
+/// it in one member that selects which of that operation's lists is answered.
+struct OtherList {
+    case: &'static str,
+    operation: &'static str,
+    items: &'static str,
+    minting: Value,
+    presenting: Value,
+}
+
+/// The rows one answer carries, out of the member its operation paginates.
+fn rows(payload: &Value, items: &str) -> Vec<Value> {
+    payload[items]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {items}: expected a list of rows in {payload}"))
+        .clone()
+}
+
+/// Every selecting member of every paginated read whose lists can each carry
+/// more than one row, against the value of it a case changes before presenting
+/// the token: the grouping, the narrowing, the ordering, the de-duplication, the
+/// granularity and the period.
+///
+/// `ListEnrollmentStatuses` selects its list by the accounts the request
+/// addresses, and every scope of it narrower than the organization's view
+/// addresses ONE account, so its cases are the ones pinned by
+/// `an_issued_token_naming_a_row_outside_the_read_it_is_given_to_is_refused`
+/// above.
+fn other_lists() -> Vec<OtherList> {
+    let (start, end) = monthly_period(2, 2);
+    let (recent_start, recent_end) = monthly_period(1, 1);
+    let (day_start, day_end) = daily_period(5, 3);
+    vec![
+        OtherList {
+            case: "ListRecommendationSummaries grouped by another dimension",
+            operation: "ListRecommendationSummaries",
+            items: ITEMS,
+            minting: json!({"groupBy": "ActionType"}),
+            presenting: json!({"groupBy": "Region"}),
+        },
+        OtherList {
+            case: "ListRecommendationSummaries narrowed by a filter the minting read did not carry",
+            operation: "ListRecommendationSummaries",
+            items: ITEMS,
+            minting: json!({"groupBy": "ResourceType"}),
+            presenting: json!({
+                "groupBy": "ResourceType",
+                "filter": {"actionTypes": ["Upgrade"]},
+            }),
+        },
+        OtherList {
+            case: "ListRecommendations narrowed by a filter the minting read did not carry",
+            operation: "ListRecommendations",
+            items: ITEMS,
+            minting: json!({"includeAllRecommendations": true}),
+            presenting: json!({
+                "includeAllRecommendations": true,
+                "filter": {"actionTypes": ["Upgrade"]},
+            }),
+        },
+        OtherList {
+            case: "ListRecommendations ordered by a dimension the minting read did not ask for",
+            operation: "ListRecommendations",
+            items: ITEMS,
+            minting: json!({"includeAllRecommendations": true}),
+            presenting: json!({
+                "includeAllRecommendations": true,
+                "orderBy": {"dimension": "EstimatedMonthlySavings", "order": "Desc"},
+            }),
+        },
+        OtherList {
+            case: "ListRecommendations de-duplicated per resource where the minting read was not",
+            operation: "ListRecommendations",
+            items: ITEMS,
+            minting: json!({"includeAllRecommendations": true}),
+            presenting: json!({"includeAllRecommendations": false}),
+        },
+        OtherList {
+            case: "ListEfficiencyMetrics grouped by another dimension",
+            operation: "ListEfficiencyMetrics",
+            items: EFFICIENCY_ITEMS,
+            minting: json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": start.clone(), "end": end.clone()},
+                "groupBy": "ResourceType",
+            }),
+            presenting: json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": start.clone(), "end": end.clone()},
+                "groupBy": "Region",
+            }),
+        },
+        OtherList {
+            case: "ListEfficiencyMetrics over another period",
+            operation: "ListEfficiencyMetrics",
+            items: EFFICIENCY_ITEMS,
+            minting: json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": start.clone(), "end": end.clone()},
+                "groupBy": "ResourceType",
+            }),
+            presenting: json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": recent_start, "end": recent_end},
+                "groupBy": "ResourceType",
+            }),
+        },
+        OtherList {
+            case: "ListEfficiencyMetrics at another granularity",
+            operation: "ListEfficiencyMetrics",
+            items: EFFICIENCY_ITEMS,
+            minting: json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": start, "end": end},
+                "groupBy": "ResourceType",
+            }),
+            presenting: json!({
+                "granularity": "Daily",
+                "timePeriod": {"start": day_start, "end": day_end},
+                "groupBy": "ResourceType",
+            }),
+        },
+    ]
+}
+
+/// A token names a row of the list the request that minted it selected, so
+/// presenting it to another list of the SAME operation is presenting a token
+/// that list did not issue: it is refused with the one refusal body, and not
+/// served as a page starting in the middle of a list no page of which ever ended
+/// there.
+///
+/// Each case asserts that the list being refused has rows past the one the token
+/// names — so what refuses the token is which list it belongs to and not the row
+/// it carries — and, as the complement, that the list that DID issue it resumes
+/// exactly where its page stopped.
+#[tokio::test]
+async fn a_token_names_a_row_of_the_list_that_issued_it_and_of_no_other() {
+    let router = enrolled_router().await;
+
+    for other in other_lists() {
+        let case = other.case;
+        let minted = ok(
+            &router,
+            other.operation,
+            &request(&other.minting, Some(1), None),
+        )
+        .await;
+        let first = rows(&minted, other.items);
+        assert_eq!(
+            first.len(),
+            1,
+            "case {case:?}: expected a page of one row to mint a token from, got {first:?}"
+        );
+        let token = minted["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected a token after a page of one row, got {minted}")
+            })
+            .to_string();
+
+        // The list the token is presented to has a row past the one the token
+        // names, so served as a page this request would answer that list from its
+        // second row on and silently drop its first.
+        let other_whole = rows(
+            &ok(&router, other.operation, &other.presenting).await,
+            other.items,
+        );
+        assert!(
+            other_whole.len() > 1,
+            "case {case:?}: expected the list presented to to have a row past the one the \
+             token names, got {other_whole:?}"
+        );
+
+        let (status, payload) = call(
+            &router,
+            other.operation,
+            &request(&other.presenting, None, Some(&token)),
+        )
+        .await;
+        assert_refused(case, other.operation, status, &payload);
+        assert!(
+            payload[other.items].is_null(),
+            "case {case:?}: expected a refusal rather than a page of rows, got {payload}"
+        );
+
+        // The complement: the list that issued the token resumes at the row it
+        // names, so the refusal above is about which list and not about the
+        // token.
+        let own_whole = rows(
+            &ok(&router, other.operation, &other.minting).await,
+            other.items,
+        );
+        let resumed = rows(
+            &ok(
+                &router,
+                other.operation,
+                &request(&other.minting, None, Some(&token)),
+            )
+            .await,
+            other.items,
+        );
+        assert_eq!(
+            resumed,
+            own_whole[1..].to_vec(),
+            "case {case:?}: expected the issuing list's rows from the second on ({:?}), \
+             got {resumed:?}",
+            &own_whole[1..]
+        );
+    }
+}
+
+/// The member that selects no list: `maxResults` bounds the page, not the list,
+/// so a token is accepted whatever page size the call presenting it asks for and
+/// a walk may change its page size mid-list.
+///
+/// Spans every paginated read: the three whose list the request selects, each
+/// through the request that mints its token above, and the enrollment read
+/// through the organization's view.
+#[tokio::test]
+async fn a_token_resumes_its_list_whatever_page_size_the_next_call_asks_for() {
+    let catalog = enrolled_router().await;
+    let organization = paged_router();
+    let others = other_lists();
+    let mut reads: Vec<(&str, &str, &str, Value, &MultiServiceRouter)> = others
+        .iter()
+        .map(|other| {
+            (
+                other.case,
+                other.operation,
+                other.items,
+                other.minting.clone(),
+                &catalog,
+            )
+        })
+        .collect();
+    reads.push((
+        "ListEnrollmentStatuses over the organization's view",
+        "ListEnrollmentStatuses",
+        ITEMS,
+        json!({"includeOrganizationInfo": true}),
+        &organization,
+    ));
+
+    for (case, operation, items, base, router) in reads {
+        let whole = rows(&ok(router, operation, &base).await, items);
+        assert!(
+            whole.len() > 1,
+            "case {case:?}: expected more than one row to page over, got {whole:?}"
+        );
+        let minted = ok(router, operation, &request(&base, Some(1), None)).await;
+        let token = minted["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected a token after a page of one row, got {minted}")
+            })
+            .to_string();
+
+        // Every page size the next call can ask for, including the one the page
+        // that issued the token used and none at all.
+        for size in [None, Some(1), Some(2), Some(whole.len() as u32 + 1)] {
+            let resumed = rows(
+                &ok(router, operation, &request(&base, size, Some(&token))).await,
+                items,
+            );
+            let want = match size {
+                None => whole[1..].to_vec(),
+                Some(size) => {
+                    let end = (1 + size as usize).min(whole.len());
+                    whole[1..end].to_vec()
+                }
+            };
+            assert_eq!(
+                resumed, want,
+                "case {case:?} with maxResults {size:?}: expected {want:?}, got {resumed:?}"
+            );
+        }
+    }
+}
+

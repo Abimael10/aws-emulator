@@ -231,10 +231,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The page this read answers, under the one pagination-token rule every
-        // paginated read of this service applies (`crate::service::page`).
+        // paginated read of this service applies (`crate::service::page`). The
+        // list it pages is the one the request's narrowing, ordering and
+        // de-duplication select, so those members are the identity the token is
+        // issued for and judged against.
         let page = crate::service::page(
             Self::NAME,
             PAGE_KIND,
+            &crate::state::ListScope::new()
+                .filter("filter", input.filter.as_ref())
+                .order_by("orderBy", input.order_by.as_ref())
+                .flag(
+                    "includeAllRecommendations",
+                    input.include_all_recommendations,
+                ),
             &rows,
             input.next_token.as_deref(),
             input.max_results,
