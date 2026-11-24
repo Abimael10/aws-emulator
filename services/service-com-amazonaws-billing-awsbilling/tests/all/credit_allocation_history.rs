@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The (`billingMonth`, `creditId`, `appliedServiceName`) triple that names one
 /// allocation entry in an expectation: together they identify one application
 /// of one credit for one account.
-type EntryId = (String, String, String);
+pub(crate) type EntryId = (String, String, String);
 
 /// One row of the date-range table: the case, `startDate`, `endDate`, and the
 /// entries that range must select.
@@ -48,15 +48,15 @@ type CreditCase = (&'static str, i64, Vec<EntryId>);
 type RefusalCase = (&'static str, Value, Option<&'static str>);
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// A second 12-digit account, used to pin that the history of one account never
 /// leaks into another's.
-const OTHER_ACCOUNT_ID: &str = "123456789012";
+pub(crate) const OTHER_ACCOUNT_ID: &str = "123456789012";
 
 /// One router over ONE shared engine — what `core/router` builds in production,
 /// so every call in a test observes the same state.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -65,7 +65,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Send one awsJson1_0 call and return its HTTP status and decoded body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -93,7 +93,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The `__type` an awsJson error body carries, without its namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -123,7 +123,7 @@ pub(crate) fn at(year: i64, month: i64, day: i64, hour: i64) -> i64 {
 }
 
 /// One persisted allocation the API must report back unchanged.
-struct Seed {
+pub(crate) struct Seed {
     credit_id: &'static str,
     currency_code: &'static str,
     currency_amount: &'static str,
@@ -165,7 +165,7 @@ impl Seed {
 ///
 /// Service names are real Amazon Web Services service names and the amounts are
 /// modeled `CurrencyAmount` decimal strings (`^[0-9]+(.[0-9]+)$`).
-fn seeds() -> Vec<Seed> {
+pub(crate) fn seeds() -> Vec<Seed> {
     vec![
         Seed {
             credit_id: "7",
@@ -245,7 +245,7 @@ fn seeds() -> Vec<Seed> {
 }
 
 /// Persist every seeded allocation in the shared engine's store.
-fn persist(engine: &Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
+pub(crate) fn persist(engine: &Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
     let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
     let mut state = state.lock();
     for seed in seeds {
@@ -266,7 +266,7 @@ fn resident(engine: &Arc<engine::InMemoryEngine>) -> usize {
 
 /// The (`billingMonth`, `creditId`, `appliedServiceName`) triples a response
 /// reports, in the order it reports them.
-fn reported(body: &Value) -> Vec<EntryId> {
+pub(crate) fn reported(body: &Value) -> Vec<EntryId> {
     body["creditAllocationHistoryList"]
         .as_array()
         .expect("creditAllocationHistoryList is a list")
@@ -285,7 +285,7 @@ fn reported(body: &Value) -> Vec<EntryId> {
 }
 
 /// A request covering every seeded month for `account`.
-fn whole_range(account: &str) -> Value {
+pub(crate) fn whole_range(account: &str) -> Value {
     json!({
         "accountId": account,
         "startDate": at(2025, 1, 1, 0),
@@ -608,66 +608,40 @@ async fn pagination_returns_every_entry_exactly_once_for_every_page_size() {
         );
     }
 
-    // A nextToken is a position in the DESCENDING walk, so the same token used
-    // with a narrower range reports the entries of that range that follow it:
-    // a token from the newest month leaves every older month still to come...
+    // A nextToken is a position among the entries ONE request selected, so the
+    // page size — how much of that one walk a caller takes — is no part of the
+    // selection: a token minted under one page size resumes the same walk under
+    // another, and reports exactly the entries that follow the cursor.
     let mut first = whole_range(ACCOUNT_ID);
     first["maxResults"] = json!(1);
     let (status, page) = call(&router, "GetCreditAllocationHistory", &first).await;
     assert_eq!(
         status, 200,
-        "case \"token from a later month\": expected 200, got {status} {page:?}"
+        "case \"a token under another page size\": expected 200, got {status} {page:?}"
     );
     let newest_token = page["nextToken"]
         .as_str()
         .expect("a first page of one entry has a nextToken")
         .to_string();
-    let oldest_month = json!({
-        "accountId": ACCOUNT_ID,
-        "startDate": at(2025, 1, 1, 0),
-        "endDate": at(2025, 1, 31, 23),
-        "nextToken": newest_token,
-    });
-    let (status, body) = call(&router, "GetCreditAllocationHistory", &oldest_month).await;
+    let mut resumed = whole_range(ACCOUNT_ID);
+    resumed["maxResults"] = json!(1000);
+    resumed["nextToken"] = json!(newest_token);
+    let (status, body) = call(&router, "GetCreditAllocationHistory", &resumed).await;
     assert_eq!(
         status, 200,
-        "case \"token from a later month\": expected 200, got {status} {body:?}"
+        "case \"a token under another page size\": expected 200, got {status} {body:?}"
     );
     assert_eq!(
         reported(&body),
-        vec![(
-            "2025-01".to_string(),
-            "7".to_string(),
-            "Amazon Elastic Compute Cloud".to_string(),
-        )],
-        "case \"token from a later month\": the older month still follows the token, got {body:?}"
+        expected[1..].to_vec(),
+        "case \"a token under another page size\": expected the entries after the first, \
+         got {body:?}"
     );
 
-    // ...and a token from an older month leaves nothing before it in a later
-    // month's range, so that request answers with an empty page.
-    let mut fifth = whole_range(ACCOUNT_ID);
-    fifth["maxResults"] = json!(5);
-    let (_, fifth_page) = call(&router, "GetCreditAllocationHistory", &fifth).await;
-    let older_token = fifth_page["nextToken"]
-        .as_str()
-        .expect("a five-entry page of a six-entry history has a nextToken")
-        .to_string();
-    let later_month = json!({
-        "accountId": ACCOUNT_ID,
-        "startDate": at(2026, 6, 1, 0),
-        "endDate": at(2026, 6, 30, 23),
-        "nextToken": older_token,
-    });
-    let (status, body) = call(&router, "GetCreditAllocationHistory", &later_month).await;
-    assert_eq!(
-        status, 200,
-        "case \"token from an earlier month\": expected 200, got {status} {body:?}"
-    );
-    assert_eq!(
-        reported(&body),
-        Vec::new(),
-        "case \"token from an earlier month\": nothing in that range follows the token, got {body:?}"
-    );
+    // WHICH requests this read takes a token back from — a token is a cut point
+    // of the sequence the account, the billing-month range and the `creditId`
+    // filter select, and of no other — is the subject of
+    // `credit_allocation_history_token_scope.rs`.
 }
 
 #[tokio::test]

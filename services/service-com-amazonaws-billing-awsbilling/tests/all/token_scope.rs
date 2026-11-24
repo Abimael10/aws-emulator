@@ -985,35 +985,22 @@ async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
     );
 
     // Each row is a read whose members only choose which entries of ONE ordered
-    // walk are reported: the date range of the account's credit history and the
-    // type of the account's billing views. The cursor is still a position in
-    // that one walk, so the narrowed request resumes from it rather than
-    // refusing it, and what it reports is exactly the tail of its own walk that
-    // follows the cursor — which each row names.
+    // walk are reported: the type of the account's billing views. The cursor is
+    // still a position in that one walk, so the narrowed request resumes from it
+    // rather than refusing it, and what it reports is exactly the tail of its
+    // own walk that follows the cursor — which each row names.
     //
     // `ListBusinessSupportSubscriptionHistory` is NOT a row here: a request that
     // names another `billingMonth` asks about another PERIOD, which selects
     // contracts the walked period does not hold rather than a subset of them, so
     // that read refuses such a token — see
-    // `business_support_subscription_history_token_scope.rs`.
+    // `business_support_subscription_history_token_scope.rs`. Neither is
+    // `GetCreditAllocationHistory`: its `startDate`/`endDate` choose WHICH
+    // billing months the walk covers rather than which entries of one walk are
+    // reported, so a range that differs by a month selects other allocations and
+    // that read refuses such a token — see
+    // `credit_allocation_history_token_scope.rs`.
     let rows: Vec<(&'static str, Value, Value, Vec<String>)> = vec![
-        (
-            "GetCreditAllocationHistory",
-            json!({
-                "accountId": ACCOUNT_ID,
-                "startDate": at(2025, 1, 1, 0),
-                "endDate": at(2025, 4, 1, 0),
-            }),
-            json!({
-                "accountId": ACCOUNT_ID,
-                "startDate": at(2025, 1, 1, 0),
-                "endDate": at(2025, 2, 1, 0),
-            }),
-            // The walk descends by month and the cursor is at 2025-03, so both
-            // months the narrowed range covers still follow it (its `endDate`
-            // falls in 2025-02, which the month-keyed range includes).
-            vec!["2025-02".to_string(), "2025-01".to_string()],
-        ),
         (
             "ListBillingViews",
             json!({}),

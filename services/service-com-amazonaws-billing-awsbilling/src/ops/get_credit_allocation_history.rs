@@ -10,7 +10,9 @@
 //! selected by the consolidated billing family of the requested account (see
 //! [`crate::state::ComAmazonawsBillingAwsbillingState::history_covers_billed_account`]),
 //! the requested billing-month range and the optional `creditId`, reported
-//! newest billing month first, and paged by `maxResults`/`nextToken`.
+//! newest billing month first, and paged by `maxResults`/`nextToken` — a token
+//! being a position among the entries ONE request selected, so this read takes
+//! one back only from a request that selects the same ones.
 //!
 //! NOTE: nothing in this emulator writes that store yet — an allocation exists
 //! only once a credit has been APPLIED to a bill, and the emulator runs no
@@ -193,29 +195,80 @@ fn invalid_field(member: &str, constraint: &str) -> GetCreditAllocationHistoryEr
     .into()
 }
 
+/// What the members that choose the sequence this read walks name, in the order
+/// a `nextToken` carries their values: the billing months the walk covers, the
+/// account whose history it reports, and the credit the answer is narrowed to.
+///
+/// The words the refusal of a token minted for another sequence uses, so the
+/// message names the member that put the caller on another walk.
+const SCOPE_BILLING_MONTH_RANGE: &str = "billing month range";
+const SCOPE_ACCOUNT: &str = "account";
+const SCOPE_CREDIT_FILTER: &str = "credit filter";
+
+/// The billing months the request asks about, as the one scope field a
+/// `nextToken` carries for them: both ends, since both decide which allocations
+/// the walk holds.
+///
+/// It is the RESOLVED month range rather than the two timestamps that spelled
+/// it, because the walk seeks the keys of whole billing months: two requests
+/// whose bounds fall in the same two months select the very same allocations, so
+/// one resumes the other's walk.
+fn billing_month_range_scope(start_month: &str, end_month: &str) -> String {
+    format!("{start_month}..{end_month}")
+}
+
+/// The credit the request narrows the history to, as the scope field a
+/// `nextToken` carries for it: the `creditId` it names, rendered from the
+/// modeled `Long` so one credit has one spelling, or — for a request that names
+/// none, which "returns allocation entries for all credits" — the empty string,
+/// which names no credit.
+fn credit_filter_scope(credit_id: Option<i64>) -> String {
+    credit_id.map(|credit| credit.to_string()).unwrap_or_default()
+}
+
 /// The store key a `nextToken` resumes after, or a `ValidationException` when
-/// the token is not one THIS read issued under this store's key — one this
-/// service cannot read back, one a caller assembled, and one it minted for
-/// another of its paginated reads, whose payload is a cut point of another
-/// sequence and names nothing in this one. The token format and the refusal's
-/// wording live in `crate::state`, shared with this service's other paginated
-/// reads.
+/// the token is no cut point of the sequence THIS request selects: one this
+/// service cannot read back, one a caller assembled, one it minted for another
+/// of its paginated reads, and one it minted while walking another selection of
+/// allocations — another billing-month range, another account, another credit
+/// filter — whose cut point names some other entry of this walk, or none at
+/// all.
+///
+/// A cursor is a position among the entries the request selects, so a token is
+/// usable only by a request that selects the same ones: the scope covers every
+/// member that narrows the sequence. Applying a cut point of another selection
+/// as this walk's bound would drop every entry of it sorting at or above that
+/// key — entries the walk the token came from never reported — and answer that
+/// truncated page with a 200. `maxResults` is deliberately NOT part of the
+/// scope: a page size is how much of one walk a caller takes, not which entries
+/// the walk is over.
+///
+/// The token format and the unusable-token wording live in `crate::state`,
+/// shared with this service's other paginated reads.
 fn resume_key(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
+    scope: &[(&str, &str)],
 ) -> Result<String, GetCreditAllocationHistoryError> {
-    crate::state::decode_page_token(key, read_by, token).ok_or_else(|| {
-        GetCreditAllocationHistoryErrorModeled::ValidationException(ValidationException {
-            message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-            reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-            field_list: Some(vec![ValidationExceptionField {
-                name: "nextToken".to_string(),
-                message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-            }]),
-        })
-        .into()
-    })
+    match crate::state::decode_scoped_page_token(key, read_by, token, scope) {
+        crate::state::ScopedPageToken::Cursor(cursor) => Ok(cursor),
+        crate::state::ScopedPageToken::OtherSequence(names) => Err(invalid_field(
+            "nextToken",
+            &format!("must have been issued for the {names} the request names"),
+        )),
+        crate::state::ScopedPageToken::Unusable => Err(
+            GetCreditAllocationHistoryErrorModeled::ValidationException(ValidationException {
+                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+                }]),
+            })
+            .into(),
+        ),
+    }
 }
 
 /// The billing month a request `Timestamp` falls in, as the modeled
@@ -361,9 +414,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // walk skip or repeat another one.
         // The key the store's tokens are authenticated under, taken off the
         // store by value so the walk below can borrow the records it reports.
+        // The sequence this request selects — the billing months the walk
+        // covers, the account whose history it reports and the credit it is
+        // narrowed to — travels in every `nextToken` of this walk, so a cut
+        // point of another selection is refused instead of being applied to
+        // this one.
         let page_key = state.page_token_key();
+        let month_range = billing_month_range_scope(&start_month, &end_month);
+        let credit_filter = credit_filter_scope(input.credit_id);
+        let scope = [
+            (SCOPE_BILLING_MONTH_RANGE, month_range.as_str()),
+            (SCOPE_ACCOUNT, input.account_id.as_str()),
+            (SCOPE_CREDIT_FILTER, credit_filter.as_str()),
+        ];
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(resume_key(&page_key, Self::NAME, token)?),
+            Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
         let limit = input
@@ -380,11 +445,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (lower, _) = crate::state::CreditAllocation::month_key_bounds(&start_month);
         let (_, end_upper) = crate::state::CreditAllocation::month_key_bounds(&end_month);
         // The range end is exclusive, so resuming AT the previous page's last
-        // key reports every entry strictly before it and nothing twice. A token
-        // naming a key below the requested range leaves an empty range, which
-        // the guard below answers as an empty page; one at or above the range
-        // leaves the whole range still to come, which is what the descending
-        // walk owes a caller that narrowed the range after that page.
+        // key reports every entry strictly before it and nothing twice. The
+        // cursor travels with the selection it is a cut point of, so one that
+        // reaches here was minted while walking THIS range and names a key
+        // inside it — a token of any other selection is refused above — and the
+        // comparison only ever narrows the range's upper end.
         let upper = match resume_after {
             Some(after) if after < end_upper => after,
             _ => end_upper,
@@ -402,8 +467,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let next_token = if page.len() > limit {
             page.truncate(limit);
-            page.last()
-                .map(|(key, _)| crate::state::encode_page_token(&page_key, Self::NAME, key))
+            page.last().map(|(key, _)| {
+                crate::state::encode_scoped_page_token(&page_key, Self::NAME, &scope, key)
+            })
         } else {
             None
         };
