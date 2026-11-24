@@ -573,6 +573,8 @@ async fn fire<Eng: Send + Sync + 'static>(
             &mut clients,
             &stores,
             &handover,
+            // This firing is when EventBridge took the event it publishes.
+            now,
             &mut budget,
             &mut sends,
         )

@@ -58,24 +58,36 @@ fn fills_itself(key: &str) -> bool {
     RESERVED_PLACEHOLDERS.contains(&key)
 }
 
+/// The member of the envelope that carries what the publisher published, which
+/// the placeholder standing for the EVENT does not reach.
+const DETAIL_FIELD: &str = "detail";
+
 /// What the reserved placeholder `key` is filled with, or `None` when the
 /// reserved namespace holds no such placeholder.
 ///
-/// The five EventBridge fills itself: the whole event (`aws.events.event`), the
-/// whole event as JSON text (`aws.events.event.json`), the matched rule's ARN and
-/// name, and the event's ingestion time.
+/// The five EventBridge fills itself: the event's envelope WITHOUT its detail
+/// (`aws.events.event`), the whole event as JSON text
+/// (`aws.events.event.json`), the matched rule's ARN and name, and the event's
+/// ingestion time.
 ///
-/// A placeholder standing for the whole EVENT carries that event's JSON DOCUMENT
-/// wherever it stands — [`Fill::Document`] — because the event is a JSON object
-/// and a reading of one as characters is not a thing any consumer is handed: a
-/// template that is nothing but `<aws.events.event.json>` renders the event, which
-/// is what the placeholder is for. The other three carry text a caller may put
-/// anywhere, so they fill like a selected value does.
+/// The two event placeholders stand for DIFFERENT readings of the event, and that
+/// is what each is for: `<aws.events.event>` is the event's metadata — the
+/// envelope with the `detail` member left out — while `<aws.events.event.json>`
+/// is the whole event, detail included. So a template that needs the envelope
+/// without the payload has a placeholder for exactly that, and one that needs the
+/// payload reaches it through the JSON placeholder or through a path of its own
+/// map.
+///
+/// A placeholder standing for an event carries a JSON DOCUMENT wherever it stands
+/// — [`Fill::Document`] — because the event is a JSON object and a reading of one
+/// as characters is not a thing any consumer is handed: a template that is nothing
+/// but `<aws.events.event.json>` renders the event, which is what the placeholder
+/// is for. The other three carry text a caller may put anywhere, so they fill like
+/// a selected value does.
 fn reserved(key: &str, event: &Value, delivery: &Delivery<'_>) -> Option<Fill> {
     match key {
-        EVENT_PLACEHOLDER | EVENT_JSON_PLACEHOLDER => {
-            Some(Fill::Document(event.to_string()))
-        }
+        EVENT_PLACEHOLDER => Some(Fill::Document(without_detail(event).to_string())),
+        EVENT_JSON_PLACEHOLDER => Some(Fill::Document(event.to_string())),
         RULE_ARN_PLACEHOLDER => Some(Fill::Selected(Value::String(
             delivery.rule_arn.to_string(),
         ))),
@@ -89,16 +101,30 @@ fn reserved(key: &str, event: &Value, delivery: &Delivery<'_>) -> Option<Fill> {
     }
 }
 
+/// `event` without its [`DETAIL_FIELD`] member, which is what the placeholder
+/// standing for the event resolves to.
+///
+/// Every other member is carried over as it stands, in the envelope's own order:
+/// what is left out is the detail and nothing else. An event that is not an object
+/// carries no member to leave out, so it stands as it is.
+fn without_detail(event: &Value) -> Value {
+    let mut envelope = event.clone();
+    if let Value::Object(members) = &mut envelope {
+        members.remove(DETAIL_FIELD);
+    }
+    envelope
+}
+
 /// What ONE placeholder is filled with, told apart by how it is WRITTEN into the
 /// template.
 #[derive(Debug, Clone)]
 enum Fill {
     /// A value the event carries: its JSON text where the placeholder stands as a
-    /// JSON value, and its characters ([`text`]) where it stands inside a string
-    /// or in a template that is not JSON at all.
+    /// JSON value, and its reading as a string ([`text`]) where it stands inside
+    /// one of the template's own strings.
     Selected(Value),
     /// A JSON document, which is written as it stands wherever the placeholder is
-    /// — the whole event is one.
+    /// — an event is one.
     Document(String),
 }
 
@@ -172,28 +198,30 @@ pub fn by_input_path(path: &str, event: &Value) -> Result<String, String> {
 /// What a target carrying an `InputTransformer` receives: `template` with
 /// each `<key>` placeholder replaced by what `paths` selects for that key.
 ///
-/// The template's own FORM decides how a value is written, because the
-/// documented templates are of two kinds:
+/// A substitution is TEXTUAL: every placeholder stands for the characters its
+/// value contributes where it stands, and the template's own characters are
+/// delivered as written. Where a placeholder stands decides which characters
+/// those are, because the documented templates are of two kinds:
 ///
 /// * one that opens a JSON OBJECT or ARRAY carries its placeholders "in quotes
 ///   or out" (`InputTransformer$InputTemplate`), so a placeholder standing as a
-///   JSON value carries the selected value's JSON text and one standing inside
-///   one of the template's own strings carries that value's CHARACTERS
-///   ([`text`]), escaped for the string it lands in — `{"n": <n>}` renders a
-///   number and `{"n": "<n>"}` renders that number's digits as a string, and
-///   neither can break the template's own JSON;
-/// * any other template is PLAIN TEXT (`"<instance> is in state <status>"`, a
-///   sentence): every placeholder carries the value's characters AS THEY READ,
-///   nothing escapes them, and every character the template itself wrote — the
-///   quotes a quoted template opens and closes with included — is delivered as
-///   written. So such a rendering is a JSON document only where the characters
-///   substituted into it happen not to break one, and an input that is not a
-///   document is never handed to the target
-///   ([`crate::ops::put_events::deliver`] fails that invocation instead).
+///   JSON value carries the selected value's JSON text — `{"n": <n>}` renders a
+///   number — and one standing inside one of the template's own strings carries
+///   that value's reading AS A STRING ([`text`]): a string's own characters, as
+///   that string carries them, and any other value's JSON text;
+/// * a template that is a quoted STRING (`"<instance> is in state <status>"`) is
+///   that one string, so every placeholder in it stands inside it and carries the
+///   same reading.
 ///
-/// A placeholder standing for the whole EVENT carries that event's JSON document
-/// ([`Fill::Document`]), escaped where it stands inside a structured template's
-/// own string, for the reason [`reserved`] gives.
+/// So a value that has no reading as a string — an object, an array — written
+/// inside a string leaves a rendering that is not a JSON document: nothing
+/// re-quotes a document to keep the template's JSON whole, because what the target
+/// would then receive is not what the template says. Such an input is never handed
+/// to a target: the invocation fails and the event is dead-lettered
+/// ([`crate::ops::put_events`] decides that).
+///
+/// A placeholder standing for an EVENT carries that event's JSON document
+/// ([`Fill::Document`]) wherever it stands, for the reason [`reserved`] gives.
 ///
 /// A key the map does not hold and the reserved namespace does not name is
 /// not a placeholder at all: the text is left exactly as the template wrote
@@ -233,19 +261,21 @@ pub fn render(
         if let Some((key, tail)) = placeholder(rest).filter(|_| !scan.escaped()) {
             if let Some(fill) = filling(key, paths, event, delivery)? {
                 match fill {
-                    // A JSON document stands as it is where the template takes a
-                    // value, and as its characters — escaped for the string it
-                    // lands in — inside one.
-                    Fill::Document(document) if scan.in_string() => {
-                        rendered.push_str(&escaped_for_a_string(&document));
-                    }
+                    // A JSON document stands as it is wherever the placeholder is.
                     Fill::Document(document) => rendered.push_str(&document),
+                    // A value standing where the template takes a VALUE is
+                    // written as its JSON text.
                     Fill::Selected(value) if scan.structured() && !scan.in_string() => {
                         rendered.push_str(&value.to_string());
                     }
-                    Fill::Selected(value) if scan.structured() => {
-                        rendered.push_str(&escaped_for_a_string(&text(&value)));
+                    // A STRING standing inside one of the template's own strings
+                    // is written as that string carries those characters.
+                    Fill::Selected(Value::String(characters)) if scan.in_string() => {
+                        rendered.push_str(&escaped_for_a_string(&characters));
                     }
+                    // Everything else is written as its reading as a string
+                    // ([`text`]), which for a value that has none is the JSON
+                    // document it is.
                     Fill::Selected(value) => rendered.push_str(&text(&value)),
                 }
                 if rendered.len() > MAX_RENDERED_BYTES {
@@ -283,12 +313,15 @@ struct Scan {
 
 impl Scan {
     /// The state a walk of `template` starts in. A template that opens a JSON
-    /// object or array is one whose own JSON the rendering keeps; anything else —
-    /// a quoted string, a sentence — is plain text, which escapes nothing and has
-    /// no JSON structure to stand inside.
+    /// object, array or STRING is one whose own JSON the rendering keeps — those
+    /// are the forms `PutTargets` accepts
+    /// ([`crate::state::request_validation`]) — so a placeholder in it stands
+    /// either where a JSON value does or inside one of the template's own
+    /// strings. Anything else is plain text, which escapes nothing and has no
+    /// JSON structure to stand inside.
     fn of(template: &str) -> Self {
         Self {
-            structured: template.trim_start().starts_with(['{', '[']),
+            structured: template.trim_start().starts_with(['{', '[', '"']),
             in_string: false,
             escaped: false,
         }
@@ -416,54 +449,83 @@ pub fn unfilled_placeholder<'a>(
     None
 }
 
-/// The characters a selected value contributes to TEXT: what the value holds,
-/// with no JSON string quoting at any level.
+/// What a placeholder standing where a JSON VALUE does is read as while a
+/// template is being JUDGED, before anything fills it: JSON's empty value, which
+/// every fill stands in the place of.
+const A_PLACEHOLDERS_VALUE: &str = "null";
+
+/// Whether `template` states a JSON document: whether it is one once every
+/// placeholder stands for what it will be filled with.
 ///
-/// A string contributes its own characters, a number and a boolean their
-/// digits and words, `null` the four characters `null` — and a container the
-/// same reading applied to what it holds: `[` its elements, `,`-separated, `]`
-/// and `{` its members as `<name>:<value>`, `,`-separated, `}`. So an array of
-/// strings reads `[a,b]` rather than `["a","b"]`: where a placeholder carries
-/// CHARACTERS rather than a JSON value, nothing of JSON's own punctuation for
-/// quoting a string is part of them, however deep in the value the string sits.
+/// What an `InputTransformer` delivers is the JSON text a target is handed, and a
+/// template is that document with holes in it: a placeholder standing where a
+/// value does will be filled with a value, and one standing inside a string with
+/// characters of that string. So the template is read with each placeholder
+/// replaced by what it stands for — a JSON value out of a string, nothing inside
+/// one — and what is left must parse. A template that is nothing but one
+/// placeholder states a document (`<aws.events.event.json>` is the event), an
+/// object or array with placeholders in it states one, a quoted string states the
+/// string it is, and a bare unquoted sentence states none.
 ///
-/// This is the one reading of a selected value as text, so a sentence template
-/// and a placeholder standing inside a JSON template's own string (where it is
-/// escaped for that string, [`escaped_for_a_string`]) carry the same characters.
-/// A placeholder standing as a JSON VALUE carries the value's JSON text instead —
-/// that one is a value, not characters — which is where the quotes come back.
+/// The walk stands where [`render`]'s does ([`Scan`]), so this reads the same
+/// placeholders a rendering fills and judges the same template the delivery will
+/// build. What it judges is the template's own FORM: a template that states a
+/// document can still RENDER text that is not one, because what a placeholder
+/// carries is a value the event supplies rather than the `null` read here — that
+/// half is charged at delivery time, where such an input is dead-lettered rather
+/// than handed over (`crate::ops::put_events`).
+pub fn states_a_json_document(template: &str) -> bool {
+    let mut scan = Scan::of(template);
+    let mut neutral = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some((_, tail)) = placeholder(rest).filter(|_| !scan.escaped()) {
+            if !scan.in_string() {
+                neutral.push_str(A_PLACEHOLDERS_VALUE);
+            }
+            rest = tail;
+            continue;
+        }
+        let character = rest.chars().next().unwrap_or_default();
+        scan.advance(character);
+        neutral.push(character);
+        rest = &rest[character.len_utf8()..];
+    }
+    ::serde_json::from_str::<Value>(neutral.trim()).is_ok()
+}
+
+/// The characters a selected value contributes where a placeholder stands for it
+/// AS A STRING: inside one of a JSON template's own string literals, or in a
+/// template that is no JSON document at all.
 ///
-/// The walk descends one frame per level of the value, which is bounded by the
-/// nesting the event was admitted under: a `Detail` is charged against the
-/// published [`super::MAX_DETAIL_DEPTH`] BEFORE anything parses it
-/// ([`super::parse_detail`]), so no caller can present a value deeper than that
-/// here — the same bound `serde_json`'s own rendering of such a value relies on.
+/// A STRING contributes its own characters, with none of JSON's quoting of a
+/// string: `{"o": "<order>"}` renders the order id and not a second pair of
+/// quotes around it — and where it lands inside such a string those characters are
+/// written as that string carries them ([`escaped_for_a_string`]), because that is
+/// what a JSON string holding them reads as.
+///
+/// Every other value has NO reading as a string, so it contributes the JSON
+/// document it is: a number its digits, `null` the four characters `null`, and a
+/// container `["a","b"]` rather than `[a,b]` — stripping the quoting of the
+/// strings INSIDE a container would hand the target text that is no reading of the
+/// value at all. A container written inside one of the template's own strings
+/// therefore carries JSON's own punctuation into it, which is what leaves such a
+/// rendering no JSON document ([`render`] states what becomes of one).
 fn text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        Value::Array(elements) => {
-            let read: Vec<String> = elements.iter().map(text).collect();
-            format!("[{}]", read.join(","))
-        }
-        Value::Object(members) => {
-            let read: Vec<String> = members
-                .iter()
-                .map(|(name, member)| format!("{name}:{}", text(member)))
-                .collect();
-            format!("{{{}}}", read.join(","))
-        }
         other => other.to_string(),
     }
 }
 
-/// `characters` escaped for the JSON string literal they are written into, so a
-/// selected value carrying a quote, a backslash or a control character cannot
-/// break the template's own JSON.
+/// `characters` written as the JSON string literal they land in carries them, so
+/// a string value holding a quote, a backslash or a control character is the
+/// string it is rather than text that breaks the template in half.
 fn escaped_for_a_string(characters: &str) -> String {
     let quoted = Value::String(characters.to_string()).to_string();
-    // `Value::String`'s rendering is the QUOTED form, and what the
-    // placeholder stands for is its content: the quotes around it belong to
-    // the template's own string, which already carries them.
+    // `Value::String`'s rendering is the QUOTED form, and what the placeholder
+    // stands for is its content: the quotes around it belong to the template's
+    // own string, which already carries them.
     quoted
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
@@ -613,9 +675,9 @@ mod tests {
             ("a null path", "{\"n\": <nul>}", "{\"n\": null}"),
             ("a null path in a string", "{\"n\": \"<nul>\"}", "{\"n\": \"null\"}"),
             (
-                // The quotes the selected value carries are escaped for the
-                // string the placeholder stands in, so the template stays the
-                // JSON it was written as.
+                // The quotes a selected STRING carries are written as the string
+                // it lands in carries them, so the template stays the JSON it was
+                // written as.
                 "a value carrying quotes",
                 "{\"q\": \"<quoted>\"}",
                 "{\"q\": \"he said \\\"hi\\\"\"}",
@@ -634,22 +696,22 @@ mod tests {
                 "\"A-1\"",
             ),
             (
-                // A selected list written inside the template's own string
-                // carries its CHARACTERS, where nothing of JSON's quoting of
-                // a string is part of them.
+                // A selected list has no reading as a string, so it is written
+                // as the JSON document it is — inside the template's own string
+                // too, where that is what leaves the rendering no JSON at all.
                 "a list inside the template's own string",
                 "\"<items>\"",
-                "\"[a,b]\"",
+                "\"[\"a\",\"b\"]\"",
             ),
             (
                 "a list in a sentence",
                 "items: <items>",
-                "items: [a,b]",
+                "items: [\"a\",\"b\"]",
             ),
             (
                 "a list of objects in a sentence",
                 "lines: <lines>",
-                "lines: [{sku:s1},{sku:s2}]",
+                "lines: [{\"sku\":\"s1\"},{\"sku\":\"s2\"}]",
             ),
             (
                 "a sentence template",
@@ -676,6 +738,100 @@ mod tests {
                 actual.as_deref(),
                 Ok(expected),
                 "case {case:?}: expected {template:?} to render {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// What each reserved placeholder resolves to, over a TABLE whose rows differ
+    /// along the placeholder: the event's envelope WITHOUT its detail, the whole
+    /// event with it, and the three the delivery itself supplies.
+    #[test]
+    fn a_reserved_placeholder_resolves_to_the_event_or_the_delivery() {
+        // (case, the placeholder, the value it resolves to)
+        let event = event();
+        let mut envelope = event.clone();
+        envelope
+            .as_object_mut()
+            .expect("the event is an object")
+            .remove("detail");
+        let rows = [
+            // "<aws.events.event>" is the metadata: the envelope's own members
+            // with the published payload left out.
+            ("the event without its detail", "aws.events.event", envelope),
+            ("the whole event", "aws.events.event.json", event.clone()),
+            (
+                "the matched rule's ARN",
+                "aws.events.rule-arn",
+                json!(delivery().rule_arn),
+            ),
+            (
+                "the matched rule's name",
+                "aws.events.rule-name",
+                json!(delivery().rule),
+            ),
+            (
+                "the event's ingestion time",
+                "aws.events.event.ingestion-time",
+                json!(delivery().ingestion_time),
+            ),
+        ];
+        let paths = ::std::collections::BTreeMap::new();
+        for (case, key, expected) in rows {
+            let template = format!("{{\"v\": <{key}>}}");
+            let rendered = render(&template, &paths, &event, &delivery())
+                .unwrap_or_else(|refusal| panic!("case {case:?}: {template} was refused: {refusal}"));
+            let actual: ::serde_json::Value = ::serde_json::from_str(&rendered)
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: {rendered} is not JSON ({error})")
+                });
+            assert_eq!(
+                actual["v"], expected,
+                "case {case:?}: expected <{key}> to resolve to {expected}, got {rendered}"
+            );
+        }
+    }
+
+    /// Which templates STATE a JSON document, over a TABLE whose rows differ along
+    /// the form of the template and along where its placeholders stand.
+    #[test]
+    fn a_template_states_a_json_document_or_is_not_one() {
+        // (case, the template, whether it states a JSON document)
+        let rows = [
+            ("an object with a bare placeholder", "{\"n\": <amount>}", true),
+            ("an object with a quoted placeholder", "{\"n\": \"<amount>\"}", true),
+            (
+                "an object with a placeholder inside a longer string",
+                "{\"n\": \"x<amount>y\"}",
+                true,
+            ),
+            ("an array", "[<amount>, \"<order>\"]", true),
+            ("an object with no placeholder at all", "{\"n\": 1}", true),
+            ("leading whitespace", "  {\"n\": <amount>}", true),
+            ("a quoted string", "\"<order> is for <amount>\"", true),
+            (
+                "nothing but a reserved placeholder",
+                "<aws.events.event.json>",
+                true,
+            ),
+            // A placeholder standing alone states the value it will be filled
+            // with. What that value turns out to be is the delivery's business:
+            // a selected STRING renders characters that are no document, which
+            // is an input the delivery dead-letters rather than one this refuses.
+            ("nothing but a caller's own placeholder", "<order>", true),
+            // A bare, unquoted sentence states no document: rendered, it could
+            // only produce text no target may be handed.
+            ("a bare sentence", "<order> is for <amount>", false),
+            ("a sentence carrying no placeholder", "a fixed sentence", false),
+            ("an object that is never closed", "{\"n\": <amount>", false),
+            ("a string that is never closed", "\"<order>", false),
+            ("nothing at all", "", false),
+            ("an object with text after it", "{\"n\": 1} and more", false),
+        ];
+        for (case, template, states) in rows {
+            let actual = super::states_a_json_document(template);
+            assert_eq!(
+                actual, states,
+                "case {case:?}: expected {template:?} to state a document={states}, got {actual}"
             );
         }
     }

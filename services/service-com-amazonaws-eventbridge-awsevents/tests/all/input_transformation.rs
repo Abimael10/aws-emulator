@@ -14,9 +14,9 @@
 //! a JSON object carries its placeholders "in quotes or out" and one that is a
 //! JSON string carries text whose own quoting survives
 //! (`InputTransformer$InputTemplate`). A placeholder standing as a JSON value
-//! carries the selected value's JSON text; one carrying CHARACTERS — inside the
-//! template's own string — carries what the value holds with no JSON string
-//! quoting at any level, so an array of strings reads `[a,b]`. A path
+//! carries the selected value's JSON text; one standing inside the template's own
+//! string carries the value's reading AS A STRING — a string's own characters,
+//! any other value's JSON text. A path
 //! that names no place in the event selects NOTHING, which an `InputTransformer`
 //! placeholder is filled with the empty string for — distinct from a place that
 //! IS there and holds `null`, which renders as the literal `null` where the
@@ -168,7 +168,7 @@ async fn an_input_path_delivers_the_part_of_the_event_it_selects() {
 #[tokio::test]
 async fn an_input_transformer_delivers_its_rendered_template() {
     // (case, InputPathsMap, InputTemplate, the text the target receives)
-    let rows: [(&str, Value, &str, &str); 21] = [
+    let rows: [(&str, Value, &str, &str); 19] = [
         (
             "a bare placeholder in a JSON object carries the value's JSON text",
             json!({ "amount": "$.detail.amount" }),
@@ -274,21 +274,6 @@ async fn an_input_transformer_delivers_its_rendered_template() {
             json!({ "nul": "$.detail.nothing" }),
             "{\"n\": \"<nul>\"}",
             "{\"n\": \"null\"}",
-        ),
-        (
-            // A placeholder standing INSIDE the template's own string carries
-            // the value's characters, where nothing of JSON's quoting of a
-            // string is part of them — however deep in the value it sits.
-            "a quoted placeholder carrying an array of strings",
-            json!({ "all": "$.detail.items[*]" }),
-            "{\"i\": \"<all>\"}",
-            "{\"i\": \"[first,second,third]\"}",
-        ),
-        (
-            "a quoted placeholder carrying a list of objects",
-            json!({ "lines": "$.detail.lines" }),
-            "{\"l\": \"<lines>\"}",
-            "{\"l\": \"[{sku:s1},{sku:s2}]\"}",
         ),
         (
             // A bare placeholder stands as a JSON VALUE, so what it carries is
@@ -453,18 +438,6 @@ async fn a_text_template_renders_values_as_text() {
             json!({ "order": "$.detail.orderId" }),
             "\"<aws.events.rule-name>/<order>\"",
             "\"transform/A-1\"",
-        ),
-        (
-            "an array of strings in a sentence",
-            json!({ "all": "$.detail.items[*]" }),
-            "\"items <all>\"",
-            "\"items [first,second,third]\"",
-        ),
-        (
-            "a list of objects in a sentence",
-            json!({ "lines": "$.detail.lines" }),
-            "\"lines <lines>\"",
-            "\"lines [{sku:s1},{sku:s2}]\"",
         ),
         (
             "a member holding null in a sentence",

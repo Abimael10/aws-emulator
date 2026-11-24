@@ -460,6 +460,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             trace_header: None,
                             published: republished_at,
                         },
+                        // A replay re-publishes the archived event NOW, so that
+                        // is when the destination bus received it.
+                        republished_at,
                         &mut budget,
                         &mut sends,
                     )

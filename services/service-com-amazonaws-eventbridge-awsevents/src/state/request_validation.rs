@@ -21,7 +21,7 @@ use crate::ops::types::{AwsVpcConfiguration, EcsParameters};
 
 use super::{
     invalid_arn_violation, parameter_not_valid, schedule, DeadLetterConfig, Tag, Target,
-    ARN_NAMESPACE, DEFAULT_EVENT_BUS_NAME,
+    DEFAULT_EVENT_BUS_NAME,
 };
 
 /// The namespace EventBridge reserves for the event buses IT names.
@@ -186,8 +186,12 @@ pub fn reserved_tag_key_removal_violation(keys: &[String]) -> Option<String> {
 /// This is the per-target counterpart of [`super::target_arn_violation`], which
 /// checks the FORM of each ARN-valued member and runs first: a value that is no
 /// ARN is reported as such rather than as a resource of the wrong service.
-pub fn target_violation(target: &Target) -> Option<String> {
-    target_role_violation(target)
+///
+/// `region` is the Region the request was signed for: whether EventBridge invokes
+/// a target as a role the target names can depend on the Region the target's own
+/// resource lives in ([`invoked_under_a_named_role`]).
+pub fn target_violation(region: &str, target: &Target) -> Option<String> {
+    target_role_violation(region, target)
         .or_else(|| target_parameters_violation(target))
         .or_else(|| ecs_parameters_violation(target))
         .or_else(|| {
@@ -196,8 +200,11 @@ pub fn target_violation(target: &Target) -> Option<String> {
                 .as_ref()
                 .and_then(dead_letter_arn_violation)
         })
+        .or_else(|| target_input_form_violation(target))
+        .or_else(|| target_input_violation(target))
         .or_else(|| target_input_path_violation(target))
         .or_else(|| target_input_template_violation(target))
+        .or_else(|| target_input_template_form_violation(target))
 }
 
 /// The services EventBridge invokes exactly ONE kind of resource of, and the
@@ -700,9 +707,9 @@ fn missing_parameter_block(target: &Target) -> Option<&'static str> {
 /// Kinesis Data Streams, Step Functions state machines and API Gateway APIs,
 /// EventBridge relies on IAM roles that you specify in the `RoleARN` argument in
 /// `PutTargets`" (this operation's own documentation) — and an event bus of
-/// another account is in that second class too ("you must specify a `RoleArn`
-/// with proper permissions in the `Target` structure"). A target of that class
-/// carrying no `RoleArn` names nothing for EventBridge to assume, so the
+/// another account or Region is in that second class too ("you must specify a
+/// `RoleArn` with proper permissions in the `Target` structure"). A target of that
+/// class carrying no `RoleArn` names nothing for EventBridge to assume, so the
 /// delivery it asks for could never be made.
 ///
 /// The classes are the ones EventBridge delivers to BY MAKING that API call on a
@@ -713,8 +720,8 @@ fn missing_parameter_block(target: &Target) -> Option<&'static str> {
 /// operation accepts without a role, whether it is invoked under a
 /// resource-based policy or under a role the delivery assumes when one is given
 /// ([`crate::ops::put_events`]'s own reading of the same sentence).
-fn target_role_violation(target: &Target) -> Option<String> {
-    if target.role_arn.is_some() || !invoked_under_a_named_role(&target.arn) {
+fn target_role_violation(region: &str, target: &Target) -> Option<String> {
+    if target.role_arn.is_some() || !invoked_under_a_named_role(region, &target.arn) {
         return None;
     }
     Some(format!("RoleArn is required for target {}.", target.arn))
@@ -728,7 +735,12 @@ fn target_role_violation(target: &Target) -> Option<String> {
 /// an `arn:aws:events:…:api-destination/…` is an HTTP endpoint this service
 /// invokes through a connection's own credentials, not the event bus of another
 /// account the documentation is about.
-const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 6] = [
+///
+/// The event bus is NOT in this table: whether EventBridge invokes one as a role
+/// the target names depends on the ACCOUNT and the REGION it belongs to rather
+/// than on its class alone, which is read where the class is
+/// ([`invoked_under_a_named_role`]).
+const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 5] = [
     // "Step Functions state machines"
     ("states", Some("stateMachine")),
     // "Kinesis Data Streams"
@@ -737,8 +749,6 @@ const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 6] = [
     ("ec2", Some("instance")),
     // "API Gateway APIs", whose invocation ARNs are of the `execute-api` service
     ("execute-api", None),
-    // The event bus of another account or Region
-    (ARN_NAMESPACE, Some("event-bus")),
     // An Amazon ECS task, which EventBridge starts by calling Amazon ECS
     // `RunTask` on the CLUSTER the target names ("contains the Amazon ECS task
     // definition and task count to be used, if the event target is an Amazon ECS
@@ -748,11 +758,31 @@ const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 6] = [
     (ECS_ARN_NAMESPACE, Some(ECS_CLUSTER_RESOURCE)),
 ];
 
-/// Whether the target `arn` names a resource of one of [`ROLE_INVOKED_TARGETS`].
-fn invoked_under_a_named_role(arn: &str) -> bool {
+/// Whether the target `arn` names a resource of one of [`ROLE_INVOKED_TARGETS`],
+/// or an event bus EventBridge publishes onto as a role the target names.
+///
+/// The role requirement the documentation states for a bus is conditioned on
+/// WHICH bus it is: "if you are setting the event bus of ANOTHER Amazon Web
+/// Services account as the target … you must specify a `RoleArn` with proper
+/// permissions in the `Target` structure" (`PutTargets`), and a bus of another
+/// REGION is reached the same way — by a publication made outside the Region the
+/// rule lives in, which is not one EventBridge makes as itself. A bus of the
+/// account AND the Region the rule itself lives in is published onto by
+/// EventBridge as itself — "set that account's event bus as a target of the rules
+/// in your account" is what the sentence is about — so such a target names no role
+/// and needs none, and a rule forwarding onto a bus beside it is accepted as
+/// written.
+///
+/// `region` is the Region the request was signed for, which is the Region its
+/// rules and their ARNs live in. WHICH class an ARN names is read through the one
+/// place that holds it ([`super::target_account::names_an_event_bus`]).
+fn invoked_under_a_named_role(region: &str, arn: &str) -> bool {
     let Some(parsed) = ::service_common::arn::parse(arn) else {
         return false;
     };
+    if super::target_account::names_an_event_bus(arn) {
+        return parsed.account != super::account_id() || parsed.region != region;
+    }
     ROLE_INVOKED_TARGETS
         .iter()
         .any(|(vendor, resource_type)| {
@@ -854,4 +884,95 @@ fn target_input_template_violation(target: &Target) -> Option<String> {
             )
         },
     )
+}
+
+/// What the service states for an `Input` that is no JSON document: the member a
+/// caller has to change, the `Id` the request gave the target, and the
+/// requirement its documentation states for it — "valid JSON text passed to the
+/// target" (`Target$Input`). Worded for the member and the target, as this
+/// service's other refusals of a target's input are
+/// ([`target_input_path_violation`], [`target_input_template_violation`]).
+fn input_not_json(target_id: &str) -> String {
+    format!("Input for target {target_id} is not valid JSON.")
+}
+
+/// The same for an `InputTemplate`, whose rendering is the JSON text the target
+/// is handed.
+fn input_template_not_json(target_id: &str) -> String {
+    format!("InputTemplate for target {target_id} is not valid JSON.")
+}
+
+/// What the service states for a target that asks to be handed its input in more
+/// than one of the ways there are: the three members, and that one target takes
+/// one of them.
+fn conflicting_input_forms(target_id: &str) -> String {
+    format!(
+        "Only one of Input, InputPath, or InputTransformer must be provided for target \
+         {target_id}."
+    )
+}
+
+/// Why a target states more than ONE way of deciding what it is handed, or `None`
+/// when it states at most one.
+///
+/// "`Input`, `InputPath`, and `InputTransformer` are mutually exclusive and
+/// optional parameters of a target" (`PutTargets`): each is a different answer to
+/// the one question of what the target receives — a constant, a part of the event,
+/// or a rendering — so a target carrying two of them asks for two inputs and
+/// EventBridge could not say which it would deliver. The members are modelled
+/// independently, so the boundary validator passes the combination and the
+/// exclusivity is read where the target is written.
+///
+/// Judged across EVERY pair of the three, and before each member's own value is
+/// ([`target_input_violation`], [`target_input_path_violation`],
+/// [`target_input_template_form_violation`]): a caller that named two of them has
+/// to drop one whatever either one holds.
+fn target_input_form_violation(target: &Target) -> Option<String> {
+    let stated = usize::from(target.input.is_some())
+        + usize::from(target.input_path.is_some())
+        + usize::from(target.input_transformer.is_some());
+    (stated > 1).then(|| conflicting_input_forms(&target.id))
+}
+
+/// Why the constant a target is handed is not one it could be handed, or `None`
+/// when it is — and for a target carrying none.
+///
+/// "`Input`: valid JSON text passed to the target. In this case, nothing from the
+/// event itself is passed to the target" (`Target$Input`): what travels is JSON
+/// TEXT, so text that is no JSON document at all (a bare sentence) is an input no
+/// target could be handed — a target may only be handed a JSON document
+/// (`crate::ops::put_events`'s `invalid_input_refusal`). The member is modelled a
+/// plain 0..8192 string, so the boundary validator passes any text and the form is
+/// read here: the target is refused where it is CONFIGURED, and an upsert carrying
+/// such a value leaves the target the rule already holds exactly as it was, rather
+/// than replacing a working one with a target whose every firing would fail.
+///
+/// The refusal is worded for the MEMBER and the target that carried it, as the
+/// service words the other refusal of a target's input
+/// ([`target_input_path_violation`]): the member a caller has to change, the `Id`
+/// the request gave the target, and that the value is not one the member admits.
+fn target_input_violation(target: &Target) -> Option<String> {
+    let input = target.input.as_deref()?;
+    ::serde_json::from_str::<::serde_json::Value>(input.trim())
+        .is_err()
+        .then(|| input_not_json(&target.id))
+}
+
+/// Why the template a target renders its input with is not one EventBridge
+/// renders, or `None` when it is — and for a target carrying no transformer.
+///
+/// An `InputTemplate` is "the input template where you specify placeholders"
+/// (`InputTransformer$InputTemplate`) and what it renders is the JSON text a
+/// target is handed, so the template itself states a JSON document: an object, an
+/// array, a quoted string, or a placeholder standing for one — read with each
+/// placeholder standing for what will fill it
+/// ([`super::input_transform::states_a_json_document`]). Text that states none — a
+/// bare, unquoted sentence — could only render an input no target may be handed,
+/// so it is refused where the target is CONFIGURED rather than stored and found to
+/// deliver nothing at every firing. Worded for the member and the target, as the
+/// other refusals of a target's input reshaping are.
+fn target_input_template_form_violation(target: &Target) -> Option<String> {
+    let template = &target.input_transformer.as_ref()?.input_template;
+    (!super::input_transform::states_a_json_document(template))
+        .then(|| input_template_not_json(&target.id))
 }

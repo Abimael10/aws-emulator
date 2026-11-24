@@ -621,9 +621,14 @@ struct Reshaped {
     case: &'static str,
     /// The members the target carries beside its `Id` and `Arn`.
     asked: fn(i64) -> Value,
-    /// The message the one written log event carries, and whether its timestamp is
-    /// the event's own instant; `None` when nothing is written.
+    /// The message the one written log event carries; `None` when nothing is
+    /// written.
     message: Option<&'static str>,
+    /// Whether the record's `timestamp` is the INGESTION instant — when
+    /// EventBridge received the event — rather than the instant the input itself
+    /// named. The publication below stamps the event 30 s in the past, so the two
+    /// are never the same instant.
+    ingestion_instant: bool,
 }
 
 /// A target that RESHAPED its input is handed the log record that input names: its
@@ -634,7 +639,7 @@ struct Reshaped {
 async fn a_reshaped_input_is_written_as_the_log_record_it_names() {
     let rows = [
         Reshaped {
-            case: "an input transformer rendering the event's instant and a message",
+            case: "an input transformer rendering the ingestion instant and a message",
             asked: |_at| {
                 json!({
                     "InputTransformer": {
@@ -645,6 +650,7 @@ async fn a_reshaped_input_is_written_as_the_log_record_it_names() {
                 })
             },
             message: Some("order A-1 placed"),
+            ingestion_instant: true,
         },
         Reshaped {
             case: "a constant Input naming the instant in epoch milliseconds",
@@ -658,6 +664,7 @@ async fn a_reshaped_input_is_written_as_the_log_record_it_names() {
                 })
             },
             message: Some("a constant record"),
+            ingestion_instant: false,
         },
         Reshaped {
             case: "an input transformer rendering neither member",
@@ -670,11 +677,13 @@ async fn a_reshaped_input_is_written_as_the_log_record_it_names() {
                 })
             },
             message: None,
+            ingestion_instant: false,
         },
         Reshaped {
             case: "an input path selecting a part of the event that is no log record",
             asked: |_at| json!({ "InputPath": "$.detail" }),
             message: None,
+            ingestion_instant: false,
         },
     ];
 
@@ -726,6 +735,19 @@ async fn a_reshaped_input_is_written_as_the_log_record_it_names() {
             json!(message),
             "case {case:?}: expected the message {message:?}, got {event:?}"
         );
+        if row.ingestion_instant {
+            // "The time at which the event was received by EventBridge": the
+            // publication stamped the event 30 s in the past, so the instant the
+            // record carries is LATER than the event's own.
+            let stamped = event["timestamp"].as_i64().unwrap_or_default();
+            assert!(
+                stamped > at * 1_000,
+                "case {case:?}: expected the ingestion instant, later than the event's own \
+                 ({}), got {event:?}",
+                at * 1_000
+            );
+            continue;
+        }
         assert_eq!(
             event["timestamp"],
             json!(at * 1_000),

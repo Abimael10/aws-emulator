@@ -56,10 +56,28 @@ pub fn cross_account_target_denial(arn: &str) -> Option<String> {
     if parsed.account.is_empty() || parsed.account == account_id() {
         return None;
     }
-    let deliverable = CROSS_ACCOUNT_TARGET_CLASSES
+    (!names_a_cross_account_class(arn)).then(|| cross_account_refusal(arn))
+}
+
+/// Whether `arn` names a resource of one of [`CROSS_ACCOUNT_TARGET_CLASSES`].
+fn names_a_cross_account_class(arn: &str) -> bool {
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return false;
+    };
+    CROSS_ACCOUNT_TARGET_CLASSES
         .iter()
         .any(|(vendor, resource_type)| {
             parsed.vendor == *vendor && parsed.resource_type() == *resource_type
-        });
-    (!deliverable).then(|| cross_account_refusal(arn))
+        })
+}
+
+/// Whether `arn` names an EVENT BUS — the one class above, read here so the
+/// class is held in one place.
+///
+/// Asked by the role requirement of a bus target
+/// ([`super::request_validation`]), which is about WHICH bus a target names
+/// rather than about whether the class may be named across accounts at all.
+#[must_use]
+pub fn names_an_event_bus(arn: &str) -> bool {
+    names_a_cross_account_class(arn)
 }

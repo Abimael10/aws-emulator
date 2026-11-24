@@ -540,11 +540,15 @@ async fn each_log_path_writes_only_into_the_group_its_own_configuration_names() 
                         message, expected,
                         "case {case:?}: expected the rendered message {expected:?}, got {event}"
                     );
-                    assert_eq!(
-                        event["timestamp"],
-                        json!(at * 1_000),
-                        "case {case:?}: expected the instant the template rendered ({}), got \
-                         {event}",
+                    // The template renders `<aws.events.event.ingestion-time>`,
+                    // which is when EventBridge RECEIVED the event: the
+                    // publication stamped it 30 s in the past, so the record's
+                    // instant is later than the event's own.
+                    let stamped = event["timestamp"].as_i64().unwrap_or_default();
+                    assert!(
+                        stamped > at * 1_000,
+                        "case {case:?}: expected the ingestion instant, later than the event's \
+                         own ({}), got {event}",
                         at * 1_000
                     );
                 }

@@ -612,19 +612,24 @@ async fn a_schedule_is_accepted_only_on_the_default_event_bus() {
 /// resource-based policies; for EC2 instances, Kinesis Data Streams, Step
 /// Functions state machines and API Gateway APIs, EventBridge relies on IAM roles
 /// that you specify in the `RoleARN` argument in `PutTargets`" — and the event bus
-/// of another account is in that second class too. A refused request leaves the
-/// rule's targets as they were.
+/// of ANOTHER account is in that second class too ("if you are setting the event
+/// bus of another account as the target … you must specify a `RoleArn` with proper
+/// permissions in the `Target` structure"), as is a bus of another REGION, while a
+/// bus of the account AND Region the rule lives in is published onto by
+/// EventBridge itself and needs none. A refused request leaves the rule's targets
+/// as they were.
 ///
 /// The rows differ along the SERVICE the target belongs to, spanning the classes
-/// that documentation enumerates (a state machine, an event bus, a data stream,
-/// an EC2 instance, an API Gateway API) and the class whose delivery IS such a
-/// call (an Amazon ECS cluster, which EventBridge runs a task in with
-/// `ecs:RunTask`) against the targets it does not name (a queue, a topic, a
-/// function, a log group) and against another resource of a service that is in
-/// the list (an activity of Step Functions, an api destination of this service),
-/// which is not one of them. An ECS ARN that names something OTHER than a cluster
-/// is refused as an ARN that names nothing a rule could invoke, whatever role it
-/// carries, which is `target_configuration_refusals`' own table.
+/// that documentation enumerates (a state machine, another account's event bus, a
+/// bus of another Region, a data stream, an EC2 instance, an API Gateway API) and
+/// the class whose delivery IS such a call (an Amazon ECS cluster, which
+/// EventBridge runs a task in with `ecs:RunTask`) against the targets it does not
+/// name (this account's and Region's own event bus, a queue, a topic, a function,
+/// a log group) and against another resource of a service that is in the list (an
+/// activity of Step Functions, an api destination of this service), which is not
+/// one of them. An ECS ARN that names something OTHER than a cluster is refused as
+/// an ARN that names nothing a rule could invoke, whatever role it carries, which
+/// is `target_configuration_refusals`' own table.
 #[tokio::test]
 async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
     let router = emulator();
@@ -645,9 +650,25 @@ async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
             true,
         ),
         (
-            "an event bus of this service",
-            format!("arn:aws:events:{REGION}:{account}:event-bus/other"),
+            // The bus of ANOTHER account, which is the one the sentence about a
+            // `RoleArn` is written for.
+            "an event bus of another account",
+            format!("arn:aws:events:{REGION}:210987654321:event-bus/other"),
             true,
+        ),
+        (
+            // A bus of another REGION, reached by a publication made outside the
+            // Region the rule lives in.
+            "an event bus of another Region",
+            format!("arn:aws:events:us-east-1:{account}:event-bus/other"),
+            true,
+        ),
+        (
+            // A bus of the account AND the Region the rule itself lives in:
+            // EventBridge publishes onto it as itself, so no role is handed to it.
+            "an event bus of this account and Region",
+            format!("arn:aws:events:{REGION}:{account}:event-bus/other"),
+            false,
         ),
         (
             "a Kinesis data stream",

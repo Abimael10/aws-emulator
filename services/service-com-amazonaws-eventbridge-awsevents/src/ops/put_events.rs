@@ -587,6 +587,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             rendered,
                             trace_header: accepted.trace_header,
                             published: accepted.time,
+                            ingested: now,
                             hops: 0,
                             matched,
                         });
@@ -683,19 +684,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
         // What each dispatched event WAS — the bus whose rules matched it, the
         // Region those rules were read in and the envelope its targets were
-        // handed — kept by `EventId` so the records this bus owes about a handover
-        // that failed can be rendered once every pass has decided its own
-        // handovers ([`append_invocation_failures`]). Every dispatch carries an
-        // `EventId` of its own, a copy re-published onto another bus included (it
-        // is minted a new one, see [`republish`]), and the envelope is MOVED here
-        // rather than copied. What this holds is bounded by the request's delivery
-        // budget: a dispatch is queued only where a matched rule has a target, and
-        // every handover charges that budget for the text it hands over before it
-        // is made, so the envelopes kept here weigh no more than the bytes the
-        // request may deliver.
-        let mut dispatched: ::std::collections::BTreeMap<String, Dispatched> =
+        // handed — kept by (`EventId`, rule) so the records this bus owes about a
+        // handover that failed can be rendered once every pass has decided its own
+        // handovers ([`append_invocation_failures`]). Keyed by the RULE as well as
+        // the event because a copy re-published onto another bus carries the
+        // event's own `EventId` (see [`republish`]). What this holds is bounded by
+        // the request's delivery budget: an entry is made only for a rule that
+        // HANDED the event to a target, every handover charges that budget for the
+        // text it hands over before it is made, and the entries of one event share
+        // ONE copy of its envelope ([`Dispatched`]) — so the envelopes kept here
+        // weigh no more than the bytes the request may deliver, whatever the
+        // number of rules that matched.
+        let mut dispatched: ::std::collections::BTreeMap<DispatchKey, Dispatched> =
             ::std::collections::BTreeMap::new();
         while let Some(dispatch) = dispatches.pop_front() {
+            // The envelope this dispatch hands over, copied once the FIRST rule
+            // that hands it over needs it and shared by every entry made for it:
+            // a dispatch no rule delivers copies nothing.
+            let mut envelope: Option<::std::sync::Arc<String>> = None;
             // Whether this request's delivery budget ran out part way through this
             // event's targets: the remaining targets of this event, and every
             // event still queued, are not handed anything — and what this event
@@ -704,6 +710,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut budget_spent = false;
             for rule in &dispatch.matched {
                 let rule_arn = crate::state::rule_arn(&dispatch.region, &dispatch.bus, &rule.name);
+                // What this event WAS, under the rule that is about to hand it
+                // over: a rule carrying no target hands nothing over, so it is
+                // never a key a recorded invocation names and gets no entry.
+                if !rule.targets.is_empty() {
+                    let envelope = ::std::sync::Arc::clone(
+                        envelope.get_or_insert_with(|| {
+                            ::std::sync::Arc::new(dispatch.rendered.clone())
+                        }),
+                    );
+                    dispatched.insert(
+                        (dispatch.event_id.clone(), rule.name.clone()),
+                        Dispatched {
+                            bus: dispatch.bus.clone(),
+                            region: dispatch.region.clone(),
+                            envelope,
+                        },
+                    );
+                }
                 for target in &rule.targets {
                     let handover = Handover {
                         event_id: &dispatch.event_id,
@@ -767,6 +791,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &mut clients,
                             &stores,
                             &handover,
+                            dispatch.ingested,
                             &mut budget,
                             &mut sends,
                         )
@@ -804,14 +829,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     break;
                 }
             }
-            dispatched.insert(
-                dispatch.event_id.clone(),
-                Dispatched {
-                    bus: dispatch.bus,
-                    region: dispatch.region,
-                    envelope: dispatch.rendered,
-                },
-            );
             if budget_spent {
                 break;
             }
@@ -1008,11 +1025,27 @@ fn bus_log_key(region: &str, bus: &str) -> BusLogKey {
 /// One dispatched event, kept for the records its bus owes about the handovers
 /// that event's targets were made: which bus routed it, the Region that bus's
 /// rules and ARNs are read in, and the envelope the targets were handed.
+///
+/// The envelope is held behind a SHARED handle: one dispatch is kept under every
+/// rule that handed the event over ([`DispatchKey`]), and the text each of them
+/// reports is the one envelope that dispatch rendered — so what this costs is one
+/// copy per EVENT, whatever the number of rules that matched it.
 struct Dispatched {
     bus: String,
     region: String,
-    envelope: String,
+    envelope: ::std::sync::Arc<String>,
 }
+
+/// Which dispatch a recorded invocation belongs to: the event and the RULE the
+/// handover was made under.
+///
+/// The event id alone does not name one: a copy a bus target re-published carries
+/// the event's own id (see [`republish`]), so one request can dispatch one event
+/// on two buses — and what tells those apart is the rule whose target was handed
+/// it, which every recorded invocation carries. Only a rule that HANDED the event
+/// to a target has an entry, because that is the only kind of key a recorded
+/// invocation names.
+type DispatchKey = (String, String);
 
 /// Append to `records` the ERROR bus-log record each handover of this request
 /// that FAILED owes.
@@ -1038,7 +1071,7 @@ struct Dispatched {
 fn append_invocation_failures(
     state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
     configs: &mut ::std::collections::BTreeMap<BusLogKey, Option<LogConfig>>,
-    dispatched: &::std::collections::BTreeMap<String, Dispatched>,
+    dispatched: &::std::collections::BTreeMap<DispatchKey, Dispatched>,
     invocations: &[crate::state::TargetInvocation],
     records: &mut Vec<crate::state::bus_logs::BusLogRecord>,
     now: ::std::time::SystemTime,
@@ -1050,7 +1083,8 @@ fn append_invocation_failures(
             else {
                 return None;
             };
-            let dispatch = dispatched.get(&invocation.event_id)?;
+            let dispatch =
+                dispatched.get(&(invocation.event_id.clone(), invocation.rule.clone()))?;
             Some((invocation, dispatch, code.as_str(), message.as_str()))
         })
         .collect();
@@ -1540,6 +1574,9 @@ struct Dispatch {
     /// the instant it was ingested — which is what the age bound of a target's
     /// `RetryPolicy` is read against ([`crate::state::retry_bounds`]).
     published: ::std::time::SystemTime,
+    /// When this service RECEIVED the event, which a publisher's own `Time` does
+    /// not change (see [`Handover`]'s own member).
+    ingested: ::std::time::SystemTime,
     /// How many event-bus targets this event has already been re-published
     /// through, which is what bounds a chain of bus-to-bus targets.
     hops: usize,
@@ -2035,12 +2072,19 @@ impl DeliveryBudget {
 /// by this same code (`crate::ops::start_replay`): a replay re-publishes the
 /// event onto a bus and the bus's rules deliver it, so the delivery rules above
 /// are stated ONCE and hold for a replayed event as they do for a published one.
+/// `ingested` is when EventBridge RECEIVED the event this handover carries, which
+/// a publisher's own `Time` does not change: it is what the reserved placeholder
+/// `<aws.events.event.ingestion-time>` of a target's `InputTransformer` resolves
+/// to ([`transformed`]), and it is the same instant for every handover one
+/// request makes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn deliver(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     clients: &mut Clients,
     stores: &Stores<'_>,
     handover: &Handover<'_>,
+    ingested: ::std::time::SystemTime,
     budget: &mut DeliveryBudget,
     sends: &mut QueueSends,
 ) -> Handed {
@@ -2084,7 +2128,7 @@ pub(crate) async fn deliver(
     // target's own constant replaces the envelope when it carries one — and
     // `InputPath` or an `InputTransformer` reshapes the event into what that
     // target asked for ([`transformed`]).
-    let reshaped = match transformed(handover) {
+    let reshaped = match transformed(handover, ingested) {
         Ok(reshaped) => reshaped,
         Err(refusal) => {
             return Handed::Outcome(crate::state::InvocationOutcome::NotAttempted(refusal))
@@ -2555,7 +2599,10 @@ async fn dead_letter_refusal(
 /// evaluate, or a rendering past
 /// [`crate::state::input_transform::MAX_RENDERED_BYTES`] — which is a delivery
 /// that does not happen rather than one the target is handed something else for.
-fn transformed(handover: &Handover<'_>) -> Result<Option<String>, String> {
+fn transformed(
+    handover: &Handover<'_>,
+    ingested: ::std::time::SystemTime,
+) -> Result<Option<String>, String> {
     let target = handover.target;
     if target.input_path.is_none() && target.transformer.is_none() {
         return Ok(None);
@@ -2563,13 +2610,14 @@ fn transformed(handover: &Handover<'_>) -> Result<Option<String>, String> {
     let event = crate::state::parse_delivered_event(handover.rendered)
         .unwrap_or(::serde_json::Value::Null);
     if let Some(transformer) = &target.transformer {
+        // "The time at which the event was received by EventBridge": the
+        // INGESTION instant, which is not the event's own `time` — a publisher
+        // may stamp an entry with any instant it likes.
+        let ingestion_time = crate::state::to_event_time(ingested);
         let delivery = crate::state::input_transform::Delivery {
             rule: handover.rule,
             rule_arn: handover.rule_arn,
-            ingestion_time: event
-                .get("time")
-                .and_then(::serde_json::Value::as_str)
-                .unwrap_or_default(),
+            ingestion_time: &ingestion_time,
         };
         return crate::state::input_transform::render(
             &transformer.template,
@@ -2659,11 +2707,12 @@ fn event_bus_target(arn: &str) -> Option<BusTarget> {
 /// The rule AWS follows: a rule whose target is an event bus publishes the event
 /// onto that bus, where it is matched by THAT bus's rules and delivered to their
 /// targets — the bus is reached by publishing, not by an API call to another
-/// service. The copy is the SAME event with a NEW event id: every other member
-/// of the envelope is carried over, the `region` it was published in included,
-/// so a rule of the other Region sees where the event came from. The forward
-/// happens at most once per event: a copy that reached its bus BY a forward is
-/// not forwarded on ([`MAX_BUS_HOPS`]).
+/// service. The copy is the SAME event, PRESERVED: every member of the envelope
+/// is carried over, its `id` and the `region` it was published in included, so a
+/// consumer reading both buses sees one event rather than two and a rule of the
+/// other Region sees where the event came from. The forward happens at most once
+/// per event: a copy that reached its bus BY a forward is not forwarded on
+/// ([`MAX_BUS_HOPS`]).
 ///
 /// The handover spends the request's own delivery budget — charged BEFORE
 /// anything about it is decided, so every outcome it can have, a refusal and the
@@ -2730,7 +2779,7 @@ async fn republish(
             dispatch.bus
         ));
     }
-    let mut envelope = match crate::state::parse_delivered_event(handover.rendered) {
+    let envelope = match crate::state::parse_delivered_event(handover.rendered) {
         Some(::serde_json::Value::Object(fields)) => fields,
         _ => {
             return crate::state::InvocationOutcome::NotAttempted(
@@ -2779,14 +2828,16 @@ async fn republish(
     ) {
         return crate::state::InvocationOutcome::Failed { code, message };
     }
-    // The copy's OWN event id, minted once the publication is authorized: a
-    // forward the destination bus refuses publishes nothing, so it consumes no
-    // id.
-    let event_id = state.lock().next_event_id(now);
-    envelope.insert(
-        EVENT_ID_FIELD.to_string(),
-        ::serde_json::Value::String(event_id.clone()),
-    );
+    // The copy carries the event's OWN id: a forward hands the destination bus
+    // the event that was published, so every member of the envelope is preserved
+    // and a consumer reading both buses sees ONE event rather than two. Nothing
+    // is minted for it — the id is the ingestion receipt of the publication the
+    // forward is carrying.
+    let event_id = envelope
+        .get(EVENT_ID_FIELD)
+        .and_then(::serde_json::Value::as_str)
+        .unwrap_or(dispatch.event_id.as_str())
+        .to_string();
     let envelope = ::serde_json::Value::Object(envelope);
     // Matching the copy against the other bus's rules is CPU-bound and runs with
     // no lock held: yielding first gives a cancellation or a shutdown signal
@@ -2813,6 +2864,9 @@ async fn republish(
             // bus: it keeps the envelope's own `time`, so its age is the age of
             // the event rather than of the forward.
             published: dispatch.published,
+            // The copy was taken by the destination bus when the forward was
+            // made, which is this request's own instant.
+            ingested: now,
             hops: dispatch.hops + 1,
             matched,
         });

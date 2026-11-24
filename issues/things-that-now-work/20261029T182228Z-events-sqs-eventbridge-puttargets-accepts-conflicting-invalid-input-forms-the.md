@@ -87,3 +87,30 @@ Cause 7: seven checks end "Error: Check timed out after 60.0s" with the SQS targ
 
 ## Steps to Reproduce
 (1) PutTargets with both Input and InputPath on one target — accepted. (2) PutTargets with an InputTransformer whose InputTemplate is a bare sentence — accepted. (3) PutTargets a working target, then upsert the same Id with an invalid Input — accepted with FailedEntryCount=0. (4) PutTargets an SQS target with a DeadLetterConfig, delete the target queue, PutEvents, read the DLQ message attributes — ERROR_CODE is QueueDoesNotExist. (5) PutTargets with an InputTransformer using <aws.events.event>, PutEvents, read the rendering — detail is present. (6) PutTargets with an InputTransformer declaring a path absent from the event, PutEvents — the rendering contains null / the literal "null". (7) Configure bus-to-bus forwarding, a custom-bus fan-out, an array/nested-object pattern, and an archive + StartReplay — the SQS targets stay empty.
+
+## What was fixed, and what three of its traces still show
+
+Causes 1-6 are fixed, and of cause 7's seven traces five are: the array-element and
+nested-object pattern checks, the missing-path transformer, the
+object-in-a-quoted-template dead letter and the substitution-forms rendering.
+
+Three traces of cause 7 still end "Check timed out after 60.0s" and are NOT fixed
+here. Each of those paths is implemented and exercised end to end over the router
+in the service crate — `tests/all/bus_forward_happens_once.rs` (six bus meshes),
+`tests/all/bulk_fan_out.rs` (1,000 events over the four partitioning patterns with
+the recorded queue policy, drained to the exact id sets in under four seconds) and
+`tests/all/archive_replay.rs` (a replay window) — and no missing delivery could be
+reproduced for any of them:
+
+* events__sqs.bus-to-bus-forwarding-happens-once-and-preserves-the-envelope
+* events__sqs.custom-bus-fanout-is-at-least-once-and-order-independent — also
+  carried by issues/things-that-do-not-work/20261116T101400Z-events-sqs-the-1-000-event-custom-bus.md
+* events__sqs.replay-redelivers-each-archived-event-exactly-once-and-never-the-out-of-window-one
+  — the replay re-emission path is also carried by
+  issues/things-that-do-not-work/20261113T113607Z-events-sqs-an-accepted-startreplay-over-an-enabled.md
+
+The exact SENTENCE AWS words the two new PutTargets refusals with (a non-JSON
+`Input`, an `InputTemplate` that states no JSON document) is also still unconfirmed:
+their status (400) and code (ValidationException) match the recording, and the
+wording follows this service's own form for the sibling refusals of the same
+members, but six candidates were tried against the recorded checks and none matched.

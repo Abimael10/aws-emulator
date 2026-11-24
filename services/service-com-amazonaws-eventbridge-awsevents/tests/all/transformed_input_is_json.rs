@@ -7,12 +7,15 @@
 //! queue the target names.
 //!
 //! The RULE asserted here: an `InputTransformer` fills every `<key>` placeholder
-//! of its `InputTemplate` with what its path selects, and the FORM of the template
-//! decides how. A template that opens a JSON value carries its placeholders "in
-//! quotes or out", each written for the place it stands in, so its rendering is
-//! still the JSON document the template was written as. Any OTHER template is
-//! text: every placeholder carries the selected value's characters as they read,
-//! nothing escapes them, and the rendering is a JSON document only by accident.
+//! of its `InputTemplate` with what its path selects, TEXTUALLY, and WHERE the
+//! placeholder stands decides what the value contributes. A template that opens a
+//! JSON value carries its placeholders "in quotes or out": one standing as a value
+//! contributes the value's JSON text, one standing inside one of the template's
+//! own strings the value's reading as a string — a string's own characters as that
+//! string carries them, and any other value's JSON text. So a value with no
+//! reading as a string (an object, an array) written inside a string leaves a
+//! rendering that is no JSON document, and so does a template that is no JSON
+//! document itself.
 //!
 //! What a target may be HANDED is a JSON document, so an input that is not one is
 //! never handed over: the invocation FAILS, the event goes to the target's
@@ -23,11 +26,11 @@
 //! IS delivered.
 //!
 //! The table spans the class rather than one case: the rows differ along the FORM
-//! of the template (a JSON object, a JSON string, a sentence, a bare placeholder),
-//! along WHERE the placeholder stands (as a value, inside a string), and along
-//! WHAT the substituted value carries (a plain string, a string holding a quote,
-//! one holding a control character, a number, the whole event) — which together
-//! decide whether the rendering is a document at all.
+//! of the template (a JSON object, a JSON array, a JSON string, a bare
+//! placeholder), along WHERE the placeholder stands (as a value, inside a string),
+//! and along WHAT the substituted value carries (a plain string, a string holding
+//! a quote, one holding a control character, a number, an object, the whole event)
+//! — which together decide whether the rendering is a document at all.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine, and the queue and rule fixtures) is
@@ -68,6 +71,7 @@ fn paths() -> Value {
         "amount": "$.detail.amount",
         "quote": "$.detail.quote",
         "line": "$.detail.line",
+        "whole": "$.detail",
     })
 }
 
@@ -107,8 +111,8 @@ async fn a_rendering_that_is_not_json_is_dead_lettered_instead_of_delivered() {
             delivered: Delivered::Text("{\"o\": \"A-1\"}"),
         },
         Row {
-            // A value carrying a quote is written for the string it lands in, so
-            // the rendering is still the JSON the template was written as.
+            // A selected STRING is written as the string it lands in carries it,
+            // so the rendering is still the JSON the template was written as.
             case: "a JSON object template whose string member carries a quote",
             template: "{\"q\": \"<quote>\"}",
             delivered: Delivered::Text("{\"q\": \"she said \\\"go\\\"\"}"),
@@ -131,20 +135,24 @@ async fn a_rendering_that_is_not_json_is_dead_lettered_instead_of_delivered() {
             delivered: Delivered::Envelope,
         },
         Row {
-            // A sentence is text: the substituted values are written as they
-            // read and the rendering is no JSON document.
-            case: "a sentence template",
-            template: "order <order> for <amount>",
+            // An OBJECT has no reading as a string, so what lands inside the
+            // template's own string is the document it is — which that string
+            // cannot hold.
+            case: "a JSON object template whose string member takes an object",
+            template: "{\"d\": \"<whole>\"}",
             delivered: Delivered::Nothing,
         },
         Row {
-            case: "a sentence template whose value carries a quote",
-            template: "the customer said <quote>",
+            // The same, one template form along: an array's own string element.
+            case: "a JSON array template whose string element takes an object",
+            template: "[\"<whole>\"]",
             delivered: Delivered::Nothing,
         },
         Row {
-            case: "a sentence template carrying no placeholder at all",
-            template: "a fixed sentence",
+            // A quoted-string template IS one JSON string, so a document
+            // substituted into it breaks it in half just the same.
+            case: "a quoted-string template taking an object",
+            template: "\"the order was <whole>\"",
             delivered: Delivered::Nothing,
         },
     ];
@@ -290,7 +298,7 @@ async fn a_rendering_that_is_not_json_is_dead_lettered_instead_of_delivered() {
 /// else down with it.
 #[tokio::test]
 async fn one_targets_unrenderable_input_does_not_stop_another_target_of_the_rule() {
-    let case = "a rule with one JSON template and one bare sentence";
+    let case = "a rule with one renderable JSON template and one that breaks";
     let emulator = emulator();
     let (good_url, good_arn) = given_queue(&emulator, "sibling-good").await;
     let (bad_url, bad_arn) = given_queue(&emulator, "sibling-bad").await;
@@ -314,7 +322,7 @@ async fn one_targets_unrenderable_input_does_not_stop_another_target_of_the_rule
                 "DeadLetterConfig": { "Arn": dead_letter_arn },
                 "InputTransformer": {
                     "InputPathsMap": paths(),
-                    "InputTemplate": "order <order>",
+                    "InputTemplate": "{\"d\": \"<whole>\"}",
                 },
             },
         ]),

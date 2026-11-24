@@ -12,7 +12,7 @@
 //! therefore cannot be chained: whatever the shape of the mesh a client wires, one
 //! published event crosses at most one bus-to-bus link, every bus sees it at most
 //! once, and the copy that does cross carries the event the publisher published —
-//! its `source`, `detail-type`, `detail` and `resources` unchanged.
+//! its `id`, `source`, `detail-type`, `detail` and `resources` unchanged.
 //!
 //! The table spans the class rather than the one recorded case: the rows differ
 //! along the SHAPE of the mesh (a chain of three buses, a longer chain, a ring of
@@ -128,8 +128,9 @@ fn detail(case: &str) -> Value {
     json!({ "nonce": case, "orderId": "A-1" })
 }
 
-/// Publish one event onto the bus `bus`, carrying the row's own detail.
-async fn publish(emulator: &Emulator, case: &str, bus: &str) {
+/// Publish one event onto the bus `bus`, carrying the row's own detail; answers
+/// its `EventId`, which every copy of it must carry.
+async fn publish(emulator: &Emulator, case: &str, bus: &str) -> String {
     let (status, body) = events(
         emulator,
         "PutEvents",
@@ -152,6 +153,10 @@ async fn publish(emulator: &Emulator, case: &str, bus: &str) {
         json!(0),
         "case {case:?}: PutEvents reported a failed entry: {body}"
     );
+    body["Entries"][0]["EventId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: PutEvents minted no EventId: {body}"))
+        .to_string()
 }
 
 /// Everything the queue at `url` holds once it holds `want` messages, so a
@@ -171,8 +176,10 @@ async fn held_once(emulator: &Emulator, url: &str, want: usize) -> Vec<Value> {
 }
 
 /// The `detail` of each message of `messages`, with the envelope members a
-/// forward must carry over asserted on every one of them.
-fn details(case: &str, bus: &str, messages: &[Value]) -> Vec<Value> {
+/// forward must carry over asserted on every one of them — the published event's
+/// own `id` included, because a forward hands the destination bus the event that
+/// was published rather than a new one built from it.
+fn details(case: &str, bus: &str, event_id: &str, messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
         .map(|message| {
@@ -195,6 +202,11 @@ fn details(case: &str, bus: &str, messages: &[Value]) -> Vec<Value> {
                 envelope["resources"],
                 json!([]),
                 "case {case:?}: the copy delivered on {bus} carries other resources: {envelope}"
+            );
+            assert_eq!(
+                envelope["id"],
+                json!(event_id),
+                "case {case:?}: the copy delivered on {bus} carries another id: {envelope}"
             );
             envelope["detail"].clone()
         })
@@ -258,7 +270,7 @@ async fn a_forwarded_event_is_never_forwarded_on() {
             .await;
         }
 
-        publish(&emulator, case, row.buses[row.published_on]).await;
+        let event_id = publish(&emulator, case, row.buses[row.published_on]).await;
 
         // The sinks that must receive are read FIRST, each until it holds what the
         // row states: once every one of them has, the routing and the delivery of
@@ -283,7 +295,7 @@ async fn a_forwarded_event_is_never_forwarded_on() {
 
         for (bus, want) in row.buses.iter().zip(row.copies) {
             let messages = held.remove(bus).unwrap_or_default();
-            let delivered = details(case, bus, &messages);
+            let delivered = details(case, bus, &event_id, &messages);
             let expected: Vec<Value> = (0..*want).map(|_| detail(case)).collect();
             assert_eq!(
                 delivered, expected,
