@@ -267,6 +267,31 @@ pub async fn table_created_by(router: &MultiServiceRouter, database: &str, name:
         .to_string()
 }
 
+/// The instant the Data Catalog recorded a table's creation at (`Table$CreateTime`), read
+/// back through Glue's own `GetTable`, as the epoch-seconds number its wire form carries.
+///
+/// For a suite that checks the grants a table was CREATED carrying against the create
+/// itself: the catalog is asked WHEN the table was created rather than the test guessing an
+/// instant of its own.
+pub async fn table_created_at(router: &MultiServiceRouter, database: &str, name: &str) -> f64 {
+    let (status, body) = glue(
+        router,
+        "GetTable",
+        &json!({ "DatabaseName": database, "Name": name }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case get table {database}.{name}: expected 200, got {status} {body:?}"
+    );
+    body.get("Table")
+        .and_then(|table| table.get("CreateTime"))
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| {
+            panic!("case get table {database}.{name}: expected a CreateTime, got {body:?}")
+        })
+}
+
 /// The sentence Lake Formation refuses a revoke with when the grantee holds NOTHING on the
 /// resource the request names: wholly fixed text, in two sentences, with no part taken from
 /// the request.
@@ -323,6 +348,27 @@ pub async fn list_permissions(
                  list, got {payload:?}"
             )
         })
+}
+
+/// The entries a listing carries with the WRITE INSTANT of each record taken out:
+/// everything but `PrincipalResourcePermissions$LastUpdated`.
+///
+/// For a comparison of what two CALLS left behind. `LastUpdated` is "the date and time when
+/// the resource was last updated", so two calls made at two instants stamp two values on the
+/// records they write and comparing them whole would only measure the clock; who wrote them
+/// (`LastUpdatedBy`) is kept, because that is a property of the write rather than of when it
+/// happened.
+pub fn without_write_instant(listed: &[Value]) -> Vec<Value> {
+    listed
+        .iter()
+        .map(|entry| {
+            let mut entry = entry.clone();
+            if let Value::Object(members) = &mut entry {
+                members.remove("LastUpdated");
+            }
+            entry
+        })
+        .collect()
 }
 
 /// One listed entry as the permission suites compare it: the principal, the resource, the

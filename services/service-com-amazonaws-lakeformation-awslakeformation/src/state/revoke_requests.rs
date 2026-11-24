@@ -226,11 +226,15 @@ pub fn plan_revoke<Eng: Send + Sync + 'static>(
 /// [`IAM_ALLOWED_PRINCIPALS`] group, which stands for every principal IAM itself allows and
 /// is therefore never absent from a resource's permission model, however little it holds
 /// there.
+///
+/// `written_at` is the instant of the call, which every record this revoke leaves holding
+/// something carries as its `LastUpdated`: trimming a record is a write to it.
 pub fn apply_revoke(
     store: &mut ComAmazonawsLakeformationAwslakeformationState,
     catalog_id: &str,
     request: &RevokeRequest,
     plan: &RevokePlan,
+    written_at: SystemTime,
 ) -> Result<RevokeOutcome, String> {
     // The creation-time default, unless a revoke already took it away. It is not a record,
     // so it is held ON TOP of whatever `GrantPermissions` wrote. What the default IS comes
@@ -315,7 +319,8 @@ pub fn apply_revoke(
     // A grant a table was created carrying is taken away the same way — remembered as gone,
     // keyed exactly as the listing renders it — and whatever it still holds becomes a
     // record, so a revoke of one permission leaves the others in place.
-    let revoked_implicit = revoke_implicit_grants(store, &plan.table_grants, &plan.scoped)?;
+    let revoked_implicit =
+        revoke_implicit_grants(store, &plan.table_grants, &plan.scoped, written_at)?;
 
     // Counted per record, symmetrically with the grant path's inserted/updated: a revoke can
     // trim one scope and empty another, and a revoke of a default grant trims no record.
@@ -324,6 +329,7 @@ pub fn apply_revoke(
         revoked_implicit,
         ..RevokeOutcome::default()
     };
+    let written_by = permission_record_updater();
     for (scoped_key, permissions, permissions_with_grant_option) in &plan.scoped {
         if let Some(grant) = store.permission_grants.get_mut(scoped_key) {
             remove_permissions(&mut grant.permissions, permissions);
@@ -338,6 +344,8 @@ pub fn apply_revoke(
                 store.permission_grants.remove(scoped_key);
                 outcome.removed += 1;
             } else {
+                grant.last_updated = written_at;
+                grant.last_updated_by = written_by.clone();
                 outcome.reduced += 1;
             }
         }

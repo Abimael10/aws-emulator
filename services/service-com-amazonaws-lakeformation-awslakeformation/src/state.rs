@@ -38,6 +38,9 @@ mod principals;
 /// How this service words its refusals: the message of each error class, and its own
 /// rendering of a refusal the framework raised before a handler ran.
 mod refusals;
+/// What a LISTING reports: the order it reports its entries in, and the audit each
+/// record carries.
+mod reported_grants;
 /// One revoke, from the request that asks for it to the records it trims: the path
 /// `RevokePermissions` and `BatchRevokePermissions` share.
 mod revoke_requests;
@@ -46,6 +49,7 @@ pub use grant_requests::*;
 pub use implicit_table_grants::*;
 pub use principals::*;
 pub use refusals::*;
+pub use reported_grants::*;
 pub use revoke_requests::*;
 
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
@@ -157,7 +161,7 @@ pub struct LfTag {
 /// permissions at all. An entry that reports SEVERAL of these records carries their union in
 /// the order the `Permission` enum declares its values ([`reported_permissions`]), there
 /// being no grant order across records.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PermissionGrant {
     /// The Data Catalog the grant was made in ([`resolve_catalog_id`]).
     pub catalog_id: String,
@@ -174,15 +178,30 @@ pub struct PermissionGrant {
     /// `Condition$Expression`, when the grant carried one: part of the record's identity,
     /// since the same permissions under two conditions are two grants.
     pub condition_expression: Option<String>,
+    /// When this record was last written — `PrincipalResourcePermissions$LastUpdated`,
+    /// "The date and time when the resource was last updated".
+    ///
+    /// The instant of the call that last changed what the record holds: the grant that
+    /// wrote it, a later grant that added to it, or a revoke that trimmed it. A grant a
+    /// resource was created carrying is dated by the create that made it.
+    pub last_updated: SystemTime,
+    /// Who made that write — `PrincipalResourcePermissions$LastUpdatedBy`, "The user who
+    /// updated the record" (`NameString`, len 1..255).
+    ///
+    /// The identity the write was made by, named as this API names a principal: the
+    /// caller for a granted or revoked record ([`permission_record_updater`]), and the
+    /// creating principal the Data Catalog recorded for a grant a resource was created
+    /// carrying.
+    pub last_updated_by: String,
 }
 
 impl PermissionGrant {
     /// This record as the wire shape `ListPermissions` projects it.
     ///
-    /// `AdditionalDetails` carries the RAM resource-share ARNs of a cross-account share
-    /// and `LastUpdated`/`LastUpdatedBy` the audit of the last change; this emulator
-    /// models neither cross-account sharing nor an IAM identity for the caller, so they
-    /// are left absent rather than filled with a fabricated share or identity.
+    /// `AdditionalDetails` carries the RAM resource-share ARNs of a cross-account share;
+    /// this emulator models no cross-account sharing, so it is left absent rather than
+    /// filled with a fabricated share. The record-keeping pair is reported for every entry,
+    /// from what the write that made the record stamped on it.
     pub fn to_wire(&self) -> PrincipalResourcePermissions {
         PrincipalResourcePermissions {
             principal: Some(DataLakePrincipal {
@@ -198,8 +217,8 @@ impl PermissionGrant {
             permissions: Some(self.permissions.clone()),
             permissions_with_grant_option: Some(self.permissions_with_grant_option.clone()),
             additional_details: None,
-            last_updated: None,
-            last_updated_by: None,
+            last_updated: Some(reported_instant(self.last_updated)),
+            last_updated_by: Some(self.last_updated_by.clone()),
         }
     }
 }
@@ -1034,11 +1053,12 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
     };
 
     // The databases the Data Catalog holds under the addressed catalog id: the one named,
-    // if it is there, else every one of them.
+    // if it is there, else every one of them — each with the instant it was created, which
+    // is when the grant it was created carrying was made.
     let Some(catalog) = glue_state::service_state(engine) else {
         return Vec::new();
     };
-    let names: Vec<String> = {
+    let names: Vec<(String, SystemTime)> = {
         let catalog = catalog.lock();
         let Some(held) = catalog.catalogs.get(&database_catalog) else {
             return Vec::new();
@@ -1046,12 +1066,16 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
         match named {
             Some(name) => {
                 let stored = glue_state::fold_name(&name);
-                if !held.databases.contains_key(&stored) {
-                    return Vec::new();
+                match held.databases.get(&stored) {
+                    Some(database) => vec![(stored, database.create_time)],
+                    None => return Vec::new(),
                 }
-                vec![stored]
             }
-            None => held.databases.keys().cloned().collect(),
+            None => held
+                .databases
+                .values()
+                .map(|database| (database.name.clone(), database.create_time))
+                .collect(),
         }
     };
 
@@ -1068,7 +1092,9 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
         .filter(|(_, permissions)| !permissions.is_empty())
         .collect();
     let mut grants: Vec<(String, PermissionGrant)> = Vec::new();
-    for name in names {
+    // Who the default grant is recorded as written by, read once for the whole rendering.
+    let written_by = permission_record_updater();
+    for (name, created_at) in names {
         for (principal, permissions) in &granted {
             let resource = Resource {
                 database: Some(DatabaseResource {
@@ -1085,6 +1111,12 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
                 // The default carries no grant option and no condition.
                 permissions_with_grant_option: Vec::new(),
                 condition_expression: None,
+                // Creating the database is what made this grant, so that is when it was
+                // last written and the identity that created it is who wrote it. The
+                // Data Catalog records no creator for a database, so the identity is this
+                // emulator's own, which is the one every call it serves is made by.
+                last_updated: created_at,
+                last_updated_by: written_by.clone(),
             };
             let key = grant_key(catalog_id, &grant.principal, &grant.resource, None);
             grants.push((key, grant));
@@ -1145,49 +1177,6 @@ pub fn is_iam_principal(identifier: &str) -> bool {
 pub fn effective_principal_holds(queried: &str, grant_principal: &str) -> bool {
     grant_principal == queried
         || (grant_principal == IAM_ALLOWED_PRINCIPALS && is_iam_principal(queried))
-}
-
-/// Adds `grant` to the listing being built in `reported`, under the principal it is
-/// REPORTED to be held by: `reported_as` when the listing resolves a group grant onto the
-/// principal it asked about, else the grantee the record names.
-///
-/// Two grants reported under one identity — a principal's own record and a group grant
-/// resolved onto it — are ONE entry carrying the union of both, because a listing reports
-/// one entry per (principal, resource, condition) triple and re-attributing a group grant
-/// must not open a second entry for a triple that already has one. That union is reported in
-/// the order the `Permission` enum declares its values ([`reported_permissions`]): the
-/// records were granted independently of each other, so the order either of them was granted
-/// in says nothing about the set they together hold.
-pub fn merge_reported_grant(
-    reported: &mut BTreeMap<String, PermissionGrant>,
-    grant: &PermissionGrant,
-    reported_as: Option<&str>,
-) {
-    let mut grant = grant.clone();
-    if let Some(principal) = reported_as {
-        grant.principal = principal.to_string();
-    }
-    let key = grant_key(
-        &grant.catalog_id,
-        &grant.principal,
-        &grant.resource,
-        grant.condition_expression.as_deref(),
-    );
-    match reported.get_mut(&key) {
-        Some(held) => {
-            merge_permissions(&mut held.permissions, &grant.permissions);
-            merge_permissions(
-                &mut held.permissions_with_grant_option,
-                &grant.permissions_with_grant_option,
-            );
-            held.permissions = reported_permissions(&held.permissions);
-            held.permissions_with_grant_option =
-                reported_permissions(&held.permissions_with_grant_option);
-        }
-        None => {
-            reported.insert(key, grant);
-        }
-    }
 }
 
 /// The most revoked-default records this store will hold, beside the explicit grants

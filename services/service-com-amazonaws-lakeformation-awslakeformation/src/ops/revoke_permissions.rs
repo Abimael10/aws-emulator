@@ -242,9 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The revoke itself, under this service's lock: a revoke that would take nothing
         // away — because the grant does not exist at all, or because it never carried these
-        // permissions — is refused here and trims nothing.
-        let outcome = crate::state::apply_revoke(&mut state.lock(), &catalog_id, &request, &plan)
-            .map_err(invalid)?;
+        // permissions — is refused here and trims nothing. The instant of the call is what
+        // a record it leaves holding something reports as its `LastUpdated`.
+        let outcome = crate::state::apply_revoke(
+            &mut state.lock(),
+            &catalog_id,
+            &request,
+            &plan,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(invalid)?;
 
         // The audit record for a state change: who, what, where, and what each scope did.
         // No secret and no credential material — the access key id identifies the caller

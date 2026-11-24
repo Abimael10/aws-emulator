@@ -242,9 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut reduced = 0_usize;
         {
             let mut store = state.lock();
+            // One instant for the whole batch, as the batch grant path stamps one: its
+            // entries are one call.
+            let written_at = ::std::time::SystemTime::now();
             for (entry, outcome) in input.entries.iter().zip(resolved) {
                 let applied = outcome.and_then(|(request, plan)| {
-                    crate::state::apply_revoke(&mut store, &catalog_id, &request, &plan)
+                    crate::state::apply_revoke(
+                        &mut store,
+                        &catalog_id,
+                        &request,
+                        &plan,
+                        written_at,
+                    )
                 });
                 match applied {
                     Ok(outcome) => {

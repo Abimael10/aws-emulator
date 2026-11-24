@@ -249,9 +249,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut updated = 0_usize;
         {
             let mut store = state.lock();
+            // One instant for the whole batch: its entries are one call, so the records
+            // they write report one `LastUpdated`.
+            let written_at = ::std::time::SystemTime::now();
             for (entry, outcome) in input.entries.iter().zip(resolved) {
                 let applied = outcome.and_then(|(request, records)| {
-                    crate::state::record_grants(&mut store, &catalog_id, &request, &records)
+                    crate::state::record_grants(
+                        &mut store,
+                        &catalog_id,
+                        &request,
+                        &records,
+                        written_at,
+                    )
                 });
                 match applied {
                     Ok((entry_inserted, entry_updated)) => {

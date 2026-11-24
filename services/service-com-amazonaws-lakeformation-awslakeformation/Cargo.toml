@@ -35,6 +35,8 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite needs no `mod` line.
+automod = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]

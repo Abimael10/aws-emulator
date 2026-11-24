@@ -14,6 +14,13 @@
 //! bounded by `MaxResults`, resuming from the grant key an opaque `NextToken` names.
 //! Reporting only — it writes nothing.
 //!
+//! The entries come in the order the ANSWER carries them — the principal each is held by,
+//! then the resource it is held on, then the condition
+//! ([`crate::state::reported_grant_order_key`]) — which is the order a `MaxResults`-bounded
+//! page is cut from, so what lands on the first page follows from the values the caller
+//! reads rather than from how a record is stored. Each entry also carries the write that
+//! made the record it reports (`LastUpdated` / `LastUpdatedBy`).
+//!
 //! Two things a client should know. A listing that matches no grant answers an EMPTY
 //! `PrincipalResourcePermissions` list — `PrincipalResourcePermissionsList` carries no
 //! length constraint, so "no permissions" is a list of none rather than an absent member.
@@ -329,12 +336,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // Every grant the filters select, keyed by the identity it is REPORTED under, so
-        // the page below walks one entry per (principal, resource, condition) triple in a
-        // stable order a continuation token can resume from. An entry that several records
-        // report into carries their union, in the order the `Permission` enum declares its
-        // values ([`crate::state::merge_reported_grant`]), so what it reports does not
-        // depend on which of them this walk read first.
+        // Every grant the filters select, keyed by where the entry falls in the order a
+        // listing REPORTS its entries in ([`crate::state::reported_grant_order_key`]): the
+        // principal it is held by, then the resource, then the condition — so the page
+        // below is cut from the entries in the order a caller reads them, and a
+        // continuation token resumes exactly where the previous page stopped. An entry that
+        // several records report into carries their union, in the order the `Permission`
+        // enum declares its values ([`crate::state::merge_reported_grant`]), so what it
+        // reports does not depend on which of them this walk read first.
         //
         // What this holds is bounded by the three stores it reads, none of which a
         // request can grow past its ceiling: `crate::state::MAX_PERMISSION_GRANTS` explicit

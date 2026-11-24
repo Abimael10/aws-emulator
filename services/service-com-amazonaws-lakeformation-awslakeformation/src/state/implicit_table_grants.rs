@@ -35,12 +35,16 @@ pub fn implicit_grant_for<'a>(
 /// request reaches, as [`scoped_grant_records`] splits it. The caller has already refused a
 /// revoke naming anything the grantee does not hold.
 ///
+/// `written_at` is the instant of the revoke, which the record left behind carries as its
+/// `LastUpdated`: the revoke is the write that made that record.
+///
 /// Every scope is weighed against both ceilings BEFORE the first write, so a refusal leaves
 /// no half of a multi-scope revoke behind.
 pub fn revoke_implicit_grants(
     store: &mut ComAmazonawsLakeformationAwslakeformationState,
     implicit: &[(String, PermissionGrant)],
     revoked: &[(String, Vec<String>, Vec<String>)],
+    written_at: SystemTime,
 ) -> Result<bool, String> {
     // What this revoke takes away, per scope: the key to remember as revoked, and what the
     // grant still holds there (`None` when nothing is left of it).
@@ -70,6 +74,10 @@ pub fn revoke_implicit_grants(
             &mut remainder.permissions_with_grant_option,
             permissions_with_grant_option,
         );
+        // The revoke is the write that records what is left, so that is the record's own
+        // last update.
+        remainder.last_updated = written_at;
+        remainder.last_updated_by = permission_record_updater();
         let keeps_remainder = !(remainder.permissions.is_empty()
             && remainder.permissions_with_grant_option.is_empty());
         taking.push((key, keeps_remainder.then_some(remainder)));
@@ -117,6 +125,8 @@ pub fn revoke_implicit_grants(
                     &mut held.permissions_with_grant_option,
                     &remainder.permissions_with_grant_option,
                 );
+                held.last_updated = remainder.last_updated;
+                held.last_updated_by = remainder.last_updated_by.clone();
             }
             None => {
                 store.permission_grants.insert(key.clone(), remainder);
