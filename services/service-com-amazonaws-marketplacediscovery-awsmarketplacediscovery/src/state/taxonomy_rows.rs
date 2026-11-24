@@ -117,7 +117,8 @@ const KIND_FULFILLMENT: &[(&str, &[&str])] = &[
 /// describes "a scenario where the product can be applied"
 /// (`smithy_query(query="operation",operation="GetListing")`) — so this tier states it
 /// instead of having [`seed_rows`] compose one from the row's other members. None of it
-/// restates the record's short description, its key features ([`KIND_HIGHLIGHTS`]), the
+/// restates the record's short description, its key features
+/// ([`super::taxonomy_features`]), the
 /// categories it is classified under or the route it is fulfilled through: the response
 /// already carries each of those in a member of its own, and a client reading the detail
 /// view is shown what the product DOES.
@@ -276,7 +277,7 @@ const KIND_CONTENT: &[KindContent] = &[
 /// The content a product of `kind` states ([`KIND_CONTENT`]).
 ///
 /// Every kind of [`PRODUCT_KINDS`] states its own, so this lookup fails loudly where its
-/// neighbours ([`fulfillment_for_kind`], [`pricing_for_kind`], [`highlights_for_kind`]) fall
+/// neighbours ([`fulfillment_for_kind`], [`pricing_for_kind`]) fall
 /// back: a kind added without content of its own would otherwise seed records whose prose
 /// describes a different kind of product, which is a false statement about the record rather
 /// than a missing one.
@@ -315,80 +316,6 @@ const KIND_PRICING: &[(&str, &str, &str)] = &[
     ("Studio", "CONTRACT", "TIERS"),
 ];
 
-/// The key features a product of `kind` offers customers, which is what `highlights` ("A
-/// list of key features that the listing offers to customers") carries for both its listing
-/// and its product.
-///
-/// A feature is something the product DOES, so it is stated per kind of product rather than
-/// composed from how the record is classified or delivered — a response already carries both
-/// of those, as `categories` and `fulfillmentOptionSummaries`.
-const KIND_HIGHLIGHTS: &[(&str, &[&str])] = &[
-    (
-        "Platform",
-        &[
-            "One control plane across every account you own",
-            "Single sign-on with role-based access control",
-            "Usage and cost reporting per team",
-        ],
-    ),
-    (
-        "Suite",
-        &[
-            "Modules that share one data model",
-            "Approval workflows with full audit history",
-            "Scheduled exports to your warehouse",
-        ],
-    ),
-    (
-        "Service",
-        &[
-            "Managed by the seller, with a published uptime target",
-            "Private connectivity from your own VPC",
-            "Hourly backups with point-in-time restore",
-        ],
-    ),
-    (
-        "Hub",
-        &[
-            "Runs beside your workloads in your own cluster",
-            "Horizontal autoscaling under load",
-            "Policy enforcement at admission time",
-        ],
-    ),
-    (
-        "Workbench",
-        &[
-            "Pre-installed toolchain ready at first boot",
-            "Reproducible environments from a pinned manifest",
-            "Notebook sessions resumable after a restart",
-        ],
-    ),
-    (
-        "Toolkit",
-        &[
-            "Composable components you add to your own pipeline",
-            "Deterministic builds from a locked manifest",
-            "Signed artefacts with provenance attestations",
-        ],
-    ),
-    (
-        "Gateway",
-        &[
-            "Terminates and inspects traffic at your edge",
-            "Rate limiting and quota enforcement per client",
-            "Failover across availability zones",
-        ],
-    ),
-    (
-        "Studio",
-        &[
-            "Visual authoring with versioned drafts",
-            "Review and comment before publishing",
-            "Publish to staging and production separately",
-        ],
-    ),
-];
-
 /// The `FulfillmentOptionType`s a product of `kind` is delivered through, per
 /// [`KIND_FULFILLMENT`].
 ///
@@ -411,18 +338,6 @@ fn pricing_for_kind(kind: &str) -> (&'static str, &'static str) {
         .iter()
         .find(|(candidate, _, _)| *candidate == kind)
         .map_or(("CONTRACT", "UNITS"), |(_, model, unit)| (*model, *unit))
-}
-
-/// The key features a product of `kind` offers, per [`KIND_HIGHLIGHTS`].
-///
-/// A kind this table does not name states no feature, and then the record reports none:
-/// `highlights` is a list, and an empty one claims nothing rather than claiming a feature
-/// the record has not stated.
-fn highlights_for_kind(kind: &str) -> &'static [&'static str] {
-    KIND_HIGHLIGHTS
-        .iter()
-        .find(|(candidate, _)| *candidate == kind)
-        .map_or(&[], |(_, features)| *features)
 }
 
 /// Seed one listing (with its product, offer and terms) per subcategory of the taxonomy.
@@ -492,8 +407,10 @@ struct BuiltRow {
     /// its use cases and its promotional captions, stated rather than composed from the
     /// row's other members.
     content: &'static KindContent,
-    /// The key features its record offers customers, read off the kind of product it is
-    /// ([`highlights_for_kind`]).
+    /// The key features its record offers customers, read off the SUBJECT the record is
+    /// classified at ([`super::taxonomy_features::features_of_subject`]): one record of this
+    /// tier per subcategory, so the features are that record's own rather than a list every
+    /// record of one kind of product — or of one delivery route — restates.
     highlights: Vec<&'static str>,
     /// How its offer is priced and what that pricing is metered in, read off the kind of
     /// product it is ([`pricing_for_kind`]).
@@ -523,7 +440,7 @@ impl BuiltRow {
             categories: vec![category, paired],
             fulfillment: fulfillment_for_kind(kind).to_vec(),
             content: kind_content(kind),
-            highlights: highlights_for_kind(kind).to_vec(),
+            highlights: super::taxonomy_features::features_of_subject(category).to_vec(),
             pricing: pricing_for_kind(kind),
             support_phone: format!(
                 "+1-{}-555-{:04}",

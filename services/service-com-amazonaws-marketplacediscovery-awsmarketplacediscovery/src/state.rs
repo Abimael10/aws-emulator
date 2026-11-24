@@ -34,6 +34,10 @@ use std::collections::BTreeMap;
 /// catalog and a facet-refined one alike continuable.
 mod taxonomy_rows;
 
+/// The key features each record of that tier offers its customers, stated per subject — the
+/// subcategory the record is classified at — so every record states its own.
+mod taxonomy_features;
+
 /// Where this emulator serves the buyer-facing pages a SaaS fulfillment option's record
 /// names, and the addresses it announces them at.
 mod saas_fulfillment;
