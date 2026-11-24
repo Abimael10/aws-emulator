@@ -43,3 +43,36 @@ Smithy: ListInstanceTypesResponse.InstanceTypes is @required; member InstanceTyp
 1. Boot the emulator from this checkout and replay the wire corpus (trace set simparity-wire-aws-v1).
 2. Replay fixture workspaces-instances-catalog-list-instance-types, step task#1: a workspaces-instances ListInstanceTypes call with no InstanceConfigurationFilter.
 3. Observe HTTP 200 whose InstanceTypes list contains none of the recorded WorkSpace Instance types (e.g. no element with InstanceType "c5.12xlarge" and its SupportedInstanceConfigurations); the recording's page carries 597 entries.
+
+## Resolution
+
+The premise "the served list carries none of the recorded types" does not hold against this
+checkout: `ListInstanceTypes` answers 200 with 588 instance types in name order, the first of
+them `c5.12xlarge` — the recording's first entry — carrying exactly the 28 `(BillingMode,
+PlatformType, Tenancy)` combinations the recording lists for it. Every recorded element is
+reported "missing" because the replay compares an element as a whole, and each element differs
+in the ORDER its `SupportedInstanceConfigurations` are serialised in.
+
+FIXED: catalog MEMBERSHIP is now the rule rather than transcribed data. A family's size ladder
+was written out per family in `state.rs` (20 `SIZES_*` constants), a hand-kept copy of the
+published instance-type names whose drift nothing could catch; `published_sizes` now reads the
+ladder out of the instance-type enumeration this workspace ships (the EC2 service model's
+`InstanceType`), bare metal and any size outside the modelled `InstanceType` pattern excluded.
+A catalogued family is therefore reported at every size that enumeration publishes it at.
+Covered by `tests/all/instance_type_catalog_published_sizes.rs`, which pins the whole ladder of
+33 families across generation, vendor and ladder shape, checks no bare-metal or non-x86 name is
+reported, and launches a type picked out of the answer so a reported record is a usable one.
+
+RESIDUAL, declined — the replay key `workspaces-instances|ListInstanceTypes|2xx->2xx|$.InstanceTypes[*]`
+still diverges, so do NOT read this file as that key passing:
+
+1. The SEQUENCE each entry's combinations are serialised in. `SupportedInstanceConfigurations`
+   is documented as "all valid combinations … the complete set of configuration options
+   available for this instance type" — a set — and the model attaches no ordering to it, so the
+   recorded permutation is one run's serialisation order and follows no rule AWS publishes. Four
+   of the 28 recorded positions are even readable from the divergence, so it could only be met
+   by pasting a recording, not by implementing anything. The served sequence is deterministic
+   and stable across calls.
+2. The entry COUNT: the recording holds 597 names, this catalog 588. Which further names the
+   service's catalog holds is service data that no model, enumeration or published list in this
+   checkout names, and inventing nine family rows to close the count would be synthesis.
