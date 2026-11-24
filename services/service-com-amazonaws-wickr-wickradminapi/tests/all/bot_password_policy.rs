@@ -40,8 +40,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_wickr_wickradminapi::ops::types::PasswordRequirements;
 use service_com_amazonaws_wickr_wickradminapi::state::{
-    password_meets_requirements, BOT_GONE_MESSAGE, BOT_STATUS_PENDING, NETWORK_GONE_MESSAGE,
-    PASSWORD_POLICY_FIELD, SECURITY_GROUP_GONE_MESSAGE,
+    password_meets_requirements, service_state, BOT_GONE_MESSAGE, BOT_STATUS_PENDING,
+    NETWORK_GONE_MESSAGE, PASSWORD_POLICY_FIELD, SECURITY_GROUP_GONE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -58,14 +58,21 @@ const NOT_FOUND_STATUS: u16 = 404;
 /// A fresh emulator holding only this service, over its own engine, so one test's
 /// networks are invisible to another's.
 fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the engine its store lives in handed back beside it,
+/// for a case that has to put a value in the store that no implemented operation
+/// sets yet.
+fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature is not the subject here; the bot rules are.
     router.set_request_authentication(false);
     router.register_service(service_com_amazonaws_wickr_wickradminapi::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// One request/response round trip: the HTTP status and the parsed JSON body.
@@ -143,6 +150,30 @@ async fn default_group(router: &MultiServiceRouter, network_id: &str) -> Value {
         .and_then(|groups| groups.first())
         .cloned()
         .unwrap_or_else(|| panic!("ListSecurityGroups: no security group in {body}"))
+}
+
+/// Put `requirements` on one stored security group, as the policy the accounts
+/// created under it are held to.
+///
+/// The operation that would set a group's policy over the wire is
+/// `UpdateSecurityGroup`, whose request carries the whole `SecurityGroupSettings`
+/// including `passwordRequirements`; it is still a scaffold, so a group with a
+/// policy of its own is reached by writing the same field of the same stored
+/// record it will write.
+fn set_group_policy(
+    engine: &Arc<engine::InMemoryEngine>,
+    network_id: &str,
+    group_id: &str,
+    requirements: PasswordRequirements,
+) {
+    let state = service_state(&**engine).expect("the service store is reachable");
+    let mut store = state.lock();
+    let group = store
+        .security_groups
+        .get_mut(network_id)
+        .and_then(|groups| groups.get_mut(group_id))
+        .unwrap_or_else(|| panic!("the network holds no group {group_id:?}"));
+    group.settings.password_requirements = Some(requirements);
 }
 
 /// One `CreateBot` call.
@@ -759,4 +790,189 @@ async fn a_create_that_names_no_resource_or_a_taken_username_is_refused() {
         "case \"a bot id this network has not\": expected this API's fixed sentence, \
          got {body}"
     );
+}
+
+/// The five numbers a refusal states are read from the policy of the group
+/// `groupId` names, not from the submitted password and not from the message.
+///
+/// One row per member `PasswordRequirements` declares — `minLength`, `uppercase`,
+/// `lowercase`, `numbers` and `symbols` — plus the shortest minimum a policy can
+/// state, each carrying a password that breaks that member and one that meets it.
+/// Every row's policy differs from the default group's, so a refusal rendered from
+/// constants instead of from the group's own numbers cannot pass any of them.
+#[tokio::test]
+async fn a_refusal_states_the_five_numbers_of_the_group_the_bot_would_join() {
+    for (case, requirements, refused_challenge, accepted_challenge) in [
+        (
+            "a stricter minimum length",
+            PasswordRequirements {
+                min_length: Some(12),
+                uppercase: Some(0),
+                lowercase: Some(0),
+                numbers: Some(0),
+                symbols: Some(0),
+            },
+            "shortpass",
+            "longenoughpassword",
+        ),
+        (
+            "uppercase letters required",
+            PasswordRequirements {
+                min_length: Some(8),
+                uppercase: Some(2),
+                lowercase: Some(0),
+                numbers: Some(0),
+                symbols: Some(0),
+            },
+            "lowercaseonly",
+            "LOwercaseonly",
+        ),
+        (
+            "lowercase letters required",
+            PasswordRequirements {
+                min_length: Some(8),
+                uppercase: Some(0),
+                lowercase: Some(3),
+                numbers: Some(0),
+                symbols: Some(0),
+            },
+            "UPPERCASE12",
+            "UPPERcase12",
+        ),
+        (
+            "numbers required",
+            PasswordRequirements {
+                min_length: Some(8),
+                uppercase: Some(0),
+                lowercase: Some(0),
+                numbers: Some(2),
+                symbols: Some(0),
+            },
+            "noDigitsHere",
+            "noDigits12",
+        ),
+        (
+            "symbols required",
+            PasswordRequirements {
+                min_length: Some(8),
+                uppercase: Some(0),
+                lowercase: Some(0),
+                numbers: Some(0),
+                symbols: Some(1),
+            },
+            "nosymbols1",
+            "nosymbols1!",
+        ),
+        (
+            "the shortest minimum a policy states",
+            PasswordRequirements {
+                min_length: Some(1),
+                uppercase: Some(0),
+                lowercase: Some(0),
+                numbers: Some(0),
+                symbols: Some(0),
+            },
+            "",
+            "a",
+        ),
+    ] {
+        let (router, engine) = emulator_with_engine();
+
+        // A second network, left as it was created, is what the row's refusal is
+        // compared against: its group carries the default policy, so the two
+        // refusals differ only because the numbers are each group's own.
+        let untouched = create_network(&router, "default-policy-net").await;
+        let default_reason = expected_reason(&default_group(&router, &untouched).await);
+
+        let network_id = create_network(&router, "group-policy-net").await;
+        let group_id = default_group(&router, &network_id).await["id"]
+            .as_str()
+            .expect("the group reports an id")
+            .to_string();
+        set_group_policy(&engine, &network_id, &group_id, requirements);
+
+        // The group reports the policy it now carries, and that is what the
+        // refusal below has to state.
+        let group = default_group(&router, &network_id).await;
+        let reason = expected_reason(&group);
+        assert_ne!(
+            reason, default_reason,
+            "case {case:?}: the row is only a test of the group's own numbers while \
+             its policy reads differently from the default one, got {reason:?}"
+        );
+
+        let (status, body) = create_bot(
+            &router,
+            &network_id,
+            "policy-bot",
+            &group_id,
+            refused_challenge,
+        )
+        .await;
+        assert_eq!(
+            status, VALIDATION_ERROR_STATUS,
+            "case {case:?}: expected {VALIDATION_ERROR_STATUS}, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationError",
+            "case {case:?}: expected ValidationError, got {body}"
+        );
+        assert!(
+            body["message"].is_null(),
+            "case {case:?}: the diagnosis lives in reasons[], so the body carries no \
+             envelope sentence, got {body}"
+        );
+        let reasons = body["reasons"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected one reason, got {body}"));
+        assert_eq!(
+            reasons.len(),
+            1,
+            "case {case:?}: expected exactly one reason, got {body}"
+        );
+        assert_eq!(
+            reasons[0]["field"],
+            json!(PASSWORD_POLICY_FIELD),
+            "case {case:?}: the refusal must name the policy, got {body}"
+        );
+        assert_eq!(
+            reasons[0]["reason"],
+            json!(reason),
+            "case {case:?}: expected the group's own numbers {reason:?}, got {}",
+            reasons[0]["reason"]
+        );
+        assert_eq!(
+            list_bots(&router, case, &network_id).await,
+            Vec::<Value>::new(),
+            "case {case:?}: the refusal must create nothing"
+        );
+
+        // The same policy accepts a password that meets it, so what refused the
+        // row above was the group's policy and not the request's shape.
+        let (status, body) = create_bot(
+            &router,
+            &network_id,
+            "policy-bot",
+            &group_id,
+            accepted_challenge,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a password meeting the group's policy expected 200, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["username"],
+            json!("policy-bot"),
+            "case {case:?}: expected the requested username echoed back, got {body}"
+        );
+        assert_eq!(
+            list_bots(&router, case, &network_id).await.len(),
+            1,
+            "case {case:?}: expected the one created bot"
+        );
+    }
 }
