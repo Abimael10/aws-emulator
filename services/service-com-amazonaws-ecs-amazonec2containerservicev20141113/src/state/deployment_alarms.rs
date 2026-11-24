@@ -27,7 +27,20 @@
 //! why the rollback falls due one [`CIRCUIT_BREAKER_ROLLBACK_SPAN`] after the failure, so a
 //! client polling the rollout reads the `FAILED` state before the rollback replaces it.
 //!
+//! # How long the watch LASTS
+//!
+//! Past the instant the rollout's tasks are in place. An alarm reports what the revision now
+//! running is doing only once it has graded the series it watches, which takes its own
+//! evaluation configuration's span, so a watch that ended with the task set could never catch
+//! the one thing this method exists to catch — and a rolling deployment is not complete when
+//! its tasks are: "After this percentage of tasks is healthy and the bake time elapses, Amazon
+//! ECS completes the deployment" (`DeploymentEarlySuccessCriteria$healthyPercent`). The bake
+//! this method earns is the span the named alarms need to speak, as the service that owns them
+//! computes it ([`AlarmWatchWindow`], [`MAX_ALARM_WATCH`]), and the rollout reaches its
+//! `COMPLETED` state at its end ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::rollout_alarm_watch_end`]).
+//!
 //! Only alarms that moved while THIS rollout was deploying count, which is what the
+
 //! `triggeredAlarmNames` doc states: an alarm that was already in `ALARM` before the rollout
 //! started was not triggered during it. That is also what keeps a rollback terminal — the
 //! redeployment a rollback starts is a rollout of its own, and an alarm that is still firing
@@ -94,6 +107,23 @@ fn deployment_alarm_event(service_name: &str, deployment_id: &str, triggered: &[
     )
 }
 
+/// The LONGEST a rollout is held open by the watch its alarms hold it under, whatever span
+/// their own evaluation configuration asks for.
+///
+/// A capacity bound of this emulator, not an AWS quota: an alarm's total evaluation period may
+/// cover up to a week ("`Period` multiplied by `EvaluationPeriods` can't be more than 604,800
+/// seconds", `PutMetricAlarmInput$Period`), and a rollout held open for days by one would never
+/// be observed to finish at all. Within it the watch is the alarms' own span
+/// ([`AlarmWatchWindow`]), so every alarm a deployment is realistically gated on — the
+/// sub-minute and one-minute periods a rollout is graded on — keeps the whole of it.
+const MAX_ALARM_WATCH: Duration = Duration::from_secs(600);
+
+/// What ONE pass reads out of the store that owns a watched rollout's alarms: the rollout, the
+/// span its own `alarmNames` need to reach a verdict about the revision it released, and the
+/// alarms of those names that MOVED into `ALARM` while it was being watched, each with the
+/// instant it moved.
+type AlarmReading = (AlarmWatch, Option<Duration>, Vec<(String, SystemTime)>);
+
 /// One rollout that is being WATCHED by alarms: which service it belongs to, the alarms its
 /// deployment configuration named, whether that configuration asked for a rollback, and the
 /// instant the rollout started.
@@ -127,6 +157,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// own rolling update has such a rollout at all: "you can only use the
     /// `DeploymentAlarms` method to detect failures when the `DeploymentController` is set to
     /// `ECS`."
+    ///
+    /// Deploying LASTS as long as the watch does ([`AlarmWatchWindow`]): a rollout whose
+    /// tasks are in place is still being watched until its alarms could have spoken about the
+    /// revision they are now running, which is why the two conditions above stay false for
+    /// the whole of that window ([`Self::rollout_alarm_watch_end`]).
     pub(super) fn rollout_alarm_watches(&self) -> Vec<AlarmWatch> {
         self.services
             .iter()
@@ -155,6 +190,96 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 })
             })
             .collect()
+    }
+
+    /// Record the WINDOW each watched rollout's alarms watch it over, as of the spans those
+    /// alarms need to speak.
+    ///
+    /// `spans` pairs one watched rollout with the span its own `alarmNames` need to reach a
+    /// verdict, read out of the CloudWatch store by [`settle_deployment_alarms`] — the service
+    /// that owns those alarms is the one that knows how long their evaluation takes. A watch
+    /// already standing over THIS rollout keeps the end it has: the window is measured once,
+    /// from the instant the rollout's tasks reached their steady state, so a later pass cannot
+    /// push a bake that is already running further out. A rollout whose alarms this emulator
+    /// holds none of gets no window, so it waits for nothing: an alarm nothing holds reaches
+    /// no verdict.
+    pub(super) fn record_rollout_alarm_watches(&mut self, spans: &[(AlarmWatch, Option<Duration>)]) {
+        for (watch, span) in spans {
+            let Some(span) = *span else {
+                continue;
+            };
+            let Some(service) = self
+                .services
+                .get_mut(&watch.key)
+                .filter(|service| service.deployment_id == watch.deployment_id)
+            else {
+                continue;
+            };
+            match service.deployment_alarm_watch.as_mut() {
+                Some(standing) if standing.deployment_id == watch.deployment_id => {
+                    standing.verdict_span = span;
+                }
+                _ => {
+                    service.deployment_alarm_watch = Some(AlarmWatchWindow {
+                        deployment_id: watch.deployment_id.clone(),
+                        verdict_span: span,
+                        ends_at: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// When the watch this service's current rollout is under ENDS, for a rollout whose tasks
+    /// were found at the steady state they were rolling out at `reached_at`; `None` for a
+    /// rollout no alarm watch holds back.
+    ///
+    /// The instant the watch was already measured to, else one verdict span past the steady
+    /// state the tasks reached — the bake a rolling deployment completes after
+    /// ([`AlarmWatchWindow`]), which is why it begins where those tasks came up and not where
+    /// the rollout did. `None` for a service whose configuration turned the method off or
+    /// named no alarm — "Amazon ECS is not using alarms for service deployment failures when
+    /// the status is `DISABLED`" — and for a window left behind by an earlier rollout.
+    pub(super) fn rollout_alarm_watch_end(
+        &self,
+        service: &ServiceRecord,
+        reached_at: SystemTime,
+    ) -> Option<SystemTime> {
+        service
+            .deployment_configuration
+            .alarms
+            .as_ref()
+            .filter(|alarms| alarms.enable && !alarms.alarm_names.is_empty())?;
+        let watch = service
+            .deployment_alarm_watch
+            .as_ref()
+            .filter(|watch| watch.deployment_id == service.deployment_id)?;
+        Some(watch.ends_at.unwrap_or(reached_at + watch.verdict_span))
+    }
+
+    /// The earliest instant in the FUTURE at which an alarm watch of this store ENDS, if any —
+    /// one of the instants the clock pump waits for
+    /// ([`super::service_action_events`]): the rollout that watch holds back completes there,
+    /// with no further call from anybody.
+    ///
+    /// Only a watch over a rollout that is still open: one a monitor already failed and one
+    /// that already completed have reached the end of the deployment state machine, so the
+    /// instant their watch was measured to is one no pass would act on.
+    pub(super) fn next_alarm_watch_due_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.services
+            .values()
+            .filter(|service| {
+                service.deployment_rollout_failure.is_none() && !service.deployment_rollout_completed
+            })
+            .filter_map(|service| {
+                service
+                    .deployment_alarm_watch
+                    .as_ref()
+                    .filter(|watch| watch.deployment_id == service.deployment_id)
+                    .and_then(|watch| watch.ends_at)
+            })
+            .filter(|due| *due > now)
+            .min()
     }
 
     /// Fail every rollout whose alarms have fired, as of `now`.
@@ -203,8 +328,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 }
 
-/// Fail every rollout whose CloudWatch alarms have moved into their `ALARM` state — the ONE
-/// call the clock pump makes for it.
+/// Settle what the CloudWatch alarms a rollout is watched by make of it — the ONE call the
+/// clock pump makes for them: the WINDOW those alarms watch each rollout over, and the failure
+/// of every rollout whose alarms have moved into their `ALARM` state inside it.
 ///
 /// Called with NO guard of this store held: it takes this store's lock to read which rollouts
 /// are being watched, releases it, reads the alarm states out of the CloudWatch store, and
@@ -214,7 +340,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 /// a cycle between the stores unreachable.
 ///
 /// Nothing is failed on an engine that holds no alarm store to read: an alarm has one home,
-/// and a rollout cannot be failed by an alarm nothing holds the state of.
+/// and a rollout cannot be failed by an alarm nothing holds the state of. Nor is one held
+/// back: a rollout watched by alarms nothing holds is waiting for a verdict that cannot come.
 pub fn settle_deployment_alarms<Eng: Send + Sync + 'static>(engine: &Eng) {
     let Some(state) = service_state(engine) else {
         return;
@@ -228,11 +355,11 @@ pub fn settle_deployment_alarms<Eng: Send + Sync + 'static>(engine: &Eng) {
     let Some(alarms) = cloudwatch::service_state(engine) else {
         return;
     };
-    let triggered: Vec<(AlarmWatch, Vec<(String, SystemTime)>)> = {
+    let read: Vec<AlarmReading> = {
         let store = alarms.lock();
         watches
             .into_iter()
-            .filter_map(|watch| {
+            .map(|watch| {
                 // ONE CloudWatch read per watched rollout, through that service's own reader
                 // of the state each named alarm is in, whichever kind of alarm it is
                 // (`ComAmazonawsCloudwatchGraniteserviceversion20100801State::child_alarm_states`).
@@ -250,16 +377,31 @@ pub fn settle_deployment_alarms<Eng: Send + Sync + 'static>(engine: &Eng) {
                         (moved_at >= watch.started_at).then_some((alarm.name, moved_at))
                     })
                     .collect();
-                (!fired.is_empty()).then_some((watch, fired))
+                // And how long those same alarms need to speak about the revision this
+                // rollout released, which is what the watch over it lasts
+                // ([`AlarmWatchWindow`]) — read through that service's own account of its
+                // alarms' evaluation, since the span is their configuration's and not this
+                // service's.
+                let span = store
+                    .alarms_verdict_span_secs(&watch.alarm_names)
+                    .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+                    .map(|span| span.min(MAX_ALARM_WATCH));
+                (watch, span, fired)
             })
             .collect()
     };
-    if triggered.is_empty() {
-        return;
-    }
-    state
-        .lock()
-        .fail_rollouts_on_triggered_alarms(&triggered);
+    let spans: Vec<(AlarmWatch, Option<Duration>)> = read
+        .iter()
+        .map(|(watch, span, _)| (watch.clone(), *span))
+        .collect();
+    let triggered: Vec<(AlarmWatch, Vec<(String, SystemTime)>)> = read
+        .into_iter()
+        .filter(|(_, _, fired)| !fired.is_empty())
+        .map(|(watch, _, fired)| (watch, fired))
+        .collect();
+    let mut store = state.lock();
+    store.record_rollout_alarm_watches(&spans);
+    store.fail_rollouts_on_triggered_alarms(&triggered);
 }
 
 /// The instant an alarm MOVED into the state it reports, from the epoch seconds CloudWatch

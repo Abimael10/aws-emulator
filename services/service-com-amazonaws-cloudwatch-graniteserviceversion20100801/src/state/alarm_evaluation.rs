@@ -458,6 +458,28 @@ fn graded_window_secs(alarm: &MetricAlarm) -> Option<f64> {
     }
 }
 
+/// How long it takes this alarm to reach a VERDICT about data published now, in seconds, or
+/// `None` for an alarm whose configuration names no period or no evaluation count — one whose
+/// series nothing here folds at all.
+///
+/// Two spans of the alarm's own configuration, as the evaluation applies them: a datapoint is
+/// graded only once the window it falls in has CLOSED, the window the clock is in still being
+/// published into ([`EvaluationGrid::newest_graded_period`]), and the verdict is taken over the
+/// alarm's `EvaluationPeriods` — "the number of periods over which data is compared to the
+/// specified threshold" — windows ([`evaluated_periods`]). So the span from a value being
+/// published to the alarm being able to report what that value implies is the look-back plus
+/// the window that value lands in: `Period` x (`EvaluationPeriods` + 1).
+///
+/// Read by the components that have to WAIT for an alarm to speak about something they are
+/// watching, rather than by the evaluation itself.
+#[must_use]
+pub fn verdict_span_secs(alarm: &MetricAlarm) -> Option<f64> {
+    let window = graded_window_secs(alarm)?;
+    #[allow(clippy::cast_precision_loss)]
+    let periods = evaluated_periods(alarm)? as f64;
+    Some(window * (periods + 1.0))
+}
+
 /// The width of the windows an alarm over ONE metric is evaluated on: its own `Period` in
 /// seconds, or `None` for an alarm naming no period a series can be folded over at all.
 ///

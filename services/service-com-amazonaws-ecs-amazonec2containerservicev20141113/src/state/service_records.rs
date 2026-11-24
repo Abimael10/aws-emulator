@@ -172,6 +172,14 @@ pub struct ServiceRecord {
     /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_run_status`]).
     /// Sticky: a later deployment does not take it back.
     pub reached_steady_state: bool,
+    /// The WATCH the current rollout's CloudWatch alarms hold it under, for a service whose
+    /// deployment configuration turned that method on; `None` for a rollout no alarm this
+    /// emulator holds is watching.
+    ///
+    /// Written by the pass that reads those alarms out of the store that owns them
+    /// ([`super::deployment_alarms`]), because how long they need to speak is their own
+    /// configuration's and not this service's.
+    pub deployment_alarm_watch: Option<AlarmWatchWindow>,
     /// `Service$version`: the version the service reports. It stays at the modelled default
     /// `0`: the recorded services report that default throughout their lives, after updates
     /// that roll a new deployment and mint a new service revision as much as after the ones
@@ -193,6 +201,34 @@ pub struct ServiceRecord {
     /// the span that replacement takes, and the clock pass that finds that span elapsed
     /// drops it ("INACTIVE: A deployment that has been completely replaced").
     pub superseded_deployments: Vec<SupersededDeployment>,
+}
+
+/// The window ONE rollout's named CloudWatch alarms WATCH it over.
+///
+/// `ServiceDeploymentRollbackMonitorsStatus` has a state for a watch that is still running
+/// (`MONITORING`) beside the one for a watch that is over (`MONITORING_COMPLETE`), and
+/// `ServiceDeploymentAlarms` says what ends a rollout the watch catches: "Amazon ECS considers
+/// the service deployment as failed when any of the alarms move to the `ALARM` state". An alarm
+/// reports what a revision is doing only once it has graded the series it watches, which takes
+/// its own evaluation configuration's span — so a watch that ended the instant the rollout's
+/// tasks were in place could never catch one, and a rolling deployment is not complete when its
+/// tasks are: "After this percentage of tasks is healthy AND THE BAKE TIME ELAPSES, Amazon ECS
+/// completes the deployment" (`DeploymentEarlySuccessCriteria$healthyPercent`). This is that
+/// bake: the span the rollout's own alarms need to speak about the revision now running.
+#[derive(Debug, Clone)]
+pub struct AlarmWatchWindow {
+    /// The `Deployment$id` of the rollout being watched, so a window left behind by an
+    /// earlier rollout is never read as this one's.
+    pub deployment_id: String,
+    /// How long the alarms `DeploymentAlarms$alarmNames` names need to reach a verdict about
+    /// the revision this rollout released, as the service that OWNS those alarms computes it
+    /// from their `Period` and `EvaluationPeriods`
+    /// (`cloudwatch::alarms_verdict_span_secs`).
+    pub verdict_span: Duration,
+    /// When this watch ENDS: one verdict span after the instant the rollout's tasks reached
+    /// the steady state it was rolling out. `None` while they have not reached it — the watch
+    /// runs for the whole of the rollout before that, so it has no end yet.
+    pub ends_at: Option<SystemTime>,
 }
 
 /// A deployment a later one replaced, kept beside the service while the task set it

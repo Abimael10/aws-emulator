@@ -218,6 +218,12 @@ const ROWS: &[Row] = &[
 /// The smallest alarm that API accepts: a name, the series it grades, the period and
 /// evaluation count it grades over, and the threshold it compares against. Nothing publishes
 /// into that series, so the alarm's state only ever moves because this suite moves it.
+///
+/// The period is the shortest one an alarm may be evaluated on ("Valid values are 10, 20, 30,
+/// and any multiple of 60", `PutMetricAlarmInput$Period`), because it is also what sizes the
+/// WATCH a rollout these alarms are configured on is held under — the span the alarm needs to
+/// reach a verdict — and nothing in this suite waits for a verdict over published data: every
+/// alarm here is moved by `SetAlarmState`.
 async fn create_alarm(router: &MultiServiceRouter, row: &Row) {
     let child = format!("{}-child", row.alarm);
     let metric_alarm = match row.kind {
@@ -232,7 +238,7 @@ async fn create_alarm(router: &MultiServiceRouter, row: &Row) {
             "Namespace": "AlarmRollout/Test",
             "MetricName": "Errors",
             "Statistic": "Sum",
-            "Period": 60,
+            "Period": 10,
             "EvaluationPeriods": 1,
             "Threshold": 1.0,
             "ComparisonOperator": "GreaterThanOrEqualToThreshold",

@@ -1232,6 +1232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service has reached no steady state: it is the create that starts the work.
             deployment_rollout_completed: false,
             reached_steady_state: false,
+            // No alarm has been read for the rollout this create starts: the pass that reads
+            // the alarms its configuration names out of the store that owns them records the
+            // watch they hold it under ([`crate::state::deployment_alarms`]).
+            deployment_alarm_watch: None,
             // The scheduler confirms the new deployment's stability a span after the
             // create, so the created service reports a deployment that is STABILIZING.
             deployment_stable_due_at: Some(now + crate::state::TRANSITION_SPAN),

@@ -3969,6 +3969,50 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .unwrap_or_default()
     }
 
+    /// How long the alarms `names` need to reach a VERDICT about data published now, in
+    /// seconds: the LONGEST such span among the alarms this store really holds under those
+    /// names, or `None` when it holds none of them under any name — an alarm no store holds
+    /// reaches no verdict at all, so there is no span to wait for.
+    ///
+    /// One alarm's own span is its evaluation's ([`alarm_evaluation::verdict_span_secs`]). A
+    /// COMPOSITE alarm has no series and no period of its own: its state is computed from the
+    /// alarms its rule references ("The alarms specified in a composite alarm's rule expression
+    /// can include metric alarms and other composite alarms", `PutCompositeAlarm`), so the span
+    /// it needs is the longest span of the metric alarms the rule reaches, followed through the
+    /// same children every other reader of a rule resolves ([`Self::child_alarm_states`]). Each
+    /// name is visited at most once, so a rule that references a composite alarm in a circle is
+    /// left after its first visit.
+    ///
+    /// Read by a component of another service that has to WAIT for one of these alarms to speak
+    /// about a change it is watching.
+    #[must_use]
+    pub fn alarms_verdict_span_secs(&self, names: &[String]) -> Option<f64> {
+        let mut pending: Vec<String> = names
+            .iter()
+            .map(|reference| alarm_rule_reference_name(reference).to_string())
+            .collect();
+        let mut visited: Vec<String> = Vec::with_capacity(pending.len());
+        let mut longest: Option<f64> = None;
+        while let Some(name) = pending.pop() {
+            if visited.contains(&name) {
+                continue;
+            }
+            visited.push(name.clone());
+            if let Some(stored) = self.alarms.get(&name) {
+                if let Some(span) = alarm_evaluation::verdict_span_secs(&stored.alarm) {
+                    longest = Some(longest.map_or(span, |held: f64| held.max(span)));
+                }
+                continue;
+            }
+            pending.extend(
+                self.composite_alarm_children(&name)
+                    .iter()
+                    .map(|reference| alarm_rule_reference_name(reference).to_string()),
+            );
+        }
+        longest
+    }
+
     /// The composite alarms whose rule references `name`: "These are the composite alarms
     /// that have AlarmRule parameters that reference the alarm named in ParentsOfAlarmName"
     /// (`DescribeAlarmsInput$ParentsOfAlarmName`) — the alarm itself is never among them.

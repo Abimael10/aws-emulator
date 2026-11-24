@@ -221,6 +221,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             })
             .chain(self.task_sets.values().map(|set| set.stable_due_at))
             .flatten()
+            // And the END of the watch a rollout's CloudWatch alarms hold it under, which is
+            // where that rollout completes ([`super::deployment_alarms`]): a client waiting
+            // for the bake to pass makes no call that would otherwise materialise it.
+            .chain(self.next_alarm_watch_due_at(now))
             .filter(|due| *due > now)
             .min()
     }

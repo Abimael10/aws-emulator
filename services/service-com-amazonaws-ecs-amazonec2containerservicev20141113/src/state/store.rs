@@ -494,7 +494,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // moves to its `COMPLETED` state once, so the event that announces that move is
             // published once ([`super::deployment_events`]).
             let rollout_was_completed = service.deployment_rollout_completed;
-            let settled = service.deployment_steady_due_at.filter(|due| {
+            let reached = service.deployment_steady_due_at.filter(|due| {
                 *due <= now
                     && service.places_tasks()
                     && !awaits_health
@@ -504,6 +504,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     && tally.running == rollout.running
                     && tally.pending == 0
             });
+            // And a rollout its alarms are still WATCHING has not completed either, however
+            // settled its task set is: a rolling deployment completes once its tasks are in
+            // place AND the bake its monitors hold it under has elapsed
+            // ([`AlarmWatchWindow`]), which is the window an alarm that fails the revision now
+            // running moves inside ([`super::deployment_alarms`]). The end of that bake is
+            // stored by the pass that first finds those tasks up, so every later reader of the
+            // rollout agrees on where the window closes.
+            let watch_ends_at = reached.and_then(|_| self.rollout_alarm_watch_end(service, now));
+            let settled = reached.filter(|_| watch_ends_at.is_none_or(|ends| ends <= now));
+
             // `DeleteService`: "After all tasks have transitioned to either STOPPING or
             // STOPPED status, the service status moves from DRAINING to INACTIVE" — which
             // needs BOTH the instant the drain falls due and the tasks it was cleaning up
@@ -571,6 +581,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 service.deployment_rollout_completed = true;
                 service.reached_steady_state = true;
                 service.record_events(events);
+            }
+            // The bake the rollout's alarm watch holds it under is measured ONCE, at the
+            // instant its tasks reached their steady state: a rollout still inside that
+            // window carries the end it was measured to, so every later pass reads the same
+            // end and the window cannot be pushed out by being looked at
+            // ([`AlarmWatchWindow`]).
+            if let Some(ends) = watch_ends_at {
+                if let Some(watch) = service
+                    .deployment_alarm_watch
+                    .as_mut()
+                    .filter(|watch| watch.ends_at.is_none())
+                {
+                    watch.ends_at = Some(ends);
+                }
             }
             // The scheduler's confirmation that the deployment is stable, owed at the
             // instant the write that touched it put on the record: once it is due the
