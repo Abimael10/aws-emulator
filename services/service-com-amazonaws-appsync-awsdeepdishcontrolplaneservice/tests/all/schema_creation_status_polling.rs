@@ -18,15 +18,15 @@
 //!
 //! The harness is the one the association and schema suites already carry — the router
 //! and `create_api` from `tests/all/source_api_association.rs`, and the schema calls
-//! (`start_creation`, `creation_status`, `get_type`), the span slack and the
-//! `SchemaStatus` catalog from `tests/all/schema_creation.rs` — so a schema request is
-//! built exactly one way across this crate and every assertion goes through the router
-//! the production emulator mounts.
+//! (`start_creation`, `creation_status`, `get_type`), the poll that waits for the creation
+//! the clock owes and the `SchemaStatus` catalog from `tests/all/schema_creation.rs` — so a
+//! schema request is built exactly one way across this crate and every assertion goes
+//! through the router the production emulator mounts.
 
 use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::state;
 
 use crate::schema_creation::{
-    creation_status, get_type, start_creation, PAST_THE_CREATION, SCHEMA_STATUSES,
+    await_settled_creation, creation_status, get_type, start_creation, SCHEMA_STATUSES,
 };
 use crate::source_api_association::{create_api, router, Answer};
 
@@ -174,9 +174,14 @@ async fn polling_the_creation_status_reports_the_stored_state_and_changes_nothin
         apis.push(api.id);
     }
 
-    // Nothing is called in between: the transitions below are owed by the clock, not by
-    // the reads above.
-    tokio::time::sleep(state::SCHEMA_CREATION_SPAN + PAST_THE_CREATION).await;
+    // No creation is started or changed in between: the transitions below are the ones the
+    // clock owes, and the wait LOOKS AGAIN for them rather than waiting a fixed time, so a
+    // loaded machine and a fast one reach the same assertions.
+    for (row, api_id) in rows.iter().zip(&apis) {
+        if row.definition.is_some() {
+            await_settled_creation(&router, api_id, row.label).await;
+        }
+    }
 
     for (row, api_id) in rows.iter().zip(&apis) {
         let settled = creation_status(&router, api_id).await;
@@ -190,8 +195,9 @@ async fn polling_the_creation_status_reports_the_stored_state_and_changes_nothin
             settled.body
         );
 
-        // A creation that ran reports what became of it; an API none ran for has nothing
-        // to detail.
+        // A creation that ran reports what became of it; an API none ran for reports the
+        // detail of the state none of the creation states applies to — either way the
+        // detail comes with the status.
         let detail = settled.body["details"].as_str();
         if row.definition.is_some() {
             assert!(
@@ -203,9 +209,10 @@ async fn polling_the_creation_status_reports_the_stored_state_and_changes_nothin
                 settled.body
             );
         } else {
-            assert!(
-                detail.is_none(),
-                "case {:?}: expected no detail where no creation has run, got {:?}",
+            assert_eq!(
+                detail,
+                Some(state::SCHEMA_NOT_APPLICABLE_DETAIL),
+                "case {:?}: expected the detail of the state no creation applies to, got {:?}",
                 row.label,
                 settled.body
             );

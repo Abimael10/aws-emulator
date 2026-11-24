@@ -103,18 +103,25 @@ pub(crate) async fn creation_status(router: &MultiServiceRouter, api_id: &str) -
     call(router, "GET", &schema_path(api_id), None).await
 }
 
-/// Wait until the schema creation `api_id` has pending has been performed.
+/// Wait until the schema creation `api_id` has pending has been PERFORMED — until the
+/// status it reports has left the non-terminal one — and report that read.
 ///
 /// A wait on the CONDITION rather than on a fixed time: the transition is one the clock
-/// owes, so the status is read again until it reports it or [`CREATION_DEADLINE`] passes,
-/// and a loaded machine and a fast one reach the same assertion. Shared by every suite
-/// that has to observe the far side of a creation.
-pub(crate) async fn await_creation(router: &MultiServiceRouter, api_id: &str, case: &str) {
+/// owes, so the status is read again until it has left [`state::SCHEMA_PROCESSING`] or the
+/// generous [`CREATION_DEADLINE`] passes, and a loaded machine and a fast one reach the
+/// same assertion. The ONE poll of this plane: [`await_creation`] is this wait plus the
+/// assertion that the creation succeeded, for the suites whose document defines a type
+/// system, and a suite whose rows settle on EITHER terminal state waits with this one.
+pub(crate) async fn await_settled_creation(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    case: &str,
+) -> Answer {
     let deadline = tokio::time::Instant::now() + CREATION_DEADLINE;
     loop {
         let settled = creation_status(router, api_id).await;
-        if settled.body["status"].as_str() == Some(state::SCHEMA_SUCCESS) {
-            return;
+        if settled.body["status"].as_str() != Some(state::SCHEMA_PROCESSING) {
+            return settled;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -122,6 +129,18 @@ pub(crate) async fn await_creation(router: &MultiServiceRouter, api_id: &str, ca
         );
         tokio::time::sleep(POLL_SPACING).await;
     }
+}
+
+/// Wait until the schema creation `api_id` has pending has been performed, and hold it to
+/// having SUCCEEDED — what every suite that goes on to read what the creation installed
+/// needs of it.
+pub(crate) async fn await_creation(router: &MultiServiceRouter, api_id: &str, case: &str) {
+    let settled = await_settled_creation(router, api_id, case).await;
+    assert_eq!(
+        settled.body["status"].as_str(),
+        Some(state::SCHEMA_SUCCESS),
+        "case {case}: expected the schema creation to have been performed, got {settled:?}"
+    );
 }
 
 /// Read the type `type_name` of `api_id` back, in `format`.

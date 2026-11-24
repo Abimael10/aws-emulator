@@ -59,3 +59,19 @@ very defect the parent issue reports.
 returns `None` for the detail when `self.schema` is `None`. Once the recorded sentence for the
 NOT_APPLICABLE state is known, report it there (and assert it in
 `tests/all/schema_creation_plane_refusals.rs`, beside the SUCCESS-detail table).
+
+## What was done, and what is left
+Fixed: the member is no longer omitted. `GraphqlApiRecord::schema_creation_status` now reports a
+detail for this state as it does for every other one — the status and the detail are the two members
+of one report — and `tests/all/schema_creation_status_detail.rs` holds every `SchemaStatus` this
+service reports to coming with its own non-empty detail, over a table of API types, documents and
+read counts.
+
+Left, and PROVISIONAL: the sentence itself. `SCHEMA_NOT_APPLICABLE_DETAIL` is an authored wording,
+documented as chosen on the constant beside `SCHEMA_PROCESSING_DETAIL`, because no source available
+here states AWS's: the model documents only the member's purpose, and the recorded value is withheld
+(see "What is needed" above). The replay key `appsync|GetSchemaCreationStatus|2xx->2xx|$.details`
+therefore still diverges on the WORDING of this one state. Should the recorded sentence become
+known, replace that constant's value — nothing else has to change, and the table test above pins
+everything around it.
+

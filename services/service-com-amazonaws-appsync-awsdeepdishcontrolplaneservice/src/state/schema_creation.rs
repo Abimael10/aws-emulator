@@ -15,6 +15,11 @@
 //! afterwards. A document the GraphQL type system cannot hold together settles to
 //! `FAILED`, carrying the reason as the status detail — the work is done on the
 //! document the call carried, never on anything the response needs.
+//!
+//! Every state is reported WITH the detail that goes with it, the one an API no creation
+//! has ever run for included: the status and "Detailed information about the status of the
+//! schema creation operation" are the two members of one report, so neither is answered
+//! without the other.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -51,6 +56,22 @@ pub const SCHEMA_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// The `details` that goes with [`SCHEMA_PROCESSING`].
 pub const SCHEMA_PROCESSING_DETAIL: &str =
     "The schema creation is scheduled and has not been performed yet.";
+
+/// The `details` that goes with [`SCHEMA_NOT_APPLICABLE`].
+///
+/// `GetSchemaCreationStatus` reports "Detailed information about the status of the schema
+/// creation operation" BESIDE the status, for every state that status can be in: the state
+/// an API no creation has ever run for is in is detailed too rather than answered with the
+/// member missing, and what there is to detail about it is that no creation has been
+/// performed for the API — so a client that reads the detail beside the status is told why
+/// none of the creation states applies instead of finding nothing there.
+///
+/// A CHOSEN wording, as [`SCHEMA_PROCESSING_DETAIL`] is: the model documents what the
+/// member carries and not its text, and the sentence recorded behaviour supplies is known
+/// only for the terminal states ([`schema_success_detail`] and
+/// [`super::SchemaDocumentError::detail`]). It interpolates nothing of the request,
+/// because an API no creation has run for has no creation of its own to report.
+pub const SCHEMA_NOT_APPLICABLE_DETAIL: &str = "No schema creation has been performed for this API.";
 
 /// The `details` that goes with [`SCHEMA_SUCCESS`], for a creation that installed
 /// `type_count` types.
@@ -211,12 +232,17 @@ impl GraphqlApiRecord {
     /// The `SchemaStatus` of this API's schema and the detail that goes with it, as
     /// `GetSchemaCreationStatus` reports them.
     ///
-    /// An API no schema creation has ever run for is in [`SCHEMA_NOT_APPLICABLE`] and
-    /// has no detail to report: there is no creation to detail.
+    /// BOTH are reported for every state: the detail is what the status it goes with
+    /// means, so an API no schema creation has ever run for — which is in
+    /// [`SCHEMA_NOT_APPLICABLE`] — carries [`SCHEMA_NOT_APPLICABLE_DETAIL`] rather than
+    /// leaving the member out, and a creation that ran carries the detail IT stored.
     pub fn schema_creation_status(&self) -> (String, Option<String>) {
         match self.schema.as_ref() {
             Some(schema) => (schema.status.clone(), Some(schema.details.clone())),
-            None => (SCHEMA_NOT_APPLICABLE.to_string(), None),
+            None => (
+                SCHEMA_NOT_APPLICABLE.to_string(),
+                Some(SCHEMA_NOT_APPLICABLE_DETAIL.to_string()),
+            ),
         }
     }
 }
