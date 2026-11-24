@@ -701,6 +701,77 @@ impl ComAmazonawsEbsEbsState {
 // words it the same way; every other refusal in this crate words itself at the site
 // that raises it, because no published rule pins the words.
 
+/// The `@length` maximum of `ErrorMessage`, the shape EVERY modelled error's `Message`
+/// member targets (`smithy_query(query="shape",shape="com.amazonaws.ebs#ErrorMessage")`
+/// reports `@length` 0..256; `ValidationException$Message`,
+/// `ResourceNotFoundException$Message` and each sibling target that shape). A Smithy
+/// `@length` on a string counts CHARACTERS, so that is the unit a message is measured in.
+pub const ERROR_MESSAGE_MAX_LENGTH: usize = 256;
+
+/// One piece of a refusal message: text the SERVICE words, or a value the REQUEST carried.
+#[derive(Debug, Clone, Copy)]
+pub enum MessagePart<'a> {
+    /// Text this service words itself — the sentence a caller matches on — kept whole.
+    Fixed(&'a str),
+    /// A value the request carried, echoed so the caller sees what was refused, and
+    /// elided when echoing it whole would not fit.
+    Echoed(&'a str),
+}
+
+/// A refusal sentence assembled from this service's own text and the values the request
+/// carried, rendered so it satisfies the `@length` of the `Message` member that carries it
+/// ([`ERROR_MESSAGE_MAX_LENGTH`]).
+///
+/// The fixed text is kept whole, and whatever it leaves of the budget is shared equally
+/// between the echoes; each echo is then held to its share by the tree's one elision
+/// (`service_common::validation::echo_held_to`), which keeps a character-boundary-safe
+/// prefix of the value and names the whole value's byte count, exactly as the request
+/// boundary's own walk does — so a caller sees one elision convention whichever side judged
+/// the value. The share is counted in BYTES, which a character-counted `@length` can only
+/// be larger than, so a value carrying multi-byte characters is held more tightly rather
+/// than less.
+///
+/// Needed because an echoed member's own bound does not bound the sentence that carries
+/// it: a member whose maximum is as large as the message member's (`BlockToken` is
+/// `@length` 0..256, exactly the maximum of the `Message` echoing it) leaves no room for
+/// the fixed text, and a header member whose constraints an operation takes off the
+/// request boundary has no enforced bound at all by the time a refusal names its value. So
+/// the fit happens here, once, for every refusal this service words around a request value.
+///
+/// The sentences this service words leave every echo a share far wider than the elision
+/// marker, which is the one thing a caller can read nowhere else and is therefore never
+/// dropped.
+pub fn fitted_message(parts: &[MessagePart<'_>]) -> String {
+    let fixed: usize = parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Fixed(text) => Some(text.len()),
+            MessagePart::Echoed(_) => None,
+        })
+        .sum();
+    let echoes = parts
+        .iter()
+        .filter(|part| matches!(part, MessagePart::Echoed(_)))
+        .count();
+    // A template whose own text fills the budget leaves no room for the value it echoes:
+    // caught here, at test time, rather than shipped as a sentence that cannot carry one.
+    debug_assert!(
+        fixed < ERROR_MESSAGE_MAX_LENGTH,
+        "a refusal template must leave room for the value it echoes"
+    );
+    let share = ERROR_MESSAGE_MAX_LENGTH.saturating_sub(fixed) / echoes.max(1);
+    let mut message = String::new();
+    for part in parts {
+        match part {
+            MessagePart::Fixed(text) => message.push_str(text),
+            MessagePart::Echoed(value) => {
+                message.push_str(&::service_common::validation::echo_held_to(value, share));
+            }
+        }
+    }
+    message
+}
+
 /// The widths of the hex suffix of a snapshot id the service accepts: the original
 /// 8-character EC2 id and the 17-character one it mints today.
 ///
@@ -739,9 +810,15 @@ pub fn is_well_formed_snapshot_id(snapshot_id: &str) -> bool {
 /// invalid. Expected: 'snap-...'.`
 ///
 /// `parameter` is the member's wire name, lower-camelled as the service reports it
-/// (`snapshotId`, `parentSnapshotId`).
+/// (`snapshotId`, `parentSnapshotId`), so it is text the SERVICE words; only the rejected
+/// value comes from the request, and it is echoed through [`fitted_message`].
 pub fn malformed_snapshot_id_message(parameter: &str, value: &str) -> String {
-    format!("Value ({value}) for parameter {parameter} is invalid. Expected: 'snap-...'.")
+    let tail = format!(") for parameter {parameter} is invalid. Expected: 'snap-...'.");
+    fitted_message(&[
+        MessagePart::Fixed("Value ("),
+        MessagePart::Echoed(value),
+        MessagePart::Fixed(&tail),
+    ])
 }
 
 /// The message `GetSnapshotBlock` answers with when a `BlockToken` does not name a block
@@ -750,8 +827,16 @@ pub fn malformed_snapshot_id_message(parameter: &str, value: &str) -> String {
 ///
 /// It states nothing about the block index: a token is the only thing that names a block,
 /// so a token that resolves to nothing is the refusal whatever the index holds.
+///
+/// The token is echoed through [`fitted_message`]: `BlockToken` is `@length` 0..256, which
+/// is the whole budget the `Message` member carrying this sentence has, so a token at its
+/// own maximum is elided to leave room for the sentence.
 pub fn invalid_block_token_message(block_token: &str) -> String {
-    format!("The block token {block_token} is invalid.")
+    fitted_message(&[
+        MessagePart::Fixed("The block token "),
+        MessagePart::Echoed(block_token),
+        MessagePart::Fixed(" is invalid."),
+    ])
 }
 
 /// The message this service answers with when a request names a snapshot that is not
@@ -762,7 +847,11 @@ pub fn invalid_block_token_message(block_token: &str) -> String {
 /// does not resolve — never that a snapshot exists but is in some other state, which is
 /// a different refusal (a `ValidationException` naming the state).
 pub fn snapshot_not_found_message(snapshot_id: &str) -> String {
-    format!("The snapshot '{snapshot_id}' does not exist.")
+    fitted_message(&[
+        MessagePart::Fixed("The snapshot '"),
+        MessagePart::Echoed(snapshot_id),
+        MessagePart::Fixed("' does not exist."),
+    ])
 }
 
 /// The message `PutSnapshotBlock` answers with when the request carries no
@@ -811,11 +900,17 @@ pub fn checksum_mismatch_message(computed: &str, supplied: &str) -> String {
 /// A request-derived template naming the rejected algorithm and the supported set, which
 /// is [`CHECKSUM_ALGORITHM_SHA256`] — the only value the modelled `ChecksumAlgorithm`
 /// enum declares.
+///
+/// The algorithm is echoed through [`fitted_message`]: the member is header-bound and its
+/// modelled constraints are taken off the request boundary, so the value named here has no
+/// enforced length of its own at the point this refusal words it.
 pub fn unsupported_checksum_algorithm_message(algorithm: &str) -> String {
-    format!(
-        "Unsupported Checksum Algorithm '{algorithm}', supported algorithms are \
-         {CHECKSUM_ALGORITHM_SHA256}"
-    )
+    let tail = format!("', supported algorithms are {CHECKSUM_ALGORITHM_SHA256}");
+    fitted_message(&[
+        MessagePart::Fixed("Unsupported Checksum Algorithm '"),
+        MessagePart::Echoed(algorithm),
+        MessagePart::Fixed(&tail),
+    ])
 }
 
 /// The message `StartSnapshot` answers with when `VolumeSize` is outside the sizes the
@@ -872,7 +967,13 @@ pub fn block_index_beyond_volume_message(block_index: i32) -> String {
 /// (`FirstSnapshotId` then `SecondSnapshotId`), and nothing else: `The snapshot <first> and
 /// <second> are not related.`
 pub fn unrelated_snapshots_message(first_snapshot_id: &str, second_snapshot_id: &str) -> String {
-    format!("The snapshot {first_snapshot_id} and {second_snapshot_id} are not related.")
+    fitted_message(&[
+        MessagePart::Fixed("The snapshot "),
+        MessagePart::Echoed(first_snapshot_id),
+        MessagePart::Fixed(" and "),
+        MessagePart::Echoed(second_snapshot_id),
+        MessagePart::Fixed(" are not related."),
+    ])
 }
 
 /// The message `ListChangedBlocks` answers with when the snapshot the URI names holds no
@@ -882,7 +983,11 @@ pub fn unrelated_snapshots_message(first_snapshot_id: &str, second_snapshot_id: 
 /// `Snapshot (<snapshotId>) is empty`. Nothing else of the request or of the stored
 /// snapshot appears in it.
 pub fn empty_snapshot_message(snapshot_id: &str) -> String {
-    format!("Snapshot ({snapshot_id}) is empty")
+    fitted_message(&[
+        MessagePart::Fixed("Snapshot ("),
+        MessagePart::Echoed(snapshot_id),
+        MessagePart::Fixed(") is empty"),
+    ])
 }
 
 /// The message `ListChangedBlocks` answers with when the request names no first snapshot to
