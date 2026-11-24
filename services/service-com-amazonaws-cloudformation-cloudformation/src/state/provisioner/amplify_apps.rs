@@ -40,6 +40,16 @@
 //! call's own `tags` member takes, and carrying the tags CloudFormation gives the resource
 //! beside the ones the declaration asks for.
 //!
+//! ## How a NOT-FOUND refusal of this service is reported
+//!
+//! Both Amplify types are deployed by a provider written against the CloudFormation
+//! resource-provider plugin, which raises that plugin's own not-found exception for the
+//! resource the handler manages instead of passing on the service's answer: a refusal AWS
+//! Amplify answers as not-found therefore reaches the failed resource's status reason as the
+//! plugin's uniform sentence, around the resource's CloudFormation TYPE and the identifier the
+//! handler holds for it ([`amplify_not_found_reported`]). The seam lives here because the
+//! branch's arm reports its refusals the same way ([`super::amplify_branches`]).
+//!
 //! A property outside [`AMPLIFY_APP_MAPPED_PROPERTIES`] is REFUSED rather than dropped: a
 //! resource reported as created with less than its declaration asked for is not the resource
 //! the template described.
@@ -67,6 +77,62 @@ const DELETE_APP: &str = "DeleteApp";
 /// modelled 404 of the read, the update and the delete of an app and of a branch alike), which
 /// is why the branch's arm reads it from here ([`super::amplify_branches`]).
 pub(super) const AMPLIFY_NOT_FOUND: &str = "NotFoundException";
+
+/// The identifier the plugin's not-found sentence quotes for a resource whose handler holds
+/// NONE: the null reference, which is what formatting an absent identifier into that sentence
+/// writes.
+///
+/// A create is the call in that position: both Amplify types are identified by the ARN that
+/// service assigns, so the state a create was handed carries no identifier at all until the
+/// call it is making answers one.
+pub(super) const AMPLIFY_NO_IDENTIFIER: &str = "null";
+
+/// What a physical resource id this emulator records for an Amplify resource opens with where
+/// it is the identifier that service assigned, rather than the stand-in a naming rule computed
+/// for a resource whose create has not answered yet.
+const ARN_PREFIX: &str = "arn:";
+
+/// How a resource provider of an AWS Amplify type reports a call that service refused as
+/// NOT-FOUND: in the resource-provider plugin's own not-found sentence
+/// ([`provider_resource_not_found`]), naming the CLOUDFORMATION TYPE the provider manages and
+/// the identifier the handler holds for that resource — and carrying nothing of that service's
+/// own wording, which names the app or the branch in Amplify's own terms and no CloudFormation
+/// type at all.
+///
+/// Both of this service's types are deployed by a provider written against that plugin, which
+/// raises the plugin's own not-found exception for the resource it manages rather than passing
+/// on the service's: the refusal says the app or the branch the handler was given is not there,
+/// and the plugin words that one way for every type so tooling triaging a rolled-back
+/// deployment reads it without knowing which service answered.
+///
+/// Judged on the CODE that service answered ([`AMPLIFY_NOT_FOUND`]) and never on its message,
+/// which carries the request's own values. Every other refusal is reported as that service
+/// worded it, and the code travels untouched either way, so the `HandlerErrorCode` class the
+/// event carries is the one the refusal falls in.
+pub(super) fn amplify_not_found_reported(
+    refusal: Refusal,
+    resource_type: &str,
+    identifier: &str,
+) -> Refusal {
+    if refusal.code != AMPLIFY_NOT_FOUND {
+        return refusal;
+    }
+    Refusal {
+        message: provider_resource_not_found(resource_type, identifier),
+        code: refusal.code,
+    }
+}
+
+/// The identifier such a provider holds for the resource it manages, as that sentence quotes
+/// it: the ARN AWS Amplify assigned, which is this resource's physical id and the type's
+/// primary identifier — and, for a record still carrying the stand-in a naming rule computed,
+/// no identifier at all ([`AMPLIFY_NO_IDENTIFIER`]).
+pub(super) fn amplify_held_identifier(physical_resource_id: &str) -> &str {
+    if physical_resource_id.starts_with(ARN_PREFIX) {
+        return physical_resource_id;
+    }
+    AMPLIFY_NO_IDENTIFIER
+}
 
 /// The member every one of those operations answers the app record in.
 const APP_MEMBER: &str = "app";
@@ -256,7 +322,17 @@ pub(super) async fn update_amplify_app(
         &app_uri(&app_id_of(resource)),
         Some(&Value::Object(request)),
     )
-    .await?;
+    .await
+    // An app this service no longer holds is the resource this handler MANAGES being gone, which
+    // its provider reports in the plugin's own sentence around the identifier it holds for the
+    // app — the ARN that is this resource's physical id ([`amplify_not_found_reported`]).
+    .map_err(|refusal| {
+        amplify_not_found_reported(
+            refusal,
+            AMPLIFY_APP,
+            amplify_held_identifier(&resource.physical_resource_id),
+        )
+    })?;
     Ok(Some(Created::attributes(app_attributes(&answered)?)))
 }
 
@@ -572,6 +648,116 @@ mod tests {
             assert!(
                 !request.contains_key(member),
                 "case \"what the caller adds itself\": expected no {member}, got {request:?}"
+            );
+        }
+    }
+
+    /// One row of [`a_not_found_refusal_is_reported_in_the_plugins_own_sentence`]: the case, the
+    /// code and message the refusal carried, the type the provider manages, the physical id the
+    /// record holds, and the message the provider reports.
+    type ReportedRow = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+
+    /// RULE: a call AWS Amplify refused as not-found is reported in the resource-provider
+    /// plugin's own not-found sentence, naming the CloudFormation type the provider manages and
+    /// the identifier it holds for that resource — the ARN that service assigned, and the null
+    /// reference where it holds none; every other refusal is reported as that service worded it,
+    /// and the code travels untouched either way.
+    ///
+    /// The rows differ along the TYPE the provider manages, whether the handler holds an
+    /// identifier (the ARN of an app and of a branch, a stand-in a naming rule computed, nothing
+    /// at all), the FORM of the identifier the service's own sentence named, and the CODE the
+    /// refusal carried.
+    #[test]
+    fn a_not_found_refusal_is_reported_in_the_plugins_own_sentence() {
+        const APP_ARN: &str = "arn:aws:amplify:us-east-1:000000000000:apps/d1a2b3c4d5e6f7";
+        const BRANCH_ARN: &str =
+            "arn:aws:amplify:us-east-1:000000000000:apps/d1a2b3c4d5e6f7/branches/main";
+        let rows: &[ReportedRow] = &[
+            (
+                "a branch whose create named an app that service holds none for",
+                AMPLIFY_NOT_FOUND,
+                "App d0e8e2c3e2eef6 not found.",
+                AMPLIFY_BRANCH,
+                "the Arn of main is not available until it has been created",
+                "Resource of type 'AWS::Amplify::Branch' with identifier 'null' was not found.",
+            ),
+            (
+                "a branch whose create named another app of the same form",
+                AMPLIFY_NOT_FOUND,
+                "App dzzzzzzzzzzzzzzzzzzz not found.",
+                AMPLIFY_BRANCH,
+                "",
+                "Resource of type 'AWS::Amplify::Branch' with identifier 'null' was not found.",
+            ),
+            (
+                "a branch the update no longer finds, by the ARN the handler holds",
+                AMPLIFY_NOT_FOUND,
+                "Branch main not found.",
+                AMPLIFY_BRANCH,
+                BRANCH_ARN,
+                "Resource of type 'AWS::Amplify::Branch' with identifier \
+                 'arn:aws:amplify:us-east-1:000000000000:apps/d1a2b3c4d5e6f7/branches/main' was \
+                 not found.",
+            ),
+            (
+                "an app the update no longer finds",
+                AMPLIFY_NOT_FOUND,
+                "App d1a2b3c4d5e6f7 not found.",
+                AMPLIFY_APP,
+                APP_ARN,
+                "Resource of type 'AWS::Amplify::App' with identifier \
+                 'arn:aws:amplify:us-east-1:000000000000:apps/d1a2b3c4d5e6f7' was not found.",
+            ),
+            (
+                "a call that service refused for the declaration itself",
+                "BadRequestException",
+                "Branch name is not supported.",
+                AMPLIFY_BRANCH,
+                BRANCH_ARN,
+                "Branch name is not supported.",
+            ),
+            (
+                "a call past that service's own quota",
+                "LimitExceededException",
+                "Number of branches exceeds the limit of 50 for app d1a2b3c4d5e6f7",
+                AMPLIFY_BRANCH,
+                "",
+                "Number of branches exceeds the limit of 50 for app d1a2b3c4d5e6f7",
+            ),
+            (
+                "a call that service would not serve at all",
+                "UnauthorizedException",
+                "User is not authorized to perform this action",
+                AMPLIFY_APP,
+                APP_ARN,
+                "User is not authorized to perform this action",
+            ),
+        ];
+        for (case, code, message, resource_type, physical_resource_id, expected) in rows {
+            let reported = amplify_not_found_reported(
+                Refusal {
+                    code: (*code).to_string(),
+                    message: (*message).to_string(),
+                },
+                resource_type,
+                amplify_held_identifier(physical_resource_id),
+            );
+            assert_eq!(
+                reported.message, *expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                reported.message
+            );
+            assert_eq!(
+                reported.code, *code,
+                "case {case:?}: expected the code {code:?} to travel untouched, got {:?}",
+                reported.code
             );
         }
     }

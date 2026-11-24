@@ -46,7 +46,7 @@ use super::query_wire::{element, elements, form_encode, opt_element, outputs_of,
 
 /// The Region every request here is signed for, and so the Region the stacks, the directories
 /// and the network they sit on belong to.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -56,7 +56,7 @@ const EC2_API_VERSION: &str = "2016-11-15";
 const DS_TARGET_PREFIX: &str = "DirectoryService_20150416";
 
 /// A password the modelled `Password` pattern admits.
-const PASSWORD: &str = "Passw0rd!2345";
+pub(crate) const PASSWORD: &str = "Passw0rd!2345";
 
 /// The fixed text CloudFormation refuses a template declaring a type it does NOT know with,
 /// which is what the defect this suite pins answered for a type AWS publishes.
@@ -65,17 +65,17 @@ const UNRECOGNIZED_TYPES: &str = "Unrecognized resource types";
 /// How long a polled read may take to reach the condition it waits for before a case fails:
 /// far longer than any span either service publishes, so a loaded or faster host changes
 /// nothing about the outcome.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(90);
 
 /// How often such a read asks again.
-const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
+pub(crate) const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
 
 /// The stage Directory Service reports a directory that is SERVING in.
-const STAGE_ACTIVE: &str = "Active";
+pub(crate) const STAGE_ACTIVE: &str = "Active";
 
 /// CloudFormation, Directory Service and Amazon EC2 over ONE shared engine, as the production
 /// router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -105,7 +105,7 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// Call one CloudFormation action over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -181,21 +181,22 @@ async fn ds(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, 
 
 /// One subnet of the account, as EC2 reported it when it minted it.
 #[derive(Debug, Clone)]
-struct Subnet {
-    id: String,
-    zone: String,
+pub(crate) struct Subnet {
+    pub(crate) id: String,
+    #[allow(dead_code)]
+    pub(crate) zone: String,
 }
 
 /// The network a row's directories are placed in: the VPC and the subnets EC2 minted in it.
 #[derive(Debug, Clone)]
-struct Network {
-    vpc_id: String,
-    subnets: Vec<Subnet>,
+pub(crate) struct Network {
+    pub(crate) vpc_id: String,
+    pub(crate) subnets: Vec<Subnet>,
 }
 
 /// Build one VPC of the account carrying one subnet per `(block, zone)` entry, through EC2's
 /// own operations — so every identifier below is one EC2 handed out.
-async fn network(
+pub(crate) async fn network(
     router: &MultiServiceRouter,
     vpc_block: &str,
     specs: &[(&str, &str)],
@@ -280,7 +281,11 @@ async fn deploy(
 
 /// The description Directory Service reports for `directory_id`, or `None` where it reports
 /// none — which is what a finished teardown looks like.
-async fn described(router: &MultiServiceRouter, directory_id: &str, case: &str) -> Option<Value> {
+pub(crate) async fn described(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Option<Value> {
     let (status, body) = ds(
         router,
         "DescribeDirectories",
@@ -298,7 +303,7 @@ async fn described(router: &MultiServiceRouter, directory_id: &str, case: &str) 
 
 /// The description Directory Service reports for a directory the stack says it created, which
 /// it must hold.
-async fn held(router: &MultiServiceRouter, directory_id: &str, case: &str) -> Value {
+pub(crate) async fn held(router: &MultiServiceRouter, directory_id: &str, case: &str) -> Value {
     described(router, directory_id, case)
         .await
         .unwrap_or_else(|| {

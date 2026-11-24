@@ -60,7 +60,7 @@ const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
 /// One AWS Amplify call over the `restJson1` wire its model declares, on the method and URI
 /// that operation's own `@http` binding names, signed for `amplify` — that model's own
 /// `sigv4Name` — in the Region the stack's resources live in.
-async fn amplify(
+pub(crate) async fn amplify(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -94,7 +94,7 @@ async fn amplify(
 
 /// `CreateApp` for one name: the id AWS Amplify minted for the app, as a client's own call gets
 /// it.
-async fn create_app(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_app(router: &MultiServiceRouter, name: &str) -> String {
     let (status, document) = amplify(router, "POST", "/apps", Some(&json!({"name": name}))).await;
     assert_eq!(
         status, 200,
@@ -109,7 +109,11 @@ async fn create_app(router: &MultiServiceRouter, name: &str) -> String {
 
 /// That service's own read of ONE branch of ONE app: the status and, for a 200, the branch
 /// record itself.
-async fn get_branch(router: &MultiServiceRouter, app_id: &str, branch_name: &str) -> (u16, Value) {
+pub(crate) async fn get_branch(
+    router: &MultiServiceRouter,
+    app_id: &str,
+    branch_name: &str,
+) -> (u16, Value) {
     let (status, document) = amplify(
         router,
         "GET",
@@ -131,7 +135,7 @@ async fn get_branch(router: &MultiServiceRouter, app_id: &str, branch_name: &str
 }
 
 /// Every branch name AWS Amplify lists for one app.
-async fn list_branch_names(router: &MultiServiceRouter, app_id: &str) -> Vec<String> {
+pub(crate) async fn list_branch_names(router: &MultiServiceRouter, app_id: &str) -> Vec<String> {
     let (_, document) = amplify(
         router,
         "GET",
@@ -810,12 +814,23 @@ async fn a_branch_whose_app_amplify_does_not_hold_rolls_the_stack_back() {
         "case {case:?}: expected no output for a stack that rolled back, got {described}"
     );
 
-    // The failure is the OWNING service's own refusal, reported on the resource that failed.
+    // The failure is reported on the resource that failed, in the sentence this type's PROVIDER
+    // words a not-found refusal of the owning service with — which carries the type it manages
+    // and the identifier it holds for the branch, and none of that service's own wording. The
+    // wording itself is pinned, over a set of app ids, by
+    // `amplify_branch_unknown_app_wording.rs`.
     let reasons = stack_event_reasons(&router, REGION, stack_name).await;
-    let sentence = format!("App {missing_app} not found.");
+    let sentence = format!("Resource of type '{BRANCH}' with identifier 'null' was not found.");
     assert!(
         reasons.iter().any(|reason| reason.contains(&sentence)),
         "case {case:?}: expected a failure reason carrying {sentence:?}, got {reasons:?}"
+    );
+    assert!(
+        !reasons
+            .iter()
+            .any(|reason| reason.contains(&format!("App {missing_app} not found."))),
+        "case {case:?}: expected no reason to carry the owning service's own sentence, got \
+         {reasons:?}"
     );
     assert!(
         reasons

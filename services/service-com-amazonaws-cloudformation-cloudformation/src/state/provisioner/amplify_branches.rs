@@ -44,6 +44,17 @@
 //! A property outside [`AMPLIFY_BRANCH_MAPPED_PROPERTIES`] is REFUSED rather than dropped: a
 //! resource reported as created with less than its declaration asked for is not the resource
 //! the template described.
+//!
+//! ## A refusal about the app the declaration REFERENCES, and about the branch itself
+//!
+//! The create names TWO resources: the branch it makes, and the app it asks to make that branch
+//! under — which the declaration only references, by the `AppId` it states. Either way the
+//! refusal says the branch this handler was asked for is not there, and this provider reports
+//! it in the resource-provider plugin's own not-found sentence
+//! ([`amplify_not_found_reported`]) rather than forwarding AWS Amplify's own sentence, which
+//! names the app in that service's terms and no CloudFormation type at all. The identifier the
+//! sentence quotes is the one the handler holds for the branch — the ARN that service assigns,
+//! which a create has not been answered yet.
 
 use super::*;
 
@@ -167,7 +178,14 @@ pub(super) async fn create_amplify_branch(
         &branches_uri(&app_id),
         Some(&Value::Object(request)),
     )
-    .await?;
+    .await
+    // A create this service refuses as not-found is the branch it was asked to make not being
+    // there, which this provider reports in the plugin's own sentence around the type it manages
+    // and the identifier it holds for the branch ([`amplify_not_found_reported`]) — and a create
+    // holds none: the branch is identified by the ARN that service assigns when it answers.
+    .map_err(|refusal| {
+        amplify_not_found_reported(refusal, AMPLIFY_BRANCH, AMPLIFY_NO_IDENTIFIER)
+    })?;
     let attributes = branch_attributes(&answered)?;
     Ok(Created {
         // "Ref returns the ARN of the branch", which AWS Amplify built around the `appId` it
@@ -218,7 +236,16 @@ pub(super) async fn update_amplify_branch(
         &branch_uri(&app_id, &name),
         Some(&Value::Object(request)),
     )
-    .await?;
+    .await
+    // The same report for the update, whose handler DOES hold an identifier for the branch: the
+    // ARN this resource's physical id carries.
+    .map_err(|refusal| {
+        amplify_not_found_reported(
+            refusal,
+            AMPLIFY_BRANCH,
+            amplify_held_identifier(&resource.physical_resource_id),
+        )
+    })?;
     Ok(Some(Created::attributes(branch_attributes(&answered)?)))
 }
 

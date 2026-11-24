@@ -416,6 +416,14 @@ pub(super) async fn update_ds_directory(
 /// is left alone (its reported `Alias` is the directory id itself until one is assigned), and a
 /// directory whose `SsoEnabled` is already true asks for nothing.
 ///
+/// That reading is made from a description taken BEFORE the calls, and a pass holds no claim on
+/// the resource it answers for — one is entered per read of the stack — so two passes can reach
+/// the same unaliased directory and both ask for the alias. What decides whether a refused
+/// assignment is this resource's failure is therefore the directory's own state afterwards
+/// ([`carries_an_alias`]) and never the refusal's wording: the pass that loses such a race is
+/// told the alias is taken by its own twin, while the flag it was applying did reach the
+/// directory.
+///
 /// The ORDER is the one single sign-on needs: it is reached through the directory's access
 /// URL, which exists only once an alias has been assigned, so the alias is asked for first.
 async fn apply_declared_flags(
@@ -438,7 +446,12 @@ async fn apply_declared_flags(
             Value::String(alias_for(directory_id)),
         );
         if let Err(refusal) = call_ds(ctx, region, CREATE_ALIAS, &Value::Object(request)).await {
-            return Ok(Some(refusal));
+            // Refused, so the question is whether the directory ended up with the alias this
+            // flag asks for anyway — which is what a concurrent pass of this same wait leaves
+            // behind, both passes asking for the one value derived from the directory's id.
+            if !carries_an_alias(ctx, region, directory_id).await? {
+                return Ok(Some(refusal));
+            }
         }
     }
     if declared_flag(declared, ENABLE_SSO_PROPERTY)
@@ -454,6 +467,23 @@ async fn apply_declared_flags(
         }
     }
     Ok(None)
+}
+
+/// Whether Directory Service now reports an alias ASSIGNED to the directory.
+///
+/// Read the one way this module reads it: a directory with no alias of its own reports the
+/// directory id as its `Alias`, so one that reports anything else carries an assigned alias —
+/// the state [`apply_declared_flags`]' own guard tests before asking for one. A directory that
+/// service no longer holds carries none.
+async fn carries_an_alias(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    directory_id: &str,
+) -> Result<bool, Refusal> {
+    let Some(described) = described_directory(ctx, region, directory_id).await? else {
+        return Ok(false);
+    };
+    Ok(reported_text(&described, ALIAS_MEMBER).as_deref() != Some(directory_id))
 }
 
 /// The alias CloudFormation asks Directory Service to assign the directory, where the
