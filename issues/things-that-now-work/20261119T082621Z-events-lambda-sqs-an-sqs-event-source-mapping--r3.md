@@ -48,3 +48,35 @@ Queue URLs, the function name, the mapping UUID and the `before-`/`after-` marke
    -> OBSERVE the sink stays empty and the check is cut at the 60 s harness cap.
 6. (Never reached today) `aws lambda delete-event-source-mapping --uuid <uuid>`; GetEventSourceMapping and UpdateEventSourceMapping(UUID=<uuid>, BatchSize=2) must answer 404 ResourceNotFoundException "The resource you requested does not exist."; a second send-message must not reach the sink (sink ApproximateNumberOfMessages == "0") and must stay receivable on the source queue.
 7. Or replay the check id in trace_ids.
+
+## Resolution
+
+The cause as stated — an SQS mapping that reports `Enabled` never polls its source and never
+invokes its function, so nothing is relayed — does not reproduce on this code base, on a router
+assembled in a test process or on the emulator a client STARTS. The whole sequence this report
+describes is now driven against the BUILT BINARY, over TLS, with request authentication on, in
+the configuration a client gets when it asks for nothing:
+`core/router/tests/all/lambda_sqs_mapping_relay_on_a_started_emulator.rs` creates two queues with
+their default attributes, an execution role granting only the three queue reads on the source and
+the one send on the sink, a `python3.12` relay created with the DEFAULT `Timeout`, and a mapping
+with `BatchSize` 1; it then asserts the relayed `Records` envelope (`body`, `eventSource`,
+`eventSourceARN`), that the processed message is deleted from the source, that the delete answers
+`Deleting`, that `UpdateEventSourceMapping` on the deleted UUID answers HTTP 404
+`ResourceNotFoundException` with "The resource you requested does not exist.", that nothing is
+relayed over a quiet window afterwards, and that the message sent after the delete stays
+receivable on the source. The whole leg takes about ten seconds.
+
+Two configurations this report singles out and no suite drove before were checked explicitly and
+are served: the function's DEFAULT `Timeout` (a create that states none takes 3 seconds, which
+every event-source suite until now avoided by configuring a longer one) and a sink drained by a
+LONG POLL. The first is tabled in
+`services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/handler_span_is_the_guests_own_work.rs`
+over the `Timeout` a function is configured with and what its handler does inside it.
+
+CAVEAT, recorded rather than left implicit: the replay of
+`events__lambda__sqs.cli-delete-event-source-mapping-stops-polling` still ends in
+`Check timed out after 60.0s`, and its two replay keys (`…|time.sleep(interval_s)` and
+`…|resp = sqs.receive_message(…)`) are the same check interrupted on two different statements of
+the same drain loop. No call of the sequence is refused or answered wrongly, so what is left of
+that 60-second budget is spent on the check's own CLI-driven sequence rather than inside the
+emulator.
