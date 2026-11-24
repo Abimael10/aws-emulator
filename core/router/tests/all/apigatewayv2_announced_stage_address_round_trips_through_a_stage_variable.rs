@@ -58,8 +58,10 @@ const ROOT_STAGE: &str = "$default";
 /// grammar an announced invoke address has to be spelled within.
 const STAGE_VARIABLE_VALUE_PUNCTUATION: &str = "-._~:/?#&=,";
 
-/// The redirect an `HTTP_PROXY` route answers with: the caller is sent to the upstream the
-/// integration resolved rather than the gateway connecting to it.
+/// The redirect an `HTTP_PROXY` route answers with for an upstream this emulator serves
+/// nothing at: the caller is sent to the upstream the integration resolved, because the
+/// gateway makes no request of its own to an address it does not serve itself. It is what each
+/// BACKEND api below answers, and so what a front api forwarding to one passes back.
 const TEMPORARY_REDIRECT: u16 = 307;
 
 /// The status and sentence an HTTP api answers for a matched route whose integration could
@@ -437,7 +439,10 @@ async fn an_announced_stage_address_is_an_accepted_stage_variable_value_that_lea
              {read}"
         );
 
-        // Half two: the front api's route resolves the variable into the announced address …
+        // Half two: the front api's route resolves the variable into the announced address and
+        // is FORWARDED there, that being an address this emulator serves itself, so what the
+        // client reads is the BACKEND's own answer, which identifies the api and the stage it
+        // reaches.
         let front_address = format!(
             "https://{}/{front_stage}/front-invoke",
             host_and_path(&front_endpoint)
@@ -447,19 +452,19 @@ async fn an_announced_stage_address_is_an_accepted_stage_variable_value_that_lea
         assert_eq!(
             answer.status,
             TEMPORARY_REDIRECT,
-            "case {case:?}: expected the front api's route to send the caller to the backend \
-             its stage selects, got {}",
+            "case {case:?}: expected the answer of the backend its stage selects, got {}",
             answer.summary()
         );
         assert_eq!(
             answer.location.as_deref(),
-            Some(expected.as_str()),
-            "case {case:?}: expected the caller to be sent to {expected:?}, got {}",
+            Some(upstream.as_str()),
+            "case {case:?}: expected the front api's route to reach the backend whose own route \
+             fronts {upstream:?}, got {}",
             answer.summary()
         );
 
-        // … and that address, DIALLED, is answered by the backend api's own route, which is
-        // what identifies the api and the stage it reached.
+        // And that same announced address, DIALLED by a client, is answered by that backend
+        // api's own route too, which is what proves the address leads back to it.
         let reached = dial(&router, &expected).await;
         assert_eq!(
             reached.status,

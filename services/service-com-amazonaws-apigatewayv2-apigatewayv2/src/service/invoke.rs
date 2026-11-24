@@ -121,12 +121,17 @@
 //! * an `AWS_PROXY` route naming a Lambda FUNCTION invokes it with the event its
 //!   `PayloadFormatVersion` defines ([`proxy_event`]) and answers with the response that
 //!   version defines ([`proxy_response`]);
-//! * an `HTTP_PROXY` route's endpoint is a URI the CALLER can reach, and this emulator
-//!   relays no request to a destination an api's own configuration names: the caller is sent
-//!   there instead ([`http_proxy`]), `307 Temporary Redirect` to the upstream the integration
-//!   resolved, which preserves the request's method and body, so the client makes exactly the
-//!   request the gateway would have relayed and nothing about the upstream's answer is
-//!   invented;
+//! * an `HTTP_PROXY` route is a HOP ([`http_proxy`]): the gateway builds a request of its own
+//!   at the endpoint the integration names, carrying the client's request with the
+//!   hop-identifying fields the GATEWAY states — its own `Via`, and none of the client's
+//!   `X-Forwarded-For` claim — and answers with what that endpoint answered. It is performed
+//!   only where THIS plane serves that endpoint itself ([`serves_this_plane`]), by handing the
+//!   request back to this plane's own serving ([`served_hop`]), which opens no connection and
+//!   dials no address a stored configuration named; every other endpoint is a URI the CALLER
+//!   can reach and this emulator makes no request of its own to one, so the caller is sent
+//!   there instead — `307 Temporary Redirect` to the upstream the integration resolved, which
+//!   preserves the request's method and body, so the client makes exactly the request the
+//!   gateway would have forwarded and nothing about that endpoint's answer is invented;
 //! * `MOCK` — the one type that answers without a backend — "is not permitted for APIs with
 //!   a protocol type of HTTP" ([`crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES`]), so it
 //!   cannot be configured here, and the two non-proxy types (`AWS`, `HTTP`) take the request
@@ -170,9 +175,9 @@ mod dispatch;
 /// mapping selects. `pub(super)` so the socket a domain name publishes and this plane can be
 /// read as the one front door they are.
 pub(super) mod custom_domain_arrival;
-/// What an `HTTP_PROXY` route ANSWERS: the upstream its integration resolved, and the
-/// redirect that sends the caller there rather than this emulator relaying a request to a
-/// destination an api's own configuration names.
+/// What an `HTTP_PROXY` route ANSWERS: the message the gateway FORWARDS to the upstream its
+/// integration resolved, and the redirect that sends the caller there instead for an upstream
+/// this emulator serves nothing at.
 mod http_proxy;
 /// What the stage LOGS about a request it served: its access-log record, rendered by the
 /// stage's own `$context` format. `pub(crate)` only for the stream NAMING a stage's records
@@ -648,6 +653,18 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
         })
 }
 
+/// Whether the address `req` is made at is one THIS plane serves ITSELF — it resolves to an
+/// HTTP api of this service, or to a custom domain name of this account ([`claims`]).
+///
+/// What an `HTTP_PROXY` integration's hop turns on ([`dispatch`]): such an upstream is
+/// answered by handing the request back to this plane's own serving, while every other
+/// address is one only the CALLER reaches. Narrower than [`claims_request`] on purpose — the
+/// endpoint space's answer for an api id this emulator does not hold is not an api serving
+/// anything, so it is no backend to forward a request to.
+pub(super) fn serves_this_plane<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    claims(engine, &Addressed::of_request(req))
+}
+
 /// Whether this data plane answers an `execute-api` ENDPOINT that resolves to NO api of this
 /// emulator — the address a client keeps calling after the api behind it was deleted.
 ///
@@ -804,6 +821,39 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
 ) -> RtResponse {
+    served(engine, req, ctx, FIRST_HOP).await
+}
+
+/// How many `HTTP_PROXY` integrations of this plane's own endpoints a request a CLIENT made
+/// has been forwarded through: none at all. A request this plane forwards to an upstream of
+/// its own carries one more than the request it was forwarded from
+/// ([`dispatch::MAX_FORWARDED_HOPS`] bounds the chain).
+pub(super) const FIRST_HOP: u8 = 0;
+
+/// [`serve`] as the HOP an `HTTP_PROXY` integration of this plane's own endpoints makes: the
+/// request that integration forwards, served against the stage it addresses, with `hop`
+/// counting the forwards this request has already been through.
+///
+/// Type-erased, because this is a CYCLE — serving a route performs its integration, and
+/// performing an `HTTP_PROXY` integration of this plane serves a route — and a future that
+/// awaits itself needs the indirection to have a size at all.
+pub(super) fn served_hop<'a, 'c: 'a, Eng: Send + Sync + 'static>(
+    engine: &'a Eng,
+    req: &'a RtRequest,
+    ctx: &'a OperationContext<'c>,
+    hop: u8,
+) -> ::smithy_server_runtime::BoxFuture<'a, RtResponse> {
+    Box::pin(served(engine, req, ctx, hop))
+}
+
+/// Serve one request addressed to a deployed HTTP api stage, as the hop `hop` of a chain of
+/// forwards ([`served_hop`]).
+async fn served<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+    hop: u8,
+) -> RtResponse {
     // Minted HERE, before anything is served, because the id names the request in THREE
     // places: the header this response reports it in, the `$context.requestId` the
     // invocation's own event carries, and the stage's access-log record ([`access_logs`]) —
@@ -816,7 +866,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         Err(answered) => (*answered, None),
         Ok((decoration, Answer::Now(response))) => (decorated(*response, &decoration), None),
         Ok((decoration, Answer::Dispatch(dispatch))) => {
-            let performed = dispatch::perform(engine, ctx, *dispatch).await;
+            let performed = dispatch::perform(engine, ctx, *dispatch, hop).await;
             (
                 decorated(performed.response, &decoration),
                 performed.integration_latency,
@@ -981,7 +1031,7 @@ fn performed_over_the_remembered_transport<Eng: Send + Sync + 'static>(
     let owned_identity = identity.clone();
     let performed = async move {
         let ctx = OperationContext::new(&head, &owned_identity, callback);
-        dispatch::perform(&*owned_engine, &ctx, dispatch).await
+        dispatch::perform(&*owned_engine, &ctx, dispatch, FIRST_HOP).await
     };
     let answered = awaited(&handle, performed);
     drop(permit);

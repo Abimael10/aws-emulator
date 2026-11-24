@@ -9,8 +9,8 @@
 //! defines and mapping the response that version defines — so the status, headers and body a
 //! client receives are the function's, while an integration that produced no response is the
 //! gateway's `500`, one that did not answer within its own `TimeoutInMillis` is its `503`,
-//! and an `HTTP_PROXY` upstream — a URI the caller can reach, which this emulator relays no
-//! request to — is the `307` that sends the caller there, whichever address it names.**
+//! and an `HTTP_PROXY` upstream is FORWARDED to where this emulator serves that endpoint
+//! itself and otherwise answered with the `307` that sends the caller there.**
 //!
 //! Nothing here is a value this emulator fills in: every assertion below is on something a
 //! function RAN and returned, which is why AWS Lambda is mounted beside this service on one
@@ -67,8 +67,9 @@ const FUNCTION_TIMEOUT_SECONDS: i32 = 29;
 const INTEGRATION_FAULT: u16 = 500;
 const INTEGRATION_FAULT_MESSAGE: &str = "Internal Server Error";
 
-/// The redirect an `HTTP_PROXY` upstream is answered with: the caller is sent to the
-/// backend rather than this emulator relaying the request to it.
+/// The redirect an `HTTP_PROXY` upstream this emulator serves nothing at is answered with:
+/// the caller is sent to the backend, because this emulator makes no request of its own to an
+/// address it does not serve itself.
 const TEMPORARY_REDIRECT: u16 = 307;
 
 /// The status and sentence it answers for an integration that ran and did not answer within
@@ -1569,22 +1570,22 @@ async fn an_events_multi_valued_maps_report_one_entry_per_occurrence_of_a_field(
 // What an `HTTP_PROXY` route ANSWERS, beside the Lambda invocation above.
 //
 // RULE: `Integration$IntegrationType` gives `HTTP_PROXY` as "for integrating the route or
-// method request with an HTTP endpoint, with the client request passed through as-is", so the
-// endpoint such a route fronts is a URI the CALLER can reach — and this emulator relays no
-// request to a destination an api's own configuration names, WHICHEVER address that names:
-// the caller is sent there with the redirect that preserves its method and body, and nothing
-// of that endpoint's own answer appears in what the client reads.
+// method request with an HTTP endpoint, with the client request passed through as-is", so
+// such a route is a HOP: the gateway forwards the client's request — its method, its body and
+// its query string — to the endpoint the integration names and answers with what that
+// endpoint answered. The hop is made where THIS emulator serves that endpoint itself, in
+// process; every OTHER address is a URI only the CALLER can reach, and this emulator makes no
+// request of its own to one, so the caller is sent there with the redirect that preserves its
+// method and body and nothing of that endpoint's own answer appears in what the client reads.
 //
-// The table above drives upstreams nothing in this emulator serves. The rows below add the
-// case that makes the rule visible rather than incidental: an upstream this emulator DOES
-// serve — a second api of its own, whose `AWS_PROXY` route echoes the event it was handed —
-// whose answer the client would be reading if the gateway had relayed the request to it. That
-// endpoint is dialled by the CALLER at the end of the case, which is what shows it was served
-// here all along.
+// The table above drives upstreams nothing in this emulator serves. The rows below drive both
+// halves against ONE origin — a second api of its own, whose `AWS_PROXY` route echoes the
+// event it was handed — so what the client reads says which of the two happened. What the
+// FORWARDED request states about the hop itself is `http_proxy_hop_headers.rs`'s rule.
 
-/// The header the echoing handler answers with, which is what shows whether the ORIGIN's own
-/// response reached the client — it must not, because the gateway sent the caller there
-/// instead of relaying the request.
+/// The header the echoing handler answers with, which is what shows the ORIGIN's own response
+/// reached the client — it does through the hop, and does not where the caller was sent to the
+/// upstream instead.
 const BACKEND_HEADER: &str = "x-backend";
 
 /// An upstream NOTHING in this emulator serves, for the row that varies that.
@@ -1673,11 +1674,11 @@ struct Sent {
 }
 
 #[tokio::test]
-async fn an_http_proxy_upstream_this_emulator_serves_is_still_the_callers_to_reach() {
+async fn an_http_proxy_route_forwards_to_an_upstream_this_emulator_serves() {
     // The rows differ along what the rule generalises over: whether the upstream is an
     // endpoint this emulator serves at all, and the verb, the path and the body the client
-    // sent — each of which is answered the same way, because the gateway relays none of them
-    // to the endpoint the api's configuration names.
+    // sent — the client's whole request is what the hop carries to an endpoint served here,
+    // and what the caller is sent to reach itself where it is not.
     let cases: [Sent; 4] = [
         Sent {
             case: "an upstream this emulator serves, reached by a GET",
@@ -1722,73 +1723,108 @@ async fn an_http_proxy_upstream_this_emulator_serves_is_still_the_callers_to_rea
             UNSERVED_UPSTREAM.to_string()
         };
         let host = given_proxy_api(&emulator, case, row.route_key, &upstream).await;
-        let answer = send_with_body(
-            &emulator,
-            &host,
+        // Asked again while the origin's function is still starting, or until [`DECISION_WAIT`]
+        // passes: the FIRST invocation of a function starts its runtime, which the gateway
+        // answers its own `500` (or its `503`) for while it is starting. The wait is for an
+        // answer — a condition — and nothing here asserts on the clock. The row whose upstream
+        // nothing serves is answered at once, so the loop's first answer is its last.
+        let deadline = std::time::Instant::now() + DECISION_WAIT;
+        let answer = loop {
+            let answer = send_with_body(
+                &emulator,
+                &host,
+                row.method,
+                row.path,
+                &[("content-type", "application/json")],
+                row.body.to_vec(),
+            )
+            .await;
+            if !matches!(answer.status, INTEGRATION_FAULT | TIMED_OUT) {
+                break answer;
+            }
+            assert!(
+                row.served_here && std::time::Instant::now() < deadline,
+                "case {case:?}: expected the route's integration to be performed, got {}",
+                answer.summary()
+            );
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        };
+        if !row.served_here {
+            assert_eq!(
+                answer.status, TEMPORARY_REDIRECT,
+                "case {case:?}: expected the caller to be sent to the upstream, got {}",
+                answer.summary()
+            );
+            assert_eq!(
+                answer.location.as_deref(),
+                Some(upstream.as_str()),
+                "case {case:?}: expected {upstream:?} in Location, got {}",
+                answer.summary()
+            );
+            // Nothing of the upstream's own answer is in it: the gateway made no request to
+            // that endpoint, so there is no response of its to report.
+            let answered = answer.header(BACKEND_HEADER);
+            assert_eq!(
+                answered, None,
+                "case {case:?}: no header of the upstream's own answer may reach the client, \
+                 got {answered:?}"
+            );
+            assert!(
+                answer.text.is_empty(),
+                "case {case:?}: the redirect carries no body of its own, got {:?}",
+                answer.text
+            );
+            continue;
+        }
+        // The hop was made: what the client reads is the ORIGIN's own answer, and the request
+        // the origin echoes is the one the client made.
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected the upstream's own answer, got {}",
+            answer.summary()
+        );
+        assert_eq!(
+            answer.header(BACKEND_HEADER).as_deref(),
+            Some("seen"),
+            "case {case:?}: expected the upstream's own response header, got {}",
+            answer.summary()
+        );
+        assert_eq!(
+            answer.location, None,
+            "case {case:?}: an upstream that was forwarded to sends the caller nowhere, got {}",
+            answer.summary()
+        );
+        let echoed: Value = serde_json::from_str(&answer.text).unwrap_or(Value::Null);
+        let read = |member: &str| {
+            echoed
+                .pointer(&format!("/{member}"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            read("method"),
             row.method,
-            row.path,
-            &[("content-type", "application/json")],
-            row.body.to_vec(),
-        )
-        .await;
+            "case {case:?}: expected the upstream to be called with {:?}, got {}",
+            row.method,
+            answer.text
+        );
+        let query = row
+            .path
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default();
         assert_eq!(
-            answer.status, TEMPORARY_REDIRECT,
-            "case {case:?}: expected the caller to be sent to the upstream, got {}",
-            answer.summary()
+            read("rawQueryString"),
+            query,
+            "case {case:?}: expected the upstream to read the query {query:?}, got {}",
+            answer.text
         );
         assert_eq!(
-            answer.location.as_deref(),
-            Some(upstream.as_str()),
-            "case {case:?}: expected {upstream:?} in Location, got {}",
-            answer.summary()
-        );
-        // Nothing of the upstream's own answer is in it: the gateway made no request to that
-        // endpoint, so there is no response of its to report.
-        let answered = answer.header(BACKEND_HEADER);
-        assert_eq!(
-            answered, None,
-            "case {case:?}: no header of the upstream's own answer may reach the client, got \
-             {answered:?}"
-        );
-        assert!(
-            answer.text.is_empty(),
-            "case {case:?}: the redirect carries no body of its own, got {:?}",
+            read("rawPath"),
+            "/echo",
+            "case {case:?}: expected the upstream's own path, got {}",
             answer.text
         );
     }
-
-    // And the origin really is served HERE: dialled by the caller itself — which is what the
-    // redirect asks of it — the same address answers that api's own route.
-    //
-    // Asked again until that answer arrives, or [`DECISION_WAIT`] passes: the FIRST invocation
-    // of a function starts its runtime, which on a loaded host the gateway answers its own
-    // `500` for while it is starting ([`INTEGRATION_FAULT`]). The wait is for the origin's own
-    // answer — a condition — and nothing here asserts on the clock.
-    let case = "the origin dialled by the caller";
-    let (emulator, engine) = emulator_with_lambda();
-    let origin = given_origin_api(&emulator, &engine, case, "relay-origin").await;
-    let authority = origin
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split_once("/echo"))
-        .map(|(authority, _)| authority.to_string())
-        .unwrap_or_else(|| panic!("case {case:?}: the origin names an endpoint, got {origin:?}"));
-    let deadline = std::time::Instant::now() + DECISION_WAIT;
-    let answer = loop {
-        let answer = send(&emulator, &authority, "GET", "/echo", &[]).await;
-        if answer.status == 200 {
-            break answer;
-        }
-        assert!(
-            answer.status == INTEGRATION_FAULT && std::time::Instant::now() < deadline,
-            "case {case:?}: expected the origin api's own route to answer, got {}",
-            answer.summary()
-        );
-        tokio::time::sleep(LOOK_INTERVAL).await;
-    };
-    assert_eq!(
-        answer.header(BACKEND_HEADER).as_deref(),
-        Some("seen"),
-        "case {case:?}: expected the origin's own response header, got {}",
-        answer.summary()
-    );
 }

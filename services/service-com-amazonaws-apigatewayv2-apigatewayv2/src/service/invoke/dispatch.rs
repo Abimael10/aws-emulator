@@ -22,14 +22,20 @@
 //!   the request and under the role its `CredentialsArn` names
 //!   ([`super::service_action`]);
 //! * `HTTP_PROXY` is "for integrating the route or method request with an HTTP endpoint,
-//!   with the client request passed through as-is". The endpoint is a URI the CALLER can
-//!   reach, and this emulator relays no request to a destination an api's own configuration
-//!   names — a forward target a `CreateIntegration` chooses is exactly what must not become
-//!   a request this process makes, and the caller's own credential must not travel to one —
-//!   so the caller is sent there instead ([`super::http_proxy`]): `307 Temporary Redirect` to
-//!   the upstream, the redirect that preserves the request's method and body (RFC 7231
-//!   §6.4.7), so the client makes exactly the request the gateway would have relayed and
-//!   nothing about the upstream's answer is invented;
+//!   with the client request passed through as-is", so it is a HOP ([`super::http_proxy`]):
+//!   the gateway builds a request of its own at that endpoint, carrying the client's method,
+//!   body, query string and headers, with the hop-identifying fields the gateway itself states
+//!   — its own `Via`, and none of the client's `X-Forwarded-For` claim — and the endpoint's
+//!   answer is what the client reads. The hop is performed where THIS plane serves that
+//!   endpoint itself ([`super::serves_this_plane`]), by handing the request back to this
+//!   plane's own serving, which opens no connection and dials no address a stored
+//!   configuration named. Every other endpoint is a URI the CALLER can reach, and this
+//!   emulator makes no request of its own to one — a forward target a `CreateIntegration`
+//!   chooses is exactly what must not become a request this process makes, and the caller's
+//!   own credential must not travel to one — so the caller is sent there instead:
+//!   `307 Temporary Redirect` to the upstream, the redirect that preserves the request's
+//!   method and body (RFC 7231 §6.4.7), so the client makes exactly the request the gateway
+//!   would have forwarded and nothing about that endpoint's answer is invented;
 //! * `AWS`, `HTTP` and `MOCK` are not an HTTP api's: `MOCK` "is not permitted for APIs with
 //!   a protocol type of HTTP", and the two non-proxy types take request and response
 //!   templates a WebSocket api's integration carries.
@@ -59,7 +65,8 @@
 //!   mapping is the api's own configuration and the request is what failed to satisfy it, so
 //!   the refusal is the caller's rather than the "produced no response" class, and no action
 //!   is performed for it;
-//! * the `307` above for an `HTTP_PROXY` upstream, which is the caller's to reach.
+//! * the `307` above for an `HTTP_PROXY` upstream this emulator serves nothing at, which is
+//!   the caller's to reach.
 //!
 //! The stage's own variables are interpolated into the integration's `IntegrationUri`
 //! before the backend is addressed, for EVERY type: "you can use API Gateway stage variables
@@ -137,9 +144,9 @@ pub struct Dispatch {
 ///
 /// The latency is `None` for a request whose backend ANSWERED NOTHING — one refused before any
 /// backend was reached (the authorizer's decision, the stage's throttle, a mapping the request
-/// cannot satisfy), one whose route names a backend this gateway relays nothing to (an
-/// `HTTP_PROXY` upstream the caller is sent to itself), and one whose backend was invoked and
-/// never answered. That is the reading `IntegrationLatency` is published by
+/// cannot satisfy), one whose route names an `HTTP_PROXY` upstream this emulator serves
+/// nothing at, so the caller is sent there and no backend of this process was reached at all,
+/// and one whose backend was invoked and never answered. That is the reading `IntegrationLatency` is published by
 /// ([`crate::service::metrics::INTEGRATION_LATENCY_METRIC`]): it measures the time between the
 /// gateway relaying the request and the backend's answer reaching it, so only a relayed
 /// invocation the backend answered has one.
@@ -162,16 +169,21 @@ impl Performed {
 }
 
 /// Perform the authorizer's decision and then the route's integration.
+///
+/// `hop` is how many `HTTP_PROXY` integrations of this plane's OWN endpoints this request has
+/// already been forwarded through ([`super::FIRST_HOP`] for a request a client made), which is
+/// what bounds a configuration that forwards in a circle ([`MAX_FORWARDED_HOPS`]).
 pub async fn perform<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     dispatch: Dispatch,
+    hop: u8,
 ) -> Performed {
     // The backend's own latency is reported by the ONE step that relayed the request to it and
     // read its answer, which is why it is written through here rather than returned up each of
     // the refusals below: every one of those is an answer no backend gave.
     let mut integration_latency: Option<Duration> = None;
-    let response = answered(engine, ctx, dispatch, &mut integration_latency).await;
+    let response = answered(engine, ctx, dispatch, hop, &mut integration_latency).await;
     Performed {
         response,
         integration_latency,
@@ -184,6 +196,7 @@ async fn answered<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     mut dispatch: Dispatch,
+    hop: u8,
     integration_latency: &mut Option<Duration>,
 ) -> RtResponse {
     if let Some((authorizer, identity)) = dispatch.authorizer.clone() {
@@ -253,17 +266,16 @@ async fn answered<Eng: Send + Sync + 'static>(
         return lambda_proxy(ctx, &dispatch, &integration, &upstream, integration_latency).await;
     }
     if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
-        // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator relays no
-        // request to a destination an api's own configuration names, so the caller is sent
-        // there instead. See the module docs and [`super::http_proxy`].
-        ::tracing::info!(
-            api_id = %dispatch.request.api_id,
-            stage = %dispatch.request.stage_name,
-            route_key = %dispatch.route_key,
-            "sending the caller to this route's HTTP_PROXY upstream rather than relaying the \
-             request to it"
-        );
-        return http_proxy::sent_to_the_upstream(&upstream);
+        return http_proxy_hop(
+            engine,
+            ctx,
+            &dispatch,
+            &integration,
+            &upstream,
+            hop,
+            integration_latency,
+        )
+        .await;
     }
     ::tracing::warn!(
         api_id = %dispatch.request.api_id,
@@ -282,7 +294,9 @@ async fn answered<Eng: Send + Sync + 'static>(
 /// reported.
 ///
 /// Everything that does not need the transport is unchanged — the throttle, and the `307`
-/// an `HTTP_PROXY` upstream is answered with, which is the caller's to reach either way.
+/// that sends the caller to an `HTTP_PROXY` upstream, which from here is the answer for EVERY
+/// upstream: forwarding the request into this plane's own serving performs the route's
+/// integration, which is what this seam has no transport for.
 pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispatch) -> Performed {
     let submission = throttle::metered(engine, dispatch);
     if let Some(refusal) = submission
@@ -336,6 +350,97 @@ fn resolved_uri(dispatch: &Dispatch, integration: &Integration) -> Option<String
 /// stored value is always a duration.
 fn deadline(integration: &Integration) -> Duration {
     Duration::from_millis(u64::try_from(integration.timeout_in_millis.max(0)).unwrap_or_default())
+}
+
+/// How many `HTTP_PROXY` integrations of THIS plane's own endpoints one invoke may be
+/// forwarded through.
+///
+/// An integration whose upstream names the very stage it is reached at — or two that name
+/// each other — would otherwise re-enter this plane's serving for ever, so the chain is cut
+/// once it reaches this many hops, as the "produced no response" class every other
+/// integration this gateway cannot perform falls into. API Gateway publishes no hop count, so
+/// this is the emulator's own bound and is deliberately small: a front api in front of a
+/// backend one is one hop. The bound is checked where the hop would be MADE, because that is
+/// where the circle would be closed.
+pub(super) const MAX_FORWARDED_HOPS: u8 = 4;
+
+/// Serve the route with its `HTTP_PROXY` integration — "for integrating the route or method
+/// request with an HTTP endpoint, with the client request passed through as-is".
+///
+/// Where this plane itself serves the upstream the integration resolved
+/// ([`super::serves_this_plane`]), the hop is PERFORMED: the message the gateway forwards
+/// carries the client's request with the gateway's own hop fields on it
+/// ([`http_proxy::forwarded_request`]) and is handed back to this plane's own serving
+/// ([`super::served_hop`]) — no connection is opened, no name is resolved and no address a
+/// stored configuration named is dialled — so what the client reads is the answer that
+/// upstream's own records produced, and the integration's `ResponseParameters` transform it
+/// like any other backend's answer.
+///
+/// Every OTHER upstream is a URI the CALLER can reach and this emulator makes no request of
+/// its own to one, so the caller is sent there instead ([`http_proxy::sent_to_the_upstream`]).
+/// The same answer covers a stored upstream that names no address a request can be made at,
+/// where there is no hop to perform at all.
+async fn http_proxy_hop<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    dispatch: &Dispatch,
+    integration: &Integration,
+    upstream: &str,
+    hop: u8,
+    integration_latency: &mut Option<Duration>,
+) -> RtResponse {
+    let Some(forwarded) = http_proxy::forwarded_request(&dispatch.request, integration, upstream)
+        .filter(|forwarded| super::serves_this_plane(engine, forwarded))
+    else {
+        ::tracing::info!(
+            api_id = %dispatch.request.api_id,
+            stage = %dispatch.request.stage_name,
+            route_key = %dispatch.route_key,
+            "sending the caller to this route's HTTP_PROXY upstream: this emulator serves \
+             nothing at that address, so it makes no request of its own to it"
+        );
+        return http_proxy::sent_to_the_upstream(upstream);
+    };
+    if hop >= MAX_FORWARDED_HOPS {
+        ::tracing::warn!(
+            api_id = %dispatch.request.api_id,
+            stage = %dispatch.request.stage_name,
+            route_key = %dispatch.route_key,
+            hops = MAX_FORWARDED_HOPS,
+            "this request has been forwarded through as many HTTP_PROXY integrations of this \
+             emulator's own endpoints as one invoke may be, so it is not forwarded further"
+        );
+        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+    }
+    // MEASURED from the hop being made: the upstream ANSWERED, whatever its answer was worth,
+    // while an upstream that had not answered when the integration's own deadline elapsed has
+    // no latency to report — the same reading every other backend of this plane is measured
+    // by.
+    let relayed = ::std::time::Instant::now();
+    let answered = ::tokio::time::timeout(
+        deadline(integration),
+        super::served_hop(engine, &forwarded, ctx, hop.saturating_add(1)),
+    )
+    .await;
+    let Ok(answered) = answered else {
+        ::tracing::info!(
+            api_id = %dispatch.request.api_id,
+            stage = %dispatch.request.stage_name,
+            route_key = %dispatch.route_key,
+            "refusing an invoke: this route's HTTP_PROXY upstream did not answer within the \
+             integration's timeout"
+        );
+        return json_response(UNAVAILABLE_STATUS, UNAVAILABLE_MESSAGE, None);
+    };
+    *integration_latency = Some(relayed.elapsed());
+    response_parameters::transformed(
+        answered,
+        &integration.response_parameters,
+        &response_parameters::Call {
+            request: &dispatch.request,
+            invocation: &dispatch.invocation,
+        },
+    )
 }
 
 /// Serve the route with its Lambda proxy integration: the event in, the function run, its
