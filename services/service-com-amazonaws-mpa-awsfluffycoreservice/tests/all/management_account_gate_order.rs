@@ -28,6 +28,14 @@
 //! MofNApprovalStrategy,PolicyReference,ApprovalTeamRequestApprovers,PoliciesReferences,
 //! IdentitySourceParameters,IamIdentityCenter")`).
 //!
+//! The last two tables pin the ENVELOPE that refusal is carried in, which a client
+//! branches on: the answer names the `AccessDeniedException` shape in the
+//! `x-amzn-errortype` response header `restJson1` resolves an error shape from — not only
+//! in the body — on that shape's own `@httpError` status, for every gated operation,
+//! every refused caller and every body form; and that header follows the shape of
+//! whatever answer the caller earns, so the permitted caller's served create carries none
+//! and its refused body carries the boundary's `ValidationException` instead.
+//!
 //! The one overlap with `authorization_gate.rs` is deliberate: that suite's table spans
 //! WHO the store records as the management account for a CONFORMING create, and the
 //! conforming row below anchors the "same answer as a conforming body" half of this
@@ -530,4 +538,167 @@ async fn the_permitted_caller_still_has_its_body_validated() {
         CONFORMING_NAME,
         "the created team reads back with the wrong Name: {team:?}"
     );
+}
+
+/// The response header `restJson1` resolves a failure's error SHAPE from. A client that
+/// branches on the refusal reads this header, not the body, so it is asserted on its own.
+const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The error shape a `restJson1` client resolves an answer to from [`ERROR_TYPE_HEADER`].
+///
+/// The header names the shape, and the name is read off it: the value may carry the
+/// shape's name alone, or qualify it with a `#`-prefixed namespace, a URI path, or a
+/// `:`-separated suffix — none of which is part of the name — so a client takes the name
+/// and ignores the qualification. The protocol is this service's own
+/// (`smithy_query(query="service_info")` reports `restJson1`).
+fn error_shape_from_header(value: &str) -> &str {
+    let name = value.split(':').next().unwrap_or(value);
+    let name = name.split('/').next_back().unwrap_or(name);
+    name.split('#').next_back().unwrap_or(name)
+}
+
+/// [`ERROR_TYPE_HEADER`] as the answer carried it, or `None` when the answer carries no
+/// such header.
+fn error_type_header(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(ERROR_TYPE_HEADER)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+}
+
+/// The bodies the wire-envelope rows below are driven with: one every modelled constraint
+/// accepts, and — from the operation's own table of bodies the model refuses — its first
+/// and its last, so the same answer is demanded of a body the boundary would accept, one
+/// it refuses while reading the request, and one it refuses while walking what it read.
+fn envelope_bodies(gated: &GatedOperation) -> Vec<(&'static str, Value)> {
+    let refused = (gated.refused_by_the_model)();
+    let mut bodies = vec![(
+        "a body every modelled constraint accepts",
+        (gated.conforming)(),
+    )];
+    if let Some(first) = refused.first() {
+        bodies.push(first.clone());
+    }
+    if let Some(last) = refused.last() {
+        bodies.push(last.clone());
+    }
+    bodies
+}
+
+/// The refusal is a MODELLED error on the wire: for every gated operation and every
+/// caller the organization record refuses, the answer names the `AccessDeniedException`
+/// shape in the error-type HEADER a `restJson1` client resolves the shape from — not only
+/// in the body — on the status that shape's `@httpError` declares, in this service's JSON
+/// envelope, whatever the request body carries.
+#[tokio::test]
+async fn the_refusal_names_the_access_denied_shape_in_the_error_type_header() {
+    // (case, who Organizations records as the management account)
+    let callers: [(&str, Option<&str>); 3] = [
+        ("no organization recorded", None),
+        (
+            "another account is the management account",
+            Some("999999999999"),
+        ),
+        (
+            "an account one digit from the caller's is the management account",
+            Some("000000000001"),
+        ),
+    ];
+
+    for gated in gated_operations() {
+        let operation = gated.operation;
+        for (caller, management) in callers {
+            for (case, body) in envelope_bodies(&gated) {
+                let harness = Harness::without_organization();
+                if let Some(account) = management {
+                    harness.record_management_account(account);
+                }
+
+                let (status, headers, answer) = harness
+                    .call_with_headers("POST", gated.uri, Some(body))
+                    .await;
+                assert_eq!(
+                    status, 403,
+                    "{operation} / caller {caller:?} / body {case:?}: expected HTTP 403, \
+                     got {status} with {answer:?}"
+                );
+                let header = error_type_header(&headers).unwrap_or_else(|| {
+                    panic!(
+                        "{operation} / caller {caller:?} / body {case:?}: the refusal \
+                         carries no {ERROR_TYPE_HEADER} header, only {answer:?}"
+                    )
+                });
+                let shape = error_shape_from_header(&header);
+                assert_eq!(
+                    shape, "AccessDeniedException",
+                    "{operation} / caller {caller:?} / body {case:?}: \
+                     {ERROR_TYPE_HEADER} names {shape:?} (header {header:?})"
+                );
+                let content_type = headers
+                    .get("content-type")
+                    .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+                    .unwrap_or_default();
+                assert!(
+                    content_type.starts_with("application/json"),
+                    "{operation} / caller {caller:?} / body {case:?}: the refusal is \
+                     served as {content_type:?}"
+                );
+                assert_eq!(
+                    error_code(&answer),
+                    "AccessDeniedException",
+                    "{operation} / caller {caller:?} / body {case:?}: the body names \
+                     another shape: {answer:?}"
+                );
+                assert_eq!(
+                    text(&answer, "Message"),
+                    MANAGEMENT_ACCOUNT_ONLY,
+                    "{operation} / caller {caller:?} / body {case:?}: wrong refusal \
+                     message in {answer:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The header carries the shape of WHATEVER answer the caller earns, so it is evidence of
+/// the refusal and not a constant: the permitted caller's conforming body is served with
+/// no error-type header at all, and the same bodies the gate refuses above earn the
+/// boundary's own modelled `ValidationException` — a different shape, on its own status —
+/// once the caller is the management account.
+#[tokio::test]
+async fn the_error_type_header_names_the_shape_of_the_answer_the_caller_earns() {
+    for gated in gated_operations() {
+        let operation = gated.operation;
+        for (case, body) in envelope_bodies(&gated) {
+            let harness = Harness::new();
+            let (status, headers, answer) = harness
+                .call_with_headers("POST", gated.uri, Some(body))
+                .await;
+            let header = error_type_header(&headers);
+            if status == 200 {
+                assert_eq!(
+                    header, None,
+                    "{operation} / body {case:?}: a served create carries \
+                     {ERROR_TYPE_HEADER} {header:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, 400,
+                "{operation} / body {case:?}: expected HTTP 400 from the boundary, got \
+                 {status} with {answer:?}"
+            );
+            let header = header.unwrap_or_else(|| {
+                panic!(
+                    "{operation} / body {case:?}: the boundary's refusal carries no \
+                     {ERROR_TYPE_HEADER} header, only {answer:?}"
+                )
+            });
+            let shape = error_shape_from_header(&header);
+            assert_eq!(
+                shape, "ValidationException",
+                "{operation} / body {case:?}: {ERROR_TYPE_HEADER} names {shape:?} \
+                 (header {header:?})"
+            );
+        }
+    }
 }

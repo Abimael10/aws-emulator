@@ -242,6 +242,22 @@ impl Harness {
 
     /// Dispatch one request and return `(status, parsed JSON body)`.
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+        let (status, _headers, parsed) = self.call_with_headers(method, uri, body).await;
+        (status, parsed)
+    }
+
+    /// Dispatch one request and return `(status, response headers, parsed JSON body)`.
+    ///
+    /// The headers are part of the wire answer and not every rule is visible in the body:
+    /// `restJson1` resolves WHICH error shape a failure carries from `x-amzn-errortype`,
+    /// so a suite that asserts on the error shape a refusal names reads it from here
+    /// rather than from the body alone.
+    pub(crate) async fn call_with_headers(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, http::HeaderMap, Value) {
         let bytes = match &body {
             None => Bytes::new(),
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize the body")),
@@ -262,13 +278,14 @@ impl Harness {
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let body = response.into_body();
         let parsed = if body.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&body).unwrap_or(Value::Null)
         };
-        (status, parsed)
+        (status, headers, parsed)
     }
 
     pub(crate) async fn create(&self, body: &Value) -> (u16, Value) {
