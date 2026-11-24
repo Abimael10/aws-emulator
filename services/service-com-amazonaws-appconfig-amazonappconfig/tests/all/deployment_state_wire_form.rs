@@ -220,7 +220,10 @@ const CASES: &[Case] = &[
 ];
 
 /// The `State` the listing reports for `number`, read through `ListDeployments`.
-async fn listed_state(
+///
+/// `pub(crate)` because more than one suite reads a deployment's state out of the listing
+/// its environment serves rather than keeping a second copy of the lookup.
+pub(crate) async fn listed_state(
     router: &MultiServiceRouter,
     case: &str,
     application: &str,
