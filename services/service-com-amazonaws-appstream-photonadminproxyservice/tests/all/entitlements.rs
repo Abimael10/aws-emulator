@@ -27,17 +27,23 @@ use crate::refusal_messages::{not_found_sentence, refusal};
 use crate::stack_fleet_lifecycle::Emulator;
 
 /// The stack the single-stack cases create their entitlements in.
-const STACK: &str = "entitled-stack";
+pub(crate) const STACK: &str = "entitled-stack";
 
 /// The resource word AWS's refusal sentences use for a stack, as the crate states it
 /// (`crate::state::STACK_KIND`).
-const STACK_KIND: &str = "stack";
+///
+/// Shared with the other suites in this target
+/// (`tests/all/entitlement_update_and_delete.rs`), so every suite states the word once.
+pub(crate) const STACK_KIND: &str = "stack";
 
 /// AWS's `EntitlementAlreadyExistsException` and `EntitlementNotFoundException`
 /// sentences: an entitlement refusal states what is true of the requested entitlement and
 /// echoes nothing of the request — no name, no stack, no account.
+///
+/// The not-found sentence is shared with the other suites in this target
+/// (`tests/all/entitlement_update_and_delete.rs`), so every suite states it once.
 const ALREADY_EXISTS_SENTENCE: &str = "The requested entitlement already exists.";
-const NOT_FOUND_SENTENCE: &str = "The requested entitlement was not found.";
+pub(crate) const NOT_FOUND_SENTENCE: &str = "The requested entitlement does not exist.";
 
 /// The `PrincipalTag` attribute names an entitlement can match on, as
 /// `smithy_query(query="doc", shape="EntitlementAttribute", member="Name")` lists the
@@ -55,7 +61,11 @@ const ATTRIBUTE_NAMES: [&str; 7] = [
 
 /// One attribute per name in the catalog above, so a row can carry as many of them as it
 /// wants to span the list's length.
-fn attributes(count: usize) -> Value {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/entitlement_update_and_delete.rs`), so every suite builds the modelled
+/// attribute list the same way.
+pub(crate) fn attributes(count: usize) -> Value {
     Value::Array(
         ATTRIBUTE_NAMES
             .iter()
@@ -72,7 +82,7 @@ fn attributes(count: usize) -> Value {
 /// presence and the length of the optional description (`@length` 0..256) and the shape of
 /// the name (`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$`) — every member and constraint from
 /// `smithy_query(query="operation", operation="CreateEntitlement")`.
-fn entitlement_rows() -> Vec<(&'static str, Value)> {
+pub(crate) fn entitlement_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "required members only",
@@ -115,7 +125,7 @@ fn entitlement_rows() -> Vec<(&'static str, Value)> {
 }
 
 /// An emulator holding one stack, ready for its entitlements.
-async fn emulator_with_stack(case: &str, stacks: &[&str]) -> Emulator {
+pub(crate) async fn emulator_with_stack(case: &str, stacks: &[&str]) -> Emulator {
     let emulator = Emulator::new();
     for stack in stacks {
         emulator
@@ -125,8 +135,8 @@ async fn emulator_with_stack(case: &str, stacks: &[&str]) -> Emulator {
     emulator
 }
 
-/// The `Entitlement` of a create or describe body.
-fn entitlement(case: &str, payload: &Value) -> Value {
+/// The `Entitlement` of a create, update or describe body.
+pub(crate) fn entitlement(case: &str, payload: &Value) -> Value {
     payload
         .get("Entitlement")
         .cloned()
@@ -134,7 +144,7 @@ fn entitlement(case: &str, payload: &Value) -> Value {
 }
 
 /// The `Entitlements` list of a describe body.
-fn entitlements(case: &str, payload: &Value) -> Vec<Value> {
+pub(crate) fn entitlements(case: &str, payload: &Value) -> Vec<Value> {
     payload
         .get("Entitlements")
         .and_then(Value::as_array)

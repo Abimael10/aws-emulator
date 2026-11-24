@@ -39,7 +39,10 @@ const REGION: &str = "us-east-1";
 
 /// The status this service answers a refused request with — the one status every error
 /// shape of this model declares but one, and the one AppStream serves them all over.
-const REFUSAL_STATUS: u16 = 400;
+///
+/// Shared with the other suites in this target
+/// (`tests/all/entitlement_update_and_delete.rs`), so every suite states it once.
+pub(crate) const REFUSAL_STATUS: u16 = 400;
 
 /// The status a scaffolded operation answers with, which is NOT a refusal of the request:
 /// nobody has written that operation yet.

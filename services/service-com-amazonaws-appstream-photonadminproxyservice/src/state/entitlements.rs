@@ -34,9 +34,10 @@ pub fn entitlement_already_exists_message() -> String {
 ///
 /// The same template with the condition this refusal states: an entitlement refusal says
 /// what is true of the requested entitlement and names none of the request's values, so
-/// this sentence has no variable part either.
+/// this sentence has no variable part either. A recorded AppStream refusal of a read of an
+/// entitlement the stack holds none of establishes the wording.
 pub fn entitlement_not_found_message() -> String {
-    format!("The requested {ENTITLEMENT_KIND} was not found.")
+    format!("The requested {ENTITLEMENT_KIND} does not exist.")
 }
 
 /// How many entitlements one `DescribeEntitlements` page carries.
