@@ -283,6 +283,11 @@ impl Provisioner {
                 describe_msk_configuration(ctx, region, physical_resource_id).await
             }
             Self::MqBroker => describe_mq_broker(ctx, region, physical_resource_id).await,
+            // And `DescribeConfiguration` reads a configuration back, by the id that service
+            // minted for it.
+            Self::MqConfiguration => {
+                describe_mq_configuration(ctx, region, physical_resource_id).await
+            }
             Self::RdsDbInstance => {
                 describe_db_instance(ctx, region, physical_resource_id).await
             }

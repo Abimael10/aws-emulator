@@ -510,6 +510,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // set, since letters, digits and the hyphen are all admitted, but may be longer
         // than the bound.
         MQ_BROKER => rules(50, Characters::AsGenerated),
+        // Amazon MQ `CreateConfiguration.Name`: that member's own rule is "can contain only
+        // alphanumeric characters, dashes, periods, underscores, and tildes (- . _ ~)" and
+        // "must be 1-150 characters long" (`CreateConfigurationRequest$Name`, Amazon MQ's own
+        // Smithy model) — a generated name is already inside that character set, since
+        // letters, digits and the hyphen are all admitted, but may be longer than the bound.
+        MQ_CONFIGURATION => rules(
+            crate::state::provisioner::MQ_CONFIGURATION_NAME_LENGTH,
+            Characters::AsGenerated,
+        ),
         // Amazon OpenSearch Service `CreateDomain.DomainName`: `DomainName`,
         // `@length(min: 3, max: 28)` with pattern `^[a-z][a-z0-9\-]+$` (that service's own
         // Smithy model), which admits no upper case and no character a generated name

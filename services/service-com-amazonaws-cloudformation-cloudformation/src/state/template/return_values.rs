@@ -598,6 +598,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             MSK_CONFIGURATION_REVISION_NUMBER,
         ],
         MQ_BROKER => &["Arn"],
+        // An Amazon MQ configuration publishes the ARN and the id that service minted for it
+        // beside the number of its LATEST revision.
+        MQ_CONFIGURATION => &["Arn", "Id", MQ_CONFIGURATION_REVISION_ATTRIBUTE],
         EVENTS_RULE => &["Arn"],
         EVENTS_EVENT_BUS => EVENTS_EVENT_BUS_ATTRIBUTES,
         SSM_PARAMETER => &["Type", "Value"],
@@ -1049,6 +1052,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // answers with the `brokerId` Amazon MQ generated for it, which is the id that
         // type's `Ref` returns and the one every `mq` operation addresses a broker by.
         || resource_type == MQ_BROKER
+        // An Amazon MQ CONFIGURATION is the same case: `CreateConfiguration` takes the
+        // configuration's NAME and answers with the `Id` Amazon MQ generated for it, which
+        // is the id that type's `Ref` returns and the `@httpLabel` every call on a
+        // configuration takes.
+        || resource_type == MQ_CONFIGURATION
         // An AWS Backup plan and one of its resource selections are two more:
         // `CreateBackupPlan` takes no identifier and answers the `BackupPlanId` it minted
         // (which is what that type's `Ref` returns), and `CreateBackupSelection` answers

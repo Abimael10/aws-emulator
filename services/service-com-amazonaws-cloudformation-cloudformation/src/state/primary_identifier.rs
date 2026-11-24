@@ -335,6 +335,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         ROUTE53_HEALTH_CHECK => "HealthCheckId",
         KMS_KEY => "KeyId",
         MQ_BROKER => "Id",
+        // A configuration of the same service, identified by the `Id` Amazon MQ minted — the
+        // `ConfigurationId` label `DescribeConfiguration`, `UpdateConfiguration` and
+        // `DeleteConfiguration` each take, which this type publishes as a return value of its
+        // own; the configuration's `Name` is only what it is called.
+        MQ_CONFIGURATION => "Id",
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => "Arn",
         // A configuration of the same service, identified by the ARN its create answered —
         // the `Arn` label `DescribeConfiguration`, `UpdateConfiguration` and

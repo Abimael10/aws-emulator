@@ -77,18 +77,18 @@ impl Provisioner {
                 create_public_repository(ctx, region, resource, propagated).await
             }
             Self::EcrRepository => create_repository(ctx, region, resource, propagated).await,
-            // An exclusion publishes no `Tags` property and `RegisterPullTimeUpdateExclusion`
-            // takes none: the record is not a taggable resource of Amazon ECR's — that
-            // registry holds tags on its repositories — so no tags are propagated to one and
-            // the declaration IS the request.
-            Self::EcrPullTimeUpdateExclusion => {
-                register_pull_time_update_exclusion(ctx, region, resource).await
-            }
             // The registry's signing configuration publishes no `Tags` property and its put
             // takes no tag member at all — it is the registry's own configuration rather than a
             // named resource — so no tags are propagated to one.
             Self::EcrSigningConfiguration => {
                 create_signing_configuration(ctx, region, resource).await
+            }
+            // An exclusion on the registry's pull-time recording is one entry of that
+            // registry's own list rather than a named resource: the type publishes no `Tags`
+            // property and `RegisterPullTimeUpdateExclusion` takes no tag member, so no tags
+            // are propagated to one.
+            Self::EcrPullTimeUpdateExclusion => {
+                register_pull_time_update_exclusion(ctx, region, resource).await
             }
             Self::Ec2Vpc => create_ec2_vpc(ctx, region, resource, propagated).await,
             Self::Ec2Subnet => create_ec2_subnet(ctx, region, resource, propagated).await,
@@ -361,6 +361,11 @@ impl Provisioner {
             // a taggable Amazon MSK resource — so no tags are propagated to one.
             Self::MskConfiguration => create_msk_configuration(ctx, region, resource).await,
             Self::MqBroker => create_mq_broker(ctx, region, resource, propagated).await,
+            // A configuration is created by its own call and then given the document the
+            // declaration states, which is a revision of it.
+            Self::MqConfiguration => {
+                create_mq_configuration(ctx, region, resource, propagated).await
+            }
             Self::RdsDbInstance => {
                 create_db_instance(ctx, region, resource, propagated).await
             }

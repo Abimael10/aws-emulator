@@ -3175,6 +3175,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     LAMBDA_VERSION,
     "AWS::Logs::LogGroup",
     MQ_BROKER,
+    // An Amazon MQ CONFIGURATION, publishing the ARN and the id that service minted for it
+    // beside the number of the revision its declared document is stored as.
+    MQ_CONFIGURATION,
     MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER,
     // An Amazon MSK configuration, publishing the ARN that service minted and the number and

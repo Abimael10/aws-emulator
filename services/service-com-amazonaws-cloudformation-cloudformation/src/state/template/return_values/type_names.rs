@@ -1446,6 +1446,40 @@ pub const MQ_ARN_NAMESPACE: &str = "mq";
 /// shape of the identifier a declaration reports BEFORE its create answers.
 pub(super) const MQ_BROKER_ID_PREFIX: &str = "b-";
 
+/// The type of an Amazon MQ CONFIGURATION: the engine configuration document a broker of
+/// that service can be given, declared in the same `AmazonMQ` namespace the broker is.
+///
+/// "Ref returns the Amazon MQ configuration ID", and `Fn::GetAtt` reads `Arn` (the
+/// configuration's own ARN), `Id` (that same configuration id) and `Revision` (the number of
+/// its latest revision). Amazon MQ MINTS the id and the ARN — `CreateConfiguration` takes
+/// the configuration's name and answers with the `Id` it generated and the `Arn` it built
+/// around it, and it NUMBERS each revision — which is why [`identity_is_service_assigned`]
+/// names this type: the id a `Ref` resolves to is the one that service created the
+/// configuration under, not one these naming rules computed.
+pub const MQ_CONFIGURATION: &str = "AWS::AmazonMQ::Configuration";
+
+/// The `Fn::GetAtt` attribute an [`MQ_CONFIGURATION`] publishes the number of its latest
+/// revision at, as the type's return values section spells it.
+pub const MQ_CONFIGURATION_REVISION_ATTRIBUTE: &str = "Revision";
+
+/// What an Amazon MQ configuration id begins with (`c-` followed by the same 128 bits in the
+/// 8-4-4-4-12 grouping a broker id carries), for the same reason
+/// [`MQ_BROKER_ID_PREFIX`] carries the broker's: the id built on it is a PLACEHOLDER no
+/// configuration that exists is reported under, since
+/// [`super::provisioning::reconcile`] adopts the id Amazon MQ minted over it.
+pub(super) const MQ_CONFIGURATION_ID_PREFIX: &str = "c-";
+
+/// The revision number the configuration an `AWS::AmazonMQ::Configuration` declares carries
+/// once it is created: its SECOND.
+///
+/// `CreateConfiguration` takes no document at all — it "creates a configuration from the
+/// engine's default settings", which is revision 1 — so the `Data` the type declares reaches
+/// the configuration as the revision `UpdateConfiguration` adds, which is revision 2
+/// ([`crate::state::provisioner::mq_configurations`] makes both calls). A PLACEHOLDER like
+/// every other value here: what the stack reports is the revision number Amazon MQ answered
+/// for the document it really stored.
+pub(super) const MQ_CONFIGURATION_DECLARED_REVISION: u32 = 2;
+
 /// The 1-based ordinal an Amazon MSK cluster or configuration ARN ends with
 /// (`cluster/<name>/<id>-<ordinal>`, `configuration/<name>/<id>-<ordinal>`), as the stand-in
 /// identifier computed here carries it.

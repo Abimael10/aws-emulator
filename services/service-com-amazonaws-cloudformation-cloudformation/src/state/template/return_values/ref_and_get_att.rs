@@ -3339,6 +3339,40 @@ pub(crate) fn return_values(
             );
             (id, attributes)
         }
+        // "Ref returns the Amazon MQ configuration ID"; Fn::GetAtt: Arn, Id, Revision.
+        // Amazon MQ MINTS the id — `CreateConfiguration` takes a configuration NAME and
+        // answers with the `Id` it generated and the `Arn` it built around it
+        // (`configuration:<id>`) — and it NUMBERS the revisions, so a declaration reports an
+        // identifier of that service's own shape (`c-` and the 128 bits its ids carry), the
+        // ARN built from it the way Amazon MQ builds one, and the revision the declared
+        // document is stored as ([`MQ_CONFIGURATION_DECLARED_REVISION`]). This is also the
+        // type `super::provisioning` creates in Amazon MQ itself, which reports the id, the
+        // ARN and the revision IT minted back as the resource's identity — and THOSE, not
+        // the ones computed here, are what the stack reports for a configuration Amazon MQ
+        // created, which is what [`identity_is_service_assigned`] names this type for.
+        MQ_CONFIGURATION => {
+            let id = format!(
+                "{MQ_CONFIGURATION_ID_PREFIX}{}",
+                generated_uuid(resource_type, name)
+            );
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    MQ_ARN_NAMESPACE,
+                    region,
+                    &format!("configuration:{id}"),
+                ),
+            );
+            attributes.insert(
+                MQ_CONFIGURATION_REVISION_ATTRIBUTE.to_string(),
+                MQ_CONFIGURATION_DECLARED_REVISION.to_string(),
+            );
+            // The type publishes that id as a `Fn::GetAtt` attribute of its own beside the
+            // `Ref`, so it is named here rather than left to the uniform convention: the
+            // catalogue's names ARE the schema the registry reports for the type.
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the backup vault name"; Fn::GetAtt: BackupVaultArn, BackupVaultName.
         // This is the type `super::provisioning` creates in AWS Backup itself, which then
         // answers with the vault's own ARN — the same ARN this computes, since both are
