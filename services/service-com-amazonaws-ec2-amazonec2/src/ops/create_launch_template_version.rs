@@ -13,7 +13,10 @@
 //! published catalog does not hold is kept too, and reported as one of the findings the
 //! response's `Warning` carries ([`crate::state::launch_template_warning`]): a version is a
 //! set of launch parameters rather than a launch, so the launch that tries to use such a type
-//! is what refuses it.
+//! is what refuses it. What it keeps are the parameters the request SPECIFIED
+//! ([`crate::state::specified_launch_template_data`]): an ec2Query field with no text cannot be
+//! told from one the request never sent, so such a parameter is not stored, not reported, and
+//! does not overwrite the value a `SourceVersion` contributes for it.
 //!
 //! ## Shape of an operation
 //!
@@ -177,8 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             held_launch_template_version, launch_template_limit_exceeded,
             launch_template_version_payload_bytes, require_service_state,
             resolve_launch_template_id, source_launch_template_version_not_found,
-            LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS, MAX_LAUNCH_TEMPLATE_VERSIONS,
-            MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
+            specified_launch_template_data, LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS,
+            MAX_LAUNCH_TEMPLATE_VERSIONS, MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
         };
 
         // Nothing here depends on the Region: a launch template carries no Region member,
@@ -208,6 +211,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
             )));
         }
+
+        // The launch parameters this request SPECIFIED, read through the one reading of them
+        // this store makes ([`specified_launch_template_data`]): an ec2Query field carrying no
+        // text is indistinguishable from one the request never sent, so a parameter with no
+        // text is not specified — it is neither stored nor reported, and it does not overwrite
+        // the value a `SourceVersion` contributes for it.
+        let specified = specified_launch_template_data(&input.launch_template_data);
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
@@ -252,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         let data = match input.source_version.as_deref() {
-            None => input.launch_template_data.clone(),
+            None => specified.clone(),
             Some(source_version) => {
                 let number = held_launch_template_version(record, source_version)?
                     .ok_or_else(source_launch_template_version_not_found)?;
@@ -261,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "launch template version '{number}' is not stored"
                     ))
                 })?;
-                inherited_launch_template_data(&source.data, &input.launch_template_data)
+                inherited_launch_template_data(&source.data, &specified)
             }
         };
 
@@ -410,6 +420,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`CreateLaunchTemplateVersionRequest$SourceVersion`) — so the unit of overwriting is the
 /// PARAMETER: a parameter the request carries replaces the source's whole value for it
 /// rather than being merged into it, and one it leaves out is inherited as stored.
+///
+/// `specified` is the parameters the request SPECIFIED
+/// ([`crate::state::specified_launch_template_data`]), not the fields it sent: a text field
+/// with no text is one no reader of an ec2Query pair list can tell from an absent one, so the
+/// source's value for it is inherited rather than overwritten with nothing.
 fn inherited_launch_template_data(
     source: &RequestLaunchTemplateData,
     specified: &RequestLaunchTemplateData,

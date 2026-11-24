@@ -2343,6 +2343,13 @@ pub use launch_template_security_groups::*;
 pub mod launch_template_warnings;
 pub use launch_template_warnings::*;
 
+/// The launch parameters a request SPECIFIED, out of the launch template data it carried: a
+/// parameter with no text is one the request did not send, so it is not stored, not reported
+/// and does not overwrite one inherited from a `SourceVersion`. Everything it declares is
+/// re-exported below.
+pub mod launch_template_parameters;
+pub use launch_template_parameters::*;
+
 /// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
 /// the launch places it in — one method on the state, in a module of its own, beside the
 /// root volume the same launch creates.

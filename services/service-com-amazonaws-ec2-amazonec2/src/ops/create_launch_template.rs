@@ -8,8 +8,11 @@
 //!
 //! The id, the create time, the creating principal and the default and latest version
 //! numbers are derived by the store, never taken from the request; the first version keeps
-//! the request's `LaunchTemplateData` verbatim, so nothing a caller set is dropped — an
-//! `ImageId` naming a Systems Manager parameter included, which is stored UNRESOLVED and
+//! the launch parameters the request SPECIFIED
+//! ([`crate::state::specified_launch_template_data`]), so nothing a caller set is dropped,
+//! while a parameter whose field carries no text — one no reader of an ec2Query pair list can
+//! tell from a field the request never sent — is not one it set. An
+//! `ImageId` naming a Systems Manager parameter is kept included, stored UNRESOLVED and
 //! resolved again by each launch. Such a value is resolved here too, against the one catalog
 //! the launch reads: a parameter this account resolves no AMI for is refused as the invalid
 //! ALIAS it is (`SsmInvalidParameter`), so no template can be stored naming an image no launch
@@ -179,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAX_TAGS_PER_RESOURCE, MAX_USER_DATA_BYTES, MIN_LAUNCH_TEMPLATE_NAME_CHARS,
             launch_template_limit_exceeded, launch_template_name_already_exists,
             launch_template_name_is_well_formed, launch_template_payload_bytes,
-            require_service_state, validate_tag_size,
+            require_service_state, specified_launch_template_data, validate_tag_size,
         };
 
         // Nothing here depends on the Region: a launch template carries no Region member,
@@ -240,19 +243,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags.len()
             )));
         }
+        // The launch parameters this request SPECIFIED, read through the one reading of them
+        // this store makes ([`specified_launch_template_data`]): an ec2Query field carrying no
+        // text is indistinguishable from one the request never sent, so a parameter with no
+        // text is not specified — the template stores nothing for it and reports nothing for
+        // it, exactly as for a request that left it out.
+        let specified = specified_launch_template_data(&input.launch_template_data);
+
         // "You must specify at least one parameter for the launch template data"
         // (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`). The member is
         // `clientOptional`, so the boundary validator lets an empty one through, and an
-        // empty version would store a template that launches nothing.
+        // empty version would store a template that launches nothing. It is the parameters
+        // the request SPECIFIED that must carry one, so a request whose every parameter
+        // carries no text has specified none.
         //
         // The shape carries dozens of members, so emptiness is decided by comparing the
         // request's data with a default one rather than by naming each member — which also
         // means a member the model gains later counts without this check being revisited.
         // The rendering is used for this comparison only; it is never reported or logged,
         // because `UserData` is `@sensitive`.
-        if format!("{:?}", input.launch_template_data)
-            == format!("{:?}", RequestLaunchTemplateData::default())
-        {
+        if format!("{specified:?}") == format!("{:?}", RequestLaunchTemplateData::default()) {
             return Err(Scaffolded::missing_parameter(
                 "The request must contain at least one parameter for LaunchTemplateData",
             ));
@@ -260,8 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AWS documents a 16 KB limit on instance user data, and this is the user data
         // every instance launched from the template will get. The model declares no
         // `@length` on it, and the template retains it, so it is bounded here.
-        if input
-            .launch_template_data
+        if specified
             .user_data
             .as_ref()
             .is_some_and(|user_data| user_data.len() > MAX_USER_DATA_BYTES)
@@ -297,10 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the template names, which is a read of ANOTHER service's state and so is made
         // outside this service's own lock — the same ordering `RunInstances` keeps for the
         // same reference.
-        let warning = crate::state::launch_template_warning(
-            &*self.engine,
-            &input.launch_template_data,
-        );
+        let warning = crate::state::launch_template_warning(&*self.engine, &specified);
 
         let spec = LaunchTemplateSpec {
             name: input.launch_template_name.clone(),
@@ -314,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             operator,
             version_description: input.version_description.clone(),
-            data: input.launch_template_data.clone(),
+            data: specified,
         };
         let payload_bytes = launch_template_payload_bytes(&spec);
 
