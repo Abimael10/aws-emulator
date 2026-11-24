@@ -237,7 +237,10 @@ async fn given_documents(emulator: &Emulator, host: &str, index: &str, documents
 }
 
 /// The `_id`s a search answered, in the order it answered them.
-fn hit_ids(answer: &Answer) -> Vec<String> {
+///
+/// `pub(crate)` because a sibling suite reads the hits of a search the same way rather than
+/// growing a second copy of this.
+pub(crate) fn hit_ids(answer: &Answer) -> Vec<String> {
     answer.body["hits"]["hits"]
         .as_array()
         .map(|hits| {

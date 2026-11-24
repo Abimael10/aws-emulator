@@ -364,9 +364,9 @@ pub fn authentication(
 /// One role of a domain's security configuration, as its security API holds it.
 ///
 /// The definition is kept VERBATIM as the document that was written, because the API
-/// reports back what it was given; what the emulator reads out of it is nothing — a role's
-/// permissions bound what a MAPPED principal may do, which is a narrowing this emulator
-/// does not model, so the record exists to be reported and to be named by a mapping.
+/// reports back what it was given; what is READ out of it is what holding the role is worth
+/// — the actions and index patterns it permits a MAPPED principal, and the documents and
+/// fields of those indexes it leaves visible ([`super::fgac_permissions`]).
 #[derive(Debug, Clone)]
 pub struct SecurityRole {
     /// The role's name — unique in the configuration, so the name IS the key.
@@ -392,7 +392,8 @@ pub struct SecurityRoleMapping {
 
 /// Whether fine-grained access control is the authorization boundary on `domain`:
 /// `AdvancedSecurityOptions$Enabled`. A domain that carries no such options, or carries
-/// them switched off, is decided by IAM alone.#[must_use]
+/// them switched off, is decided by IAM alone.
+#[must_use]
 pub fn enforced(domain: &Domain) -> bool {
     domain
         .advanced_security_options
