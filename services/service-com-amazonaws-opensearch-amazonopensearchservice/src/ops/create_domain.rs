@@ -677,6 +677,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::warm_instance_type_refusal`]), by the same rule the update
             // path applies.
             crate::state::warm_instance_type_refusal(input.cluster_config.as_ref()),
+            // ... and the warm tier is provisioned in a number of nodes inside the range
+            // the service publishes for the warm role, so a cluster asking for it in a
+            // count outside those bounds is refused rather than provisioned
+            // ([`crate::state::warm_node_count_refusal`]), by the same rule the update
+            // path applies.
+            crate::state::warm_node_count_refusal(input.cluster_config.as_ref()),
             // ... and the security groups a VPC-access domain is reached through have to
             // fit on one network interface (read above, before this store was locked).
             security_groups_refused,

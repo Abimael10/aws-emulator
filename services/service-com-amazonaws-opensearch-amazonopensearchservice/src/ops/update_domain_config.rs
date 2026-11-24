@@ -860,6 +860,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // warm tier on an instance type that offers none is refused for the same
             // reason the create path refuses it.
             crate::state::warm_instance_type_refusal(Some(&merged.cluster_config)),
+            // ... and against the published warm-node count bounds, so a change that would
+            // leave the domain with a warm tier in a count the service does not provision
+            // it in is refused for the same reason the create path refuses it — judged on
+            // the MERGED record, so a change that only switches the tier on is checked
+            // against the count the domain keeps.
+            crate::state::warm_node_count_refusal(Some(&merged.cluster_config)),
             // A VPC-access domain is reached through network interfaces carrying the
             // security groups a request names, so a change naming more groups than the
             // account's own quota allows is refused for the same reason the create path

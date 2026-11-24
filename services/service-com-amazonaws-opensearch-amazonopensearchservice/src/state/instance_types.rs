@@ -201,11 +201,6 @@ pub(super) enum OfferedReleases {
     /// From an OpenSearch release onwards, and on no Elasticsearch release: a family
     /// the service publishes for the OpenSearch engine alone.
     SinceOpenSearch((u32, u32)),
-    /// On the Elasticsearch releases alone — a family the service RETIRED with that
-    /// engine line and offers on no OpenSearch release, so a cluster or a limits read
-    /// pairing it with an OpenSearch release names an instance type the service does
-    /// not offer.
-    ElasticsearchOnly,
 }
 
 /// One family of the published instance-type catalog: the instance types the service
@@ -232,7 +227,6 @@ impl CatalogFamily {
             OfferedReleases::Every => true,
             OfferedReleases::SinceElasticsearch(release) => version.since_elasticsearch(release),
             OfferedReleases::SinceOpenSearch(release) => version.opensearch_at_least(release),
-            OfferedReleases::ElasticsearchOnly => !version.is_opensearch(),
         }
     }
 }
@@ -756,16 +750,16 @@ pub(super) const INSTANCE_TYPE_CATALOG: &[CatalogFamily] = &[
         roles: ROLES_DATA_AND_MASTER,
         releases: OfferedReleases::Every,
     },
-    // The one previous-generation family the service offers on the Elasticsearch line
-    // alone: the burstable T2 instances predate the OpenSearch engine and the T3 family
-    // replaced them for it, so no OpenSearch release offers them. Every other previous
-    // generation is still offered on both lines ([`PREVIOUS_GENERATION_FAMILIES`]) —
-    // the catalog is not filtered by instance generation, only by what a release offers.
+    // The burstable previous generation, which the T3 family above succeeded. Like every
+    // other previous generation it is still offered on BOTH engine lines
+    // ([`PREVIOUS_GENERATION_FAMILIES`]): the catalog is not filtered by instance
+    // generation, only by the engine prerequisite a family publishes, and this one
+    // publishes none.
     CatalogFamily {
         family: "t2",
         instance_types: &["t2.micro.search", "t2.small.search", "t2.medium.search"],
         roles: ROLES_DATA_AND_MASTER,
-        releases: OfferedReleases::ElasticsearchOnly,
+        releases: OfferedReleases::Every,
     },
     // The UltraWarm tier.
     CatalogFamily {
@@ -1624,6 +1618,43 @@ pub fn warm_instance_type_refusal(cluster: Option<&ClusterConfig>) -> Option<Val
         message: Some(format!(
             "Warm storage is not available for the {named} instance type. Select a \
              different instance type."
+        )),
+    })
+}
+
+/// Whether the warm nodes `cluster` asks for are a count the service provisions the warm
+/// tier in, and the refusal naming the published bounds otherwise.
+///
+/// `ClusterConfig$WarmCount` is "the number of warm nodes in the cluster" and carries no
+/// modelled range, so the bound is the service's own: the warm tier is provisioned in a
+/// number of nodes inside the range the service PUBLISHES for the warm role — the very
+/// range [`WARM_NODE_COUNT_RANGE`] holds and `DescribeInstanceTypeLimits` reports under
+/// that role — so a cluster asking for the tier in a count outside it describes a warm
+/// tier the service does not provision and the request is refused rather than stored.
+/// Reading the bound off the published range is what keeps the refusal and the published
+/// limit one fact.
+///
+/// `None` for a cluster whose warm tier is not turned on (`WarmEnabled` is "whether to
+/// enable warm storage for the cluster") — the count then provisions no node — and for one
+/// that names no count, which names no number of warm nodes to judge.
+///
+/// The sentence states the published BOUNDS and never the value the request carried: what a
+/// caller has to know is the range it has to come back inside, and the count is its own.
+/// The links below it are [`warm_storage_refusal`] and [`warm_instance_type_refusal`].
+pub fn warm_node_count_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationException> {
+    let cluster = cluster?;
+    if !cluster.warm_enabled.unwrap_or(false) {
+        return None;
+    }
+    let warm_nodes = cluster.warm_count?;
+    if WARM_NODE_COUNT_RANGE.contains(&warm_nodes) {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(format!(
+            "Warm storage node count must be between {} and {}.",
+            WARM_NODE_COUNT_RANGE.start(),
+            WARM_NODE_COUNT_RANGE.end()
         )),
     })
 }

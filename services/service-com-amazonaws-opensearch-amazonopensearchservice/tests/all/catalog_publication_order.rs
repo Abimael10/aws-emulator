@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use super::compatible_versions::rank;
 use super::domain_lifecycle::Emulator;
-use super::instance_type_catalog::{instance_types, list, whole_listing, ELASTICSEARCH_ONLY};
+use super::instance_type_catalog::{instance_types, list, whole_listing};
 
 /// The releases every case below spans: the oldest Elasticsearch release, the releases
 /// the catalog gates an instance family on and one either side of them, the engine-line
@@ -167,16 +167,15 @@ async fn a_later_release_publishes_the_earlier_listing_in_the_same_order() {
             // one with the types the earlier release did not offer taken out.
             let mut cursor = 0_usize;
             for instance_type in earlier_types {
-                // A family the later release's engine does not offer at all is not in its
-                // listing to be found.
-                if !later_types.contains(instance_type) {
-                    assert!(
-                        ELASTICSEARCH_ONLY.contains(&instance_type.as_str()),
-                        "case {case}: expected the later listing to publish {instance_type}, \
-                         which only a family the later engine does not offer is absent from"
-                    );
-                    continue;
-                }
+                // A release offers at least what an earlier release of the succession
+                // offers: every family the catalog gates is gated on a release it is
+                // offered FROM, so nothing an earlier listing published is missing from a
+                // later one.
+                assert!(
+                    later_types.contains(instance_type),
+                    "case {case}: expected the later listing to publish {instance_type}, \
+                     which the earlier release offers"
+                );
                 match later_types[cursor..]
                     .iter()
                     .position(|candidate| candidate == instance_type)

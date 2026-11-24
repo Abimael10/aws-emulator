@@ -97,15 +97,16 @@ const PREVIOUS_GENERATION_FAMILIES: [&str; 8] = ["c4", "d2", "i2", "m3", "m4", "
 
 /// The family that serves the warm tier, which the catalog publishes apart from the
 /// hot-tier families.
-/// The instance families the service offers on the ELASTICSEARCH line alone: the
-/// burstable previous generation, which the T3 family replaced for the OpenSearch
-/// engine. The rows are instance types, so the premise of each is read off the published
-/// catalog by [`the_elasticsearch_only_family_is_offered_on_that_line_alone`] rather than
-/// asserted against the service's own table.
-pub(crate) const ELASTICSEARCH_ONLY: [&str; 3] =
-    ["t2.micro.search", "t2.small.search", "t2.medium.search"];
-
 const WARM_FAMILY: &str = "ultrawarm1";
+
+/// The previous-generation BURSTABLE instance types, which the catalog offers on both
+/// engine lines like every other previous generation: the `t3` family succeeded them but
+/// the service publishes no engine prerequisite for them, so no release stops offering
+/// them. Read off the published catalog by
+/// [`the_previous_generation_burstable_family_is_offered_on_both_engine_lines`] rather
+/// than asserted against the service's own table.
+pub(crate) const PREVIOUS_GENERATION_BURSTABLE: [&str; 3] =
+    ["t2.micro.search", "t2.small.search", "t2.medium.search"];
 
 /// The families whose instances hold the domain's data and are never master-eligible:
 /// the OpenSearch-optimized ones.
@@ -390,11 +391,16 @@ async fn the_listing_is_published_in_the_catalogs_documented_order() {
     }
 
     // The catalog is not filtered by instance GENERATION: a previous-generation family
-    // is published for a current release too, after the current generations — every one
-    // of them but the burstable generation the service retired with the Elasticsearch
-    // line ([`ELASTICSEARCH_ONLY`]).
+    // is published for a current release too, after the current generations — the
+    // burstable previous generation among them
+    // ([`PREVIOUS_GENERATION_BURSTABLE`]).
     let current = instance_types(&whole_listing(&emulator, "OpenSearch_2.19", "").await);
-    for previous_generation in ["c4.4xlarge.search", "m4.large.search", "r4.2xlarge.search"] {
+    for previous_generation in [
+        "c4.4xlarge.search",
+        "m4.large.search",
+        "r4.2xlarge.search",
+        "t2.small.search",
+    ] {
         assert!(
             current.contains(&previous_generation.to_string()),
             "case {previous_generation} on OpenSearch_2.19: expected the catalog to carry \
@@ -456,8 +462,7 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
 
     // A release offers at least what an earlier release of the line offers: a family is
     // introduced for a release and is offered from it onwards, so the catalog grows
-    // along the succession and loses an entry only where the later release's ENGINE does
-    // not offer the family at all ([`ELASTICSEARCH_ONLY`]).
+    // along the succession and loses nothing.
     for earlier in VERSIONS {
         for later in VERSIONS {
             let succeeds = if parse(earlier).0 == parse(later).0 {
@@ -476,12 +481,7 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
                 instance_types(&whole_listing(&emulator, later, "").await)
                     .into_iter()
                     .collect();
-            let lost: Vec<&String> = earlier_types
-                .difference(&later_types)
-                .filter(|instance_type| {
-                    !(is_opensearch(later) && ELASTICSEARCH_ONLY.contains(&instance_type.as_str()))
-                })
-                .collect();
+            let lost: Vec<&String> = earlier_types.difference(&later_types).collect();
             assert!(
                 lost.is_empty(),
                 "case {earlier} -> {later}: expected a release to offer every instance \
@@ -492,21 +492,21 @@ async fn the_listing_is_the_catalog_the_named_release_offers() {
 }
 
 #[tokio::test]
-async fn the_elasticsearch_only_family_is_offered_on_that_line_alone() {
+async fn the_previous_generation_burstable_family_is_offered_on_both_engine_lines() {
     let emulator = Emulator::new();
 
-    // Every release of the version table, so the premise of [`ELASTICSEARCH_ONLY`] is
-    // read off the published catalog on both engine lines: offered on each Elasticsearch
-    // release, however early or late, and on no OpenSearch release.
+    // Every release of the version table, so the rule is read off the published catalog
+    // on both engine lines: a previous generation the service publishes no engine
+    // prerequisite for is offered on every release, however early or late and whichever
+    // engine it runs.
     for version in VERSIONS {
         let offered = instance_types(&whole_listing(&emulator, version, "").await);
-        for instance_type in ELASTICSEARCH_ONLY {
-            let carried = offered.contains(&instance_type.to_string());
-            assert_eq!(
-                carried,
-                !is_opensearch(version),
-                "case {instance_type} on {version}: expected the family to be offered on \
-                 the Elasticsearch line alone, got carried={carried} among {} entries",
+        for instance_type in PREVIOUS_GENERATION_BURSTABLE {
+            assert!(
+                offered.contains(&instance_type.to_string()),
+                "case {instance_type} on {version}: expected a previous generation with no \
+                 published engine prerequisite to be offered on every release, got {} \
+                 entries",
                 offered.len()
             );
         }
@@ -706,11 +706,9 @@ async fn a_feature_available_on_one_release_stays_available_on_a_later_one() {
                 let instance_type = instance_types(std::slice::from_ref(entry))
                     .pop()
                     .expect("one entry has one InstanceType");
-                // A family the later release's engine does not offer at all has no
-                // successor entry to carry a feature forward ([`ELASTICSEARCH_ONLY`]).
-                if is_opensearch(later) && ELASTICSEARCH_ONLY.contains(&instance_type.as_str()) {
-                    continue;
-                }
+                // A family the later release's engine offers no entry of carries no
+                // feature forward, and the catalog gates none: every type an earlier
+                // listing published is in the later one.
                 let case = format!("{instance_type}: {earlier} -> {later}");
                 let successor = later_listing
                     .iter()
