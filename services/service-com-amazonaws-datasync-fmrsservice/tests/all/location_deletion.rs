@@ -471,11 +471,13 @@ async fn create_task(
 }
 
 /// Assert the whole refusal envelope a delete of a still-referenced location earns: the
-/// one in-use discriminator in both code members, and a message that names the location
-/// that cannot go and a task that still holds it.
+/// one in-use discriminator in both code members, and the sentence that names ONLY the
+/// location the request addressed.
 ///
-/// No recording pins the wording, so the assertion is on the two resources the message
-/// has to identify rather than on a sentence.
+/// The sentence is fixed text plus one variable part, the bare resource id of the
+/// `LocationArn` the request carried. The tasks that hold the location are passed in so
+/// the assertion can also prove none of them is named: which resource holds the location
+/// is state the caller did not ask about, so it is no part of the message.
 fn assert_location_in_use(
     refusal: &serde_json::Value,
     location_arn: &str,
@@ -490,17 +492,19 @@ fn assert_location_in_use(
         );
     }
     let message = string(refusal, "message", case);
-    assert!(
-        message.contains(resource_id(location_arn)),
-        "case {case:?}: the refusal must name the location it would not delete, got {refusal}"
+    assert_eq!(
+        message,
+        format!("Location {} is in use.", resource_id(location_arn)),
+        "case {case:?}: the refusal must name only the location it would not delete, \
+         got {refusal}"
     );
-    assert!(
-        task_arns
-            .iter()
-            .any(|task_arn| message.contains(resource_id(task_arn))),
-        "case {case:?}: the refusal must name a task that still references the location \
-         (one of {task_arns:?}), got {refusal}"
-    );
+    for task_arn in task_arns {
+        assert!(
+            !message.contains(resource_id(task_arn)),
+            "case {case:?}: the refusal must not name the holding task {task_arn:?}, \
+             got {refusal}"
+        );
+    }
 }
 
 /// Read a task's status back through `DescribeTask` until it is `want`, or give up after
@@ -674,8 +678,8 @@ async fn a_location_two_tasks_share_is_in_use_until_both_tasks_are_gone() {
     .await;
     assert_location_in_use(&refusal, &arns[1], &[first.as_str(), second.as_str()], case);
 
-    // One task gone, one still referencing: still in use, and the refusal now names the
-    // task that remains.
+    // One task gone, one still referencing: still in use, and the refusal reads the same
+    // whichever task is the one that remains.
     ok(
         &router,
         "DeleteTask",
@@ -805,4 +809,135 @@ async fn a_location_is_in_use_whatever_status_the_referencing_task_has() {
         case,
     )
     .await;
+}
+
+/// Which endpoint member of each holding task carries the location whose delete is
+/// refused.
+#[derive(Debug, Clone, Copy)]
+enum HeldAs {
+    Source,
+    Destination,
+    /// Half the holding tasks each way, so the location is held from both members at
+    /// once.
+    Alternating,
+}
+
+/// One row of the in-use wording table: the kind of location whose delete is refused,
+/// which endpoint member holds it, and how many tasks hold it.
+#[derive(Debug)]
+struct WordingCase {
+    case: &'static str,
+    kind_index: usize,
+    held_as: HeldAs,
+    holders: usize,
+}
+
+/// RULE (the WORDING of that refusal): the in-use refusal's message is fixed text with
+/// exactly ONE variable part, the bare resource id of the `LocationArn` the request
+/// carried — so no identifier the emulator reads out of its own state reaches the
+/// sentence, and in particular the tasks that hold the location are not named.
+///
+/// The rows differ along everything the rule generalises over and the sentence therefore
+/// must NOT vary with: the kind of location being deleted, which endpoint member of a
+/// task holds it, and how many tasks hold it (one, two, three, from either member or
+/// both). Every row holds its own freshly minted location, so the one variable part is
+/// also shown to track the request rather than being fixed text.
+#[tokio::test]
+async fn the_in_use_refusal_names_only_the_location_the_request_addressed() {
+    let router = service();
+    let kinds = kinds();
+
+    let rows = [
+        WordingCase {
+            case: "one task holding an object storage location as its source",
+            kind_index: 0,
+            held_as: HeldAs::Source,
+            holders: 1,
+        },
+        WordingCase {
+            case: "one task holding an Amazon S3 location as its destination",
+            kind_index: 1,
+            held_as: HeldAs::Destination,
+            holders: 1,
+        },
+        WordingCase {
+            case: "two tasks holding an Azure Blob Storage location as their destination",
+            kind_index: 2,
+            held_as: HeldAs::Destination,
+            holders: 2,
+        },
+        WordingCase {
+            case: "three tasks holding an Amazon EFS location from both endpoints",
+            kind_index: 3,
+            held_as: HeldAs::Alternating,
+            holders: 3,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let kind = &kinds[row.kind_index];
+        let held = string(
+            &ok(&router, kind.create_operation, (kind.request)(), case).await,
+            "LocationArn",
+            case,
+        );
+
+        let mut holders: Vec<String> = Vec::new();
+        for holder in 0..row.holders {
+            // Each holding task needs a second endpoint of its own: a task copies one
+            // location onto another, so the pair cannot be the same location.
+            let other_kind = &kinds[(row.kind_index + 1 + holder) % kinds.len()];
+            let other = string(
+                &ok(
+                    &router,
+                    other_kind.create_operation,
+                    (other_kind.request)(),
+                    case,
+                )
+                .await,
+                "LocationArn",
+                case,
+            );
+            let held_as_source = match row.held_as {
+                HeldAs::Source => true,
+                HeldAs::Destination => false,
+                HeldAs::Alternating => holder % 2 == 0,
+            };
+            let (source, destination) = if held_as_source {
+                (&held, &other)
+            } else {
+                (&other, &held)
+            };
+            holders.push(
+                create_task(
+                    &router,
+                    source,
+                    destination,
+                    &format!("wording-holder-{holder}"),
+                    case,
+                )
+                .await,
+            );
+        }
+
+        let refusal = refused(
+            &router,
+            "DeleteLocation",
+            serde_json::json!({ "LocationArn": held }),
+            case,
+        )
+        .await;
+        let holder_arns: Vec<&str> = holders.iter().map(String::as_str).collect();
+        assert_location_in_use(&refusal, &held, &holder_arns, case);
+
+        // Nothing of the holding tasks is in the sentence — neither an id nor the word
+        // for the resource that holds the location.
+        let message = string(&refusal, "message", case);
+        assert!(
+            !message.to_ascii_lowercase().contains("task"),
+            "case {case:?}: the refusal must not mention the holding task at all, \
+             got {message:?}"
+        );
+    }
 }

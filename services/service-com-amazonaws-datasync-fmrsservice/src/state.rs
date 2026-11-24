@@ -1003,8 +1003,8 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         if !self.locations.contains_key(arn) {
             return Err(LocationRefusal::not_found(arn));
         }
-        if let Some(task) = self.tasks_referencing_location(arn).first() {
-            return Err(LocationRefusal::in_use(arn, &task.arn));
+        if !self.tasks_referencing_location(arn).is_empty() {
+            return Err(LocationRefusal::in_use(arn));
         }
         self.locations
             .remove(arn)
@@ -1220,15 +1220,16 @@ impl LocationRefusal {
     /// The refusal a delete of a location a transfer task still names as an endpoint
     /// earns.
     ///
-    /// The message names both resources the rule is about — the location that cannot go
-    /// and one task that still holds it — each by its bare resource id, the way this
-    /// service identifies a resource in a refusal ([`resource_id`]).
-    pub fn in_use(location_arn: &str, task_arn: &str) -> Self {
+    /// The message names ONLY the resource the request addressed — the location that
+    /// cannot go, by its bare resource id, the way this service identifies a resource in
+    /// a refusal ([`resource_id`]). Which resource still holds it is state the caller did
+    /// not ask about and is not part of the sentence: the refusal states that the location
+    /// is in use, not by what.
+    pub fn in_use(location_arn: &str) -> Self {
         Self {
             message: format!(
-                "Location {location} is in use by task {task}.",
-                location = resource_id(location_arn),
-                task = resource_id(task_arn)
+                "Location {location} is in use.",
+                location = resource_id(location_arn)
             ),
             error_code: Some(LOCATION_IN_USE_CODE.to_string()),
         }
