@@ -22,6 +22,19 @@
 //! `crate::state`'s ([`crate::state::rejected_restore_testing_plan_body`]),
 //! shared with the create, so the two cannot drift.
 //!
+//! The updates of ONE plan are SERIALIZED. Rewriting a plan is not
+//! instantaneous: a call takes the plan for the span this service spends
+//! applying its update ([`crate::state::RESTORE_TESTING_PLAN_UPDATE_SPAN`]),
+//! which is the window every update a caller sent without waiting for an answer
+//! arrives in, and an update that finds the plan held is refused as a concurrent
+//! one ([`crate::state::restore_testing_plan_concurrent_update`]). So of however
+//! many updates of one plan are in flight together, one wins and rewrites it,
+//! and what a later read reports is that winner's body — never a refused
+//! racer's. The plan is taken and released under the store's lock, never held
+//! across the span, so the racers are served beside one another rather than one
+//! after another, and the guard at the foot of this file releases the plan
+//! however the request ends.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -147,6 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The plan's ARN was minted by the create and is stored with it, so this
+        // write reports identifiers rather than recomputing any: nothing here is
+        // read off the request's region.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateRestoreTestingPlanErrorModeled::ServiceUnavailableException(
@@ -156,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let now = ::std::time::SystemTime::now();
+        let name = input.restore_testing_plan_name;
         let body = input.restore_testing_plan;
 
         // The documented rules on a plan body are `crate::state`'s, shared with
@@ -164,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read by the same rules that admitted the create's. The name is not one
         // of them — it addresses the plan rather than being rewritten — so it is
         // not re-read here. Applied before the store is reached, so a refused
-        // update rewrites nothing.
+        // update rewrites nothing and never contends with anybody.
         if let Some(refusal) = crate::state::rejected_restore_testing_plan_body(
             None,
             body.schedule_expression.as_deref(),
@@ -179,13 +195,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Resolving the plan and taking it for this update are ONE critical
+        // section, so of the updates of one plan in flight together exactly one
+        // takes it and every other sees it held. The name addresses the plan to
+        // rewrite; one the account holds no plan under is the not-found
+        // condition every read of a plan answers.
+        {
+            let mut store = state.lock();
+            store
+                .stored_restore_testing_plan(&name)
+                .map_err(UpdateRestoreTestingPlanErrorModeled::ResourceNotFoundException)?;
+            if !store.claim_restore_testing_plan_update(&name) {
+                return Err(UpdateRestoreTestingPlanErrorModeled::ConflictException(
+                    crate::state::restore_testing_plan_concurrent_update(&name),
+                )
+                .into());
+            }
+        }
+        let _applying = ApplyingUpdate {
+            state: state.clone(),
+            name: name.clone(),
+        };
+
+        // The span this service spends applying the update, spent with the
+        // store's lock released so the updates racing for this plan are served
+        // beside one another: each of them reaches the resolution above while
+        // this one still holds the plan, instead of a write landing before
+        // another caller's request can be taken in at all.
+        ::tokio::time::sleep(crate::state::RESTORE_TESTING_PLAN_UPDATE_SPAN).await;
+
+        // The rewrite, under the lock again, with the clock read there too: the
+        // plan is stamped with the instant its new body landed rather than one
+        // read before the span above. A plan deleted while this update was being
+        // applied is no longer one this account holds, so the same not-found
+        // refusal answers.
         let mut store = state.lock();
-        // The name addresses the plan to rewrite; one the account holds no plan
-        // under is the not-found condition every read of a plan answers.
-        // Resolved under the lock the rewrite below takes, so a refused update
-        // changes nothing.
+        let now = ::std::time::SystemTime::now();
         let record = store
-            .stored_restore_testing_plan_mut(&input.restore_testing_plan_name)
+            .stored_restore_testing_plan_mut(&name)
             .map_err(UpdateRestoreTestingPlanErrorModeled::ResourceNotFoundException)?;
         record.apply_update(body, now);
         Ok(UpdateRestoreTestingPlanOutput {
@@ -197,5 +244,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::modelled_timestamp(record.creation_time),
             update_time: crate::state::modelled_timestamp(record.last_update_time),
         })
+    }
+}
+
+/// Holds the plan an update took for as long as its request is being served, and
+/// releases it however that request ends — answered, refused, or dropped because
+/// its caller went away. Without that release a plan one update took would
+/// refuse every later update of it, so the claim is tied to the request's
+/// lifetime rather than to any one exit path.
+struct ApplyingUpdate {
+    state: ::engine::ServiceState<crate::state::ComAmazonawsBackupCryocontrollerusermanagerState>,
+    name: String,
+}
+
+impl Drop for ApplyingUpdate {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .release_restore_testing_plan_update(&self.name);
     }
 }

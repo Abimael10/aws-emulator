@@ -27,18 +27,32 @@
 //!   until an update rewrites it — so a read reports when its configuration last
 //!   changed, and an update rewrites only the members its body states
 //!   ([`RestoreTestingPlanRecord::apply_update`]);
+//! * the updates of ONE plan are serialized: a call takes the plan for the span
+//!   it spends applying its update ([`RESTORE_TESTING_PLAN_UPDATE_SPAN`]) and an
+//!   update that arrives while the plan is held is refused as a concurrent one
+//!   ([`restore_testing_plan_concurrent_update`]), so whichever of the updates
+//!   in flight together took the plan is the one whose body a later read
+//!   reports. The hold lasts only as long as the REQUEST that took it, which is
+//!   why it is a claim rather than the due-instant device a framework's
+//!   deployment carries ([`super::FrameworkRecord::deployment_in_flight`]): a
+//!   framework really is unavailable for a span after its action returns, and a
+//!   call that arrives in that span is refused, whereas a restore testing plan
+//!   is written whole by the call that took it and is available again the
+//!   instant that call answers — so an update sent after one returned must be
+//!   served, and only one sent while another is still being applied is refused;
 //! * a plan stops being held when it is taken out of the store
 //!   ([`ComAmazonawsBackupCryocontrollerusermanagerState::remove_restore_testing_plan`]),
 //!   which a plan that still holds restore testing selections bars
 //!   ([`restore_testing_plan_selections_exist`]).
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    InvalidParameterValueException, InvalidRequestException, RestoreTestingPlanForGet,
-    RestoreTestingPlanForList, RestoreTestingPlanForUpdate, RestoreTestingRecoveryPointSelection,
+    ConflictException, InvalidParameterValueException, InvalidRequestException,
+    RestoreTestingPlanForGet, RestoreTestingPlanForList, RestoreTestingPlanForUpdate,
+    RestoreTestingRecoveryPointSelection,
 };
 
 /// The most restore testing plans this emulator keeps.
@@ -73,6 +87,49 @@ pub const MAX_SELECTION_WINDOW_DAYS: i32 = 365;
 /// The most characters a `RestoreTestingPlanName` may carry: "Maximum length is
 /// 50" (model doc for `CreateRestoreTestingPlanOutput$RestoreTestingPlanName`).
 pub const MAX_RESTORE_TESTING_PLAN_NAME_LENGTH: usize = 50;
+
+/// How long this service spends APPLYING one update of a restore testing plan:
+/// the span between the call taking the plan and its write of the merged body
+/// landing. An emulator-chosen span, like the one a sampling-rule create spends
+/// in the X-Ray service, not a published AWS figure: what it stands for is that
+/// writing a plan is not instantaneous, so every update a caller sent without
+/// waiting for an answer is still in flight when the one that took the plan
+/// first writes it — which is what makes the serialization observable at all.
+pub const RESTORE_TESTING_PLAN_UPDATE_SPAN: Duration = Duration::from_millis(100);
+
+/// The FIXED text AWS states for "another update of this restore testing plan is
+/// still being applied", around its one variable part: the name the call
+/// addressed the plan by. Composed by
+/// [`restore_testing_plan_concurrent_update_message`], the one place the sentence
+/// is built.
+pub const MESSAGE_RESTORE_TESTING_PLAN_CONCURRENT_UPDATE_PREFIX: &str =
+    "Failed to update restore testing plan [";
+/// The text that closes that sentence, after the plan name.
+pub const MESSAGE_RESTORE_TESTING_PLAN_CONCURRENT_UPDATE_SUFFIX: &str =
+    "] due to an attempt to update it concurrently.";
+
+/// The sentence AWS states for "another update of this restore testing plan is
+/// still being applied": the fixed text above around the name the REQUEST
+/// carried, so the refusal says which plan was contended for.
+pub fn restore_testing_plan_concurrent_update_message(name: &str) -> String {
+    format!(
+        "{MESSAGE_RESTORE_TESTING_PLAN_CONCURRENT_UPDATE_PREFIX}{name}\
+         {MESSAGE_RESTORE_TESTING_PLAN_CONCURRENT_UPDATE_SUFFIX}"
+    )
+}
+
+/// The modelled refusal for an update of a restore testing plan another update
+/// is still applying — see [`restore_testing_plan_concurrent_update_message`].
+/// AWS serializes the updates of one plan, so the update that loses the race is
+/// refused rather than blended into the one already running; no `Code`, as the
+/// framework's own concurrent-update refusal states none
+/// ([`super::framework_action_in_progress`]).
+pub fn restore_testing_plan_concurrent_update(name: &str) -> ConflictException {
+    ConflictException {
+        message: Some(restore_testing_plan_concurrent_update_message(name)),
+        ..Default::default()
+    }
+}
 
 /// `Code` for "the restore testing plan this delete addresses still holds
 /// restore testing selections, which have to be deleted first" — the restore
@@ -331,6 +388,25 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.restore_testing_plans
             .get_mut(name)
             .ok_or_else(super::restore_testing_plan_not_found)
+    }
+
+    /// Take the named plan for an update, answering whether this call took it.
+    ///
+    /// `false` means another update of that plan is still being applied, which is
+    /// the concurrent-update condition
+    /// ([`restore_testing_plan_concurrent_update`]): the updates of one plan are
+    /// serialized, so exactly one of however many arrive together holds the plan
+    /// and writes it. A call that took the plan releases it with
+    /// [`Self::release_restore_testing_plan_update`] however it ends.
+    pub fn claim_restore_testing_plan_update(&mut self, name: &str) -> bool {
+        self.restore_testing_plan_updates_in_flight
+            .insert(name.to_string())
+    }
+
+    /// Release the named plan once the update that took it has answered, so the
+    /// next update of it is served rather than refused.
+    pub fn release_restore_testing_plan_update(&mut self, name: &str) {
+        self.restore_testing_plan_updates_in_flight.remove(name);
     }
 
     /// Take the restore testing plan a `RestoreTestingPlanName` addresses OUT of

@@ -86,7 +86,7 @@
 
 pub mod schedule;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The EventBridge events a job's state changes publish, and the path that publishes
@@ -3828,6 +3828,13 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// testing plan is addressed by, so the map itself is what makes that name
     /// unique to the account. Bounded by [`MAX_RESTORE_TESTING_PLANS`].
     pub restore_testing_plans: BTreeMap<String, RestoreTestingPlanRecord>,
+    /// The `RestoreTestingPlanName`s an update is STILL APPLYING — claimed as a
+    /// call takes the plan ([`ComAmazonawsBackupCryocontrollerusermanagerState::claim_restore_testing_plan_update`])
+    /// and released as it answers, so an update that arrives while the plan is
+    /// held is refused as a concurrent one rather than blended into the update
+    /// already running. It holds a name only while a request is in flight for
+    /// it, so it is bounded by the requests being served.
+    pub restore_testing_plan_updates_in_flight: BTreeSet<String>,
     /// Restore testing selections by the (`RestoreTestingPlanName`,
     /// `RestoreTestingSelectionName`) pair a selection is addressed by: a
     /// selection belongs to ONE restore testing plan and its name identifies it
