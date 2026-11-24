@@ -261,7 +261,9 @@ impl ReplicatedInstanceBackupRecord {
     ///
     /// `None` while the backups are still `creating`, "waiting for the first automated
     /// snapshot to be available": there is no instant they can be restored to yet, so no
-    /// window is reported rather than one nothing covers.
+    /// window is reported rather than one nothing covers. The member itself is still published
+    /// — EMPTY, carrying neither time — which is the wire form a backup with nothing to restore
+    /// to takes ([`DbInstanceRecord::automated_backup_to_wire`]).
     pub fn restore_window(&self) -> Option<RestoreWindow> {
         if self.status == DB_INSTANCE_AUTOMATED_BACKUP_STATUS_CREATING {
             return None;
@@ -288,7 +290,7 @@ impl ReplicatedInstanceBackupRecord {
         DBInstanceAutomatedBackup {
             db_instance_automated_backups_arn: Some(self.automated_backups_arn()),
             status: Some(self.status.clone()),
-            restore_window: self.restore_window(),
+            restore_window: Some(self.restore_window().unwrap_or_default()),
             backup_retention_period: Some(self.backup_retention_period),
             kms_key_id: self.kms_key_id.clone(),
             tag_list: Some(self.tags.clone()),

@@ -309,20 +309,21 @@ impl DbInstanceRecord {
     /// instance and a describe of its automated backup cannot disagree, and the restore
     /// window is the window a point-in-time restore of the instance may target
     /// ([`Self::restorable_window`]) — the same window, read once.
+    ///
+    /// The `RestoreWindow` carries NO earliest or latest time while the instance has no
+    /// window to report: one still coming up is "waiting for the first automated snapshot to
+    /// be available", so there is no instant it can be restored to. The member is the backup's
+    /// own structure and is reported either way — EMPTY where there is nothing to restore to,
+    /// rather than carrying a span whose two ends are the same instant, which would tell a
+    /// client a restore target exists that nothing covers.
     pub fn automated_backup_to_wire(&self) -> DBInstanceAutomatedBackup {
-        let window = self.restorable_window().map_or_else(
-            // An instance still coming up has taken no backup yet, so there is no instant
-            // it can be restored to: the window reaches from the instant it was created to
-            // that same instant rather than claiming coverage nothing holds.
-            || RestoreWindow {
-                earliest_time: Some(self.instance_create_time),
-                latest_time: Some(self.instance_create_time),
-            },
-            |(earliest, latest)| RestoreWindow {
+        let window = self
+            .restorable_window()
+            .map(|(earliest, latest)| RestoreWindow {
                 earliest_time: Some(earliest),
                 latest_time: Some(latest),
-            },
-        );
+            })
+            .unwrap_or_default();
         DBInstanceAutomatedBackup {
             db_instance_identifier: Some(self.identifier.clone()),
             dbi_resource_id: Some(self.dbi_resource_id.clone()),
@@ -370,35 +371,72 @@ impl DbInstanceRecord {
     }
 }
 
-/// `arn:aws:rds:<region>:<account>:auto-backup:ab-<source instance's resource id>` — the
-/// ARN form `DBInstanceAutomatedBackupsArn` publishes
-/// (`arn:aws:rds:us-east-1:123456789012:auto-backup:ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`).
+/// `arn:aws:rds:<region>:<account>:auto-backup:ab-<the backup's own id>` — the ARN form
+/// `DBInstanceAutomatedBackupsArn` publishes.
 ///
 /// Derived from the SOURCE instance's `DbiResourceId`, which "can't be changed and ... is
 /// unique to an Amazon Web Services Region": one instance has one automated backup, so the
 /// ARN is a function of that id rather than a second id minted beside it, and it still
-/// names the same backup after the instance is deleted. The `db-` the instance's own
-/// resource id begins with is dropped, so the id reads under the `ab-` prefix its own
-/// member publishes.
+/// names the same backup after the instance is deleted. The id the ARN carries is written in
+/// the form an automated backup's own id is written in
+/// ([`automated_backup_id`]), which is not the form of the instance resource id
+/// it is derived from.
 pub fn instance_automated_backups_arn(region: &str, dbi_resource_id: &str) -> String {
-    let id = dbi_resource_id
-        .strip_prefix(DBI_RESOURCE_ID_PREFIX)
-        .unwrap_or(dbi_resource_id);
     emulator_server::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("{AUTOMATED_BACKUP_RESOURCE}:{AUTOMATED_BACKUP_ID_PREFIX}{id}"),
+        &format!(
+            "{AUTOMATED_BACKUP_RESOURCE}:{}",
+            automated_backup_id(region, dbi_resource_id)
+        ),
     )
+}
+
+/// The RESOURCE ID of one automated backup, as the recorded auto-backup ARN carries it: the
+/// `ab-` prefix and [`AUTOMATED_BACKUP_ID_TOKEN_LEN`] characters of lowercase ASCII letters
+/// and digits — a form of its own, not the `db-` plus digits-and-uppercase form of the
+/// instance resource id a caller names the same backup by
+/// ([`mint_dbi_resource_id`]).
+///
+/// One automated backup per source instance per Region, so the id is a FUNCTION of those
+/// two: the source instance's own token fills the first [`RESOURCE_ID_TOKEN_LEN`]
+/// characters, lowercased, and a digest of the Region and that token
+/// ([`super::minted_hex`]) fills the id out to the published width — so the backup of one
+/// instance reports one id on every read, two Regions report different ids for the backups
+/// they each hold, and the source instance's resource id reads back out of the id
+/// ([`dbi_resource_id_in_automated_backups_arn`]), which is what lets a refusal name the
+/// backup by the id it is identified by after the record is gone. A source id NOT of the
+/// width this service mints one in carries no such field: the id is then the digest alone,
+/// which is of the same published form and names no instance of this store.
+fn automated_backup_id(region: &str, dbi_resource_id: &str) -> String {
+    let source = dbi_resource_id
+        .strip_prefix(DBI_RESOURCE_ID_PREFIX)
+        .unwrap_or(dbi_resource_id);
+    let digest = super::minted_hex(
+        &format!("{AUTOMATED_BACKUP_RESOURCE}/{region}/{source}"),
+        AUTOMATED_BACKUP_ID_TOKEN_LEN,
+    );
+    let token: String = source
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    match token.len() == RESOURCE_ID_TOKEN_LEN {
+        true => {
+            let fill: String = digest.chars().skip(RESOURCE_ID_TOKEN_LEN).collect();
+            format!("{AUTOMATED_BACKUP_ID_PREFIX}{token}{fill}")
+        }
+        false => format!("{AUTOMATED_BACKUP_ID_PREFIX}{digest}"),
+    }
 }
 
 /// Whether `value` is an ARN that names an automated backup AT ALL, which is what
 /// `DBInstanceAutomatedBackupsArn` — "the Amazon Resource Name (ARN) of the automated
-/// backups" — has to carry: the whole form the member publishes
-/// (`arn:aws:rds:us-east-1:123456789012:auto-backup:ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`), which
-/// is an ARN of this service ([`parse_rds_resource_arn`]) naming a REGION and an ACCOUNT —
+/// backups" — has to carry: the whole form the member publishes, which is an ARN of this
+/// service ([`parse_rds_resource_arn`]) naming a REGION and an ACCOUNT —
 /// an automated backup belongs to one of each — whose resource is this resource type, and
-/// whose id reads back as a source instance's resource id
-/// ([`dbi_resource_id_in_automated_backups_arn`], the inverse of the function above).
+/// whose id is written in the form an automated backup's own id is written in
+/// ([`automated_backup_id`]).
 ///
 /// `Err` carries the sentence a member whose value is no ARN of the resource it names is
 /// refused with ([`invalid_arn_for_parameter_message`]), so a handler lifts it into its own
@@ -435,31 +473,73 @@ fn names_an_automated_backup(value: &str) -> bool {
     if fields.region.is_empty() || !owned_by_an_account {
         return false;
     }
-    // The resource it names: this type, with a source instance's resource id behind the
-    // `ab-` prefix — and an id of the FORM such an id is written in, which is what the
-    // member's own documented example carries
-    // (`ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`): the digits-and-uppercase token of the width this
-    // service mints a regional resource id in ([`RESOURCE_ID_TOKEN_LEN`]). A value carrying
-    // anything else behind the prefix names no automated backup of any account.
+    // The resource it names: this type, with an automated backup's own id behind the `ab-`
+    // prefix — an id of the FORM this service publishes one in
+    // ([`automated_backup_id`]). A value carrying anything else behind the prefix names no
+    // automated backup of any account.
     let names_this_type = parse_rds_resource_arn(value)
         .is_some_and(|arn| arn.resource_type.eq_ignore_ascii_case(AUTOMATED_BACKUP_RESOURCE));
-    names_this_type
-        && dbi_resource_id_in_automated_backups_arn(value)
-            .is_some_and(|resource_id| is_a_dbi_resource_id(&resource_id))
+    names_this_type && automated_backup_id_in(value).is_some_and(is_an_automated_backup_id)
 }
 
-/// Whether `value` is written in the form a `DbiResourceId` is: the `db-` prefix and the
-/// digits-and-uppercase token of the width this service mints one in
-/// ([`mint_dbi_resource_id`], "`db-` plus 26 uppercase characters").
-fn is_a_dbi_resource_id(value: &str) -> bool {
-    let Some(token) = value.strip_prefix(DBI_RESOURCE_ID_PREFIX) else {
-        return false;
-    };
-    token.len() == RESOURCE_ID_TOKEN_LEN
+/// Whether `token` — the characters behind the `ab-` prefix of an automated backup's own id —
+/// is written in the form this service publishes one in: the published width, in lowercase
+/// ASCII letters and digits ([`automated_backup_id`]).
+fn is_an_automated_backup_id(token: &str) -> bool {
+    token.len() == AUTOMATED_BACKUP_ID_TOKEN_LEN
         && token
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
 }
+
+/// Whether `value` is written in the form a `DbiResourceId` is — "the resource ID of the DB
+/// instance", which has a GRAMMAR of its own: the `db-` prefix, and a non-empty remainder of
+/// ASCII letters and digits. The member "isn't case-sensitive", so neither is the prefix.
+///
+/// `Err` carries the sentence Amazon RDS refuses a value outside that form with
+/// ([`invalid_dbi_resource_id_message`]), so a handler lifts it into its own
+/// `InvalidParameterValue` channel BEFORE any lookup: a value of another form is no DB
+/// resource id of any Region, which is a bad REQUEST rather than a resource that happens to
+/// be missing — the same reading this front door holds every member that must be an ARN to
+/// ([`check_automated_backups_arn`]). Whether the resource the id names EXISTS is the
+/// lookup's question, and a well-formed id naming none is that operation's not-found fault.
+///
+/// The form is the one the SENTENCE states, which is wider than the form this service MINTS
+/// an id in ([`mint_dbi_resource_id`]): a shorter well-formed id is a lookup that finds
+/// nothing, not a bad request.
+pub fn check_dbi_resource_id(value: &str) -> Result<(), String> {
+    let remainder = value
+        .get(..DBI_RESOURCE_ID_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(DBI_RESOURCE_ID_PREFIX))
+        .map(|prefix| &value[prefix.len()..]);
+    let well_formed = remainder.is_some_and(|remainder| {
+        !remainder.is_empty()
+            && remainder
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+    });
+    match well_formed {
+        true => Ok(()),
+        false => Err(invalid_dbi_resource_id_message()),
+    }
+}
+
+/// The sentence a `DbiResourceId` outside that form is refused with: the rule itself, naming
+/// the wire parameter Amazon RDS prints for the member — entirely fixed text, since the rule
+/// it states is the same whatever value the request carried.
+pub fn invalid_dbi_resource_id_message() -> String {
+    format!(
+        "The parameter {DBI_RESOURCE_ID_PARAMETER} is not a valid DbiResourceId. The \
+         DbiResourceId must begin with db- prefix; remaining part must contain only ASCII \
+         letters and digits; and must not be empty."
+    )
+}
+
+/// How Amazon RDS names the `DbiResourceId` member in the sentence above: the hyphenated,
+/// lowercase parameter name its own validation prints, which is what a caller matching the
+/// message reads rather than the model's spelling of the same member — as it is for the ARN
+/// member beside it ([`AUTOMATED_BACKUPS_ARN_PARAMETER`]).
+const DBI_RESOURCE_ID_PARAMETER: &str = "dbi-resource-id";
 
 /// The `db-` an instance's resource id begins with, which the automated backup's own
 /// `ab-` id is read against ([`instance_automated_backups_arn`]).
@@ -469,26 +549,48 @@ const DBI_RESOURCE_ID_PREFIX: &str = "db-";
 const AUTOMATED_BACKUP_RESOURCE: &str = "auto-backup";
 const AUTOMATED_BACKUP_ID_PREFIX: &str = "ab-";
 
+/// How many characters an automated backup's own id carries behind its `ab-` prefix: the
+/// width the auto-backup ARN Amazon RDS answers is recorded carrying, written in lowercase
+/// ASCII letters and digits. The member's own documented example shows a shorter,
+/// digits-and-uppercase id (`ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`); the recorded answer is what the
+/// service publishes, so it is what this emulator publishes
+/// ([`automated_backup_id`]).
+const AUTOMATED_BACKUP_ID_TOKEN_LEN: usize = 58;
+
 /// The segment an automated backup's ARN carries its own id behind, which is what the id is
 /// read back out of it after ([`dbi_resource_id_in_automated_backups_arn`]).
 const AUTOMATED_BACKUP_ARN_SEGMENT: &str = ":auto-backup:";
 
-/// The SOURCE INSTANCE's `DbiResourceId` an automated-backups ARN names, read back out of
-/// the ARN — the inverse of [`instance_automated_backups_arn`] for every id that function is
-/// given, which is a minted one and so always carries the [`DBI_RESOURCE_ID_PREFIX`] this
-/// puts back.
+/// The SOURCE INSTANCE's `DbiResourceId` an automated-backups ARN names, read out of the
+/// source field of the backup's own id — the inverse of [`automated_backup_id`] for every
+/// resource id of the width this service mints one in ([`mint_dbi_resource_id`]), which is
+/// every id that function is given.
 ///
-/// `None` for a value of any other form, which names no automated backup of this service at
-/// all. This is what lets a refusal name the backup by the id it is identified by even when
-/// the request named it by its ARN and no record of it is left
+/// `None` for a value carrying no id of the published form, which names no automated backup
+/// of this service at all. This is what lets a refusal name the backup by the id it is
+/// identified by even when the request named it by its ARN and no record of it is left
 /// ([`AutomatedBackupReference::describe`]).
 pub fn dbi_resource_id_in_automated_backups_arn(arn: &str) -> Option<String> {
-    let (_, resource) = arn.rsplit_once(AUTOMATED_BACKUP_ARN_SEGMENT)?;
-    let id = resource.strip_prefix(AUTOMATED_BACKUP_ID_PREFIX)?;
-    if id.is_empty() {
+    let token = automated_backup_id_in(arn)?;
+    if !is_an_automated_backup_id(token) {
         return None;
     }
-    Some(format!("{DBI_RESOURCE_ID_PREFIX}{id}"))
+    let source = token.get(..RESOURCE_ID_TOKEN_LEN)?;
+    Some(format!(
+        "{DBI_RESOURCE_ID_PREFIX}{}",
+        source.to_ascii_uppercase()
+    ))
+}
+
+/// The characters behind the `ab-` prefix of the id `arn` carries, or `None` for a value that
+/// carries no such id at all.
+fn automated_backup_id_in(arn: &str) -> Option<&str> {
+    let (_, resource) = arn.rsplit_once(AUTOMATED_BACKUP_ARN_SEGMENT)?;
+    let token = resource.strip_prefix(AUTOMATED_BACKUP_ID_PREFIX)?;
+    match token.is_empty() {
+        true => None,
+        false => Some(token),
+    }
 }
 
 /// `RestoreWindow`: "the earliest and latest time a DB instance can be restored to".

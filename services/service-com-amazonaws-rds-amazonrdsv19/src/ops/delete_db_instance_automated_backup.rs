@@ -173,6 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_automated_backups_arn(arn)
                 .map_err(DeleteDBInstanceAutomatedBackupError::invalid_parameter_value)?;
         }
+        // `DbiResourceId` is "the identifier for the source DB instance", which has a
+        // grammar of its own: it is checked for FORM before any lookup too, so a value that
+        // is no DB resource id is the caller-input refusal stating that rule — a 400 — and
+        // not the 404 of a backup that happens to be missing
+        // ([`crate::state::check_dbi_resource_id`]).
+        if let Some(resource_id) = &reference.dbi_resource_id {
+            crate::state::check_dbi_resource_id(resource_id)
+                .map_err(DeleteDBInstanceAutomatedBackupError::invalid_parameter_value)?;
+        }
         match (
             &reference.dbi_resource_id,
             &reference.automated_backups_arn,
@@ -290,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteDBInstanceAutomatedBackupErrorModeled::DBInstanceAutomatedBackupNotFoundFault(
                     DBInstanceAutomatedBackupNotFoundFault {
                         message: Some(
-                            crate::ops::describe_db_instance_automated_backups::automated_backup_not_found_message(
+                            crate::state::delete_automated_backup_not_found_message(
                                 &reference.describe(),
                             ),
                         ),

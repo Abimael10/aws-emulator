@@ -30,8 +30,9 @@
 //! reached by polling a REPORTING call through `lifecycle_poll_loops::poll_until`.
 
 use crate::db_instance_automated_backups::{available_instance, describe_instance};
-use crate::db_instances::{call, emulator, expect_error, expect_ok, subtrees, text};
+use crate::db_instances::{call, emulator, expect_error, expect_ok, subtrees, text, REGION};
 use crate::lifecycle_poll_loops::poll_until;
+use service_com_amazonaws_rds_amazonrdsv19::state as st;
 
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
 macro_rules! params {
@@ -181,12 +182,9 @@ async fn a_well_formed_arn_is_answered_by_the_lookup_it_names() {
     let backups_arn = text(&reported, "DBInstanceAutomatedBackupsArn");
 
     // An ARN of the same form naming an instance nothing was ever created under: a
-    // well-formed value — a resource id of the form this service mints one in — so the
-    // answer is the lookup's.
-    let unknown = backups_arn.replace(
-        resource_id.trim_start_matches("db-"),
-        "NOTHINGWASEVERCREATEDUNDER",
-    );
+    // well-formed value — read through the same derivation the published one comes from, for
+    // a resource id of the form this service mints one in — so the answer is the lookup's.
+    let unknown = st::instance_automated_backups_arn(REGION, "db-NOTHINGWASEVERCREATEDUNDER");
     assert_ne!(
         unknown, backups_arn,
         "the unknown ARN must differ from the published one, got {unknown}"

@@ -181,6 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_filter_names(&filters).map_err(DescribeDBSnapshotsError::invalid_parameter_value)?;
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBSnapshotsError::validation)?;
+        // `DbiResourceId` carries "a specific DB resource ID", which has a grammar of its own:
+        // it is checked for FORM before any lookup, so a value that is no DB resource id is
+        // the caller-input refusal stating that rule rather than a report that narrowed to
+        // nothing ([`crate::state::check_dbi_resource_id`]).
+        if let Some(resource_id) = &input.dbi_resource_id {
+            crate::state::check_dbi_resource_id(resource_id)
+                .map_err(DescribeDBSnapshotsError::invalid_parameter_value)?;
+        }
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the

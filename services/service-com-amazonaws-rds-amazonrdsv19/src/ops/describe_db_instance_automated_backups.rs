@@ -188,6 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_automated_backups_arn(arn)
                 .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
         }
+        // `DbiResourceId` is "the resource ID of the DB instance that is the source of the
+        // automated backup", which has a grammar of its own: it is checked for FORM before
+        // any lookup as well, so a value that is no DB resource id is the caller-input
+        // refusal stating that rule rather than a resource that happens to be missing
+        // ([`crate::state::check_dbi_resource_id`]).
+        if let Some(resource_id) = &input.dbi_resource_id {
+            crate::state::check_dbi_resource_id(resource_id)
+                .map_err(DescribeDBInstanceAutomatedBackupsError::invalid_parameter_value)?;
+        }
 
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all. Unreachable with the engine the router builds;
@@ -312,18 +321,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled not-found fault for a value that resolves to no automated backup, worded
-/// as Amazon RDS words it — a statement about the backups, naming the value the request
-/// carried, whichever member narrowed the report.
-pub(crate) fn automated_backup_not_found_message(requested: &str) -> String {
-    format!("Automated backups could not be found for: {requested}")
-}
-
-/// That fault, for this operation's error channel.
+/// The modelled not-found fault for a value that resolves to no automated backup, worded as
+/// Amazon RDS words it for THIS operation
+/// ([`crate::state::describe_automated_backup_not_found_message`]) — naming the value the
+/// request carried, whichever member narrowed the report.
 fn not_found(requested: &str) -> DescribeDBInstanceAutomatedBackupsError {
     DescribeDBInstanceAutomatedBackupsErrorModeled::DBInstanceAutomatedBackupNotFoundFault(
         DBInstanceAutomatedBackupNotFoundFault {
-            message: Some(automated_backup_not_found_message(requested)),
+            message: Some(crate::state::describe_automated_backup_not_found_message(
+                requested,
+            )),
         },
     )
     .into()

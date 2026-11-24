@@ -801,3 +801,23 @@ pub fn restore_engine_incompatible_message(engine: &str, source: &str) -> String
          ({source})."
     )
 }
+
+/// How `DescribeDBInstanceAutomatedBackups` words `DBInstanceAutomatedBackupNotFoundFault`:
+/// a statement about the automated backup of ONE DB instance, with the value the request
+/// named that instance by as its only variable part.
+///
+/// The model carries no message template for the fault, so each of the two operations that
+/// answer it is worded as Amazon RDS is recorded answering THAT operation, which is not one
+/// sentence: the report speaks of the `DBInstanceAutomatedBackup` of a `DBInstance`
+/// (here), and the delete speaks of the backups themselves
+/// ([`delete_automated_backup_not_found_message`]). A caller that matches on either reads
+/// what the service sends for the call it made.
+pub fn describe_automated_backup_not_found_message(named: &str) -> String {
+    format!("DBInstanceAutomatedBackup for DBInstance {named} not found.")
+}
+
+/// How `DeleteDBInstanceAutomatedBackup` words the same fault; see
+/// [`describe_automated_backup_not_found_message`] for why the two differ.
+pub fn delete_automated_backup_not_found_message(named: &str) -> String {
+    format!("Automated backups could not be found for: {named}")
+}

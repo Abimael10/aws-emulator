@@ -21,8 +21,8 @@
 //! `status` / `db-instance-id` / `dbi-resource-id` filters), `DeleteDBInstanceAutomatedBackup`
 //! removes it and nothing reports it afterwards, the backup of a LIVE instance refuses that
 //! delete with `InvalidDBInstanceAutomatedBackupState`, and a reference that resolves to no
-//! backup is `DBInstanceAutomatedBackupNotFound` (HTTP 404) worded "Automated backups could
-//! not be found for: <value>".
+//! backup is `DBInstanceAutomatedBackupNotFound` (HTTP 404), worded as the call that answers
+//! it words that fault.
 //!
 //! The tables below span what the rule generalises over: the engine families an instance
 //! runs (the two whose native wire this emulator speaks, one it does not, and MariaDB), the
@@ -69,11 +69,21 @@ macro_rules! params {
     };
 }
 
-/// The sentence every not-found refusal of an automated backup carries: fixed text with the
-/// SOURCE INSTANCE's `DbiResourceId` as its only variable part — the id an automated backup
-/// is identified by, which a request that named the backup by its ARN is answered with too,
-/// since that ARN is a function of that one id.
+/// The sentence `DescribeDBInstanceAutomatedBackups` words its not-found refusal in: fixed
+/// text with the value the request named the source instance by as its only variable part.
+///
+/// The two automated-backup calls do NOT share one sentence — the delete has its own
+/// ([`expected_delete_not_found`]) — so each is asserted against the wording of the call that
+/// answers it.
 fn expected_not_found(dbi_resource_id: &str) -> String {
+    format!("DBInstanceAutomatedBackup for DBInstance {dbi_resource_id} not found.")
+}
+
+/// The sentence `DeleteDBInstanceAutomatedBackup` words its not-found refusal in: fixed text
+/// with the SOURCE INSTANCE's `DbiResourceId` as its only variable part — the id an automated
+/// backup is identified by, which a request that named the backup by its ARN is answered with
+/// too, since that ARN is a function of that one id.
+fn expected_delete_not_found(dbi_resource_id: &str) -> String {
     format!("Automated backups could not be found for: {dbi_resource_id}")
 }
 
@@ -604,7 +614,7 @@ async fn a_retained_backup_is_found_by_every_reference_the_report_accepts() {
     );
     assert_eq!(
         text(&refused, "Message"),
-        expected_not_found(&resource_id),
+        expected_delete_not_found(&resource_id),
         "case {case:?}: expected the sentence this refusal carries, got {refused}"
     );
 }
@@ -750,13 +760,16 @@ async fn a_delete_that_cannot_keep_the_backup_is_refused_and_keeps_the_instance(
     delete_instance(&router, case, identifier, Some(true)).await;
 }
 
-/// The automated-backups ARN of the instance whose resource id is `resource_id`, as a
-/// client composes it from what `DescribeDBInstanceAutomatedBackups` reported:
-/// `arn:aws:rds:<region>:<account>:auto-backup:ab-<id>`.
+/// The automated-backups ARN of the instance whose resource id is `resource_id`, as the
+/// emulator publishes it: `arn:aws:rds:<region>:<account>:auto-backup:ab-<the backup's own
+/// id>`, read through the one derivation of that form this service has, so a case that names
+/// a backup by its ARN names the same ARN the report publishes. What that derivation PUBLISHES
+/// is asserted on its own, against the published form, in
+/// `automated_backup_envelope_and_input_form`.
 fn backups_arn(resource_id: &str) -> String {
-    format!(
-        "arn:aws:rds:{REGION}:{ACCOUNT}:auto-backup:ab-{}",
-        resource_id.trim_start_matches("db-")
+    service_com_amazonaws_rds_amazonrdsv19::state::instance_automated_backups_arn(
+        REGION,
+        resource_id,
     )
 }
 
@@ -933,9 +946,14 @@ async fn the_requests_the_automated_backup_calls_refuse() {
                 404,
                 NOT_FOUND,
             );
+            // Each call words the one fault its own way.
+            let expected = match operation {
+                "DeleteDBInstanceAutomatedBackup" => expected_delete_not_found(unknown),
+                _ => expected_not_found(unknown),
+            };
             assert_eq!(
                 text(&refused, "Message"),
-                expected_not_found(unknown),
+                expected,
                 "case {operation:?}: expected the sentence this refusal carries, got {refused}"
             );
         }

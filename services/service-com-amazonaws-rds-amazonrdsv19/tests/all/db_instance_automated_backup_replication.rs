@@ -42,7 +42,8 @@ use service_com_amazonaws_rds_amazonrdsv19::state::{
 };
 
 use crate::db_instances::{
-    call_in, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+    call_in, element_is_empty, emulator, expect_error, expect_ok, optional_text, subtrees, text,
+    texts,
 };
 use crate::lifecycle_poll_loops::poll_until;
 
@@ -268,14 +269,14 @@ fn replication_arns(backup: &str) -> Vec<String> {
         .collect()
 }
 
-/// The automated-backups ARN a client composes for the backups of the instance whose resource
-/// id is `resource_id`, held in `region`: `arn:aws:rds:<region>:<account>:auto-backup:ab-<id>`,
-/// the form `DBInstanceAutomatedBackupsArn` publishes
-/// (`arn:aws:rds:us-east-1:123456789012:auto-backup:ab-L2IJCEXJP7XQ7HOJ4SIEXAMPLE`).
+/// The automated-backups ARN the emulator publishes for the backups of the instance whose
+/// resource id is `resource_id`, held in `region`, read through the one derivation of that
+/// form this service has — so a case that names backups by their ARN names the ARN the report
+/// publishes for them, in the Region that holds them.
 fn backups_arn(region: &str, resource_id: &str) -> String {
-    format!(
-        "arn:aws:rds:{region}:{ACCOUNT}:auto-backup:ab-{}",
-        resource_id.trim_start_matches("db-")
+    service_com_amazonaws_rds_amazonrdsv19::state::instance_automated_backups_arn(
+        region,
+        resource_id,
     )
 }
 
@@ -399,11 +400,17 @@ async fn start_replicates_the_source_instance_backups_into_the_destination_regio
             row.engine,
             "case {case:?}: the backups report the source instance's engine, got {backup}"
         );
+        let window = subtrees(&backup, "RestoreWindow");
         assert_eq!(
-            optional_text(&backup, "RestoreWindow"),
-            None,
+            window.len(),
+            1,
+            "case {case:?}: the backups publish the window member whatever they cover, got \
+             {backup}"
+        );
+        assert!(
+            element_is_empty(&window[0], "RestoreWindow"),
             "case {case:?}: a replication with no snapshot yet can be restored to no \
-             instant, got {backup}"
+             instant, so the window carries neither time, got {backup}"
         );
 
         // The destination Region reports them from now on, and the clock takes them to
