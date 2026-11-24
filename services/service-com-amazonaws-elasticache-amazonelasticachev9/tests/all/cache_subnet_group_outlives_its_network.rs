@@ -47,7 +47,11 @@ const DESCRIPTION: &str = "storage app subnet group";
 
 /// One subnet of a group as the account's own network holds it: the id EC2 minted and the
 /// Availability Zone it was minted in.
-type Member = (String, String);
+///
+/// `pub(crate)` with [`account_network`] below: the sibling suite that takes the same network
+/// away and then deletes the group left behind mints its network through that one helper
+/// rather than through a second copy of it.
+pub(crate) type Member = (String, String);
 
 /// One row: the group's name, how many subnets it is built over, which of those the owner
 /// then deletes, and whether the VPC itself goes with them.
@@ -128,7 +132,9 @@ async fn zones(ec2: &::aws_sdk_ec2::Client) -> Vec<String> {
 
 /// Mint one VPC and `count` subnets in it through EC2's own operations, one subnet per zone,
 /// and answer the VPC id and the members in the order they were minted.
-async fn account_network(emulator: &Emulator, count: usize) -> (String, Vec<Member>) {
+///
+/// `pub(crate)` for the reason [`Member`] is.
+pub(crate) async fn account_network(emulator: &Emulator, count: usize) -> (String, Vec<Member>) {
     let ec2 = emulator.ec2(REGION);
     let zones = zones(&ec2).await;
     assert!(
