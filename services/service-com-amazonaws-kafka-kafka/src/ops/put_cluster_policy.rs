@@ -173,35 +173,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        // The checks that depend on the request alone run before the state lock
-        // is taken: a value that is not a cluster ARN, and a document larger
-        // than this emulator stores.
+        // The SHAPE of the reference this request acts on is decided from the
+        // request alone, before the state lock is taken: a value that is not a
+        // cluster ARN names no cluster to resolve.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(PutClusterPolicyErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }
-        // `Policy` is kept on the cluster record as the document the service
-        // canonicalizes it to, so the document this emulator will hold for one
-        // cluster is bounded here. Checked before the document is parsed, and
-        // before the lock: it depends on the request alone.
-        if input.policy.len() > crate::state::MAX_CLUSTER_POLICY_BYTES {
-            return Err(
-                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some(crate::state::CLUSTER_POLICY_MEMBER.to_string()),
-                    message: Some(format!(
-                        "Policy must be at most {} bytes.",
-                        crate::state::MAX_CLUSTER_POLICY_BYTES
-                    )),
-                })
-                .into(),
-            );
-        }
 
         let mut state = state.lock();
         // Resolved through the settling lookup, as every operation that reaches
-        // a cluster does. This operation models no `NotFoundException`, so an
+        // a cluster does, and BEFORE the document the body carries is judged:
+        // the policy is attached to that one cluster, so a reference this
+        // endpoint resolves nothing for could not have been served whatever the
+        // body carried. This operation models no `NotFoundException`, so an
         // ARN this endpoint's region holds no cluster for — absent, or belonging
         // to another region — is refused as a bad parameter, in the words the
         // other cluster-addressed operations that model none use.
@@ -218,6 +205,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // `Policy` is kept on the cluster record as the document the service
+        // canonicalizes it to, so the document this emulator will hold for one
+        // cluster is bounded here. Checked before the document is parsed, and
+        // after the cluster has resolved.
+        if input.policy.len() > crate::state::MAX_CLUSTER_POLICY_BYTES {
+            return Err(
+                PutClusterPolicyErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some(crate::state::CLUSTER_POLICY_MEMBER.to_string()),
+                    message: Some(format!(
+                        "Policy must be at most {} bytes.",
+                        crate::state::MAX_CLUSTER_POLICY_BYTES
+                    )),
+                })
+                .into(),
+            );
+        }
 
         // A `CurrentVersion` is a token the SERVICE mints and the caller quotes
         // back, so a value outside that shape

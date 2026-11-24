@@ -198,16 +198,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // The SHAPE of the reference this request acts on, and WHICH members it
-        // carries, are decided from the request alone and before the registry
-        // lock is taken; the values those members carry are judged once the
-        // cluster the URI names has resolved.
+        // The SHAPE of the reference this request acts on is decided from the
+        // request alone and before the registry lock is taken; everything the
+        // body carries is judged once the cluster the URI names has resolved.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(UpdateBrokerStorageErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster — its own provisioning,
+        // and an earlier update of its own whose completion has come due — are
+        // materialised before this call judges its state and version. It is
+        // resolved BEFORE the body is read at all: this call changes that one
+        // cluster's storage, so a reference this endpoint resolves nothing for
+        // could not have been served whatever the body asked for.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateBrokerStorageErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let current_volume_size = cluster.volume_size_gb();
 
         // ALL means every broker, so one entry describes the whole update and a
         // second one could only contradict it.
@@ -228,25 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         }
-
-        let now = std::time::SystemTime::now();
-        let mut state = state.lock();
-        // Resolved through the settling lookup every other operation uses, so the
-        // transitions the clock already owed this cluster — its own provisioning,
-        // and an earlier update of its own whose completion has come due — are
-        // materialised before this call judges its state and version.
-        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
-            return Err(
-                UpdateBrokerStorageErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
-        };
-        // Copied out of the record: the checks below are followed by a write, so
-        // the borrow of the registry has to end here.
-        let current_volume_size = cluster.volume_size_gb();
 
         // Only now are the VALUES the entry carries judged: the cluster the URI
         // names is resolved first, so a cluster this endpoint holds nothing for

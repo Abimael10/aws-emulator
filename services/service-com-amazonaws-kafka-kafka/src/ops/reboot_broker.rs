@@ -24,6 +24,11 @@
 //! denied caller is told it is not authorized rather than told whether the cluster
 //! exists.
 //!
+//! The cluster the URI names is then RESOLVED before `BrokerIds` is judged: this
+//! call restarts nodes of that one cluster, so a well-formed cluster ARN this
+//! endpoint holds no cluster for is the not-found refusal whatever the body
+//! carries ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,30 +192,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // Request-only checks run first, before the registry lock is taken: none
-        // of them depends on stored state.
+        // The SHAPE of the reference the URI carries is read first: a value that
+        // is not a cluster ARN at all names no cluster to resolve, so there is
+        // nothing for the lookup below to do with it.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(RebootBrokerErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
         }
-        // "The reboot-broker operation supports rebooting one broker at a time"
-        // (`RebootBrokerRequest$BrokerIds`), so a request naming no broker asks for
-        // nothing and one naming several asks for more than this API performs.
-        let [broker_id] = input.broker_ids.as_slice() else {
-            return Err(bad_request(
-                BROKER_IDS_MEMBER,
-                format!(
-                    "BrokerIds must name exactly one broker, not {}: the reboot-broker \
-                     operation supports rebooting one broker at a time.",
-                    input.broker_ids.len()
-                ),
-            ));
-        };
 
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
+        // The CLUSTER the URI names is resolved BEFORE the values the body
+        // carries are judged: this call acts on that one cluster, so a reference
+        // this endpoint resolves nothing for could not have been served whatever
+        // the body said, and the caller is told the resource is absent rather
+        // than sent to correct a member of a request that names nothing.
+        //
         // Resolved through the settling lookup every other operation uses, so the
         // transitions the clock already owed this cluster — its own provisioning,
         // and an earlier operation of its own whose completion has come due — are
@@ -223,6 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        };
+        // "The reboot-broker operation supports rebooting one broker at a time"
+        // (`RebootBrokerRequest$BrokerIds`), so a request naming no broker asks for
+        // nothing and one naming several asks for more than this API performs.
+        // Judged on the resolved cluster, after the lookup above.
+        let [broker_id] = input.broker_ids.as_slice() else {
+            return Err(bad_request(
+                BROKER_IDS_MEMBER,
+                format!(
+                    "BrokerIds must name exactly one broker, not {}: the reboot-broker \
+                     operation supports rebooting one broker at a time.",
+                    input.broker_ids.len()
+                ),
+            ));
         };
         // Copied out of the record: the checks below are followed by a write, so
         // the borrow of the registry has to end here.

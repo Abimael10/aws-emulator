@@ -238,22 +238,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        // Request-only checks first, so the registry mutex below is held for the
-        // state-dependent work alone.
+        // The SHAPE of the reference the URI carries is read first, from the
+        // request alone: a value that is not a cluster ARN names no cluster for
+        // the lookup below to resolve.
         if !crate::state::is_cluster_arn(&input.cluster_arn) {
             return Err(CreateTopicErrorModeled::BadRequestException(
                 crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
             )
             .into());
-        }
-        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
-            return Err(
-                CreateTopicErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("TopicName".to_string()),
-                    message: Some(reason),
-                })
-                .into(),
-            );
         }
 
         let now = std::time::SystemTime::now();
@@ -262,7 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A topic is created ON a cluster, so a `ClusterArn` this endpoint's region
         // holds no cluster for names a resource that is not there: reported as the
         // 404 every other topic operation answers for it, with the service's own
-        // not-found wording.
+        // not-found wording. Resolved BEFORE the values the body carries are
+        // judged, because this call acts on that one cluster and a reference that
+        // resolves to nothing could not have been served whatever the body said.
         //
         // Resolved through the SETTLING lookup because the broker count below comes
         // off that record: the count an accepted broker-count update installs is
@@ -279,6 +273,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // `TopicName` is a BODY member of this operation, so the name it carries
+        // is judged once the cluster has resolved.
+        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
+            return Err(
+                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
 
         // The Topic Management surface applies to a cluster whose brokers this
         // service manages for the caller, so a serverless one is refused on its
