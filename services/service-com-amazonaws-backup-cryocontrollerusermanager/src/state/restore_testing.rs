@@ -33,8 +33,8 @@ use std::time::SystemTime;
 
 use super::ComAmazonawsBackupCryocontrollerusermanagerState;
 use crate::ops::types::{
-    InvalidParameterValueException, RestoreTestingPlanForGet, RestoreTestingPlanForUpdate,
-    RestoreTestingRecoveryPointSelection,
+    InvalidParameterValueException, RestoreTestingPlanForGet, RestoreTestingPlanForList,
+    RestoreTestingPlanForUpdate, RestoreTestingRecoveryPointSelection,
 };
 
 /// The most restore testing plans this emulator keeps.
@@ -118,6 +118,23 @@ impl RestoreTestingPlanRecord {
             last_execution_time: self
                 .last_execution_time
                 .map(super::modelled_timestamp),
+        }
+    }
+
+    /// The plan as a LISTING reports it — the metadata of the SAME stored
+    /// record the read projects, minus the recovery-point selection the
+    /// `RestoreTestingPlanForList` shape has no member for, so a listing can
+    /// report nothing a read of the plan would not.
+    pub fn for_list(&self) -> RestoreTestingPlanForList {
+        RestoreTestingPlanForList {
+            restore_testing_plan_name: self.name.clone(),
+            restore_testing_plan_arn: self.arn.clone(),
+            schedule_expression: self.schedule_expression.clone(),
+            schedule_expression_timezone: Some(self.schedule_expression_timezone.clone()),
+            start_window_hours: self.start_window_hours,
+            creation_time: super::modelled_timestamp(self.creation_time),
+            last_update_time: Some(super::modelled_timestamp(self.last_update_time)),
+            last_execution_time: self.last_execution_time.map(super::modelled_timestamp),
         }
     }
 
