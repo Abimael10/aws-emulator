@@ -593,6 +593,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — with this service's guard released first, since that write takes the other
         // stores' locks.
         crate::state::settle_managed_scaling_policies(&*self.engine, now);
+        // The series that policy TRACKS is Amazon ECS's own to publish, for as long as the
+        // wiring this call created stands and with no further request from anybody, so the
+        // datapoints it owes are handed to this store's clock pump
+        // ([`crate::state::drive_managed_scaling_clock`]).
+        crate::state::drive_managed_scaling_clock(ctx, &self.engine, &region);
 
         Ok(CreateCapacityProviderOutput {
             capacity_provider: Some(view),

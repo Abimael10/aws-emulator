@@ -138,7 +138,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// provider's capacity to be acquired: the parked tasks on their way UP
     /// ([`TaskRecord::is_awaiting_placement`]) whose provider is one whose group Amazon ECS
     /// manages the scaling of ([`needs_registered_capacity_now`]).
-    fn tasks_awaiting_managed_capacity(&self) -> HashMap<(String, String), i32> {
+    pub(super) fn tasks_awaiting_managed_capacity(&self) -> HashMap<(String, String), i32> {
         let mut waiting: HashMap<(String, String), i32> = HashMap::new();
         for task in self.tasks.values() {
             if task.desired_status != STATUS_RUNNING || !task.is_awaiting_placement() {

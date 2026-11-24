@@ -329,6 +329,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // nothing calls again between one datapoint and the next
             // ([`super::service_utilization`]).
             self.next_service_utilization_due_at(),
+            // And so is the next datapoint of the `CapacityProviderReservation` series of a
+            // capacity provider whose managed scaling Amazon ECS runs: that series is published
+            // for as long as the provider's wiring stands, and nothing calls again between one
+            // datapoint and the next ([`super::capacity_provider_reservation_series`]).
+            self.next_capacity_provider_reservation_due_at(),
             // And so is the stop a task holding a container that GAVE UP on resolving a
             // dependency earns: that container never starts, so nothing else will ever move
             // the task ([`super::container_health`], `ContainerDefinition$startTimeout`).
@@ -808,6 +813,25 @@ pub fn publish_data_plane_task_state_changes<Eng: Send + Sync + 'static>(
 ) {
     record_task_moves(engine);
     spawn_task_clock_pump(callback, engine, region);
+}
+
+/// Drive the clock for the MANAGED-SCALING wiring a capacity-provider call has just changed.
+///
+/// The `CapacityProviderReservation` series Amazon ECS publishes for a provider whose scaling it
+/// manages is owed by the clock for as long as that wiring stands, and nothing calls again
+/// between one datapoint and the next — so the door that created, re-targeted or associated the
+/// provider OPENS that series ([`super::settle_capacity_provider_reservation`]) and hands the
+/// datapoints after it to the same single pump every door shares. It changes no answer this call
+/// gives and waits for nothing.
+///
+/// Called with NO guard of this store held.
+pub fn drive_managed_scaling_clock<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    super::settle_capacity_provider_reservation(&**engine, SystemTime::now());
+    spawn_task_clock_pump(ctx.callback(), engine, region);
 }
 
 /// Start the ONE clock pump of this store, unless a pump is already driving it.

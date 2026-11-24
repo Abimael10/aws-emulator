@@ -437,6 +437,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's guard released, since that write takes the other stores' locks.
         drop(guard);
         crate::state::settle_managed_scaling_policies(&*self.engine, now);
+        // The series that policy tracks follows the same configuration, and Amazon ECS
+        // publishes it for as long as the wiring stands with no further request from anybody,
+        // so the datapoints it owes are handed to this store's clock pump
+        // ([`crate::state::drive_managed_scaling_clock`]).
+        crate::state::drive_managed_scaling_clock(
+            ctx,
+            &self.engine,
+            &crate::state::request_region(ctx),
+        );
 
         Ok(UpdateCapacityProviderOutput {
             capacity_provider: Some(view),

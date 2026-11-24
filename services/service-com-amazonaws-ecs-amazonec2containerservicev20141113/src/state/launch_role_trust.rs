@@ -124,6 +124,11 @@ pub fn advance_task_clock<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemT
     // on, which the clock owes in the same way: Amazon ECS puts it on the provider's group
     // with no request from anybody ([`super::settle_managed_scaling_policies`]).
     super::settle_managed_scaling_policies(engine, now);
+    // And the datapoint of the series that policy TRACKS which the publish schedule has made
+    // due: Amazon ECS publishes a provider's reservation for as long as it manages that
+    // provider's scaling, with no request from anybody
+    // ([`super::settle_capacity_provider_reservation`]).
+    super::settle_capacity_provider_reservation(engine, now);
     settle_task_launches(engine);
 }
 

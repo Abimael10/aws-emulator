@@ -407,6 +407,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &*self.engine,
             ::std::time::SystemTime::now(),
         );
+        // The association is also what gives that policy a series to track, which Amazon ECS
+        // publishes for as long as it stands and with no further request from anybody, so the
+        // datapoints it owes are handed to this store's clock pump
+        // ([`crate::state::drive_managed_scaling_clock`]).
+        crate::state::drive_managed_scaling_clock(ctx, &self.engine, &region);
 
         Ok(PutClusterCapacityProvidersOutput {
             cluster: Some(view),

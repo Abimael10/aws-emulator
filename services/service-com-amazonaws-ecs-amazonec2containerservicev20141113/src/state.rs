@@ -537,6 +537,11 @@ pub use managed_capacity_scaling::*;
 mod managed_scaling_policy;
 pub use managed_scaling_policy::*;
 
+/// The `CapacityProviderReservation` series Amazon ECS publishes for such a provider: what
+/// that policy tracks and its alarms are evaluated from.
+mod capacity_provider_reservation_series;
+pub use capacity_provider_reservation_series::*;
+
 /// The ECS MANAGED DAEMON scheduler: the revisions a daemon's configuration is captured as,
 /// the deployments that roll them out, and the one daemon task each container instance of
 /// the daemon's capacity providers runs.
@@ -4966,6 +4971,11 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// while it holds a running task — so the map is the set of services whose utilization
     /// CloudWatch is receiving.
     service_utilization: HashMap<(String, String), UtilizationSeries>,
+    /// `(clusterName, capacityProviderName)` -> where that pair's `CapacityProviderReservation`
+    /// publish schedule stands (see [`capacity_provider_reservation_series`]). An entry exists
+    /// only while the pair is METERED — while Amazon ECS manages the scaling of that provider's
+    /// group for that cluster — so the map is the set of pairs CloudWatch is receiving one for.
+    capacity_provider_reservation: HashMap<(String, String), ReservationSeries>,
     /// The cluster, and the service of it, each Container Insights UTILIZATION series is of ->
     /// what that series reported last, so the next figure it reports measures the interval
     /// since then (see [`container_usage`]). An entry exists only while the cluster, and the

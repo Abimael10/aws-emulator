@@ -850,8 +850,17 @@ pub fn sync_policy_alarms<Eng: Send + Sync + 'static>(
             alarm_configuration_updated_timestamp: Some(cloudwatch::state::to_timestamp(now)),
             actions_enabled: Some(true),
             // The alarm's one action names the scaling policy it executes: that wiring is
-            // what makes a target-tracking policy alarm-driven.
-            alarm_actions: Some(vec![policy.policy_arn.clone()]),
+            // what makes a target-tracking policy alarm-driven. The other two action lists
+            // are EMPTY rather than absent, through CloudWatch's own rule for an alarm's
+            // action lists ([`cloudwatch::state::configured_actions`]: "no action is a list
+            // of none rather than no list"), so an alarm this writer mints reports the same
+            // shape as one `PutMetricAlarm` wrote and a client reading it cannot be left
+            // telling an empty list from an absent one.
+            ok_actions: cloudwatch::state::configured_actions(Some(&[])),
+            alarm_actions: cloudwatch::state::configured_actions(Some(
+                ::std::slice::from_ref(&policy.policy_arn),
+            )),
+            insufficient_data_actions: cloudwatch::state::configured_actions(Some(&[])),
             state_value,
             state_reason,
             state_reason_data,

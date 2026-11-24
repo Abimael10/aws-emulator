@@ -472,6 +472,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service's guard released, since that write takes the other stores' locks.
         drop(guard);
         crate::state::settle_managed_scaling_policies(&*self.engine, now);
+        // And the series that policy tracks, which Amazon ECS publishes for as long as the
+        // wiring stands and with no further request from anybody
+        // ([`crate::state::drive_managed_scaling_clock`]).
+        crate::state::drive_managed_scaling_clock(ctx, &self.engine, &region);
 
         Ok(CreateClusterResponse {
             payload: CreateClusterOutput {
