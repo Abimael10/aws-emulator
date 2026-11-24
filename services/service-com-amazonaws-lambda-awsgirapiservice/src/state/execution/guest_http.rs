@@ -115,9 +115,11 @@ pub struct Sending<'a> {
     /// name a service in the URL itself resolve.
     pub published: Option<&'a ::service_common::published_data_planes::PublishedPlanes>,
     /// The state of the EXECUTION ENVIRONMENT the request was made from, for a URL that
-    /// addresses the runtime API ([`super::runtime_api`]): the registrations of the
-    /// invocation whose sandbox the handler is running in. `None` for a run that was given
-    /// no sandbox, where that interface has no environment to answer from.
+    /// addresses the runtime API ([`super::runtime_api`]) or the environment's own metadata
+    /// service ([`super::instance_metadata`]): the registrations of the invocation whose
+    /// sandbox the handler is running in, and the metadata session it reads its own placement
+    /// through. `None` for a run that was given no sandbox, where those two interfaces have no
+    /// environment to answer from.
     pub sandbox: Option<&'a super::runtime_api::Sandbox>,
 }
 
@@ -153,6 +155,23 @@ pub async fn sent(sending: &Sending<'_>) -> Result<Answered, Refusal> {
             return Err(Refusal::TimedOut);
         }
         super::runtime_api::Reached::Elsewhere => {}
+    }
+    // The INSTANCE METADATA SERVICE is answered by the host for the same reason: the
+    // link-local address a node's own facts are published at is no service of this emulator
+    // and nothing is signed for it, so what a handler reading it reaches is the execution
+    // environment's own metadata service ([`super::instance_metadata`]).
+    match super::instance_metadata::answered(&super::runtime_api::Requested {
+        method: &method,
+        url: sending.url,
+        headers: sending.headers,
+        body: sending.body,
+        sandbox: sending.sandbox,
+    }) {
+        super::runtime_api::Reached::Answered(answered) => return Ok(answered),
+        // That interface answers every request it reaches, so neither of these is a request
+        // it holds: a path it publishes nothing at is answered as that.
+        super::runtime_api::Reached::NeverAnswered
+        | super::runtime_api::Reached::Elsewhere => {}
     }
     let addressed = addressed(sending.url, sending.default_region)
         .or_else(|| {

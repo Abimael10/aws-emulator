@@ -13,12 +13,17 @@
 //! The facts beside them are the function's own, read off the invocation this sandbox serves,
 //! because they are what the register call ANSWERS: "Response body contains the function
 //! name, version, and handler name" of the function whose environment the extension
-//! registered in.
+//! registered in — and, beside them, WHERE the environment is running, which is what its own
+//! metadata service publishes to a handler inside it
+//! ([`super::super::instance_metadata`]).
 
 use ::std::sync::{Arc, Mutex, PoisonError};
 
-/// What the register call reports about the function whose execution environment it is
-/// serving, read off the invocation itself.
+use super::super::instance_metadata::MetadataSession;
+
+/// The facts of the function whose execution environment this sandbox is, read off the
+/// invocation itself: the first four are what the register call reports, and the two beside
+/// them are where and on what the environment runs it, which its metadata service publishes.
 #[derive(Debug, Clone)]
 pub struct FunctionFacts {
     /// The function's name, as the invocation names it.
@@ -29,6 +34,11 @@ pub struct FunctionFacts {
     pub handler: String,
     /// The account the function belongs to.
     pub account_id: String,
+    /// The Region the invocation was addressed to, which is the Region this environment runs
+    /// in.
+    pub region: String,
+    /// The instruction set architecture the function runs on, as its configuration names it.
+    pub architecture: String,
 }
 
 /// ONE extension registered in this sandbox.
@@ -83,6 +93,12 @@ pub struct Sandbox {
     facts: Arc<FunctionFacts>,
     /// Every extension registered in it, in the order they registered.
     registered: Arc<Mutex<Vec<Registration>>>,
+    /// The metadata session of this environment: when it was initialised, and the session
+    /// tokens its own metadata service has issued ([`super::super::instance_metadata`]).
+    /// Shared between this sandbox's clones for the reason the registrations are: they are all
+    /// inside ONE environment, so a token minted through one of them is a token of the
+    /// environment.
+    metadata: Arc<MetadataSession>,
 }
 
 impl Sandbox {
@@ -93,13 +109,32 @@ impl Sandbox {
         Self {
             facts: Arc::new(facts),
             registered: Arc::new(Mutex::new(Vec::new())),
+            metadata: Arc::new(MetadataSession::new()),
         }
+    }
+
+    /// The same sandbox, reading its metadata service from `metadata` — the session of the
+    /// EXECUTION ENVIRONMENT this invocation is served in
+    /// ([`super::super::instance_metadata::session_of`]), which every invocation served in that
+    /// environment shares. A sandbox built for no environment of the pool keeps the session
+    /// [`Sandbox::new`] opened for it alone.
+    #[must_use]
+    pub fn in_environment(mut self, metadata: Arc<MetadataSession>) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// The function this sandbox is running.
     #[must_use]
     pub fn facts(&self) -> &FunctionFacts {
         &self.facts
+    }
+
+    /// The metadata session of this execution environment, which its own metadata service is
+    /// answered from ([`super::super::instance_metadata`]).
+    #[must_use]
+    pub fn metadata(&self) -> &MetadataSession {
+        &self.metadata
     }
 
     /// Register an extension called `name` for `events`, and mint the identifier its later
@@ -173,6 +208,8 @@ mod tests {
             function_version: "$LATEST".to_string(),
             handler: "lambda_function.lambda_handler".to_string(),
             account_id: "000000000000".to_string(),
+            region: "us-east-1".to_string(),
+            architecture: "x86_64".to_string(),
         }
     }
 

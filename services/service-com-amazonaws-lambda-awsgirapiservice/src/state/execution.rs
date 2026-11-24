@@ -135,6 +135,10 @@ pub mod guest_http;
 /// The RUNTIME API that seam answers at the address `AWS_LAMBDA_RUNTIME_API` names.
 pub mod runtime_api;
 
+/// The INSTANCE METADATA SERVICE it answers at the link-local address a node's own facts are
+/// published at: the token a read presents, and the environment's own placement.
+pub mod instance_metadata;
+
 /// The TLS layer of the standard library a running Python handler imports, supplied beside
 /// the socket interface it is built on.
 pub mod guest_tls;
@@ -876,6 +880,29 @@ pub async fn run_invocation(
     if let Some(header) = invocation.trace.as_ref().map(|trace| trace.header.clone()) {
         invocation.aws = invocation.aws.take().map(|aws| aws.tracing(header));
     }
+    // WHICH execution environments this invocation may be served in: the ones built for this
+    // function version at this revision, in this Region, for this tenant and for this kind of
+    // initialization ([`warm_pool`]). An invocation that finds one of them standing is served
+    // in it and pays no initialization; one that finds none builds its own.
+    let environment_key = warm_pool::EnvironmentKey {
+        function_name: invocation.function_name.clone(),
+        executed_version: invocation.executed_version.clone(),
+        region: invocation.region.clone(),
+        code_revision: invocation.code_revision.clone(),
+        runtime: invocation.runtime.clone().unwrap_or_default(),
+        handler: handler.clone(),
+        memory_size: invocation.memory_size,
+        architecture: invocation.architecture.clone(),
+        initialization_type: invocation.initialization_type,
+        // An invocation is served only in an environment built for the tenant it names, so
+        // nothing a handler left in the interpreter for one tenant is reachable from
+        // another's invocation.
+        tenant_id: invocation.tenant_id.clone(),
+    };
+    // The METADATA SESSION of that environment: the token it was handed and the ones its own
+    // metadata service issues, which every invocation served in it reads that service through
+    // ([`instance_metadata::session_of`]).
+    let metadata_session = instance_metadata::session_of(&environment_key);
     // The RUNTIME API this run addresses is served from the EXECUTION ENVIRONMENT's own state
     // ([`runtime_api`]): the extensions registered in it, against the function it is running.
     // The environment is this invocation's, so the state is too, and the facts the Extensions
@@ -885,7 +912,17 @@ pub async fn run_invocation(
         function_version: invocation.executed_version.clone(),
         handler: handler.clone(),
         account_id: account_of(&invocation.invoked_function_arn),
-    });
+        // WHERE this environment is running, which is what its own metadata service publishes
+        // to a handler inside it ([`instance_metadata`]): the Region the invocation was
+        // addressed to, and the architecture the function is configured to run on.
+        region: invocation.region.clone(),
+        architecture: invocation.architecture.clone(),
+    })
+    // The METADATA SESSION it reads that service through is the ENVIRONMENT's, not this one
+    // invocation's: a session token stays good for the lifetime it was issued for however many
+    // invocations the environment that minted it goes on to serve, which is what a handler that
+    // mints one outside its own body relies on ([`instance_metadata::session_of`]).
+    .in_environment(Arc::clone(&metadata_session));
     invocation.aws = invocation.aws.take().map(|aws| aws.in_sandbox(sandbox));
 
     // A host already holding as many runs past their budget as it keeps threads for starts
@@ -1111,26 +1148,7 @@ pub async fn run_invocation(
     let (sender, receiver) = ::tokio::sync::oneshot::channel();
     let lifecycle = Arc::new(AtomicU8::new(RUN_RUNNING));
     let thread_lifecycle = Arc::clone(&lifecycle);
-    let environment = runtime_environment(&invocation, started);
-    // WHICH execution environments this invocation may be served in: the ones built for this
-    // function version at this revision, in this Region, for this tenant and for this kind of
-    // initialization ([`warm_pool`]). An invocation that finds one of them standing is served
-    // in it and pays no initialization; one that finds none builds its own.
-    let environment_key = warm_pool::EnvironmentKey {
-        function_name: invocation.function_name.clone(),
-        executed_version: invocation.executed_version.clone(),
-        region: invocation.region.clone(),
-        code_revision: invocation.code_revision.clone(),
-        runtime: invocation.runtime.clone().unwrap_or_default(),
-        handler: handler.clone(),
-        memory_size: invocation.memory_size,
-        architecture: invocation.architecture.clone(),
-        initialization_type: invocation.initialization_type,
-        // An invocation is served only in an environment built for the tenant it names, so
-        // nothing a handler left in the interpreter for one tenant is reachable from
-        // another's invocation.
-        tenant_id: invocation.tenant_id.clone(),
-    };
+    let environment = runtime_environment(&invocation, started, &metadata_session);
     let spawned = ::std::thread::Builder::new()
         .name("lambda-invocation".to_string())
         .stack_size(RUN_STACK_BYTES)
@@ -2178,7 +2196,11 @@ fn credential_variables(
 /// credential in it is the session of the function's own execution role
 /// ([`credential_variables`]) — never the credential the framework hands this emulator's
 /// handlers.
-fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap<String, String> {
+fn runtime_environment(
+    invocation: &Invocation,
+    started: SystemTime,
+    metadata: &instance_metadata::MetadataSession,
+) -> BTreeMap<String, String> {
     let mut environment = invocation.variables.clone();
     let reserved: &[(&str, String)] = &[
         ("AWS_LAMBDA_FUNCTION_NAME", invocation.function_name.clone()),
@@ -2217,6 +2239,16 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
             "AWS_LAMBDA_RUNTIME_API",
             runtime_api::RUNTIME_API_ADDRESS.to_string(),
         ),
+        // The host and port of the METADATA endpoint the execution environment publishes to
+        // the handler running in it, beside the runtime API above: the address a handler that
+        // discovers which Region and zone it is running in reads its own placement from
+        // ([`instance_metadata`]). A handler is told the address rather than having to know
+        // one, which is what the variable is for, and it is the address this emulator really
+        // answers that interface on.
+        (
+            "AWS_LAMBDA_METADATA_API",
+            instance_metadata::METADATA_API_ADDRESS.to_string(),
+        ),
         ("LAMBDA_TASK_ROOT", "/var/task".to_string()),
         ("LAMBDA_RUNTIME_DIR", "/var/runtime".to_string()),
         (
@@ -2233,6 +2265,22 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     ];
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
+    }
+    // The TOKEN this execution environment was handed for that endpoint, which a read of it
+    // has to present ([`instance_metadata`]): the environment is given the credential rather
+    // than having to ask for one, exactly as it is given the address above. An environment
+    // this process could mint no token for names none, so a handler reads no value that is not
+    // a token.
+    match metadata.environment_token() {
+        Some(token) => {
+            environment.insert(
+                "AWS_LAMBDA_METADATA_TOKEN".to_string(),
+                token.to_string(),
+            );
+        }
+        None => {
+            environment.remove("AWS_LAMBDA_METADATA_TOKEN");
+        }
     }
     // The two variables the structured format brings with it, which a function on the
     // default plain-text format carries NEITHER of: the FORMAT the runtime renders this
@@ -3074,7 +3122,11 @@ mod tests {
         }];
         // The environment a run of the probe function really sees, which is where the
         // runtime reads the library directory of its own modules from.
-        let environment = runtime_environment(&probe_invocation(), SystemTime::UNIX_EPOCH);
+        let environment = runtime_environment(
+            &probe_invocation(),
+            SystemTime::UNIX_EPOCH,
+            &instance_metadata::MetadataSession::new(),
+        );
         let finished = ::std::thread::Builder::new()
             .stack_size(RUN_STACK_BYTES)
             .spawn(move || {
@@ -3231,7 +3283,11 @@ mod tests {
         invocation
             .variables
             .insert("SECRET".to_string(), "value".to_string());
-        let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
+        let environment = runtime_environment(
+            &invocation,
+            SystemTime::UNIX_EPOCH,
+            &instance_metadata::MetadataSession::new(),
+        );
         let cases: &[(&str, &str)] = &[
             ("SECRET", "value"),
             ("AWS_LAMBDA_FUNCTION_NAME", "probe"),
@@ -3436,7 +3492,11 @@ mod tests {
                     missing.to_string(),
                 );
             }
-            let environment = runtime_environment(&invocation, SystemTime::UNIX_EPOCH);
+            let environment = runtime_environment(
+                &invocation,
+                SystemTime::UNIX_EPOCH,
+                &instance_metadata::MetadataSession::new(),
+            );
             let published = environment
                 .get(xray_daemon::DAEMON_ADDRESS_VARIABLE)
                 .map(String::as_str)

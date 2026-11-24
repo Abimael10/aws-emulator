@@ -56,6 +56,10 @@ use super::run_clock::Clock;
 
 /// How long an environment nothing has used is kept standing.
 ///
+/// `pub(super)` because the metadata session of an execution environment is retired on the same
+/// span: an environment this pool no longer keeps standing is one whose session is no longer
+/// that environment's ([`super::instance_metadata::session_of`]).
+///
 /// AWS states no span for this ("Lambda maintains the execution environment for some time"),
 /// so it is this host's own: an idle environment holds its interpreter's memory, and this is
 /// how long this process holds it in anticipation of the next invocation. It is far longer
@@ -67,8 +71,7 @@ use super::run_clock::Clock;
 /// thread of this emulator watching a pool nobody is invoking against: what an environment
 /// outstays this span for is the count and the memory bounds beside it, which hold whatever
 /// happens next.
-const IDLE_LIFETIME: Duration = Duration::from_secs(60);
-
+pub(super) const IDLE_LIFETIME: Duration = Duration::from_secs(60);
 /// How many idle environments this process keeps at once.
 ///
 /// One of the two bounds on what the standing environments hold of this host, beside

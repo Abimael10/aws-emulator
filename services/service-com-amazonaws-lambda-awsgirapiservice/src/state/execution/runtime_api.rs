@@ -248,6 +248,8 @@ mod tests {
             function_version: "$LATEST".to_string(),
             handler: "lambda_function.lambda_handler".to_string(),
             account_id: "000000000000".to_string(),
+            region: "us-east-1".to_string(),
+            architecture: "x86_64".to_string(),
         });
         let registering = Requested {
             method: "POST",
@@ -347,6 +349,8 @@ mod tests {
             function_version: "$LATEST".to_string(),
             handler: "lambda_function.lambda_handler".to_string(),
             account_id: "000000000000".to_string(),
+            region: "us-east-1".to_string(),
+            architecture: "x86_64".to_string(),
         });
         let registered = sandbox.register("telemetry-probe", vec!["INVOKE".to_string()]);
         let class = (
