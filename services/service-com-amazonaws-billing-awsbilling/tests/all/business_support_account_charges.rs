@@ -42,8 +42,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A second and third 12-digit account, added to the consolidated billing
 /// family so the payer account's answer covers their bills.
-const MEMBER_ACCOUNT_ID: &str = "123456789012";
-const OTHER_MEMBER_ACCOUNT_ID: &str = "210987654321";
+pub(crate) const MEMBER_ACCOUNT_ID: &str = "123456789012";
+pub(crate) const OTHER_MEMBER_ACCOUNT_ID: &str = "210987654321";
 
 /// A 12-digit account that is NOT in the consolidated billing family, so no
 /// bill of its own belongs to the payer account's answer.
@@ -52,11 +52,11 @@ const OUTSIDE_ACCOUNT_ID: &str = "999999999999";
 /// A billing month far enough in the past that the clock cannot move it: the
 /// pricing, selection and paging rows use it, so only the estimated/finalized
 /// rows depend on today's date.
-const PAST_MONTH: &str = "2024-03";
+pub(crate) const PAST_MONTH: &str = "2024-03";
 
 /// A second past billing month, so a month's answer can be shown not to carry
 /// another month's bills.
-const EARLIER_MONTH: &str = "2024-02";
+pub(crate) const EARLIER_MONTH: &str = "2024-02";
 
 /// One minor unit of currency (a cent), the scale the stored amounts use.
 const CENTS: i64 = 100;
@@ -81,7 +81,7 @@ type TierCase = (&'static str, &'static str, i64, &'static str, usize);
 
 /// One router over ONE shared engine — what `core/router` builds in production,
 /// so every call in a test observes the same state.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -90,7 +90,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Send one awsJson1_0 call and return its HTTP status and decoded body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -118,7 +118,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The `__type` an awsJson error body carries, without its namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -130,7 +130,7 @@ fn error_code(body: &Value) -> String {
 
 /// One account-month of Support-eligible spend to persist: the plan, the
 /// currency, the per-service spend in minor units and the discount, if any.
-struct Seed {
+pub(crate) struct Seed {
     account_id: &'static str,
     billing_month: &'static str,
     support_plan_name: &'static str,
@@ -142,7 +142,7 @@ struct Seed {
 
 impl Seed {
     /// A record of a single service's spend — the shape most rows need.
-    fn one_service(
+    pub(crate) fn one_service(
         account_id: &'static str,
         billing_month: &'static str,
         support_plan_name: &'static str,
@@ -194,7 +194,7 @@ impl Seed {
 /// Persist every seeded record, and put every account it names (bar the one
 /// deliberately left outside) in the consolidated billing family, so the payer
 /// account's answer covers their bills.
-fn persist(engine: &Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
+pub(crate) fn persist(engine: &Arc<engine::InMemoryEngine>, seeds: &[Seed]) {
     let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
     let mut state = state.lock();
     for seed in seeds {
@@ -219,7 +219,7 @@ fn resident(engine: &Arc<engine::InMemoryEngine>) -> usize {
 }
 
 /// The accounts a response reports, in the order it reports them.
-fn reported_accounts(body: &Value) -> Vec<String> {
+pub(crate) fn reported_accounts(body: &Value) -> Vec<String> {
     body["accountCharges"]
         .as_array()
         .map(|charges| {
@@ -257,7 +257,7 @@ fn month_from_now(offset: i32) -> String {
 }
 
 /// A whole number of currency units, in the minor units the store holds.
-fn units(whole: i64) -> i64 {
+pub(crate) fn units(whole: i64) -> i64 {
     whole * CENTS
 }
 

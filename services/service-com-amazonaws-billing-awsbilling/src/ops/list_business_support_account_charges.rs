@@ -313,18 +313,39 @@ fn invalid_field(member: &str, constraint: &str) -> ListBusinessSupportAccountCh
     .into()
 }
 
-/// What the member that chooses the sequence this read walks names — the
-/// billing month whose bills are paged — as the refusal of a token minted for
-/// another one words it.
+/// What each member that chooses the sequence this read walks names — the
+/// billing month whose bills are paged, and the account the breakdown is
+/// narrowed to — as the refusal of a token minted for another one words it.
 const SCOPE_BILLING_MONTH: &str = "billing month";
+const SCOPE_ACCOUNT_FILTER: &str = "account filter";
+
+/// The account the request narrows the breakdown to, as the scope field a
+/// `nextToken` carries for it: the 12-digit `accountId` it names, or — for a
+/// request that names none, whose answer "includes charges for all linked
+/// accounts" — the empty string, which the modeled `AccountId` pattern
+/// (`^[0-9]{12}$`) admits for no account.
+fn account_filter_scope(account_id: Option<&str>) -> &str {
+    account_id.unwrap_or_default()
+}
 
 /// The store key a `nextToken` resumes after, or a `ValidationException` when
 /// the token is no cut point of the sequence THIS request selects: one this
 /// service cannot read back, one a caller assembled, one it minted for another
-/// of its paginated reads, and one it minted while paging another billing
-/// month, whose keys are that month's and name no bill of this one. The token
-/// format and the unusable-token wording live in `crate::state`, shared with
-/// this service's other paginated reads.
+/// of its paginated reads, and one it minted while paging another selection of
+/// bills — another billing month, whose keys are that month's and name no bill
+/// of this one, or another account filter, whose walk holds bills this one does
+/// not.
+///
+/// A cursor is a position among the entries the request selects, so a token is
+/// usable only by a request that selects the same ones: comparing a cut point of
+/// another selection against these keys would drop every bill of this walk that
+/// sorts at or below it — bills the walk the token came from never reported —
+/// and answer that truncated page with a 200. `maxResults` is deliberately NOT
+/// part of the scope: a page size is how much of one walk a caller takes, not
+/// which bills the walk is over.
+///
+/// The token format and the unusable-token wording live in `crate::state`,
+/// shared with this service's other paginated reads.
 fn resume_key(
     key: &crate::state::PageTokenKey,
     read_by: &str,
@@ -517,13 +538,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The key the store's tokens are authenticated under, taken off the
         // store by value so the walk below can borrow the records it reports.
-        // The month the request names selects WHICH bills are walked — the store
-        // is keyed month first, so a cut point of another month is a key of
-        // another sequence — so every token of this walk carries it and one
-        // minted for another month is refused rather than compared against this
-        // month's keys.
+        // The members the request names select WHICH bills are walked — the
+        // month, because the store is keyed month first, so a cut point of
+        // another month is a key of another sequence, and the `accountId`
+        // filter, because it decides which of the month's bills the walk holds
+        // at all — so every token of this walk carries both and one minted under
+        // another selection is refused rather than compared against the keys of
+        // this one.
         let page_key = state.page_token_key();
-        let scope = [(SCOPE_BILLING_MONTH, input.billing_month.as_str())];
+        let scope = [
+            (SCOPE_BILLING_MONTH, input.billing_month.as_str()),
+            (
+                SCOPE_ACCOUNT_FILTER,
+                account_filter_scope(input.account_id.as_deref()),
+            ),
+        ];
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
