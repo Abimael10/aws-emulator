@@ -37,11 +37,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID, REGION};
 
 /// The Identity Center instance id every create below names, as Identity Center mints one.
-const INSTANCE_ID: &str = "ssoins-1234567890abcdef";
+pub const INSTANCE_ID: &str = "ssoins-1234567890abcdef";
 
 /// An Identity Center instance ARN, as Identity Center spells one:
 /// `arn:aws:sso:::instance/<instance id>`.
-const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
+pub const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
 
 /// An emulator whose account HOLDS the Identity Center instances `instance_ids` names.
 ///
@@ -49,7 +49,7 @@ const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
 /// ([`crate::identity_center_instance`] pins that rule), so a suite about the SINGLETON
 /// stands the instances it names up first — seeded into the Identity Center store the way
 /// that service's own create writes them.
-fn emulator_holding(instance_ids: &[&str]) -> MultiServiceRouter {
+pub fn emulator_holding(instance_ids: &[&str]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = engine.state::<IdentityCenterState>();

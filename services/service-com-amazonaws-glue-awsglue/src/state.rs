@@ -1467,8 +1467,8 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `DeleteGlueIdentityCenterConfiguration` and
     /// `UpdateGlueIdentityCenterConfiguration` take no input at all, so the account is the
     /// whole address of the configuration and there is at most one of it. A create while
-    /// one is stored is therefore a duplicate rather than an overwrite, and a read or a
-    /// delete while none is stored is a miss.
+    /// one is stored is therefore a duplicate rather than an overwrite, and a read, an
+    /// update or a delete while none is stored is a miss.
     pub identity_center_configuration: Option<IdentityCenterConfigurationEntry>,
     /// The job-run state changes this store has observed and not published yet, oldest
     /// first ([`job_run_events`]).

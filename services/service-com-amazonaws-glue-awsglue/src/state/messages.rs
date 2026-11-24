@@ -808,7 +808,7 @@ pub fn session_id_not_found(session_id: &str) -> String {
 pub const RUN_STATEMENT_SESSION_NOT_FOUND: &str = "Entity not found";
 
 /// A read of the Glue Identity Center configuration of an account that has none
-/// (`GetGlueIdentityCenterConfiguration`), and the delete of the same absent
+/// (`GetGlueIdentityCenterConfiguration`), and the delete or update of the same absent
 /// singleton.
 ///
 /// Recorded constant: the refusal names the Identity Center application Glue could not

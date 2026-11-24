@@ -79,6 +79,27 @@ impl IdentityCenterConfigurationEntry {
             user_background_sessions_enabled,
         }
     }
+
+    /// Apply the members an `UpdateGlueIdentityCenterConfiguration` carries to the stored
+    /// configuration.
+    ///
+    /// Each member the request SENT replaces the stored value of that member, and a member
+    /// the request omitted keeps the value the last write gave it: the update addresses the
+    /// singleton the account already holds, so what it does not mention it does not change.
+    /// The application and the instance the create registered are not modelled as inputs of
+    /// the update at all, so they survive every update untouched.
+    pub fn apply_update(
+        &mut self,
+        scopes: Option<&Vec<String>>,
+        user_background_sessions_enabled: Option<bool>,
+    ) {
+        if let Some(scopes) = scopes {
+            self.scopes = Some(scopes.clone());
+        }
+        if let Some(enabled) = user_background_sessions_enabled {
+            self.user_background_sessions_enabled = Some(enabled);
+        }
+    }
 }
 
 /// How many Identity Center application ids this process has minted. A nonce source for

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGlueIdentityCenterConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGlueIdentityCenterConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGlueIdentityCenterConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Modifies the Glue Identity Center configuration this account already holds — an account
+//! SINGLETON ([`crate::ops::get_glue_identity_center_configuration`]), so the update takes
+//! no address at all and changes the one configuration the account's create registered.
+//!
+//! Each member the request SENDS replaces the stored value of that member
+//! ([`crate::state::IdentityCenterConfigurationEntry::apply_update`]), and a member it
+//! omits keeps the value the last write gave it; the `ApplicationArn` the create minted and
+//! the `InstanceArn` it named are not inputs of this operation, so an update never moves
+//! the application to another instance. What an update wrote is read back through
+//! `GetGlueIdentityCenterConfiguration`.
+//!
+//! An account that holds NO configuration — one where no
+//! `CreateGlueIdentityCenterConfiguration` has run, or where a
+//! `DeleteGlueIdentityCenterConfiguration` has returned the account to that state — has
+//! nothing to modify, so the update is refused with `EntityNotFoundException`, the same
+//! miss the read and the delete of the absent singleton answer, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +155,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGlueIdentityCenterConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGlueIdentityCenterConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGlueIdentityCenterConfiguration"))
+        // The request carries only the members to change: the configuration is the
+        // account's own.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateGlueIdentityCenterConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Identity Center store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The miss and the write happen under ONE hold of the store's guard, so an update
+        // racing the delete of the singleton either modifies a configuration that is still
+        // there or is refused, and never writes one back after it was removed.
+        let mut store = state.lock();
+        let Some(configuration) = store.identity_center_configuration.as_mut() else {
+            return Err(
+                UpdateGlueIdentityCenterConfigurationErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::IDENTITY_CENTER_CONFIGURATION_NOT_FOUND
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        configuration.apply_update(input.scopes.as_ref(), input.user_background_sessions_enabled);
+        ::tracing::info!(
+            operation = "UpdateGlueIdentityCenterConfiguration",
+            "modified the Glue Identity Center configuration of this account"
+        );
+
+        // The response models no member: what the update wrote is what the read reports.
+        Ok(UpdateGlueIdentityCenterConfigurationOutput {})
     }
 }
+
