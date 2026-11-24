@@ -65,7 +65,11 @@ fn read_from_the_start(name: &str) -> serde_json::Value {
 }
 
 /// Whether `payload` carries `frame` as a contiguous run of bytes.
-fn carries(payload: &[u8], frame: &[u8]) -> bool {
+///
+/// `pub(crate)` because the read-scoping suite beside this one (`read_stream_scoping`) asks
+/// the same question of a served payload and of a refusal, and one reader is what keeps the
+/// two suites agreeing on what "carries this stream's media" means.
+pub(crate) fn carries(payload: &[u8], frame: &[u8]) -> bool {
     !frame.is_empty() && payload.windows(frame.len()).any(|window| window == frame)
 }
 

@@ -8,11 +8,14 @@
 //!
 //! 1. the address belongs to the STREAM it was discovered for — "Gets an endpoint for a
 //!    specified stream for either reading or writing", with the stream named in the
-//!    discovery call's own input — so a session naming any other stream, whether that
-//!    stream is another active stream of the account or a name that exists nowhere, asked
-//!    an endpoint for a stream it does not serve: refused HTTP 404
+//!    discovery call's own input — so a session naming another stream of the account used
+//!    the wrong endpoint: refused HTTP 400 `InvalidEndpointException`, the class Kinesis
+//!    Video Media declares for a "caller used wrong endpoint" and whose remedy is to
+//!    re-run `GetDataEndpoint` and produce at the endpoint it reports. A session naming an
+//!    identifier the registry does not hold is the OTHER class, HTTP 404
 //!    `ResourceNotFoundException` with the sentence this family states for a stream that
-//!    is not there to serve, and nothing persisted to either stream;
+//!    is not there to serve: the registry's answer is settled before the address is read
+//!    against it. Either way nothing is persisted to either stream;
 //! 2. the payload hash the producer's signature covers has to be DECLARED in
 //!    `x-amz-content-sha256`, because the ingest front end is handed a stream and never
 //!    buffers a body to hash: a session that declares none carries a signature over
@@ -40,6 +43,16 @@ const CONTENT_SHA256: &str = "x-amz-content-sha256";
 /// out as the wire carries it rather than read off the code under test — the clause "not
 /// found or not active" is the fixed text of the refusal.
 const STREAM_NOT_FOUND: &str = "The requested stream is not found or not active.";
+
+/// The sentence Kinesis Video Media states for a caller that used the wrong endpoint,
+/// written out as the wire carries it rather than read off the code under test: the
+/// documented text of `InvalidEndpointException`
+/// (`smithy_query(query="doc", shape="InvalidEndpointException")`), whose remedy clause is
+/// what a client re-discovers its endpoint on.
+const WRONG_ENDPOINT: &str = "Caller used wrong endpoint to write data to a stream. On \
+                              receiving such an exception, the user must call \
+                              GetDataEndpoint with AccessMode set to \"READ\" and use the \
+                              endpoint Kinesis Video returns in the next GetMedia call.";
 
 /// The producer clock every session in this suite is stamped from: a whole second, well
 /// behind this machine's clock, so no row is refused for a timestamp that has not happened.
@@ -105,12 +118,35 @@ enum Named {
     AbsentArn,
 }
 
+/// What this endpoint answers a row's session with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The session is admitted and its media taken.
+    Served,
+    /// The stream resolved, but at an address announced for another one: the
+    /// wrong-endpoint class.
+    WrongEndpoint,
+    /// The registry holds no such stream at all: the not-found class.
+    NotFound,
+}
+
+impl Answer {
+    /// The status, error code and sentence this answer is stated with.
+    fn refusal(self) -> Option<(u16, &'static str, &'static str)> {
+        match self {
+            Self::Served => None,
+            Self::WrongEndpoint => Some((400, "InvalidEndpointException", WRONG_ENDPOINT)),
+            Self::NotFound => Some((404, "ResourceNotFoundException", STREAM_NOT_FOUND)),
+        }
+    }
+}
+
 /// One row of rule 1: which stream the session names, and whether this endpoint serves it.
 #[derive(Debug, Clone, Copy)]
 struct Row {
     case: &'static str,
     named: Named,
-    served: bool,
+    answer: Answer,
 }
 
 /// The rows, differing along which stream the identical session named and in which form.
@@ -118,40 +154,41 @@ const ROWS: &[Row] = &[
     Row {
         case: "the endpoint's own stream, by name",
         named: Named::OwnStreamByName,
-        served: true,
+        answer: Answer::Served,
     },
     Row {
         case: "the endpoint's own stream, by ARN",
         named: Named::OwnStreamByArn,
-        served: true,
+        answer: Answer::Served,
     },
     Row {
         case: "another active stream of the account, by name",
         named: Named::OtherStreamByName,
-        served: false,
+        answer: Answer::WrongEndpoint,
     },
     Row {
         case: "another active stream of the account, by ARN",
         named: Named::OtherStreamByArn,
-        served: false,
+        answer: Answer::WrongEndpoint,
     },
     Row {
         case: "a stream name that exists nowhere",
         named: Named::AbsentName,
-        served: false,
+        answer: Answer::NotFound,
     },
     Row {
         case: "a well-formed stream ARN that exists nowhere",
         named: Named::AbsentArn,
-        served: false,
+        answer: Answer::NotFound,
     },
 ];
 
 /// RULE: an announced ingest endpoint serves the ONE stream it was discovered for — a
-/// session naming any other stream is refused 404 `ResourceNotFoundException` with the
-/// sentence this family states for a stream that is not there to serve, and persists
-/// nothing to either stream, while the endpoint keeps serving its own stream in either
-/// identifier form.
+/// session naming another stream of the account is refused 400 `InvalidEndpointException`
+/// with the sentence that class carries, a session naming an identifier the registry does
+/// not hold is refused 404 `ResourceNotFoundException` with the sentence this family
+/// states for a stream that is not there to serve, both persist nothing to either stream,
+/// and the endpoint keeps serving its own stream in either identifier form.
 #[tokio::test]
 async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
     let harness = Harness::new();
@@ -186,7 +223,7 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
             .put_media_at(&own_host, &headers, container(0x40 + index as u8))
             .await;
 
-        if row.served {
+        if row.answer == Answer::Served {
             assert_eq!(
                 status(&response),
                 200,
@@ -210,25 +247,29 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
             );
             own_archived += 2;
         } else {
+            let (expected_status, expected_code, expected_message) = row
+                .answer
+                .refusal()
+                .expect("every row but the served one states a refusal");
             assert_eq!(
                 status(&response),
-                404,
-                "case {case:?}: a stream this endpoint does not serve must be refused, \
-                 got {} {}",
+                expected_status,
+                "case {case:?}: a stream this endpoint does not serve must be refused \
+                 {expected_status}, got {} {}",
                 status(&response),
                 text(&response)
             );
             assert_eq!(
                 error_code(&response),
-                "ResourceNotFoundException",
-                "case {case:?}: expected the missing-stream class, got {:?} {}",
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {:?} {}",
                 error_code(&response),
                 text(&response)
             );
             assert_eq!(
                 message(&response),
-                STREAM_NOT_FOUND,
-                "case {case:?}: expected the family's own sentence, got {:?}",
+                expected_message,
+                "case {case:?}: expected that class's own sentence, got {:?}",
                 message(&response)
             );
             assert!(

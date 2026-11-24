@@ -356,10 +356,10 @@ pub fn published_endpoint<Eng: Send + Sync + 'static>(
 ///
 /// An announced endpoint is the endpoint of the stream it was discovered for, so a media
 /// API served there serves that stream and no other: a request naming a different stream
-/// reached an endpoint that does not serve the stream it asked for, which is the same
-/// condition as a stream that is not there to serve — and `ResourceNotFoundException`
-/// ("Amazon Kinesis Video Streams can't find the stream that you specified") is the class
-/// of both.
+/// used the wrong endpoint, which the media endpoint's own
+/// `InvalidEndpointException` is declared for ("Caller used wrong endpoint … the user must
+/// call GetDataEndpoint … and use the endpoint Kinesis Video returns in the next GetMedia
+/// call") and is a different condition from a stream that is not there to serve.
 ///
 /// `true` for an address this store announced nothing at: this emulator knows the stream
 /// of the endpoints it published and of no others, so a request that reached a host

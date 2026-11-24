@@ -56,8 +56,8 @@
 //! - the stream the request names has to be the stream the ADDRESS it arrived on was
 //!   announced for ([`serves_the_addressed_stream`]): `GetDataEndpoint` resolves an
 //!   endpoint for the stream the discovery call named, so an ingest address is that one
-//!   stream's and a request naming any other reached an endpoint that does not serve the
-//!   stream it asked for.
+//!   stream's and a request naming any other used the wrong endpoint, refused with the
+//!   class this family declares for exactly that ([`crate::service::wrong_endpoint`]).
 //!
 //! Every accepted Cluster is persisted through
 //! [`crate::state::ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::ingest_fragment`],
@@ -341,11 +341,11 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             return stream_not_found(&session).response();
         };
         // And it has to be the stream this ADDRESS serves: an announced ingest endpoint
-        // belongs to the stream it was discovered for, so a session naming any other
-        // stream — whether or not that stream exists — asked an endpoint for a stream it
-        // does not serve, which is the same refusal as a stream that is not there.
+        // belongs to the stream it was discovered for, so a session naming another stream
+        // that DID resolve used the wrong endpoint, and is refused the class whose remedy
+        // is to discover that stream's own endpoint and produce there.
         if !serves_the_addressed_stream(&*self.engine, req, &stream_arn) {
-            return stream_not_found(&session).response();
+            return wrong_endpoint().response();
         }
 
         // Reading the container — up to one request's ceiling of media, re-framed Cluster
@@ -659,6 +659,18 @@ fn stream_not_found(_session: &SubmittedSession) -> Refusal {
     }
 }
 
+/// `InvalidEndpointException` for a session that resolved its stream at an address
+/// announced for a DIFFERENT one: this plane's envelope carrying the status, the code and
+/// the sentence the class is declared with ([`crate::service::wrong_endpoint`]), which the
+/// modelled read route refuses the same condition with.
+fn wrong_endpoint() -> Refusal {
+    Refusal {
+        status: crate::service::wrong_endpoint::STATUS,
+        code: crate::service::wrong_endpoint::ERROR_CODE,
+        message: crate::service::wrong_endpoint::MESSAGE.to_string(),
+    }
+}
+
 /// The refusal a request earns when its signature covers no payload hash the ingest front
 /// end can check: HTTP 403 `InvalidSignatureException`, with nothing read and nothing
 /// ingested, or `None` when the request declares one.
@@ -700,7 +712,7 @@ const SIGNATURE_NOT_VERIFIED: &str = "The request signature we calculated does n
 /// A `DataEndpoint` is resolved per stream — `GetDataEndpoint` takes `StreamName`/
 /// `StreamARN` so that "an endpoint for a specified stream" is what it hands back — so the
 /// ingest address a producer was given serves that one stream, and a session naming
-/// another stream on it reached an endpoint that does not serve the stream it asked for.
+/// another stream on it used the wrong endpoint ([`crate::service::wrong_endpoint`]).
 /// Which stream an address was announced for comes from the control plane that announced
 /// it ([`control_plane::endpoint_serves_stream`]), so an address this emulator published
 /// nothing at carries no stream to check against and nothing here narrows it.

@@ -715,12 +715,27 @@ async fn the_announced_scheme_is_the_only_transport_the_plane_serves() {
     );
 }
 
+/// One row of the per-stream scoping table: the case, the origin the read is sent to, the
+/// route asked for there, the stream the read names, and the refusal it earns — `None` when
+/// the read is served.
+type ScopingRow<'a> = (
+    &'a str,
+    &'a String,
+    &'a str,
+    &'a str,
+    Option<(u16, &'a str, &'a str)>,
+);
+
 /// RULE: an announced endpoint belongs to the STREAM it was discovered for — "Gets an
 /// endpoint for a specified stream for either reading or writing", with the stream named in
 /// the discovery call's own input — so the reads served there read that stream and no
-/// other: a read naming a different stream asked an endpoint for a stream it does not
-/// serve, which is as unreadable as a stream that is not there and is refused with the same
-/// class and sentence, while each stream's own endpoint keeps serving it.
+/// other: a read naming a different stream used the wrong endpoint, refused in the class
+/// the serving endpoint's own model declares for that — Kinesis Video Media's
+/// `InvalidEndpointException` (400), whose remedy is to re-run `GetDataEndpoint` and read
+/// at the endpoint it reports, and, for the archived-media endpoint, whose model declares
+/// no such class, the missing-stream class it does declare. An identifier no record
+/// answers to is the missing-stream class at either endpoint, and each stream's own
+/// endpoint keeps serving it.
 ///
 /// The rows differ in which endpoint the read was sent to (the archived-media one and the
 /// live media one, so the scoping is a property of the announced address rather than of one
@@ -731,6 +746,21 @@ async fn an_announced_endpoint_reads_only_the_stream_it_was_discovered_for() {
     /// A second retained stream of the same account, so one stream's endpoint can be asked
     /// for the other's archive.
     const SECOND: &str = "kvam-discovered-second";
+
+    /// What a read that used the wrong endpoint earns on the LIVE media endpoint: the class
+    /// Kinesis Video Media models for exactly that caller, with the sentence it documents.
+    const WRONG_ENDPOINT: (u16, &str, &str) = (
+        400,
+        "InvalidEndpointException",
+        "Caller used wrong endpoint to write data to a stream. On receiving such an \
+         exception, the user must call GetDataEndpoint with AccessMode set to \"READ\" and \
+         use the endpoint Kinesis Video returns in the next GetMedia call.",
+    );
+
+    /// What a stream the registry does not hold earns, and what the archived-media endpoint
+    /// earns for a stream it was not announced for: its model declares no wrong-endpoint
+    /// class, so the stream it will not read is reported as the missing resource.
+    const NOT_FOUND: (u16, &str, &str) = (404, "ResourceNotFoundException", STREAM_NOT_FOUND);
 
     let router = emulator();
     create_stream(&router, RETAINED, 1).await;
@@ -752,52 +782,65 @@ async fn an_announced_endpoint_reads_only_the_stream_it_was_discovered_for() {
     );
 
     let client = stock_client();
-    // (case, the origin the read is sent to, the route, the stream it names, served).
-    let rows: Vec<(&str, &String, &str, &str, bool)> = vec![
+    let rows: Vec<ScopingRow> = vec![
         (
             "the archive listing of another stream, on this stream's archive origin",
             &own_archive,
             "/listFragments",
             SECOND,
-            false,
+            Some(NOT_FOUND),
         ),
         (
             "the archive listing of a stream that exists nowhere",
             &own_archive,
             "/listFragments",
             ABSENT,
-            false,
+            Some(NOT_FOUND),
         ),
         (
             "the archive listing of this origin's own stream",
             &own_archive,
             "/listFragments",
             RETAINED,
-            true,
+            None,
         ),
         (
             "the live read of another stream, on this stream's media origin",
             &own_media,
             "/getMedia",
             SECOND,
-            false,
+            Some(WRONG_ENDPOINT),
+        ),
+        (
+            "the live read of a stream that exists nowhere, on this stream's media origin",
+            &own_media,
+            "/getMedia",
+            ABSENT,
+            Some(NOT_FOUND),
         ),
         (
             "the live read of this origin's own stream",
             &own_media,
             "/getMedia",
             RETAINED,
-            true,
+            None,
+        ),
+        (
+            "the other stream's live read on its OWN media origin",
+            &second_media,
+            "/getMedia",
+            SECOND,
+            None,
         ),
         (
             "the other stream's archive listing on its OWN archive origin",
             &second_archive,
             "/listFragments",
             SECOND,
-            true,
+            None,
         ),
     ];
-    for (case, origin, path, named, served) in rows {
+    for (case, origin, path, named, refusal) in rows {
         let body = match path {
             "/getMedia" => json!({
                 "StreamName": named,
@@ -806,28 +849,29 @@ async fn an_announced_endpoint_reads_only_the_stream_it_was_discovered_for() {
             _ => json!({ "StreamName": named, "FragmentSelector": whole_archive() }),
         };
         let answer = dial(&client, case, origin, path, &body).await;
-        if served {
-            assert_eq!(
+        match refusal {
+            None => assert_eq!(
                 answer.status, 200,
                 "case {case:?}: an origin serves the stream it was announced for, got {answer:?}"
-            );
-        } else {
-            assert_eq!(
-                answer.status, 404,
-                "case {case:?}: an origin must not read a stream it was not announced for, \
-                 got {answer:?}"
-            );
-            assert_eq!(
-                answer.error_code(),
-                "ResourceNotFoundException",
-                "case {case:?}: expected the missing-stream class, got {answer:?}"
-            );
-            assert_eq!(
-                answer.message(),
-                STREAM_NOT_FOUND,
-                "case {case:?}: expected {STREAM_NOT_FOUND:?}, got {:?}",
-                answer.message()
-            );
+            ),
+            Some((status, code, message)) => {
+                assert_eq!(
+                    answer.status, status,
+                    "case {case:?}: an origin must not read a stream it was not announced \
+                     for, got {answer:?}"
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    code,
+                    "case {case:?}: expected {code}, got {answer:?}"
+                );
+                assert_eq!(
+                    answer.message(),
+                    message,
+                    "case {case:?}: expected {message:?}, got {:?}",
+                    answer.message()
+                );
+            }
         }
     }
 }

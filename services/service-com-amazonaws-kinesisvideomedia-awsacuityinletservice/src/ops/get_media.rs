@@ -29,10 +29,15 @@
 //! `GetMedia` holds the connection open and keeps streaming new fragments, while this
 //! one ends the session at the newest fragment persisted when the call arrived and
 //! hands back the token that resumes there. The throttling
-//! (`ClientLimitExceededException`, `ConnectionLimitExceededException`) and wrong-endpoint
-//! (`InvalidEndpointException`) behaviours, and the stream-level/expired-token refusal the
-//! modelled `NotAuthorizedException` (401) carries, are not modelled here and are filed as
-//! their own gap issues.
+//! (`ClientLimitExceededException`, `ConnectionLimitExceededException`) behaviours, and the
+//! stream-level/expired-token refusal the modelled `NotAuthorizedException` (401) carries,
+//! are not modelled here and are filed as their own gap issues.
+//!
+//! A read that resolved its stream at an address announced for a DIFFERENT stream used the
+//! wrong endpoint, which this handler refuses with the modelled `InvalidEndpointException`
+//! (400) — the class whose own documentation carries the remedy, re-running
+//! `GetDataEndpoint` and retrying at the endpoint it reports
+//! ([`crate::service::wrong_endpoint`]).
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +200,17 @@ pub const UNDECODABLE_CONTINUATION_TOKEN_MESSAGE: &str = "Illegal embedded sign 
 fn resource_not_found(message: impl Into<String>) -> GetMediaError {
     GetMediaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `InvalidEndpointException` (HTTP 400) — the modelled refusal of a read that used the
+/// wrong endpoint: it resolved its stream, but at an address announced for another one.
+/// The sentence is the class's own, stated once for both of this endpoint's data routes
+/// ([`crate::service::wrong_endpoint`]).
+fn invalid_endpoint() -> GetMediaError {
+    GetMediaErrorModeled::InvalidEndpointException(InvalidEndpointException {
+        message: Some(crate::service::wrong_endpoint::MESSAGE.to_string()),
     })
     .into()
 }
@@ -622,17 +638,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
             // And the stream has to be the one the ADDRESS serves: an announced data
             // endpoint is the endpoint of the stream it was discovered for, so a read at
-            // it naming another stream asked an endpoint for a stream it does not serve —
-            // as unreadable as a stream that is not there, and the same sentence.
+            // it naming another stream used the wrong endpoint — the one condition
+            // `InvalidEndpointException` is declared for, and whose remedy is to discover
+            // this stream's own endpoint and read there.
             if !crate::service::read_plane::serves_the_addressed_stream(
                 &*self.engine,
                 ctx.parts(),
                 &stream.arn,
             ) {
-                return Err(resource_not_found(
-                    ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state::STREAM_NOT_FOUND_MESSAGE
-                        .to_string(),
-                ));
+                return Err(invalid_endpoint());
             }
             let fragments = stream.fragments;
             let start = match selector_type {

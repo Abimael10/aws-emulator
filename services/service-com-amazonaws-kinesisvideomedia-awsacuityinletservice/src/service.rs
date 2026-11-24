@@ -84,12 +84,18 @@
 //! that path, so [`Service::override_operation`] names this family's front-door answer for
 //! an unroutable request instead of the operation — nothing is resolved and nothing is
 //! read.
+//!
+//! An announced address serves ONE stream, too, and both data routes hold a call to that:
+//! a call that resolved its stream at an address announced for a different one used the
+//! wrong endpoint, which is the condition this service's `InvalidEndpointException` is
+//! declared for and which [`wrong_endpoint`] states once for both routes.
 
 pub mod authorization;
 pub mod matroska;
 pub mod put_media;
 pub mod read_plane;
 pub mod validation;
+pub mod wrong_endpoint;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,

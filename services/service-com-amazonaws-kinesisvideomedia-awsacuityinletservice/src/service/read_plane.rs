@@ -62,8 +62,9 @@ pub fn read_plane_served_at<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRe
 ///
 /// An endpoint is discovered PER STREAM — `GetDataEndpoint` takes `StreamName`/`StreamARN`
 /// so that "an endpoint for a specified stream" is what it reports — so the address a
-/// reader was handed serves that one stream, and a read there naming another stream asked
-/// an endpoint for a stream it does not serve. The sibling [`super::put_media`] scopes the
+/// reader was handed serves that one stream, and a read there naming another stream used
+/// the wrong endpoint, which both data routes refuse with the class declared for that
+/// condition ([`super::wrong_endpoint`]). The sibling [`super::put_media`] scopes the
 /// ingest route by the same reading, against the same record of which stream an address
 /// was announced for, so the two routes of this one endpoint cannot drift on whose media
 /// they serve.
