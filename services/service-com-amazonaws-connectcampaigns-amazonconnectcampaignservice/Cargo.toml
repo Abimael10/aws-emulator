@@ -38,5 +38,9 @@ service-com-amazonaws-connect-amazonconnectservice = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite is added by adding its file.
+automod = { workspace = true }
+
 [lints]
 workspace = true

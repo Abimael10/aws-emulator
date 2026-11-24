@@ -925,35 +925,6 @@ async fn every_run_state_renders_as_a_value_the_model_declares() {
     );
 }
 
-#[tokio::test]
-async fn operations_outside_this_slice_still_answer_501() {
-    // The campaign slice is implemented; the rest of the service is still scaffolded, and
-    // a scaffold must answer 501 rather than an empty success. These are each their own
-    // gap issue.
-    let router = service_router();
-    let id = created_id(&router, &simple_request("not-yet", "inst-1")).await;
-
-    // `GetCampaignStateBatch` used to sit here; it is implemented now, and the batch
-    // state read has its own suite (`campaign_state_batch.rs`). `ResumeCampaign` left
-    // for the same reason, with the resume transition in `campaign_resume.rs`.
-    let rows: &[(&str, String, Option<Value>)] = &[(
-        "UpdateCampaignDialerConfig",
-        format!("/campaigns/{id}/dialer-config"),
-        Some(json!({
-            "dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 0.25}}
-        })),
-    )];
-
-    for (case, path, body) in rows {
-        let answer = call(&router, "POST", path, body.as_ref()).await;
-        assert_eq!(
-            answer.status, 501,
-            "case {case:?}: expected 501 from an unimplemented operation, got {} {:?}",
-            answer.status, answer.body
-        );
-    }
-}
-
 /// One page of ListCampaigns: the ids it reports, and the `nextToken` it answers with.
 async fn list_page(
     router: &MultiServiceRouter,

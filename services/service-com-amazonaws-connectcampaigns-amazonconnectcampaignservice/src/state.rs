@@ -691,6 +691,55 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         })
     }
 
+    /// Replace the dialer config of one campaign with the one a request carries, and
+    /// report what that did, or report why nothing was written.
+    ///
+    /// The one place a campaign's dialer config is amended, so the operation that updates
+    /// it and every later reader of it cannot disagree about what an update does: the
+    /// whole config the request carries — the union member it names and that member's own
+    /// parameters — replaces the stored one, and no other part of the campaign (its id,
+    /// ARN, name, instance, outbound-call config, tags, run state or creation order)
+    /// moves. The campaign's run state is not weighed at all: a dialer config is a
+    /// parameter of the campaign rather than of a run, so a campaign that is dialling
+    /// takes an amendment exactly as an idle one does.
+    ///
+    /// What the amendment may NOT do is move the campaign between dialling WITH agents
+    /// and dialling without them ([`DialerType::is_agentless`]): that is the kind of
+    /// campaign it is, fixed when it was created, so a request asking for the other kind
+    /// is refused ([`DialerAmendRefused::DialerTypeChange`], the modelled
+    /// `ValidationException`, worded by [`dialer_type_change_message`] around the two
+    /// types) and nothing is written. WITHIN the agent-based kind the dialer type moves
+    /// freely — a campaign dialling progressively takes the predictive dialer and the
+    /// other way about — which is what the recorded responses of this operation show.
+    ///
+    /// A request carrying the config the campaign already holds is reported as
+    /// [`AmendApplied::Unchanged`] and nothing is written, which is what makes the update
+    /// idempotent: a retry after a timeout, and two callers asking for the same config,
+    /// each succeed and leave one stored config behind.
+    pub fn amend_dialer_config(
+        &mut self,
+        id: &str,
+        wanted: &DialerConfig,
+    ) -> Result<AmendApplied, DialerAmendRefused> {
+        let stored = &mut self
+            .campaigns
+            .get_mut(id)
+            .ok_or(DialerAmendRefused::NoSuchCampaign)?
+            .dialer_config;
+        let (stored_type, wanted_type) = (DialerType::of(stored), DialerType::of(wanted));
+        if stored_type.is_agentless() != wanted_type.is_agentless() {
+            return Err(DialerAmendRefused::DialerTypeChange {
+                stored: stored_type,
+                requested: wanted_type,
+            });
+        }
+        if same_dialer_config(stored, wanted) {
+            return Ok(AmendApplied::Unchanged);
+        }
+        *stored = wanted.clone();
+        Ok(AmendApplied::Amended)
+    }
+
     /// Every campaign in creation order — the order `ListCampaigns` pages over.
     pub fn campaigns_in_creation_order(&self) -> Vec<&StoredCampaign> {
         let mut all: Vec<&StoredCampaign> = self.campaigns.values().collect();
@@ -819,6 +868,119 @@ fn same_answer_machine_detection(
         stored.enable_answer_machine_detection == wanted.enable_answer_machine_detection
             && stored.await_answer_machine_prompt == wanted.await_answer_machine_prompt
     })
+}
+
+/// Which member of the modelled `DialerConfig` union a campaign dials with: the dialer
+/// TYPE of the campaign, as `smithy_query(query="shape", shape="DialerConfig")` lists its
+/// members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialerType {
+    Progressive,
+    Predictive,
+    Agentless,
+}
+
+/// The dialer types a campaign may carry, in the order the model lists the union's
+/// members. Kept beside the enum so a caller can walk every type rather than listing them
+/// a second time.
+pub const ALL_DIALER_TYPES: &[DialerType] = &[
+    DialerType::Progressive,
+    DialerType::Predictive,
+    DialerType::Agentless,
+];
+
+impl DialerType {
+    /// The dialer type `config` carries.
+    pub fn of(config: &DialerConfig) -> Self {
+        match config {
+            DialerConfig::progressiveDialerConfig(_) => Self::Progressive,
+            DialerConfig::predictiveDialerConfig(_) => Self::Predictive,
+            DialerConfig::agentlessDialerConfig(_) => Self::Agentless,
+        }
+    }
+
+    /// Whether a campaign dialling with this dialer places its calls with NO agent on
+    /// them — which is what separates an agentless campaign from an agent-based one, and
+    /// so the one thing about a campaign's dialer that an update cannot move.
+    pub fn is_agentless(self) -> bool {
+        matches!(self, Self::Agentless)
+    }
+
+    /// The spelling this dialer type takes inside a refusal's sentence: the modelled
+    /// union member's name with the `DialerConfig` suffix it shares with the others
+    /// dropped, in UPPER CASE — the case this service names a campaign's state in a
+    /// refusal with ([`CampaignState::as_upper_wire`]).
+    pub fn as_upper_wire(self) -> &'static str {
+        match self {
+            Self::Progressive => "PROGRESSIVE",
+            Self::Predictive => "PREDICTIVE",
+            Self::Agentless => "AGENTLESS",
+        }
+    }
+}
+
+/// Why this store wrote no dialer config for a campaign, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::amend_dialer_config`]
+/// reports it. Nothing is written in either case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialerAmendRefused {
+    /// No campaign with that id is stored, so there is no config to amend: the modelled
+    /// `ResourceNotFoundException` (HTTP 404).
+    NoSuchCampaign,
+    /// The campaign dials with agents and the request asks for the agentless dialer, or
+    /// the other way about: the modelled `ValidationException` (HTTP 400), worded by
+    /// [`dialer_type_change_message`] around the two types it names.
+    DialerTypeChange {
+        stored: DialerType,
+        requested: DialerType,
+    },
+}
+
+/// Whether a stored dialer config already says what `wanted` says: the same union member,
+/// carrying the same parameters.
+///
+/// The modelled union carries no equality of its own, so the comparison lives here —
+/// beside the amendment that needs it — rather than being open-coded per caller. A config
+/// naming a different member is a different config, whatever its parameters say.
+fn same_dialer_config(stored: &DialerConfig, wanted: &DialerConfig) -> bool {
+    match (stored, wanted) {
+        (
+            DialerConfig::progressiveDialerConfig(stored),
+            DialerConfig::progressiveDialerConfig(wanted),
+        ) => {
+            stored.bandwidth_allocation == wanted.bandwidth_allocation
+                && stored.dialing_capacity == wanted.dialing_capacity
+        }
+        (
+            DialerConfig::predictiveDialerConfig(stored),
+            DialerConfig::predictiveDialerConfig(wanted),
+        ) => {
+            stored.bandwidth_allocation == wanted.bandwidth_allocation
+                && stored.dialing_capacity == wanted.dialing_capacity
+        }
+        (
+            DialerConfig::agentlessDialerConfig(stored),
+            DialerConfig::agentlessDialerConfig(wanted),
+        ) => stored.dialing_capacity == wanted.dialing_capacity,
+        _ => false,
+    }
+}
+
+/// What this service answers when a request asks a campaign to dial with agents when it
+/// was created to dial without them, or the other way about.
+///
+/// Composed from service state and the request — the dialer type the stored campaign
+/// carries and the one the request named, each spelled as [`DialerType::as_upper_wire`]
+/// renders it; the service names no campaign in it. The one text every refusal of this
+/// class shares, so neither direction of the crossing is worded differently from the
+/// other. The sentence ends in a SPACE: that is the service's own text, as the recorded
+/// refusals of this class carry it, and not a stray character to tidy away.
+pub fn dialer_type_change_message(stored: DialerType, requested: DialerType) -> String {
+    format!(
+        "Updating campaign dialer type from {} to {} is not allowed ",
+        stored.as_upper_wire(),
+        requested.as_upper_wire()
+    )
 }
 
 /// Why this store took no dial request for a campaign, as

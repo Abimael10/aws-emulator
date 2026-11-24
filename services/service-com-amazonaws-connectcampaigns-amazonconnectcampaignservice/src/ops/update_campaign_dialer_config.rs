@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignDialerConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignDialerConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignDialerConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,23 +155,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UPDATE_CAMPAIGN_DIALER_CONFIG_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Give the campaign the request addresses the dialer config the request carries.
+    ///
+    /// The whole config replaces the stored one — the `DialerConfig` member the request
+    /// names and that member's own parameters — so the config the campaign reads back
+    /// under `DescribeCampaign` is the one this request asked for. Nothing else about the
+    /// campaign moves: its id, ARN, name, Connect instance, outbound-call config, tags,
+    /// run state and place in the creation order are left as they were. The run state is
+    /// not weighed either: a dialer config is a parameter of the campaign rather than of
+    /// a run, so a campaign that is dialling takes an update exactly as an idle one does.
+    ///
+    /// A request asking for the config the campaign already carries writes nothing and
+    /// still succeeds, which is the idempotence the model declares for this operation.
+    ///
+    /// A request that would move the campaign between dialling WITH agents and dialling
+    /// without them is refused with the modelled `ValidationException` (HTTP 400) and
+    /// writes nothing: whether a campaign dials through agents is the kind of campaign it
+    /// is, settled when it was created. Within the agent-based kind the dialer type moves
+    /// freely, as the recorded responses of this operation show. An id naming no stored
+    /// campaign writes nothing and is the modelled `ResourceNotFoundException` (HTTP
+    /// 404). The ranges of the dialer parameters are the model's, so the boundary
+    /// validator has already refused a value outside them before this runs.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignDialerConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignDialerConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignDialerConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateCampaignDialerConfigError::from(
+                UpdateCampaignDialerConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the campaign store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                ),
+            )
+        })?;
+
+        let applied = state
+            .lock()
+            .amend_dialer_config(&input.id, &input.dialer_config);
+
+        match applied {
+            // An update that wrote something is audited; one that wrote nothing — because
+            // the campaign already carried that config — is not, since there is no change
+            // to record. The record names the campaign id only: a dialer's parameters are
+            // caller-supplied content and never go into an audit line.
+            Ok(crate::state::AmendApplied::Amended) => {
+                crate::state::audit_campaign_change(
+                    ctx.parts(),
+                    "UpdateCampaignDialerConfig",
+                    &input.id,
+                    "dialer config replaced",
+                );
+                Ok(UpdateCampaignDialerConfigOutput)
+            }
+            Ok(crate::state::AmendApplied::Unchanged) => Ok(UpdateCampaignDialerConfigOutput),
+            Err(crate::state::DialerAmendRefused::NoSuchCampaign) => Err(
+                UpdateCampaignDialerConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::campaign_not_found_message(&input.id),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::DialerAmendRefused::DialerTypeChange { stored, requested }) => {
+                Err(UpdateCampaignDialerConfigErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::dialer_type_change_message(stored, requested),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into())
+            }
+        }
     }
 }
