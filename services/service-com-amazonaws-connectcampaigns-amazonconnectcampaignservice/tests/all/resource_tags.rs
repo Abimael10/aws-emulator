@@ -18,11 +18,12 @@
 //! refused wherever a request names one — a map's key on a create or a tag call, a key
 //! list on an untag — ahead of any lookup, and nothing is written.
 //!
-//! A second rule is asserted here because this plane is where it shows: every reply of
-//! this service announces the media type its `restJson1` protocol trait implies
-//! (`application/json`), whichever layer answered it — a success, a refusal its handlers
-//! raise, a refusal the framework renders inside the request walk, and the tag plane's own
-//! refusals, which carry wire codes naming no shape this model declares.
+//! A second rule is asserted here because this plane is where its exception shows: a reply
+//! announces the media type of the layer that ANSWERED it. Everything this service's own
+//! front door produces — a success, a refusal its handlers raise, a refusal the framework
+//! renders inside the request walk — announces `application/x-amz-json-1.1`, while the tag
+//! plane's own refusals, which carry wire codes naming no shape this model declares, keep
+//! the `application/json` their own producer stamped.
 
 use std::collections::BTreeMap;
 
@@ -913,10 +914,13 @@ async fn a_tag_write_lands_on_exactly_the_resource_its_arn_names() {
     }
 }
 
-/// The media type every reply of this service announces: the one its `restJson1` protocol
-/// trait implies, which its recorded wire carries on a body and on a refusal envelope
-/// alike — the tag plane's own refusals included.
-const RESPONSE_MEDIA_TYPE: &str = "application/json";
+/// The media type this service's own front door announces on what it answers — not the
+/// `application/json` its `restJson1` protocol trait implies.
+const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
+/// The media type the TAG tier's own refusals are announced under: the protocol's own,
+/// which is the value their producer stamped.
+const TAG_TIER_MEDIA_TYPE: &str = "application/json";
 
 /// What one row of the media-type table asks for.
 enum Announced {
@@ -942,7 +946,7 @@ struct AnnouncedRow {
 }
 
 #[tokio::test]
-async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
+async fn every_reply_announces_the_media_type_of_the_layer_that_answered_it() {
     let router = router();
     let arn = a_stored_campaign(&router, "announced", Some(tag_map([("env", "dev")]))).await;
 
@@ -956,29 +960,29 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
     // Rows differ along the layer that answers (this service's handlers, the framework's
     // own refusal tail, the tag plane's refusals), the status class of the reply (200 with
     // a body, 200 with none, 400, 404), the operation it came from (all three tag
-    // operations, plus the campaign plane) and the class of ARN that reaches it — and every
-    // one of them announces the same value.
+    // operations, plus the campaign plane) and the class of ARN that reaches it — and each
+    // one announces the media type of the layer that answered it.
     let rows: Vec<AnnouncedRow> = vec![
         AnnouncedRow {
             case: "the tag listing of a stored campaign (200, a body)",
             asked: Announced::ListTags(arn.clone()),
             status: 200,
             code: "",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on a stored campaign (200, no body)",
             asked: Announced::Tag(arn.clone()),
             status: 200,
             code: "",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of a stored campaign (200, no body)",
             asked: Announced::Untag(arn.clone()),
             status: 200,
             code: "",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a campaign read (200, a body)",
@@ -989,7 +993,7 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
             ),
             status: 200,
             code: "",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a campaign id that resolves to nothing (404, a handler's modelled shape)",
@@ -1000,7 +1004,7 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
             ),
             status: 404,
             code: "ResourceNotFoundException",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a value outside a modelled bound (400, the walk's own refusal)",
@@ -1011,56 +1015,56 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
             ),
             status: 400,
             code: "ValidationException",
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: FRONT_DOOR_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "the tag listing of an ARN of another resource (400, the tag tier)",
             asked: Announced::ListTags(not_a_campaign.clone()),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on an ARN of another vendor (400, the tag tier)",
             asked: Announced::Tag(another_vendor.clone()),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of an ARN of another resource (400, the tag tier)",
             asked: Announced::Untag(not_a_campaign),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "the tag listing of an absent campaign (404, the tag tier)",
             asked: Announced::ListTags(absent.clone()),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on an absent campaign (404, the tag tier)",
             asked: Announced::Tag(absent.clone()),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of an absent campaign (404, the tag tier)",
             asked: Announced::Untag(absent),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag key the caller may not supply (400, the tag-key rule)",
             asked: Announced::Tag(arn.clone()),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: RESPONSE_MEDIA_TYPE,
+            announced: TAG_TIER_MEDIA_TYPE,
         },
     ];
 
@@ -1105,7 +1109,7 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
         }
         assert_eq!(
             answer.media_type, row.announced,
-            "case {:?}: expected the media type {:?} this service's protocol implies, got \
+            "case {:?}: expected the media type {:?} of the layer that answered it, got \
              {:?} on HTTP {} {}",
             row.case, row.announced, answer.media_type, answer.status, answer.body
         );

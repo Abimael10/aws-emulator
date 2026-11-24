@@ -23,7 +23,8 @@
 //!   raised, a refusal the framework rendered in front of one, and an unroutable request
 //!   alike — announces the media type that front end labels its JSON with, rather than the
 //!   one its protocol trait implies. (The refusals of the TAG tier in front of it are the
-//!   one exception, and `resource_tags.rs` owns them.)
+//!   one exception, and `resource_tags.rs` owns them; `response_media_type.rs` asserts the
+//!   whole rule across both planes.)
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::{
@@ -620,8 +621,13 @@ async fn the_next_token_this_service_hands_out_is_base64_and_resumes_the_walk() 
     );
 }
 
+/// The media type this service's own front door announces on every reply it produces,
+/// whichever layer behind it answered — not the `application/json` its `restJson1`
+/// protocol trait implies.
+const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
 #[tokio::test]
-async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
+async fn every_reply_of_the_front_door_announces_the_media_type_it_labels_its_json_with() {
     let router = router();
     let stored = a_stored_campaign(&router, "control").await;
 
@@ -678,9 +684,10 @@ async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
     for (case, method, path, body) in rows {
         let answer = call(&router, REGION, method, &path, &body).await;
         assert_eq!(
-            answer.media_type, "application/json",
-            "case {case:?}: expected every reply of this service to announce the media \
-             type its restJson1 protocol implies, got {:?} on HTTP {} {}",
+            answer.media_type, FRONT_DOOR_MEDIA_TYPE,
+            "case {case:?}: expected every reply of this service's front door to announce \
+             the media type {FRONT_DOOR_MEDIA_TYPE:?} it labels its JSON with, got {:?} on \
+             HTTP {} {}",
             answer.media_type, answer.status, answer.body
         );
     }
