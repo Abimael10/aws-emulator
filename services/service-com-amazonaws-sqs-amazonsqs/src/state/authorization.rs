@@ -261,8 +261,13 @@ fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -
 /// is a wording choice rather than part of the decision — and the wording is the service's:
 /// the recorded refusals of this service name the action case-folded (`sqs:sendmessage`),
 /// whatever case the policy and the model spell it in.
+///
+/// The spelling is the workspace's one
+/// ([`::service_common::iam_authorization::reported_action`], whose table of the namespaces
+/// worded that way carries this service), so a call this gate refuses and the same call
+/// CloudFormation reports as refused under a stack's service role name one action.
 fn reported_action(action: &str) -> String {
-    action.to_lowercase()
+    ::service_common::iam_authorization::reported_action(action)
 }
 
 /// The reason an IMPLICIT deny states: within one account the permission a principal is

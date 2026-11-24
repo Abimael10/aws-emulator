@@ -21,7 +21,11 @@
 //! The denied table's rows differ along what the rule generalises over: which transport the
 //! token names, and so which action is asked for; which of IAM's rules withheld the call (no
 //! statement about it at all, an explicit `Deny`); and what the statements name as their
-//! `Resource` (every resource, the provider's exact ARN, another provider's ARN).
+//! `Resource` (every resource, the provider's exact ARN, another provider's ARN). Each row's
+//! role is also allowed one NON-invoking action of the provider's own service, because the
+//! provider itself is a resource the same stack creates there and a deployment's calls to a
+//! service its role may act in no way at all are refused for want of a grant — so a role
+//! allowed nothing there would fail the provider instead of reaching the call under test.
 //!
 //! The controls are the second test: the same template under roles that DO allow the call —
 //! scoped to the provider's exact ARN, by a wildcard action and resource, by patterns the call
@@ -311,7 +315,12 @@ const DENIED: &[Denied] = &[
         case: "a role whose statements say nothing about invoking the provider",
         stack: "cr-grant-silent",
         transport: Transport::Function,
-        statements: |_| json!([{ "Effect": "Allow", "Action": "sns:*", "Resource": "*" }]),
+        statements: |_| {
+            json!([
+                { "Effect": "Allow", "Action": "sns:*", "Resource": "*" },
+                { "Effect": "Allow", "Action": "lambda:CreateFunction", "Resource": "*" },
+            ])
+        },
         explicit: false,
     },
     Denied {
@@ -345,7 +354,12 @@ const DENIED: &[Denied] = &[
         case: "a topic provider the role carries no publish grant for",
         stack: "cr-grant-topic-silent",
         transport: Transport::Topic,
-        statements: |_| json!([{ "Effect": "Allow", "Action": "lambda:*", "Resource": "*" }]),
+        statements: |_| {
+            json!([
+                { "Effect": "Allow", "Action": "lambda:*", "Resource": "*" },
+                { "Effect": "Allow", "Action": "sns:CreateTopic", "Resource": "*" },
+            ])
+        },
         explicit: false,
     },
     Denied {

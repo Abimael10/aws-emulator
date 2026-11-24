@@ -636,6 +636,116 @@ pub fn identity_may_allow_action(documents: &[PreparedDocument], action: &str) -
     })
 }
 
+/// Whether these identity-based documents could allow SOME action of `namespace` at all — any
+/// action of that service, on any resource.
+///
+/// The question a caller asks when it knows which SERVICE a call is made to but cannot
+/// establish the exact action a grant would have to name: a gate standing in front of work
+/// whose API calls it only approximates, where withholding every call for want of a grant on
+/// the one action it happens to make would refuse work the real service performs. `false` is
+/// the one answer that establishes something — no readable `Allow` is about that service at
+/// all, so no call to it can be granted and every one of them falls to IAM's default deny.
+///
+/// `namespace` is the action namespace of the called service (`sqs`), which is its signing
+/// name. Read in the same weaker direction as [`identity_may_allow_action`] reads its
+/// question: a grant scoped to resources the call may not even be about, and one whose
+/// `Condition` this evaluator cannot decide, both answer `true`. It says nothing about `Deny`,
+/// which is decided against the resource through [`identity_decision`].
+///
+/// The tree's ONE reading of this question: IAM's own
+/// `ListPoliciesGrantingServiceAccess` family asks it of a stored policy document
+/// (that crate's `state::grants_service_access`, which reads this one), so the service that
+/// REPORTS which policies grant access to a service and a gate that decides a call to it
+/// cannot answer differently.
+#[must_use]
+pub fn identity_may_allow_an_action_of(documents: &[PreparedDocument], namespace: &str) -> bool {
+    documents.iter().any(|document| {
+        statements(document).into_iter().any(|statement| {
+            statement["Effect"]
+                .as_str()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("Allow")
+                && names_an_action_of(statement, namespace)
+        })
+    })
+}
+
+/// The separator between an action's namespace and its own name, and the value that names
+/// every action there is — the two spellings [`names_an_action_of`] reads an action element by.
+const ACTION_SEPARATOR: char = ':';
+const ANY_ACTION: &str = "*";
+
+/// Whether the statement's action element is about some action of `namespace`.
+///
+/// An `Action` element is about the namespace when one of its values NAMES an action of it
+/// ([`reaches_namespace`]). A `NotAction` element permits the complement of its values, so it
+/// is about the namespace unless one of them covers EVERY action of it
+/// ([`covers_namespace`]): a value excluding one action of the namespace, or excluding another
+/// namespace altogether, leaves actions of this one allowed. A statement carrying neither
+/// element is about no action at all.
+fn names_an_action_of(statement: &::serde_json::Value, namespace: &str) -> bool {
+    match element(statement, "Action", "NotAction") {
+        Some((values, false)) => values
+            .iter()
+            .any(|value| reaches_namespace(value, namespace)),
+        Some((values, true)) => !values
+            .iter()
+            .any(|value| covers_namespace(value, namespace)),
+        None => false,
+    }
+}
+
+/// Whether the action-element value `value` names at least ONE action of `namespace`.
+///
+/// An action is `<namespace>:<ApiName>`, so what decides it is the part before the separator,
+/// matched as the pattern it is (`*`, `sq*`) and without regard to case, which is the
+/// comparison [`wildcard_match`] makes for every action name here. A value carrying no
+/// separator names an action only when it is the whole-element wildcard.
+fn reaches_namespace(value: &str, namespace: &str) -> bool {
+    match value.split_once(ACTION_SEPARATOR) {
+        Some((named, _action)) => wildcard_match(named, namespace, false),
+        None => value == ANY_ACTION,
+    }
+}
+
+/// Whether the action-element value `value` names EVERY action of `namespace` — what a
+/// `NotAction` value has to do to put the whole service outside the statement's grant.
+fn covers_namespace(value: &str, namespace: &str) -> bool {
+    match value.split_once(ACTION_SEPARATOR) {
+        Some((named, action)) => action == ANY_ACTION && wildcard_match(named, namespace, false),
+        None => value == ANY_ACTION,
+    }
+}
+
+/// The action namespaces whose own authorization refusal names the action CASE-FOLDED.
+///
+/// IAM compares action names case-insensitively, so the case a refusal reports is the refusing
+/// service's WORDING rather than part of the decision — and Amazon SQS words its refusals with
+/// the action case-folded throughout (`sqs:createqueue`), whatever case the policy and the
+/// model spell it in. One entry per namespace whose refusals are worded that way; a service
+/// with no entry names an action as its model spells it.
+pub const CASE_FOLDED_ACTION_NAMESPACES: &[&str] = &["sqs"];
+
+/// `action` as the service that refuses it names an action in its OWN authorization refusal
+/// ([`CASE_FOLDED_ACTION_NAMESPACES`]).
+///
+/// Stated here beside the sentences that name an action
+/// ([`not_authorized_by_identity_policy`] and its siblings) and read by both gates that word
+/// such a refusal — the service refusing its own caller, and CloudFormation reporting a call
+/// it did not make under a stack's service role — so one call cannot be refused in two
+/// spellings. `action` is the fully qualified IAM action ([`iam_action`]).
+#[must_use]
+pub fn reported_action(action: &str) -> String {
+    let namespace = action.split(ACTION_SEPARATOR).next().unwrap_or_default();
+    if CASE_FOLDED_ACTION_NAMESPACES
+        .iter()
+        .any(|folded| folded.eq_ignore_ascii_case(namespace))
+    {
+        return action.to_lowercase();
+    }
+    action.to_string()
+}
+
 /// Whether a statement of the resource-based `document` that is ABOUT `request` narrows its
 /// grant with a `Condition` over `key` — "is the decision this document took about this
 /// request one that TURNS ON that condition key?".
@@ -3019,6 +3129,140 @@ mod tests {
             assert_eq!(
                 could, expected,
                 "case {case:?}: expected identity_may_allow_action {expected}, got {could}"
+            );
+        }
+    }
+
+    /// RULE: documents could allow SOME action of a service exactly when one of them holds an
+    /// `Allow` whose action element is ABOUT that service — an `Action` value naming one of its
+    /// actions, or a `NotAction` element no value of which excludes the whole namespace —
+    /// whichever action and whichever resource that statement is scoped to, because an `Allow`
+    /// is the only thing that grants.
+    #[test]
+    fn documents_could_allow_an_action_of_a_service_an_allow_statement_names() {
+        // (case, the statements of the one document, whether SOME `sqs` action could be
+        // allowed by them)
+        let rows: [(&str, &str, bool); 14] = [
+            ("no statement at all", "", false),
+            (
+                "an allow of one action of that service",
+                "{\"Effect\":\"Allow\",\"Action\":\"sqs:CreateQueue\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow of another action of that service, scoped to one ARN",
+                "{\"Effect\":\"Allow\",\"Action\":\"sqs:DeleteQueue\",\"Resource\":\"arn:aws:sqs:us-east-1:000000000000:orders\"}",
+                true,
+            ),
+            (
+                "an allow written in another case",
+                "{\"Effect\":\"Allow\",\"Action\":\"SQS:SendMessage\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow under a wildcard over that service",
+                "{\"Effect\":\"Allow\",\"Action\":\"sqs:*\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow of every action of every service",
+                "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow under a wildcard the namespace matches",
+                "{\"Effect\":\"Allow\",\"Action\":\"sq*:*\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow of another service whose name starts the same way",
+                "{\"Effect\":\"Allow\",\"Action\":\"sqsmessages:Send\",\"Resource\":\"*\"}",
+                false,
+            ),
+            (
+                "an allow of another service's actions only",
+                "{\"Effect\":\"Allow\",\"Action\":\"ssm:*\",\"Resource\":\"*\"}",
+                false,
+            ),
+            (
+                "a DENY of that service's actions and nothing else",
+                "{\"Effect\":\"Deny\",\"Action\":\"sqs:*\",\"Resource\":\"*\"}",
+                false,
+            ),
+            (
+                "an allow of everything but ONE action of that service",
+                "{\"Effect\":\"Allow\",\"NotAction\":\"sqs:DeleteQueue\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow of everything but another service's actions",
+                "{\"Effect\":\"Allow\",\"NotAction\":\"ssm:*\",\"Resource\":\"*\"}",
+                true,
+            ),
+            (
+                "an allow of everything but that service's actions",
+                "{\"Effect\":\"Allow\",\"NotAction\":\"sqs:*\",\"Resource\":\"*\"}",
+                false,
+            ),
+            (
+                "an allow of everything but every action there is",
+                "{\"Effect\":\"Allow\",\"NotAction\":\"*\",\"Resource\":\"*\"}",
+                false,
+            ),
+        ];
+        for (case, text, expected) in rows {
+            let documents = prepare_documents(&[identity(text)]);
+            let could = identity_may_allow_an_action_of(&documents, "sqs");
+            assert_eq!(
+                could, expected,
+                "case {case:?}: expected identity_may_allow_an_action_of {expected}, got {could}"
+            );
+        }
+    }
+
+    /// RULE: a refusal names an action case-folded exactly for the namespaces whose own
+    /// refusals are worded that way, and as it was spelled for every other.
+    ///
+    /// The rows span the namespaces on each side of that table, how the action is spelled on
+    /// the way in (as the model spells it, already folded, in another case) and a value that is
+    /// not a qualified action at all.
+    #[test]
+    fn an_action_is_reported_as_the_refusing_service_words_it() {
+        // (case, the action asked for, the action a refusal names)
+        let rows: [(&str, &str, &str); 7] = [
+            (
+                "a case-folding service's action as the model spells it",
+                "sqs:CreateQueue",
+                "sqs:createqueue",
+            ),
+            (
+                "the same action already folded",
+                "sqs:createqueue",
+                "sqs:createqueue",
+            ),
+            (
+                "the same namespace in another case",
+                "SQS:SendMessage",
+                "sqs:sendmessage",
+            ),
+            (
+                "another service's action, left as it was spelled",
+                "ssm:PutParameter",
+                "ssm:PutParameter",
+            ),
+            (
+                "another service whose name starts the same way",
+                "sqsmessages:Send",
+                "sqsmessages:Send",
+            ),
+            ("the whole-action wildcard", "*", "*"),
+            ("no namespace at all", "CreateQueue", "CreateQueue"),
+        ];
+        for (case, asked, expected) in rows {
+            let named = reported_action(asked);
+            assert_eq!(
+                named, expected,
+                "case {case:?}: expected {expected:?}, got {named:?}"
             );
         }
     }

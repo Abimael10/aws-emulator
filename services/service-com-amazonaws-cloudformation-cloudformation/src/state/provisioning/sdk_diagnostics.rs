@@ -412,6 +412,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ServiceDiscovery",
         SdkDiagnostic::Attempts,
     ),
+    // Amazon SQS's SDK names it `Sqs` — that model's own `sdkId` (`SQS`,
+    // `smithy_query(query="service_info")` on that service's model) written with only its
+    // initial capitalised, which is the name its SDK client carries, exactly as AWS Step
+    // Functions' below is. The shape is the ATTEMPT-counting one, as the recorded
+    // `ResourceStatusReason` of an `AWS::SQS::Queue` whose create the stack's service role is
+    // not authorized to make carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `cloudformation__iam__sqs__ssm.cdk-deploy-role-\
+    // arn-stays-the-stacks-role-for-later-deploys`, whose reason reads `Resource handler
+    // returned message: "<the service's sentence> (Service: Sqs, Status Code: 403, Request ID:
+    // …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode: AccessDenied)`). The two
+    // resource types this emulator provisions over this signing name are both that service's
+    // ([`crate::state::provisioner::application_services`]'s queue and queue-policy arms).
+    ("sqs", "Sqs", SdkDiagnostic::Attempts),
     // AWS Step Functions' SDK names it `Sfn` — that model's own `sdkId` (`SFN`,
     // `smithy_query(query="service_info")` on that service's model) written as its SDK client
     // is, which is NOT the signing name the request was signed with (`states`) nor the service
@@ -1502,20 +1515,39 @@ pub(super) fn already_managed_reason(
 }
 
 /// The refusal the stack's SERVICE ROLE answers a call of `operation` on `signing_name`
-/// with, or `None` where nothing refuses it — so a call the role's policies deny is never
-/// made ([`crate::state::service_role`]).
+/// with, or `None` where nothing refuses it — so a call the role's policies do not permit is
+/// never made ([`crate::state::service_role`]).
 ///
-/// The refusal is CLOUDFORMATION's, not the owning service's: the call was not made, so
-/// there is no answer of that service's to report. Its code is the one an unauthorized call
-/// is classified under ([`handler_error_code`]'s `AccessDenied` class, which is what tells a
+/// What a client reads is the answer the called service would have given, because that is what
+/// AWS reports: the provider makes the call with the role's credentials and the owning service
+/// refuses it with HTTP 403, so what reaches the resource's event is that service's own
+/// authorization sentence inside the diagnostic its SDK appends ([`sdk_message`]). The call
+/// itself is not made — the decision is already known, and making it would create the very
+/// resource the refusal says was not created. Its code is the one an unauthorized call is
+/// classified under ([`handler_error_code`]'s `AccessDenied` class, which is what tells a
 /// client whether the failed resource is worth retrying) rather than the particular spelling
-/// the called service would have used, and its message is the sentence AWS words such a
-/// refusal with, naming the principal, the action and the resource. `operation` is `None` for
-/// a wire this cannot read an operation name off, which is judged by nothing.
+/// each service gives that error. `operation` is `None` for a wire this cannot read an
+/// operation name off, which is judged by nothing.
 pub(super) fn denied_by_the_service_role(signing_name: &str, operation: Option<&str>) -> Option<Refusal> {
     let message = crate::state::service_role::refusal(signing_name, operation?)?;
     Some(Refusal {
+        message: sdk_message(signing_name, UNAUTHORIZED_STATUS, UNAUTHORIZED_CODE, &message),
         code: crate::state::service_role::ACCESS_DENIED.to_string(),
-        message,
     })
 }
+
+/// The HTTP status a service answers a call the caller is not authorized to make with, which
+/// is the status the diagnostic of its SDK states ("Status Code: 403").
+const UNAUTHORIZED_STATUS: u16 = 403;
+
+/// The ERROR CODE such an answer carries, which the diagnostic of an SDK that words one states:
+/// the exception the services this emulator refuses on answer an unauthorized call with, as the
+/// recorded diagnostic of a refused provider call carries it (`Status Code: 403; Error Code:
+/// AccessDeniedException`, the `bedrock`/`CreateSession` row of [`SDK_SHARED_NAME_SERVICES`]).
+///
+/// It is NOT the `HandlerErrorCode` CLASS CloudFormation files the failure under
+/// ([`crate::state::service_role::ACCESS_DENIED`], the refusal's own code): a class says
+/// whether the resource is worth retrying, where this is the called service's exception — and
+/// the class this code falls in ([`handler_error_code`]) is that same one, so what the envelope
+/// reports and what the diagnostic names stay one decision.
+const UNAUTHORIZED_CODE: &str = "AccessDeniedException";

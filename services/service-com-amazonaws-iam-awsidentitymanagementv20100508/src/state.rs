@@ -3364,25 +3364,16 @@ pub fn context_keys_in_policies<'a, I: IntoIterator<Item = &'a str>>(documents: 
 /// IAM policy grammar spells it.
 const EFFECT_ALLOW: &str = "Allow";
 
-/// The character separating a service namespace from an action name in an action
-/// element's value (`iam:CreateUser`).
-const ACTION_SEPARATOR: char = ':';
-
-/// The whole-element wildcard: the value that stands for every action, and the one
-/// action element the grammar admits with no service namespace in front of it.
-const ANY_ACTION: &str = "*";
-
 /// Whether the IAM policy document `document` grants access to the service whose
 /// namespace is `service_namespace` — that is, whether one of its statements ALLOWS
 /// at least one action belonging to that service.
 ///
-/// A policy grants access to a service when it permits an action of that service:
-/// an action element's value is `<namespace>:<action>` (or the whole-element `*`),
-/// so the namespace a value reaches is the part before the separator, matched with
-/// IAM's `*` and `?` wildcards and without regard to case — the comparison
-/// [`::service_common::iam_authorization::wildcard_match`] makes for every action
-/// name in the tree. A `NotAction` element permits everything its values do NOT, so
-/// it reaches the namespace unless one of its values covers EVERY action of it.
+/// The decision is [`::service_common::iam_authorization::identity_may_allow_an_action_of`]'s,
+/// the tree's ONE reading of that question — a policy grants access to a service when a
+/// statement of it permits an action of that service, whichever resource the statement is
+/// scoped to, and a `NotAction` element reaches the namespace unless one of its values covers
+/// EVERY action of it — so this service's report of which policies grant access to a service
+/// and a gate deciding a call to it cannot answer differently.
 ///
 /// Only a statement's EFFECT and its action element decide this: what the policy
 /// grants access to is a property of the policy, so a statement's resource scope
@@ -3392,37 +3383,10 @@ const ANY_ACTION: &str = "*";
 /// [`context_keys_in_policies`] gives such a document, and `Statement` is read both
 /// as the list and as the single statement the grammar admits.
 pub fn grants_service_access(document: &str, service_namespace: &str) -> bool {
-    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
-        return false;
-    };
-    let Some(statement) = parsed.get("Statement") else {
-        return false;
-    };
-    let statements = match statement.as_array() {
-        Some(statements) => statements.as_slice(),
-        None => ::std::slice::from_ref(statement),
-    };
-    statements.iter().any(|statement| {
-        let allows = statement
-            .get("Effect")
-            .and_then(::serde_json::Value::as_str)
-            .is_some_and(|effect| effect == EFFECT_ALLOW);
-        if !allows {
-            return false;
-        }
-        if let Some(permitted) = statement.get("Action") {
-            return element_values(permitted)
-                .into_iter()
-                .any(|value| reaches_namespace(value, service_namespace));
-        }
-        if let Some(excluded) = statement.get("NotAction") {
-            return !element_values(excluded)
-                .into_iter()
-                .any(|value| covers_namespace(value, service_namespace));
-        }
-        // A statement with neither element is about no action at all.
-        false
-    })
+    ::service_common::iam_authorization::identity_may_allow_an_action_of(
+        &::service_common::iam_authorization::prepare_documents(&[document.to_string()]),
+        service_namespace,
+    )
 }
 
 /// The string values one policy element carries: the IAM grammar writes
@@ -3435,38 +3399,6 @@ fn element_values(element: &::serde_json::Value) -> Vec<&str> {
     .iter()
     .filter_map(::serde_json::Value::as_str)
     .collect()
-}
-
-/// Whether the action-element value `value` names at least ONE action of the service
-/// whose namespace is `service_namespace`.
-fn reaches_namespace(value: &str, service_namespace: &str) -> bool {
-    match value.split_once(ACTION_SEPARATOR) {
-        Some((namespace, _action)) => ::service_common::iam_authorization::wildcard_match(
-            namespace,
-            service_namespace,
-            false,
-        ),
-        // Without a separator the only value that names an action is the
-        // whole-element wildcard, which names every action of every service.
-        None => value == ANY_ACTION,
-    }
-}
-
-/// Whether the action-element value `value` names EVERY action of the service whose
-/// namespace is `service_namespace` — what a `NotAction` value has to do to put the
-/// whole service outside the statement's grant.
-fn covers_namespace(value: &str, service_namespace: &str) -> bool {
-    match value.split_once(ACTION_SEPARATOR) {
-        Some((namespace, action)) => {
-            action == ANY_ACTION
-                && ::service_common::iam_authorization::wildcard_match(
-                    namespace,
-                    service_namespace,
-                    false,
-                )
-        }
-        None => value == ANY_ACTION,
-    }
 }
 
 /// The most `(action, resource)` asks one delegation request's permission policy is
