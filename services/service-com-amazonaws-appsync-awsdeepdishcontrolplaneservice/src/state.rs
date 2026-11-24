@@ -32,6 +32,12 @@ pub mod graphql_data_plane;
 /// decision may be reused in is read under the same lock as the API that configured it.
 pub mod lambda_authorizer_cache;
 
+/// The ENTRIES a GraphQL API's server-side cache holds: what its GraphQL endpoint already
+/// answered, for as long as each answer may be served again. A field of the cache INSTANCE
+/// ([`ApiCacheRecord`]), so the teardown of the instance takes its entries with it.
+pub mod api_cache_entries;
+pub use api_cache_entries::CacheEntries;
+
 /// The GraphQL types created under a GraphQL API, and how one type definition is
 /// parsed, kept and reported.
 mod schema_types;
@@ -345,6 +351,21 @@ impl GraphqlApiRecord {
             .filter(|cache| !cache.is_being_removed())
     }
 
+    /// The cache instance this API SERVES requests from at `now`, or `None` where it
+    /// serves none.
+    ///
+    /// The transition the clock owes the instance is materialised first
+    /// ([`Self::settle_api_cache`]) — it was owed at this instant whether or not
+    /// anybody read the cache — and the instance is then answered only where it serves
+    /// entries at all ([`ApiCacheRecord::serves_entries`]). Mutable, because serving a
+    /// request from a cache both reads its entries and writes the ones it did not hold.
+    pub fn serving_api_cache(&mut self, now: SystemTime) -> Option<&mut ApiCacheRecord> {
+        self.settle_api_cache(now);
+        self.api_cache
+            .as_mut()
+            .filter(|cache| cache.serves_entries())
+    }
+
     /// Materialise the cache transition the CLOCK already made due at `now`.
     ///
     /// Owed by the clock alone: the due instant was recorded by the call that started the
@@ -469,13 +490,23 @@ pub struct ApiCacheRecord {
     pub available_at: Option<SystemTime>,
     /// The instant the cache's entries were last discarded, or `None` while nothing
     /// has discarded them. Not a member of the modelled `ApiCache`, so no operation
-    /// projects it: it is read only by whatever serves an entry.
+    /// projects it.
     ///
     /// A cache entry is a response the GraphQL endpoint served, so the entries are
-    /// written by the data plane rather than by any control-plane call: what a flush
-    /// leaves behind is this boundary, after which no entry cached before it is
-    /// served. [`ApiCacheRecord::flush`] moves it; nothing else does.
+    /// written by the data plane rather than by any control-plane call:
+    /// [`ApiCacheRecord::flush`] discards them and records the instant it did here;
+    /// nothing else moves it.
     pub last_flushed_at: Option<SystemTime>,
+    /// The entries this instance HOLDS: what the API's GraphQL endpoint already
+    /// answered, for as long as each answer may be served again
+    /// ([`api_cache_entries`]).
+    ///
+    /// Held on the instance rather than beside it, because an entry belongs to the
+    /// cache that holds it: the teardown of the instance and the deletion of the API
+    /// drop the record, and the entries go with it. Not a member of the modelled
+    /// `ApiCache`, so no operation projects it — it is read and written only by what
+    /// serves a request on the API's own data plane.
+    pub entries: CacheEntries,
     /// The instant the teardown of this instance finishes removing it, or `None` while no
     /// teardown of it has been accepted. Stored rather than slept on, like
     /// [`Self::available_at`].
@@ -541,10 +572,25 @@ impl ApiCacheRecord {
     /// Discard every entry the cache holds, as of `now`.
     ///
     /// The instance itself is untouched — its settings and the status it is in are
-    /// properties of the instance, not of the entries it holds — so the only thing a
-    /// flush leaves behind is the new entry boundary ([`Self::last_flushed_at`]).
+    /// properties of the instance, not of the entries it holds — so what a flush leaves
+    /// behind is a cache that holds nothing, and the instant it was emptied
+    /// ([`Self::last_flushed_at`]). The next request for any key the cache held before
+    /// is a miss, which is the whole observable effect of a flush.
     pub fn flush(&mut self, now: SystemTime) {
+        self.entries.discard_all();
         self.last_flushed_at = Some(now);
+    }
+
+    /// Whether this instance SERVES entries at all: `true` only for one the service
+    /// reports as [`CACHE_AVAILABLE`] ("the instance is available for use") whose
+    /// teardown has not been accepted.
+    ///
+    /// An instance still being created, one that failed creation and one on its way out
+    /// holds nothing a request is answered from: a request on an API whose cache is not
+    /// available is executed, which is what a caller polling for availability before
+    /// enabling caching depends on.
+    pub fn serves_entries(&self) -> bool {
+        self.status == CACHE_AVAILABLE && !self.is_being_removed()
     }
 
     /// This record as the modelled `ApiCache` shape — the single projection the

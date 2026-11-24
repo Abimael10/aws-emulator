@@ -146,6 +146,14 @@ pub const SET_SUBSCRIPTION_INVALIDATION_FILTER: &str = "setSubscriptionInvalidat
 /// See [`SET_SUBSCRIPTION_FILTER`].
 pub const INVALIDATE_SUBSCRIPTIONS: &str = "invalidateSubscriptions";
 
+/// The `extensions` call that "evicts an item from the AppSync server-side cache", stated by
+/// a resolver's response handler and carrying THREE arguments — the type, the field and the
+/// key-value pair the entry to remove was keyed on
+/// (`extensions.evictFromApiCache(typeName, fieldName, keyValuePair)`), recorded as the JSON
+/// list of the three. What the host does with it is the plane's own
+/// (`crate::service::graphql_api::api_cache`).
+pub const EVICT_FROM_API_CACHE: &str = "evictFromApiCache";
+
 /// The `function` names a request may ask for: "The function within the code to be
 /// evaluated. If provided, the valid values are request and response"
 /// (`EvaluateCodeRequest$function`).
@@ -188,18 +196,20 @@ pub const ARGUMENTS_MEMBER: &str = "arguments";
 /// See [`ARGUMENTS_MEMBER`].
 pub const ARGUMENTS_SHORT_MEMBER: &str = "args";
 
-/// One `extensions.*` call the evaluated code made: which function it called, and the
-/// argument it called it with as the JSON text the engine rendered.
+/// One `extensions.*` call the evaluated code made: which function it called, and what it
+/// called it with as the JSON text the engine rendered.
 ///
 /// The call is RECORDED rather than acted on inside the engine: what it asks for belongs to
-/// the real-time plane, which reads the record after the run.
+/// the host that owns it — the real-time plane, or the API's own cache — which reads the
+/// record after the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCall {
     /// The name the module exports the called function under: one of
-    /// [`SET_SUBSCRIPTION_FILTER`], [`SET_SUBSCRIPTION_INVALIDATION_FILTER`] or
-    /// [`INVALIDATE_SUBSCRIPTIONS`].
+    /// [`SET_SUBSCRIPTION_FILTER`], [`SET_SUBSCRIPTION_INVALIDATION_FILTER`],
+    /// [`INVALIDATE_SUBSCRIPTIONS`] or [`EVICT_FROM_API_CACHE`].
     pub name: String,
-    /// The argument the call carried, as JSON text.
+    /// What the call carried, as JSON text: the one argument it took, or the LIST of them
+    /// for a call that takes several ([`EVICT_FROM_API_CACHE`]).
     pub argument: String,
 }
 
@@ -1463,10 +1473,20 @@ const extensionCall = function (name) {
         hostExtension(name, JSON.stringify(argument === undefined ? null : argument));
     };
 };
+// The eviction a response handler raises over the API's server-side cache names the entry to
+// remove with three arguments rather than one, so the whole list is what the host is handed.
+const evictFromApiCache = function (typeName, fieldName, keyValuePair) {
+    hostExtension("evictFromApiCache", JSON.stringify([
+        typeName === undefined ? null : typeName,
+        fieldName === undefined ? null : fieldName,
+        keyValuePair === undefined ? null : keyValuePair,
+    ]));
+};
 export const extensions = {
     setSubscriptionFilter: extensionCall("setSubscriptionFilter"),
     setSubscriptionInvalidationFilter: extensionCall("setSubscriptionInvalidationFilter"),
     invalidateSubscriptions: extensionCall("invalidateSubscriptions"),
+    evictFromApiCache: evictFromApiCache,
 };
 export default { util, runtime, extensions };
 "#;

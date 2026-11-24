@@ -246,6 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh instance holds no entries yet, so nothing has been discarded
             // from it, and no teardown of it has been asked for.
             last_flushed_at: None,
+            entries: crate::state::CacheEntries::default(),
             removal_due: None,
         });
 

@@ -47,16 +47,17 @@
 //! [`super::metrics`] publishes them).
 
 use ::std::collections::BTreeMap;
-use ::std::time::Duration;
+use ::std::time::{Duration, SystemTime};
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
+use super::api_cache::{self, ResolverEntry, Serving};
 use super::enhanced_metrics::Enhanced;
 use super::lambda;
 use super::mapping_template::{self, Raised};
 use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
-use crate::ops::types::SyncConfig;
+use crate::ops::types::{CachingConfig, SyncConfig};
 use crate::state::{DataSourceRecord, GraphqlApiRecord, ResolverRecord};
 
 /// The stage that validates one request's document against the schema the API SERVES,
@@ -122,6 +123,11 @@ pub struct Answer {
     /// ([`super::field_logs`]): empty for an API that captures no field-level logs, which is
     /// what the execution is told before it starts.
     pub traces: Vec<FieldTrace>,
+    /// What the API reports about the request BESIDE the result: the `extensions` a GraphQL
+    /// response may carry, which is where AppSync reports how many entries of its cache an
+    /// `extensions.evictFromApiCache` removed ([`super::api_cache`]). `None` for a request
+    /// that asked for no eviction, which is answered with no such member at all.
+    pub extensions: Option<Json>,
 }
 
 /// What resolving ONE field came to, as the API's field-level logging reports it: where the
@@ -180,6 +186,7 @@ impl Answer {
             data: None,
             errors: vec![json!({"message": message})],
             traces: Vec::new(),
+            extensions: None,
         }
     }
 
@@ -193,6 +200,9 @@ impl Answer {
         if !self.errors.is_empty() {
             body.insert(ERRORS_MEMBER.to_string(), Json::Array(self.errors.clone()));
         }
+        if let Some(extensions) = &self.extensions {
+            body.insert(EXTENSIONS_MEMBER.to_string(), extensions.clone());
+        }
         Json::Object(body)
     }
 }
@@ -200,6 +210,7 @@ impl Answer {
 /// The members a GraphQL response carries.
 const DATA_MEMBER: &str = "data";
 const ERRORS_MEMBER: &str = "errors";
+const EXTENSIONS_MEMBER: &str = "extensions";
 
 /// What joins the type and the field in the RESOLVER NAME an enhanced resolver-level series
 /// is dimensioned on: resolver metrics are "recorded by API ID and resolver name", and a
@@ -476,12 +487,14 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
             data: None,
             errors: invalid,
             traces: Vec::new(),
+            extensions: None,
         };
     }
     // Both read off ONE guard of the store, taken and released before the execution starts:
     // whether the API captures field-level logs, and which of its ENHANCED series this
     // request publishes ([`super::enhanced_metrics`]) — read ONCE here so every field of the
-    // request is reported under the configuration the request met.
+    // request is reported under the configuration the request met, and read AHEAD of the
+    // cache because a request the cache answers is still a request the API reports on.
     let (traced, enhanced) = {
         let store = context.state.lock();
         (
@@ -489,6 +502,40 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
             Enhanced::of_api(&store, &context.api_id),
         )
     };
+    // The API's own server-side cache, as it stands for this request ([`super::api_cache`]).
+    // Read ONCE here, ahead of dispatch, because that is where a cache decides a request: a
+    // key the cache already holds a live entry for is answered FROM it, and nothing of the
+    // resolution is performed. Only a QUERY is: a mutation changes what the API holds, so
+    // its response is neither served from an entry nor held as one.
+    let now = SystemTime::now();
+    let serving = api_cache::serving(context, now);
+    let cache = match kind {
+        OperationKind::Query => serving.clone(),
+        _ => None,
+    };
+    let response_key = cache
+        .as_ref()
+        .and_then(|serving| api_cache::response_key(serving, request));
+    if let Some(key) = &response_key {
+        if let Some(data) = api_cache::served(context, key, now) {
+            ::tracing::debug!(
+                api_id = %context.api_id,
+                "this API's cache answered a request from an entry it already held"
+            );
+            // A request answered from the cache is still "a specified GraphQL operation …
+            // called", so the operation's own series counts it like any other — with no
+            // error, because the entry holds an answer that reported none.
+            if enhanced.reports_operations() {
+                context.metrics.operation_executed(kind.root_operation_type(), 0);
+            }
+            return Answer {
+                data: Some(data),
+                errors: Vec::new(),
+                traces: Vec::new(),
+                extensions: None,
+            };
+        }
+    }
     let mut execution = Execution {
         context,
         request,
@@ -508,6 +555,8 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         template_spent: ::std::time::Duration::ZERO,
         engine_spent: ::std::time::Duration::ZERO,
         extensions: Vec::new(),
+        cache,
+        now,
         enhanced,
     };
     let data = execution
@@ -526,6 +575,31 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         // this execution's runs stated ([`super::subscription_filters`]).
         super::subscription_filters::invalidated(context, &execution.extensions).await;
     }
+    // A resolver's response half may also EVICT an entry of the API's cache
+    // (`extensions.evictFromApiCache`), whichever operation it was reached through: the one
+    // entry each call names is removed, and its siblings are left
+    // ([`super::api_cache::evicted`]). Applied before this answer is held, so a request that
+    // evicts the key it is about holds what it just resolved rather than keeping what it
+    // evicted. HOW MANY entries that removed is what the response reports back, and only
+    // where it removed any: a call that named a field or a key no entry was held under
+    // deleted nothing, which is a response with no such member at all.
+    let deleted = match serving.is_some() {
+        true => api_cache::evicted(context, &execution.extensions, now),
+        false => 0,
+    };
+    // And what this request resolved becomes the entry the next request for its key is
+    // answered from — unless something did not resolve, which is no answer to replay.
+    if let (Some(key), Some(serving)) = (response_key, execution.cache.as_ref()) {
+        if execution.errors.is_empty() {
+            api_cache::hold(
+                context,
+                key,
+                data.clone(),
+                api_cache::response_ttl(serving),
+                now,
+            );
+        }
+    }
     // What the OPERATION came to, where the API asked for operation-level metrics: "the
     // number of times a specified GraphQL operation was called" and "the number of GraphQL
     // errors that occurred during" it, reported under the ROOT OPERATION TYPE the operation
@@ -541,6 +615,7 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         data: Some(data),
         errors: execution.errors,
         traces: execution.traces,
+        extensions: api_cache::reported_eviction(deleted),
     }
 }
 
@@ -698,9 +773,18 @@ struct Execution<'a> {
     engine_spent: ::std::time::Duration,
     /// The `extensions.*` calls this request's APPSYNC_JS runs STATED, in the order they
     /// were made: what each asks for belongs to the real-time plane
-    /// ([`super::subscription_filters`]), which reads them once the operation has been
+    /// ([`super::subscription_filters`]) or to the API's own cache
+    /// ([`super::api_cache::evicted`]), which read them once the operation has been
     /// executed.
     extensions: Vec<appsync_js::ExtensionCall>,
+    /// The API's server-side cache as it serves THIS request, or `None` where it serves it
+    /// from no cache — an API with no available cache, and any operation but a query
+    /// ([`super::api_cache`]).
+    cache: Option<Serving>,
+    /// The instant this request is being served at, which every entry of the cache it reads
+    /// or writes is dated by: read once, so one request cannot see an entry expire halfway
+    /// through its own fields.
+    now: SystemTime,
     /// Which of the API's ENHANCED series this request publishes, as its
     /// `enhancedMetricsConfig` asks for them ([`super::enhanced_metrics`]).
     enhanced: Enhanced,
@@ -874,6 +958,37 @@ impl Execution<'_> {
         }
         let plan = self.plan(type_name, &field.name);
         let resolver_arn = plan.as_ref().and_then(|plan| plan.arn.clone());
+        // The entry this API's cache holds THIS field's result as, where the behavior in
+        // force holds one for it ([`super::api_cache`]), and the key it is held under: the
+        // caching keys the resolver declares, resolved against the context this field is
+        // being resolved over.
+        let cached = match (
+            self.cache.as_ref(),
+            plan.as_ref().and_then(|plan| self.cached_entry(plan)),
+        ) {
+            (Some(serving), Some(entry)) => {
+                let key = api_cache::resolver_key(
+                    serving,
+                    &entry,
+                    type_name,
+                    &field.name,
+                    &Json::Object(field.arguments.clone()),
+                    source,
+                    &self.request.identity,
+                );
+                Some((entry, key))
+            }
+            _ => None,
+        };
+        // A key the cache already holds a live entry for IS this field's value: the resolver
+        // is not run and its data source is not called, which is what caching a resolver
+        // means.
+        let held = cached
+            .as_ref()
+            .and_then(|(_, key)| api_cache::served(self.context, key, self.now));
+        // Whether this field's value came from the cache rather than from a resolution,
+        // which is what says there is nothing new to hold.
+        let was_held = held.is_some();
         // WHETHER this field's resolver has its enhanced resolver-level series published, and
         // the value they are dimensioned on: resolver metrics are "recorded by API ID and
         // resolver name", which names the field the resolver is attached to. A field that
@@ -887,27 +1002,56 @@ impl Execution<'_> {
         let start_offset = self.started.elapsed();
         self.steps.clear();
         self.appended.clear();
+        // How many `extensions.*` calls had been stated before this field was resolved, so
+        // the ones THIS field's own steps state are the ones reported under its path.
+        let stated = self.extensions.len();
         let resolved: Result<Json, Failure> = match ready {
             // A resolution this field's own siblings performed WITH it: the value is already
             // what the resolver came to, so nothing of it is run again.
             Some(ready) => ready,
-            None => match plan {
-                // A field the API attaches no resolver to is the member of the object its
-                // parent resolved to, which is what a GraphQL object's own field is.
-                None => Ok(source.get(&field.name).cloned().unwrap_or(Json::Null)),
-                Some(plan) => {
-                    if self.runs >= MAX_RESOLVER_RUNS {
-                        self.fault(field_error(
-                            path,
-                            &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}."),
-                        ));
-                        return Json::Null;
+            None => match held {
+                Some(held) => Ok(held),
+                None => match plan {
+                    // A field the API attaches no resolver to is the member of the object its
+                    // parent resolved to, which is what a GraphQL object's own field is.
+                    None => Ok(source.get(&field.name).cloned().unwrap_or(Json::Null)),
+                    Some(plan) => {
+                        if self.runs >= MAX_RESOLVER_RUNS {
+                            self.fault(field_error(
+                                path,
+                                &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}."),
+                            ));
+                            return Json::Null;
+                        }
+                        self.runs = self.runs.saturating_add(1);
+                        self.run(&plan, type_name, source, field).await
                     }
-                    self.runs = self.runs.saturating_add(1);
-                    self.run(&plan, type_name, source, field).await
-                }
+                },
             },
         };
+        // What the resolution came to becomes the entry the next request for its key is
+        // answered from. Only a resolution that was PERFORMED writes one: a value answered
+        // from an entry is already held, and re-holding it would extend a window the cache
+        // measures from the instant the entry was written.
+        if let (Some((entry, key)), Ok(value)) = (&cached, &resolved) {
+            if !was_held {
+                api_cache::hold(
+                    self.context,
+                    key.clone(),
+                    value.clone(),
+                    api_cache::entry_ttl(entry),
+                    self.now,
+                );
+            }
+        }
+        // An eviction this field's steps asked for, naming a key AppSync could not have
+        // keyed an entry on, is reported under this field's own path: the call named no
+        // entry, so nothing was evicted, and the caller is told which key it got wrong
+        // ([`super::api_cache::refused_evictions`]).
+        for refusal in api_cache::refused_evictions(self.extensions.get(stated..).unwrap_or(&[]))
+        {
+            self.fault(field_error(path, &refusal));
+        }
         // How long resolving this field took, which is the span both the field's own trace and
         // the resolver's own `Latency` series report.
         let duration = self.started.elapsed().saturating_sub(start_offset);
@@ -1096,10 +1240,20 @@ impl Execution<'_> {
             data_source: step_data_source(api, resolver.data_source_name.as_deref()),
             functions: pipeline_steps(api, resolver),
             sync_config: resolver.sync_config.clone(),
+            caching_config: resolver.caching_config.clone(),
             metrics_config: resolver.metrics_config.clone(),
             is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
             max_batch_size: resolver.max_batch_size,
         })
+    }
+
+    /// The entry this API's cache holds `plan`'s result as, or `None` where it holds none —
+    /// a request this cache does not serve at all, and a resolver the behavior in force
+    /// caches nothing of ([`super::api_cache::Serving::resolver_entry`]).
+    fn cached_entry(&self, plan: &ResolverPlan) -> Option<ResolverEntry> {
+        self.cache
+            .as_ref()?
+            .resolver_entry(plan.caching_config.as_ref())
     }
 
     /// What one of GraphQL's introspection fields answers for this field, as `(the
@@ -2044,6 +2198,13 @@ impl Execution<'_> {
     /// `None` where each resolution is an invocation of its own ([`ResolverPlan::batch_size`]).
     fn batched_plan(&self, type_name: &str, field: &SelectedField) -> Option<ResolverPlan> {
         let plan = self.plan(type_name, &field.name)?;
+        // A resolver whose result this API's cache holds is NOT batched: the cache is
+        // consulted per resolution, ahead of any invocation of a data source, so a
+        // resolution that may be answered from an entry cannot be merged into an invocation
+        // made for its siblings.
+        if self.cached_entry(&plan).is_some() {
+            return None;
+        }
         plan.batch_size().map(|_| plan)
     }
 
@@ -2463,6 +2624,10 @@ struct ResolverPlan {
     /// "The `SyncConfig` for a resolver attached to a versioned data source"
     /// (`Resolver$syncConfig`) the resolver carries, which its own step is made under.
     sync_config: Option<SyncConfig>,
+    /// "The caching configuration for the resolver" (`Resolver$cachingConfig`) it carries,
+    /// which says whether the API's cache holds this resolver's result and under which keys
+    /// ([`super::api_cache`]).
+    caching_config: Option<CachingConfig>,
     /// `Resolver$metricsConfig`: whether this resolver OPTED IN to the enhanced
     /// resolver-level series, which decides whether it is reported under an API whose
     /// behavior is `PER_RESOLVER_METRICS` ([`super::enhanced_metrics`]).

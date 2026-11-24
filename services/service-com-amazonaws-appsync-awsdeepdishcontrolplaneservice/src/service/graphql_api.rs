@@ -51,6 +51,7 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 use crate::ops::types::AdditionalAuthenticationProvider;
 use crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState as ServiceStore;
 
+pub mod api_cache;
 pub mod authorizer;
 pub mod caller;
 pub mod data_source_role;
