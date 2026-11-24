@@ -2486,6 +2486,10 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// which is what paces a destination to its own
     /// `InvocationRateLimitPerSecond` ([`api_destination_pacing`]).
     pub api_destination_pacing: api_destination_pacing::InvocationPacing,
+    /// How many AppSync handovers this emulator is making at once, the backstop
+    /// that keeps a cycle of deliveries finite however it is awaited
+    /// ([`graphql_handovers`]).
+    pub graphql_handovers: graphql_handovers::GraphqlHandovers,
 }
 
 /// The store comes up holding no bus RECORD at all: the account's `default` bus
@@ -2516,6 +2520,7 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
             event_seq: 0,
             schedules: schedule::Schedules::default(),
             api_destination_pacing: api_destination_pacing::InvocationPacing::default(),
+            graphql_handovers: graphql_handovers::GraphqlHandovers::default(),
         }
     }
 }
@@ -2668,6 +2673,27 @@ pub fn glue_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<GlueState>> {
     ::service_com_amazonaws_glue_awsglue::state::service_state(engine)
+}
+
+/// The AppSync store, for the same reason the Glue one above is reached: a rule
+/// target that is a field of an AppSync GraphQL API is delivered to by EXECUTING
+/// the target's own GraphQL operation on that API, and the API's `GRAPHQL`
+/// endpoint is a socket that service serves per API rather than a route of this
+/// emulator's front door — so there is no address to make a request at, and the
+/// operation is handed to the very code that endpoint serves
+/// (`crate::ops::put_events::app_sync`), reading and writing the records that
+/// service's own operations do.
+pub type AppSyncState =
+    ::service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState;
+
+/// The AppSync store in the SAME shared engine, which is where a GraphQL API, its
+/// resolvers and the endpoints it is served on live. `None` means the engine
+/// carries no such store — a deployment with no AppSync to deliver to, which is
+/// evidence of nothing.
+pub fn appsync_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<AppSyncState>> {
+    ::service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::state::service_state(engine)
 }
 
 /// Count ONE undeliverable event on the rule's `FailedInvocations` metric.
@@ -4945,6 +4971,11 @@ pub mod endpoint_health_check;
 
 mod replays;
 pub use replays::*;
+
+/// The BACKSTOP on the AppSync handovers of one emulator — how many it makes at once —
+/// which keeps a cycle of deliveries finite however it is awaited: a rule's target executes
+/// an operation whose resolver publishes onto a bus again.
+pub mod graphql_handovers;
 
 /// The attempts a rule's target invocation MADE, and the counter they are
 /// published on — the attempt-series total beside

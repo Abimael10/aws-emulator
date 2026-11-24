@@ -218,6 +218,16 @@ use ecs_task::*;
 #[path = "put_events/rest_api_stage.rs"]
 mod rest_api_stage;
 
+/// The AWS AppSync half of the delivery pass: the GraphQL operation a rule
+/// executes on the API field an `appsync` target names.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives. Its items are reached through the
+/// module name rather than through a glob, for the reason the API Gateway module
+/// above gives.
+#[path = "put_events/app_sync.rs"]
+mod app_sync;
+
 /// The CloudWatch Logs half of the delivery pass: the log event a rule writes
 /// into the log group a target names, what the documents in force over that
 /// group admit of it, and the retries of a write that group would not take.
@@ -609,6 +619,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let iam = crate::state::iam_state(&*self.engine);
         let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let glue = crate::state::glue_state(&*self.engine);
+        let appsync = crate::state::appsync_state(&*self.engine);
         let kms = crate::state::target_encryption::kms_state(&*self.engine);
         // The base URL this emulator is reached at, which is where a delivery to
         // an HTTP endpoint of it is addressed.
@@ -617,6 +628,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             iam: iam.as_ref(),
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
+            appsync: appsync.as_ref(),
             kms: kms.as_ref(),
             events: Some(&state),
             endpoint: endpoint.as_str(),
@@ -1699,6 +1711,12 @@ pub(crate) struct CompiledTarget {
     /// the `RunTask` an ECS cluster target is invoked by is made of
     /// ([`ecs_task::run`]). `None` for a target that is not one.
     ecs_parameters: Option<EcsParameters>,
+    /// `AppSyncParameters$GraphQLOperation`: "the GraphQL operation; that is, the
+    /// query, mutation, or subscription to be parsed and executed by the GraphQL
+    /// service" — what an AWS AppSync API target's delivery EXECUTES on the field
+    /// its ARN names ([`app_sync::execute_graphql_operation`]). `None` for a
+    /// target that is not one, and for one carrying no `AppSyncParameters`.
+    graphql_operation: Option<String>,
 }
 
 impl CompiledTarget {
@@ -1857,6 +1875,11 @@ pub(crate) fn compiled_targets(
                 .as_ref()
                 .and_then(|parameters| parameters.message_group_id.clone()),
             ecs_parameters: target.raw.ecs_parameters.clone(),
+            graphql_operation: target
+                .raw
+                .app_sync_parameters
+                .as_ref()
+                .and_then(|parameters| parameters.graph_ql_operation.clone()),
         })
         .collect()
 }
@@ -2104,13 +2127,29 @@ pub(crate) async fn deliver(
     let outcome = if let Some((code, message)) = unassumable {
         crate::state::InvocationOutcome::Failed { code, message }
     } else if let Some(kind) = kind {
+        // The RESOURCE an AppSync field target's `appsync:GraphQL` is performed
+        // on, which is neither the target's own ARN nor anything the target
+        // states: it is a field the operation SELECTS, resolved through the API
+        // itself ([`app_sync::action_resources`]) — the first of them here, and
+        // every one of them where the role's grant is decided
+        // ([`app_sync::invoke_authorization_refusal`]). Nothing resolved leaves the
+        // decision to be taken over the target's own ARN, as it is for every other
+        // kind.
+        let graphql_resource = match kind {
+            TargetKind::GraphqlApiField => {
+                app_sync::action_resources(stores, handover).into_iter().next()
+            }
+            _ => None,
+        };
         let attempt = crate::state::DeliveryAttempt {
             rule: handover.rule,
             target_id: &target.id,
             action: kind.action(),
             // The resource that action is performed ON, which is the target's own
             // ARN for every kind but one ([`TargetKind::action_resource`]).
-            resource: kind.action_resource(handover),
+            resource: graphql_resource
+                .as_deref()
+                .unwrap_or_else(|| kind.action_resource(handover)),
         };
         // A target reached AS a role is one whose own API call that role's
         // permissions can grant: within one account "the resource-based policy and
@@ -2345,6 +2384,12 @@ pub(crate) struct Stores<'a> {
     /// generated under it
     /// ([`crate::state::target_encryption::generate_data_key_denied`]).
     pub(crate) kms: Option<&'a ::engine::ServiceState<crate::state::target_encryption::KmsState>>,
+    /// The AppSync store the API an `appsync` target names is served from: the
+    /// GraphQL operation such a delivery executes is handed to that API's own
+    /// `GRAPHQL` endpoint through it ([`app_sync`]). `None` is an engine with no
+    /// AppSync mounted, which is a gap in this emulator rather than a refusal, so
+    /// nothing is attempted and nothing is invented in its place.
+    pub(crate) appsync: Option<&'a ::engine::ServiceState<crate::state::AppSyncState>>,
     /// This service's OWN store: where an api-destination invocation the
     /// destination's rate has deferred books its slot and is recorded when it is
     /// made ([`deferred`]). `None` is a delivery with no store to pace against,
@@ -3009,6 +3054,11 @@ enum TargetKind {
     /// carrying what the target receives as the body (see
     /// [`rest_api_stage::invoke_rest_api_stage`]).
     RestApiStage,
+    /// One field of an AWS AppSync GraphQL API: the `appsync:GraphQL` the target's
+    /// ARN names, made by EXECUTING the target's own `GraphQLOperation` on that
+    /// API with what the target receives as the operation's variables (see
+    /// [`app_sync::execute_graphql_operation`]).
+    GraphqlApiField,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -3144,6 +3194,13 @@ impl TargetKind {
             {
                 Some(Self::RestApiStage)
             }
+            // An AppSync target's ARN names the API's published GraphQL ENDPOINT, or the
+            // API (and optionally one field of it) by id: an ARN naming fewer of those
+            // names addresses no API, so no operation is executed for it
+            // ([`app_sync::addressed`]).
+            app_sync::APPSYNC_ARN_NAMESPACE if app_sync::addressed(arn).is_some() => {
+                Some(Self::GraphqlApiField)
+            }
             _ => None,
         }
     }
@@ -3167,6 +3224,7 @@ impl TargetKind {
             Self::DeliveryStream => "firehose:PutRecord",
             Self::EcsTask => crate::state::ecs_target::RUN_TASK_ACTION,
             Self::RestApiStage => rest_api_stage::INVOKE_ACTION,
+            Self::GraphqlApiField => app_sync::GRAPHQL_ACTION,
         }
     }
 
@@ -3192,7 +3250,9 @@ impl TargetKind {
     /// into published as a condition key
     /// ([`ecs_task::run_authorization_refusal`]) and which an invoke of an API
     /// Gateway stage REPORTS as the answer the endpoint gives an identity that may
-    /// not invoke it ([`rest_api_stage::invoke_authorization_refusal`]).
+    /// not invoke it ([`rest_api_stage::invoke_authorization_refusal`]) — as an
+    /// AppSync field's execution reports it as the answer that API's endpoint gives
+    /// such an identity ([`app_sync::invoke_authorization_refusal`]).
     fn role_bars(
         self,
         stores: &Stores<'_>,
@@ -3210,6 +3270,9 @@ impl TargetKind {
                 attempt,
                 stores.endpoint,
             ),
+            Self::GraphqlApiField => {
+                app_sync::invoke_authorization_refusal(stores, role_arn, handover, attempt)
+            }
             _ => role_refusal(iam, role_arn, handover.rule_arn, attempt),
         }
     }
@@ -3497,6 +3560,14 @@ impl TargetKind {
                 )
                 .await
             }
+            Self::GraphqlApiField => {
+                // The API's own `GRAPHQL` endpoint EXECUTES the operation, in this
+                // same process: that endpoint is a socket the AppSync service
+                // serves per API rather than a route of this emulator's front
+                // door, so the request is handed to the very code it serves and no
+                // socket is opened ([`app_sync`]).
+                app_sync::execute_graphql_operation(callback, stores, region, handover, body).await
+            }
         })
     }
 
@@ -3515,6 +3586,7 @@ impl TargetKind {
             Self::DeliveryStream => FIREHOSE_ARN_NAMESPACE,
             Self::EcsTask => ECS_ARN_NAMESPACE,
             Self::RestApiStage => rest_api_stage::EXECUTE_API_ARN_NAMESPACE,
+            Self::GraphqlApiField => app_sync::APPSYNC_ARN_NAMESPACE,
         }
     }
 }

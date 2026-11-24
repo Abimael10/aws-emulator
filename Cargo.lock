@@ -14720,6 +14720,7 @@ dependencies = [
  "http",
  "percent-encoding",
  "serde_json",
+ "service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",

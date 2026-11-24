@@ -350,6 +350,49 @@ async fn answer(
     served.unwrap_or_else(|_| error_response(408, BAD_REQUEST_ERROR_TYPE, REQUEST_TIMED_OUT))
 }
 
+/// Answer ONE already-framed request of this API, minting the request id it is answered
+/// and logged under — the whole of what this endpoint does with a request once a connection
+/// has been read ([`served_request`] and [`stamped`]), under the same PANIC CONTAINMENT
+/// ([`contained`]).
+///
+/// What the socket above reaches through its own connection handling, and what a request
+/// that reached the endpoint from INSIDE this emulator is answered by
+/// ([`super::in_process`]): both are the same request to the same API, so both are answered
+/// by the same code — the web ACL at the edge, the API's authorization, the document's
+/// execution and the records the API logs about having served it — and both are answered
+/// through the containment, so a panic anywhere under it is this endpoint's own `500`
+/// rather than something that unwinds into the caller. That matters most for the IN-PROCESS
+/// caller: its stack is another service's delivery pass, which a panic escaping here would
+/// take with it.
+///
+/// The request is REBUILT as an owned one for that: the containment guards a future of its
+/// own ('static), and what it needs of the request is the method, the target, the fields and
+/// the body — the request as this endpoint reads it.
+pub async fn served_buffered_request(
+    context: &PlaneContext,
+    parts: &::http::request::Parts,
+    body: &[u8],
+) -> ::http::Response<Full<Bytes>> {
+    let request_id = context.state.lock().graphql_data_plane.mint_request_id();
+    let mut rebuilt = ::http::Request::new(());
+    *rebuilt.method_mut() = parts.method.clone();
+    *rebuilt.uri_mut() = parts.uri.clone();
+    *rebuilt.version_mut() = parts.version;
+    *rebuilt.headers_mut() = parts.headers.clone();
+    let facts = ::emulator_server::RequestFacts::from_request(&rebuilt);
+    let (owned, ()) = rebuilt.into_parts();
+    let context = context.clone();
+    let body = body.to_vec();
+    let answered = {
+        let request_id = request_id.clone();
+        contained(facts, async move {
+            served_request(&context, &owned, &body, &request_id).await
+        })
+        .await
+    };
+    stamped(answered, &request_id, None)
+}
+
 /// Answer one framed request: the GraphQL route, and the refusals every other request to
 /// this endpoint meets.
 async fn served_request(

@@ -32,6 +32,14 @@ use super::gauge_sampling::GaugeSampling;
 
 /// The sockets one GraphQL API's endpoints are served on, and what is open on them.
 struct ApiSocket {
+    /// What every request on either of this API's endpoints is answered from — the very
+    /// context the two socket handlers hold.
+    ///
+    /// Kept here because a request can also reach the `GRAPHQL` endpoint from INSIDE this
+    /// emulator, where there is no socket to dial and no operation context to build one
+    /// from ([`crate::service::graphql_api::in_process`]): what an API is served from is a
+    /// fact about that API, so it is read where the API's own records are.
+    plane: crate::service::graphql_api::PlaneContext,
     /// The socket the API's GraphQL endpoint (`GraphqlApi$uris`'s `GRAPHQL` entry) is
     /// served on.
     graphql: Arc<ResourceListener>,
@@ -144,6 +152,7 @@ impl GraphqlDataPlane {
     pub fn remember_listeners(
         &mut self,
         api_id: &str,
+        plane: crate::service::graphql_api::PlaneContext,
         graphql: Arc<ResourceListener>,
         realtime: Arc<ResourceListener>,
     ) -> (String, String) {
@@ -151,6 +160,7 @@ impl GraphqlDataPlane {
         if let Some(replaced) = self.apis.insert(
             api_id.to_string(),
             ApiSocket {
+                plane,
                 graphql,
                 realtime,
                 connections: BTreeMap::new(),
@@ -160,6 +170,14 @@ impl GraphqlDataPlane {
             replaced.gauges.abort();
         }
         authorities
+    }
+
+    /// What `api_id`'s endpoints answer from, or `None` for an API this emulator serves no
+    /// endpoint of — one it never held, or one whose records a delete took with them.
+    ///
+    /// Cloned out, so a request answered from it holds no lock of this store.
+    pub fn plane(&self, api_id: &str) -> Option<crate::service::graphql_api::PlaneContext> {
+        self.apis.get(api_id).map(|socket| socket.plane.clone())
     }
 
     /// Close `api_id`'s sockets and forget everything open on them — what an API being

@@ -111,6 +111,13 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # model — so the delivery writes the very store `GetWorkflowRuns` reads, exactly
 # as this service's own metrics are written into CloudWatch's.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# A rule target that is an AWS AppSync GraphQL API field is delivered to by
+# EXECUTING the target's `AppSyncParameters.GraphQLOperation` against that API's
+# own GraphQL endpoint (`ops::put_events::app_sync`). That endpoint is a socket
+# the AppSync service serves per API rather than a route of this emulator's front
+# door, so the operation is handed to it in process, the way a Glue workflow
+# target's event is handed to Glue's own store.
+service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice = { workspace = true }
 # A global endpoint's failover policy WATCHES an Amazon Route 53 health check,
 # which is Route 53's resource: `CreateEndpoint`/`UpdateEndpoint` resolve it
 # through that service's own `GetHealthCheck` over the in-process callback

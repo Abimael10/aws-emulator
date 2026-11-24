@@ -62,6 +62,7 @@ pub mod field_auth;
 pub mod field_logs;
 pub mod gauges;
 pub mod http_endpoint;
+pub mod in_process;
 pub mod introspection;
 pub mod lambda;
 pub mod mapping_template;
@@ -178,11 +179,12 @@ pub async fn open_for_api<Eng: Send + Sync + 'static>(
         .await
         .map_err(|error| format!("the API's GraphQL endpoint could not be opened: {error}"))?;
     let realtime_listener = listeners
-        .tcp_plaintext(realtime::RealtimeSocket::new(context, upgrader))
+        .tcp_plaintext(realtime::RealtimeSocket::new(context.clone(), upgrader))
         .await
         .map_err(|error| format!("the API's real-time endpoint could not be opened: {error}"))?;
     let authorities = state.lock().graphql_data_plane.remember_listeners(
         api_id,
+        context,
         Arc::new(graphql_listener),
         Arc::new(realtime_listener),
     );
