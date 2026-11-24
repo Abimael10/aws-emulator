@@ -68,9 +68,10 @@ const EC2_TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect"
 pub(crate) const SSM_CORE_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
 
 /// How far back a case moves an instance's launch instant to make its registration due:
-/// past the span, with room to spare, so the case does not depend on how fast the host runs.
+/// past every span the launch owes, with room to spare, so the case does not depend on how
+/// fast the host runs.
 pub(crate) fn launched_long_enough_ago() -> Duration {
-    ssm::state::node_registration::REGISTRATION_DELAY + Duration::from_secs(30)
+    Duration::from_secs(30)
 }
 
 /// What a role carries, which is the axis the registration gate turns on.
@@ -427,8 +428,13 @@ impl Emulator {
             .get_mut(instance_id)
             .unwrap_or_else(|| panic!("EC2 must hold the launched instance {instance_id}"));
         instance.launch_time = SystemTime::now() - ago;
-        // The guest's first boot is owed from the launch, so moving the launch moves it too.
-        instance.boot_due = Some(instance.launch_time + ec2::state::TRANSITION_DELAY);
+        // The guest's first boot is owed from the launch, so moving the launch moves a boot
+        // that has not come up yet. A guest that has ALREADY come up is left where it is: a
+        // second boot would restart its init system, which is not what moving the launch
+        // instant is for.
+        if instance.boots.is_empty() {
+            instance.boot_due = Some(instance.launch_time);
+        }
         if let Some(pending) = instance.pending_transition.as_mut() {
             pending.due_at = std::time::Instant::now();
         }

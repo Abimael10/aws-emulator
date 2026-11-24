@@ -246,6 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Systems Manager is regional: a command is reported through the endpoint it was
         // sent to, which is the Region this request was signed for.
         let region = request_region(ctx.parts());
+        // The delivery a command already owes a node whose agent has picked it up since — its
+        // guest came up at the instant Amazon EC2 owed its boot, whether or not anybody called
+        // — is materialised before the store is read, with no guard of it held.
+        crate::state::command_deliveries::settle_due_deliveries(
+            &self.engine,
+            ctx.credential_store(),
+            &region,
+        )
+        .await;
         let mut store = state.lock();
         // The one write a report makes: the drop the clock already owed of a command whose
         // history is no longer retained.

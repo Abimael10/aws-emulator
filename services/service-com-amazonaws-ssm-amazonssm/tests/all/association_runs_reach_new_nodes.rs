@@ -18,12 +18,11 @@
 //!
 //! The rows differ along what the rule generalises over: whether the association's targets
 //! select the node (a tag the instance carries, a tag value nothing carries, a tag key nothing
-//! carries) and whether the node was registered when the association was created.
+//! carries) and whether the node was a managed node when the association was created.
 //!
-//! Nothing here waits a fixed time: the registration span and a run's own span are stored due
-//! instants, which a case moves into the past through the store the way this crate's other
-//! clock-owed suites do, and every read LOOKS AGAIN until the condition holds or a generous
-//! deadline passes.
+//! Nothing here waits a fixed time: a run's own span is a stored due instant, which a case
+//! moves into the past through the store the way this crate's other clock-owed suites do, and
+//! every read LOOKS AGAIN until the condition holds or a generous deadline passes.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -78,11 +77,12 @@ async fn an_association_execution_gains_a_node_that_registered_after_it_was_disp
         let emulator = Emulator::new();
         let image = emulator.image(case, AL2023_NAME_PATTERN).await;
         let profile = emulator
-            .profile(case, "estate-role", &Grant::Attached(SSM_CORE_POLICY_ARN))
+            .profile(case, "estate-role", &Grant::Nothing)
             .await;
-        // The instance is launched BEFORE the association is created, and its registration is
-        // not due yet: the association's first run therefore reaches nothing, which is the
-        // position a template that creates both at once leaves it in.
+        // The instance is launched BEFORE the association is created, running as a role whose
+        // policies do not let its agent register: it is no managed node yet, so the
+        // association's first run reaches nothing — the position a template that creates both
+        // at once leaves it in.
         let instance = launch_tagged(&emulator, case, &image, &profile).await;
         let association = created(&emulator, case, target).await;
         let first = executions(&emulator, case, &association).await;
@@ -104,9 +104,18 @@ async fn an_association_execution_gains_a_node_that_registered_after_it_was_disp
             .unwrap_or_else(|| panic!("case {case:?}: the execution must report its id: {first:?}"))
             .to_string();
 
-        // Now the clock: the instance's registration falls due, and the run the association
-        // already had is one the clock has brought to its end.
-        emulator.launched_ago(&instance, launched_long_enough_ago());
+        // Now the node registers — its role is granted the call its agent registers with —
+        // and the run the association already had is one the clock has brought to its end.
+        emulator
+            .iam(
+                case,
+                "AttachRolePolicy",
+                &[
+                    ("RoleName", "estate-role"),
+                    ("PolicyArn", SSM_CORE_POLICY_ARN),
+                ],
+            )
+            .await;
         finish_the_run(&emulator, case, &association);
 
         if !*selects {

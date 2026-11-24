@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComplianceSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComplianceSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComplianceSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComplianceSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComplianceSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComplianceSummaries"))
+        use crate::state::compliance_items as compliance;
+        use crate::state::request_region;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComplianceSummariesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the compliance store is unavailable".to_string()),
+            })
+        })?;
+
+        // A filter compares one member of a compliance item against the values it carries,
+        // under the comparison it names — the SAME reading the item read takes of one
+        // (`compliance::compliance_filter_rejection`), so the two cannot differ about which
+        // filters a compliance read serves. A filter that names neither a member nor a value
+        // cannot be served, and the request is refused before an item is read.
+        let mut filters: Vec<(String, Vec<String>, String)> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            let values = filter.values.clone().unwrap_or_default();
+            if let Some(why) = compliance::compliance_filter_rejection(
+                filter.key.as_deref(),
+                &values,
+                filter.r#type.as_deref(),
+            ) {
+                return Err(ListComplianceSummariesErrorModeled::InvalidFilter(
+                    InvalidFilter { message: Some(why) },
+                )
+                .into());
+            }
+            let Some(key) = filter.key.clone().filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            let operator = filter
+                .r#type
+                .clone()
+                .filter(|operator| !operator.is_empty())
+                .unwrap_or_else(|| compliance::OPERATOR_EQUAL.to_string());
+            filters.push((key, values, operator));
+        }
+
+        let page_size = compliance::compliance_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // Systems Manager is regional: the compliance of a node is reached through the
+        // endpoint of the Region that node is registered with, which is the Region this
+        // request was signed for. The compliance a finished State Manager association run owes
+        // the nodes it applied the patch-baseline document on is materialised first, together
+        // with the managed-node registrations that application is derived from — each write
+        // was owed at the same instant whether or not anybody called — exactly as the item
+        // read takes them, and each with no guard of this store held.
+        let region = request_region(ctx.parts());
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
+        let store = state.lock();
+
+        // The token names the compliance type this read stopped at, authenticated under this
+        // store's own key: a value it did not mint is refused rather than served a page it
+        // never offered.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match compliance::page_cursor(&store.page_token_key(), token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(ListComplianceSummariesErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // The aggregate itself: every compliance item of the Region the filters admit, rolled
+        // up by the compliance type it was reported under
+        // (`crate::state::compliance_summaries::summarize`). The items come from the one place
+        // this service holds them, so what a summary counts is what the item read reports.
+        let summaries = crate::state::compliance_summaries::summarize(
+            store.compliance_items(&region, &[]).iter().filter(|item| {
+                filters
+                    .iter()
+                    .all(|(key, values, operator)| item.matches_filter(key, values, operator))
+            }),
+        );
+
+        let mut compliance_summary_items = Vec::new();
+        let mut next_token = None;
+        let mut last_served: Option<String> = None;
+        for (compliance_type, summary) in summaries {
+            // The page resumes STRICTLY after the type the previous page's token named, so
+            // nothing it reported is reported twice.
+            if resume_after
+                .as_deref()
+                .is_some_and(|cut| compliance_type.as_str() <= cut)
+            {
+                continue;
+            }
+            if compliance_summary_items.len() == page_size {
+                // The page is full and a type is still waiting: hand the caller the type this
+                // page stopped at, so the next request continues where it left off.
+                next_token = last_served
+                    .as_deref()
+                    .map(|served| compliance::page_token(&store.page_token_key(), served));
+                break;
+            }
+            compliance_summary_items.push(summary.to_compliance_summary_item(&compliance_type));
+            last_served = Some(compliance_type);
+        }
+
+        Ok(ListComplianceSummariesOutput {
+            compliance_summary_items: Some(compliance_summary_items),
+            next_token,
+        })
     }
 }

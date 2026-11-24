@@ -62,7 +62,7 @@ const UNREGISTERED: &str = "i-0dead999";
 /// The one compliance resource type Systems Manager supports: "`ManagedInstance` is currently
 /// the only supported resource type"
 /// (`smithy_query(query="doc", shape="PutComplianceItemsRequest", member="ResourceType")`).
-const MANAGED_INSTANCE: &str = "ManagedInstance";
+pub(crate) const MANAGED_INSTANCE: &str = "ManagedInstance";
 
 /// A compliance type of the caller's own namespace: "specify `Association` (for a State
 /// Manager association), `Patch`, or `Custom:string`"
@@ -97,7 +97,11 @@ fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Register a node in `region` the way its own registration would.
-fn register(engine: &Arc<engine::InMemoryEngine>, region: &str, node_id: &str) {
+///
+/// `pub(crate)`: the suite about the ROLL-UP of a node's compliance
+/// (`compliance_summaries`) needs the same seeded node, and a second copy of this would reach
+/// into the node store a second way.
+pub(crate) fn register(engine: &Arc<engine::InMemoryEngine>, region: &str, node_id: &str) {
     let at = SystemTime::UNIX_EPOCH + LAST_PING;
     let mut node = ManagedNodeRecord::registering(node_id, RESOURCE_TYPE_EC2_INSTANCE, at);
     node.properties.platform_type = Some("Linux".to_string());
@@ -134,7 +138,10 @@ fn summary(execution_id: Option<&str>, execution_type: Option<&str>) -> Value {
 }
 
 /// `PutComplianceItems` of `items` about `resource_id`, signed for `region`.
-async fn put(
+///
+/// `pub(crate)` for the reason [`register`] is: the roll-up suite writes its compliance the
+/// same way, through this service's own put.
+pub(crate) async fn put(
     router: &MultiServiceRouter,
     region: &str,
     resource_type: &str,

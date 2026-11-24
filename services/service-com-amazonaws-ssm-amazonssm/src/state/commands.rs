@@ -165,9 +165,15 @@ pub struct CommandInvocationRecord {
     pub status: String,
     /// The detailed status, in the spelling `CommandInvocation$StatusDetails` documents.
     pub status_details: String,
-    /// What the node's agent ran and what it answered, for an invocation something has
-    /// been delivered to; `None` for one that reached no guest to run in.
+    /// What the agent in the node's guest ran for this invocation, and what the guest
+    /// answered, for an invocation something has been delivered to; `None` for one that
+    /// reached no guest to run in.
     pub outcome: Option<InvocationOutcome>,
+    /// The script the node's agent has NOT PICKED UP yet, for an invocation whose node had no
+    /// operating system up when the send reached it — a node this emulator holds no booted
+    /// guest for ([`AwaitedDelivery`]). `None` for every other invocation: one already
+    /// delivered, and one there is nothing to deliver to the node at all.
+    pub awaiting: Option<AwaitedDelivery>,
     /// When the cancel a caller asked for this invocation settles, for one `CancelCommand`
     /// reached while it was still running; `None` for an invocation nobody cancelled.
     ///
@@ -175,6 +181,34 @@ pub struct CommandInvocationRecord {
     /// after it, and nothing a step did moves it on — "the command was terminated before
     /// it was completed" ([`CommandInvocationRecord::materialize_due`]).
     pub cancel_settles_at: Option<SystemTime>,
+}
+
+/// The script one node's agent has not picked up yet, kept so that the agent runs THAT script
+/// when its guest comes up.
+///
+/// A send performs its document's script in each node's guest as it goes
+/// ([`crate::ops::send_command`]), which is the agent in that guest taking the command. An
+/// agent whose guest is not up has taken nothing: "Pending: The command hasn't been sent to
+/// the managed node" is the status that invocation stays in (`CommandInvocation$StatusDetails`),
+/// and the delivery is owed to the clock — the guest comes up at the instant Amazon EC2 owes
+/// its boot, and the agent in it then takes the command whether or not anybody calls in
+/// between ([`super::command_deliveries::settle_due_deliveries`] is what materialises it).
+///
+/// What is kept is what that delivery needs and nothing more: the step whose plugin runs and
+/// the lines it delivers, both resolved when the send was made, so a document or a parameter
+/// that changed afterwards cannot change what the agent was sent.
+#[derive(Debug, Clone)]
+pub struct AwaitedDelivery {
+    /// The step of the document whose plugin the agent runs — what `GetCommandInvocation`'s
+    /// `PluginName` then names.
+    pub plugin_name: String,
+    /// The lines that step delivers to the guest, as ONE script.
+    pub commands: Vec<String>,
+    /// When the invocation's own move off `Pending` was owed when the send was made
+    /// ([`InvocationOutcome::due_at`]): a delivery that happens later does not bring that
+    /// instant forward, and one that happens after it has passed leaves the invocation
+    /// finished as soon as the run is in.
+    pub due_at: SystemTime,
 }
 
 /// What the agent on one node ran for one invocation, and what the guest answered.
@@ -422,8 +456,20 @@ impl CommandInvocationRecord {
             status: COMMAND_STATUS_PENDING.to_string(),
             status_details: COMMAND_STATUS_PENDING.to_string(),
             outcome: None,
+            awaiting: None,
             cancel_settles_at: None,
         }
+    }
+
+    /// Keep `awaited` as the script this invocation's node has not picked up yet, and answer
+    /// the invocation to its caller's hand.
+    ///
+    /// Recorded beside the placeholder outcome a send leaves for a node nothing reached, so an
+    /// invocation whose guest never comes up still times out at the send's own delivery
+    /// timeout; the awaited script is what a later delivery runs
+    /// ([`super::command_deliveries::settle_due_deliveries`]).
+    pub fn awaits_delivery(&mut self, awaited: AwaitedDelivery) {
+        self.awaiting = Some(awaited);
     }
 
     /// Cancel this invocation at `now`, with the cancel settling at
@@ -442,7 +488,14 @@ impl CommandInvocationRecord {
 
     /// Record what the agent ran for this invocation, with its move off `Pending` owed at
     /// `due_at`.
+    ///
+    /// A delivery is what the agent in the guest TOOK, so recording one leaves nothing
+    /// awaiting: a node whose agent has run the script is not one that has still to pick it
+    /// up.
     pub fn delivered(&mut self, outcome: InvocationOutcome) {
+        if outcome.delivered {
+            self.awaiting = None;
+        }
         self.outcome = Some(outcome);
     }
 

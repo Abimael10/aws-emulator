@@ -280,6 +280,10 @@ pub mod parameter_pagination;
 /// those nodes holds of it.
 pub mod commands;
 
+/// The delivery a sent command still owes a node whose agent has not picked it up yet, and
+/// the settle that performs it once that node's guest is up.
+pub mod command_deliveries;
+
 /// An automation execution a caller started, the step executions it is made of, and the
 /// walk through them the clock owes.
 pub mod automation;
@@ -389,6 +393,10 @@ pub mod instance_patches;
 /// operation left and the items a caller's own `PutComplianceItems` wrote, which
 /// `ListComplianceItems` reports.
 pub mod compliance_items;
+
+/// The roll-up of those items by compliance type, which `ListComplianceSummaries` answers
+/// with.
+pub mod compliance_summaries;
 
 /// The patch-baseline run Patch Manager performs on a managed node when the document it
 /// publishes for that is sent to one, and the compliance that run reports.

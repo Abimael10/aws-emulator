@@ -12,9 +12,9 @@
 //! each read through its own state accessors rather than through a second copy of them:
 //!
 //! 1. **the instance** — Amazon EC2's own store
-//!    (`ComAmazonawsEc2Amazonec2State::instances`): an instance exists, is `running` and
-//!    carries the address, the host name, the type and the Availability Zone a node
-//!    reports. An instance EC2 does not hold is no node here, and an instance it reports
+//!    (`ComAmazonawsEc2Amazonec2State::instances`): an instance exists, its guest's operating
+//!    machine is up or coming up ([`is_up`]) and it carries the address, the host name, the
+//!    type and the Availability Zone a node reports. An instance EC2 does not hold is no node here, and an instance it reports
 //!    `stopped` or `terminated` is one "this operation does not return information for"
 //!    (`DescribeInstanceInformation`), so the node it registered goes with it.
 //! 2. **the instance profile** — the association EC2 holds between the instance and an IAM
@@ -67,11 +67,14 @@
 //!
 //! ## What is written, and why a report may write it
 //!
-//! The agent is a process of the GUEST, started by it, so the node it registers appears as
-//! the instance comes up: the registration falls due [`REGISTRATION_DELAY`] after the launch,
-//! whether or not anybody calls in between, and a caller that reads straight after
-//! `RunInstances` sees the instance not managed yet — as it would against the real service,
-//! and as Amazon EC2's own reads report the instance itself for that same span.
+//! The agent is part of the MACHINE the launch starts — preinstalled in the image and started
+//! by its guest — so the node it registers is there from the launch instant
+//! ([`registered_at`]), whether or not anybody called in between: a client that launches an
+//! instance and asks straight away is answered the node its agent registered, and the
+//! `RegistrationDate` it reports is that launch's own instant. What the node's guest can be
+//! made to DO still waits for that guest to come up: a command sent to a node whose operating
+//! system has not come up is one its agent has not picked up, so its invocation stays
+//! `Pending` until it has ([`super::commands::CommandInvocationRecord`]).
 //! [`settle_registrations`] is what materialises the registrations the clock has already
 //! made due: that write was owed at the same instant whether or not anybody called, which
 //! is why a REPORTING operation of this service takes it before it reads the node store.
@@ -84,30 +87,13 @@
 //! per Region.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use ::service_common::iam_authorization::{self as authorization, Decision};
 
 use super::{ManagedNodeRecord, PING_STATUS_CONNECTION_LOST, PING_STATUS_ONLINE, RESOURCE_TYPE_EC2_INSTANCE};
-
-/// How long after its launch an instance's registration with Systems Manager falls due.
-///
-/// AWS publishes no span for it — it is however long the agent takes to come up and reach the
-/// service — so the span is the emulator's CHOSEN one, and what it is chosen to be is the
-/// span the instance's OWN boot takes: the agent is a process of the guest, started by it, so
-/// the node it registers appears as the instance reaches `running`, which is the move the
-/// service that owns the instance owes it ([`ec2::TRANSITION_DELAY`], read from that crate so
-/// the two cannot drift apart). An instance that service does not yet hold `running` has no
-/// guest for the agent to run in, and so registers no node whatever this span says.
-///
-/// It is deliberately never zero: a caller that describes managed nodes straight after a
-/// launch sees the instance not managed yet, the way it would against the real service — and
-/// a node reported before its guest is up would be one every `SendCommand` to it could
-/// deliver nothing to, the guest run needing a running, booted instance
-/// ([`super::guest_execution::perform_in_guest`]).
-pub const REGISTRATION_DELAY: Duration = ec2::TRANSITION_DELAY;
 
 /// The IAM action an agent registers its node with, and so the one a profile's role has to
 /// allow for the instance to become a managed node: `ssm:UpdateInstanceInformation`
@@ -169,8 +155,8 @@ pub const SOURCE_TYPE_EC2_INSTANCE: &str = "AWS::EC2::Instance";
 /// Call it with NO guard of this service's store held: it reads Amazon EC2's and IAM's
 /// stores and then writes this service's.
 ///
-/// The two writes are the ones the clock owes: a node whose instance was launched more than
-/// [`REGISTRATION_DELAY`] ago, whose profile lets the agent register and whose security groups
+/// The two writes are the ones the clock owes: a node whose instance's guest has come up
+/// ([`registered_at`]), whose profile lets the agent register and whose security groups
 /// let the agent's own call reach the service is added, and a node
 /// THIS projection registered whose instance no longer qualifies — gone, stopped,
 /// terminated, or no longer running as such a profile — is dropped, because
@@ -262,7 +248,7 @@ fn registered_nodes<Eng: Send + Sync + 'static>(
             .instances
             .values()
             .filter(|instance| ec2::region_of_zone_name(&instance.placement_az) == region)
-            .filter(|instance| is_running(instance, settled))
+            .filter(|instance| is_up(instance, settled))
             .filter(|instance| registered_at(instance) <= now)
             .filter_map(|instance| ManagedInstance::of(&store, instance))
             .collect::<Vec<ManagedInstance>>()
@@ -348,16 +334,18 @@ impl ManagedInstance {
             .iam_instance_profile_of_instance(&instance.instance_id)
             .and_then(|profile| profile.arn)?;
         let platform_type = platform_type(store, instance);
+        // The agent registered the node when the machine it is part of was launched.
+        let registered_at = registered_at(instance);
         Some(Self {
             id: instance.instance_id.clone(),
             profile_arn,
-            registered_at: registered_at(instance),
+            registered_at,
             platform_type,
             platform: super::node_platform::guest_platform(
                 platform_type,
                 image_name(store, instance),
             ),
-            agent_version: bundled_agent_version(store, instance, registered_at(instance)),
+            agent_version: bundled_agent_version(store, instance, registered_at),
             ip_address: instance.private_ip.clone(),
             computer_name: instance.private_dns_name.clone(),
             instance_type: instance.instance_type.clone(),
@@ -478,33 +466,49 @@ fn image_name<'a>(
         .and_then(|image| image.name.as_deref())
 }
 
-/// When `instance`'s registration with Systems Manager fell due: [`REGISTRATION_DELAY`]
-/// after the instant it was launched.
+/// When the AGENT on `instance` registered its node: the instant the instance was launched.
+///
+/// The agent is part of the machine the launch starts — it is preinstalled in the image and
+/// started by the guest — so nothing of this emulator's own stands between the launch and the
+/// registration: AWS's own latency for it is however long the agent takes to come up and
+/// reach the service (tens of seconds, which this emulator does not model), and a client
+/// that launches an instance and asks straight away is answered the node its agent
+/// registered rather than an empty list.
 ///
 /// Derived from the stored launch instant rather than from the clock, so it is the same
 /// instant on every read — which is what lets the node record report one `RegistrationDate`
-/// however often it is materialised.
+/// however often it is materialised, and keeps that date where it was when the guest
+/// restarts (a registration happens once).
+///
+/// What the node's guest can be made to DO still waits for that guest: a command sent to a
+/// node whose operating system has not come up yet is one its agent has not picked up, so the
+/// invocation of it stays `Pending` until it has ([`super::commands`]).
 fn registered_at(instance: &ec2::InstanceRecord) -> SystemTime {
-    instance.launch_time + REGISTRATION_DELAY
+    instance.launch_time
 }
 
-/// Whether Amazon EC2 holds `instance` in the one state a managed node is reported in.
+/// Whether Amazon EC2 holds `instance` in a state whose machine is up or coming up.
 ///
 /// "This operation does not return information for nodes that are either Stopped or
-/// Terminated" (`DescribeInstanceInformation`), and the other states an instance passes
-/// through are ones whose guest is not up: the agent reports itself from a guest that is
-/// running, so a node is reported for a running instance and for no other.
+/// Terminated" (`DescribeInstanceInformation`), and an instance on its way to one of those
+/// (`stopping`, `shutting-down`) is one whose operating system is going down with it. What is
+/// left is an instance that is `running` and one that is `pending` — "the instance is
+/// preparing to enter the running state", which is the machine coming up with the agent in
+/// it — so a node is reported for those and for no other.
 ///
 /// The state is the one that service owes the instance at `settled`: an instance whose move
 /// to `running` has already fallen due IS running, whether or not anybody has called Amazon
 /// EC2 since — materialising it is that service's own write, not this one's, so the state
 /// is derived here rather than written.
-fn is_running(instance: &ec2::InstanceRecord, settled: Instant) -> bool {
+fn is_up(instance: &ec2::InstanceRecord, settled: Instant) -> bool {
     let state = match instance.pending_transition.as_ref() {
         Some(pending) if pending.due_at <= settled => pending.to,
         _ => instance.state,
     };
-    state == ec2::InstanceStateName::Running
+    matches!(
+        state,
+        ec2::InstanceStateName::Running | ec2::InstanceStateName::Pending
+    )
 }
 
 /// The SSM Agent build the guest of `instance` holds, for a node registering at

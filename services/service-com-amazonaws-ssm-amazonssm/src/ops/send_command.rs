@@ -702,7 +702,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this process do) — is NOT left `Pending` for ever: "`ExpiresAfter` is calculated
         // based on the total timeout for the overall command" (`Command$ExpiresAfter`), so
         // its invocation is owed the delivery timeout the send ran with, after which it
-        // reports that the command was never delivered.
+        // reports that the command was never delivered. A node whose guest is only not up YET
+        // — a machine whose launch is still coming up — is one whose agent takes the command
+        // when that guest does come up, which the clock owes it
+        // (`crate::state::command_deliveries`): the script stays with the invocation until
+        // then.
         let due_at = now + crate::state::commands::INVOCATION_COMPLETES_AFTER;
         let undelivered_at = record.expires_after();
         let mut ran_on: Vec<String> = Vec::new();
@@ -747,7 +751,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A run this process could not perform at all — no thread for it, or a thread that
             // ended without answering — is a node nothing was delivered to, exactly as one
             // with no guest to run in is.
+            //
+            // A node whose guest is not up YET is one whose agent has not picked the command
+            // up: the script it is to run is kept on the invocation, which the clock then owes
+            // a delivery once that guest has come up
+            // (`crate::state::command_deliveries::settle_due_deliveries`). The invocation is
+            // still left as a send leaves an undelivered one below, so a guest that never
+            // comes up times out at the command's own delivery timeout.
             let Some(run) = performed.ok().flatten() else {
+                if let Some(invocation) = invocations.get_mut(&id) {
+                    invocation.awaits_delivery(crate::state::commands::AwaitedDelivery {
+                        plugin_name: step.name,
+                        commands: step.commands,
+                        due_at,
+                    });
+                }
                 continue;
             };
             if let Some(invocation) = invocations.get_mut(&id) {
