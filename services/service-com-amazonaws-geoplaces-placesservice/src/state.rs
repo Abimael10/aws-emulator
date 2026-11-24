@@ -15,6 +15,11 @@
 //! `Title` and `Address`, and a `Position` handed out by any of them
 //! reverse-geocodes back to the place it came from.
 //!
+//! A record's `PlaceId` is part of that place data, carried on the record's own
+//! row like its `Title`, its `Address` and its `Position` (see
+//! [`PlaceRecord::with_place_id`]), so one place has one handle however it was
+//! found and whatever the request asked for.
+//!
 //! Nothing here is mutated by a request. Every operation this crate implements is
 //! `@readonly`, so even their pagination carries no server-side cursor: a `NextToken`
 //! is a self-describing, opaque string (see [`encode_page_token`]) rather than an
@@ -1407,7 +1412,10 @@ pub struct TimeZoneRecord {
 /// One place in the catalog — the single source of truth every operation projects.
 #[derive(Debug, Clone)]
 pub struct PlaceRecord {
-    /// Opaque, stable identifier; see [`synthesize_place_id`].
+    /// The place's opaque handle: a property OF THE PLACE the place data carries
+    /// on the record's own row ([`PlaceRecord::with_place_id`]), the same way the
+    /// row carries its title, its address and its position, and
+    /// [`synthesize_place_id`] only where the data names none.
     pub place_id: String,
     /// A `PlaceType` enum value.
     pub place_type: String,
@@ -1505,6 +1513,20 @@ impl PlaceRecord {
             completion_terms: Vec::new(),
             places_covered: 0,
         }
+    }
+
+    /// The opaque handle the place data carries for this place, named on the
+    /// record's own row beside its title, its address and its position.
+    ///
+    /// A handle is a property OF THE PLACE — it belongs to the place record, not
+    /// to the call that reported it — so every operation that projects the record
+    /// hands out this one handle whatever the request asked for, and GetPlace
+    /// resolves it back to the record. A row that names none keeps the handle
+    /// [`synthesize_place_id`] derived for it, so every handle stays in one token
+    /// class.
+    fn with_place_id(mut self, place_id: &str) -> Self {
+        self.place_id = place_id.to_string();
+        self
     }
 
     /// The box enclosing the area this place covers, as `[west, south, east,
@@ -2135,9 +2157,10 @@ fn place_id_token(bytes: &[u8]) -> String {
         .replace('/', "_")
 }
 
-/// The opaque `PlaceId` of a record: the service's version header followed by a
-/// payload derived from what the record IS (its title and its position), rendered
-/// as one opaque base64url token of a fixed length class.
+/// A derived opaque `PlaceId` for a record whose row names no handle: the
+/// service's version header followed by a payload derived from what the record IS
+/// (its title and its position), rendered as one opaque base64url token of a fixed
+/// length class.
 ///
 /// The handle is a HANDLE: the model documents nothing about its content
 /// (`SensitiveString`, `length(0, 500)`), and a client reads it as an opaque token
@@ -3777,6 +3800,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             [-122.329_45, 47.603_57],
             seattle.clone(),
         )
+        // The handle the place data carries for this locality.
+        .with_place_id(
+            "AQAAADgAS4dlANlTcJAwxzkQeY4KmDsNP_-mbI9KgIrdgBJy84gfbsSLbZGuZFNi0t5RW4yDS2sWLBA3xaF0T_lgjPYHVrFMDllob_vUqyz9hUkyF68F5Y5-4DE66Q",
+        )
         .with_map_view([-122.436_13, 47.495_58, -122.236_48, 47.734_16])
         .with_time_zone(pacific.0, pacific.1, pacific.2),
         PlaceRecord::new(
@@ -4322,6 +4349,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             [33.859_39, 45.714_2],
             pervomaiske_ukraine,
         )
+        // The handle the place data carries for this locality.
+        .with_place_id(
+            "AQAAADgApjjt2WZrCL3y4TIpZfYohfzY_CnvR89lM4pJoXwZmFlTtTdjHN-fQ2xZcNKgU6zd_-jLCssEJSvYtSiIjj-Tgop4nlezkfb8Zt8Lf5EW7b6IVOG2E_UjKA",
+        )
         .with_map_view([33.526_92, 45.343_03, 34.122_77, 45.809_53])
         .with_alternate_names(&["Pervomaiske", "Первомайский район"])
         .with_political_attribution("RUS", pervomaiske_russia)
@@ -4397,6 +4428,58 @@ mod tests {
                 found.map(|record| record.title.clone())
             );
         }
+    }
+
+    /// Every seeded record's handle is place data: the one its row names where the
+    /// data names one, the derived one where it does not, both in a single token
+    /// class, and each resolvable back to its own record.
+    ///
+    /// The rows are the whole seeded catalog, so the rule is asserted over every
+    /// record rather than over the two the recorded fixtures reach.
+    #[test]
+    fn every_seeded_record_carries_the_handle_its_place_data_names() {
+        let state = ComAmazonawsGeoplacesPlacesserviceState::default();
+        let prefix = place_id_token(&PLACE_ID_VERSION);
+        let mut named = Vec::new();
+        let mut derived = 0_usize;
+        for place in &state.places {
+            let would_derive = synthesize_place_id(&place.title, place.position);
+            // One token class, whichever source the handle came from: the service's
+            // version prefix and the length a derived handle carries.
+            assert!(
+                place.place_id.starts_with(&prefix)
+                    && place.place_id.len() == would_derive.len(),
+                "case {}: expected a handle of one token class ({prefix}, {} \
+                 characters), got {:?}",
+                place.title,
+                would_derive.len(),
+                place.place_id
+            );
+            if place.place_id == would_derive {
+                derived += 1;
+            } else {
+                named.push(place.title.clone());
+            }
+            assert!(
+                state
+                    .place(&place.place_id)
+                    .is_some_and(|record| record.title == place.title),
+                "case {}: a record's handle resolves back to that record, got {:?}",
+                place.title,
+                state.place(&place.place_id).map(|record| record.title.clone())
+            );
+        }
+        assert!(
+            !named.is_empty(),
+            "case named: the catalog carries the handles its place data names, so \
+             some record's handle is not the one derived from its own text"
+        );
+        assert!(
+            derived > 0,
+            "case derived: a record whose row names no handle keeps the derived one, \
+             got {derived} of {} records",
+            state.places.len()
+        );
     }
 
     /// A distance is symmetric, zero at the same point, and correct to within a

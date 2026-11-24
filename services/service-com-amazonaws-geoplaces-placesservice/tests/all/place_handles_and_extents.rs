@@ -315,6 +315,286 @@ async fn every_operation_reports_the_same_handle_for_a_place() {
     }
 }
 
+/// `PlaceType` values that are also the name of the `GeocodeQueryComponents`
+/// member naming a place of that granularity, so a structured query can ask for
+/// the record by the component the model gives its level (`smithy_query`
+/// query=shape shape=GeocodeQueryComponents: `Country`, `Region`, `SubRegion`,
+/// `Locality`, `District`, `Street`, `AddressNumber`, `PostalCode`).
+const ADMINISTRATIVE_COMPONENT_PLACE_TYPES: [&str; 5] =
+    ["Country", "Region", "SubRegion", "Locality", "District"];
+
+/// `PlaceType` values a Geocode request may filter on, from the model's
+/// `GeocodeFilterPlaceType` enum (`smithy_query` query=shape
+/// shape=GeocodeFilterPlaceType).
+const GEOCODE_FILTER_PLACE_TYPES: [&str; 10] = [
+    "Locality",
+    "PostalCode",
+    "Intersection",
+    "Street",
+    "PointAddress",
+    "InterpolatedAddress",
+    "SecondaryAddress",
+    "PointOfInterest",
+    "Country",
+    "Region",
+];
+
+/// A handle belongs to the PLACE, not to the call that reported it: whatever form
+/// the request takes — a free-form query, an assembled label, structured
+/// components, a result filter, a requested language, a page size or an intended
+/// use — the handle a result item carries is the one the place data holds for that
+/// record, and a response never reports a handle the place data does not hold.
+///
+/// The rows are a place of every granularity the catalog holds crossed with the
+/// request forms that reach it, so the rule is asserted over a SET of requests
+/// rather than on the single form a recorded call happened to use.
+#[tokio::test]
+async fn a_place_handle_is_the_places_own_whatever_form_the_request_takes() {
+    let emulator = Emulator::new();
+    let catalog = emulator.catalog();
+    let held: std::collections::BTreeSet<String> =
+        catalog.iter().map(|place| place.place_id.clone()).collect();
+    // One place per `PlaceType`, so the table spans point of interest up to
+    // country rather than repeating one granularity.
+    let mut by_type: std::collections::BTreeMap<String, Place> = std::collections::BTreeMap::new();
+    for place in catalog {
+        by_type.entry(place.place_type.clone()).or_insert(place);
+    }
+    assert!(
+        by_type.len() >= 5,
+        "case granularities: expected a place at several granularities, got {:?}",
+        by_type.keys().collect::<Vec<_>>()
+    );
+
+    let mut forms_naming_the_place = 0_usize;
+    for place in by_type.values() {
+        let at = json!([place.position[0], place.position[1]]);
+        let mut forms: Vec<(&str, &str, Value)> = vec![
+            (
+                "text",
+                GEOCODE,
+                json!({"QueryText": place.name, "MaxResults": 100}),
+            ),
+            (
+                "text-language",
+                GEOCODE,
+                json!({"QueryText": place.name, "Language": "fr", "MaxResults": 100}),
+            ),
+            (
+                "text-stored",
+                GEOCODE,
+                json!({"QueryText": place.name, "IntendedUse": "Storage", "MaxResults": 100}),
+            ),
+            (
+                "text-one-result",
+                GEOCODE,
+                json!({"QueryText": place.name, "MaxResults": 1}),
+            ),
+            (
+                "label",
+                GEOCODE,
+                json!({"QueryText": place.label, "MaxResults": 100}),
+            ),
+            (
+                "position",
+                REVERSE_GEOCODE,
+                json!({"QueryPosition": at, "MaxResults": 100}),
+            ),
+            (
+                "position-language",
+                REVERSE_GEOCODE,
+                json!({"QueryPosition": at, "Language": "en", "MaxResults": 100}),
+            ),
+        ];
+        if ADMINISTRATIVE_COMPONENT_PLACE_TYPES.contains(&place.place_type.as_str()) {
+            // The component member of the place's own level names the place.
+            let mut components = serde_json::Map::new();
+            components.insert(place.place_type.clone(), Value::String(place.name.clone()));
+            forms.push((
+                "components",
+                GEOCODE,
+                json!({"QueryComponents": components, "MaxResults": 100}),
+            ));
+        }
+        if GEOCODE_FILTER_PLACE_TYPES.contains(&place.place_type.as_str()) {
+            forms.push((
+                "filtered",
+                GEOCODE,
+                json!({
+                    "QueryText": place.name,
+                    "Filter": {"IncludePlaceTypes": [place.place_type]},
+                    "MaxResults": 100,
+                }),
+            ));
+        }
+
+        for (form, path, body) in forms {
+            let case = format!("{}-{form}", place.name);
+            let response = emulator.post_ok(&case, path, &body).await;
+            let mut named_the_place = false;
+            for item in items(&response) {
+                let handle = text(&item, "PlaceId");
+                assert!(
+                    held.contains(&handle),
+                    "case {case}: a response reports only handles the place data holds, \
+                     got {handle:?}"
+                );
+                // The item names THIS place when it reports the record's own
+                // position and granularity — the two members that identify which
+                // catalog record a result projects.
+                if position(&item) == place.position.to_vec()
+                    && text(&item, "PlaceType") == place.place_type
+                {
+                    assert_eq!(
+                        handle, place.place_id,
+                        "case {case}: the place at {:?} reports its own handle whatever \
+                         the request asked for, got {handle:?}",
+                        place.position
+                    );
+                    named_the_place = true;
+                }
+            }
+            if named_the_place {
+                forms_naming_the_place += 1;
+            }
+        }
+    }
+    assert!(
+        forms_naming_the_place > 20,
+        "case coverage: the table must reach a place through many request forms, \
+         got {forms_naming_the_place}"
+    );
+}
+
+/// A handle is what a client hands BACK: GetPlace resolves it to the same place
+/// under every modifier a read may carry — a language, a political view in either
+/// of its two modeled code forms, an intended use, an additional feature — because
+/// the handle names the place and not the call it came from.
+///
+/// The rows are a place of every granularity the catalog holds crossed with those
+/// modifiers.
+#[tokio::test]
+async fn getplace_resolves_a_handle_under_every_read_modifier() {
+    let emulator = Emulator::new();
+    let mut by_type: std::collections::BTreeMap<String, Place> = std::collections::BTreeMap::new();
+    for place in emulator.catalog() {
+        by_type.entry(place.place_type.clone()).or_insert(place);
+    }
+    let mut reads = 0_usize;
+    for place in by_type.values() {
+        for (modifier, query) in [
+            ("plain", ""),
+            ("language", "?language=fr"),
+            // `PoliticalView` is "the alpha-2 or alpha-3 character code for the
+            // political view of a country", so both forms name one view.
+            ("political-view-alpha2", "?political-view=RU"),
+            ("political-view-alpha3", "?political-view=RUS"),
+            ("stored", "?intended-use=Storage"),
+            ("feature", "?additional-features=TimeZone"),
+        ] {
+            let case = format!("{}-{modifier}", place.name);
+            let read = emulator
+                .get_ok(&case, &format!("{PLACE}/{}{query}", place.place_id))
+                .await;
+            assert_eq!(
+                text(&read, "PlaceId"),
+                place.place_id,
+                "case {case}: GetPlace reports back the handle it was asked for, got {:?}",
+                text(&read, "PlaceId")
+            );
+            assert_eq!(
+                (position(&read), text(&read, "PlaceType")),
+                (place.position.to_vec(), place.place_type.clone()),
+                "case {case}: a handle resolves to the place it names, got {:?} and {:?}",
+                position(&read),
+                text(&read, "PlaceType")
+            );
+            reads += 1;
+        }
+    }
+    assert!(
+        reads > 20,
+        "case coverage: expected every granularity read under every modifier, got {reads}"
+    );
+}
+
+/// The handles the place data carries for places of this catalog, as `(title,
+/// handle)`: a place's handle is a datum OF THE PLACE, so a record whose row names
+/// one reports that handle and not a token derived from the record's own text.
+///
+/// SOURCE: the handles the service itself returns for these two places, carried on
+/// their catalog rows in `src/state.rs`. The rows below are the test's join back
+/// onto the catalog — a record whose row stops naming its handle, or whose handle
+/// is overwritten by a derivation, fails here.
+const HANDLES_THE_PLACE_DATA_CARRIES: [(&str, &str); 2] = [
+    (
+        "Seattle",
+        "AQAAADgAS4dlANlTcJAwxzkQeY4KmDsNP_-mbI9KgIrdgBJy84gfbsSLbZGuZFNi0t5RW4yDS2sWLBA3xaF0T_lgjPYHVrFMDllob_vUqyz9hUkyF68F5Y5-4DE66Q",
+    ),
+    (
+        "Первомайський район",
+        "AQAAADgApjjt2WZrCL3y4TIpZfYohfzY_CnvR89lM4pJoXwZmFlTtTdjHN-fQ2xZcNKgU6zd_-jLCssEJSvYtSiIjj-Tgop4nlezkfb8Zt8Lf5EW7b6IVOG2E_UjKA",
+    ),
+];
+
+/// A record whose place data NAMES a handle reports that handle: the catalog row
+/// carries it, every operation that projects the record hands it out, and
+/// `GET /v2/place/{PlaceId}` resolves it back to that same place — the round trip
+/// a client makes with an id it captured earlier.
+///
+/// The rows are every place the catalog's data names a handle for, each read
+/// through every operation that projects a place, so the rule is asserted over the
+/// whole set rather than on the one request a recording happened to make.
+#[tokio::test]
+async fn a_record_reports_the_handle_its_place_data_names_for_it() {
+    let emulator = Emulator::new();
+    let catalog = emulator.catalog();
+    for (title, handle) in HANDLES_THE_PLACE_DATA_CARRIES {
+        let place = catalog
+            .iter()
+            .find(|place| place.name == title)
+            .unwrap_or_else(|| panic!("case {title}: the catalog holds this place"));
+        assert_eq!(
+            place.place_id, handle,
+            "case {title}: the catalog row carries the handle its place data names, \
+             got {:?}",
+            place.place_id
+        );
+        for (operation, body) in projections(&emulator, place).await {
+            let reported = if operation == "GetPlace" {
+                vec![text(&body, "PlaceId")]
+            } else {
+                handles(&body)
+            };
+            assert!(
+                reported.iter().any(|found| found == handle),
+                "case {title}-{operation}: expected the place's own handle among the \
+                 handles reported, got {reported:?}"
+            );
+        }
+        // The round trip: the handle names the place whatever produced it.
+        let read = emulator
+            .get_ok(title, &format!("{PLACE}/{handle}"))
+            .await;
+        assert_eq!(
+            (
+                text(&read, "PlaceId"),
+                position(&read),
+                text(&read, "PlaceType")
+            ),
+            (
+                handle.to_string(),
+                place.position.to_vec(),
+                place.place_type.clone()
+            ),
+            "case {title}: the handle resolves to the place whose data names it, got \
+             {:?} at {:?}",
+            text(&read, "PlaceId"),
+            position(&read)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The extent a place covers, and the precision a coordinate is reported at
 // ---------------------------------------------------------------------------
