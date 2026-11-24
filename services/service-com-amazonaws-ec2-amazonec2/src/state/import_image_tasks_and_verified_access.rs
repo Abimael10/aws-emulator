@@ -337,14 +337,16 @@ pub fn require_well_formed_import_task_id<E>(
     Err(invalid_import_task_id_format(task_id))
 }
 
-/// Refuse a value a request named as an import task id that is not an import task id at
-/// all: HTTP 400 [`INVALID_CONVERSION_TASK_ID`].
+/// Refuse an `ImportTaskIds` entry a DESCRIBE was given that is not an import task id of
+/// the kind it reports at all: HTTP 400 [`INVALID_CONVERSION_TASK_ID`].
 ///
-/// The id form is read BEFORE the store, and the import task family carries one code for
-/// every id it cannot resolve: a value outside the form is answered under the same code as
-/// a well-formed id that names no task ([`invalid_conversion_task_id_not_found`]), not
-/// under the code for an id of a resource kind the service does not know. The ONE
-/// definition of that refusal for every operation naming an import task, of either kind.
+/// The id form is read BEFORE the store. Which refusal a value outside that form earns is a
+/// fact of the OPERATION that read it, as the recorded refusals of this family show: the
+/// describes that select rows by `ImportTaskIds` answer this family code, while
+/// `crate::ops::cancel_import_task`, which acts on the ONE task it names, answers the
+/// resource-agnostic [`crate::scaffolded::Scaffolded::invalid_id`] for a value that is no
+/// import task id at all — the same refusal `crate::ops::cancel_export_task` words one
+/// with. The ONE definition of the describes' refusal, whichever kind of task they report.
 pub fn invalid_import_task_id_format<E>(task_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_CONVERSION_TASK_ID,
@@ -395,9 +397,10 @@ pub fn import_task_kind_of(id: &str) -> Option<&'static str> {
 /// 400 [`INVALID_CONVERSION_TASK_ID`], with EC2's not-found sentence for the KIND the id
 /// names — the task kind's modelled resource type, then `ID`, then the id the request sent.
 ///
-/// The counterpart of [`invalid_import_task_id_format`], which answers the same code for a
-/// value that names no import task kind at all. The ONE wording for an import task of
-/// either kind a request names and this account does not hold.
+/// This code reports a task of this family that is MISSING, so it is answered only for a
+/// value whose kind was read: a value naming no import task kind at all is refused for its
+/// form instead, by the reader the calling operation words that half with. The ONE wording
+/// for an import task of either kind a request names and this account does not hold.
 pub fn import_task_id_not_found<E>(import_task_id: &str) -> crate::scaffolded::Scaffolded<E> {
     match import_task_kind_of(import_task_id) {
         // The id is echoed through [`echoed_resource_id`], the bound every refusal that
@@ -409,7 +412,7 @@ pub fn import_task_id_not_found<E>(import_task_id: &str) -> crate::scaffolded::S
             &echoed_resource_id(import_task_id),
         ),
         // Unreachable through an operation, which reads the id's kind before it looks a
-        // task up: a value naming no kind is answered as a format failure instead.
+        // task up: a value naming no kind is answered for its form instead.
         None => invalid_import_task_id_format(import_task_id),
     }
 }

@@ -5,14 +5,18 @@
 //! harness.
 //!
 //! The rule under test: an operation that names an import task refuses an id it cannot
-//! resolve to a task with HTTP 400 `InvalidConversionTaskId`, the import (conversion) task
-//! family's own code — whether the value names no kind of import task at all, which is
-//! judged before the store is reached, or names a kind the account holds no such task
-//! under, where the refusal spells that kind. The generic code for an id of a resource kind
-//! the service does not know is never the answer for one. The one qualification is a
-//! describe, which reports "a list of zero or more" tasks: an id of the kind THAT describe
-//! reports which names no task selects no row rather than failing the call, so only a value
-//! whose kind it cannot read is refused.
+//! resolve to a task with HTTP 400, by the half of the rule the value falls in. An id whose
+//! KIND the operation reads that the account holds no such task under is refused
+//! `InvalidConversionTaskId`, the import (conversion) task family's own code, with the
+//! refusal spelling that kind: the family's code reports a task of this family that is
+//! MISSING. A value that names no kind the operation reads at all is no id of this family,
+//! so it is refused for its FORM, before the store is reached, by the refusal THAT
+//! operation's validator words — the single-task `CancelImportTask` answers EC2's
+//! resource-agnostic `InvalidID` / "The ID '<value>' is not valid", as its recorded refusal
+//! carries, while the describes that select rows by `ImportTaskIds` answer the family code
+//! with the service's unreadable-id sentence. The one further qualification is a describe's
+//! list semantics: it reports "a list of zero or more" tasks, so an id of the kind THAT
+//! describe reports which names no task selects no row rather than failing the call.
 //!
 //! The kind of an import task id is the one its PREFIX names, followed by a hexadecimal
 //! suffix of any length: the length of the suffix is no part of what the parameter admits.
@@ -43,6 +47,11 @@ use super::ec2_query::{call, element, elements, error_code, member, unescaped};
 /// The Region every call here is signed for. An import task carries no Region member, so
 /// the Region only selects the ec2Query envelope.
 const REGION: &str = "eu-west-1";
+
+/// What a value the single-task cancel cannot read as an import task id of either kind is
+/// refused with: EC2's resource-agnostic code for an id of no kind the operation resolves,
+/// as that operation's recorded refusal carries it.
+const INVALID_ID: &str = "InvalidID";
 
 /// One request's form parameters, as the ec2Query harness takes them.
 type Params = Vec<(String, String)>;
@@ -124,6 +133,23 @@ impl Caller {
             None => import_task_id_of_any_kind_is_well_formed(import_task_id),
         }
     }
+
+    /// The `(code, message)` this operation refuses a value it cannot read as an id of a
+    /// task it names with — the half of the rule that is a fact of the OPERATION: the cancel
+    /// of the one task it names reports the value as no id it resolves, while a describe
+    /// answers the task family's own code with the service's unreadable-id sentence.
+    fn unreadable_refusal(self, import_task_id: &str) -> (&'static str, String) {
+        match self {
+            Self::Cancel => (
+                INVALID_ID,
+                format!("The ID '{import_task_id}' is not valid"),
+            ),
+            Self::DescribeImageTasks | Self::DescribeSnapshotTasks => (
+                INVALID_CONVERSION_TASK_ID,
+                format!("Invalid id: \"{import_task_id}\""),
+            ),
+        }
+    }
 }
 
 /// One call of `caller` naming `import_task_id` and nothing else.
@@ -202,10 +228,11 @@ fn reported_ids(body: &str) -> Vec<String> {
 }
 
 /// The rule, over every operation that names an import task crossed with every way an id
-/// can fail to name a task of the account: one code, HTTP 400 `InvalidConversionTaskId`,
-/// worded as the value it was sent when the operation cannot read the value's kind and as
-/// the task of that kind that is not there when it can — except where a describe answers an
-/// id of its own kind with no row at all.
+/// can fail to name a task of the account: an id whose kind the operation reads that names
+/// no task is HTTP 400 `InvalidConversionTaskId` worded as the task of that kind that is not
+/// there, while a value whose kind it cannot read is refused for its form — the cancel's
+/// `InvalidID` or a describe's family-coded unreadable-id sentence — except where a describe
+/// answers an id of its own kind with no row at all.
 #[tokio::test]
 async fn an_import_task_id_that_names_no_task_is_answered_the_same_way_everywhere() {
     let (router, engine) = emulator();
@@ -248,23 +275,25 @@ async fn an_import_task_id_that_names_no_task_is_answered_the_same_way_everywher
                 status, 400,
                 "case {case:?}: expected HTTP 400, got {status} with body {body}"
             );
+            // The two causes are worded — and coded — apart: an id whose kind the operation
+            // reads that names no task is reported as the task of that kind that is not
+            // there, under the family's own code, while a value whose kind it cannot read is
+            // refused for its form by the refusal that operation words. The XML escapes the
+            // quotes around the id, so the texts are compared.
+            let message = element(&body, "Message").map(|message| unescaped(&message));
+            let (expected_code, expected) =
+                match resource_type.filter(|_| caller.can_read(import_task_id)) {
+                    Some(resource_type) => (
+                        INVALID_CONVERSION_TASK_ID,
+                        format!("The {resource_type} ID '{import_task_id}' does not exist"),
+                    ),
+                    None => caller.unreadable_refusal(import_task_id),
+                };
             assert_eq!(
                 error_code(&body),
-                INVALID_CONVERSION_TASK_ID,
-                "case {case:?}: expected {INVALID_CONVERSION_TASK_ID}, got body {body}"
+                expected_code,
+                "case {case:?}: expected {expected_code}, got body {body}"
             );
-            // The two causes under that one code are worded apart: a value whose kind the
-            // operation cannot read is reported as the value it was sent, and an id whose
-            // kind it reads that names no task is reported as the task of that kind that is
-            // not there. The XML escapes the quotes around the id, so the texts are
-            // compared.
-            let message = element(&body, "Message").map(|message| unescaped(&message));
-            let expected = match resource_type.filter(|_| caller.can_read(import_task_id)) {
-                Some(resource_type) => {
-                    format!("The {resource_type} ID '{import_task_id}' does not exist")
-                }
-                None => format!("Invalid id: \"{import_task_id}\""),
-            };
             assert_eq!(
                 message,
                 Some(expected.clone()),

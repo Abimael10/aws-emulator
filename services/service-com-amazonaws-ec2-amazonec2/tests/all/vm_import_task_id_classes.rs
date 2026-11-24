@@ -12,8 +12,12 @@
 //! an instance or volume" (`CancelConversionTask`), so it reports a conversion task missing.
 //! Neither ever reports a value as a missing task of the class it did not name. The two
 //! classes are disjoint, so an id of one family is a value the other's parameter cannot read
-//! at all: it is refused for its FORM, before any lookup. Both causes carry the one code
-//! this family answers an id it cannot resolve with, HTTP 400 `InvalidConversionTaskId`.
+//! at all: it is refused for its FORM, before any lookup. A task of either family that is
+//! MISSING carries the one code this family answers such a task with, HTTP 400
+//! `InvalidConversionTaskId`; a value that is no id of the class the operation names carries
+//! the refusal THAT operation's validator words it with — `CancelImportTask` answers EC2's
+//! resource-agnostic `InvalidID`, `CancelConversionTask` the family code with the parameter
+//! named beside the value — both HTTP 400.
 //!
 //! Rows differ along what the rule generalises over: which operation names the id, which
 //! family's class the value belongs to, which minting prefix inside that family, and how
@@ -41,6 +45,11 @@ use super::ec2_query::{call, elements, error_code, error_message, member};
 /// The Region every call here is signed for. Neither kind of task carries a Region member of
 /// its own, so the Region only selects the ec2Query envelope.
 const REGION: &str = "ap-southeast-2";
+
+/// What `CancelImportTask` refuses a value it cannot read as an import task id of either
+/// kind with: EC2's resource-agnostic code for an id of no class it resolves, as that
+/// operation's recorded refusal carries it.
+const INVALID_ID: &str = "InvalidID";
 
 /// One request's form parameters, as the ec2Query harness takes them.
 type Params = Vec<(String, String)>;
@@ -114,15 +123,17 @@ impl Family {
         }
     }
 
-    /// The sentence this family refuses a value its parameter cannot read as an id of its
-    /// class with: the import tasks quote the value back, the conversion tasks name the
-    /// parameter beside it.
-    fn unreadable_message(self, id: &str) -> String {
+    /// The `(code, message)` this family refuses a value its parameter cannot read as an id
+    /// of its class with: the import cancel reports the value as no id it resolves, under
+    /// the resource-agnostic code, the conversion cancel names the parameter beside the
+    /// value under the family code.
+    fn unreadable_refusal(self, id: &str) -> (&'static str, String) {
         match self {
-            Self::Import => format!("Invalid id: \"{id}\""),
-            Self::Conversion => {
-                format!("Parameter {CONVERSION_TASK_ID_PARAMETER} ({id}) has an invalid format.")
-            }
+            Self::Import => (INVALID_ID, format!("The ID '{id}' is not valid")),
+            Self::Conversion => (
+                INVALID_CONVERSION_TASK_ID,
+                format!("Parameter {CONVERSION_TASK_ID_PARAMETER} ({id}) has an invalid format."),
+            ),
         }
     }
 
@@ -270,13 +281,13 @@ async fn a_cancel_refuses_an_id_of_the_other_task_family_as_a_value_it_cannot_re
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
+        let message = error_message(&body);
+        let (expected_code, expected) = caller.unreadable_refusal(&row.id);
         assert_eq!(
             error_code(&body),
-            INVALID_CONVERSION_TASK_ID,
-            "case {case:?}: expected {INVALID_CONVERSION_TASK_ID}, got body {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got body {body}"
         );
-        let message = error_message(&body);
-        let expected = caller.unreadable_message(&row.id);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the format refusal {expected:?}, got {message:?}"
@@ -357,13 +368,13 @@ async fn an_id_the_service_minted_is_read_only_by_the_family_that_minted_it() {
             "case {case:?}: expected HTTP 400 from {}, got {status} with body {body}",
             Family::Conversion.action()
         );
+        let message = error_message(&body);
+        let (expected_code, expected) = Family::Conversion.unreadable_refusal(&minted);
         assert_eq!(
             error_code(&body),
-            INVALID_CONVERSION_TASK_ID,
-            "case {case:?}: expected {INVALID_CONVERSION_TASK_ID}, got body {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got body {body}"
         );
-        let message = error_message(&body);
-        let expected = Family::Conversion.unreadable_message(&minted);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the format refusal {expected:?}, got {message:?}"

@@ -18,11 +18,14 @@
 //! SNAPSHOT task, the two kinds the member documents ("the ID of the import image or import
 //! snapshot task to be canceled") — through the crate's one reader of that form
 //! ([`crate::state::import_task_id_of_any_kind_is_well_formed`]). A value naming neither
-//! kind is refused [`crate::state::invalid_import_task_id_format`] BEFORE any lookup, and
-//! an id whose kind is read that this account holds no task for is answered
-//! [`crate::state::import_task_id_not_found`], which names that kind — both under
-//! `InvalidConversionTaskId`, the one code this family answers an id it cannot resolve
-//! with, whichever of the two causes it is.
+//! kind is no task id this operation can resolve at all, so it is refused
+//! [`crate::scaffolded::Scaffolded::invalid_id`] — HTTP 400 `InvalidID`, "The ID '<value>'
+//! is not valid" — BEFORE any lookup, the same refusal the sibling cancel of an export task
+//! words a value outside its own id form with ([`crate::ops::cancel_export_task`]). Only an
+//! id whose kind IS read that this account holds no task for is answered as a task of that
+//! kind that is not there ([`crate::state::import_task_id_not_found`], under
+//! `InvalidConversionTaskId`): the family's own code reports a task that is missing, never a
+//! value that is not one of its ids.
 //!
 //! ## Shape of an operation
 //!
@@ -154,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             IMPORT_TASK_STATE_ACTIVE, MAX_IMPORT_TASK_CANCEL_REASON_CHARS,
             import_task_id_not_found, import_task_id_of_any_kind_is_well_formed,
-            incorrect_state_of, invalid_import_task_id_format, require_service_state,
+            incorrect_state_of, require_service_state,
         };
 
         // An import task carries no Region member of its own (it has no ARN and no zone),
@@ -175,11 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An id that is not one EC2 issues for an import task of either kind names no
-        // resource to look up, so it is refused before the store is reached — under the same
-        // code as an id this account holds no task for, because this family reports every
-        // import task id it cannot resolve under that one code.
+        // resource to look up, so it is refused before the store is reached — and as a value
+        // that is no id this operation resolves, not as a task of this family that is
+        // missing: the family's own code is reserved for an id whose kind was read.
         if !import_task_id_of_any_kind_is_well_formed(import_task_id) {
-            return Err(invalid_import_task_id_format(import_task_id));
+            return Err(Scaffolded::invalid_id(import_task_id));
         }
 
         // The reason is retained on the task it cancels for the process's lifetime, and the

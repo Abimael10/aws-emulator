@@ -7,13 +7,15 @@
 //! The rules under test are:
 //!
 //! 1. AN ID THAT CANNOT BE RESOLVED TO AN IMPORT TASK IS REFUSED BEFORE ANYTHING IS
-//!    WRITTEN, under the one code this family answers such an id with: 400
-//!    `InvalidConversionTaskId`, whether the value names no kind of import task at all
-//!    (judged before the store is reached) or names a kind the account holds no such task
-//!    under, where the refusal spells that kind. The kind of an import task id is the one
-//!    its prefix names — `import-ami-` for an import image task and `import-snap-` for an
-//!    import snapshot task, the two kinds `CancelImportTaskRequest$ImportTaskId` documents
-//!    — followed by a hexadecimal suffix of any length;
+//!    WRITTEN, by the half of the rule the value falls in: a value that names no kind of
+//!    import task at all is no id this operation resolves, so it is refused 400 `InvalidID`
+//!    with "The ID '<value>' is not valid" (judged before the store is reached), while an id
+//!    whose kind IS read that the account holds no such task under is refused 400
+//!    `InvalidConversionTaskId` with the refusal spelling that kind. The kind of an import
+//!    task id is the one its prefix names — `import-ami-` for an import image task and
+//!    `import-snap-` for an import snapshot task, the two kinds
+//!    `CancelImportTaskRequest$ImportTaskId` documents — followed by a hexadecimal suffix of
+//!    any length;
 //! 2. A CANCEL THE TASK'S STATE DOES NOT ADMIT IS REFUSED with `IncorrectState` and writes
 //!    nothing: "cancels an IN-PROCESS import virtual machine or import snapshot task"
 //!    (`CancelImportTask`), so a task that is not importing any more has nothing left to
@@ -56,6 +58,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{call, element, error_code, member, unescaped};
 use super::wire::{child, child_text, document};
+
+/// What a value this operation cannot read as an import task id of either kind is refused
+/// with: EC2's resource-agnostic code for an id of no kind it resolves, as the recorded
+/// refusal of this operation carries it. Written out here rather than imported from the
+/// service, so a change to its wording fails this suite instead of following it.
+const INVALID_ID: &str = "InvalidID";
 
 /// The Region every call here is signed for. An import task carries no Region member, so
 /// the Region only selects the ec2Query envelope.
@@ -398,10 +406,10 @@ fn minted_id_rows() -> Vec<(String, String, &'static str)> {
     rows
 }
 
-/// Rule 1: a value naming no kind of import task is refused `InvalidConversionTaskId` with
-/// the message naming the value it was sent, while an id whose kind EC2 reads that the
-/// account holds no task for is refused under the same code with the message naming that
-/// kind — and neither refusal writes anything.
+/// Rule 1: a value naming no kind of import task is refused `InvalidID` with the message
+/// naming the value it was sent, while an id whose kind EC2 reads that the account holds no
+/// task for is refused `InvalidConversionTaskId` with the message naming that kind — and
+/// neither refusal writes anything.
 #[tokio::test]
 async fn an_id_ec2_could_not_have_issued_is_refused_before_any_lookup() {
     let (router, engine) = emulator();
@@ -419,17 +427,17 @@ async fn an_id_ec2_could_not_have_issued_is_refused_before_any_lookup() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_CONVERSION_TASK_ID,
-            "case {case:?}: expected {INVALID_CONVERSION_TASK_ID}, got {body}"
+            INVALID_ID,
+            "case {case:?}: expected {INVALID_ID}, got {body}"
         );
-        // The message EC2 builds for a value it cannot read as an id of the kind the
-        // parameter names repeats that value back. The XML body escapes the quotes around
-        // it, so the text is compared.
+        // The message EC2 builds for a value that is no id it resolves repeats that value
+        // back inside its own sentence. The XML body escapes the quotes around it, so the
+        // text is compared.
         let message = element(&body, "Message").map(|message| unescaped(&message));
         assert_eq!(
             message,
-            Some(format!("Invalid id: \"{import_task_id}\"")),
-            "case {case:?}: expected the malformed-id message to name the id, got {message:?}"
+            Some(format!("The ID '{import_task_id}' is not valid")),
+            "case {case:?}: expected the invalid-id message to name the id, got {message:?}"
         );
     }
 
@@ -902,7 +910,7 @@ async fn a_dry_run_cancel_reports_what_would_have_happened_and_writes_nothing() 
             "an id EC2 could not have issued",
             "import-fffffff0".to_string(),
             400,
-            INVALID_CONVERSION_TASK_ID,
+            INVALID_ID,
         ),
         (
             "an id EC2 could have issued that names no task",

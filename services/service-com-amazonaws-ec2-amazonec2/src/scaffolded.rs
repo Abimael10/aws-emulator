@@ -419,11 +419,20 @@ impl<E> Scaffolded<E> {
 
     /// `InvalidID` (HTTP 400): the request named a resource id of a kind this
     /// operation cannot resolve at all.
+    ///
+    /// The value the REQUEST sent is quoted back only as far as
+    /// [`crate::state::echoed_resource_id`] quotes one — the crate's single bound on an
+    /// echoed caller value, which every other refusal that repeats an id back holds to
+    /// ([`Self::instance_id_is_malformed`], [`crate::state::invalid_id_message`]) — so this
+    /// sentence cannot be made to carry an arbitrary payload either.
     pub fn invalid_id(resource_id: &str) -> Self {
         Self::service_error(
             "InvalidID",
             400,
-            format!("The ID '{resource_id}' is not valid"),
+            format!(
+                "The ID '{}' is not valid",
+                crate::state::echoed_resource_id(resource_id)
+            ),
         )
     }
 
