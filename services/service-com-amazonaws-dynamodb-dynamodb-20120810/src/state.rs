@@ -1390,10 +1390,13 @@ impl VectorIndex {
     /// ([`Self::consumed_attributes`]) — so one entry serves every question about what the
     /// index HOLDS for an item: what a write of it meters
     /// ([`Table::vector_write_request_bytes`]), what a condition reads, and what a search
-    /// hands back of it — "only attributes projected into the vector index can be retrieved"
+    /// READS of it — "only attributes projected into the vector index can be retrieved"
     /// (`SearchVectors$ProjectionExpression`), and the vector attribute is among them, since
     /// it is the index's own key attribute and "the primary key attributes and index key
-    /// attributes … are automatically projected" (`Projection`).
+    /// attributes … are automatically projected" (`Projection`). What a search HANDS BACK is
+    /// narrower still — a result carries "the projected attributes of the item returned by
+    /// the vector search" (`SearchResultItem$Item`), which the vector the index is built on
+    /// is not one of — and that is the search's own to decide, not this entry's.
     ///
     /// The vector itself is held as the index holds it rather than as the item does
     /// ([`stored_vector`]): "each element is a 32-bit IEEE-754 floating point number"

@@ -236,8 +236,8 @@ async fn a_default_retrieval_leaves_out_the_vector_the_index_finds_items_by() {
             row.case
         );
 
-        // The item the TABLE holds keeps the decimals the write carried: what a search hands
-        // back is the index's own copy.
+        // The item the TABLE holds keeps the decimals the write carried, vector and all:
+        // what a search leaves out of its results is nothing the store dropped.
         let read = ok(
             &router,
             "GetItem",
@@ -272,9 +272,10 @@ async fn a_projection_may_narrow_a_result_to_the_indexed_vector_alone() {
         )
         .await;
 
-        // "Only attributes projected into the vector index can be retrieved"
-        // (`SearchVectors$ProjectionExpression`): a request may narrow what the index
-        // projects, and the vector attribute is one of the names it may narrow to.
+        // "A string that identifies one or more attributes to retrieve from the index"
+        // (`SearchVectors$ProjectionExpression`): the vector attribute is one of the names a
+        // request may retrieve through the index it is the key of, and naming it is the one
+        // way a result carries it.
         let answered = ok(
             &router,
             "SearchVectors",

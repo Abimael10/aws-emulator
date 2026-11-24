@@ -7,7 +7,7 @@
 //! own `Projection` copies there — "attributes that are copied (projected) from the table
 //! into the vector index" (`VectorIndex$Projection`) — beside "the primary key attributes
 //! and index key attributes, which are automatically projected" (`Projection`): the TABLE's
-//! key, the attributes its `SearchSchema` is keyed and filtered by ("an attribute
+//! key and the attributes its `SearchSchema` is keyed and filtered by ("an attribute
 //! projected into the vector index for filtering at the storage layer during search",
 //! `SearchSchemaElement$SearchSchemaElementType`), and the VECTOR attribute, which is the
 //! index's own key attribute. So a search hands back nothing the table holds outside what
@@ -154,7 +154,8 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
                     Value::Null,
                 ),
                 // An `INCLUDE` that names the vector attribute itself: the index holds that
-                // attribute either way, since it is the index's own key attribute.
+                // attribute either way, since it is the index's own key attribute — which
+                // still leaves it out of what a result PROJECTS back.
                 index(
                     "include-the-vector",
                     json!({"ProjectionType": "INCLUDE", "NonKeyAttributes": ["vec"]}),
@@ -237,7 +238,8 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
 
         // A `ProjectionExpression` may only narrow what the index projects: a name it holds
         // nothing for reports nothing, which is also what a projection over a table's items
-        // does for an attribute an item does not carry.
+        // does for an attribute an item does not carry. Naming the vector attribute
+        // retrieves it, which is the one way a result carries it.
         let narrowed = search(&router, table, row.index, row.partitioned, Some("vec, note")).await;
         let reported = reported_attributes(&narrowed);
         assert_eq!(

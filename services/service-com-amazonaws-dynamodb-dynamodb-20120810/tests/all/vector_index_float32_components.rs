@@ -36,7 +36,7 @@ use crate::emulator::{emulator, ok, POLL_INTERVAL};
 const TABLE: &str = "VectorFloat32Components";
 
 /// The index over the `emb` attribute, which projects everything so a search reports the
-/// whole entry it holds.
+/// whole entry it holds apart from the vector it finds items by.
 const INDEX: &str = "float32-index";
 
 /// How long a poll for the `CREATING` -> `ACTIVE` transitions the clock owes may take
@@ -285,7 +285,7 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
 }
 
 #[tokio::test]
-async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
+async fn a_projection_retrieves_the_vector_attribute_as_the_index_holds_it() {
     let router = emulator();
     stored_rows(&router).await;
     let answered = search_every_row_retrieving_the_vector(&router).await;
@@ -301,8 +301,8 @@ async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
         assert_eq!(
             result["Item"]["emb"]["L"][0]["N"],
             json!(row.held),
-            "case {:?}: a search hands the coordinate back as the float32 the index holds, \
-             got {result} of {answered}",
+            "case {:?}: a projection naming the vector retrieves the coordinate as the \
+             float32 the index holds, got {result} of {answered}",
             row.case
         );
         let default = result_for(&whole, &key_of(at));
@@ -329,12 +329,12 @@ async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
         );
     }
 
-    // A `ProjectionExpression` naming the vector attribute reports THAT attribute and
-    // nothing else: a request may only narrow what the index projects ("only attributes
-    // projected into the vector index can be retrieved",
-    // `SearchVectors$ProjectionExpression`), and the vector is one of the projected
-    // attributes. The rows are still SCORED and answered — the projection decides what each
-    // result carries, not which items a search finds.
+    // A `ProjectionExpression` naming the vector attribute retrieves THAT attribute and
+    // nothing else: it "identifies one or more attributes to retrieve from the index"
+    // (`SearchVectors$ProjectionExpression`), and the index holds the vector it is keyed by.
+    // The rows are still SCORED and answered — the projection decides what each result
+    // carries, not which items a search finds — and the coordinates it hands back are the
+    // 32-bit floats the index holds.
     let narrowed = ok(
         &router,
         "SearchVectors",

@@ -389,8 +389,8 @@ async fn a_result_carries_the_attributes_the_index_projects() {
         // hold is the same case, over an index that projects every attribute of the item as
         // much as over one that projects none.
         ("all-index", json!("absent"), Value::Null, &[]),
-        // The vector attribute is projected into every index that is keyed by it, so a
-        // projection naming it reports it — and only it.
+        // The vector attribute is held by every index that is keyed by it, so a projection
+        // naming it retrieves it — and only it.
         ("all-index", json!("emb"), Value::Null, &["emb"]),
         // `note` is outside what a `KEYS_ONLY` index holds, so only the vector comes back.
         ("keys-index", json!("note, emb"), Value::Null, &["emb"]),
@@ -1032,12 +1032,12 @@ async fn consumed_capacity_reports_the_index_data_the_search_read() {
             .unwrap_or(f64::NAN);
         assert!(
             narrow < total,
-            "case {case:?}: a search that hands back less is charged less than the {total} \
-             bytes the whole entries cost, got {narrow} from {answered}"
+            "case {case:?}: a search that scores and hands back less is charged less than \
+             the {total} bytes the whole entries cost, got {narrow} from {answered}"
         );
         assert_eq!(
             narrow, FLOOR_BYTES,
-            "case {case:?}: what it hands back is under the per-request floor, so it costs that \
+            "case {case:?}: the work it did is under the per-request floor, so it costs that \
              floor, got {narrow} from {answered}"
         );
     }
