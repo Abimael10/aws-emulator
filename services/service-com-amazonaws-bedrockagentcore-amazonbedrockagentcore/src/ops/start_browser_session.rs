@@ -14,8 +14,8 @@
 //!
 //! The session's STREAMS are materialised here and persisted with the session, so this
 //! response and [`crate::ops::get_browser_session`] cannot report different ones: an
-//! endpoint per stream under the address this emulator answers on
-//! ([`smithy_server_runtime::OperationContext::endpoint`]), with the automation stream
+//! endpoint per stream on the endpoint host this request reached the service at
+//! ([`crate::state::reported_endpoint_host`]), with the automation stream
 //! enabled for the session this call makes usable. `UpdateBrowserStream` is what moves
 //! that stream's status afterwards.
 //!
@@ -228,11 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The streams this call materialises address THIS emulator: the base a client of
-        // it reaches a resource at. `traceId` / `traceParent` are carried on the request
-        // for distributed tracing and are not part of any response or stored record.
-        let endpoint = ctx.endpoint();
-        let endpoint_base = endpoint.as_str();
+        // The streams this call materialises are addressed on the endpoint host this
+        // request reached the service at — the address a client of the started session
+        // dials, which is this service's own endpoint host for the region the request was
+        // signed for when the request names none — and never on some other listener this
+        // process happens to answer on. `traceId` / `traceParent` are carried on the
+        // request for distributed tracing and are not part of any response or stored
+        // record.
+        let endpoint_host =
+            crate::state::reported_endpoint_host(ctx, &crate::state::request_region(ctx.parts()));
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBrowserSessionErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the shared engine does not carry this service's state".to_string()),
@@ -287,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let seq = store.next_seq();
-        let session = crate::state::BrowserSessionRecord::started(seq, now, &input, endpoint_base);
+        let session = crate::state::BrowserSessionRecord::started(seq, now, &input, &endpoint_host);
         // Built from what is about to be stored, so the response and the store cannot
         // disagree. `BrowserSessionStatus` models only READY and TERMINATED, so a
         // started session is usable at once — which is why this response models no

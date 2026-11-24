@@ -17,6 +17,10 @@
 //!   conflict because a stopped session cannot be restarted.
 //! * `UpdateBrowserStream` moves the automation stream's status, and that status is what
 //!   every later read reports; the endpoints stay the session's own.
+//! * Both endpoints are addressed on the endpoint host the caller addressed this service
+//!   at — and on this service's own endpoint host for the region the request was signed
+//!   for when the caller states none — beneath which the layout, the `wss` automation
+//!   scheme and the `https` live-view scheme are fixed.
 //! * Every answer that models a `BrowserSessionStream` reports one populated — the
 //!   `@required` `automationStream` with both of its own `@required` members — for a
 //!   session in EVERY status `BrowserSessionStatus` names and however it reached that
@@ -952,5 +956,200 @@ async fn a_replayed_start_token_answers_with_the_streams_it_already_materialised
             member(&started, "streams"),
             "case {case:?}: expected the replay to report the streams the first start materialised, got {replayed:?}"
         );
+    }
+}
+
+/// This service's `endpointPrefix`, the first label of the endpoint host it is addressed
+/// at (source: smithy_query query="service_info", `awsService.endpointPrefix`).
+const ENDPOINT_PREFIX: &str = "bedrock-agentcore";
+
+/// One row of [`a_sessions_streams_are_addressed_on_the_endpoint_the_caller_reached`]:
+/// how the caller ADDRESSED the start, and the authority its streams are therefore
+/// reported on.
+struct AddressingCase {
+    case: &'static str,
+    /// The authority the caller stated, or `None` for a client that states none.
+    stated_host: Option<&'static str>,
+    /// The region the request was signed for, or `None` for a call that presents no
+    /// credential scope at all.
+    region: Option<&'static str>,
+    /// The authority both stream endpoints are expected to be addressed on: the host the
+    /// caller stated when it stated one, and this service's own endpoint host for the
+    /// region the request was signed for otherwise.
+    expected_authority: &'static str,
+}
+
+/// Send one request ADDRESSED as a case states it: `stated_host` is the authority the
+/// caller named (`None` for a client that names none, which leaves the request target in
+/// origin form), and `region` the region its SigV4 credential scope was signed for
+/// (`None` for a call presenting no scope at all, which this service answers in the
+/// emulator's default region).
+async fn send_addressed(
+    router: &MultiServiceRouter,
+    stated_host: Option<&str>,
+    region: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let payload = body.map_or_else(bytes::Bytes::new, |v| bytes::Bytes::from(v.to_string()));
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(region) = region {
+        builder = builder.header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{ENDPOINT_PREFIX}/aws4_request, \
+                 SignedHeaders=host, Signature=0"
+            ),
+        );
+    }
+    if let Some(host) = stated_host {
+        builder = builder.header("host", host);
+    }
+    let request = builder.body(payload).expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// A session's stream endpoints are addressed on the endpoint host the caller addressed
+/// this service at — and, for a caller that states none, on this service's own endpoint
+/// host for the region the request was signed for
+/// (`<endpointPrefix>.<region>.amazonaws.com`) — never on some other listener this process
+/// happens to answer on, which the caller never addressed.
+///
+/// Rows differ along WHAT the caller addressed and WHICH region it signed for: the
+/// service's endpoint host in two regions, one carrying an explicit port, this emulator's
+/// own address literal, a client that states no host (answered on the endpoint host of the
+/// region it signed for), a client that presents no credential scope and is routed by its
+/// host alone, and a stated value that is no host. Beneath that authority the layout is fixed —
+/// `/browser-streams/{browserIdentifier}/sessions/{sessionId}/automation|live-view`, `wss`
+/// for the automation stream and `https` for the live view (source: the `streamEndpoint`
+/// docs of smithy_query query="shape" shape="AutomationStream,LiveViewStream", a WebSocket
+/// connection for the one and an ordinary connection to this service's endpoint for the
+/// other).
+#[tokio::test]
+async fn a_sessions_streams_are_addressed_on_the_endpoint_the_caller_reached() {
+    let router = emulator();
+
+    let cases = [
+        AddressingCase {
+            case: "the service's own endpoint host",
+            stated_host: Some("bedrock-agentcore.us-west-2.amazonaws.com"),
+            region: Some("us-west-2"),
+            expected_authority: "bedrock-agentcore.us-west-2.amazonaws.com",
+        },
+        AddressingCase {
+            case: "the service's endpoint host in another region",
+            stated_host: Some("bedrock-agentcore.eu-central-1.amazonaws.com"),
+            region: Some("eu-central-1"),
+            expected_authority: "bedrock-agentcore.eu-central-1.amazonaws.com",
+        },
+        AddressingCase {
+            case: "an endpoint host carrying an explicit port",
+            stated_host: Some("bedrock-agentcore.ap-southeast-2.amazonaws.com:443"),
+            region: Some("ap-southeast-2"),
+            expected_authority: "bedrock-agentcore.ap-southeast-2.amazonaws.com:443",
+        },
+        AddressingCase {
+            case: "a client pointed straight at this emulator's own address",
+            stated_host: Some("127.0.0.1:9297"),
+            region: Some("us-east-1"),
+            expected_authority: "127.0.0.1:9297",
+        },
+        AddressingCase {
+            case: "a client that states no host",
+            stated_host: None,
+            region: Some("sa-east-1"),
+            expected_authority: "bedrock-agentcore.sa-east-1.amazonaws.com",
+        },
+        AddressingCase {
+            case: "a client that presents no credential scope, routed by its host",
+            stated_host: Some("bedrock-agentcore.eu-west-3.amazonaws.com"),
+            region: None,
+            expected_authority: "bedrock-agentcore.eu-west-3.amazonaws.com",
+        },
+        AddressingCase {
+            case: "a stated value that is no host at all",
+            stated_host: Some("not a host"),
+            region: Some("us-west-1"),
+            expected_authority: "bedrock-agentcore.us-west-1.amazonaws.com",
+        },
+    ];
+
+    for row in &cases {
+        let case = row.case;
+        let (status, started) = send_addressed(
+            &router,
+            row.stated_host,
+            row.region,
+            "PUT",
+            &format!("/browsers/{SYSTEM_BROWSER}/sessions/start"),
+            Some(json!({"sessionTimeoutSeconds": 600})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from StartBrowserSession, got {status} with {started:?}"
+        );
+        let session_id = text(&started, "sessionId").to_string();
+        let session_path = format!("browser-streams/{SYSTEM_BROWSER}/sessions/{session_id}");
+        let expected_automation = format!(
+            "wss://{}/{session_path}/automation",
+            row.expected_authority
+        );
+        let expected_live_view = format!(
+            "https://{}/{session_path}/live-view",
+            row.expected_authority
+        );
+
+        assert_eq!(
+            automation_endpoint(&started),
+            expected_automation,
+            "case {case:?}: expected the automation stream at {expected_automation:?}, got {:?}",
+            automation_endpoint(&started)
+        );
+        assert_eq!(
+            live_view_endpoint(&started),
+            expected_live_view,
+            "case {case:?}: expected the live view stream at {expected_live_view:?}, got {:?}",
+            live_view_endpoint(&started)
+        );
+        assert_streams(case, &started, &session_id, ENABLED);
+
+        // Both endpoints are reported back by the reader, unchanged, however that read is
+        // itself addressed: the start materialises them once and every reader reports the
+        // record.
+        for (round, reader_host, reader_region) in [
+            ("read-as-addressed", row.stated_host, row.region),
+            (
+                "read-from-another-endpoint",
+                Some("bedrock-agentcore.ca-central-1.amazonaws.com"),
+                Some("ca-central-1"),
+            ),
+        ] {
+            let (status, read) = send_addressed(
+                &router,
+                reader_host,
+                reader_region,
+                "GET",
+                &format!("/browsers/{SYSTEM_BROWSER}/sessions/get?sessionId={session_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {round:?}: expected HTTP 200 from GetBrowserSession, got {status} with {read:?}"
+            );
+            assert_eq!(
+                (automation_endpoint(&read), live_view_endpoint(&read)),
+                (expected_automation.as_str(), expected_live_view.as_str()),
+                "case {case:?} {round:?}: expected the endpoints the start materialised, got {read:?}"
+            );
+        }
     }
 }

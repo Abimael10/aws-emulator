@@ -6,7 +6,9 @@
 //! registered here by the first `StartBrowserSession` that names it — the same way a
 //! code interpreter is registered by the first session started on it. The record a start
 //! writes ([`BrowserSessionRecord`]) is exactly what `GetBrowserSession` reports back:
-//! its streams ([`BrowserSessionStreamRecord`]) are materialised by the start, and its
+//! its streams ([`BrowserSessionStreamRecord`]) are materialised by the start, on the
+//! endpoint host that call reached this service at
+//! ([`crate::state::reported_endpoint_host`]), and its
 //! status is read off the stop that terminated it or off the clock against the session's
 //! effective time-to-live ([`BrowserSessionRecord::status_as_of`]), so no call is needed
 //! to make a termination that is already due visible.
@@ -94,9 +96,9 @@ pub fn effective_session_timeout_seconds(requested: i32) -> i32 {
     }
 }
 
-/// The path every stream of one browser session is addressed under, beneath the address
-/// this emulator answers on: the service lays a session's streams out per browser and
-/// session, with one trailing segment per stream
+/// The path every stream of one browser session is addressed under, beneath the endpoint
+/// host the session's streams are reported on: the service lays a session's streams out
+/// per browser and session, with one trailing segment per stream
 /// (`/browser-streams/{browserIdentifier}/sessions/{sessionId}/<stream>`).
 const STREAM_PATH_PREFIX: &str = "browser-streams";
 
@@ -107,14 +109,14 @@ const AUTOMATION_STREAM_SEGMENT: &str = "automation";
 /// The scheme the automation stream is addressed over: the stream is the bidirectional
 /// channel a client "establish[es] a WebSocket connection to … for sending commands and
 /// receiving responses" (source: smithy_query query="shape" shape="AutomationStream",
-/// member `streamEndpoint`), so its address is a WebSocket URL on the host this emulator
-/// answers on, where the live view is read over that host's own scheme.
+/// member `streamEndpoint`), so its address is a WebSocket URL.
 const AUTOMATION_STREAM_SCHEME: &str = "wss";
 
-/// The scheme every address this emulator answers on carries
-/// ([`smithy_server_runtime::EndpointUrl`] parses no other), and therefore the one the
-/// automation stream's scheme replaces.
-const ENDPOINT_SCHEME_PREFIX: &str = "https://";
+/// The scheme the live view stream is addressed over: it is read from the endpoint by an
+/// ordinary connection to it (source: smithy_query query="shape" shape="LiveViewStream",
+/// member `streamEndpoint`, "used to establish a connection to receive visual updates"),
+/// so it carries the scheme this service's own endpoint is served over.
+const LIVE_VIEW_STREAM_SCHEME: &str = "https";
 
 /// The trailing segment of the stream an embedded live view reads the session from.
 const LIVE_VIEW_STREAM_SEGMENT: &str = "live-view";
@@ -136,25 +138,23 @@ pub struct BrowserSessionStreamRecord {
 }
 
 impl BrowserSessionStreamRecord {
-    /// The streams a session gets when it is started: an endpoint per stream under
-    /// `endpoint_base` — the address this emulator answers on, which is where a client
-    /// of THIS emulator reaches a resource of it — and an automation stream the started
+    /// The streams a session gets when it is started: an endpoint per stream on
+    /// `endpoint_host` — the endpoint host this service is addressed at, which is the
+    /// authority a stream of one of its sessions is dialled on
+    /// ([`crate::state::reported_endpoint_host`]) — and an automation stream the started
     /// session can be driven over.
     ///
-    /// The host and port of an endpoint are the environment's; its presence and the
-    /// session it addresses are the session's.
-    pub fn materialized(endpoint_base: &str, browser_identifier: &str, session_id: &str) -> Self {
+    /// The host of an endpoint is the endpoint's; its scheme, its layout and the session
+    /// it addresses are the session's.
+    pub fn materialized(endpoint_host: &str, browser_identifier: &str, session_id: &str) -> Self {
         let session_path =
             format!("{STREAM_PATH_PREFIX}/{browser_identifier}/sessions/{session_id}");
-        let host = endpoint_base
-            .strip_prefix(ENDPOINT_SCHEME_PREFIX)
-            .unwrap_or(endpoint_base);
         Self {
             automation_endpoint: format!(
-                "{AUTOMATION_STREAM_SCHEME}://{host}/{session_path}/{AUTOMATION_STREAM_SEGMENT}"
+                "{AUTOMATION_STREAM_SCHEME}://{endpoint_host}/{session_path}/{AUTOMATION_STREAM_SEGMENT}"
             ),
             live_view_endpoint: format!(
-                "{endpoint_base}/{session_path}/{LIVE_VIEW_STREAM_SEGMENT}"
+                "{LIVE_VIEW_STREAM_SCHEME}://{endpoint_host}/{session_path}/{LIVE_VIEW_STREAM_SEGMENT}"
             ),
             automation_enabled: true,
         }
@@ -236,18 +236,18 @@ pub struct BrowserSessionRecord {
 
 impl BrowserSessionRecord {
     /// A session as the call that starts it leaves it: the configuration that call asked
-    /// for, created at `created_at`, with the streams that call materialised under
-    /// `endpoint_base`, nothing stopped and nothing changed since.
+    /// for, created at `created_at`, with the streams that call materialised on
+    /// `endpoint_host`, nothing stopped and nothing changed since.
     pub fn started(
         seq: u64,
         created_at: SystemTime,
         input: &StartBrowserSessionInput,
-        endpoint_base: &str,
+        endpoint_host: &str,
     ) -> Self {
         let session_id = mint_browser_session_id(seq);
         Self {
             streams: BrowserSessionStreamRecord::materialized(
-                endpoint_base,
+                endpoint_host,
                 &input.browser_identifier,
                 &session_id,
             ),

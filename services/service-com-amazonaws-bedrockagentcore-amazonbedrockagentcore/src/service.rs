@@ -65,7 +65,12 @@ pub(crate) mod map_entry_constraints;
 /// endpointPrefix` is `bedrock-agentcore`, which here equals `sigv4Name`. Stated
 /// anyway, and beside the claim it feeds, so the claim does not silently change meaning
 /// if either name ever does.
-const ENDPOINT_PREFIX: &str = "bedrock-agentcore";
+///
+/// `pub(crate)` because it is also what an address this service REPORTS for one of its
+/// own resources is composed on when the request names no host of its own
+/// (`crate::state::reported_endpoint_host`): the endpoint a caller addresses this service
+/// at and the endpoint it is told to come back to are the same endpoint.
+pub(crate) const ENDPOINT_PREFIX: &str = "bedrock-agentcore";
 
 /// The segments of `InvokeCodeInterpreter`'s modelled URI,
 /// `/code-interpreters/{codeInterpreterIdentifier}/tools/invoke` (source:

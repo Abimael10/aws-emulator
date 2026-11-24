@@ -2452,10 +2452,50 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// the region segment of an ARN or an endpoint this service reports back is.
 const MAX_REGION_LABEL: usize = 32;
 
+/// The endpoint host an address this service REPORTS for one of its own resources is
+/// composed on: the endpoint host the request reached this service at, so the address a
+/// caller is handed leads back to where it is already talking rather than naming some
+/// other listener this process happens to answer on.
+///
+/// The reading is the workspace's one
+/// ([`::service_common::data_plane_addressing::reached_endpoint_host`]): the host the
+/// request addressed — its `Host` header, or the authority of an absolute-form request
+/// target for a request that carries its endpoint there — when it is shaped like a host,
+/// and otherwise this service's own resolved endpoint host for the region the request was
+/// signed for, `bedrock-agentcore.<region>.amazonaws.com` (its `endpointPrefix`, which is
+/// also the host [`crate::service`] claims a request at, so a caller that resolves AWS's
+/// own names reaches the resource there).
+pub fn reported_endpoint_host(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> String {
+    ::service_common::data_plane_addressing::reached_endpoint_host(
+        &ctx.parts().uri.to_string(),
+        ctx.parts()
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+        crate::service::ENDPOINT_PREFIX,
+        region,
+    )
+}
+
 /// The `iss` of a workload access token this service issues: the AgentCore endpoint of
 /// the region the request was signed for, which is the authority that issued it.
+///
+/// This is the endpoint IDENTITY of this service in a region, not an address a caller
+/// dials, so it is this service's own published endpoint name whatever host the request
+/// that minted the token arrived on
+/// ([`::service_common::data_plane_addressing::service_endpoint_host`], the workspace's
+/// one composer of that name).
 pub fn workload_access_token_issuer(region: &str) -> String {
-    format!("https://{ARN_SERVICE}.{region}.amazonaws.com")
+    format!(
+        "https://{}",
+        ::service_common::data_plane_addressing::service_endpoint_host(
+            crate::service::ENDPOINT_PREFIX,
+            region
+        )
+    )
 }
 
 /// The workload identity a `workloadName` addresses, in the token vault's `default`
