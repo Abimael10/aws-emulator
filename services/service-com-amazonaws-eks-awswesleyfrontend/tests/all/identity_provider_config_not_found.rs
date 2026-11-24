@@ -16,15 +16,13 @@
 //! two identity-provider endpoint drivers live here, as `pub(crate)`, so no suite needs
 //! a second copy of them.
 
-use std::time::Duration;
-
-use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    CLUSTER_ACTIVATION_DELAY, RESOURCE_NOT_FOUND_MESSAGE,
-};
+use service_com_amazonaws_eks_awswesleyfrontend::state::RESOURCE_NOT_FOUND_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{create, describe_until_absent, minimal_request, REGION};
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::cluster_lifecycle::{
+    create, describe_until_absent, describe_when_active, minimal_request, REGION,
+};
+use crate::wire::{call, emulator, encode_label, read_until, Answer};
 
 pub(crate) async fn associate_in(
     router: &MultiServiceRouter,
@@ -86,8 +84,12 @@ pub(crate) async fn describe_config_of_type_in(
     .await
 }
 
-/// Create `name` in `region` and wait out the span the clock owes it, so it is
-/// `ACTIVE` — the state a cluster must be in before it can take an identity provider.
+/// Create `name` in `region` and look again until it reports `ACTIVE` — the state a
+/// cluster must be in before it can take an identity provider.
+///
+/// The wait is for the CONDITION, through [`read_until`], so a loaded host only makes
+/// a suite slower; it is `pub(crate)` so every suite that needs a cluster ready for an
+/// identity provider stands one up the one way.
 pub(crate) async fn active_cluster_in(router: &MultiServiceRouter, region: &str, name: &str) {
     let created = call(
         router,
@@ -101,7 +103,14 @@ pub(crate) async fn active_cluster_in(router: &MultiServiceRouter, region: &str,
         created.status, 200,
         "setup: creating cluster {name:?} in {region} must succeed, got {created:?}"
     );
-    tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    let uri = format!("/clusters/{}", encode_label(name));
+    read_until(
+        name,
+        "the cluster the clock owes ACTIVE became ACTIVE",
+        || call(router, region, "GET", &uri, ""),
+        |answer| answer.body["cluster"]["status"] == serde_json::json!("ACTIVE"),
+    )
+    .await;
 }
 
 /// Assert the whole not-found answer of a describe: status, error code and the one
@@ -291,7 +300,7 @@ async fn a_configuration_is_not_found_once_its_cluster_is_deleted() {
     for case in ["doomed", "doomed-too"] {
         let created = create(&router, &minimal_request(case)).await;
         assert_eq!(created.status, 200, "setup create {case:?}: {created:?}");
-        tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+        describe_when_active(&router, case).await;
         let associated = associate_in(&router, REGION, case, "attached").await;
         assert_eq!(
             associated.status, 200,
