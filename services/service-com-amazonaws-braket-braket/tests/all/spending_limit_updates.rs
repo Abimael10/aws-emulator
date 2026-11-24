@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::quantum_task_loop::{encode, member, Braket, Reply};
 use crate::spending_limits::{
     a_device, create_limit, limit_body, limit_by_arn, limits_on, now_epoch, period, period_second,
-    CREATED,
+    reported_amount, CREATED,
 };
 
 /// The region the harness's SigV4 credential scope names, so an ARN it mints carries it —
@@ -166,7 +166,9 @@ async fn an_update_writes_each_member_it_carries_and_leaves_the_rest() {
         );
 
         let after = limit_by_arn(&braket, &device, &arn).await;
-        let expected_amount = amount.unwrap_or(ORIGINAL_AMOUNT);
+        // The amount a summary reports is the written one in its plain decimal form,
+        // which is the form every amount of a summary carries.
+        let expected_amount = reported_amount(amount.unwrap_or(ORIGINAL_AMOUNT));
         assert_eq!(
             member(&after, "spendingLimit"),
             expected_amount,
@@ -334,7 +336,7 @@ async fn the_arn_decides_which_limit_an_update_resolves() {
     let after = limit_by_arn(&braket, &device, &arn).await;
     assert_eq!(
         member(&after, "spendingLimit"),
-        ORIGINAL_AMOUNT,
+        reported_amount(ORIGINAL_AMOUNT),
         "a refused update leaves the stored limit alone, got {after}"
     );
     assert!(
@@ -396,7 +398,7 @@ async fn an_amount_is_held_to_the_form_the_model_publishes() {
         ("surrounded by spaces", " 250 ", false),
     ];
 
-    let mut stored = ORIGINAL_AMOUNT.to_string();
+    let mut stored = reported_amount(ORIGINAL_AMOUNT);
     for (index, (case, amount, admitted)) in rows.iter().enumerate() {
         let reply = update_limit(
             &braket,
@@ -410,7 +412,7 @@ async fn an_amount_is_held_to_the_form_the_model_publishes() {
                 "case {case:?} ({amount:?}): expected 200, got {} {}",
                 reply.status, reply.body
             );
-            stored = (*amount).to_string();
+            stored = reported_amount(amount);
         } else {
             assert_eq!(
                 reply.status, 400,
@@ -478,7 +480,7 @@ async fn a_time_period_that_covers_no_time_is_refused_by_an_update() {
         let after = limit_by_arn(&braket, &device, &arn).await;
         assert_eq!(
             member(&after, "spendingLimit"),
-            ORIGINAL_AMOUNT,
+            reported_amount(ORIGINAL_AMOUNT),
             "case {case:?}: a refused update writes neither member, got {after}"
         );
         assert!(
@@ -583,7 +585,7 @@ async fn the_client_token_makes_an_update_idempotent() {
     );
     assert_eq!(
         member(&limit_by_arn(&braket, &device, &other).await, "spendingLimit"),
-        ORIGINAL_AMOUNT,
+        reported_amount(ORIGINAL_AMOUNT),
         "no refused reuse changed the other limit either"
     );
 }

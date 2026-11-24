@@ -9,6 +9,11 @@
 //! the `service` section, the shot range, what a run costs and where the device is
 //! documented — each value taken from that device's own catalog row.
 //!
+//! A device is PUBLISHED by Amazon Braket rather than created through the API, so the
+//! last suite pins the other half of that: every value of the document, its two
+//! documentation links and its published instant included, is data of the catalog entry,
+//! so a later boot of the emulator publishes the same document for the same device.
+//!
 //! The table is the seeded inventory itself: its rows differ in device type, status,
 //! accepted action types, shot range, native gate set, result types, noise support and
 //! cost unit, so a document that is a fixed stand-in rather than the device's own row
@@ -37,6 +42,27 @@ const COST_UNITS: &[&str] = &["minute", "hour", "shot", "task"];
 const RESULT_TYPE_PRAGMA_PREFIX: &str = "braket_result_type_";
 /// The prefix of the pragmas that apply a noise channel.
 const NOISE_PRAGMA_PREFIX: &str = "braket_noise_";
+
+/// The page every device's `externalDocumentationUrl` names: the Amazon Braket developer
+/// guide's supported-devices page, which each device's link anchors on its own section.
+const DEVICE_LIST_PAGE: &str =
+    "https://docs.aws.amazon.com/braket/latest/developerguide/braket-devices.html";
+
+/// Whether `text` is an instant in the `yyyy-mm-ddThh:mm:ss` form a Braket
+/// device-service-properties document carries `updatedAt` in — the published instant of
+/// the catalog entry, which is a date and a time of day and nothing else.
+///
+/// Spelled out here (rather than parsed with a date library) so the suite states the form
+/// it requires: ten characters of date, the `T`, eight of time, and digits exactly where
+/// the form has digits.
+fn is_published_instant(text: &str) -> bool {
+    let shape = "0000-00-00T00:00:00";
+    text.len() == shape.len()
+        && text.chars().zip(shape.chars()).all(|(got, want)| match want {
+            '0' => got.is_ascii_digit(),
+            other => got == other,
+        })
+}
 
 /// A result-type name as the OpenQASM pragma that requests it: the Braket pragma
 /// names are the result-type name in snake_case under [`RESULT_TYPE_PRAGMA_PREFIX`],
@@ -209,10 +235,10 @@ async fn the_service_section_publishes_the_cost_and_documentation_properties() {
         // updatedAt: when the catalog entry a caller is reading was published.
         let updated_at = member(service, "updatedAt");
         assert!(
-            updated_at.len() >= "2024-01-01T00:00:00Z".len()
-                && updated_at.contains('T')
-                && updated_at.ends_with('Z'),
-            "case {case}: expected updatedAt as an ISO-8601 instant, got {updated_at:?}"
+            is_published_instant(updated_at),
+            "case {case}: expected updatedAt as a published instant in the \
+             yyyy-mm-ddThh:mm:ss form the device-service-properties document carries, \
+             got {updated_at:?}"
         );
     }
 
@@ -562,4 +588,95 @@ async fn reading_a_device_twice_publishes_the_same_document() {
             "case device {arn}: the capability document must be stable across reads"
         );
     }
+}
+
+/// A published catalog entry is DATA OF THE CATALOG, not of the emulator serving it:
+/// every value in it — its two documentation links and the instant it states it was last
+/// published included — comes from the device's own entry, so the document one emulator
+/// publishes for a device is the document a later one publishes for it. A restart is not
+/// a change to the catalog.
+///
+/// The table is the inventory itself, and the second emulator stands in for the restart:
+/// it is built over its own engine, so it seeds its devices again from scratch.
+#[tokio::test]
+async fn a_published_catalog_entry_is_the_same_document_after_a_restart() {
+    let published_by = Braket::new();
+    let republished_by = Braket::new();
+
+    let inventory = published_by.inventory().await;
+    assert!(
+        inventory.len() >= 2,
+        "the seeded inventory must hold at least two devices to span the rule, got {}",
+        inventory.len()
+    );
+
+    let mut images: Vec<String> = Vec::new();
+    let mut anchors: Vec<String> = Vec::new();
+
+    for summary in &inventory {
+        let arn = member(summary, "deviceArn");
+        let case = format!("device {arn}");
+        let published = capabilities(&published_by, arn).await;
+        let republished = capabilities(&republished_by, arn).await;
+        assert_eq!(
+            published, republished,
+            "case {case}: a later boot must publish the same document, got {published} \
+             then {republished}"
+        );
+
+        let service = published
+            .get("service")
+            .unwrap_or_else(|| panic!("case {case}: no service section: {published}"));
+        let updated_at = member(service, "updatedAt");
+        assert!(
+            is_published_instant(updated_at),
+            "case {case}: updatedAt is the entry's published instant in the \
+             yyyy-mm-ddThh:mm:ss form, got {updated_at:?}"
+        );
+
+        let documentation = service
+            .get("deviceDocumentation")
+            .unwrap_or_else(|| panic!("case {case}: no deviceDocumentation: {service}"));
+        let link = member(documentation, "externalDocumentationUrl");
+        let anchor = link
+            .strip_prefix(DEVICE_LIST_PAGE)
+            .and_then(|fragment| fragment.strip_prefix('#'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: expected the guide's device page anchored on the \
+                     device's own documentation section ({DEVICE_LIST_PAGE}#<section>), \
+                     got {link:?}"
+                )
+            });
+        assert!(
+            !anchor.is_empty(),
+            "case {case}: the documentation link must name the section documenting the \
+             device, got {link:?}"
+        );
+        anchors.push(anchor.to_string());
+        images.push(member(documentation, "imageUrl").to_string());
+    }
+
+    // Each entry carries its OWN published image, not one asset served for every
+    // device.
+    let mut distinct_images = images.clone();
+    distinct_images.sort();
+    distinct_images.dedup();
+    assert_eq!(
+        distinct_images.len(),
+        inventory.len(),
+        "each device publishes its own image: expected {} distinct imageUrl values, \
+         got {images:?}",
+        inventory.len()
+    );
+    // And the catalog documents devices in more than one section, so a link is a
+    // property of the entry rather than a single page everything points at.
+    let mut distinct_anchors = anchors.clone();
+    distinct_anchors.sort();
+    distinct_anchors.dedup();
+    assert!(
+        distinct_anchors.len() >= 2,
+        "the catalog documents its devices in different sections: expected at least two \
+         distinct anchors across the inventory, got {anchors:?}"
+    );
 }

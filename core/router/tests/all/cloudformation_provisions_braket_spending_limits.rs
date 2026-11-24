@@ -15,7 +15,8 @@
 //! The rows of the deploy table differ along what the rule generalises over: which device the
 //! limit caps (four quantum processors, under ARNs that carry a Region and ARNs that do not,
 //! and one the inventory publishes as `OFFLINE`), the form of the amount (two decimals, one,
-//! none — the three the modelled `^\d+(\.\d{1,2})?$` admits), which published return value
+//! none — the three the modelled `^\d+(\.\d{1,2})?$` admits, each read back in the plain form
+//! the owning service reports an amount in), which published return value
 //! the output reads (`Ref`, `Fn::GetAtt SpendingLimitArn`, `Fn::GetAtt CreatedAt`), the
 //! template spelling (JSON with long-form intrinsics, YAML with the short-form tags), whether
 //! the declaration carries the type's own `Tags`, and how many limits one stack declares.
@@ -100,6 +101,23 @@ async fn cloudformation(
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     (status, String::from_utf8_lossy(response.body()).to_string())
+}
+
+/// One USD amount as Amazon Braket reports it in a spending-limit summary: the amount's
+/// plain decimal value, with the zeros its fraction does not need — and a decimal point
+/// left bare by them — dropped, so the cents appear exactly when they are not zero.
+///
+/// A template declares the amount in any of the forms the member's pattern admits, and the
+/// owning service reports what it holds in this one form, so a declaration is read back
+/// through here rather than character for character.
+fn reported_amount(amount: &str) -> String {
+    match amount.split_once('.') {
+        None => amount.to_string(),
+        Some((dollars, fraction)) => match fraction.trim_end_matches('0') {
+            "" => dollars.to_string(),
+            cents => format!("{dollars}.{cents}"),
+        },
+    }
 }
 
 /// `SearchSpendingLimits` narrowed to one device, over Amazon Braket's own restJson1 wire
@@ -404,10 +422,13 @@ async fn a_deployed_stack_publishes_the_spending_limit_braket_minted() {
                 Some(declared.device_arn),
                 "case {case:?}: expected the limit to cap the declared device, got {summary}"
             );
+            let reported = reported_amount(declared.amount);
             assert_eq!(
                 summary.get("spendingLimit").and_then(Value::as_str),
-                Some(declared.amount),
-                "case {case:?}: expected the declared amount, got {summary}"
+                Some(reported.as_str()),
+                "case {case:?}: expected the declared amount {} reported as {reported}, \
+                 got {summary}",
+                declared.amount
             );
             assert_eq!(
                 summaries.len(),
@@ -627,10 +648,12 @@ async fn a_stack_update_applies_the_change_to_the_limit_amazon_braket_holds() {
         let summary = summary_of(&summaries, &arn).unwrap_or_else(|| {
             panic!("case {case:?}: expected Amazon Braket to still list {arn:?}, got {summaries:?}")
         });
+        let reported = reported_amount(amount);
         assert_eq!(
             summary.get("spendingLimit").and_then(Value::as_str),
-            Some(amount),
-            "case {case:?}: expected the re-declared amount, got {summary}"
+            Some(reported.as_str()),
+            "case {case:?}: expected the re-declared amount {amount} reported as \
+             {reported}, got {summary}"
         );
     }
 }

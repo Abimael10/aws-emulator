@@ -17,6 +17,9 @@
 //! * `queuedSpend` and `totalSpend` are COMPUTED from the device's quantum tasks over
 //!   the limit's own period, at the per-shot price the device's capability document
 //!   publishes.
+//! * Every USD amount a summary carries is reported in its plain decimal form — only the
+//!   digits the amount needs — so an amount submitted with zero cents written out comes
+//!   back without them and a device with nothing spent on it reports `0`.
 //! * The search is filtered (on a limit's own ARN or its device's, `EQUAL` only) and
 //!   paginated.
 //!
@@ -95,6 +98,22 @@ pub(crate) fn limit_body(client_token: &str, device_arn: &str, amount: &str) -> 
     })
 }
 
+/// One USD amount as a spending-limit summary reports it: the amount's plain decimal
+/// value, with the zeros its fraction does not need — and a decimal point left bare by
+/// them — dropped, so cents appear exactly when they are not zero.
+///
+/// Derived here from the rule rather than read off the service, so a door that pads every
+/// amount to a fixed width of cents fails these suites instead of agreeing with them.
+pub(crate) fn reported_amount(amount: &str) -> String {
+    match amount.split_once('.') {
+        None => amount.to_string(),
+        Some((whole, fraction)) => match fraction.trim_end_matches('0') {
+            "" => whole.to_string(),
+            cents => format!("{whole}.{cents}"),
+        },
+    }
+}
+
 /// Seconds since the epoch, as `TimePeriod`'s `epoch-seconds` members carry.
 pub(crate) fn now_epoch() -> i64 {
     i64::try_from(
@@ -122,7 +141,10 @@ pub(crate) fn period_second(limit: &Value, name: &str) -> f64 {
 
 /// What one charged unit costs on `device_arn` and the unit it is charged per, read
 /// from the device's own published capability document (`service.deviceCost`).
-async fn published_price(braket: &Braket, device_arn: &str) -> (f64, String) {
+///
+/// The price comes back as the TEXT of the number the document publishes, so [`charge`]
+/// can multiply it by a unit count in exact decimal arithmetic.
+async fn published_price(braket: &Braket, device_arn: &str) -> (String, String) {
     let reply = braket.get_device(device_arn).await;
     assert_eq!(
         reply.status, 200,
@@ -138,9 +160,32 @@ async fn published_price(braket: &Braket, device_arn: &str) -> (f64, String) {
         .unwrap_or_else(|| panic!("{device_arn} publishes no service.deviceCost"));
     let price = cost
         .get("price")
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("{device_arn} publishes no deviceCost.price"));
+        .filter(|price| price.is_number())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| panic!("{device_arn} publishes no numeric deviceCost.price"));
     (price, member(&cost, "unit").to_string())
+}
+
+/// `units` charged units at the price `price` dollars each, as the amount a summary must
+/// report for them.
+///
+/// Computed from the price's own DIGITS — the price is shifted to a whole number of its
+/// smallest published fraction, multiplied, and the point put back — so the expected text
+/// is an exact decimal derived independently of how the service renders one, in the plain
+/// form of [`reported_amount`].
+fn charge(price: &str, units: i64) -> String {
+    let (dollars, fraction) = price.split_once('.').unwrap_or((price, ""));
+    let shifted: i128 = format!("{dollars}{fraction}")
+        .parse()
+        .unwrap_or_else(|e| panic!("the published price {price:?} is not a decimal: {e}"));
+    let scale = 10_i128.pow(u32::try_from(fraction.len()).expect("a short fraction"));
+    let total = shifted * i128::from(units);
+    let cents = total % scale;
+    if cents == 0 {
+        return (total / scale).to_string();
+    }
+    let width = fraction.len();
+    reported_amount(&format!("{}.{cents:0width$}", total / scale))
 }
 
 /// The ARN of a device the inventory publishes with `device_type` and `status`.
@@ -253,10 +298,11 @@ async fn a_created_spending_limit_round_trips_through_the_search() {
         assert_spending_limit_arn(&arn, case);
 
         let limit = limit_by_arn(&braket, &device, &arn).await;
+        let expected_amount = reported_amount(amount);
         assert_eq!(
             member(&limit, "spendingLimit"),
-            *amount,
-            "case {case:?}: the amount must come back as written, got {limit}"
+            expected_amount,
+            "case {case:?}: the amount must come back as {expected_amount}, got {limit}"
         );
         assert_eq!(
             member(&limit, "deviceArn"),
@@ -312,12 +358,12 @@ async fn a_created_spending_limit_round_trips_through_the_search() {
         );
         assert_eq!(
             member(&limit, "queuedSpend"),
-            "0.00",
+            "0",
             "case {case:?}: no task is queued on the device, got {limit}"
         );
         assert_eq!(
             member(&limit, "totalSpend"),
-            "0.00",
+            "0",
             "case {case:?}: nothing has been spent on the device, got {limit}"
         );
     }
@@ -327,6 +373,71 @@ async fn a_created_spending_limit_round_trips_through_the_search() {
         rows.len(),
         "every created limit is persisted, and no more than those"
     );
+}
+
+/// Every USD amount a summary carries — the limit's own and both spend figures — is
+/// reported in its plain decimal form: only the digits the amount needs, so the cents
+/// appear exactly when they are not zero and nothing is padded to a fixed width.
+///
+/// The rows span the forms `CreateSpendingLimit`'s own `@pattern` for the member admits
+/// (`^\d+(\.\d{1,2})?$`, `smithy_query(query="shape", shape="CreateSpendingLimitRequest")`):
+/// a whole amount, the same amount with its zero cents written out, one and two
+/// significant cents digits, a significant cent followed by a zero, zero in both forms,
+/// and a large amount in both forms. The two spend figures ride along on every row: a
+/// device nothing has been queued or charged on reports them as `0`.
+#[tokio::test]
+async fn every_reported_usd_amount_carries_only_the_digits_it_needs() {
+    let braket = Braket::new();
+    let device = a_device(&braket, "QPU", "ONLINE").await;
+
+    // (case, the amount submitted, the amount reported)
+    let rows: &[(&str, &str, &str)] = &[
+        ("a whole amount", "500", "500"),
+        ("a whole amount with its zero cents written out", "500.00", "500"),
+        ("a significant cent followed by a zero", "500.10", "500.1"),
+        ("both cents significant", "12.34", "12.34"),
+        ("one decimal place", "0.5", "0.5"),
+        ("one cent", "0.01", "0.01"),
+        ("zero", "0", "0"),
+        ("zero with its cents written out", "0.00", "0"),
+        ("a large whole amount", "1000000", "1000000"),
+        ("a large amount with zero cents", "1000000.00", "1000000"),
+    ];
+
+    for (index, (case, submitted, reported)) in rows.iter().enumerate() {
+        // The table and the rule agree, so a row cannot pin a form the rule does not
+        // state.
+        assert_eq!(
+            reported_amount(submitted),
+            *reported,
+            "case {case:?}: the plain form of {submitted} is {reported}"
+        );
+
+        let reply = create_limit(
+            &braket,
+            limit_body(&format!("tok-amount-form-{index}"), &device, submitted),
+        )
+        .await;
+        assert_eq!(
+            reply.status, CREATED,
+            "case {case:?}: expected {CREATED}, got {} {}",
+            reply.status, reply.body
+        );
+        let limit = limit_by_arn(&braket, &device, &reply.str_member("spendingLimitArn")).await;
+        assert_eq!(
+            member(&limit, "spendingLimit"),
+            *reported,
+            "case {case:?}: {submitted} must be reported as {reported}, got {limit}"
+        );
+        for spend in ["queuedSpend", "totalSpend"] {
+            assert_eq!(
+                member(&limit, spend),
+                "0",
+                "case {case:?}: nothing is queued or charged on the device, so {spend} \
+                 must be reported as 0, got {limit}"
+            );
+        }
+    }
 }
 
 /// Whether a limit may be created at all is decided by the device: every published row
@@ -625,7 +736,7 @@ async fn the_reported_spend_is_computed_from_the_devices_quantum_tasks() {
         let before = limit_by_arn(&braket, &device, &arn).await;
         assert_eq!(
             member(&before, "queuedSpend"),
-            "0.00",
+            "0",
             "case {case:?}: nothing is queued yet, got {before}"
         );
 
@@ -638,13 +749,11 @@ async fn the_reported_spend_is_computed_from_the_devices_quantum_tasks() {
             task.status, task.body
         );
 
-        #[allow(clippy::cast_precision_loss)]
-        let committed = price * (*shots as f64);
         let expected_queued = if *covers_now {
-            format!("{committed:.2}")
+            charge(&price, *shots)
         } else {
             // The task was created outside the period, so it is not this period's spend.
-            "0.00".to_string()
+            "0".to_string()
         };
         let after = limit_by_arn(&braket, &device, &arn).await;
         assert_eq!(
@@ -655,7 +764,7 @@ async fn the_reported_spend_is_computed_from_the_devices_quantum_tasks() {
         );
         assert_eq!(
             member(&after, "totalSpend"),
-            "0.00",
+            "0",
             "case {case:?}: no task has completed, so nothing has been charged, got {after}"
         );
     }

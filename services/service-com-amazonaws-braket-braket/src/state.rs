@@ -731,10 +731,51 @@ impl ComAmazonawsBraketBraketState {
     }
 }
 
-/// An amount in USD, as the `^\d+(\.\d{1,2})?$` form every Braket spending member
-/// carries: whole cents, never an exponent.
+/// How many fractional digits a COMPUTED amount is rendered to before
+/// [`plain_amount`] drops the zeros it does not need.
+///
+/// A charge is a published per-unit price times an integer count, and the finest price
+/// this catalog publishes carries five fractional digits ([`DEVICE_SEEDS`]), so a sum of
+/// charges is a multiple of one hundred-thousandth of a dollar: six digits render such a
+/// sum exactly while keeping the binary-float residue of the addition out of the text.
+const COMPUTED_AMOUNT_DIGITS: usize = 6;
+
+/// A COMPUTED amount in USD, as every Braket spending member reports one: the plain
+/// decimal value, in the form [`plain_amount`] defines.
 pub fn usd(amount: f64) -> String {
-    format!("{amount:.2}")
+    if !amount.is_finite() || amount == 0.0 {
+        // A sum of no charges, and the negative zero an empty sum can hold, are both
+        // nothing spent.
+        return "0".to_string();
+    }
+    let digits = COMPUTED_AMOUNT_DIGITS;
+    plain_amount(&format!("{amount:.digits$}"))
+}
+
+/// One USD amount in the plain decimal form Amazon Braket reports a spending member in:
+/// the amount's own digits, with the insignificant zeros of its fraction — and a
+/// fraction left empty by them — dropped.
+///
+/// Nothing is padded to a fixed width, so cents appear exactly when they are not zero:
+/// a limit submitted as a whole number of dollars is reported as that whole number, and a
+/// device with nothing spent on it reports `0`. The model puts no `@pattern` and no
+/// length on `SpendingLimitSummary$spendingLimit`, `$queuedSpend` or `$totalSpend`
+/// (`smithy_query(query="shape", shape="SpendingLimitSummary")`, which reports them as
+/// plain required Strings), and the recorded search is the statement of the form: an
+/// amount whose cents are zero comes back without them, and an unspent device comes back
+/// as a bare zero.
+///
+/// Takes the TEXT, so the amount a caller submitted and an amount computed from the
+/// records are reported in one form without routing a submitted amount through a float.
+pub fn plain_amount(amount: &str) -> String {
+    let Some((whole, fraction)) = amount.split_once('.') else {
+        return amount.to_string();
+    };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        return whole.to_string();
+    }
+    format!("{whole}.{fraction}")
 }
 
 /// Apply the transitions `now` has made due to one hybrid job.
@@ -1000,10 +1041,11 @@ const GATE_MODEL_OPERATIONS: &[&str] = &[
 ];
 
 /// Where `deviceDocumentation.externalDocumentationUrl` points: the Amazon Braket
-/// developer guide's device list, anchored on the device.
+/// developer guide, whose supported-devices page documents every published device.
 const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/braket/latest/developerguide";
-/// Where `deviceDocumentation.imageUrl` points.
-const DEVICE_IMAGE_BASE: &str = "https://d1.awsstatic.com/braket/devices";
+/// The page of that guide the devices are documented on, which each device's own link
+/// anchors on its [`DeviceSeed::documentation_section`].
+const DEVICE_LIST_PAGE: &str = "braket-devices.html";
 
 /// One row of the seeded inventory.
 ///
@@ -1041,6 +1083,25 @@ struct DeviceSeed {
     cost: (f64, &'static str),
     /// `deviceDocumentation.summary`.
     summary: &'static str,
+    /// `deviceDocumentation.externalDocumentationUrl`: the section of the guide's
+    /// supported-devices page ([`DEVICE_LIST_PAGE`]) that documents THIS device.
+    ///
+    /// A published link of the catalog entry, carried per device rather than derived
+    /// from the device's name: the guide names a device's section after the family or
+    /// the provider it belongs to as often as after the device itself, so a link built
+    /// out of the name leads nowhere.
+    documentation_section: &'static str,
+    /// `deviceDocumentation.imageUrl`: the device's published image asset, the other
+    /// link the catalog entry carries and the Braket SDK surfaces.
+    image_url: &'static str,
+    /// `service.updatedAt`: when this catalog entry was last published, in the
+    /// `yyyy-mm-ddThh:mm:ss` form the device-service-properties document carries it in.
+    ///
+    /// A FIXED property of the published entry, not an instant this emulator observes:
+    /// devices are published by Amazon Braket rather than created through the API, so
+    /// the same device read after a restart must report the same document — anything
+    /// that caches or diffs the catalog would otherwise see a change nobody made.
+    published_at: &'static str,
 }
 
 /// The device inventory this emulator publishes.
@@ -1078,6 +1139,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.075, "minute"),
         summary: "Amazon Braket state vector simulator",
+        documentation_section: "braket-simulator-sv1",
+        image_url: "https://d1.awsstatic.com/braket/devices/amazon-sv1.png",
+        published_at: "2020-08-13T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/quantum-simulator/amazon/dm1",
@@ -1095,6 +1159,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: true,
         cost: (0.075, "minute"),
         summary: "Amazon Braket density matrix simulator",
+        documentation_section: "braket-simulator-dm1",
+        image_url: "https://d1.awsstatic.com/braket/devices/amazon-dm1.png",
+        published_at: "2021-05-26T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/quantum-simulator/amazon/tn1",
@@ -1112,6 +1179,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.275, "minute"),
         summary: "Amazon Braket tensor network simulator",
+        documentation_section: "braket-simulator-tn1",
+        image_url: "https://d1.awsstatic.com/braket/devices/amazon-tn1.png",
+        published_at: "2021-02-10T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/ionq/Aria-1",
@@ -1129,6 +1199,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.03, "shot"),
         summary: "IonQ Aria trapped-ion quantum processor",
+        documentation_section: "braket-qpu-partner-ionq",
+        image_url: "https://d1.awsstatic.com/braket/devices/ionq-aria-1.png",
+        published_at: "2023-06-28T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/ionq/Forte-1",
@@ -1146,6 +1219,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.08, "shot"),
         summary: "IonQ Forte trapped-ion quantum processor",
+        documentation_section: "braket-qpu-partner-ionq",
+        image_url: "https://d1.awsstatic.com/braket/devices/ionq-forte-1.png",
+        published_at: "2024-02-28T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:eu-north-1::device/qpu/iqm/Garnet",
@@ -1163,6 +1239,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00145, "shot"),
         summary: "IQM Garnet superconducting quantum processor",
+        documentation_section: "braket-qpu-partner-iqm",
+        image_url: "https://d1.awsstatic.com/braket/devices/iqm-garnet.png",
+        published_at: "2024-03-26T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-west-1::device/qpu/rigetti/Ankaa-3",
@@ -1180,6 +1259,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.0009, "shot"),
         summary: "Rigetti Ankaa superconducting quantum processor",
+        documentation_section: "braket-qpu-partner-rigetti",
+        image_url: "https://d1.awsstatic.com/braket/devices/rigetti-ankaa-3.png",
+        published_at: "2024-12-17T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/quera/Aquila",
@@ -1200,6 +1282,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.01, "shot"),
         summary: "QuEra Aquila neutral-atom analog Hamiltonian simulator",
+        documentation_section: "braket-qpu-partner-quera",
+        image_url: "https://d1.awsstatic.com/braket/devices/quera-aquila.png",
+        published_at: "2022-11-28T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:eu-west-2::device/qpu/oqc/Lucy",
@@ -1217,6 +1302,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00035, "shot"),
         summary: "Oxford Quantum Circuits Lucy superconducting quantum processor",
+        documentation_section: "braket-qpu-partner-oqc",
+        image_url: "https://d1.awsstatic.com/braket/devices/oqc-lucy.png",
+        published_at: "2022-03-29T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-west-1::device/qpu/rigetti/Aspen-M-3",
@@ -1234,6 +1322,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00035, "shot"),
         summary: "Rigetti Aspen-M-3 superconducting quantum processor",
+        documentation_section: "braket-qpu-partner-rigetti",
+        image_url: "https://d1.awsstatic.com/braket/devices/rigetti-aspen-m-3.png",
+        published_at: "2022-10-17T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/qpu/ionq/Harmony",
@@ -1251,6 +1342,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.01, "shot"),
         summary: "IonQ Harmony trapped-ion quantum processor",
+        documentation_section: "braket-qpu-partner-ionq",
+        image_url: "https://d1.awsstatic.com/braket/devices/ionq-harmony.png",
+        published_at: "2020-08-13T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-west-2::device/qpu/d-wave/Advantage_system6",
@@ -1270,6 +1364,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00019, "shot"),
         summary: "D-Wave Advantage quantum annealer",
+        documentation_section: "braket-qpu-partner-dwave",
+        image_url: "https://d1.awsstatic.com/braket/devices/dwave-advantage-system6.png",
+        published_at: "2022-02-23T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/qpu/d-wave/DW_2000Q_6",
@@ -1287,6 +1384,9 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00019, "shot"),
         summary: "D-Wave 2000Q quantum annealer",
+        documentation_section: "braket-qpu-partner-dwave",
+        image_url: "https://d1.awsstatic.com/braket/devices/dwave-dw-2000q-6.png",
+        published_at: "2020-08-13T00:00:00",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/xanadu/Borealis",
@@ -1305,16 +1405,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         noise: false,
         cost: (0.00035, "shot"),
         summary: "Xanadu Borealis photonic quantum processor",
+        documentation_section: "braket-qpu-partner-xanadu",
+        image_url: "https://d1.awsstatic.com/braket/devices/xanadu-borealis.png",
+        published_at: "2022-06-02T00:00:00",
     },
 ];
 
 /// Build the seeded inventory, keyed and ordered by device ARN.
 fn seeded_devices() -> BTreeMap<String, Device> {
-    // `service.updatedAt` reports when the catalog entry a caller reads was last
-    // published. This inventory is published when the store is created, so that is the
-    // instant every row carries — and it does not move afterwards, so a capability
-    // document read twice is the same document.
-    let published_at = SystemTime::now();
     DEVICE_SEEDS
         .iter()
         .map(|seed| {
@@ -1324,7 +1422,7 @@ fn seeded_devices() -> BTreeMap<String, Device> {
                 provider_name: seed.provider.to_string(),
                 device_type: seed.device_type.to_string(),
                 device_status: seed.device_status.to_string(),
-                device_capabilities: capabilities_document(seed, published_at),
+                device_capabilities: capabilities_document(seed),
                 shots_range: seed.shots_range,
                 cost_price: seed.cost.0,
                 cost_unit: seed.cost.1.to_string(),
@@ -1346,7 +1444,13 @@ fn seeded_devices() -> BTreeMap<String, Device> {
 /// `serde_json`, so what a caller parses is always well-formed JSON, and every
 /// property is computed from the catalog row — the emulator has no hardware, so it
 /// reports no calibration data.
-fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String {
+///
+/// Nothing in it comes from the clock or from the device's NAME: the documentation links
+/// and the instant the entry was published are properties of the catalog row
+/// ([`DeviceSeed::documentation_section`], [`DeviceSeed::image_url`],
+/// [`DeviceSeed::published_at`]), so the document a caller reads for one device is the
+/// same document before and after a restart.
+fn capabilities_document(seed: &DeviceSeed) -> String {
     let actions: serde_json::Map<String, serde_json::Value> = seed
         .action_types
         .iter()
@@ -1357,7 +1461,6 @@ fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String 
             )
         })
         .collect();
-    let slug = url_slug(seed.name);
     let mut document = serde_json::json!({
         "braketSchemaHeader": {
             "name": capabilities_schema(seed),
@@ -1379,12 +1482,15 @@ fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String 
                 "unit": seed.cost.1,
             },
             "deviceDocumentation": {
-                "imageUrl": format!("{DEVICE_IMAGE_BASE}/{slug}.png"),
+                "imageUrl": seed.image_url,
                 "summary": seed.summary,
                 "externalDocumentationUrl":
-                    format!("{DOCUMENTATION_BASE}/braket-devices.html#{slug}"),
+                    format!(
+                        "{DOCUMENTATION_BASE}/{DEVICE_LIST_PAGE}#{}",
+                        seed.documentation_section
+                    ),
             },
-            "updatedAt": as_iso8601(published_at),
+            "updatedAt": seed.published_at,
         },
         "action": serde_json::Value::Object(actions),
         "deviceParameters": device_parameters_schema(seed),
@@ -1641,23 +1747,6 @@ fn device_properties(seed: &DeviceSeed) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(properties)
-}
-
-/// A device name as the url slug the catalog's documentation links carry: lowercase,
-/// with every run of characters that are not letters or digits collapsed to one `-`.
-fn url_slug(name: &str) -> String {
-    let mut slug = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    slug
 }
 
 /// An instant as the ISO-8601 `date-time` a JSON document carries.
@@ -1987,7 +2076,7 @@ pub fn device_not_found_in_region(device_arn: &str, region: &str) -> String {
     format!(
         "Braket device '{device_arn}' not found in {region}. You can find a list of all \
          supported device ARNs and the regions in which they are available in the \
-         documentation: {DOCUMENTATION_BASE}/braket-devices.html"
+         documentation: {DOCUMENTATION_BASE}/{DEVICE_LIST_PAGE}"
     )
 }
 
