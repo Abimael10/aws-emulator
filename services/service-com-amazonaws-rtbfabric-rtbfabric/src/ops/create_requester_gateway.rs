@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: now,
             // Nothing has been updated yet: the record carries an update's
             // client token only once it has taken one.
-            last_update: None,
+            accepted_updates: crate::state::AcceptedUpdates::default(),
         };
 
         let output = CreateRequesterGatewayOutput {

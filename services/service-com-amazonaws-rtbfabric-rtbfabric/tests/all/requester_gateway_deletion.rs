@@ -393,9 +393,10 @@ async fn a_gateway_still_settling_can_be_released() {
 // a request to clear what is stored — and reports that record's OWN status, which
 // is pending while the gateway puts the change into service. A gateway that is not
 // in service has no configuration in service to change, so it is refused. A retry
-// of the `clientToken` the record last took is answered with the record rather than
-// applied to it a second time, and the same token carrying different parameters is
-// refused instead of answering for parameters the caller did not send. The table
+// of any `clientToken` a change of the record was accepted under is answered with
+// the record rather than applied to it a second time — however many changes it has
+// taken since — and the same token carrying different parameters is refused instead
+// of answering for parameters the caller did not send. The table
 // spans what the rules generalise over: whether the record already carried a
 // description, whether the update states one, and the form and length of the one it
 // states.
@@ -693,6 +694,104 @@ async fn a_retry_of_the_token_the_record_last_took_is_answered_rather_than_appli
         after, settled,
         "case {case:?}: expected the retry to leave the record as the first update left it, got {after:?}"
     );
+}
+
+/// The changes one requester gateway takes in turn, each under a `clientToken` of
+/// its own: the operation applies `description` alone, so the rows differ along
+/// the value it states and whether it states one at all.
+const ACCEPTED_CHANGES: &[(&str, Option<&str>)] = &[
+    ("token-one", Some("Display exchange")),
+    ("token-two", Some("Video exchange")),
+    ("token-three", None),
+    ("token-four", Some("Spot bidding fabric")),
+    ("token-five", Some("A")),
+];
+
+#[tokio::test]
+async fn a_retry_of_an_earlier_token_is_recognised_after_later_changes_were_taken() {
+    // Each row: how many of the changes above the gateway has taken when the retry
+    // arrives, and which of them is retried.
+    for (case, taken, retried) in [
+        ("the first change of two", 2usize, 0usize),
+        ("the second change of two", 2, 1),
+        ("the first change of five", 5, 0),
+        ("the middle change of five", 5, 2),
+        ("the change taken last of five", 5, 4),
+    ] {
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .create_described_requester(case, Some("Created by the suite"), "token-create")
+            .await;
+        fabric
+            .poll_requester_until(case, &gateway_id, IN_SERVICE_STATUS)
+            .await;
+
+        for (token, description) in &ACCEPTED_CHANGES[..taken] {
+            let (status, answered) = fabric
+                .update_requester(&gateway_id, update_requester_body(*description, token))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the change under {token:?} to answer 200, got {status} {answered:?}"
+            );
+            fabric
+                .poll_requester_until(case, &gateway_id, IN_SERVICE_STATUS)
+                .await;
+        }
+        let settled = fabric.read_requester(case, &gateway_id).await;
+
+        // The retry an SDK would send, now that later changes have been taken: it is
+        // answered from the record, and its own change is not applied over them.
+        let (token, description) = ACCEPTED_CHANGES[retried];
+        let (status, replayed) = fabric
+            .update_requester(&gateway_id, update_requester_body(description, token))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the retry of {token:?} to answer 200, got {status} {replayed:?}"
+        );
+        assert_eq!(
+            text(&replayed, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the retry of {token:?} to answer for the same gateway, got {replayed:?}"
+        );
+        assert_eq!(
+            text(&replayed, "status"),
+            IN_SERVICE_STATUS,
+            "case {case:?}: expected the retry of {token:?} to report the record rather than taking the change again, got {replayed:?}"
+        );
+        let after = fabric.read_requester(case, &gateway_id).await;
+        assert_eq!(
+            after, settled,
+            "case {case:?}: expected the retry of {token:?} to apply nothing a second time, got {after:?} after {settled:?}"
+        );
+
+        // The same earlier token carrying different parameters is refused rather
+        // than applied.
+        let (status, refused) = fabric
+            .update_requester(
+                &gateway_id,
+                update_requester_body(Some("Different parameters"), token),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {token:?} with other parameters to be refused, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            format!(
+                "clientToken {token} was already used for a UpdateRequesterGateway request \
+                 with different parameters"
+            ),
+            "case {case:?}: expected the mismatch wording, got {refused:?}"
+        );
+        let after = fabric.read_requester(case, &gateway_id).await;
+        assert_eq!(
+            after, settled,
+            "case {case:?}: expected the refused retry of {token:?} to change nothing, got {after:?}"
+        );
+    }
 }
 
 #[tokio::test]

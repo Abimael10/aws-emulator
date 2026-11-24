@@ -1189,6 +1189,153 @@ async fn the_same_client_token_with_different_parameters_is_refused_and_changes_
     }
 }
 
+/// The changes one gateway takes in turn, each under a `clientToken` of its own.
+///
+/// They differ along what the update generalises over — which of the members it
+/// applies the call states, and the value each one carries — so a retry of any of
+/// them is a change the record would visibly take again were it applied twice.
+fn accepted_changes() -> Vec<(&'static str, Value)> {
+    vec![
+        ("token-one", json!({ "description": "One" })),
+        (
+            "token-two",
+            json!({ "description": "Two", "clientRoutingPolicy": "ANY_AVAILABILITY_ZONE" }),
+        ),
+        (
+            "token-three",
+            json!({ "listenerConfig": { "protocols": ["HTTP"] } }),
+        ),
+        (
+            "token-four",
+            json!({
+                "trustStoreConfiguration": { "certificateAuthorityCertificates": [CA_CERTIFICATE] }
+            }),
+        ),
+        (
+            "token-five",
+            json!({ "description": "Five", "clientRoutingPolicy": "AVAILABILITY_ZONE_AFFINITY" }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_retried_client_token_is_recognised_after_later_changes_were_accepted() {
+    let changes = accepted_changes();
+    // Each row: how many of the changes above the gateway has taken when the retry
+    // arrives, and which of those changes is retried — the first, one in the
+    // middle, and the one taken last.
+    for (case, taken, retried) in [
+        ("the first change of two", 2usize, 0usize),
+        ("the second change of two", 2, 1),
+        ("the first change of five", 5, 0),
+        ("the middle change of five", 5, 2),
+        ("the change taken last of five", 5, 4),
+    ] {
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .create_responder_gateway(case, update_baseline_body("create"))
+            .await;
+        fabric
+            .poll_gateway_status(case, &gateway_id, GATEWAY_STATUS_ACTIVE)
+            .await;
+
+        for (token, patch) in &changes[..taken] {
+            let (status, answered) = fabric
+                .send(
+                    "POST",
+                    &update_path(&gateway_id),
+                    Some(update_body(token, patch)),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the change under {token:?} to answer 200, got {status} {answered:?}"
+            );
+            assert_eq!(
+                text(&answered, "status"),
+                GATEWAY_STATUS_PENDING_UPDATE,
+                "case {case:?}: expected the change under {token:?} to be taken as {GATEWAY_STATUS_PENDING_UPDATE:?}, got {answered:?}"
+            );
+            fabric
+                .poll_gateway_status(case, &gateway_id, GATEWAY_STATUS_ACTIVE)
+                .await;
+        }
+        let settled = fabric.read_responder_gateway(case, &gateway_id).await;
+
+        // The retry an SDK would send: the same token and the same parameters, now
+        // that later changes have been accepted. It is answered from the record,
+        // and the change it carries is NOT taken a second time over the later one.
+        let (token, patch) = &changes[retried];
+        let (status, replayed) = fabric
+            .send(
+                "POST",
+                &update_path(&gateway_id),
+                Some(update_body(token, patch)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the retry of {token:?} to answer 200, got {status} {replayed:?}"
+        );
+        assert_eq!(
+            text(&replayed, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the retry of {token:?} to answer for {gateway_id:?}, got {replayed:?}"
+        );
+        assert_eq!(
+            text(&replayed, "status"),
+            GATEWAY_STATUS_ACTIVE,
+            "case {case:?}: expected the retry of {token:?} to report the record rather than taking the change again, got {replayed:?}"
+        );
+        assert_eq!(
+            replayed["clientRoutingPolicy"], settled["clientRoutingPolicy"],
+            "case {case:?}: expected the retry of {token:?} to report the stored policy {:?}, got {:?}",
+            settled["clientRoutingPolicy"], replayed["clientRoutingPolicy"]
+        );
+        let after = fabric.read_responder_gateway(case, &gateway_id).await;
+        assert_eq!(
+            after, settled,
+            "case {case:?}: expected the retry of {token:?} to apply nothing a second time, got {after:?} after {settled:?}"
+        );
+
+        // The same earlier token carrying DIFFERENT parameters is refused, rather
+        // than answering for parameters the caller did not send or applying them.
+        let (status, refused) = fabric
+            .send(
+                "POST",
+                &update_path(&gateway_id),
+                Some(update_body(
+                    token,
+                    &json!({ "description": "Different parameters" }),
+                )),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {token:?} with other parameters to be refused with 400, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "__type"),
+            "ValidationException",
+            "case {case:?}: expected the modelled error code, got {refused:?}"
+        );
+        let expected = format!(
+            "clientToken {token} was already used for a UpdateResponderGateway request with different parameters"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            refused["message"]
+        );
+        let after = fabric.read_responder_gateway(case, &gateway_id).await;
+        assert_eq!(
+            after, settled,
+            "case {case:?}: expected the refused retry of {token:?} to change nothing, got {after:?} after {settled:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_gateway_that_is_not_in_service_has_no_configuration_to_change() {
     // Every member of the modelled `ResponderGatewayStatus` enum, read off the

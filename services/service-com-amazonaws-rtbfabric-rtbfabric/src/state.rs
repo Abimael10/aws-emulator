@@ -12,6 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
+/// The `@idempotencyToken`s a stored resource's accepted changes were presented
+/// under, which is what a retried update is answered from.
+mod accepted_updates;
 /// The `/responder-gateway/{gatewayId}/certificate` surface's record.
 mod certificates;
 /// The two external-link surfaces' records: the outbound links a requester gateway
@@ -28,6 +31,7 @@ mod routing_rules;
 mod tagging;
 // Named rather than glob, so this module's public surface stays explicit, and every
 // path a handler uses (`crate::state::…`) keeps resolving.
+pub use accepted_updates::{AcceptedUpdates, Retry, ACCEPTED_UPDATES_RETAINED};
 pub use certificates::{
     CertificateAssociation, CERTIFICATE_ASSOCIATIONS_PER_GATEWAY_QUOTA,
     CERTIFICATE_EXTERNAL_ONLY_MESSAGE, CERTIFICATE_STATUS_ASSOCIATED,
@@ -190,10 +194,11 @@ pub struct RequesterGateway {
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The `@idempotencyToken` of the most recent accepted change of this
-    /// gateway's configuration, and a digest of that call's other parameters;
-    /// `None` until one is accepted. See [`IdempotentUpdate`].
-    pub last_update: Option<IdempotentUpdate>,
+    /// Every `@idempotencyToken` an accepted change of this gateway's
+    /// configuration was presented under, so a retry of any of them is answered
+    /// from this record rather than applied to it again. Empty until one is
+    /// accepted. See [`AcceptedUpdates`].
+    pub accepted_updates: AcceptedUpdates,
 }
 
 impl RequesterGateway {
@@ -254,10 +259,10 @@ pub struct ResponderGateway {
     pub external_inbound_endpoint: Option<String>,
     pub description: Option<String>,
     pub tags: HashMap<String, String>,
-    /// The `@idempotencyToken` of the most recent accepted change of this
-    /// gateway's configuration, and a digest of that call's other parameters;
-    /// `None` until one is accepted. See [`IdempotentUpdate`].
-    pub last_update: Option<IdempotentUpdate>,
+    /// Every `@idempotencyToken` an accepted change of this gateway's
+    /// configuration was presented under, exactly as
+    /// [`RequesterGateway::accepted_updates`] holds the other kind's.
+    pub accepted_updates: AcceptedUpdates,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -443,27 +448,6 @@ pub struct IdempotentCreate {
     /// A digest of that call's other parameters: the documented contract is that
     /// a retry of the same token with DIFFERENT parameters fails rather than
     /// silently answering the first call's resource.
-    pub fingerprint: [u8; 32],
-}
-
-/// What the most recent accepted call carrying an `@idempotencyToken` CHANGED a
-/// stored resource to, so a retry with the same token answers with the record
-/// that call produced instead of applying the change a second time.
-///
-/// Held ON the record the call changed rather than in
-/// [`ComAmazonawsRtbfabricRtbfabricState::idempotency`], which answers for a
-/// resource a first call MINTED: an update mints nothing, and one record per
-/// resource is what stops a caller growing the store by retrying the same change
-/// under fresh tokens. Fixed size — both digests are 32 bytes — so a
-/// caller-chosen `clientToken` cannot grow the bytes retained either.
-#[derive(Debug, Clone)]
-pub struct IdempotentUpdate {
-    /// The token that call carried, as [`idempotency_key`] digests it together
-    /// with the operation's own name, so two operations' tokens never collide.
-    pub key: [u8; 32],
-    /// A digest of that call's other parameters: the documented contract is that
-    /// a retry of the same token with DIFFERENT parameters fails rather than
-    /// silently answering for parameters the caller did not send.
     pub fingerprint: [u8; 32],
 }
 

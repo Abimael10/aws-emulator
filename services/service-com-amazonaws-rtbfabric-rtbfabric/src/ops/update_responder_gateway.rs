@@ -222,11 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken` is an `@idempotencyToken`: the same token replays the
         // first call's answer, and the same token with different parameters is
         // refused rather than silently answering for parameters the caller did
-        // not send. The model declares no `IdempotentParameterMismatch`, so the
-        // refusal is this operation's `ValidationException` (400). Every member
-        // the call carries is in the fingerprint, the ones this operation does
-        // not apply included: a retry that restates them differently is a
-        // different request.
+        // not send. That holds for every token a call has been accepted under,
+        // however many changes the gateway has taken since, so a retry never
+        // applies its change over a later one. The model declares no
+        // `IdempotentParameterMismatch`, so the refusal is this operation's
+        // `ValidationException` (400). Every member the call carries is in the
+        // fingerprint, the ones this operation does not apply included: a retry
+        // that restates them differently is a different request.
         let fingerprint = crate::state::parameter_fingerprint(&format!(
             "gatewayId={:?}|domainName={:?}|port={:?}|protocol={:?}|listenerConfig={:?}\
              |trustStore={:?}|managedEndpoint={:?}|clientRoutingPolicy={:?}|description={:?}",
@@ -251,10 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The record of the change this gateway most recently took lives on the
-        // gateway itself, so a retry is answered from the resource it addressed.
-        if let Some(prior) = gateway.last_update.as_ref().filter(|prior| prior.key == key) {
-            if prior.fingerprint != fingerprint {
+        // The records of the changes this gateway has taken live on the gateway
+        // itself, so a retry is answered from the resource it addressed. EVERY
+        // token it still retains is recognised, not only the one it took last: a
+        // retry of an earlier call must not apply its change over a later one.
+        match gateway.accepted_updates.classify(&key, &fingerprint) {
+            crate::state::Retry::Mismatch => {
                 return Err(UpdateResponderGatewayErrorModeled::ValidationException(
                     ValidationException {
                         message: format!(
@@ -266,13 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // The same change under the same token: report the record it already
-            // produced rather than apply it a second time.
-            return Ok(UpdateResponderGatewayOutput {
-                gateway_id: gateway.gateway_id.clone(),
-                status: gateway.status.clone(),
-                client_routing_policy: gateway.client_routing_policy.clone(),
-            });
+            crate::state::Retry::Replay => {
+                // The same change under the same token: report the record that
+                // change left rather than apply it a second time.
+                return Ok(UpdateResponderGatewayOutput {
+                    gateway_id: gateway.gateway_id.clone(),
+                    status: gateway.status.clone(),
+                    client_routing_policy: gateway.client_routing_policy.clone(),
+                });
+            }
+            crate::state::Retry::Fresh => {}
         }
 
         if !gateway.in_service() {
@@ -330,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             gateway.client_routing_policy = input.client_routing_policy;
         }
         gateway.updated_at = now;
-        gateway.last_update = Some(crate::state::IdempotentUpdate { key, fingerprint });
+        gateway.accepted_updates.accept(key, fingerprint);
         // The gateway is in service, so the change is applied to a live gateway:
         // this call reports the update as pending, and the clock owes the gateway
         // its way back into service. A changed client routing policy is reported

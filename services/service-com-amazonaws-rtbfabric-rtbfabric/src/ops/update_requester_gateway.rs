@@ -181,10 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not anybody called.
         store.settle_all(now);
 
-        // `clientToken` is an `@idempotencyToken`: a retry of the change the gateway
-        // last took is answered with that gateway rather than applied to it again, and
-        // the same token carrying DIFFERENT parameters is refused rather than silently
-        // answering for parameters the caller did not send. The model declares no
+        // `clientToken` is an `@idempotencyToken`: a retry of a change the gateway has
+        // taken is answered with that gateway rather than applied to it again, and the
+        // same token carrying DIFFERENT parameters is refused rather than silently
+        // answering for parameters the caller did not send. Every token the gateway
+        // still retains is recognised, not only the one it took last, so a retry never
+        // applies its change over a later one. The model declares no
         // `IdempotentParameterMismatch`, so that refusal is this operation's
         // `ValidationException` (400), exactly as the sibling updates and creates of
         // this service refuse it.
@@ -203,10 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The record of the change this gateway most recently took lives on the
-        // gateway itself, so a retry is answered from the resource it addressed.
-        if let Some(prior) = gateway.last_update.as_ref().filter(|prior| prior.key == key) {
-            if prior.fingerprint != fingerprint {
+        // The records of the changes this gateway has taken live on the gateway
+        // itself, so a retry is answered from the resource it addressed.
+        match gateway.accepted_updates.classify(&key, &fingerprint) {
+            crate::state::Retry::Mismatch => {
                 return Err(UpdateRequesterGatewayErrorModeled::ValidationException(
                     ValidationException {
                         message: format!(
@@ -218,12 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // The same change under the same token: report the record it already
-            // produced rather than apply it a second time.
-            return Ok(UpdateRequesterGatewayOutput {
-                gateway_id: gateway.gateway_id.clone(),
-                status: gateway.status.clone(),
-            });
+            crate::state::Retry::Replay => {
+                // The same change under the same token: report the record that
+                // change left rather than apply it a second time.
+                return Ok(UpdateRequesterGatewayOutput {
+                    gateway_id: gateway.gateway_id.clone(),
+                    status: gateway.status.clone(),
+                });
+            }
+            crate::state::Retry::Fresh => {}
         }
 
         if !gateway.in_service() {
@@ -243,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             gateway.description = input.description;
         }
         gateway.updated_at = now;
-        gateway.last_update = Some(crate::state::IdempotentUpdate { key, fingerprint });
+        gateway.accepted_updates.accept(key, fingerprint);
         // The gateway is in service, so the change is applied to a live gateway: this
         // call reports the update as pending, and the clock owes the gateway its way
         // back into service.
