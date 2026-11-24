@@ -116,8 +116,8 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
 }
 
 /// How a DEPLOYMENT reports model data it could not download: the download that failed, the
-/// location it was attempted on AS THE MODEL NAMES IT, and the two things that have to hold
-/// for it to succeed — an object at that URL, and a role that may read it.
+/// BUCKET and the KEY of the object it was attempted on, and the two things that have to hold
+/// for it to succeed — an object at that URL, and a role that may download it.
 ///
 /// A different surface from the creates above, and so a different sentence: those REFUSE a
 /// call, while this travels on the endpoint as its `FailureReason` once the fleet it was
@@ -126,12 +126,17 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
 /// download model artifacts from the S3 path you provided", `CreateEndpoint`). One sentence
 /// for the whole condition, because it names both of the things that can make the download
 /// fail and the deployment reports the download rather than which of them it was.
+///
+/// The two variable parts are the location SPLIT into its parts rather than the whole `s3://`
+/// URI: a client reads which object is missing straight off the message — the bucket to re-grant
+/// on and the key to re-upload — instead of having to take a URI apart.
 #[must_use]
-pub fn failed_to_download_model_data(s3_url: &str) -> String {
+pub fn failed_to_download_model_data(location: &crate::state::S3Location) -> String {
     format!(
-        "Failed to download data. Cannot download {s3_url}. Please ensure that there is an \
+        "Failed to download model data(bucket: {}, key: {}). Please ensure that there is an \
          object located at the URL and that the role passed to CreateModel has permissions to \
-         access the object."
+         download the model.",
+        location.bucket, location.key
     )
 }
 

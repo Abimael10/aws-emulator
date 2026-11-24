@@ -8,9 +8,10 @@
 //! model artifacts from the S3 path you provided" (`CreateEndpoint`). `CreateEndpoint` is
 //! ACCEPTED either way and the endpoint reports `Creating`; the outcome the clock then owes it
 //! is `EndpointStatus` `InService` when every model's model data can be read as that model's
-//! execution role, and `Failed` with a `FailureReason` naming the location that could not be
-//! read otherwise — never `InService` for a fleet with no model behind it. An endpoint in that
-//! state serves no traffic, so `InvokeEndpoint` against it is refused rather than answered.
+//! execution role, and `Failed` with a `FailureReason` naming the BUCKET and the KEY of the
+//! object it could not download otherwise — never `InService` for a fleet with no model behind
+//! it. An endpoint in that state serves no traffic, so `InvokeEndpoint` against it is refused
+//! rather than answered.
 //!
 //! Only a cross-service suite can ask this: the flow spans four services over ONE engine
 //! exactly as `core/router/src/lib.rs` mounts them — IAM for the role the deployment reads
@@ -38,6 +39,17 @@ const VARIANT: &str = "AllTraffic";
 /// An artifact's bytes. Nothing reads them in these cases: what is under test is whether the
 /// deployment resolves the LOCATION, so the body only has to be an object Amazon S3 holds.
 const ARTIFACT_BODY: &str = "{\"model\":{\"intercept\":1.0,\"weights\":[1.0],\"epochs\":1}}";
+
+/// SageMaker's own `FailureReason` for model data a deployment could not download: a fixed
+/// sentence whose only variable parts are the bucket and the key of the object the download was
+/// attempted on, which is the location the model named taken apart rather than the URI itself.
+fn failed_download_reason(bucket: &str, key: &str) -> String {
+    format!(
+        "Failed to download model data(bucket: {bucket}, key: {key}). Please ensure that there \
+         is an object located at the URL and that the role passed to CreateModel has permissions \
+         to download the model."
+    )
+}
 
 /// `DELETE /<bucket>/<key>` — `DeleteObject`, so a case can take an artifact away after the
 /// model that names it was registered.
@@ -81,8 +93,8 @@ struct Row {
     case: &'static str,
     /// The containers the model carries: the first is the primary container.
     containers: Vec<Container>,
-    /// The key whose absence must be named by the `FailureReason`, or `None` for a row whose
-    /// deployment comes up.
+    /// The key whose failed download must be named by the `FailureReason`, or `None` for a row
+    /// whose deployment comes up.
     missing: Option<&'static str>,
 }
 
@@ -215,7 +227,7 @@ async fn settled_endpoint(router: &MultiServiceRouter, case: &str, endpoint: &st
 
 /// RULE: an endpoint's create settles `InService` only when every model it hosts holds the
 /// model data its containers name; one whose model data is gone settles `Failed` with the
-/// `FailureReason` naming that location, and serves nothing.
+/// `FailureReason` naming the bucket and the key of that location, and serves nothing.
 #[tokio::test]
 async fn a_deployment_settles_on_whether_its_model_data_can_be_downloaded() {
     for row in rows() {
@@ -306,11 +318,11 @@ async fn a_deployment_settles_on_whether_its_model_data_can_be_downloaded() {
                     "case {case:?}: a deployment whose model data is gone must not serve, \
                      got {settled}"
                 );
-                let named = format!("s3://{BUCKET}/{key}");
-                assert!(
-                    reason.contains(&named),
-                    "case {case:?}: the FailureReason must name the model data location \
-                     {named:?}, got {reason:?}"
+                assert_eq!(
+                    reason,
+                    failed_download_reason(BUCKET, key),
+                    "case {case:?}: the FailureReason must attribute the failure to the download \
+                     of the bucket and key the model named, got {reason:?}"
                 );
             }
         }
@@ -485,9 +497,11 @@ async fn a_trained_models_artifact_decides_the_deployment_whenever_it_goes() {
                 "case {case:?}: a deployment with no model artifact to download must not \
                  serve, got {read}"
             );
-            assert!(
-                reason.contains(&artifact),
-                "case {case:?}: the FailureReason must name {artifact:?}, got {reason:?}"
+            assert_eq!(
+                reason,
+                failed_download_reason(BUCKET, &artifact_key),
+                "case {case:?}: the FailureReason must attribute the failure to the download of \
+                 the bucket and key of {artifact:?}, got {reason:?}"
             );
         } else {
             assert_eq!(

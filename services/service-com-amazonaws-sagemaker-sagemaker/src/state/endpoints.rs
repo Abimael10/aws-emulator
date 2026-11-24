@@ -387,8 +387,8 @@ pub async fn resolve_due_endpoint_deployment(
 /// the S3 path you provided" (`CreateEndpoint`): the download happens while the endpoint is
 /// brought up, so a location that holds no object, or one the role may not read, is a fleet
 /// that never serves. Both are the DOWNLOAD failing, which is the one sentence a deployment
-/// reports them with ([`failed_to_download_model_data`]) — it names the location and both of
-/// the things that have to hold for the download to succeed.
+/// reports them with ([`failed_to_download_model_data`]) — it names the bucket and the key of
+/// the object and both of the things that have to hold for the download to succeed.
 ///
 /// Asked through the same reading the hosting creates ask ([`first_unreadable_location_as_role`])
 /// and awaited with NO store guard held; only what Amazon S3 and IAM ANSWERED fails a
@@ -406,8 +406,11 @@ pub async fn model_data_deployment_failure(
             [artifact.uri.as_str()],
         )
         .await;
-        if let Some(unreadable) = unreadable {
-            return Some(failed_to_download_model_data(unreadable.uri()));
+        // A location that reading answers about is one it could take a bucket and a key off —
+        // it asks nothing about any other — and those two parts are what the reason names.
+        let location = unreadable.and_then(|unreadable| S3Location::parse(unreadable.uri()));
+        if let Some(location) = location {
+            return Some(failed_to_download_model_data(&location));
         }
     }
     None
