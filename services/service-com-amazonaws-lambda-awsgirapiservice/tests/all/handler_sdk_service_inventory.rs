@@ -66,10 +66,13 @@ const KEY: &str = "orders/one.txt";
 const MUST_REACH: &[&str] = &[
     "apigateway",
     "apigatewaymanagementapi",
+    "batch",
     "cloudwatch",
     "cognito-idp",
     "dynamodb",
     "ec2",
+    "ecr",
+    "ecs",
     "events",
     "iam",
     "kinesis",
@@ -92,7 +95,7 @@ const MUST_REACH: &[&str] = &[
 /// A token of a real AWS service this runtime binds no requests for, which is what the
 /// unknown-service rows below probe with: the catalog the SDK reports is read out of the
 /// sentence raised for it.
-const UNREACHABLE_TOKEN: &str = "batch";
+const UNREACHABLE_TOKEN: &str = "polly";
 
 /// One row: the token a handler builds its client with, and whether the runtime's SDK answers
 /// to it.

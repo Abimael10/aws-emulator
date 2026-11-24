@@ -1219,6 +1219,70 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&TRANSFER),
     },
+    // `services/service-com-amazonaws-batch-awsbatchv20160810/smithy-model/
+    // com-amazonaws-batch-awsbatchv20160810.json`: restJson1, sigv4Name `batch`,
+    // endpointPrefix `batch`, sdkId `Batch`. Its requests are bound per operation out of that
+    // same model ([`BATCH`]).
+    //
+    // A FUNCTION THAT SUBMITS A JOB is the standard front door of a batch workload: the
+    // long-running work a handler cannot do inside one invocation is handed to this service
+    // with `SubmitJob`, and the handler answers its caller the job id it was given, which is
+    // the id every later read of that work — `DescribeJobs`, `ListJobs`, `CancelJob`,
+    // `TerminateJob` — is made against. Registering a definition and reading the queues and
+    // compute environments a submission is placed on is the rest of what such a handler does.
+    // A handler that cannot reach this service can neither start that work nor report on it.
+    Api {
+        sdk_token: "batch",
+        signing_name: "batch",
+        endpoint_prefix: "batch",
+        model: Some(BATCH_MODEL),
+        protocol: Protocol::RestJson(&BATCH),
+        answer_model: Some(&BATCH_ANSWERS),
+    },
+    // `services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/smithy-model/
+    // com-amazonaws-ecr-amazonec2containerregistry-v20150921.json`: awsJson1_1, sigv4Name `ecr`,
+    // endpointPrefix `api.ecr`, sdkId `ECR`, service shape
+    // `AmazonEC2ContainerRegistry_V20150921`.
+    //
+    // THE IMAGE a container workload runs is this service's: a handler that starts containerised
+    // work reads the repository it is to run from and the images in it (`DescribeRepositories`,
+    // `DescribeImages`, `BatchGetImage`), creates the repository that work will publish to, and
+    // vends the registry credential a pull is made with (`GetAuthorizationToken`) — so a handler
+    // that cannot reach this service cannot tell an image that exists from one that does not,
+    // which is exactly the fact a container job's outcome turns on.
+    Api {
+        sdk_token: "ecr",
+        signing_name: "ecr",
+        endpoint_prefix: "api.ecr",
+        model: Some(ECR_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "AmazonEC2ContainerRegistry_V20150921",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&ECR_ANSWERS),
+    },
+    // `services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/smithy-model/
+    // com-amazonaws-ecs-amazonec2containerservicev20141113.json`: awsJson1_1, sigv4Name `ecs`,
+    // endpointPrefix `ecs`, sdkId `ECS`, service shape `AmazonEC2ContainerServiceV20141113`.
+    //
+    // THE TASK a container workload runs AS is this service's: a handler that runs work too long
+    // for one invocation hands it to a task (`RunTask`), reads what that task came to
+    // (`DescribeTasks`, `ListTasks`), and manages the services and definitions behind it — and a
+    // task is also what another service's placed job runs as, so the handle such a job reports
+    // is only resolvable from inside a function once this service is reachable.
+    Api {
+        sdk_token: "ecs",
+        signing_name: "ecs",
+        endpoint_prefix: "ecs",
+        model: Some(ECS_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "AmazonEC2ContainerServiceV20141113",
+            json_version: "1.1",
+            query_compatible: false,
+        },
+        answer_model: Some(&ECS_ANSWERS),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -1453,6 +1517,18 @@ pub(super) const SCHEDULER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-scheduler-awschronosservice/smithy-model/\
      com-amazonaws-scheduler-awschronosservice.json"
 );
+pub(super) const BATCH_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-batch-awsbatchv20160810/smithy-model/\
+     com-amazonaws-batch-awsbatchv20160810.json"
+);
+pub(super) const ECR_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/smithy-model/\
+     com-amazonaws-ecr-amazonec2containerregistry-v20150921.json"
+);
+pub(super) const ECS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-ecs-amazonec2containerservicev20141113/smithy-model/\
+     com-amazonaws-ecs-amazonec2containerservicev20141113.json"
+);
 /// THIS service's own model, read the same way as every other entry's: a call a handler makes
 /// to Lambda is bound by the model this crate is generated from, so the surface a running
 /// function reaches is the surface this emulator serves.
@@ -1629,6 +1705,18 @@ static SCHEDULER_ANSWERS: super::blob_members::ServiceModel = super::blob_member
     source: SCHEDULER_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static BATCH_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: BATCH_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static ECR_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: ECR_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static ECS_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: ECS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
 /// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
@@ -1763,6 +1851,15 @@ static S3VECTORS: super::rest_json::RestApi = super::rest_json::RestApi {
 static SCHEDULER: super::rest_json::RestApi = super::rest_json::RestApi {
     model: SCHEDULER_MODEL,
     namespace: "com.amazonaws.scheduler",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// AWS Batch's own model, which a call to it is bound by — embedded exactly as the models above
+/// are and for the same reason: the wire facts of each of its operations are that model's, so
+/// this seam states none of them.
+static BATCH: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: BATCH_MODEL,
+    namespace: "com.amazonaws.batch",
     parsed: ::std::sync::OnceLock::new(),
 };
 
