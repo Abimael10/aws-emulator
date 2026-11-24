@@ -809,3 +809,107 @@ async fn the_destinations_security_group_gates_the_connectors_path() {
         );
     }
 }
+
+/// The .zip a client uploads whose ONLY entry is the container specification: the guest
+/// does not exist as an entry of the archive at all — the build's own `RUN` steps
+/// materialise it, which is the ordinary container-image shape for this service.
+fn specification_only_artifact(dockerfile: &str) -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        writer
+            .start_file("Dockerfile", options)
+            .expect("the entry starts");
+        writer
+            .write_all(dockerfile.as_bytes())
+            .expect("the entry's bytes");
+        writer.finish().expect("a finished archive");
+    }
+    buffer.into_inner()
+}
+
+/// The guest program the rows below materialise with a build step, in the one-line form a
+/// `RUN` writes a file in.
+const BAKED_GUEST: &str =
+    "require(\"http\").createServer(function (req, res) { res.writeHead(200, \
+     {\"content-type\": \"application/json\"}); res.end(JSON.stringify({baked: true, \
+     path: req.url})); }).listen(8080);";
+
+/// One row of the baked-guest table: what a failing assertion calls it, the `RUN` steps
+/// the specification declares, and the command that starts the guest.
+type BakedRow<'a> = (&'a str, Vec<String>, &'a str);
+
+/// RULE: what a MicroVM image's own container specification BUILDS is part of the image,
+/// so the module its command names is the guest that runs — whether that module is an
+/// entry of the code artifact or a file the build's own steps wrote.
+///
+/// The rows differ along how the step materialises the guest (a redirection, an appended
+/// pair of redirections, a decoded pipeline), where in the image it writes it, and how the
+/// command names it.
+#[tokio::test]
+async fn a_guest_the_builds_own_steps_wrote_is_the_guest_that_runs() {
+    // `base64 -d` is the decoder GNU coreutils' `base64` provides, which the shell this
+    // emulator performs a build step in carries; the encoded text is that same program,
+    // encoded by the codec this workspace already uses.
+    let encoded = aws_smithy_types::base64::encode(BAKED_GUEST);
+    let rows: Vec<BakedRow> = vec![
+        (
+            "a step that redirects the program into place",
+            vec![format!("echo '{BAKED_GUEST}' > /server.js")],
+            "CMD [\"node\", \"/server.js\"]",
+        ),
+        (
+            "a step that makes a directory first, and names the module in shell form",
+            vec![
+                "mkdir -p /opt".to_string(),
+                format!("echo '{BAKED_GUEST}' > /main.js"),
+            ],
+            "CMD [\"/bin/sh\", \"-c\", \"node /main.js\"]",
+        ),
+        (
+            "a step that decodes the program out of a pipeline",
+            vec![format!("echo {encoded} | base64 -d > /decoded.js")],
+            "ENTRYPOINT [\"node\", \"/decoded.js\"]",
+        ),
+    ];
+
+    for (case, steps, command) in rows {
+        let (router, engine) = emulator();
+        let dockerfile = format!(
+            "FROM public.ecr.aws/amazonlinux/amazonlinux:2023\n{}\n{command}\n",
+            steps
+                .iter()
+                .map(|step| format!("RUN {step}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let key = "baked.zip";
+        stage_artifact(
+            &router,
+            "mvm-baked-artifacts",
+            key,
+            specification_only_artifact(&dockerfile),
+        )
+        .await;
+        let image = guest_image(
+            &router,
+            "baked-guest",
+            &format!("s3://mvm-baked-artifacts/{key}"),
+        )
+        .await;
+        let microvm = running_microvm(&router, &image, &[internet_egress_arn()]).await;
+        let token = auth_token(&router, &microvm.0).await;
+        let (status, body) =
+            through_endpoint(&router, &engine, &microvm.0, "/probe", &token).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the guest's own answer, got {status} {body}"
+        );
+        assert_eq!(
+            body,
+            json!({"baked": true, "path": "/probe"}),
+            "case {case:?}: expected the body the baked guest wrote, got {body}"
+        );
+    }
+}

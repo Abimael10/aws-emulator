@@ -61,6 +61,7 @@ pub mod regions;
 
 /// The guest a MicroVM runs: the program held in the image version's code artifact.
 pub mod guest_program;
+pub mod guest_python;
 
 /// The MACHINE that guest runs on: the identity its MicroVM publishes to it, the
 /// environment its image declares and the filesystem it reads and writes.

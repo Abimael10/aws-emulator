@@ -81,29 +81,56 @@ fn build_config() -> SessionConfig {
     }
 }
 
-/// The reason the build of the artifact `bytes` settles on the FAILURE branch, and `None`
-/// for an artifact whose own build steps this emulator could not refute.
+/// What performing one artifact's own build steps established: the reason the build
+/// settles on the failure branch, and the files the steps LEFT in the image.
+///
+/// A `RUN` is "a command in a new layer", so what it writes is part of the image the build
+/// produces: a context that materialises its guest with `RUN` steps (an interpreter's
+/// source file written out by one of them) declares its program there rather than as an
+/// entry of the archive, and the files below are that program
+/// ([`super::guest_program::read`] reads them beside the archive's own entries).
+#[derive(Debug, Default, Clone)]
+pub struct Built {
+    /// The `stateReason` the version and its builds settle with, and `None` for a build
+    /// this emulator could not refute.
+    pub failure_reason: Option<String>,
+    /// The files the performed steps left, keyed by the absolute path each was written at.
+    pub files: Vec<(String, String)>,
+}
+
+/// PERFORM the build steps the artifact `bytes` declares, over one tree seeded with the
+/// artifact's own files, and report what that established.
 ///
 /// `key` is the object key the artifact was fetched from, which names the single entry of
 /// an artifact that is not an archive.
 #[must_use]
-pub fn refuted(bytes: &[u8], key: &str) -> Option<String> {
+pub fn perform(bytes: &[u8], key: &str) -> Built {
     let entries = super::guest_program::artifact_entries(bytes, key);
-    let spec = entries
+    let Some(spec) = entries
         .iter()
         .find(|entry| entry.path == CONTAINER_SPEC)
-        .map(|entry| entry.source.as_str())?;
-    let steps = build_steps(spec);
-    if steps.is_empty() {
-        return None;
-    }
+        .map(|entry| entry.source.clone())
+    else {
+        return Built::default();
+    };
+    let steps = build_steps(&spec);
     // The tree the steps run over is the build context: the artifact's own files, so a
-    // step reads what the artifact holds rather than an empty directory.
-    let mut session = ShellSession::new(BTreeMap::new(), build_config()).with_file_utilities();
+    // step reads what the artifact holds rather than an empty directory. It is the IMAGE's
+    // own storage, bounded by what a MicroVM's machine holds
+    // ([`super::guest_machine::volume_limits`]), and it is taken back below, so what the
+    // steps wrote is part of the image they built.
+    let mut tree = ::service_common::posix_shell_volume::ShellVolume::new(
+        super::guest_machine::volume_limits(),
+    );
     for entry in &entries {
-        session.put_file(&entry.path, &entry.source);
+        // The context is the directory the steps run in, which is the root of the tree:
+        // a step naming `Dockerfile` reads the artifact's own entry.
+        tree.put_file(&format!("/{}", entry.path), &entry.source);
     }
+    let mut session = ShellSession::in_volume(BTreeMap::new(), build_config(), tree)
+        .with_file_utilities();
     let statuses = Statuses::default();
+    let mut failure_reason = None;
     for step in steps {
         let status = session.run(&step);
         // Each step is its own shell, as each layer of a container build is, so a step
@@ -114,9 +141,31 @@ pub fn refuted(bytes: &[u8], key: &str) -> Option<String> {
         if status == statuses.success || status == statuses.could_not_run {
             continue;
         }
-        return Some(step_failure_reason(&step, status));
+        failure_reason = Some(step_failure_reason(&step, status));
+        break;
     }
-    None
+    let files = session
+        .into_volume()
+        .map(|tree| {
+            tree.stored_files()
+                .map(|(path, contents)| (path.to_string(), contents.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Built {
+        failure_reason,
+        files,
+    }
+}
+
+/// The reason the build of the artifact `bytes` settles on the FAILURE branch, and `None`
+/// for an artifact whose own build steps this emulator could not refute.
+///
+/// `key` is the object key the artifact was fetched from, which names the single entry of
+/// an artifact that is not an archive.
+#[must_use]
+pub fn refuted(bytes: &[u8], key: &str) -> Option<String> {
+    perform(bytes, key).failure_reason
 }
 
 /// The build steps `dockerfile` declares, in the order the builder performs them: the
@@ -297,6 +346,29 @@ mod tests {
         assert!(
             actual.is_none(),
             "expected no verdict for an artifact with no specification, got {actual:?}"
+        );
+    }
+
+    /// RULE: what a build's own `RUN` steps write is part of the image they built, so the
+    /// files the steps left are reported with the verdict.
+    #[test]
+    fn the_files_the_steps_wrote_are_part_of_the_image() {
+        let dockerfile =
+            "FROM scratch\nRUN mkdir -p /srv\nRUN echo baked > /srv/server.js\n";
+        let built = perform(dockerfile.as_bytes(), CONTAINER_SPEC);
+        assert!(
+            built.failure_reason.is_none(),
+            "expected a build nothing refuted, got {built:?}"
+        );
+        let found = built
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with("server.js"));
+        assert_eq!(
+            found.map(|(path, source)| (path.as_str(), source.as_str())),
+            Some(("/srv/server.js", "baked\n")),
+            "expected the file the step wrote, got {:?}",
+            built.files
         );
     }
 

@@ -9,6 +9,8 @@ Issue-Commit: 5bdc422e571ff089197010dd8b23a6f4d1e72235
 # lambda-core VPC-egress connector reachability cannot be observed: the MicroVM endpoint answers HTTP 501 instead of the guest's response, so egressNetworkConnectors is never enforced as a network path
 
 > _Note: this issue was identified against the code base at commit `5bdc422e571ff089197010dd8b23a6f4d1e72235`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+>
+> _RESOLVED for the layers it was filed about: the endpoint serves a guest's own HTTP response rather than a fixed 501, the VPC_EGRESS network connector decides whether a guest's outbound connection connects or is dropped, and an image that declares its guest ONLY through its container specification's `RUN` steps now runs that guest. The two replay keys above are NOT recorded as working: they are re-filed, with the one layer that remains, as `issues/things-that-do-not-work/20261108T144919Z-lambda-microvms-the-vpc-egress-connector-checks-run-no-python-guest.md` — their image's guest is a Python program, and this crate embeds no engine that runs one (owned by `issues/things-that-do-not-work/20261115T120000Z-lambda-microvms-the-microvm-endpoint-runs-no-python-guest.md`)._
 
 ## Operation
 RunMicrovm

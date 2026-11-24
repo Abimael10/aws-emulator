@@ -17,19 +17,21 @@
 //! * an artifact that is not an archive is the guest's single module, which is the other
 //!   form a one-file program is staged as.
 //!
-//! Only entries the embedded engine can COMPILE are kept: JavaScript source
-//! ([`JAVASCRIPT_SUFFIXES`]) and the JSON a program reads beside it. A compiled
-//! artefact, a native library or a base-image layer in the artifact is NOT loaded —
-//! nothing here loads a host library — so a guest that needs one holds no program here
-//! and nothing is reported as having run.
+//! Only entries the embedded engines can COMPILE are kept: JavaScript source
+//! ([`JAVASCRIPT_SUFFIXES`]), Python source ([`PYTHON_SUFFIX`]) and the JSON a program
+//! reads beside it — plus whatever the image's own build steps left behind
+//! ([`super::image_build`]), which is where a context that materialises its guest with
+//! `RUN` steps declares it. A compiled artefact, a native library or a base-image layer in
+//! the artifact is NOT loaded — nothing here loads a host library — so a guest that needs
+//! one holds no program here and nothing is reported as having run.
 //!
 //! # The entry module
 //!
 //! Which module STARTS the guest is the artifact's own declaration, read in the order a
 //! container image declares it:
 //!
-//! 1. the JavaScript file the image's `Dockerfile` names in its `CMD` or `ENTRYPOINT` —
-//!    the command the container runs;
+//! 1. the source file the image's `Dockerfile` names in its `CMD` or `ENTRYPOINT` — the
+//!    command the container runs, whichever interpreter it starts;
 //! 2. the `main` of a `package.json` beside it, then `index.js` — Node's own module
 //!    resolution ("If the main field is absent … Node.js will attempt to load
 //!    `index.js`");
@@ -66,6 +68,9 @@ pub const MAX_MODULE_BYTES: usize = 2 * 1024 * 1024;
 /// beside its code.
 const JAVASCRIPT_SUFFIXES: [&str; 4] = [".js", ".mjs", ".cjs", ".json"];
 
+/// The suffix of an entry the embedded PYTHON engine can load.
+const PYTHON_SUFFIX: &str = ".py";
+
 /// The module Node loads when a package declares no `main`: "If the main field is absent
 /// … Node.js will attempt to load `index.js`".
 const DEFAULT_ENTRY: &str = "index.js";
@@ -88,6 +93,18 @@ pub struct GuestModule {
     pub source: String,
 }
 
+/// Which ENGINE runs a guest's program: the language the module that starts it is written
+/// in, which is what the image's own container specification decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestLanguage {
+    /// The program is JavaScript, run by the embedded QuickJS engine
+    /// ([`super::guest_runtime`]).
+    JavaScript,
+    /// The program is Python, run by the embedded RustPython engine
+    /// ([`super::guest_python`]).
+    Python,
+}
+
 /// The program a MicroVM's guest runs: every module the artifact holds, and the one that
 /// starts it.
 #[derive(Debug, Clone)]
@@ -96,6 +113,8 @@ pub struct GuestProgram {
     pub modules: BTreeMap<String, String>,
     /// The path of the module that starts the guest.
     pub entry: String,
+    /// The engine that runs [`Self::entry`], read off that module's own suffix.
+    pub language: GuestLanguage,
 }
 
 /// The guest program `bytes` hold, or `None` when they hold none this engine can run.
@@ -104,7 +123,21 @@ pub struct GuestProgram {
 /// of an artifact that is not an archive.
 #[must_use]
 pub fn read(bytes: &[u8], key: &str) -> Option<GuestProgram> {
-    program(artifact_entries(bytes, key))
+    let mut entries = artifact_entries(bytes, key);
+    // What the image's own build steps LEFT in the image: a context that materialises its
+    // guest with `RUN` steps declares its program there and not as an entry of the archive
+    // ([`super::image_build`] performs them), so those files are modules of the program
+    // too, under the absolute paths the steps wrote them at.
+    entries.extend(
+        super::image_build::perform(bytes, key)
+            .files
+            .into_iter()
+            .map(|(path, source)| GuestModule {
+                path: module_path(&path),
+                source,
+            }),
+    );
+    program(entries)
 }
 
 /// Every entry of the artifact `bytes`, whether or not this engine can load it: the
@@ -141,14 +174,30 @@ fn program(entries: Vec<GuestModule>) -> Option<GuestProgram> {
         .map(|entry| (entry.path, entry.source))
         .collect();
     let entry = resolve_entry(&modules, declared.as_deref())?;
-    Some(GuestProgram { modules, entry })
+    let language = language_of(&entry);
+    Some(GuestProgram {
+        modules,
+        entry,
+        language,
+    })
 }
 
-/// Whether the engine can load the module stored under `path`.
+/// The engine that runs the module stored under `path`, read off its suffix.
+fn language_of(path: &str) -> GuestLanguage {
+    if path.to_ascii_lowercase().ends_with(PYTHON_SUFFIX) {
+        GuestLanguage::Python
+    } else {
+        GuestLanguage::JavaScript
+    }
+}
+
+/// Whether the engines can load the module stored under `path`.
 fn is_loadable(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
     JAVASCRIPT_SUFFIXES
         .iter()
-        .any(|suffix| path.to_ascii_lowercase().ends_with(suffix))
+        .chain([PYTHON_SUFFIX].iter())
+        .any(|suffix| lowered.ends_with(suffix))
 }
 
 /// The entry the artifact DECLARES: its container command first, then its package
@@ -166,13 +215,13 @@ fn declared_entry(entries: &[GuestModule]) -> Option<String> {
     text(PACKAGE_MANIFEST).and_then(package_main)
 }
 
-/// The JavaScript module a `Dockerfile`'s command names, from the LAST `CMD` or
-/// `ENTRYPOINT` instruction it carries (a later one replaces an earlier).
+/// The source module a `Dockerfile`'s command names, from the LAST `CMD` or `ENTRYPOINT`
+/// instruction it carries (a later one replaces an earlier).
 ///
 /// Both forms an instruction is written in are read — the JSON array (`CMD ["node",
-/// "server.js"]`) and the shell form (`CMD node server.js`) — and what is taken from it
-/// is the first word naming a JavaScript module. An instruction naming none yields
-/// nothing.
+/// "server.js"]`, `CMD ["/bin/sh", "-c", "python3 /srv/app.py"]`) and the shell form (`CMD
+/// node server.js`) — and what is taken from it is the first word naming a module an engine
+/// loads. An instruction naming none yields nothing.
 fn container_command_module(dockerfile: &str) -> Option<String> {
     dockerfile
         .lines()
@@ -250,13 +299,14 @@ fn archive_entries(bytes: &[u8]) -> Option<Vec<GuestModule>> {
     Some(entries)
 }
 
-/// One stored path as a module path: `\` normalised to `/`, any leading `./` removed.
+/// One stored path as a module path: `\` normalised to `/`, any leading `./` removed, and
+/// any leading `/` removed — so a module a build step wrote at an absolute path and one
+/// the archive holds under a relative path are named the same way, and the command that
+/// names either resolves to it.
 fn module_path(path: &str) -> String {
     let normalised = path.replace('\\', "/");
-    normalised
-        .strip_prefix("./")
-        .unwrap_or(&normalised)
-        .to_string()
+    let relative = normalised.strip_prefix("./").unwrap_or(&normalised);
+    relative.strip_prefix('/').unwrap_or(relative).to_string()
 }
 
 #[cfg(test)]
@@ -356,6 +406,28 @@ mod tests {
                 "case {case:?}: expected the entry {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// RULE: what the build's own steps WROTE is a module of the program, so a command
+    /// naming a file no entry of the archive holds still resolves to the guest.
+    #[test]
+    fn a_build_step_can_be_what_declares_the_guest() {
+        let dockerfile = "FROM scratch\nRUN mkdir -p /srv\nRUN echo baked > /srv/server.js\n\
+                          CMD [\"node\", \"/srv/server.js\"]\n";
+        let program = read(dockerfile.as_bytes(), "Dockerfile")
+            .expect("the file a build step wrote is the guest program");
+        assert_eq!(
+            program.entry, "srv/server.js",
+            "expected the module the command names, got {:?} of {:?}",
+            program.entry,
+            program.modules.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            program.language,
+            GuestLanguage::JavaScript,
+            "expected the engine the module's own suffix names, got {:?}",
+            program.language
+        );
     }
 
     /// RULE: an artifact that is not an archive this emulator reads is the guest's own

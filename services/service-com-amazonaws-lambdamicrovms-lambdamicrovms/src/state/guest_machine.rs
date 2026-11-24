@@ -441,6 +441,7 @@ mod tests {
                 .map(|(path, source)| (path.to_string(), source.to_string()))
                 .collect(),
             entry: entry.to_string(),
+            language: super::super::guest_program::GuestLanguage::JavaScript,
         }
     }
 

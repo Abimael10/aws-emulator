@@ -92,7 +92,7 @@ use ::rquickjs::function::Func;
 use ::rquickjs::{CatchResultExt, Context, Ctx, Function, Object, Runtime};
 
 use super::guest_machine::GuestMachine;
-use super::guest_program::GuestProgram;
+use super::guest_program::{GuestLanguage, GuestProgram};
 use super::microvm_network::ConnectVerdict;
 use super::ComAmazonawsLambdamicrovmsLambdamicrovmsState as ServiceState;
 
@@ -357,7 +357,14 @@ fn serve_calls(
     bound: &::tokio::sync::watch::Sender<Option<Vec<i32>>>,
 ) {
     let seams = Seams::new(Arc::clone(machine));
-    let started = Engine::start(program, &seams);
+    // WHICH engine runs the guest is the image's own declaration, read off the module that
+    // starts it ([`super::guest_program::GuestLanguage`]): a program of a language this
+    // emulator embeds no engine for is a MicroVM nothing is listening inside of, which is
+    // what the endpoint then answers for.
+    let started = match program.language {
+        GuestLanguage::JavaScript => Engine::start(program, &seams),
+        GuestLanguage::Python => Err(super::guest_python::no_engine_for_a_python_guest()),
+    };
     // What the guest bound is published whichever way its program ended, so nothing waits
     // on a process that started no server at all.
     let _ = bound.send(Some(
@@ -1965,6 +1972,7 @@ mod tests {
         Arc::new(GuestProgram {
             modules,
             entry: "index.js".to_string(),
+            language: GuestLanguage::JavaScript,
         })
     }
 
