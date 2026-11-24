@@ -38,3 +38,34 @@ No assertion in the check failed — neither `scan-complete event delivered to t
 3. Push a minimal single-layer image via InitiateLayerUpload / UploadLayerPart / CompleteLayerUpload / PutImage. Poll the queue: nothing should arrive (correct).
 4. SetQueueAttributes with a policy allowing events.amazonaws.com sqs:SendMessage for the rule ARN, then PutTargets wiring the queue to the SAME rule.
 5. Push a second, distinct image and poll the queue for an `ECR Image Scan` event whose detail.image-digest is the new digest. Observe that no event ever arrives, so the check can only run to its cap.
+
+## Resolution
+
+The cause as stated — "pushing an image to a repository with scanOnPush enabled never results
+in an `ECR Image Scan` event on the default event bus" — is not what this code base does. The
+scan-on-push completion path is `state/scan_events.rs`: a push into a repository that scanning
+is configured for on push starts the same basic scan `StartImageScan` starts, and `PutImage`
+arms the publication of that run's completion, which is published once onto the default event
+bus as source `aws.ecr` / detail-type `ECR Image Scan`, read back out of the stored run. It
+landed with `issues/things-that-now-work/20261029T174654Z-cloudwatch-ecr-ecs-an-ecr-image-push-and.md`,
+after this check's key had already been filed against it once.
+
+What this change adds is the coverage of the two axes the recorded check drives that no suite
+reached, over the whole assembled emulator:
+`core/router/tests/all/ecr_scan_on_push_event_reaches_a_rule_scoped_queue_target.rs` pushes its
+images through the raw layer-upload sequence (`InitiateLayerUpload` -> `UploadLayerPart` ->
+`CompleteLayerUpload` -> `PutImage`), so the scanned image is a single-layer one basic scanning
+cannot examine and the run ends `FAILED` as the recording shows; and it decides the delivery
+against a queue grant SCOPED to the invoking rule (`aws:SourceArn`, a pattern covering it,
+`aws:SourceAccount`, and — the boundary — another rule's ARN), with the rule first holding no
+target and then holding one. Its second test drives the same row with every signature verified,
+because the announcement is published from a task of the registry's that outlives the push that
+armed it.
+
+REMAINING DIVERGENCE, unchanged from the earlier resolution: the recorded unit still ends
+"Check timed out after 60.0s" and no wire call of it diverges. The check's own absence leg polls
+the queue for a span longer than the replay harness's whole budget, so it is cut off inside its
+`sqs.receive_message` before either of its assertions is reached — which is what the replay
+reports — whatever the emulator answers. The behaviour the check would assert is the one the two
+router suites and the ECR crate's own `scan_on_push.rs` hold the emulator to.
+
