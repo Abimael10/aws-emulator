@@ -341,11 +341,17 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// Materialise the transition the clock has already made due for every
     /// report plan: the deployment a create or an update that reports a
     /// non-terminal status owes, which finishes as
-    /// [`REPORT_PLAN_DEPLOYMENT_STATUS_COMPLETED`]. Like
-    /// [`Self::settle_frameworks`] this is the only write a reporting operation
-    /// performs — each plan was owed its deployment at its own `settles_at`
-    /// whether or not anybody called.
+    /// [`REPORT_PLAN_DEPLOYMENT_STATUS_COMPLETED`], and the runs of the report
+    /// jobs of those plans. Like [`Self::settle_frameworks`] this is the only
+    /// write a reporting operation performs — each plan was owed its deployment
+    /// at its own `settles_at` whether or not anybody called.
     pub fn settle_report_plans(&mut self, now: SystemTime) {
+        // The instants a plan reports about its own runs are owed by the REPORT
+        // JOBS of it, so their clock is materialised first: a plan read then
+        // reports the execution a job of it has already finished rather than
+        // waiting for somebody to read that job
+        // ([`ComAmazonawsBackupCryocontrollerusermanagerState::settle_report_jobs`]).
+        self.settle_report_jobs(now);
         for plan in self.report_plans.values_mut() {
             if plan.deployment_in_flight() && now >= plan.settles_at {
                 plan.deployment_status = REPORT_PLAN_DEPLOYMENT_STATUS_COMPLETED.to_string();

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartReportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartReportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartReportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Begins an on-demand run of the report plan a `ReportPlanName` addresses: the
+//! plan is resolved out of [`crate::state`] first — a name this account holds no
+//! plan under is the one not-found refusal
+//! ([`crate::state::report_plan_not_found`]) and starts nothing — and the job
+//! that is started takes its template and its delivery destination from that
+//! stored plan, since this call carries neither
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::start_report_job`]).
+//! The run is not finished when this call answers: the job reaches its published
+//! report on this service's own clock
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::settle_report_jobs`]).
+//! A repeated `IdempotencyToken` takes no second action: it answers with the
+//! `ReportJobId` the start that carried it already answered.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +155,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartReportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartReportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartReportJob"))
+        let _ = ctx;
+        // `ReportPlanName` is `@required` and targets a patterned, length-bound
+        // shape, so an absent or malformed one is refused before this handler
+        // runs, and `crate::service` words that refusal as this service's own
+        // `MissingParameterValueException` / `InvalidParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartReportJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise what the clock has already made due — the deployment of
+        // every stored plan, and with it the run of every started job — so a
+        // replayed token and a fresh start both answer from the store's current
+        // state.
+        store.settle_report_plans(now);
+
+        // A report job is a run OF A STORED PLAN, so the plan is resolved FIRST:
+        // a name this account holds no plan under starts nothing and takes the
+        // one not-found refusal every report-plan call shares, whatever token the
+        // request carried.
+        store
+            .report_plan(&input.report_plan_name)
+            .map_err(StartReportJobErrorModeled::ResourceNotFoundException)?;
+
+        // A repeated `IdempotencyToken` replays the job that token started: no
+        // second run of the report, and the same identifier the first call
+        // answered with. A token distinguishes "otherwise identical calls to
+        // StartReportJobInput" (model doc for the member), and a start naming
+        // ANOTHER report plan is not one of those, so the replay is scoped to the
+        // plan the token was first used with.
+        if let Some(existing) = input
+            .idempotency_token
+            .as_deref()
+            .and_then(|token| store.report_job_by_idempotency_token(&input.report_plan_name, token))
+        {
+            return Ok(StartReportJobOutput {
+                report_job_id: Some(existing.id.clone()),
+            });
+        }
+
+        let report_job_id = store
+            .start_report_job(&input.report_plan_name, input.idempotency_token, now)
+            .ok_or_else(|| {
+                StartReportJobErrorModeled::ResourceNotFoundException(
+                    crate::state::report_plan_not_found(&input.report_plan_name),
+                )
+            })?;
+
+        Ok(StartReportJobOutput {
+            report_job_id: Some(report_job_id),
+        })
     }
 }

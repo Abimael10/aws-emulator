@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the report job a `ReportJobId` addresses, out of the one record
+//! `StartReportJob` stored in [`crate::state`] and through the one read
+//! projection of it ([`crate::state::ReportJobRecord::reported`]), so this read
+//! can report nothing the start stored no run for. An id this account holds no
+//! report job under is the one not-found refusal
+//! ([`crate::state::report_job_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -65,6 +63,9 @@
 //!
 //! ## Errors
 //!
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the shape this SERVICE models for a member whose value it cannot accept,
+//!   which this operation's own `errors` list does not repeat.
 //! * `MissingParameterValueException` (HTTP 400) — Indicates that a required parameter is
 //!   missing.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource that is required for the action
@@ -86,9 +87,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backup-cryocontrollerus
 // here — hence the `DescribeReportJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backup#DescribeReportJob")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: this
+// SERVICE models that shape, and answers it for a `ReportJobId` that carries no
+// identifying character at all, which this operation's own `errors` list does not
+// repeat.
+#[smithy_macros::operation_error(
+    "com.amazonaws.backup#DescribeReportJob",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeReportJobErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     MissingParameterValueException(MissingParameterValueException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -145,18 +155,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReportJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeReportJobErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A `ReportJobId` that is not of the form a report job's id takes names
+        // no job and is not resolved at all: the rule is `crate::state`'s, shared
+        // with every other call that addresses a report job by id.
+        if let Some(refusal) = crate::state::rejected_report_job_id(&input.report_job_id) {
+            return Err(DescribeReportJobErrorModeled::InvalidParameterValueException(refusal).into());
+        }
+        // The ONE write a report performs: the run transitions the clock has
+        // already made due, and the completion they record on the plan the job
+        // ran for. Everything below is read out of the stored report job.
+        store.settle_report_jobs(now);
+        let job = store
+            .report_job(&input.report_job_id)
+            .map_err(DescribeReportJobErrorModeled::ResourceNotFoundException)?;
+
+        Ok(DescribeReportJobOutput {
+            report_job: Some(job.reported()),
+        })
     }
 }

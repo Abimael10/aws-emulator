@@ -162,6 +162,12 @@ pub use restore_testing_selection::*;
 mod report_plan;
 pub use report_plan::*;
 
+/// The report JOBS those plans are run by, the one read projection of one and
+/// the clock that moves a run to its published report. Re-exported for the
+/// reason given on `events`.
+mod report_job;
+pub use report_job::*;
+
 /// The tiering configurations this service stores, and the two projections its
 /// reads answer from. Re-exported for the reason given on `events`.
 mod tiering;
@@ -3822,6 +3828,9 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// by, so the map itself is what makes that name unique to the account.
     /// Bounded by [`MAX_REPORT_PLANS`].
     pub report_plans: BTreeMap<String, ReportPlanRecord>,
+    /// Report jobs by the `ReportJobId` this service mints for a run of a stored
+    /// report plan. Bounded by [`MAX_REPORT_JOBS`].
+    pub report_jobs: BTreeMap<String, ReportJobRecord>,
     /// Restore jobs by `RestoreJobId`. Bounded by [`MAX_RESTORE_JOBS`].
     pub restore_jobs: BTreeMap<String, RestoreJobRecord>,
     /// Restore testing plans by `RestoreTestingPlanName` — the name a restore
