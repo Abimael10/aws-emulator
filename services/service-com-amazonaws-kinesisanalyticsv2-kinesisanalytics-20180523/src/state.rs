@@ -2214,14 +2214,17 @@ pub fn now_timestamp() -> DateTime {
     DateTime::from_secs(secs as i64)
 }
 
-/// How this service words a lookup miss on an application: the name the caller asked for,
-/// quoted, and the fact that no such application exists.
+/// How the operations that END the sentence in a period word a lookup miss on an
+/// application: the name the caller asked for, quoted, and the fact that no such
+/// application exists.
 ///
-/// One wording for every operation that looks an application up by name, so two readers
-/// of the same absent application cannot report it differently. The error CODE stays each
-/// operation's own — the model does not declare the same error on all of them, and
-/// `CreateApplicationSnapshot` reports the miss as `InvalidArgumentException` with its own
-/// wording — but the sentence a `ResourceNotFoundException` carries is this one.
+/// This API words a not-found refusal per operation, so this is not one sentence for the
+/// whole service: `StopApplication` answers the same miss with the same sentence stopped
+/// at its last word, and carries its own wording
+/// (`crate::ops::stop_application::unknown_application_message`). The error CODE stays
+/// each operation's own too — the model does not declare the same error on all of them,
+/// and `CreateApplicationSnapshot` reports the miss as `InvalidArgumentException` with its
+/// own wording.
 pub fn missing_application_message(name: &str) -> String {
     format!("Application '{name}' does not exist.")
 }

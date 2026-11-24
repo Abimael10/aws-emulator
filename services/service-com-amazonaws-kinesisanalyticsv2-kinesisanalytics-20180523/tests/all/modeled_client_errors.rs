@@ -466,6 +466,9 @@ async fn an_update_that_moves_an_application_onto_a_deprecated_runtime_is_refuse
 /// `InvalidArgumentException` for `CreateApplicationSnapshot`, which reports a missing
 /// application as a bad argument and names the account it looked in.
 ///
+/// The SENTENCE is each operation's own, which is why every row carries its own: the
+/// readers end theirs in a period and `StopApplication` stops at its last word.
+///
 /// The names span the forms `ApplicationName` admits (len 1..128, `^[a-zA-Z0-9_.-]+$`):
 /// the shortest, one with each admitted separator, and the longest — so what is asserted
 /// is the rule and not one recorded name. One STORED application is created first, so a
@@ -506,7 +509,10 @@ async fn a_name_no_application_is_stored_under_is_refused_with_the_modelled_code
                 "StopApplication",
                 json!({"ApplicationName": name}),
                 "ResourceNotFoundException",
-                format!("Application '{name}' does not exist."),
+                // This operation's sentence stops at its last word; the table in
+                // `a_stop_of_an_unknown_application_reports_this_operations_sentence`
+                // drives that rule over the inputs it generalises across.
+                format!("Application '{name}' does not exist"),
             ),
             (
                 "snapshot",
@@ -536,6 +542,116 @@ async fn a_name_no_application_is_stored_under_is_refused_with_the_modelled_code
             );
         }
     }
+}
+
+/// `StopApplication` refuses a name no application is stored under with HTTP 400
+/// `ResourceNotFoundException` carrying THIS operation's sentence — `Application '<name>'
+/// does not exist`, whose only variable part is the `ApplicationName` the request carried,
+/// quoted, and which ends at its last word with no terminating period.
+///
+/// The not-found sentence is worded per operation rather than once for the service, so each
+/// case also reads the same absent name through `DescribeApplication`, whose sentence does
+/// end in a period: one miss, two wordings, each the one its operation answers.
+///
+/// The rows span what the rule generalises over: the forms `ApplicationName` admits (len
+/// 1..128, `^[a-zA-Z0-9_.-]+$` — the shortest name, each admitted separator, digits only,
+/// the longest) and whether the request asks to FORCE the stop (the member absent, `false`,
+/// `true`), because a name that resolves to no application is a miss before any status or
+/// force is weighed. One application is stored first, so a miss is a miss about a store
+/// that holds applications.
+#[tokio::test]
+async fn a_stop_of_an_unknown_application_reports_this_operations_sentence() {
+    let router = router();
+    let stored = "stored-for-the-stop-miss";
+    let (status, created) = call(
+        &router,
+        "CreateApplication",
+        &create_body(stored, "FLINK-1_20"),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateApplication got {status} {created}");
+
+    let longest = "n".repeat(128);
+    let names = [
+        "a",
+        "no-such-app",
+        "probe.app_2-absent",
+        "Stopped_App.9",
+        "0",
+        longest.as_str(),
+    ];
+    let forces = [Value::Null, json!(false), json!(true)];
+
+    for name in names {
+        for force in &forces {
+            let case = format!("{name:?}/Force={force}");
+            let mut body = json!({"ApplicationName": name});
+            if !force.is_null() {
+                body["Force"] = force.clone();
+            }
+
+            let (status, answered) = call(&router, "StopApplication", &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400, got {status} {answered}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "ResourceNotFoundException",
+                "case {case}: expected ResourceNotFoundException, got {answered}"
+            );
+            let message = error_message(&answered);
+            assert_eq!(
+                message,
+                format!("Application '{name}' does not exist"),
+                "case {case}: expected this operation's miss sentence, got {message:?}"
+            );
+            assert!(
+                !message.ends_with('.'),
+                "case {case}: this operation's sentence ends at its last word, got {message:?}"
+            );
+
+            // The same miss, read through a reader: the readers' sentence, which does end
+            // in a period, so the wording belongs to the operation and not to the service.
+            let (read_status, described) = call(
+                &router,
+                "DescribeApplication",
+                &json!({"ApplicationName": name}),
+            )
+            .await;
+            assert_eq!(
+                (read_status, error_code(&described).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {case}: expected the reader to report the same miss, got {read_status} \
+                 {described}"
+            );
+            assert_eq!(
+                error_message(&described),
+                format!("Application '{name}' does not exist."),
+                "case {case}: expected the readers' miss sentence, got {described}"
+            );
+        }
+    }
+
+    // The control: the same call on a name the store DOES hold is refused on the status the
+    // application is in, so the miss sentence answers a lookup miss and nothing else.
+    let (status, answered) = call(
+        &router,
+        "StopApplication",
+        &json!({"ApplicationName": stored}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "ResourceInUseException"),
+        "case stored: expected a stored application to be refused on its status, got {status} \
+         {answered}"
+    );
+    assert_eq!(
+        error_message(&answered),
+        "Application cannot be Stopped in 'READY' state",
+        "case stored: expected the ineligible-status sentence, got {answered}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(application) = store.applications.get(&name) else {
             return Err(StopApplicationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::missing_application_message(&name)),
+                    message: Some(unknown_application_message(&name)),
                 },
             )
             .into());
@@ -231,6 +231,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         })
     }
+}
+
+/// How a stop addressed to a name no application is stored under is refused: the name the
+/// request carried, quoted, and the fact that no such application exists — the sentence
+/// this operation answers a `ResourceNotFoundException` with, which this API ends WITHOUT
+/// terminating punctuation.
+///
+/// This API words its not-found sentence per operation rather than once for the service:
+/// the readers end theirs in a period ([`crate::state::missing_application_message`]),
+/// while this one stops at the last word. The name is its only variable part and is taken
+/// from the request, so one wording answers every name a caller can miss with.
+fn unknown_application_message(name: &str) -> String {
+    format!("Application '{name}' does not exist")
 }
 
 /// How a FORCED stop is refused when the application's status is not one the force is
