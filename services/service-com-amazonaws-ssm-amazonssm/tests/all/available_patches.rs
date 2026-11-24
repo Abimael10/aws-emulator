@@ -125,7 +125,7 @@ const MAX_PAGES: usize = 300;
 
 /// The request body of one read: one `Filters` entry per pair, and none at all for an empty
 /// table row.
-fn request(filters: &[(&str, &[&str])]) -> Value {
+pub(crate) fn request(filters: &[(&str, &[&str])]) -> Value {
     if filters.is_empty() {
         return json!({});
     }
@@ -174,7 +174,7 @@ fn reported_patches(case: &str, response: &Value) -> Vec<Value> {
 }
 
 /// The value `patch` carries for the member `key`, or `None` where it carries none.
-fn member<'a>(patch: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn member<'a>(patch: &'a Value, key: &str) -> Option<&'a str> {
     patch.get(key).and_then(Value::as_str)
 }
 
@@ -293,7 +293,11 @@ async fn walked(
 }
 
 /// Every patch a read of `body` reports, walked at the largest page the read serves.
-async fn all_patches(router: &MultiServiceRouter, case: &str, body: &Value) -> Vec<Value> {
+pub(crate) async fn all_patches(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> Vec<Value> {
     walked(router, case, body, MAX_RESULTS_MAX).await
 }
 
@@ -301,7 +305,7 @@ async fn all_patches(router: &MultiServiceRouter, case: &str, body: &Value) -> V
 /// `property`, read through `DescribePatchProperties` — the sibling read of the SAME
 /// published catalogue, so the rows below name no product or property value this service
 /// does not publish.
-async fn published_values(
+pub(crate) async fn published_values(
     router: &MultiServiceRouter,
     operating_system: &str,
     property: &str,

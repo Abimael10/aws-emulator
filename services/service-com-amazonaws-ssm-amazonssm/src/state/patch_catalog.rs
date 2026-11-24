@@ -203,6 +203,36 @@ const WINDOWS_VENDOR: &str = "Microsoft";
 /// published once for every language.
 const LANGUAGE_NEUTRAL: &str = "All";
 
+/// What a patch of an operating system that publishes no classification at all is called in
+/// its title and description: the kind of thing every entry of a published catalogue is,
+/// where that catalogue names no kind for it.
+const UNCLASSIFIED_UPDATE: &str = "Update";
+
+/// Where the article of a patch its vendor identifies by a Knowledge Base id is published:
+/// "the URL where more information can be obtained about the patch" (`Patch$ContentUrl`) is
+/// that article, addressed by the digits of the id ([`PublishedPatch::kb_number`]).
+const KB_ARTICLE_URL: &str = "https://support.microsoft.com/en-us/kb/";
+
+/// How far one monthly release moves a patch on through the CLASSIFICATIONS its group
+/// publishes.
+///
+/// Each published property advances on its OWN stride, so no two properties are locked to
+/// each other and every pair of values the catalogue publishes for two properties is
+/// carried by some patch in it — which is what makes a read filtered on such a pair report
+/// the patches carrying it rather than nothing.
+///
+/// What the two strides below give is that the severity a patch carries does not follow
+/// from its classification ACROSS the group: the strides differ, so for a published
+/// classification the severity moves on with the product, and a group covers every pair
+/// once it publishes at least as many products as severities and the catalogue holds enough
+/// monthly releases ([`MONTHLY_RELEASES`]) to reach every classification. Shortening a
+/// group's product list below that brings back the pairs no patch carries.
+const CLASSIFICATION_STRIDE: u64 = 1;
+
+/// How far the same release moves a patch on through the SEVERITIES its group publishes,
+/// which is the other stride of that rule.
+const SEVERITY_STRIDE: u64 = 3;
+
 /// One patch the published catalogue holds.
 ///
 /// Every member is derived from the published metadata of the product it applies to and
@@ -219,6 +249,22 @@ pub struct PublishedPatch {
     pub kb_number: Option<String>,
     /// "The title of the patch" (`Patch$Title`).
     pub title: String,
+    /// "The description of the patch" (`Patch$Description`): what kind of update it is, the
+    /// product it applies to, the release it belongs to and the package it moves on, all
+    /// stated from this patch's own published metadata.
+    pub description: String,
+    /// "The URL where more information can be obtained about the patch"
+    /// (`Patch$ContentUrl`): the vendor's own article for this patch, where the vendor
+    /// publishes its patches as articles ([`KB_ARTICLE_URL`]), and nothing where the
+    /// catalogue publishes the advisory ids of a patch instead
+    /// ([`PublishedPatch::advisory_ids`]).
+    pub content_url: Option<String>,
+    /// "The ID of the Microsoft Security Response Center (MSRC) bulletin the patch is
+    /// related to. For example, `MS14-045`" (`Patch$MsrcNumber`): the bulletin a patch is
+    /// published through, and `None` for a patch related to none — which is every patch of
+    /// this catalogue, because it publishes its updates one article at a time
+    /// ([`KB_ARTICLE_URL`]) rather than through numbered bulletins.
+    pub msrc_number: Option<String>,
     /// "The date the patch was released" (`Patch$ReleaseDate`): the instant of the
     /// monthly release this patch belongs to.
     pub release_date: SystemTime,
@@ -283,6 +329,9 @@ impl PublishedPatch {
             id: Some(self.id.clone()),
             kb_number: self.kb_number.clone(),
             title: Some(self.title.clone()),
+            description: Some(self.description.clone()),
+            content_url: self.content_url.clone(),
+            msrc_number: self.msrc_number.clone(),
             release_date: Some(crate::state::wire_instant(self.release_date)),
             vendor: self.vendor.clone(),
             product_family: self.product_family.clone(),
@@ -705,8 +754,11 @@ fn published_patch(
     let operating_system = group.operating_system;
     // This patch's position in the rotation through the values its group publishes: the
     // product's own ordinal moved on by the release, so each product has its own sequence
-    // and each release moves every product on.
-    let position = ordinal + release.month_ordinal;
+    // and each release moves every product on. A property with its own stride
+    // ([`SEVERITY_STRIDE`]) is rotated from its own position, so it does not follow from the
+    // classification.
+    let position = ordinal + CLASSIFICATION_STRIDE * release.month_ordinal;
+    let severity_position = ordinal + SEVERITY_STRIDE * release.month_ordinal;
     let classification = rotated(group.classifications, position);
     let windows = operating_system == PATCH_SET_OPERATING_SYSTEM;
     // "The Microsoft Knowledge Base ID of the patch. Applies to Windows patches only":
@@ -722,7 +774,7 @@ fn published_patch(
         "{}-{:02} {} for {}",
         release.year,
         release.month,
-        classification.unwrap_or("Update"),
+        classification.unwrap_or(UNCLASSIFIED_UPDATE),
         product
     );
     if let Some(kb) = kb_number.as_deref() {
@@ -732,29 +784,46 @@ fn published_patch(
     // packages: its name, version, release, architecture and repository are the package
     // properties "Applies to Linux-based managed nodes only" names.
     let package = rotated(group.packages, position);
+    let package_version = package.map(|_| package_version(position));
+    let vendor = windows.then(|| WINDOWS_VENDOR.to_string());
     // A patch published through a security advisory carries that advisory and what it
     // addresses; another update kind is not published through one.
     let advisory = (classification == Some(SECURITY_CLASSIFICATION)
         && !group.advisory_prefix.is_empty())
         .then(|| advisory_id(group.advisory_prefix, release, position));
+    // "The URL where more information can be obtained about the patch": the article the
+    // vendor publishes this patch as, which is the one the Knowledge Base id names.
+    let content_url = kb_number
+        .as_deref()
+        .map(|kb| format!("{KB_ARTICLE_URL}{}", kb.strip_prefix("KB").unwrap_or(kb)));
     PublishedPatch {
         id,
         kb_number,
         title,
+        description: published_description(
+            classification,
+            product,
+            vendor.as_deref(),
+            release,
+            package.zip(package_version.as_deref()),
+        ),
+        content_url,
+        // No patch of this catalogue is published through a numbered bulletin, so none is
+        // related to one to name.
+        msrc_number: None,
         release_date: release.at,
-        vendor: windows.then(|| WINDOWS_VENDOR.to_string()),
+        vendor,
         product_family: (!group.product_family.is_empty())
             .then(|| group.product_family.to_string()),
         product: product.to_string(),
         classification: classification.map(str::to_string),
-        msrc_severity: rotated(group.msrc_severities, position).map(str::to_string),
-        severity: rotated(group.severities, ordinal + 3 * release.month_ordinal)
-            .map(str::to_string),
+        msrc_severity: rotated(group.msrc_severities, severity_position).map(str::to_string),
+        severity: rotated(group.severities, severity_position).map(str::to_string),
         priority: rotated(group.priorities, position).map(str::to_string),
         language: windows.then(|| LANGUAGE_NEUTRAL.to_string()),
         patch_set: group.patch_set,
         name: package.map(str::to_string),
-        version: package.map(|_| package_version(position)),
+        version: package_version,
         release: package
             .filter(|_| !group.release_tag.is_empty())
             .map(|_| package_release(group.release_tag, release)),
@@ -767,6 +836,39 @@ fn published_patch(
         bugzilla_ids: advisory.iter().map(|_| bug_id(position)).collect(),
         advisory_ids: advisory.into_iter().collect(),
     }
+}
+
+/// The description of one published patch: "the description of the patch"
+/// (`Patch$Description`) — what kind of update it is, who publishes it, the product it
+/// applies to, the release it belongs to and, where the patch is a package update, the
+/// package version it moves that package to.
+///
+/// Stated from the patch's own published metadata, so the catalogue describes no patch by
+/// anything it does not itself publish.
+fn published_description(
+    classification: Option<&str>,
+    product: &str,
+    vendor: Option<&str>,
+    release: &MonthlyRelease,
+    package: Option<(&str, &str)>,
+) -> String {
+    let kind = classification.unwrap_or(UNCLASSIFIED_UPDATE);
+    let mut description = match vendor {
+        Some(vendor) => format!("{kind} published by {vendor} for {product}"),
+        None => format!("{kind} published for {product}"),
+    };
+    let _ = write!(
+        description,
+        " in the {}-{:02} release.",
+        release.year, release.month
+    );
+    if let Some((package, version)) = package {
+        let _ = write!(
+            description,
+            " Updates the {package} package to version {version}."
+        );
+    }
+    description
 }
 
 /// The version of a published package: "the version number of the patch. For example, in

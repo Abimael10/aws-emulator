@@ -454,12 +454,23 @@ pub const PUBLISHED_PATCH_METADATA: &[PublishedPatchGroup] = &[
         "UBUNTU",
         &["Ubuntu18.04", "Ubuntu20.04", "Ubuntu22.04", "Ubuntu24.04"],
     ),
+    // One product per Windows release the vendor publishes updates for, spelled the way the
+    // patch docs spell a Windows product (`Patch$Product`: "For example,
+    // `WindowsServer2016`"; `DescribeAvailablePatches$Filters`: `PRODUCT` sample value
+    // `WindowsServer2012`) — the client releases from Windows 7 on and the server releases
+    // from Windows Server 2008 on, so a read naming any release the vendor publishes for is
+    // served that product's patches instead of nothing.
     windows(
         PATCH_SET_OS,
         "Windows",
         &[
             "Windows10",
             "Windows11",
+            "Windows7",
+            "Windows8",
+            "Windows8.1",
+            "WindowsServer2008",
+            "WindowsServer2008R2",
             "WindowsServer2012",
             "WindowsServer2012R2",
             "WindowsServer2016",
@@ -473,10 +484,19 @@ pub const PUBLISHED_PATCH_METADATA: &[PublishedPatchGroup] = &[
         "Exchange",
         &["Exchange Server 2016", "Exchange Server 2019"],
     ),
+    // The Office releases the same docs name, among them the one the `PRODUCT` sample values
+    // publish (`DescribeAvailablePatches$Filters`: `WindowsServer2012 | Office 2010 |
+    // MicrosoftDefenderAntivirus`).
     windows(
         PATCH_SET_APPLICATION,
         "Office",
-        &["Office 2013", "Office 2016", "Office 2019", "Office 2021"],
+        &[
+            "Office 2010",
+            "Office 2013",
+            "Office 2016",
+            "Office 2019",
+            "Office 2021",
+        ],
     ),
     windows(
         PATCH_SET_APPLICATION,
