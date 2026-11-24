@@ -2847,7 +2847,13 @@ impl ComAmazonawsCloudformationCloudformationState {
             .find(|deployed| deployed.resource.logical_id == result.logical_id)
         {
             deployed.drift_status = result.status.clone();
-            deployed.drift_checked_at = Some(checked_at);
+            // "NOT_CHECKED: CloudFormation has not checked if the resource differs from its
+            // expected configuration" — no comparison was carried out over this resource, so
+            // there is no instant one was, whatever the detection did for the rest of the
+            // stack: `LastCheckTimestamp` is "when CloudFormation last checked if the
+            // resource had drifted".
+            deployed.drift_checked_at =
+                (result.status != resource_drift_status::NOT_CHECKED).then_some(checked_at);
             deployed.drift_detail = result.detail.clone();
         }
     }

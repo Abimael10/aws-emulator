@@ -91,10 +91,17 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 ///
 /// An Amazon Bedrock knowledge base is such a type: a drift check of one is refused,
 /// naming the type, while the `AWS::IAM::Role` of the same stack is checked and reported
-/// (recorded). A type of this emulator that no provisioner owns, or whose owning service
-/// does not serve the read, is already NOT_CHECKED without being named here — nothing was
-/// read for it either way.
-const DRIFT_DETECTION_UNSUPPORTED_TYPES: &[&str] = &[super::template::BEDROCK_KNOWLEDGE_BASE];
+/// (recorded). So is an AWS Lambda EVENT SOURCE MAPPING — the only Lambda type outside that
+/// published support, while the function, its versions, aliases, permissions, layer versions
+/// and event-invoke configurations this emulator also provisions are all inside it — so a
+/// stack's queue-worker wiring is left out of every drift read however completely AWS Lambda
+/// reports the mapping back (recorded). A type of this emulator that no provisioner owns, or
+/// whose owning service does not serve the read, is already NOT_CHECKED without being named
+/// here — nothing was read for it either way.
+const DRIFT_DETECTION_UNSUPPORTED_TYPES: &[&str] = &[
+    super::template::BEDROCK_KNOWLEDGE_BASE,
+    super::provisioning::lambda_event_source_mapping::LAMBDA_EVENT_SOURCE_MAPPING,
+];
 
 /// Whether drift detection is supported for `resource_type`
 /// ([`DRIFT_DETECTION_UNSUPPORTED_TYPES`]).
