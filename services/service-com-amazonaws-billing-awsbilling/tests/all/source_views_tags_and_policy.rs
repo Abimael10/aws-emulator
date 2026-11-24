@@ -18,8 +18,10 @@
 //! * `TagResource`/`ListTagsForResource` read and write the view's tag set, refusing
 //!   a managed view with 400 `ValidationException` and an unknown ARN with 404
 //!   `ResourceNotFoundException`.
-//! * `GetResourcePolicy` reports the policy document stored on a CUSTOM view and
-//!   answers 404 `ResourceNotFoundException` when there is none.
+//! * `GetResourcePolicy` answers 404 `ResourceNotFoundException` for a view no
+//!   share has attached a policy to; the document a SHARED view carries, and the
+//!   path by which it comes into existence, are
+//!   `tests/all/shared_view_resource_policy.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -861,15 +863,15 @@ async fn tagging_refuses_a_managed_view_and_an_unknown_resource() {
 }
 
 #[tokio::test]
-async fn get_resource_policy_reports_a_stored_policy_and_404s_without_one() {
-    let (router, engine) = emulator_with_engine();
+async fn get_resource_policy_404s_for_a_view_no_share_has_attached_a_policy_to() {
+    let router = emulator();
     let unshared = create_view(&router, "unshared", &[PRIMARY_ARN.to_string()]).await;
 
-    // No policy document is stored: the modeled 404, for a managed view that
-    // resolves through GetBillingView just as much as for an absent ARN.
+    // Nothing has attached a policy document: the modeled 404, for a managed view
+    // that resolves through GetBillingView just as much as for an absent ARN.
     for (case, arn) in [
         ("the managed PRIMARY view", PRIMARY_ARN.to_string()),
-        ("a custom view carrying no policy", unshared.clone()),
+        ("a custom view no share shares", unshared.clone()),
         ("an absent billing view", ABSENT_ARN.to_string()),
         (
             "an absent non-billingview resource",
@@ -895,54 +897,9 @@ async fn get_resource_policy_reports_a_stored_policy_and_404s_without_one() {
         "GetBillingView must still resolve the managed view, got {status}"
     );
 
-    // A CUSTOM view that does carry a policy document reports exactly the stored
-    // text. This service models no operation that attaches one (there is no
-    // PutResourcePolicy), so the store is written directly, the way a sharing
-    // mechanism outside this API would.
-    let documents = [
-        ("a minimal document", r#"{"Version":"2012-10-17","Statement":[]}"#),
-        (
-            "a statement naming a principal",
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"000000000000"},"Action":"billing:GetBillingView","Resource":"*"}]}"#,
-        ),
-        ("a document with newlines", "{\n  \"Version\": \"2012-10-17\"\n}"),
-    ];
-    for (case, document) in documents {
-        let target = create_view(&router, "shared", &[PRIMARY_ARN.to_string()]).await;
-        {
-            let state = service_com_amazonaws_billing_awsbilling::state::service_state(&*engine)
-                .expect("the billing state is reachable from the shared engine");
-            let mut state = state.lock();
-            state
-                .billing_views
-                .get_mut(&target)
-                .expect("the view just created is stored")
-                .resource_policy = Some(document.to_string());
-        }
-
-        let (status, body) = call(
-            &router,
-            "GetResourcePolicy",
-            &json!({ "resourceArn": target }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200, got {status} {body:?}"
-        );
-        assert_eq!(
-            body["resourceArn"].as_str(),
-            Some(target.as_str()),
-            "case {case:?}: the response must echo the resource it answered for, got {:?}",
-            body["resourceArn"]
-        );
-        assert_eq!(
-            body["policy"].as_str(),
-            Some(document),
-            "case {case:?}: expected the stored policy document, got {:?}",
-            body["policy"]
-        );
-    }
+    // The other half of the rule — a view a resource share DOES share reports the
+    // document that share attached to it — is asserted over the wire path that
+    // attaches one, in `tests/all/shared_view_resource_policy.rs`.
 }
 
 #[tokio::test]

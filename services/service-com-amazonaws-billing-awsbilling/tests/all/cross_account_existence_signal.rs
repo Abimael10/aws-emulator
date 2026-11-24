@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use service_com_amazonaws_billing_awsbilling::state::BILLING_VIEW_TYPE_CUSTOM;
 use service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState;
+use service_com_amazonaws_ram_amazonresourcesharing::state as resource_sharing;
 
 use crate::arn_account_boundary::{
     BodyOf, BILLING_VIEW_ARN_OPERATIONS, FOREIGN_BILLING_VIEW_ARNS, FOREIGN_RESOURCE_TYPE_ARNS,
@@ -42,9 +43,14 @@ use crate::billing_views::{
 use crate::rejection_fidelity::message;
 
 /// A marker string planted in every field of a planted record that an answer
-/// could possibly carry (its name, description, tag, source view and resource
-/// policy), so an answer built from the store is recognisable as one.
+/// could possibly carry (its name, description, tag and source view), so an
+/// answer built from the store is recognisable as one.
 const PLANTED_MARKER: &str = "planted-record-content";
+
+/// The principal, in another account, the planted shares share a view with: an
+/// identity outside the owner's organization, which is the one a resource-based
+/// policy has to grant.
+const FOREIGN_PRINCIPAL: &str = "arn:aws:iam::444455556666:root";
 
 /// One row of the foreign-ARN table: the case, the ARN, and whether the ARN is in
 /// the `billingview/` form the `BillingViewArn` operations take (the tagging and
@@ -73,8 +79,39 @@ fn plant_record(engine: &Arc<engine::InMemoryEngine>, arn: &str, source_views: V
             format!("{PLANTED_MARKER}-key"),
             format!("{PLANTED_MARKER}-value"),
         )]);
-        view.resource_policy = Some(format!("{{\"Statement\":\"{PLANTED_MARKER}-policy\"}}"));
     });
+}
+
+/// Share the billing view `arn` the way the account shares one — a live resource
+/// share of this account, holding that view and an identity outside the owner's
+/// organization — so a resource-based policy IS attached to the ARN.
+///
+/// That document is the only thing `GetResourcePolicy` could report for the ARN,
+/// so a store that holds one is what makes "the boundary was decided first"
+/// distinguishable from "the policy lookup missed".
+fn plant_share(engine: &Arc<engine::InMemoryEngine>, arn: &str) {
+    let shares = resource_sharing::service_state(&**engine)
+        .expect("the resource sharing state is reachable from the shared engine");
+    let mut shares = shares.lock();
+    let now = shares.tick();
+    let share = resource_sharing::ShareRecord {
+        arn: shares.fresh_share_arn("us-east-1"),
+        name: format!("{PLANTED_MARKER}-share"),
+        owning_account_id: ACCOUNT_ID.to_string(),
+        allow_external_principals: true,
+        status: resource_sharing::SHARE_STATUS_ACTIVE.to_string(),
+        creation_time: now,
+        last_updated_time: now,
+        ..Default::default()
+    };
+    shares.insert_share(share.clone());
+    shares.associate(&share, resource_sharing::ASSOCIATION_TYPE_RESOURCE, arn, now);
+    shares.associate(
+        &share,
+        resource_sharing::ASSOCIATION_TYPE_PRINCIPAL,
+        FOREIGN_PRINCIPAL,
+        now,
+    );
 }
 
 /// The ARNs outside the caller's account the rule is asserted over: the two
@@ -121,6 +158,7 @@ async fn a_foreign_account_arn_answers_the_same_whether_or_not_the_store_holds_i
                 "arn:aws:billing::111122223333:billingview/{PLANTED_MARKER}-source"
             )],
         );
+        plant_share(&seeded_engine, arn);
     }
 
     for row in &rows {
@@ -178,16 +216,26 @@ async fn a_foreign_account_arn_answers_the_same_whether_or_not_the_store_holds_i
                 stored.name.as_str(),
                 stored.source_views.len(),
                 stored.tags.len(),
-                stored.resource_policy.is_some(),
             ),
-            (
-                format!("{PLANTED_MARKER}-name").as_str(),
-                1,
-                1,
-                true
-            ),
+            (format!("{PLANTED_MARKER}-name").as_str(), 1, 1),
             "case {case:?}: a refused cross-account call changes nothing it refused, got \
              {stored:?}"
+        );
+    }
+    drop(state);
+
+    // The policy attached to each of those ARNs is still attached: a refused
+    // cross-account call neither reported it nor took it away.
+    let shares = resource_sharing::service_state(&*seeded_engine)
+        .expect("the resource sharing state is reachable from the shared engine");
+    let shares = shares.lock();
+    for (case, arn, _) in &rows {
+        assert!(
+            shares.resource_policies(arn, None).is_some_and(|documents| {
+                documents.iter().any(|document| document.contains(arn))
+            }),
+            "case {case:?}: the planted share of {arn} must still attach a policy to it, got {:?}",
+            shares.resource_policies(arn, None)
         );
     }
 }

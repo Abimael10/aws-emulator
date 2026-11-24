@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! Reports the resource-based policy document stored for the addressed billing
+//! Reports the resource-based policy document attached to the addressed billing
 //! view.
+//!
+//! Nothing in this service's model attaches one: a custom billing view comes to
+//! carry a policy when the account SHARES it, so the document is the one the
+//! account's resource shares of that view instantiate on it
+//! ([`crate::state::attached_resource_policy`]) rather than a field of the
+//! stored view.
 //!
 //! Only a CUSTOM billing view can carry one — a managed view's sharing is the
 //! service's own — so an ARN that names no stored view, names a managed one, or
-//! names a view with no policy document is a `ResourceNotFoundException` (404),
-//! even where `GetBillingView` resolves the same ARN.
+//! names a view no share has attached a policy to is a
+//! `ResourceNotFoundException` (404), even where `GetBillingView` resolves the
+//! same ARN.
 //!
 //! The caller-account boundary is decided before that lookup, as it is for every
 //! operation that identifies a billing view by ARN: an ARN whose embedded account
@@ -158,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The modeled `resourceArn` pattern is refused by the boundary validator
         // before this runs; what is left to decide is whether a policy document
-        // is stored for it.
+        // is attached to it.
         // The account boundary comes first, as it does for every operation that
         // identifies a billing view by ARN: a well-formed ARN outside the
         // caller's own account is refused before the store is consulted, so the
@@ -179,17 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the billing view store is unavailable".to_string(),
             })
         })?;
-        let state = state.lock();
+        // Whether this ARN names a view whose policy is the customer's at all is
+        // this store's answer; the document itself is not held here, so the
+        // store's lock is released before the shares that produce it are read.
+        let addresses_custom_view = state
+            .lock()
+            .billing_views
+            .get(&input.resource_arn)
+            .is_some_and(|view| !view.is_managed());
 
         // One refusal for all three cases, because a caller is told the same
         // thing by each: there is no custom billing view carrying a policy at
         // this ARN. Whether the view exists at all is not disclosed here —
         // `GetBillingView` is the read that answers that.
-        let policy = state
-            .billing_views
-            .get(&input.resource_arn)
-            .filter(|view| !view.is_managed())
-            .and_then(|view| view.resource_policy.clone())
+        let policy = addresses_custom_view
+            .then(|| crate::state::attached_resource_policy(&*self.engine, &input.resource_arn))
+            .flatten()
             .ok_or_else(|| {
                 GetResourcePolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

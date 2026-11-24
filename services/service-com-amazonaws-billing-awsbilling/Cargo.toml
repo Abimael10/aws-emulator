@@ -17,6 +17,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # organization out of that service's store rather than keeping a copy here
 # (src/state.rs).
 service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
+# A custom billing view comes to carry a resource-based policy when the account
+# SHARES it, which is AWS Resource Access Manager's action and not an operation this
+# service's model declares — so `GetResourcePolicy` derives the document from that
+# service's store (src/state/resource_policy.rs).
+service-com-amazonaws-ram-amazonresourcesharing = { workspace = true }
 # The opaque `nextToken` every paginated read hands out is AUTHENTICATED under a
 # per-store secret, so a cut point a caller assembled is refused rather than
 # honoured: the workspace's one page-token key (src/state.rs).

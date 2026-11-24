@@ -350,9 +350,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // empty reason list: see `BillingView::health_status_reasons`.
             health_status_reasons: Vec::new(),
             tags,
-            // No operation in this service's model attaches a resource-based
-            // policy, so a new view carries none: see `BillingView::resource_policy`.
-            resource_policy: None,
         };
         state.billing_views.insert(arn.clone(), view);
         if let Some(token) = client_token {

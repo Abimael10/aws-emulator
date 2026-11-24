@@ -96,6 +96,12 @@ mod tagging;
 
 pub use tagging::*;
 
+/// The resource-based policy document a shared billing view carries, which
+/// `GetResourcePolicy` reports.
+mod resource_policy;
+
+pub use resource_policy::*;
+
 /// When each account of the billing family was linked and subscribed to
 /// Enterprise Support, which `ListEnterpriseSupportLinkedAccountCharges`
 /// prorates an account's spend by.
@@ -436,7 +442,10 @@ pub struct PreferenceEntry {
 /// the first is `source_views.len()`, the second is the number of views whose
 /// `source_views` name this one, and the third is the account the view's own
 /// sources belong to ([`BillingView::source_account_id`]) — all three derived on
-/// read so none of them can go stale.
+/// read so none of them can go stale. Neither is the resource-based policy
+/// `GetResourcePolicy` reports: the account attaches one by SHARING the view,
+/// which is resource sharing's action, so the document is derived from the
+/// shares that produce it ([`attached_resource_policy`]).
 #[derive(Debug, Clone)]
 pub struct BillingView {
     /// The ARN this view is keyed by, minted by [`ComAmazonawsBillingAwsbillingState::mint_view_arn`].
@@ -465,16 +474,6 @@ pub struct BillingView {
     pub health_status_reasons: Vec<String>,
     /// The view's resource tags, by key.
     pub tags: BTreeMap<String, String>,
-    /// The resource-based policy document attached to this view, as
-    /// `GetResourcePolicy` reports it.
-    ///
-    /// `None` for every view this emulator creates: only a CUSTOM billing view
-    /// can carry one, and this service's model declares no operation that
-    /// attaches a policy (there is no `PutResourcePolicy` — on AWS the document
-    /// appears when the view is shared), so nothing in the API writes it.
-    /// `GetResourcePolicy` reports the stored document when a view carries one
-    /// and answers `ResourceNotFoundException` when it does not.
-    pub resource_policy: Option<String>,
 }
 
 impl BillingView {
@@ -816,7 +815,6 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             health_status_code: BILLING_VIEW_STATUS_HEALTHY.to_string(),
             health_status_reasons: Vec::new(),
             tags: BTreeMap::new(),
-            resource_policy: None,
         };
         // The default view's domain is the account's own final charges: the
         // account belongs to no organization (see

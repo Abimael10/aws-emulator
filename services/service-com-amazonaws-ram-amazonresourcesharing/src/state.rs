@@ -417,10 +417,21 @@ pub struct ResourceTypeEntry {
 /// permissions that documentation records for each — the Amazon EC2, Amazon VPC,
 /// Amazon API Gateway and Amazon Web Services Private CA resources there are shared
 /// only through the permissions Amazon Web Services manages for them.
+///
+/// A custom billing view is one of the types: the Billing service declares no
+/// operation that attaches a resource-based policy to a view, and the document its
+/// `GetResourcePolicy` reports is the one a share of the view instantiates on it
+/// ([`ComAmazonawsRamAmazonresourcesharingState::resource_policies`]). Its entry
+/// records support for a customer managed permission, as every type this service
+/// publishes without the one documented exception above does \u2014 a custom billing
+/// view is not one of the Amazon EC2, Amazon VPC, Amazon API Gateway or Amazon Web
+/// Services Private CA resources that are shared only through the permissions
+/// Amazon Web Services manages.
 pub const RESOURCE_TYPES: &[ResourceTypeEntry] = &[
     resource_type_entry("acm-pca:CertificateAuthority", false),
     resource_type_entry("apigateway:Domainnames", false),
     resource_type_entry("appmesh:Mesh", true),
+    resource_type_entry("billing:BillingView", true),
     resource_type_entry("cloudtrail:EventDataStore", true),
     resource_type_entry("codebuild:Project", true),
     resource_type_entry("codebuild:ReportGroup", true),
@@ -498,11 +509,14 @@ const fn resource_type_entry(
 /// test [`resource_region_scope`] applies to a resource ARN. Source: the ARN format each
 /// owning service documents for the type. The entries below are the catalog's types
 /// whose ARN leaves the Region field empty — a global network and a core network
-/// (`arn:<partition>:networkmanager::<account>:core-network/<id>`), and an IP Address
+/// (`arn:<partition>:networkmanager::<account>:core-network/<id>`), an IP Address
 /// Manager, one of its pools and one of its resource discoveries
-/// (`arn:<partition>:ec2::<account>:ipam/<id>`); every other type in the catalog names
-/// its resources inside one Region.
+/// (`arn:<partition>:ec2::<account>:ipam/<id>`), and a billing view
+/// (`arn:<partition>:billing::<account>:billingview/<id>`, the form the Billing
+/// model's own `BillingViewArn` pattern declares); every other type in the catalog
+/// names its resources inside one Region.
 const GLOBAL_SCOPE_RESOURCE_TYPES: &[&str] = &[
+    "billing:BillingView",
     "ec2:Ipam",
     "ec2:IpamPool",
     "ec2:IpamResourceDiscovery",
