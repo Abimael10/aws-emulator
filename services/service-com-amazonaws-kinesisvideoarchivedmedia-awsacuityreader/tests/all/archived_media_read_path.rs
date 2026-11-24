@@ -10,11 +10,17 @@
 //! The archive is SEEDED through the service's own state API (this service has
 //! no create operation: streams and fragments are ingested through the Kinesis
 //! Video Streams control/data plane), and every assertion below is about what
-//! the handlers compute FROM that archive.
+//! the handlers compute FROM that archive. A seeded stream is REGISTERED in the
+//! Kinesis Video Streams registry under the same identity ([`register_stream`]),
+//! because that registry is where a stream exists: a read resolves it there and
+//! then serves the archive that record's own ARN is held under, exactly as an
+//! ingest writes it.
 
 use bytes::Bytes;
+use service_com_amazonaws_kinesisvideo_kinesisvideo_20170930 as control_plane;
 use service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader as archived_media;
 use smithy_server_runtime::MultiServiceRouter;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -540,6 +546,47 @@ fn content_type(response: &http::Response<Bytes>) -> String {
         .to_string()
 }
 
+/// Register `archived` in the Kinesis Video Streams registry, under the very
+/// identity its archive is held with, the way `CreateStream` plus the ingest
+/// plane leave the two stores.
+///
+/// A stream EXISTS in that registry, so an archived-media read resolves it there
+/// and serves the archive the resolved record's own `StreamARN` is held under —
+/// which is what an ingest writes, since the archive it creates carries the ARN
+/// the registry holds. Seeding an archive alone would therefore leave a stream no
+/// read resolves, so every seeded stream is registered here too, `ACTIVE` with
+/// nothing the clock owes it.
+pub(crate) fn register_stream(engine: &engine::InMemoryEngine, archived: &ArchivedStream) {
+    let registry = control_plane::state::service_state(engine).expect("the control-plane store");
+    let mut registry = registry.lock();
+    let version = registry.mint_version();
+    registry
+        .stream_arn_index
+        .insert(archived.arn.clone(), archived.name.clone());
+    registry.streams.insert(
+        archived.name.clone(),
+        control_plane::state::Stream {
+            stream_name: archived.name.clone(),
+            stream_arn: archived.arn.clone(),
+            device_name: None,
+            media_type: Some(archived.media_type.clone()),
+            kms_key_id: control_plane::state::default_kms_key_id(REGION),
+            version,
+            status: control_plane::state::STATUS_ACTIVE.to_string(),
+            creation_time_millis: control_plane::state::now_millis(),
+            data_retention_in_hours: i32::try_from(archived.data_retention_in_hours)
+                .unwrap_or(i32::MAX),
+            tags: BTreeMap::new(),
+            default_storage_tier: None,
+            activates_at: None,
+            deletes_at: None,
+            notification_configuration: None,
+            image_generation_configuration: None,
+            edge: None,
+        },
+    );
+}
+
 /// A router serving this service alone over an engine seeded with three
 /// streams: an archive in the past, one with no retention, and one ingested
 /// just now.
@@ -550,14 +597,14 @@ pub(crate) fn seeded() -> Harness {
         let mut state = state.lock();
 
         let created_at = from_epoch_millis(T0_SECS * 1000);
-        state.put_stream(ArchivedStream::new(STREAM, REGION, created_at, 24));
-        state.put_stream(ArchivedStream::new(
-            NO_RETENTION_STREAM,
-            REGION,
-            created_at,
-            0,
-        ));
-        state.put_stream(ArchivedStream::new(LIVE_STREAM, REGION, created_at, 24));
+        for archived in [
+            ArchivedStream::new(STREAM, REGION, created_at, 24),
+            ArchivedStream::new(NO_RETENTION_STREAM, REGION, created_at, 0),
+            ArchivedStream::new(LIVE_STREAM, REGION, created_at, 24),
+        ] {
+            register_stream(&engine, &archived);
+            state.put_stream(archived);
+        }
 
         // Appended out of ingestion order on purpose: the archive is kept in
         // ascending fragment-number order by the state API, not by the caller.
@@ -1229,12 +1276,10 @@ async fn get_clip_truncates_at_the_documented_fragment_ceiling() {
     {
         let state = service_state(&*harness.engine).expect("the service store");
         let mut state = state.lock();
-        state.put_stream(ArchivedStream::new(
-            DEEP_STREAM,
-            REGION,
-            from_epoch_millis(T0_SECS * 1000),
-            24,
-        ));
+        let archived =
+            ArchivedStream::new(DEEP_STREAM, REGION, from_epoch_millis(T0_SECS * 1000), 24);
+        register_stream(&harness.engine, &archived);
+        state.put_stream(archived);
         for index in 0..held {
             let at = from_epoch_millis((T0_SECS + index as i64) * 1000);
             assert!(
@@ -1878,12 +1923,9 @@ fn seeded_clip_request(
     {
         let state = service_state(&*harness.engine).expect("the service store");
         let mut state = state.lock();
-        state.put_stream(ArchivedStream::new(
-            stream,
-            REGION,
-            from_epoch_millis(T0_SECS * 1000),
-            24,
-        ));
+        let archived = ArchivedStream::new(stream, REGION, from_epoch_millis(T0_SECS * 1000), 24);
+        register_stream(&harness.engine, &archived);
+        state.put_stream(archived);
         for (index, media) in fragments.iter().enumerate() {
             let at = from_epoch_millis((T0_SECS + 10 * index as i64) * 1000);
             assert!(

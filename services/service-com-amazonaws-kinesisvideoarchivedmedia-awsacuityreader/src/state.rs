@@ -10,13 +10,15 @@
 //! (`CreateStream` creates it, `UpdateDataRetention` changes its retention,
 //! `DeleteStream` removes it), so a read resolves the stream it addresses in
 //! that service's registry in the shared engine — not in a second copy of it
-//! held here. The FRAGMENTS of a resolved stream are this service's own
-//! archive, populated through
+//! held here, and not in this store, which holds no stream of its own: an
+//! identifier that registry does not hold ACTIVE is a missing resource whatever
+//! this archive holds for it. The FRAGMENTS of a resolved stream are this
+//! service's own archive, populated through
 //! [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::put_stream`] /
 //! [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::append_fragment`],
 //! which an ingest path (or a seed/test harness) calls on the one shared engine
-//! store; a registered stream nothing has been ingested into simply has an
-//! empty archive.
+//! store under the ARN the registry holds that stream with; a registered stream
+//! nothing has been ingested into simply has an empty archive.
 //!
 //! The query helpers (stream resolution, timestamp-range filtering, pagination
 //! cursors) live here beside the data they read, so every operation resolves a
@@ -362,8 +364,9 @@ pub fn fragments_in_range(
 /// read through [`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::resolve_stream`]
 /// on every call, so a retention change the control plane accepted is observed
 /// by the very next read rather than by a copy taken earlier. Its FRAGMENTS are
-/// this service's archive for that stream, which is empty for a stream nothing
-/// has been ingested into.
+/// this service's archive for THAT stream record, which is empty for a stream
+/// nothing has been ingested into — including a stream created again under a
+/// name whose previous incarnation left an archive behind.
 #[derive(Debug)]
 pub struct ResolvedStream<'a> {
     /// The stream's `StreamName`.
@@ -744,8 +747,11 @@ pub const MAX_STREAMING_SESSIONS: usize = 1024;
 pub struct ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     /// Every stream's archive, keyed by stream name.
     pub streams: HashMap<String, ArchivedStream>,
-    /// `StreamARN` -> stream name, so an ARN and a name resolve to the same
-    /// [`ArchivedStream`] rather than to two copies of one stream.
+    /// `StreamARN` -> stream name: the IDENTITY index an archive is found
+    /// through. An archive belongs to the one stream record it was ingested for,
+    /// and a stream's creation instant is part of its ARN, so looking an archive
+    /// up by the ARN the control plane holds a stream with is what keeps a read
+    /// off an archive a previous incarnation of that name left behind.
     pub arn_index: HashMap<String, String>,
     /// Every minted streaming session, keyed by its session token.
     pub sessions: HashMap<String, StreamingSession>,
@@ -825,16 +831,28 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     ///
     /// A stream EXISTS because the Kinesis Video Streams control plane created
     /// it, so the identifier is resolved in that service's registry in the
-    /// shared engine first, and its record is what the stream's ARN and current
-    /// retention are read from — re-read here on every call, so a retention
-    /// change is visible to the next read. A registered stream is READ only
-    /// while its record is in the one status that serves reads, `ACTIVE`: a
-    /// record the registry still holds in a non-terminal status — created and
-    /// not yet active, or marked for deletion — is as unreadable as one the
-    /// registry does not hold at all, and is reported with the same
-    /// [`STREAM_NOT_FOUND_MESSAGE`] ("not found or not active"). An identifier
-    /// neither that registry nor this service's own archive answers to is a
-    /// missing resource too.
+    /// shared engine — the ONE place a stream's existence is held — and its
+    /// record is what the stream's ARN and current retention are read from,
+    /// re-read here on every call so a retention change is visible to the next
+    /// read. A registered stream is READ only while its record is in the one
+    /// status that serves reads, `ACTIVE`: a record the registry still holds in
+    /// a non-terminal status — created and not yet active, or marked for
+    /// deletion — is as unreadable as one the registry no longer holds at all,
+    /// and an identifier the registry does not hold is a missing resource
+    /// however much media this service's archive still holds for it. All of
+    /// them are reported with the same [`STREAM_NOT_FOUND_MESSAGE`] ("not found
+    /// or not active").
+    ///
+    /// This service's archive is not a registration of its own: it is the media
+    /// an ingest wrote for ONE stream record, held under the ARN that record
+    /// was registered with — a stream's creation instant is part of its ARN, so
+    /// the ARN names the incarnation the media was ingested into
+    /// ([`Self::put_stream`]). A read therefore attaches the archive the
+    /// RESOLVED record's own ARN is indexed under, and the archive of a stream
+    /// the registry has removed is served to nobody: not under the identifier it
+    /// was ingested with, and not as the archive of a later stream created with
+    /// the same name, which is a different stream with a new ARN and an empty
+    /// archive until something is ingested into it.
     ///
     /// `addressed_endpoint` is the emulator address the request reached, when it
     /// reached one this emulator serves
@@ -873,53 +891,45 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             .and_then(|address| control_plane::published_endpoint_stream(engine, address));
         let serves = |arn: &str| announced_for.as_deref().is_none_or(|served| served == arn);
 
-        // The stream as the control plane holds it right now, with this
-        // service's archive for it — which is empty for a registered stream
-        // nothing has been ingested into, and that emptiness is what the
-        // per-operation no-fragments behaviour is computed from.
-        if let Some(registered) = registered_stream(engine, stream_name, stream_arn) {
-            // A record the registry holds in a status that does not serve reads
-            // is not a readable stream: the archived-media plane refuses it as
-            // the missing resource it is, rather than reporting the archive of
-            // a stream that is not there yet or is on its way out.
-            if !registered.readable() || !serves(&registered.arn) {
-                return Err(StreamLookupError::NotFound(
-                    STREAM_NOT_FOUND_MESSAGE.to_string(),
-                ));
-            }
-            let archive = self.streams.get(&registered.name);
-            return Ok(ResolvedStream {
-                name: registered.name,
-                arn: registered.arn,
-                data_retention_in_hours: registered.data_retention_in_hours,
-                archive_content_type: archive.map_or_else(
-                    || ARCHIVE_CONTENT_TYPE.to_string(),
-                    |held| held.archive_content_type.clone(),
-                ),
-                fragments: archive.map_or(&[][..], |held| held.fragments.as_slice()),
-            });
-        }
-
-        // No control-plane record: the archive's own entry is the registration
-        // of a stream whose fragments were ingested into this store directly,
-        // so it answers for itself rather than being reported absent.
-        let archive = match (stream_name, stream_arn) {
-            (Some(name), _) => self.streams.get(name),
-            (_, Some(arn)) => self.arn_index.get(arn).and_then(|name| self.streams.get(name)),
-            (None, None) => None,
-        };
-        match archive {
-            Some(held) if serves(&held.arn) => Ok(ResolvedStream {
-                name: held.name.clone(),
-                arn: held.arn.clone(),
-                data_retention_in_hours: i64::from(held.data_retention_in_hours),
-                archive_content_type: held.archive_content_type.clone(),
-                fragments: held.fragments.as_slice(),
-            }),
-            _ => Err(StreamLookupError::NotFound(
+        // The stream as the control plane holds it right now. An identifier that
+        // registry does not hold names no stream at all: this store holds the
+        // ARCHIVE of a stream, never a stream, so there is nothing here for a
+        // read to fall back on.
+        let Some(registered) = registered_stream(engine, stream_name, stream_arn) else {
+            return Err(StreamLookupError::NotFound(
                 STREAM_NOT_FOUND_MESSAGE.to_string(),
-            )),
+            ));
+        };
+        // A record the registry holds in a status that does not serve reads
+        // is not a readable stream: the archived-media plane refuses it as
+        // the missing resource it is, rather than reporting the archive of
+        // a stream that is not there yet or is on its way out.
+        if !registered.readable() || !serves(&registered.arn) {
+            return Err(StreamLookupError::NotFound(
+                STREAM_NOT_FOUND_MESSAGE.to_string(),
+            ));
         }
+        // THIS record's archive: the entry held under the resolved ARN, the
+        // identity an archive is written and indexed under ([`Self::put_stream`]).
+        // `None` — an empty archive, which is what the per-operation
+        // no-fragments behaviour is computed from — both for a registered stream
+        // nothing has been ingested into and for one whose name an earlier,
+        // removed stream left an archive under: that archive belongs to the ARN
+        // it was ingested for, which is not this stream's.
+        let archive = self
+            .arn_index
+            .get(&registered.arn)
+            .and_then(|name| self.streams.get(name));
+        Ok(ResolvedStream {
+            name: registered.name,
+            arn: registered.arn,
+            data_retention_in_hours: registered.data_retention_in_hours,
+            archive_content_type: archive.map_or_else(
+                || ARCHIVE_CONTENT_TYPE.to_string(),
+                |held| held.archive_content_type.clone(),
+            ),
+            fragments: archive.map_or(&[][..], |held| held.fragments.as_slice()),
+        })
     }
 
     /// Mint a fresh, unique streaming-session token.

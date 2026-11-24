@@ -8,12 +8,12 @@
 //! The framework validates the request before any handler runs, and this
 //! service words that refusal (`Service::override_refusal`): a constraint
 //! broken by the ELEMENTS of a collection member is stated at the member, with
-//! the element shape's whole modelled constraint set. Resolution — the registry
-//! of the Kinesis Video Streams control plane, then this service's own archive
-//! — happens inside the handler, which such a request never reaches. These
-//! cases pin that order over all three resolution outcomes: a stream the
-//! control plane created, one only this service's archive holds, and one
-//! nothing holds.
+//! the element shape's whole modelled constraint set. Resolution — in the
+//! registry of the Kinesis Video Streams control plane, where a stream exists —
+//! happens inside the handler, which such a request never reaches. These cases
+//! pin that order over all three resolution outcomes: a stream the control
+//! plane created, an archive entry no registry record answers for (which no read
+//! resolves), and an identifier nothing holds.
 //!
 //! The per-operation behaviour over a registered stream's archive is
 //! `control_plane_stream_resolution`'s; the refusal wording itself is
@@ -117,8 +117,10 @@ impl Harness {
         );
     }
 
-    /// Put an empty archive for `name` into the reader's own store, which is
-    /// how a stream the control plane does not hold is still read.
+    /// Put an empty archive for `name` into the reader's own store, with no
+    /// registry record behind it: a stream exists in the control plane's
+    /// registry, so no read resolves this one — and the refusal under test
+    /// answers before any read gets that far.
     fn seed_archive(&self, name: &str) {
         let state = service_state(&*self.engine).expect("the archived-media store");
         state
@@ -138,8 +140,8 @@ fn message(body: &serde_json::Value) -> String {
 
 /// RULE: a modelled constraint the request breaks is refused before the stream
 /// is resolved, so the clause is the same for a stream the control plane holds,
-/// one only this service's archive holds, and one nothing holds — and it is the
-/// element-set clause, never a resolution refusal.
+/// an archive entry no registry record answers for, and an identifier nothing
+/// holds — and it is the element-set clause, never a resolution refusal.
 ///
 /// The rows differ along the two things the rule generalises over: where (if
 /// anywhere) the named stream exists, and which of the element shape's
@@ -163,7 +165,7 @@ async fn a_constraint_refusal_answers_before_the_stream_is_resolved() {
             "",
         ),
         (
-            "a stream only the archive holds, a non-numeric element",
+            "an archive entry no registry record answers for, a non-numeric element",
             "archive-only-stream",
             "0x2a",
         ),

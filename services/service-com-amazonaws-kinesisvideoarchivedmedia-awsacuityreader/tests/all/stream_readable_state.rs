@@ -16,8 +16,12 @@
 //! The tables span what the rule generalises over: the status the registry holds
 //! the record in (all four values of the modelled enum —
 //! `smithy_query(query="shape",shape="Status",model_path="services/service-com-amazonaws-kinesisvideo-kinesisvideo-20170930/smithy-model/com-amazonaws-kinesisvideo-kinesisvideo-20170930.json")`),
-//! how the request addresses its stream (`StreamName`, `StreamARN`) and which
-//! read is made (all six stream-addressed operations of this plane).
+//! how the request addresses its stream (`StreamName`, `StreamARN`), which
+//! read is made (all six stream-addressed operations of this plane) and how much
+//! media this service's archive holds for the stream — which changes nothing: the
+//! archive is the media ingested for ONE stream record, so it answers only
+//! through that record and a stream created again under the same name reads the
+//! empty archive it has.
 //!
 //! Every case drives one router carrying both emulated services over ONE shared
 //! engine, through the same request walk a socket-served request takes, so a
@@ -233,13 +237,20 @@ impl Harness {
     /// Put `count` fragments into `stream`'s archive, 10 seconds apart from
     /// [`T0_SECS`], so a readable stream has media for every read to answer from.
     ///
+    /// The archive is held under `arn`, the ARN the registry holds this stream
+    /// with: an archive belongs to the ONE stream record it was ingested for
+    /// (a stream's creation instant is part of its ARN), which is the identity an
+    /// ingest writes it under and the one a read looks it up by.
+    ///
     /// The media is one archived Matroska fragment of coded H.264 per fragment,
     /// which is what an ingest plane writes — and what the reads that mux it
     /// into a clip need.
-    fn seed_archive(&self, stream: &str, count: u64) {
+    fn seed_archive(&self, stream: &str, arn: &str, count: u64) {
         let state = service_state(&*self.engine).expect("the archived-media store");
         let mut state = state.lock();
-        state.put_stream(ArchivedStream::new(stream, REGION, SystemTime::now(), 24));
+        let mut archived = ArchivedStream::new(stream, REGION, SystemTime::now(), 24);
+        archived.arn = arn.to_string();
+        state.put_stream(archived);
         for index in 0..count {
             let offset = 10 * i64::try_from(index).expect("a small index");
             let at = from_epoch_millis((T0_SECS + offset) * 1000);
@@ -355,7 +366,7 @@ async fn only_an_active_registered_stream_is_read() {
     for (case, status, served) in statuses {
         let name = format!("probe-status-{}", status.to_lowercase());
         let arn = harness.create_stream(&name).await;
-        harness.seed_archive(&name, 3);
+        harness.seed_archive(&name, &arn, 3);
         harness.hold_in_status(&name, status);
 
         for (path, body) in every_read() {
@@ -409,15 +420,19 @@ async fn only_an_active_registered_stream_is_read() {
 /// of THIS call, so a deletion the clock has already made due is observed by the
 /// read itself — no control-plane call has to run in between for the stream to
 /// stop being readable, and a client polling a deleted stream is refused rather
-/// than served for as long as nobody touches the control plane.
+/// than served for as long as nobody touches the control plane. The stream's
+/// archive HOLDS media throughout: a stream exists in the registry, so the
+/// archive of a record that registry no longer holds answers nothing.
 #[tokio::test]
 async fn a_deleted_stream_stops_being_read_once_its_removal_falls_due() {
     let harness = Harness::new();
     let name = "probe-deleted-stream";
     let arn = harness.create_stream(name).await;
+    harness.seed_archive(name, &arn, 3);
 
-    // Readable first, so the refusal below is the delete's effect and not a
-    // stream that was never there.
+    // Readable first, with the media in it, so the refusal below is the delete's
+    // effect and not a stream that was never there or an archive that was always
+    // empty.
     let listed = harness
         .call(
             "/listFragments",
@@ -430,6 +445,11 @@ async fn a_deleted_stream_stops_being_read_once_its_removal_falls_due() {
     assert_eq!(
         listed.status, 200,
         "case before the delete: expected HTTP 200, got {listed:?}"
+    );
+    assert_eq!(
+        listed.body["Fragments"].as_array().map_or(0, Vec::len),
+        3,
+        "case before the delete: expected the seeded fragments, got {listed:?}"
     );
 
     let deleted = harness
@@ -471,4 +491,148 @@ async fn a_deleted_stream_stops_being_read_once_its_removal_falls_due() {
         "case deleted: the reads alone must settle the removal the delete made due, but the \
          registry still holds {name:?}"
     );
+}
+
+/// Wait until the registry no longer holds `name`, which is what `DeleteStream`
+/// makes due.
+///
+/// The removal is materialised by a call that settles the registry's clock, so
+/// the loop makes one — a read, which must refuse for the whole life of the
+/// record — and then looks at the registry.
+///
+/// Waits for the CONDITION, not for a span, under a deadline far longer than the
+/// removal needs.
+async fn await_removal(harness: &Harness, name: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        let reply = harness
+            .call(
+                "/listFragments",
+                with_members(
+                    &every_read()[0].1,
+                    &serde_json::json!({ "StreamName": name }),
+                ),
+            )
+            .await;
+        assert!(
+            reply.is_not_found_or_not_active(),
+            "case remove {name:?}: a deleted stream's read must refuse, got {reply:?}"
+        );
+        if !harness.registry_holds(name) {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+    panic!("case remove {name:?}: the registry still holds the record past the deadline");
+}
+
+/// RULE: an archive belongs to the ONE stream record it was ingested for — a
+/// stream's creation instant is part of its `StreamARN` — so a stream created
+/// again under a name an earlier, removed stream used is a DIFFERENT stream and
+/// reads the empty archive it has, never the previous incarnation's fragments:
+/// `ListFragments` answers an empty page, and the fragment numbers that
+/// incarnation held name no fragment of this one.
+///
+/// The rows differ along how much media the previous incarnation left behind.
+#[tokio::test]
+async fn a_stream_created_again_under_a_used_name_reads_its_own_empty_archive() {
+    let harness = Harness::new();
+
+    // (the case, how many fragments the previous incarnation left in the archive)
+    let rows: [(&str, u64); 3] = [
+        ("one fragment left behind", 1),
+        ("three fragments left behind", 3),
+        ("a whole window left behind", 8),
+    ];
+
+    for (case, left_behind) in rows {
+        let name = format!("probe-recreated-{left_behind}");
+        let first_arn = harness.create_stream(&name).await;
+        harness.seed_archive(&name, &first_arn, left_behind);
+
+        let listing = with_members(
+            &every_read()[0].1,
+            &serde_json::json!({ "StreamName": name.clone() }),
+        );
+        let before = harness.call("/listFragments", listing.clone()).await;
+        assert_eq!(
+            before.body["Fragments"].as_array().map_or(0, Vec::len) as u64,
+            left_behind,
+            "case {case}: the first incarnation must read its own archive, got {before:?}"
+        );
+
+        let deleted = harness
+            .call(
+                "/deleteStream",
+                serde_json::json!({ "StreamARN": first_arn.clone() }),
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case}: the delete expected HTTP 200, got {deleted:?}"
+        );
+        await_removal(&harness, &name).await;
+
+        // The same NAME, a new stream: the control plane mints it a new ARN,
+        // which is what makes it a different resource.
+        let second_arn = harness.create_stream(&name).await;
+        assert_ne!(
+            second_arn, first_arn,
+            "case {case}: a re-created stream must carry a new ARN"
+        );
+
+        for (form, addressing) in [
+            (
+                "StreamName",
+                serde_json::json!({ "StreamName": name.clone() }),
+            ),
+            (
+                "StreamARN",
+                serde_json::json!({ "StreamARN": second_arn.clone() }),
+            ),
+        ] {
+            let listed = harness
+                .call("/listFragments", with_members(&every_read()[0].1, &addressing))
+                .await;
+            assert_eq!(
+                listed.status, 200,
+                "case {case} by {form}: a registered stream with an empty archive is a success, \
+                 got {listed:?}"
+            );
+            let fragments = listed.body["Fragments"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case} by {form}: no Fragments in {listed:?}"));
+            assert!(
+                fragments.is_empty(),
+                "case {case} by {form}: the new stream must read no fragment of the removed one, \
+                 got {fragments:?}"
+            );
+
+            // And the media itself is gone with the stream it was ingested for:
+            // the numbers the previous incarnation held name no fragment here,
+            // which `GetMediaForFragmentList` states as the invalid ones.
+            let held: Vec<String> = (0..left_behind).map(fragment_number).collect();
+            let requested = with_members(
+                &serde_json::json!({ "Fragments": held.clone() }),
+                &addressing,
+            );
+            let fetched = harness.call("/getMediaForFragmentList", requested).await;
+            assert_eq!(
+                fetched.status, 400,
+                "case {case} by {form}: expected HTTP 400 for the removed stream's fragment \
+                 numbers, got {fetched:?}"
+            );
+            assert_eq!(
+                fetched.code(),
+                "InvalidArgumentException",
+                "case {case} by {form}: expected InvalidArgumentException, got {fetched:?}"
+            );
+            let expected = format!("Fragment numbers are invalid : [{}]", held.join(", "));
+            assert_eq!(
+                fetched.message(),
+                expected,
+                "case {case} by {form}: expected {expected:?}, got {fetched:?}"
+            );
+        }
+    }
 }

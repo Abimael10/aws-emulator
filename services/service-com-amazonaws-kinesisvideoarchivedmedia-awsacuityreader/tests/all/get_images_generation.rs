@@ -29,7 +29,7 @@ use service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader as archived_
 
 use archived_media::state::{from_epoch_millis, service_state, ArchivedStream, StoredFragment};
 
-use crate::archived_media_read_path::{body_json, seeded, Harness};
+use crate::archived_media_read_path::{body_json, register_stream, seeded, Harness};
 
 /// The region this suite's streams are created in.
 const REGION: &str = "us-east-1";
@@ -135,21 +135,16 @@ pub(crate) fn harness() -> Harness {
         let state = service_state(&*harness.engine).expect("the service store");
         let mut state = state.lock();
         let created_at = from_epoch_millis(T0_SECS * 1000);
-        state.put_stream(ArchivedStream::new(IMAGES_STREAM, REGION, created_at, 24));
-        state.put_stream(ArchivedStream::new(OPAQUE_STREAM, REGION, created_at, 24));
-        state.put_stream(ArchivedStream::new(EMPTY_STREAM, REGION, created_at, 1));
-        state.put_stream(ArchivedStream::new(
-            TALL_FRAME_STREAM,
-            REGION,
-            created_at,
-            24,
-        ));
-        state.put_stream(ArchivedStream::new(
-            NO_RETENTION_STREAM,
-            REGION,
-            created_at,
-            0,
-        ));
+        for archived in [
+            ArchivedStream::new(IMAGES_STREAM, REGION, created_at, 24),
+            ArchivedStream::new(OPAQUE_STREAM, REGION, created_at, 24),
+            ArchivedStream::new(EMPTY_STREAM, REGION, created_at, 1),
+            ArchivedStream::new(TALL_FRAME_STREAM, REGION, created_at, 24),
+            ArchivedStream::new(NO_RETENTION_STREAM, REGION, created_at, 0),
+        ] {
+            register_stream(&harness.engine, &archived);
+            state.put_stream(archived);
+        }
 
         for index in 0..SEEDED_FRAGMENTS {
             let number = FRAGMENT_BASE + u64::try_from(index).expect("a small index");

@@ -214,18 +214,19 @@ impl Harness {
     ///
     /// There is no ingest OPERATION yet, so the archive is seeded through the
     /// reader's own state API — on the same engine the router serves from — with
-    /// the archived Matroska fragment of coded H.264 an ingest plane writes.
-    /// `archived_retention` is what the ARCHIVE's own record carries, which the
-    /// registry's record overrides wherever the two disagree.
-    fn seed_archive(&self, stream: &str, archived_retention: u32, count: u64) {
+    /// the archived Matroska fragment of coded H.264 an ingest plane writes. It
+    /// is held under `arn`, the ARN the registry holds this stream with, because
+    /// that is the identity an archive belongs to and the one a read looks it up
+    /// by — an ingest writes it the same way. `archived_retention` is what the
+    /// ARCHIVE's own record carries, which the registry's record overrides
+    /// wherever the two disagree.
+    fn seed_archive(&self, stream: &str, arn: &str, archived_retention: u32, count: u64) {
         let state = service_state(&*self.engine).expect("the archived-media store");
         let mut state = state.lock();
-        state.put_stream(ArchivedStream::new(
-            stream,
-            REGION,
-            SystemTime::now(),
-            archived_retention,
-        ));
+        let mut archived =
+            ArchivedStream::new(stream, REGION, SystemTime::now(), archived_retention);
+        archived.arn = arn.to_string();
+        state.put_stream(archived);
         for index in 0..count {
             let offset = 10 * i64::try_from(index).expect("a small index");
             let at = from_epoch_millis((T0_SECS + offset) * 1000);
@@ -332,7 +333,7 @@ async fn the_retention_gate_reads_the_registered_streams_retention() {
         let arn = harness.create_stream(&name, retention).await;
         // The archive's own record deliberately disagrees with the registry:
         // the stream is the control plane's resource, so its record decides.
-        harness.seed_archive(&name, if retention == 0 { 72 } else { 0 }, 0);
+        harness.seed_archive(&name, &arn, if retention == 0 { 72 } else { 0 }, 0);
 
         for (path, extra) in retention_gated_operations() {
             for (form, addressing) in [
@@ -505,7 +506,7 @@ async fn list_fragments_answers_an_empty_page_for_a_registered_stream() {
     ] {
         let name = format!("probe-list-{retention}-{archived}");
         let arn = harness.create_stream(&name, retention).await;
-        harness.seed_archive(&name, 0, archived);
+        harness.seed_archive(&name, &arn, 0, archived);
         for (form, addressing) in [
             (
                 "StreamName",
@@ -543,8 +544,8 @@ async fn list_fragments_answers_an_empty_page_for_a_registered_stream() {
 async fn get_media_for_fragment_list_lists_the_fragment_numbers_it_cannot_find() {
     let harness = Harness::new();
     let name = "probe-fragment-numbers";
-    harness.create_stream(name, 24).await;
-    harness.seed_archive(name, 24, 3);
+    let arn = harness.create_stream(name, 24).await;
+    harness.seed_archive(name, &arn, 24, 3);
 
     // Rows differ along how many of the requested numbers are archived and
     // where the unknown ones sit in the request.
@@ -616,7 +617,7 @@ async fn an_unregistered_identifier_is_the_only_missing_resource() {
     let harness = Harness::new();
     let name = "probe-addressing";
     let arn = harness.create_stream(name, 24).await;
-    harness.seed_archive(name, 24, 2);
+    harness.seed_archive(name, &arn, 24, 2);
 
     // (the case, the addressing members, the expected status, error code and
     // message). An empty expectation means the call succeeds.
