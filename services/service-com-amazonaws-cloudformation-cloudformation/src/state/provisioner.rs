@@ -1014,6 +1014,16 @@ pub(super) enum Provisioner {
     /// answers the cluster `creating`, in which it serves nothing and carries no endpoint, so
     /// the resource's creation is held open until ElastiCache reports it `available`.
     ElastiCacheCacheCluster,
+    /// `AWS::ElastiCache::ServerlessCache`: a serverless cache of Amazon ElastiCache, which
+    /// `CreateServerlessCache` creates under the `ServerlessCacheName` the declaration states
+    /// — the name this type's `Ref` returns — and `DeleteServerlessCache` deletes by it. That
+    /// create answers the cache `creating`, in which it serves nothing and carries no
+    /// endpoint, so the resource's creation is held open until ElastiCache reports it
+    /// `available`. Creating it there is also what applies that operation's own validation to
+    /// the declaration — the subnets held against the ones Amazon EC2 has, the major engine
+    /// versions the declared engine offers, the usage-limit bounds — so a template that
+    /// service refuses fails the resource rather than being reported created.
+    ElastiCacheServerlessCache,
     RdsDbSubnetGroup,
     /// `AWS::RDS::OptionGroup`: an option group of Amazon RDS, which `CreateOptionGroup`
     /// creates under the name the stack decided — the name this type's `Ref` returns — and
@@ -1818,6 +1828,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_CLUSTER => Some(Provisioner::RdsDbCluster),
         ELASTICACHE_CACHE_CLUSTER => Some(Provisioner::ElastiCacheCacheCluster),
+        ELASTICACHE_SERVERLESS_CACHE => Some(Provisioner::ElastiCacheServerlessCache),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         rds_option_groups::RDS_OPTION_GROUP => Some(Provisioner::RdsOptionGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
@@ -2355,6 +2366,12 @@ impl Provisioner {
                     final_snapshot,
                 ))
                 .await
+            }
+            // The serverless cache's own final snapshot is the `FinalSnapshotName` the
+            // declaration states or the one a `Snapshot` deletion policy asks for, so the arm
+            // takes the whole record beside that identifier.
+            Self::ElastiCacheServerlessCache => {
+                Box::pin(delete_serverless_cache(ctx, region, resource, final_snapshot)).await
             }
             Self::RedshiftCluster => {
                 delete_redshift_cluster(ctx, region, physical_resource_id, final_snapshot)
@@ -3228,6 +3245,11 @@ mod application_insights;
 /// delete and read a concern of their own.
 mod batch_job_definitions;
 pub(super) mod elasticache_caches;
+/// The Amazon ElastiCache SERVERLESS cache arm: the cache an
+/// `AWS::ElastiCache::ServerlessCache` declares, created in the service that owns it so every
+/// rule `CreateServerlessCache` applies to the declared properties decides the resource's
+/// fate and a client's own read of that service resolves the cache the stack publishes.
+pub(super) mod elasticache_serverless_caches;
 /// The Amazon RDS DB CLUSTER arm: the cluster an `AWS::RDS::DBCluster` declares, created in
 /// the service that owns it so a member DB instance of that cluster resolves it.
 pub(super) mod rds_db_clusters;
@@ -3333,6 +3355,7 @@ use bedrock_agentcore_gateways::*;
 use codepipeline_webhooks::*;
 use memorydb_groups::*;
 use elasticache_caches::*;
+use elasticache_serverless_caches::*;
 use rds_db_clusters::*;
 use rds_tags::*;
 use redshift_parameter_groups::*;

@@ -387,6 +387,13 @@ impl Provisioner {
                 // walk keeps on the stack.
                 Box::pin(create_cache_cluster(ctx, region, resource, propagated)).await
             }
+            // `AWS::ElastiCache::ServerlessCache` publishes `Tags` as the same `{Key, Value}`
+            // list, which `CreateServerlessCache` takes as its own `Tags` member, so a cache
+            // a stack creates carries the tags CloudFormation gives it beside the declared
+            // ones.
+            Self::ElastiCacheServerlessCache => {
+                Box::pin(create_serverless_cache(ctx, region, resource, propagated)).await
+            }
             Self::RedshiftCluster => {
                 create_redshift_cluster(ctx, region, resource, propagated).await
             }
@@ -1313,6 +1320,9 @@ impl Provisioner {
                 // `AddTagsToResource` alike, in the one check its own crate's tag validation
                 // makes — so a cache cluster carries the stack's own tags without the three.
                 | Self::ElastiCacheCacheCluster
+                // The same check guards `CreateServerlessCache`'s own `Tags` member, so a
+                // serverless cache is in exactly that position.
+                | Self::ElastiCacheServerlessCache
                 // Resource Groups refuses a tag key in the reserved namespace on every call
                 // that takes tags — `CreateGroup`'s `Tags` map and `Tag` alike, in the one
                 // check its own crate's tag validation makes — so a group carries the stack's

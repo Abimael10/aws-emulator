@@ -103,6 +103,12 @@ impl Provisioner {
             Self::ElastiCacheCacheCluster => {
                 Box::pin(cache_cluster_readiness(ctx, region, physical_resource_id)).await
             }
+            // `CreateServerlessCache` answers the cache `creating`, in which it has no
+            // endpoint and serves no client, so the resource's creation is finished once
+            // Amazon ElastiCache reports it `available`.
+            Self::ElastiCacheServerlessCache => {
+                Box::pin(serverless_cache_readiness(ctx, region, physical_resource_id)).await
+            }
             // `CreateDBInstance` answers the instance `creating`, in which it serves no
             // connection and publishes no endpoint a client can reach, so the resource's
             // creation is finished once Amazon RDS reports it `available` — which is also
@@ -511,6 +517,18 @@ impl Provisioner {
             Self::ElastiCacheCacheCluster => {
                 Box::pin(cache_cluster_ready_attributes(ctx, region, physical_resource_id)).await
             }
+            // A serverless cache has neither of its endpoints while it is `creating`, and
+            // neither the full engine version ElastiCache settles on for the declared major
+            // version nor the time it created the cache is known before that service has: the
+            // type's attributes are read off the cache once it reports it `available`.
+            Self::ElastiCacheServerlessCache => {
+                Box::pin(serverless_cache_ready_attributes(
+                    ctx,
+                    region,
+                    physical_resource_id,
+                ))
+                .await
+            }
             // A Redshift cluster has no connection endpoint while it is `creating`: the
             // address and the port a client connects to are what Amazon Redshift publishes
             // once the cluster is serving, so the type's endpoint attributes are read off the
@@ -634,6 +652,13 @@ impl Provisioner {
             // cluster still sits in.
             Self::ElastiCacheCacheCluster => {
                 Box::pin(cache_cluster_removal(ctx, region, physical_resource_id)).await
+            }
+            // `DeleteServerlessCache` leaves the cache `deleting` while Amazon ElastiCache
+            // takes it away, so it is still there when the delete answers and the deletion is
+            // finished once that service no longer holds it — which is what keeps a stack from
+            // deleting the subnets and the security groups the cache still sits in.
+            Self::ElastiCacheServerlessCache => {
+                Box::pin(serverless_cache_removal(ctx, region, physical_resource_id)).await
             }
             // `DeleteDBCluster` leaves the cluster `deleting` until the deletion completes,
             // so it is still there when the delete answers and the deletion is finished once
