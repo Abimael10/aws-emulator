@@ -9,6 +9,12 @@
 //! `ACTIVE` again from the next request on. `GetCluster` reads back exactly what this
 //! wrote.
 //!
+//! The operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`, so a
+//! retry presenting the token an accepted update used answers that call's result from the
+//! stored record and has no further effect — it does not apply the change a second time
+//! (see
+//! [`crate::state::ComAmazonawsPcsAwsparallelcomputingserviceState::remember_create`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -243,9 +249,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
-        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
             return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
+            )
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so the stored cluster is answered without applying the change a second
+        // time — and without moving the status again, which is what a second application
+        // would do. The token is remembered with the cluster the first call changed, so the
+        // same token naming another cluster is a conflict rather than a second update; a
+        // request carrying no token is no retry at all (the SDK generates a fresh one per
+        // call), so it is answered on its own.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            if remembered.resource_id != cluster_id {
+                return Err(UpdateClusterErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "update",
+                        crate::state::CLUSTER,
+                        &remembered.resource_id,
+                    ),
+                )
+                .into());
+            }
+            let Some(replayed) = state.clusters.get(&cluster_id) else {
+                return Err(UpdateClusterErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the cluster disappeared while it was being read".to_string(),
+                    },
+                )
+                .into());
+            };
+            return Ok(UpdateClusterOutput {
+                cluster: Some(replayed.to_api()),
+            });
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
+            return Err(UpdateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being written".to_string(),
+                },
             )
             .into());
         };
@@ -306,8 +355,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Answered from the STORED record, so the update and a later read cannot differ.
+        let updated = cluster.to_api();
+        let cluster_name = cluster.name.clone();
+        // Remembered only now that the update has been ACCEPTED: a retry replays a call
+        // that completed successfully, so a refused update leaves its token free.
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            None,
+            &cluster_id,
+            &cluster_name,
+        );
+
         Ok(UpdateClusterOutput {
-            cluster: Some(cluster.to_api()),
+            cluster: Some(updated),
         })
     }
 }

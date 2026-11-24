@@ -33,6 +33,11 @@ mod scheduler_version_ordering;
 #[path = "cluster_update_and_endpoints/accounting_purge_time.rs"]
 mod accounting_purge_time;
 
+// What a reused `clientToken` on an `UpdateCluster` answers — the first call's result,
+// rather than the change applied twice — is its own suite, declared the same way.
+#[path = "cluster_update_and_endpoints/idempotent_update_retry.rs"]
+mod idempotent_update_retry;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 

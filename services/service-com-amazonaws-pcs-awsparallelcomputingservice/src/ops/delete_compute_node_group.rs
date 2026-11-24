@@ -11,6 +11,12 @@
 //! settled, because a group still being provisioned or already on its way out has another
 //! operation of its own in flight.
 //!
+//! The operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`, so a
+//! retry presenting the token an accepted delete used replays that call's empty success
+//! and has no further effect — it is not a second delete of a group this service is no
+//! longer going to hold (see
+//! [`crate::state::ComAmazonawsPcsAwsparallelcomputingserviceState::remember_delete`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that resolves to none earns is decided by its FORM: a generated cluster id names a
         // cluster that is not there, a cluster NAME is a permissions failure; see
         // `crate::state::cluster_authorization`.
-        let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
             return Err(match crate::state::cluster_authorization::unresolved_cluster(
                 &input.cluster_identifier,
             ) {
@@ -210,6 +216,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
             }
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so a delete that already used this token is replayed with its empty
+        // success — BEFORE the group is looked up, because the group the first call took
+        // out is exactly what a retry can no longer find, and while it is still on its way
+        // out it is no longer `ACTIVE` either. The token is remembered with the group that
+        // call deleted, so the same token naming another group is a conflict rather than a
+        // second delete; a request carrying no token is no retry at all (the SDK generates
+        // a fresh one per call), so it is answered on its own.
+        match state.remembered_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &input.compute_node_group_identifier,
+        ) {
+            Some(crate::state::RememberedDelete::Replay) => {
+                return Ok(DeleteComputeNodeGroupOutput {});
+            }
+            Some(crate::state::RememberedDelete::Conflict(remembered)) => {
+                return Err(DeleteComputeNodeGroupErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "delete",
+                        crate::state::COMPUTE_NODE_GROUP,
+                        &remembered.resource_id,
+                    ),
+                )
+                .into());
+            }
+            None => {}
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
+            return Err(DeleteComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being read".to_string(),
+                },
+            )
             .into());
         };
         let Some(group_id) = cluster
@@ -259,6 +304,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         group.status = crate::state::STATUS_DELETING.to_string();
         group.modified_at = crate::state::now_date_time();
         group.pending = Some(crate::state::PendingChange::MarkDeleted);
+        let group_name = group.name.clone();
+        // Remembered only now that the delete has been ACCEPTED: a retry replays a call
+        // that completed successfully, so a refused delete leaves its token free.
+        state.remember_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &group_id,
+            &group_name,
+        );
         Ok(DeleteComputeNodeGroupOutput {})
     }
 }

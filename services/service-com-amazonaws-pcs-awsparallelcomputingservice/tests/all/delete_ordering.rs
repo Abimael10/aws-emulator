@@ -42,6 +42,11 @@ use super::cluster_lifecycle::{call, emulator};
 #[path = "delete_ordering/idempotent_delete_retry.rs"]
 mod idempotent_delete_retry;
 
+/// The same reading of `clientToken` on the deletes of the OTHER two resources this suite
+/// orders — the cluster itself and a compute node group — declared the same way.
+#[path = "delete_ordering/idempotent_cluster_delete_retry.rs"]
+mod idempotent_cluster_delete_retry;
+
 /// The region the shared harness signs every call for.
 const REGION: &str = "us-east-1";
 

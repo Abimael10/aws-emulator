@@ -41,9 +41,9 @@
 //!   as much as a later `TagResource`; `RequestTagMap`'s modelled
 //!   `@length(min: 1, max: 200)` bounds one request only.
 //! * the idempotency index — [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicted
-//!   oldest-first, and every entry pointing into a cluster is dropped when that
-//!   cluster is removed ([`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`]),
-//!   so a create/delete loop cannot grow it.
+//!   oldest-first, and an entry a removed cluster leaves nothing to answer from is
+//!   dropped with it ([`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`]), so a
+//!   create/delete loop is held well below the ceiling the eviction already guarantees.
 //! * response size — [`page_size`] clamps a caller's `maxResults` to the modelled
 //!   `1..=100` before [`paginate`] truncates.
 
@@ -694,6 +694,11 @@ pub struct RememberedCreate {
     /// `*Identifier` may address the resource by once there is nothing left to resolve it
     /// against. `None` only for an entry remembered without one.
     pub resource_name: Option<String>,
+    /// Whether that call DELETED the resource it names. A remembered delete is exactly
+    /// what a retry needs once the resource is gone, so it outlives the record it points
+    /// at; an entry recording a create or an update is answered FROM the stored record,
+    /// so it has nothing left to replay once that record has been removed.
+    pub deleted: bool,
 }
 
 impl RememberedCreate {
@@ -863,6 +868,7 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
                 cluster_id: cluster_id.map(str::to_string),
                 resource_id: resource_id.to_string(),
                 resource_name: Some(resource_name.to_string()),
+                deleted: false,
             },
         );
     }
@@ -915,6 +921,7 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
                 cluster_id: cluster_id.map(str::to_string),
                 resource_id: resource_id.to_string(),
                 resource_name: Some(resource_name.to_string()),
+                deleted: true,
             },
         );
     }
@@ -956,8 +963,15 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         }
     }
 
-    /// Drop every remembered create that points at `cluster_id` or at a resource inside
-    /// it, so removing a cluster releases its share of the index.
+    /// Drop every remembered token a removed cluster leaves nothing to answer from, so
+    /// removing a cluster releases its share of the index.
+    ///
+    /// What stays is the DELETE of the cluster itself ([`RememberedCreate::deleted`]):
+    /// that entry exists precisely for the retry that arrives once the record is gone, so
+    /// dropping it with the record would turn the replay the token promises back into a
+    /// refusal. Everything else about the cluster — a create or an update, which are
+    /// answered from the stored record, and every token pointing INSIDE the cluster, which
+    /// no request can get past the cluster lookup to reach — has nothing left to replay.
     fn forget_creates_for_cluster(&mut self, cluster_id: &str) {
         let Self {
             client_tokens,
@@ -965,8 +979,10 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
             ..
         } = self;
         client_tokens.retain(|_, remembered| {
-            remembered.resource_id != cluster_id
-                && remembered.cluster_id.as_deref() != Some(cluster_id)
+            if remembered.cluster_id.as_deref() == Some(cluster_id) {
+                return false;
+            }
+            remembered.resource_id != cluster_id || remembered.deleted
         });
         client_token_order.retain(|key| client_tokens.contains_key(key));
     }

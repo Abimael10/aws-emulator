@@ -5,6 +5,12 @@
 //! the next request on, after which `GetCluster` answers 404 and `ListClusters` no longer
 //! lists it.
 //!
+//! The operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`, so a
+//! retry presenting the token an accepted delete used replays that call's empty success
+//! and has no further effect — it is not a second delete of a cluster this service is no
+//! longer going to hold (see
+//! [`crate::state::ComAmazonawsPcsAwsparallelcomputingserviceState::remember_delete`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,6 +178,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle();
 
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so a delete that already used this token is replayed with its empty
+        // success — BEFORE the cluster is looked up, because the cluster the first call
+        // took out is exactly what a retry can no longer find, and while it is still on
+        // its way out it is no longer `ACTIVE` either. The token is remembered with the
+        // cluster that call deleted, so the same token naming another cluster is a
+        // conflict rather than a second delete; a request carrying no token is no retry at
+        // all (the SDK generates a fresh one per call), so it is answered on its own.
+        match state.remembered_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            None,
+            &input.cluster_identifier,
+        ) {
+            Some(crate::state::RememberedDelete::Replay) => return Ok(DeleteClusterOutput {}),
+            Some(crate::state::RememberedDelete::Conflict(remembered)) => {
+                return Err(DeleteClusterErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "delete",
+                        crate::state::CLUSTER,
+                        &remembered.resource_id,
+                    ),
+                )
+                .into());
+            }
+            None => {}
+        }
+
         let Some(cluster) = state.cluster_mut(&input.cluster_identifier) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::CLUSTER, &input.cluster_identifier),
@@ -202,6 +236,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         cluster.status = crate::state::STATUS_DELETING.to_string();
         cluster.modified_at = crate::state::now_date_time();
         cluster.pending = Some(crate::state::PendingChange::Remove);
+        let cluster_id = cluster.id.clone();
+        let cluster_name = cluster.name.clone();
+        // Remembered only now that the delete has been ACCEPTED: a retry replays a call
+        // that completed successfully, so a refused delete leaves its token free.
+        state.remember_delete(
+            Self::NAME,
+            input.client_token.as_ref(),
+            None,
+            &cluster_id,
+            &cluster_name,
+        );
         Ok(DeleteClusterOutput {})
     }
 }
