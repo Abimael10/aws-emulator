@@ -45,11 +45,15 @@ pub fn unopened_schemas(pattern: Option<&str>) -> Vec<String> {
 /// with the two wild cards the Data API's catalogue patterns document ("`%`
 /// means match any substring of 0 or more characters and `_` means match any one
 /// character"), by the one matcher this crate has for them.
+///
+/// Each name is reported as a CALLER spells it: a schema the catalogue holds
+/// under a stored spelling of a delimited identifier ([`identifier_case`]) is
+/// listed under the name it was created with, and matched as that name.
 fn narrowed<'a>(names: impl Iterator<Item = &'a str>, pattern: Option<&str>) -> Vec<String> {
     names
+        .map(identifier_case::spelled)
         .filter(|name| {
             pattern.is_none_or(|pattern| session_settings::wild_card_matches(pattern, name))
         })
-        .map(ToString::to_string)
         .collect()
 }

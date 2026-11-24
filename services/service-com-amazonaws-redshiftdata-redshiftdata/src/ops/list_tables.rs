@@ -133,9 +133,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, non_empty, split_relation, BadConnection, CatalogFilter,
-    ConnectionRequest, TargetSelectors, ABSENT_ENDPOINT_MESSAGE, CURSOR_TABLES, DEFAULT_PAGE_SIZE,
-    INVALID_TOKEN_MESSAGE,
+    decode_cursor, encode_cursor, identifier_case, non_empty, split_relation, BadConnection,
+    CatalogFilter, ConnectionRequest, TargetSelectors, ABSENT_ENDPOINT_MESSAGE, CURSOR_TABLES,
+    DEFAULT_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
 };
 
 /// The compute-target selectors THIS operation accepts: its input shape models
@@ -388,8 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|held| {
                 let (schema, name) = split_relation(&held.table);
                 TableMember {
-                    name: Some(name.to_string()),
-                    schema: Some(schema.to_string()),
+                    // The name the caller spelled: a relation the engine holds
+                    // under a stored spelling of a delimited identifier is
+                    // listed under the name it was created with.
+                    name: Some(identifier_case::spelled(name)),
+                    schema: Some(identifier_case::spelled(schema)),
                     r#type: Some(held.kind.to_string()),
                 }
             })

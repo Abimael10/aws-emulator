@@ -392,9 +392,13 @@ pub(super) fn column_metadata(
         is_currency: currency,
         is_signed: signed,
         // Redshift reports the column's output name as both name and label; a
-        // statement that aliases a column changes both together.
-        label: Some(name.to_string()),
-        name: Some(name.to_string()),
+        // statement that aliases a column changes both together. The name is
+        // the one the caller spelled: a column the engine holds under a STORED
+        // spelling — one carrying the case a delimited identifier was declared
+        // with ([`super::identifier_case`]) — is reported under the name it was
+        // declared with.
+        label: Some(super::identifier_case::spelled(name)),
+        name: Some(super::identifier_case::spelled(name)),
         precision: column_type.map_or(0, precision_of),
         scale: column_type.map_or(0, scale_of),
         // "The length of the column" is reported on the CATALOGUE surface
@@ -410,8 +414,12 @@ pub(super) fn column_metadata(
         // relation of a schema under its qualified name, which is split back
         // into the two ([`split_relation`]) — and one a statement computes
         // belongs to no table and reports neither.
-        schema_name: origin.map(|origin| split_relation(&origin.table).0.to_string()),
-        table_name: origin.map(|origin| split_relation(&origin.table).1.to_string()),
+        schema_name: origin.map(|origin| {
+            super::identifier_case::spelled(split_relation(&origin.table).0)
+        }),
+        table_name: origin.map(|origin| {
+            super::identifier_case::spelled(split_relation(&origin.table).1)
+        }),
         // "The default value of the column": what the relation that includes it
         // declares as its `DEFAULT`, and nothing for a column that declares
         // none or belongs to no relation.
@@ -520,8 +528,15 @@ pub struct CatalogFilter {
 impl CatalogFilter {
     /// Whether this filter describes `relation`, the name the engine's catalogue
     /// holds it under.
+    ///
+    /// The request names a relation as a CALLER spells it, so the engine's name
+    /// is read as that spelling first: a relation the engine holds under a
+    /// stored spelling of a delimited identifier
+    /// ([`super::identifier_case`]) is described by the name it was created
+    /// with.
     fn admits(&self, relation: &str) -> bool {
-        let (schema, table) = split_relation(relation);
+        let relation = super::identifier_case::spelled(relation);
+        let (schema, table) = split_relation(&relation);
         named(self.schema.as_deref(), schema)
             && named(self.table.as_deref(), table)
             && matched(self.schema_pattern.as_deref(), schema)

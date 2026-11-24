@@ -126,6 +126,14 @@ pub mod join_planning;
 /// registered on every connection.
 pub mod functions;
 
+/// The DATE PARTS a Redshift date or time function names, and the functions
+/// that take one — likewise implemented and registered on every connection.
+pub mod date_parts;
+
+/// Whether the engine behind a database reads a DELIMITED IDENTIFIER's case,
+/// which the cluster parameter `enable_case_sensitive_identifier` decides.
+pub mod identifier_case;
+
 /// The data warehouse TYPES the engine does not carry — the geometric types and
 /// the currency type — implemented and registered on every connection.
 pub mod warehouse_types;
@@ -1518,6 +1526,9 @@ impl Database {
         // any caller SQL reaches the connection so that a statement naming one
         // of them finds an implementation rather than an unknown function.
         functions::install(&connection)?;
+        // The date and time functions of that family, whose first argument is a
+        // date-part keyword rather than a value, installed for the same reason.
+        date_parts::install(&connection)?;
         // The warehouse types the engine does not carry, installed alongside
         // them and for the same reason: a statement naming one of these types
         // finds an implementation of it rather than an unknown function.
@@ -1842,13 +1853,19 @@ impl From<rusqlite::Error> for ExecutionFailure {
 
 impl ExecutionFailure {
     /// The message to report as the statement's `Error`.
+    ///
+    /// A name the engine holds under a STORED spelling — one carrying the case
+    /// a delimited identifier was declared with ([`identifier_case`]) — is
+    /// reported as the caller spelled it, here as everywhere else a name
+    /// reaches a caller.
     fn message(&self) -> String {
-        match self {
+        let reported = match self {
             Self::Engine(error) => scrub_paths(&error.to_string()),
             Self::Bound(message) | Self::Catalogue(message) | Self::Warehouse(message) => {
                 message.clone()
             }
-        }
+        };
+        identifier_case::spelled(&reported)
     }
 }
 
@@ -2400,8 +2417,18 @@ fn carry_out(
     effects: &mut RunEffects<'_>,
     query: i64,
 ) -> Result<Produced, ExecutionFailure> {
+    // A DELIMITED identifier carries the CASE it was declared with when the
+    // engine this statement runs on reads one, which the cluster parameter
+    // `enable_case_sensitive_identifier` decides: the statement is re-spelled
+    // before it is read as this dialect, so the names it creates and the names
+    // it resolves are the ones that engine holds
+    // ([`identifier_case`]).
+    let respelled = reads_identifier_case(database, plane, effects.scope.key())
+        .then(|| identifier_case::respell(sql))
+        .flatten();
+    let read: &str = respelled.as_deref().unwrap_or(sql);
     let translated = redshift_sql::translate(
-        sql,
+        read,
         &database.schemas,
         &effects.temp(),
         &join_planning::EngineColumns::new(&database.connection),
@@ -2434,6 +2461,23 @@ fn carry_out(
         }
     }
     produced
+}
+
+/// Whether the engine one statement runs on reads a DELIMITED identifier's
+/// case: the value in force for `enable_case_sensitive_identifier` on the
+/// connection it runs on ([`identifier_case`]).
+///
+/// A READ of that connection's parameters, like [`assigned_queue`]: a
+/// connection that has set none is read as holding none rather than having an
+/// entry written for it by the statement that looked.
+fn reads_identifier_case(
+    database: &Database,
+    plane: &data_plane::DataPlane,
+    connection: &str,
+) -> bool {
+    let unset = session_settings::SessionSettings::default();
+    let session = database.settings.get(connection).unwrap_or(&unset);
+    identifier_case::case_sensitive(session, &plane.facts.settings)
 }
 
 /// Do what the statement `translated` reads as asks for. The one caller is

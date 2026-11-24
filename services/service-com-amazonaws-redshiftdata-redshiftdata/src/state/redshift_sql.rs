@@ -53,13 +53,15 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CastKind, DataType, Expr, Ident, ObjectName, ObjectNamePart, ObjectType, SchemaName,
-    SelectItem, SetExpr, Statement, Visit, VisitMut, Visitor, VisitorMut,
+    CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, ObjectType, SchemaName, SelectItem, SetExpr, Statement, Value as SqlValue,
+    Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::RedshiftSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
+use super::date_parts;
 use super::warehouse_statements::{self, WarehouseStatement};
 use super::warehouse_types;
 use super::{join_planning, LockMode, LockRequest, TempRelations, TEMP_QUALIFIER};
@@ -420,6 +422,102 @@ fn constructed_warehouse_value(expr: &Expr) -> Option<Expr> {
     }
 }
 
+/// The functions of this dialect whose FIRST argument is a DATE PART keyword
+/// rather than a value, and whether that function takes only a part naming a
+/// SPAN.
+///
+/// Source: the Amazon Redshift *Database Developer Guide*, "Date and time
+/// functions" — `DATEADD(datepart, interval, {date|timestamp})`,
+/// `DATEDIFF(datepart, {date|timestamp}, {date|timestamp})` and
+/// `DATE_PART(datepart, {date|timestamp})` are the three written that way; the
+/// first two move or count a span, so the day-of-week and day-of-year parts the
+/// published table admits for `DATE_PART` alone are not parts of theirs. Every
+/// other function of the family takes the part as a quoted string
+/// (`DATE_TRUNC('datepart', timestamp)`) or as a clause
+/// (`EXTRACT(datepart FROM …)`, read below), so neither has a keyword to
+/// re-spell here.
+const DATE_PART_FUNCTIONS: &[(&str, bool)] =
+    &[("datediff", true), ("dateadd", true), ("date_part", false)];
+
+/// The function `EXTRACT`'s own reading: `EXTRACT(<datepart> FROM <expr>)` asks
+/// for the same value `DATE_PART(<datepart>, <expr>)` does, which is the call
+/// this emulator implements ([`date_parts`]).
+const DATE_PART_FUNCTION: &str = "date_part";
+
+/// Re-spell the DATE PART an expression names as the value the implementation
+/// of that function reads, and report whether this expression was one.
+///
+/// A date part is a KEYWORD in the grammar of these functions, not a name: the
+/// engine behind this service has no such grammar, so it would resolve
+/// `datediff(microsecond, …)`'s leading word as a column of the statement's
+/// relations and refuse the statement. The keyword is therefore handed to the
+/// implementation as the part it names, and only when the vocabulary really
+/// publishes a part of that spelling for that function ([`date_parts`]) — a
+/// word it does not publish, and a QUOTED word, which is a name and never a
+/// keyword, are left exactly as the caller wrote them.
+fn respell_date_part(expr: &mut Expr) -> bool {
+    match expr {
+        Expr::Function(function) => {
+            let name = function.name.to_string();
+            let Some((_, spans_only)) = DATE_PART_FUNCTIONS
+                .iter()
+                .find(|(named, _)| named.eq_ignore_ascii_case(name.trim()))
+            else {
+                return false;
+            };
+            let FunctionArguments::List(arguments) = &mut function.args else {
+                return false;
+            };
+            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(first))) =
+                arguments.args.first_mut()
+            else {
+                return false;
+            };
+            let Expr::Identifier(keyword) = &*first else {
+                return false;
+            };
+            if keyword.quote_style.is_some() {
+                return false;
+            }
+            let published = if *spans_only {
+                date_parts::names_a_span(&keyword.value)
+            } else {
+                date_parts::unit_named(&keyword.value).is_some()
+            };
+            if !published {
+                return false;
+            }
+            *first = Expr::Value(
+                SqlValue::SingleQuotedString(keyword.value.to_ascii_lowercase()).with_empty_span(),
+            );
+            true
+        }
+        // `EXTRACT(<datepart> FROM <expr>)`: the part is a clause of the
+        // grammar rather than an argument, and the value it asks for is the one
+        // `DATE_PART` answers — so the whole expression becomes that call,
+        // READ by the same parser this module reads a statement with.
+        Expr::Extract {
+            field,
+            expr: inner,
+            ..
+        } => {
+            let keyword = field.to_string().trim().to_ascii_lowercase();
+            if date_parts::unit_named(&keyword).is_none() {
+                return false;
+            }
+            let Some(call) = constructor(
+                DATE_PART_FUNCTION,
+                &format!("'{keyword}', {}", inner.as_ref()),
+            ) else {
+                return false;
+            };
+            *expr = call;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Whether a text is one this module READS at all.
 ///
 /// A text longer than the engine itself accepts (`super::MAX_SQL_BYTES`, its
@@ -557,6 +655,13 @@ impl VisitorMut for Rewriter<'_> {
         // [`respell_typed_literals`].)
         if let Some(rewritten) = constructed_warehouse_value(expr) {
             *expr = rewritten;
+            self.changed = true;
+            return ControlFlow::Continue(());
+        }
+        // A DATE PART keyword is the unit a date or time function works in, not
+        // a name: it is re-spelled as the value the implementation of that
+        // function reads ([`date_parts`]).
+        if respell_date_part(expr) {
             self.changed = true;
             return ControlFlow::Continue(());
         }
