@@ -292,6 +292,23 @@ impl StoredWarmPool {
     /// How many instances this pool maintains, for a group whose desired capacity is
     /// `desired_capacity` and whose maximum is `max_size`.
     ///
+    /// [`Self::prepared_size`]'s documented difference, held to [`super::MAX_GROUP_CAPACITY`],
+    /// the ceiling this process holds ONE GROUP to: a group's maximum is stored as the
+    /// headroom it may later grow within ([`super::size_past_ceiling`]) and is not itself
+    /// bounded, so without this a pool whose size follows that maximum would MAINTAIN more
+    /// instances than the group may hold — and this is the number every reader of the pool's
+    /// target acts on, the reconcile that prepares the difference included. The two writers of
+    /// a pool's size refuse a request that would pass the ceiling rather than reaching it
+    /// (`PutWarmPool`, and the update that raises the group's maximum), so this is the FLOOR
+    /// under those refusals and not the service's answer to them.
+    pub fn target_size(&self, desired_capacity: i32, max_size: i32) -> i32 {
+        self.prepared_size(desired_capacity, max_size)
+            .clamp(0, super::MAX_GROUP_CAPACITY)
+    }
+
+    /// The difference the documented size rule states, as it states it — unbounded, so a
+    /// caller can hold it to the per-group ceiling rather than reach it.
+    ///
     /// The documented rule, from `PutWarmPoolType$MaxGroupPreparedCapacity`: "If a value
     /// for MaxGroupPreparedCapacity is not specified, Amazon EC2 Auto Scaling launches
     /// and maintains the difference between the group's maximum capacity and its desired
@@ -302,18 +319,15 @@ impl StoredWarmPool {
     /// unless you specify a value for MinSize", which is the floor the pool's own minimum
     /// puts under the difference.
     ///
-    /// The answer is held to [`super::MAX_GROUP_CAPACITY`], the ceiling this process holds
-    /// ONE GROUP to: a group's maximum is stored as the headroom it may later grow within
-    /// ([`super::size_past_ceiling`]) and is not itself bounded, so without this a pool
-    /// whose size follows that maximum would MAINTAIN more instances than the group may
-    /// hold — and this is the number every reader of the pool's target acts on, the
-    /// reconcile that prepares the difference included.
-    pub fn target_size(&self, desired_capacity: i32, max_size: i32) -> i32 {
+    /// THE ONE reading of that rule: [`Self::target_size`] is this answer held to the
+    /// ceiling, and the handler that raises a group's maximum weighs this one against the
+    /// ceiling before it applies the member.
+    pub fn prepared_size(&self, desired_capacity: i32, max_size: i32) -> i32 {
         let prepared = self.max_group_prepared_capacity.unwrap_or(max_size);
         prepared
             .saturating_sub(desired_capacity)
             .max(self.min_size)
-            .clamp(0, super::MAX_GROUP_CAPACITY)
+            .max(0)
     }
 
     /// Record that the preparation of what this pool may now be short of is owed from `at`

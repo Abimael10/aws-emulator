@@ -713,7 +713,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // And therefore before the group's name is weighed against the names already taken:
         // the launch source a request names is resolved first, so a request whose launch
         // source resolves to nothing is told about the launch source and not about the name.
+        //
+        // And a specification states WHICH template before anything of it is resolved: one
+        // carrying neither half of the identity names no template to resolve at all, so it is
+        // refused for the halves themselves
+        // ([`crate::state::group_configuration::launch_template_identity_error`]).
+        if let Some(refusal) = crate::state::group_configuration::launch_template_identity_error(
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
         if let Some(refusal) = crate::state::group_configuration::unresolvable_launch_template_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
+        // And the version it resolves to has to be one an instance could be launched FROM: a
+        // group pointed at launch parameters that cannot launch anything would hold no
+        // capacity ever, so the request is refused instead of stored
+        // ([`crate::state::group_configuration::unlaunchable_launch_template_error`]).
+        if let Some(refusal) = crate::state::group_configuration::unlaunchable_launch_template_error(
             &*self.engine,
             input.launch_template.as_ref(),
             input.mixed_instances_policy.as_ref(),

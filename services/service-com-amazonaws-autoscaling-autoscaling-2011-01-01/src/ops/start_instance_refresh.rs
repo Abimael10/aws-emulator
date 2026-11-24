@@ -240,8 +240,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // could launch nothing from a template Amazon EC2 does not have. Asked BEFORE this
         // service's store is locked, so only one store is ever held at a time.
         if let Some(desired) = input.desired_configuration.as_ref() {
+            // And a specification states WHICH template before anything of it is resolved:
+            // one carrying neither half of the identity names no template to resolve.
+            if let Some(refusal) =
+                crate::state::group_configuration::launch_template_identity_error(
+                    desired.launch_template.as_ref(),
+                    desired.mixed_instances_policy.as_ref(),
+                )
+            {
+                return Err(refusal);
+            }
             if let Some(refusal) =
                 crate::state::group_configuration::unresolvable_launch_template_error(
+                    &*self.engine,
+                    desired.launch_template.as_ref(),
+                    desired.mixed_instances_policy.as_ref(),
+                )
+            {
+                return Err(refusal);
+            }
+            // And the version it resolves to has to be one an instance could be launched
+            // FROM: a refresh cannot move the group's instances onto launch parameters that
+            // could launch none of them.
+            if let Some(refusal) =
+                crate::state::group_configuration::unlaunchable_launch_template_error(
                     &*self.engine,
                     desired.launch_template.as_ref(),
                     desired.mixed_instances_policy.as_ref(),

@@ -473,8 +473,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against Amazon EC2's own store exactly as the create resolves the one it is given: a
         // specification naming a template nothing holds would leave the group unable to launch
         // anything. Asked BEFORE this service's store is locked, so only one store is ever held
-        // at a time.
+        // at a time — and after the question of whether the specification names a template at
+        // all, which is about its members rather than about what the account holds.
+        if let Some(refusal) = crate::state::group_configuration::launch_template_identity_error(
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
         if let Some(refusal) = crate::state::group_configuration::unresolvable_launch_template_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
+        // And the version it resolves to has to be one an instance could be launched FROM,
+        // exactly as the create requires of the one it is given: an update pointing the group
+        // at launch parameters that cannot launch anything would leave it permanently unable
+        // to hold capacity.
+        if let Some(refusal) = crate::state::group_configuration::unlaunchable_launch_template_error(
             &*self.engine,
             input.launch_template.as_ref(),
             input.mixed_instances_policy.as_ref(),
@@ -596,16 +614,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             min_size,
             max_size,
         );
-        // Those checks are all RELATIVE, so none of them bounds the absolute size:
-        // every unit of capacity the group RUNS is a stored instance, while the bounds
-        // themselves are stored verbatim and hold no instance of their own. So what is
-        // held to the ceiling is the capacity this update leaves the group at, refused
-        // before any member is applied or any instance allocated.
+        // Those checks are all RELATIVE, so none of them bounds the absolute size: every unit
+        // of capacity the group RUNS is a stored instance, while a bound is stored verbatim as
+        // the headroom the group may later grow within. So what is held to the ceiling is the
+        // capacity this update leaves the group at, refused before any member is applied or
+        // any instance allocated — beside the one number a BOUND does materialise, the
+        // instances a warm pool following the group's maximum would prepare, held to the same
+        // ceiling just below.
         if let Some(size) = crate::state::size_past_ceiling(&[desired_capacity]) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "The group size {size} exceeds the limit of {} instances per Auto Scaling group",
                 crate::state::MAX_GROUP_CAPACITY
             )));
+        }
+        // A group's MAXIMUM is the other half of the difference its warm pool maintains when
+        // the pool names no prepared capacity of its own
+        // ([`crate::state::StoredWarmPool::prepared_size`]), so for a group that HOLDS a pool
+        // the maximum this update would leave it with is a number of instances the pool then
+        // prepares. That number is held to the ceiling this process holds one group to, and
+        // the request is refused with the sentence `PutWarmPool` refuses a pool size past it
+        // with — one ceiling and one wording, whichever call sets the size — before any member
+        // is applied, so a refused update neither raises the bound nor owes a preparation.
+        if let Some(size) = group
+            .warm_pool()
+            .map(|pool| pool.prepared_size(desired_capacity, max_size))
+            .and_then(|prepared| crate::state::size_past_ceiling(&[prepared]))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::warm_pools::too_large_warm_pool_message(size),
+            ));
         }
         if let Some(configuration) = input.launch_configuration_name.as_deref() {
             if !state.launch_configurations.contains_key(configuration) {

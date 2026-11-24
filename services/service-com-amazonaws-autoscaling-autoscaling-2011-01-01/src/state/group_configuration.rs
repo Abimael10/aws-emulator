@@ -231,6 +231,120 @@ pub fn launch_source_error<E>(
     (stated != 1).then(|| Scaffolded::validation_error(ONE_LAUNCH_SOURCE_MESSAGE))
 }
 
+/// What Amazon EC2 Auto Scaling answers a launch-template specification that names no launch
+/// template at all.
+///
+/// "Conditional: You must specify either a `LaunchTemplateId` or a `LaunchTemplateName`"
+/// (`smithy_query(query="shape",shape="LaunchTemplateSpecification")`, which both halves
+/// carry): a specification states the VERSION of ONE template, so one carrying neither half
+/// names nothing to launch from. Fixed text naming the two members, with nothing of the
+/// request in it — the rule is about the specification's MEMBERS, exactly as
+/// [`ONE_LAUNCH_SOURCE_MESSAGE`]'s is about the request's.
+pub const LAUNCH_TEMPLATE_IDENTITY_MESSAGE: &str =
+    "Valid requests must contain either launchTemplateId or LaunchTemplateName";
+
+/// The refusal for a launch source that does not name the launch template it launches from,
+/// or `None` when it names one everywhere it has to.
+///
+/// Decided from the MEMBERS alone, so it is answered before any of their values is resolved
+/// ([`unresolvable_launch_template_error`]): a launch source naming no template has nothing
+/// to resolve, and the caller is told to name one rather than told that a template it never
+/// named does not exist.
+///
+/// Two ways a launch source names none, both answered the one sentence, because the caller
+/// left out the same pair of members either way:
+///
+/// * a specification it carries states neither half — the group's own `LaunchTemplate`, the
+///   launch template of its `MixedInstancesPolicy` and the one each override of that policy
+///   may name ([`super::ec2_instances::specifications`]) are all read, the rule being a fact
+///   about the SHAPE and holding wherever a request carries one;
+/// * a `MixedInstancesPolicy` carries no specification AT ALL — "one or more launch templates
+///   and the instance types (overrides) that are used to launch EC2 instances"
+///   (`MixedInstancesPolicy$LaunchTemplate`) is what such a group launches from, so a policy
+///   naming a template in neither place names none. ONE of the places is enough: a policy
+///   whose overrides name the template they launch their type from has named it.
+pub fn launch_template_identity_error<E>(
+    launch_template: Option<&LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&MixedInstancesPolicy>,
+) -> Option<Scaffolded<E>> {
+    let policy_names_no_template = mixed_instances_policy.is_some_and(|policy| {
+        super::ec2_instances::specifications(None, Some(policy)).is_empty()
+    });
+    let a_specification_names_no_template =
+        super::ec2_instances::specifications(launch_template, mixed_instances_policy)
+            .into_iter()
+            .any(|specification| TemplateIdentity::of(specification).is_none());
+    (policy_names_no_template || a_specification_names_no_template)
+        .then(|| Scaffolded::validation_error(LAUNCH_TEMPLATE_IDENTITY_MESSAGE))
+}
+
+/// The detail a refusal carries for a launch-template version that asks for a public address
+/// on a launch of SEVERAL network interfaces.
+///
+/// "The public IP address can only be assigned to a network interface for eth0, and can only
+/// be assigned to a new network interface, not an existing one. You cannot specify more than
+/// one network interface in the request"
+/// (`LaunchTemplateInstanceNetworkInterfaceSpecificationRequest$AssociatePublicIpAddress`):
+/// the assignment and a launch of several interfaces cannot both happen, so a version asking
+/// for both could launch no instance. Entirely fixed text — Amazon EC2's own wording for that
+/// conflict, naming the parameter and nothing of the request.
+const PUBLIC_ADDRESS_WITH_MULTIPLE_INTERFACES: &str =
+    "The associatePublicIPAddress parameter cannot be specified when launching with multiple \
+     network interfaces.";
+
+/// The refusal for a launch source whose launch-template version could launch NO instance at
+/// all, or `None` when every version it names could.
+///
+/// A group exists to launch instances from the version its specification names, so Amazon EC2
+/// Auto Scaling reads that version's launch parameters when the group is configured and
+/// refuses a request pointing it at parameters that cannot launch anything — the group would
+/// otherwise be left permanently unable to hold capacity, with nothing telling the caller
+/// why. The sentence is this service's own preamble for a launch source it cannot use
+/// ([`INVALID_LAUNCH_SOURCE`]) followed by Amazon EC2's own detail for the conflict, exactly
+/// as an instance profile that does not resolve is reported
+/// ([`super::iam_instance_profiles`]).
+///
+/// Asked of every specification the launch source carries, for the reason
+/// [`launch_template_identity_error`] reads them all: each is a template instances of the
+/// group are launched from.
+///
+/// `None` covers a version the account does not hold — a reference that resolves to nothing
+/// is [`unresolvable_launch_template_error`]'s refusal, and is read first — and an engine
+/// carrying no Amazon EC2 store: a refusal has to be grounded in launch parameters the
+/// account's Amazon EC2 state answered with, never assumed.
+pub fn unlaunchable_launch_template_error<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    launch_template: Option<&LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&MixedInstancesPolicy>,
+) -> Option<Scaffolded<E>> {
+    super::ec2_instances::specifications(launch_template, mixed_instances_policy)
+        .into_iter()
+        .filter_map(|specification| {
+            super::ec2_instances::launch_template_data(engine, specification)
+        })
+        .find_map(|data| unlaunchable_launch_parameters(&data))
+        .map(|detail| Scaffolded::validation_error(format!("{INVALID_LAUNCH_SOURCE} {detail}")))
+}
+
+/// Why the launch parameters of one launch-template version could launch no instance, or
+/// `None` for parameters that could.
+///
+/// ONE reading of those parameters, so the two operations that configure a group and the
+/// refresh that states a desired configuration cannot disagree about which versions are
+/// launchable. The conflict read here is the ASSIGNMENT of a public address on a launch of
+/// more than one interface — `Some(true)` is what asks for the assignment, the reading Amazon
+/// EC2's own launch path takes of the same member.
+fn unlaunchable_launch_parameters(
+    data: &::service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData,
+) -> Option<&'static str> {
+    let interfaces = data.network_interfaces.as_deref().unwrap_or_default();
+    (interfaces.len() > 1
+        && interfaces
+            .iter()
+            .any(|interface| interface.associate_public_ip_address == Some(true)))
+    .then_some(PUBLIC_ADDRESS_WITH_MULTIPLE_INTERFACES)
+}
+
 /// The refusal for a launch source naming a launch template — or a VERSION of one — the
 /// account does not hold, or `None` when every reference it names resolves.
 ///
