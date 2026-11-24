@@ -587,10 +587,11 @@ impl DbClusterRecord {
         )
     }
 
-    /// The DNS suffix BOTH of this cluster's endpoint names sit in.
+    /// The DNS suffix every name this cluster MINTS sits in ([`Self::minted_endpoint_name`],
+    /// [`Self::custom_endpoint_host`]).
     ///
     /// A cluster whose engine wire this emulator serves is reached on a listener of its own,
-    /// so its names sit in the zone that listener's address names
+    /// so a name it mints sits in the zone that listener's address names
     /// ([`served_endpoint_suffix`]) — the loopback zone for the interface the core binds on —
     /// and a cluster this emulator serves no plane for keeps the published AWS form, under the
     /// endpoint domain of the control plane that owns its engine ([`endpoint_domain`]).
@@ -610,9 +611,11 @@ impl DbClusterRecord {
     /// another zone than the cluster it fronts.
     ///
     /// A cluster whose data plane is an AWS API this emulator serves at its own endpoint is
-    /// read as [`Self::endpoint_name`] reads it, for the same reason: that plane answers on
-    /// this process's address and nowhere else, so a custom endpoint in front of it is
-    /// reached there too.
+    /// read as [`Self::endpoint`] reads it, for the same reason: that plane answers on this
+    /// process's address and nowhere else, so a custom endpoint in front of it is reached
+    /// there too. A custom endpoint this emulator opened a LISTENER for publishes that
+    /// listener's own address instead of the name composed here
+    /// ([`DbClusterEndpointRecord::to_wire`]).
     pub fn custom_endpoint_host(&self, named: &str) -> String {
         if let Some(served) = &self.served_endpoint {
             if engine_data_plane_is_an_api(&self.engine) {
@@ -666,7 +669,15 @@ impl DbClusterRecord {
     ///
     /// The CLUSTER mints the name, not any reader instance: it is therefore non-empty,
     /// distinct from the writer endpoint and of this form whatever the cluster's membership
-    /// is — a cluster with no Aurora Replica at all is still reached at it.
+    /// is — a cluster with no Aurora Replica at all is still reached at it. The
+    /// `cluster-ro-` label is what tells a read path from a write path, which is the whole of
+    /// what this member carries that the writer endpoint does not: the read-only plane is a
+    /// listener of its own ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own,
+    /// and the one `Port` the model gives the pair is the WRITER listener's, so the address a
+    /// client composes from this name and that port reaches the writer's plane. Publishing
+    /// the read-only listener's own address needs a resource to be dialable at a port of its
+    /// own, which the core does not offer (`vendor/server/src/listeners.rs` binds every
+    /// listener on the one operator-chosen interface at an OS-assigned port).
     ///
     /// It is the minted NAME and not an address of this emulator's, where the writer endpoint
     /// is the address the write path is answered at ([`Self::endpoint`]): the read-only plane

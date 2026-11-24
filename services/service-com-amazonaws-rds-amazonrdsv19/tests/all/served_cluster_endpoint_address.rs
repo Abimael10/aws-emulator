@@ -9,7 +9,7 @@
 //! nobody would not. The `cluster-ro-` name the cluster mints beside it is the read path, which
 //! is what a client that splits its traffic reads.
 //!
-//! A cluster this emulator serves NO data plane for keeps the same form under the published
+//! A cluster this emulator serves NO data plane for keeps the minted form under the published
 //! AWS domain — there is no local plane for such a cluster to lead a client to — which is the
 //! contrast row below.
 //!
@@ -188,9 +188,10 @@ async fn a_served_clusters_published_endpoint_is_the_address_its_engine_listener
             row.case
         );
 
-        // And that address leads to the listener's own: the name the cluster minted, in the
-        // zone the interface that listener is bound on names, with the listener's port beside
-        // it — so what the client resolves is the interface the plane answers on.
+        // And that address IS the listener's own: the host the core bound the cluster's
+        // listener on, with that listener's port beside it — so what the client dials is the
+        // interface the plane answers on. The reader member beside it is the `cluster-ro-`
+        // name the cluster mints in the zone that interface is reached in.
         let reader = text(&settled, "ReaderEndpoint");
         assert_served_endpoint_pair(row.case, row.identifier, REGION, &endpoint, &reader);
         let listener = listener_address(&engine, row.case, row.identifier);

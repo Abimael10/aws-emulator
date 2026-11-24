@@ -16,11 +16,13 @@
 //! 2. Each entry publishes the address of its OWN endpoint kind, the same address the
 //!    cluster's own report publishes for that kind: the connection endpoint's for the
 //!    `WRITER` entry, the reader endpoint's for the `READER` entry, and the custom endpoint's
-//!    own name for each `CUSTOM` entry — so the three names a cluster MINTS are distinct, and
-//!    an entry's address is never read off this emulator's bind address instead of the
-//!    cluster's endpoint for that kind. The one cluster class whose endpoints share an
-//!    address is the one whose whole data plane is served at this emulator's own endpoint,
-//!    where that address is where every one of its endpoints is reached.
+//!    own address for each `CUSTOM` entry — so no two of a cluster's endpoints collapse onto
+//!    one value. For a cluster whose wire this emulator serves, the kinds a client DIALS
+//!    publish the address of the listener that answers them (the cluster's own for `WRITER`,
+//!    the endpoint's own for `CUSTOM`) and the `READER` entry the `cluster-ro-` name the
+//!    cluster mints. The one cluster class whose endpoints share an address is the one whose
+//!    whole data plane is served at this emulator's own endpoint, where that address is where
+//!    every one of its endpoints is reached.
 //! 3. `DBClusterEndpointResourceIdentifier` is a server-minted id of the form
 //!    `cluster-endpoint-<token>`, whose token is of the width every server-assigned id of a
 //!    regional resource of this service carries, and it is the SAME value on the create, on
@@ -264,10 +266,11 @@ async fn the_report_lists_the_custom_endpoints_of_a_cluster_before_its_own_two()
 /// address a client reaches that endpoint at.
 #[derive(Debug, PartialEq, Eq)]
 enum Published {
-    /// A cluster whose own engine LISTENER serves its data plane: the writer and reader
-    /// entries publish the names the cluster mints for them, in the zone the interface those
-    /// listeners are bound on names, and the custom endpoint the address of the listener
-    /// OPENED FOR IT — a client dials the members that endpoint selects there.
+    /// A cluster whose own engine LISTENER serves its data plane: the writer entry publishes
+    /// the address that listener answers on, the reader entry the `cluster-ro-` name the
+    /// cluster mints in the zone the interface it is bound on names, and the custom endpoint
+    /// the address of the listener OPENED FOR IT — a client dials the members that endpoint
+    /// selects there.
     NamesWithCustomListener,
     /// A cluster whose data plane is an AWS API this emulator serves at its OWN endpoint:
     /// every endpoint of such a cluster is reached at that one address, because its plane
@@ -400,11 +403,13 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                     );
                 }
                 // Each minted name carries the label its kind is published under, in front of
-                // the resource it belongs to — for the endpoints that publish a NAME. A custom
-                // endpoint of a cluster this emulator serves the wire of publishes its OWN
-                // listener's address instead, which is what routes a session to the members
-                // that endpoint selects, and which carries that listener's port because the
-                // modelled endpoint shape has no port member of its own.
+                // the resource it belongs to — for the endpoints that publish a NAME. A cluster
+                // whose wire this emulator serves publishes an ADDRESS for the two kinds a
+                // client dials: its WRITER endpoint is the host its engine listener answers on,
+                // and a custom endpoint of it its OWN listener's address, which is what routes
+                // a session to the members that endpoint selects and which carries that
+                // listener's port because the modelled endpoint shape has no port member of its
+                // own.
                 match row.expected {
                     Published::NamesWithCustomListener => {
                         let (host, port) = custom.rsplit_once(':').unwrap_or_else(|| {
@@ -466,17 +471,23 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                 }
             }
         }
-        // Every entry that publishes a NAME publishes a bare HOST: the cluster has one
-        // `Port` member for all of its endpoints, so no such entry carries a port or a scheme
-        // of its own. The one address that does carry a port is a custom endpoint's own
-        // listener (asserted above), which the cluster's `Port` does not answer on.
+        // Every entry a client dials publishes a bare HOST: the cluster has one `Port` member
+        // for all of its endpoints, so no such entry carries a port or a scheme of its own. The
+        // one address that does carry a port is a custom endpoint's own listener (asserted
+        // above), which the cluster's `Port` does not answer on. A published ADDRESS is read as
+        // one first — an IPv6 literal carries colons of its own — so only a trailing `:<port>`
+        // on a value that is NOT an address is the violation.
         let bare: Vec<(&str, &String)> = match row.expected {
             Published::NamesWithCustomListener => vec![(WRITER, &writer), (READER, &reader)],
             _ => vec![(CUSTOM, &custom), (WRITER, &writer), (READER, &reader)],
         };
         for (which, address) in bare {
+            let carries_a_port = address.parse::<std::net::IpAddr>().is_err()
+                && address
+                    .rsplit_once(':')
+                    .is_some_and(|(_host, port)| port.parse::<u16>().is_ok());
             assert!(
-                !address.is_empty() && !address.contains(':') && !address.contains('/'),
+                !address.is_empty() && !carries_a_port && !address.contains('/'),
                 "case {:?}: the {which} entry publishes a bare host, got {address:?}",
                 row.case
             );

@@ -1117,7 +1117,7 @@ fn output_cases() -> Vec<OutputCase> {
                     "ClusterReaderEndpoint",
                     Expected::Form {
                         described: "the cluster's reader endpoint name, which carries the \
-                                    `cluster-ro-` label over the same suffix",
+                                    `cluster-ro-` label",
                         check: |value| {
                             is_served_rds_cluster_endpoint(
                                 value,

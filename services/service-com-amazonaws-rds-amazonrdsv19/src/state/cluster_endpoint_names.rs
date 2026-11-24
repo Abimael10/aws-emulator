@@ -79,9 +79,10 @@ pub fn cluster_endpoint_host(
     format!("{identifier}.{role}{label}.{region}.{suffix}")
 }
 
-/// The DNS suffix the endpoints of a cluster whose data plane this emulator SERVES sit in:
-/// the service label of the control plane that owns the cluster's engine, in the zone a
-/// resolver answers with the interface the cluster's listener is bound on.
+/// The DNS suffix a name MINTED for a cluster whose data plane this emulator SERVES sits in
+/// (its reader endpoint, and a custom endpoint with no listener of its own): the service
+/// label of the control plane that owns the cluster's engine, in the zone a resolver answers
+/// with the interface the cluster's listener is bound on.
 ///
 /// `endpoint_domain` is that control plane's own endpoint domain
 /// (`rds.amazonaws.com`, `docdb.amazonaws.com`, `neptune.amazonaws.com`): its FIRST label is
