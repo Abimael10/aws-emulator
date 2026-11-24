@@ -59,14 +59,45 @@
 //! * WHAT a `clientToken` answers for: a repeat of THAT removal, whether the token was
 //!   the caller's or the one the removal minted for a request that carried none — and
 //!   not for a removal on a share that is gone, nor for a different removal.
+//!
+//! The BULK half of the same rule is driven by the rows at the very end of this file:
+//! `ReplacePermissionAssociations` moves every resource share governed by one managed
+//! permission onto another one, at that permission's current default version, as a
+//! background task the call reports and `ListReplacePermissionAssociationsWork` reads
+//! back (its own stub issue: 20261123T230154Z-ram-replacepermissionassociations-stub.md).
+//! Those rows vary along what the bulk rule generalises over too:
+//!
+//! * WHICH permissions the task names: the same permission on both ends (which moves
+//!   every share onto its current default version), two customer managed permissions, a
+//!   customer managed one replaced by an AWS managed one, and an AWS managed one replaced
+//!   by a customer managed one;
+//! * WHICH VERSION the request restricts the task to: none at all, and one version of
+//!   several — which moves the shares holding that version and leaves the others alone;
+//! * WHICH SHARES the task reaches: the ones governed by the old permission, not a share
+//!   governed by another permission, and not an attachment of another resource type on a
+//!   share it does reach;
+//! * WHEN the move is observable: not while the task is in flight, and on every later
+//!   read once the clock has made it due;
+//! * WHAT a `clientToken` answers for: a repeat of THAT request, which starts no second
+//!   task, and not a different request that reuses the token;
+//! * HOW the tasks are read back: by id, by status, and one page at a time;
+//! * WHAT a replacement that cannot be made answers: a value that is not a permission
+//!   ARN, a version below the first one or one the permission never carried, a permission
+//!   nothing answers to, and two permissions for different resource types.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ram_amazonresourcesharing::state::{
     aws_managed_permission_arn, last_permission_for_resource_type_message,
-    permission_arn_rejection, permission_not_attached_message, share_arn_rejection,
+    permission_arn_rejection, permission_not_attached_message,
+    permission_resource_type_mismatch_message, permission_version_below_first_message,
+    share_arn_rejection, unknown_permission_message, unknown_permission_version_message,
     unknown_share_message, FIRST_PERMISSION_VERSION, IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
     MAX_ENTITIES_PER_CALL, MAX_PERMISSION_VERSIONS, PERMISSION_FEATURE_SET_STANDARD,
-    PERMISSION_TYPE_CUSTOMER_MANAGED, SHARE_PERMISSION_STATUS_ASSOCIATED,
+    PERMISSION_TYPE_CUSTOMER_MANAGED, REPLACE_PERMISSION_ASSOCIATIONS_COMPLETED_AFTER_MILLIS,
+    REPLACE_WORK_STATUS_COMPLETED, REPLACE_WORK_STATUS_IN_PROGRESS,
+    SHARE_PERMISSION_STATUS_ASSOCIATED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -2490,5 +2521,823 @@ async fn a_removals_token_does_not_answer_for_a_share_that_is_gone() {
         error_message(&refused),
         unknown_share_message(&share_arn),
         "case {case:?}: unexpected refusal wording, got {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ReplacePermissionAssociations: the bulk half of the same rule — every share
+// governed by one managed permission moved onto another one, by a background
+// task the call reports and `ListReplacePermissionAssociationsWork` reads back.
+// ---------------------------------------------------------------------------
+
+/// How long a poll for a replacement task to complete keeps looking. Nothing sleeps
+/// server-side: the move is one the clock owes and the first call at or after it falls
+/// due is what materialises it, so the loop waits for the CONDITION and this is only the
+/// point at which it gives up — deliberately far beyond the span itself, so a loaded host
+/// still passes.
+const REPLACE_POLL_DEADLINE: Duration =
+    Duration::from_millis((REPLACE_PERMISSION_ASSOCIATIONS_COMPLETED_AFTER_MILLIS as u64) * 20);
+
+/// How long the poll loop waits between looks.
+const REPLACE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// A Glue database permission the catalog publishes as that type's default, and one it
+/// publishes at a later version that is NOT the default, so a replacement onto it must
+/// report the version that permission's own default is.
+const GLUE_DATABASE_DEFAULT: &str = "AWSRAMDefaultPermissionGlueDatabase";
+const GLUE_DATABASE_READ_WRITE: &str = "AWSRAMPermissionGlueDatabaseReadWrite";
+/// The version the catalog publishes [`GLUE_DATABASE_READ_WRITE`] at, which is therefore
+/// its default version (`ListPermissions` reports it).
+const GLUE_DATABASE_READ_WRITE_VERSION: i32 = 3;
+
+async fn replace(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/replacepermissionassociations", Some(body)).await
+}
+
+async fn list_work(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        "/listreplacepermissionassociationswork",
+        Some(body),
+    )
+    .await
+}
+
+/// The background tasks a read reported.
+fn works_of(case: &str, body: &Value) -> Vec<Value> {
+    body.get("replacePermissionAssociationsWorks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: response carried no replacePermissionAssociationsWorks, got \
+                 {body:?}"
+            )
+        })
+}
+
+/// Start a replacement that must be served, and answer the task it reported — which a
+/// call that has only just started it reports in flight.
+async fn replace_ok(router: &MultiServiceRouter, case: &str, request: &Value) -> Value {
+    let (status, answered) = replace(router, request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {request}, got {status} with {answered:?}"
+    );
+    assert!(
+        answered
+            .get("clientToken")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty()),
+        "case {case:?}: a replacement reports the idempotency token it used, got {answered:?}"
+    );
+    let work = answered
+        .get("replacePermissionAssociationsWork")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the call reported no background task, got {answered:?}")
+        });
+    assert_eq!(
+        field(case, &work, "status"),
+        REPLACE_WORK_STATUS_IN_PROGRESS,
+        "case {case:?}: the task the call starts is still in flight, got {work:?}"
+    );
+    work
+}
+
+/// The one task `work_id` names, read back through `ListReplacePermissionAssociationsWork`.
+async fn one_work(router: &MultiServiceRouter, case: &str, work_id: &str) -> Value {
+    let (status, body) = list_work(router, &json!({"workIds": [work_id]})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reading task {work_id}, got {status} with {body:?}"
+    );
+    let reported = works_of(case, &body);
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: a read naming one task id reports exactly that task, got {reported:?}"
+    );
+    assert_eq!(
+        field(case, &reported[0], "id"),
+        work_id,
+        "case {case:?}: the task reported is the one asked for, got {reported:?}"
+    );
+    reported[0].clone()
+}
+
+/// Look at the task until it reports `COMPLETED`, or the deadline passes, and answer the
+/// task that reported it.
+async fn poll_until_completed(router: &MultiServiceRouter, case: &str, work_id: &str) -> Value {
+    let give_up_at = Instant::now() + REPLACE_POLL_DEADLINE;
+    loop {
+        let reported = one_work(router, case, work_id).await;
+        let status = field(case, &reported, "status");
+        if status == REPLACE_WORK_STATUS_COMPLETED {
+            return reported;
+        }
+        assert_eq!(
+            status, REPLACE_WORK_STATUS_IN_PROGRESS,
+            "case {case:?}: a task that has not completed is in flight, got {reported:?}"
+        );
+        assert!(
+            Instant::now() < give_up_at,
+            "case {case:?}: expected task {work_id} to report \
+             {REPLACE_WORK_STATUS_COMPLETED}, still {status:?} after {REPLACE_POLL_DEADLINE:?}"
+        );
+        std::thread::sleep(REPLACE_POLL_INTERVAL);
+    }
+}
+
+/// The version of `permission_arn` the share `share_arn` is governed by, and whether that
+/// is the permission's default version.
+async fn governed_at(
+    router: &MultiServiceRouter,
+    case: &str,
+    share_arn: &str,
+    permission_arn: &str,
+) -> (String, bool) {
+    let reported = listed(router, case, share_arn).await;
+    let held = reported
+        .iter()
+        .find(|permission| field(case, permission, "arn") == permission_arn)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: share {share_arn} reports no permission {permission_arn}, got \
+                 {reported:?}"
+            )
+        });
+    (
+        field(case, held, "version"),
+        flag(case, held, "defaultVersion"),
+    )
+}
+
+/// Write a further version of `permission_arn`, which becomes its default version, and
+/// assert the write was served.
+async fn write_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    permission_arn: &str,
+    action: &str,
+) {
+    let (status, written) = create_permission_version(
+        router,
+        &json!({"permissionArn": permission_arn, "policyTemplate": policy_template(action)}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 writing a further version of {permission_arn}, got \
+         {status} with {written:?}"
+    );
+}
+
+/// One row of the replacement table: the permission a share is governed by, the one the
+/// task moves it onto, and what the share must report once the task has run.
+struct ReplaceRow {
+    case: &'static str,
+    /// The permission the subject share is governed by when the replacement is made.
+    from: String,
+    /// An action to write a further version of `from` with after the share attached it,
+    /// so the permission's default version has moved past the one the share holds.
+    revise_from: Option<&'static str>,
+    /// The version the request restricts the task to, or `None` for every version of
+    /// `from`.
+    from_version: Option<i32>,
+    /// The permission the task moves the share onto.
+    to: String,
+    /// The version of `to` the task must associate: that permission's default version.
+    to_version: i32,
+    /// A permission of ANOTHER resource type the share also holds, which the task must
+    /// leave exactly where it is.
+    kept: Vec<String>,
+}
+
+impl ReplaceRow {
+    /// Govern a share by this row's permission, replace it, and assert that the share is
+    /// moved onto the new permission at its default version — and not before the task
+    /// the call reported has completed.
+    async fn run(&self, router: &MultiServiceRouter, suffix: &str) {
+        let case = self.case;
+        let share_arn = share_with(
+            router,
+            case,
+            &json!({"name": format!("replace-subject-{suffix}"), "resourceArns": []}),
+        )
+        .await;
+        attach_ok(router, case, &share_arn, &self.from).await;
+        for kept in &self.kept {
+            attach_ok(router, case, &share_arn, kept).await;
+        }
+        let (held_version, _) = governed_at(router, case, &share_arn, &self.from).await;
+        if let Some(action) = self.revise_from {
+            write_version(router, case, &self.from, action).await;
+        }
+
+        let mut request = json!({"fromPermissionArn": self.from, "toPermissionArn": self.to});
+        if let Some(version) = self.from_version {
+            request["fromPermissionVersion"] = json!(version);
+        }
+        let work = replace_ok(router, case, &request).await;
+        assert_eq!(
+            (
+                field(case, &work, "fromPermissionArn"),
+                field(case, &work, "toPermissionArn"),
+                field(case, &work, "toPermissionVersion"),
+                work.get("fromPermissionVersion")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ),
+            (
+                self.from.clone(),
+                self.to.clone(),
+                self.to_version.to_string(),
+                self.from_version.map(|version| version.to_string()),
+            ),
+            "case {case:?}: the task reports the replacement it was asked for, at the target \
+             permission's default version, got {work:?}"
+        );
+
+        // The move is the task's work, so a read taken before it has run still reports
+        // the attachment the share made for itself.
+        assert_eq!(
+            (
+                listed_arns(router, case, &share_arn).await,
+                governed_at(router, case, &share_arn, &self.from).await.0,
+            ),
+            (
+                {
+                    let mut before = self.kept.clone();
+                    before.push(self.from.clone());
+                    before.sort();
+                    before
+                },
+                held_version.clone()
+            ),
+            "case {case:?}: while the task is in flight the share is still governed by {} at \
+             version {held_version}",
+            self.from
+        );
+
+        let work_id = field(case, &work, "id");
+        poll_until_completed(router, case, &work_id).await;
+
+        let mut expected = self.kept.clone();
+        expected.push(self.to.clone());
+        expected.sort();
+        assert_eq!(
+            listed_arns(router, case, &share_arn).await,
+            expected,
+            "case {case:?}: once the task has run the share is governed by {} and keeps {:?}",
+            self.to,
+            self.kept
+        );
+        assert_eq!(
+            governed_at(router, case, &share_arn, &self.to).await,
+            (self.to_version.to_string(), true),
+            "case {case:?}: the task associates the target permission's current default version"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_moves_every_share_governed_by_the_old_permission() {
+    let router = emulator();
+    let case = "mint the permissions the replacement rows name";
+    let propagated = mint(
+        &router,
+        case,
+        "ComponentPropagated",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let pinned = mint(
+        &router,
+        case,
+        "ComponentPinned",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let replaced = mint(
+        &router,
+        case,
+        "ComponentReplaced",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let target = mint(
+        &router,
+        case,
+        "ComponentTarget",
+        COMPONENT_TYPE,
+        "imagebuilder:ListComponents",
+    )
+    .await;
+    let promoted = mint(
+        &router,
+        case,
+        "ComponentPromoted",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let glue_reader = mint(
+        &router,
+        case,
+        "GlueDatabaseReader",
+        "glue:Database",
+        "glue:GetDatabase",
+    )
+    .await;
+
+    let rows = [
+        ReplaceRow {
+            case: "the same permission, propagating the default version it now has",
+            from: propagated.clone(),
+            revise_from: Some("imagebuilder:ListComponents"),
+            from_version: None,
+            to: propagated.clone(),
+            to_version: FIRST_PERMISSION_VERSION + 1,
+            // A permission for another resource type is another attachment entirely, so
+            // the task must leave it alone.
+            kept: vec![managed(GLUE_DATABASE_DEFAULT)],
+        },
+        ReplaceRow {
+            case: "the same permission, restricted to the version the share holds",
+            from: pinned.clone(),
+            revise_from: Some("imagebuilder:ListComponents"),
+            from_version: Some(FIRST_PERMISSION_VERSION),
+            to: pinned.clone(),
+            to_version: FIRST_PERMISSION_VERSION + 1,
+            kept: vec![],
+        },
+        ReplaceRow {
+            case: "another customer managed permission for the same resource type",
+            from: replaced.clone(),
+            revise_from: None,
+            from_version: None,
+            to: target.clone(),
+            to_version: FIRST_PERMISSION_VERSION,
+            kept: vec![],
+        },
+        ReplaceRow {
+            case: "an AWS managed permission for the same resource type",
+            from: glue_reader.clone(),
+            revise_from: None,
+            from_version: None,
+            to: managed(GLUE_DATABASE_READ_WRITE),
+            // The catalog publishes that permission at a later version, which is its
+            // default — not the first version.
+            to_version: GLUE_DATABASE_READ_WRITE_VERSION,
+            kept: vec![],
+        },
+        ReplaceRow {
+            case: "a customer managed permission replacing an AWS managed one",
+            from: managed(COMPONENT_TYPE_DEFAULT),
+            revise_from: None,
+            from_version: None,
+            to: promoted.clone(),
+            to_version: FIRST_PERMISSION_VERSION,
+            kept: vec![],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        row.run(&router, &index.to_string()).await;
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_restricted_to_a_version_moves_only_the_shares_holding_it() {
+    let router = emulator();
+    let case = "a task restricted to one version of the permission";
+    let permission = mint(
+        &router,
+        case,
+        "ComponentVersionSelected",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let other = mint(
+        &router,
+        case,
+        "ComponentUntouched",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+
+    // The first share attaches the permission's only version.
+    let first = share_with(
+        &router,
+        case,
+        &json!({"name": "replace-version-first", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &first, &permission).await;
+
+    // A second version becomes the default, and the second share attaches that one.
+    write_version(&router, case, &permission, "imagebuilder:ListComponents").await;
+    let second = share_with(
+        &router,
+        case,
+        &json!({"name": "replace-version-second", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &second, &permission).await;
+
+    // A third share is governed by another permission entirely.
+    let bystander = share_with(
+        &router,
+        case,
+        &json!({"name": "replace-version-bystander", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &bystander, &other).await;
+
+    // A third version becomes the default, so no share holds it yet.
+    write_version(&router, case, &permission, "imagebuilder:GetComponentPolicy").await;
+    let default_version = FIRST_PERMISSION_VERSION + 2;
+
+    let work = replace_ok(
+        &router,
+        case,
+        &json!({
+            "fromPermissionArn": permission,
+            "fromPermissionVersion": FIRST_PERMISSION_VERSION,
+            "toPermissionArn": permission,
+        }),
+    )
+    .await;
+    let work_id = field(case, &work, "id");
+    poll_until_completed(&router, case, &work_id).await;
+
+    // The share holding the version the request named is moved to the permission's
+    // current default version; the one holding another version keeps it, and the share
+    // the permission does not govern is untouched.
+    assert_eq!(
+        governed_at(&router, case, &first, &permission).await,
+        (default_version.to_string(), true),
+        "case {case:?}: the share holding version {FIRST_PERMISSION_VERSION} is moved to the \
+         default version {default_version}"
+    );
+    assert_eq!(
+        governed_at(&router, case, &second, &permission).await,
+        ((FIRST_PERMISSION_VERSION + 1).to_string(), false),
+        "case {case:?}: the share holding another version of the permission keeps it"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &bystander).await,
+        vec![other.clone()],
+        "case {case:?}: a share the replaced permission does not govern is left alone"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_that_cannot_be_made_is_refused_and_starts_no_task() {
+    let router = emulator();
+    let case = "set up the permissions the refused rows name";
+    let component = mint(
+        &router,
+        case,
+        "ComponentRefusals",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let share_arn = share_with(
+        &router,
+        case,
+        &json!({"name": "replace-refusals", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &share_arn, &component).await;
+    let missing = customer("ComponentNothingStored");
+    let beyond = FIRST_PERMISSION_VERSION + 3;
+
+    let rows = [
+        (
+            "a fromPermissionArn that is not a permission ARN",
+            json!({"fromPermissionArn": "component-reader", "toPermissionArn": component}),
+            "MalformedArnException",
+            permission_arn_rejection("fromPermissionArn", "component-reader")
+                .expect("a value that is not a permission ARN is refused"),
+        ),
+        (
+            "a toPermissionArn naming another kind of resource",
+            json!({"fromPermissionArn": component, "toPermissionArn": share_arn}),
+            "MalformedArnException",
+            permission_arn_rejection("toPermissionArn", &share_arn)
+                .expect("a share ARN is not a permission ARN"),
+        ),
+        (
+            "a version below the first one any permission carries",
+            json!({
+                "fromPermissionArn": component,
+                "fromPermissionVersion": FIRST_PERMISSION_VERSION - 1,
+                "toPermissionArn": component,
+            }),
+            "InvalidParameterException",
+            permission_version_below_first_message("fromPermissionVersion"),
+        ),
+        (
+            "a fromPermissionArn nothing is stored under",
+            json!({"fromPermissionArn": missing, "toPermissionArn": component}),
+            "UnknownResourceException",
+            unknown_permission_message(&missing),
+        ),
+        (
+            "a toPermissionArn nothing is stored under",
+            json!({"fromPermissionArn": component, "toPermissionArn": missing}),
+            "UnknownResourceException",
+            unknown_permission_message(&missing),
+        ),
+        (
+            "a version the permission never carried",
+            json!({
+                "fromPermissionArn": component,
+                "fromPermissionVersion": beyond,
+                "toPermissionArn": component,
+            }),
+            "UnknownResourceException",
+            unknown_permission_version_message(&component, beyond),
+        ),
+        (
+            "two permissions for different resource types",
+            json!({
+                "fromPermissionArn": component,
+                "toPermissionArn": managed(GLUE_DATABASE_DEFAULT),
+            }),
+            "InvalidParameterException",
+            permission_resource_type_mismatch_message(
+                &component,
+                COMPONENT_TYPE,
+                &managed(GLUE_DATABASE_DEFAULT),
+                "glue:Database",
+            ),
+        ),
+    ];
+
+    for (case, request, code, message) in rows {
+        let (status, refused) = replace(&router, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {request}, got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            code,
+            "case {case:?}: expected {code}, got {refused:?}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            message,
+            "case {case:?}: unexpected refusal wording, got {refused:?}"
+        );
+    }
+
+    // A refused request starts nothing: no task is held and the share is governed by
+    // exactly what it attached.
+    let (status, listed_tasks) = list_work(&router, &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reading the tasks, got {status} with {listed_tasks:?}"
+    );
+    assert_eq!(
+        works_of(case, &listed_tasks),
+        Vec::<Value>::new(),
+        "case {case:?}: every replacement above was refused, so no task was started"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &share_arn).await,
+        vec![component.clone()],
+        "case {case:?}: a refused replacement moved nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_replacements_client_token_answers_for_a_repeat_of_that_request() {
+    let router = emulator();
+    let case = "a repeat of the same replacement";
+    let component = mint(
+        &router,
+        case,
+        "ComponentTokened",
+        COMPONENT_TYPE,
+        "imagebuilder:GetComponent",
+    )
+    .await;
+    let target = mint(
+        &router,
+        case,
+        "ComponentTokenedTarget",
+        COMPONENT_TYPE,
+        "imagebuilder:ListComponents",
+    )
+    .await;
+    let token = "ram-replace-token";
+    let request = json!({
+        "fromPermissionArn": component,
+        "toPermissionArn": target,
+        "clientToken": token,
+    });
+
+    let first = replace_ok(&router, case, &request).await;
+    let repeat = replace_ok(&router, case, &request).await;
+    assert_eq!(
+        field(case, &repeat, "id"),
+        field(case, &first, "id"),
+        "case {case:?}: a repeat reports the task the first call started, got {repeat:?}"
+    );
+    let (status, listed_tasks) = list_work(&router, &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reading the tasks, got {status} with {listed_tasks:?}"
+    );
+    assert_eq!(
+        works_of(case, &listed_tasks).len(),
+        1,
+        "case {case:?}: the repeat started no second task, got {listed_tasks:?}"
+    );
+
+    // The same token with any other parameter is a different request.
+    let case = "the same token for a different replacement";
+    let (status, refused) = replace(
+        &router,
+        &json!({
+            "fromPermissionArn": target,
+            "toPermissionArn": component,
+            "clientToken": token,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "IdempotentParameterMismatchException",
+        "case {case:?}: expected IdempotentParameterMismatchException, got {refused:?}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+        "case {case:?}: unexpected refusal wording, got {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_task_read_selects_by_id_and_status_and_pages_in_id_order() {
+    let router = emulator();
+    let case = "three tasks to read back";
+    let mut permissions = Vec::new();
+    for name in ["ComponentListedOne", "ComponentListedTwo", "ComponentListedThree"] {
+        permissions.push(
+            mint(
+                &router,
+                case,
+                name,
+                COMPONENT_TYPE,
+                "imagebuilder:GetComponent",
+            )
+            .await,
+        );
+    }
+    let mut ids = Vec::new();
+    for permission in &permissions {
+        let work = replace_ok(
+            &router,
+            case,
+            &json!({"fromPermissionArn": permission, "toPermissionArn": permission}),
+        )
+        .await;
+        ids.push(field(case, &work, "id"));
+    }
+    let mut ordered = ids.clone();
+    ordered.sort();
+
+    let reported_ids = |body: &Value| -> Vec<String> {
+        works_of(case, body)
+            .iter()
+            .map(|work| field(case, work, "id"))
+            .collect()
+    };
+
+    // A read that names no filter reports every task, in id order.
+    let (status, every) = list_work(&router, &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {every:?}"
+    );
+    assert_eq!(
+        reported_ids(&every),
+        ordered,
+        "case {case:?}: every task is reported, in id order"
+    );
+
+    // `workIds` selects exactly the tasks it names, and an id nothing answers to selects
+    // nothing.
+    let wanted = vec![ids[0].clone(), ids[2].clone()];
+    let mut wanted_order = wanted.clone();
+    wanted_order.sort();
+    let (_, selected) = list_work(&router, &json!({"workIds": wanted})).await;
+    assert_eq!(
+        reported_ids(&selected),
+        wanted_order,
+        "case {case:?}: a read naming ids reports those tasks only"
+    );
+    let (_, none) = list_work(
+        &router,
+        &json!({"workIds": ["00000000-0000-4000-8000-000000000000"]}),
+    )
+    .await;
+    assert_eq!(
+        reported_ids(&none),
+        Vec::<String>::new(),
+        "case {case:?}: an id no task answers to reports nothing"
+    );
+
+    // `status` selects by where a task has got to: in flight now, completed once the
+    // clock has made each move due.
+    let (_, in_flight) =
+        list_work(&router, &json!({"status": REPLACE_WORK_STATUS_IN_PROGRESS})).await;
+    assert_eq!(
+        reported_ids(&in_flight),
+        ordered,
+        "case {case:?}: every task is in flight while its move is not due"
+    );
+    for id in &ordered {
+        poll_until_completed(&router, case, id).await;
+    }
+    let (_, completed) =
+        list_work(&router, &json!({"status": REPLACE_WORK_STATUS_COMPLETED})).await;
+    assert_eq!(
+        reported_ids(&completed),
+        ordered,
+        "case {case:?}: every task has completed once its move fell due"
+    );
+    let (_, still_in_flight) =
+        list_work(&router, &json!({"status": REPLACE_WORK_STATUS_IN_PROGRESS})).await;
+    assert_eq!(
+        reported_ids(&still_in_flight),
+        Vec::<String>::new(),
+        "case {case:?}: no task is left in flight"
+    );
+
+    // One page at a time: a page holds at most `maxResults` tasks and the token walks
+    // the rest, each task exactly once.
+    for page_size in 1..=4 {
+        let case = format!("pages of {page_size}");
+        let mut walked = Vec::new();
+        let mut next_token: Option<String> = None;
+        for _ in 0..=ordered.len() {
+            let mut request = json!({"maxResults": page_size});
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let (status, page) = list_work(&router, &request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {page:?}"
+            );
+            let on_page = works_of(&case, &page);
+            assert!(
+                on_page.len() <= page_size,
+                "case {case:?}: a page holds at most {page_size} tasks, got {on_page:?}"
+            );
+            walked.extend(on_page.iter().map(|work| field(&case, work, "id")));
+            next_token = page
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if next_token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            (walked, next_token),
+            (ordered.clone(), None),
+            "case {case:?}: following nextToken walks every task exactly once"
+        );
+    }
+
+    // A token this read never issued is refused.
+    let case = "a token this read never issued";
+    let (status, refused) = list_work(&router, &json!({"nextToken": "not-a-token"})).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "InvalidNextTokenException",
+        "case {case:?}: expected InvalidNextTokenException, got {refused:?}"
     );
 }

@@ -144,9 +144,13 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// not anybody asks. The delete of ONE version is the same owed move, so it is
     /// settled from here too
     /// ([`ComAmazonawsRamAmazonresourcesharingState::settle_due_permission_versions`]):
-    /// every call that settles a permission settles its versions.
+    /// every call that settles a permission settles its versions. So is the background
+    /// task `ReplacePermissionAssociations` starts
+    /// ([`ComAmazonawsRamAmazonresourcesharingState::settle_due_permission_replacements`]),
+    /// which is owed on the same terms.
     pub fn settle_due_permissions(&mut self, now: i64) {
         self.settle_due_permission_versions(now);
+        self.settle_due_permission_replacements(now);
         for permission in self.permissions.values_mut() {
             let Some(deletion) = &mut permission.deletion else {
                 continue;

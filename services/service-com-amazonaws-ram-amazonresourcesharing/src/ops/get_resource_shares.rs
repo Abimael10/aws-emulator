@@ -237,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let now = store.tick();
         store.settle_due_associations(now);
+        // The `permissionArn` filter answers which permissions govern a share, so a
+        // `ReplacePermissionAssociations` task whose move has fallen due has to be
+        // materialised here too before the filter is applied.
+        store.settle_due_permission_replacements(now);
 
         // An ARN the caller names explicitly must belong to a share this emulator
         // holds; one that does not is the `UnknownResourceException` case, told apart

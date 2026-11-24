@@ -26,12 +26,14 @@
 mod aws_managed_permissions;
 mod permission_attachments;
 mod permission_deletion;
+mod permission_replacement;
 mod permission_version_deletion;
 mod policy_actions;
 
 pub use aws_managed_permissions::*;
 pub use permission_attachments::*;
 pub use permission_deletion::*;
+pub use permission_replacement::*;
 pub use permission_version_deletion::*;
 pub use policy_actions::*;
 
@@ -921,9 +923,10 @@ pub struct ClientTokenRecord {
     /// A later call with the same token and a different digest is the
     /// `IdempotentParameterMismatchException` case.
     pub fingerprint: String,
-    /// The ARN of the resource the first call acted on — a resource share or a
-    /// managed permission — so the repeat can answer from the store rather than from
-    /// a cached body.
+    /// What the first call acted on, so the repeat can answer from the store rather
+    /// than from a cached body: the ARN of a resource share or a managed permission,
+    /// or — where the call started one — the id of the background task it recorded
+    /// ([`ReplaceWorkRecord`]).
     pub resource_arn: String,
 }
 
@@ -945,6 +948,11 @@ pub struct ComAmazonawsRamAmazonresourcesharingState {
     /// name is unique within a Region and its ARN carries that name, so one name in
     /// one Region is one entry here.
     pub permissions: BTreeMap<String, PermissionRecord>,
+    /// Every `ReplacePermissionAssociations` background task this service has started,
+    /// keyed by the id the call that started it handed back ([`ReplaceWorkRecord`]). A
+    /// task is kept after it has run so a read can still report it, and the map is
+    /// capped by [`MAX_REPLACE_PERMISSION_ASSOCIATIONS_WORKS`].
+    pub replace_permission_associations_works: BTreeMap<String, ReplaceWorkRecord>,
     /// `(operation, clientToken)` -> what that token already did.
     client_tokens: HashMap<(String, String), ClientTokenRecord>,
     /// The order tokens were remembered in, so the oldest can be forgotten at the
@@ -966,6 +974,7 @@ impl Default for ComAmazonawsRamAmazonresourcesharingState {
             associations: BTreeMap::new(),
             invitations: BTreeMap::new(),
             permissions: aws_managed_permissions::catalog_records(now_millis()),
+            replace_permission_associations_works: BTreeMap::new(),
             client_tokens: HashMap::new(),
             client_token_order: VecDeque::new(),
             id_counter: 0,

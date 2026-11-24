@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReplacePermissionAssociationsWork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReplacePermissionAssociationsWork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the `ReplacePermissionAssociations` background tasks held in
+//! [`crate::state`]: every one of them, or the ones whose id or status the request
+//! names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReplacePermissionAssociationsWork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A task is kept after it has run, so this read reports where each one got to — the
+//! task the call that started it answered `IN_PROGRESS`, and the same task `COMPLETED`
+//! once the move the clock owed it fell due. The tasks are keyed by id, so one page ends
+//! at an id and the opaque `nextToken` names the next page's first one.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +172,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReplacePermissionAssociationsWork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReplacePermissionAssociationsWorkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReplacePermissionAssociationsWork"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListReplacePermissionAssociationsWorkErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the managed permission store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The model bounds neither the length of the id list nor the ids in it, so both
+        // rules are applied here, rendered as the modelled error this read refuses a
+        // parameter with.
+        let work_ids = input.work_ids.unwrap_or_default();
+        if let Some(why) = crate::state::entity_count_rejection("workIds", work_ids.len())
+            .or_else(|| crate::state::entity_value_rejection("workIds", &work_ids))
+        {
+            return Err(
+                ListReplacePermissionAssociationsWorkErrorModeled::InvalidParameterException(
+                    InvalidParameterException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_replace_work_cursor(token).ok_or_else(
+                || {
+                    ListReplacePermissionAssociationsWorkErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: "nextToken is not a pagination token issued by \
+                                      ListReplacePermissionAssociationsWork"
+                                .to_string(),
+                        },
+                    )
+                },
+            )?),
+        };
+
+        let mut store = state.lock();
+        // A task whose move has fallen due has run whether or not anybody asked, so this
+        // read materialises that owed move before reporting: the only write it performs.
+        let now = store.tick();
+        store.settle_due_permission_replacements(now);
+
+        let mut works = Vec::with_capacity(
+            page_size.min(store.replace_permission_associations_works.len()),
+        );
+        let mut next_token = None;
+        // The tasks are keyed by id, so a token naming one starts this page at the first
+        // task at or after it.
+        for (id, work) in store
+            .replace_permission_associations_works
+            .range(start.unwrap_or_default()..)
+        {
+            // "Specifies that you want to see only the details about requests with a
+            // status that matches this value" (`status`), and the ids "come from the id
+            // field of the replacePermissionAssociationsWork structure returned by the
+            // ReplacePermissionAssociations operation" (`workIds`): a request naming
+            // neither asks about every task.
+            if !work_ids.is_empty() && !work_ids.contains(id) {
+                continue;
+            }
+            if input
+                .status
+                .as_deref()
+                .is_some_and(|wanted| wanted != work.status)
+            {
+                continue;
+            }
+            // The first task that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if works.len() == page_size {
+                next_token = Some(crate::state::encode_replace_work_cursor(id));
+                break;
+            }
+            works.push(work.view());
+        }
+
+        Ok(ListReplacePermissionAssociationsWorkOutput {
+            replace_permission_associations_works: Some(works),
+            next_token,
+        })
     }
 }

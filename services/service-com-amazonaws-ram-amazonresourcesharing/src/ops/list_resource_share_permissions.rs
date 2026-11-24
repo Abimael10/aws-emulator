@@ -219,7 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?),
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A `ReplacePermissionAssociations` task whose move has fallen due has moved the
+        // shares it named whether or not anybody asked, so this read materialises that
+        // owed move before reporting which permissions govern the share: the only write
+        // it performs.
+        let now = store.tick();
+        store.settle_due_permission_replacements(now);
 
         // A share `DeleteResourceShare` has removed shares nothing, so it has no
         // permissions to report either.

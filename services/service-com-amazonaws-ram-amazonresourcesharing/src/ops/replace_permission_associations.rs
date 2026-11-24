@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplacePermissionAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplacePermissionAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the background task that moves every resource share governed by one managed
+//! permission onto another one, and reports that task.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplacePermissionAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The shares to move are the live ones holding the old permission by name — those
+//! attached at the version the request names, when it names one — and each of them is
+//! moved onto the new permission at its current default version, because this operation
+//! "always applies the default version of the target managed permission". The move is
+//! what the task performs, so the call records the task
+//! ([`crate::state::ComAmazonawsRamAmazonresourcesharingState::start_permission_replacement`])
+//! and answers it `IN_PROGRESS`; `ListReplacePermissionAssociationsWork` reports what
+//! became of it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +192,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplacePermissionAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplacePermissionAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplacePermissionAssociations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ReplacePermissionAssociationsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: "the managed permission store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // The model constrains none of these members, so every rule below is applied
+        // here, each rendered as the modelled error RAM words that refusal with.
+        if let Some(why) =
+            crate::state::permission_arn_rejection("fromPermissionArn", &input.from_permission_arn)
+                .or_else(|| {
+                    crate::state::permission_arn_rejection(
+                        "toPermissionArn",
+                        &input.to_permission_arn,
+                    )
+                })
+        {
+            return Err(
+                ReplacePermissionAssociationsErrorModeled::MalformedArnException(
+                    MalformedArnException { message: why },
+                )
+                .into(),
+            );
+        }
+        // Versions are numbered upward from the first one, so a number below it names no
+        // version any permission could carry.
+        if input
+            .from_permission_version
+            .is_some_and(|version| version < crate::state::FIRST_PERMISSION_VERSION)
+        {
+            return Err(
+                ReplacePermissionAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: crate::state::permission_version_below_first_message(
+                            "fromPermissionVersion",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(
+                ReplacePermissionAssociationsErrorModeled::InvalidClientTokenException(
+                    InvalidClientTokenException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+        store.settle_due_permissions(now);
+
+        // Every parameter other than the token itself, so a retry of this request is told
+        // apart from a different request that reuses the token.
+        let fingerprint = crate::state::fingerprint(&[
+            &input.from_permission_arn,
+            &input
+                .from_permission_version
+                .map(|version| version.to_string())
+                .unwrap_or_default(),
+            &input.to_permission_arn,
+        ]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        ReplacePermissionAssociationsErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat starts no second task: the one the first call started is the
+                // answer, reported from the store so the repeat also reports where it has
+                // got to since.
+                let work_id = record.resource_arn.clone();
+                if let Some(work) = store.replace_permission_associations_work(&work_id) {
+                    return Ok(ReplacePermissionAssociationsOutput {
+                        replace_permission_associations_work: Some(work.view()),
+                        client_token: Some(token),
+                    });
+                }
+            }
+        }
+
+        // A permission `DeletePermission` has deleted, or is deleting, is no longer one a
+        // resource share can be governed by, so neither end of a replacement can name one:
+        // [`live_permission`] reports it as the unknown resource it now is.
+        let from = store
+            .live_permission(&input.from_permission_arn)
+            .cloned()
+            .ok_or_else(|| {
+                ReplacePermissionAssociationsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_permission_message(
+                            &input.from_permission_arn,
+                        ),
+                    },
+                )
+            })?;
+        // A version the permission never carried names no attachment to move.
+        if let Some(requested) = input.from_permission_version {
+            if from.version(Some(requested)).is_none() {
+                return Err(
+                    ReplacePermissionAssociationsErrorModeled::UnknownResourceException(
+                        UnknownResourceException {
+                            message: crate::state::unknown_permission_version_message(
+                                &input.from_permission_arn,
+                                requested,
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        let to = store
+            .live_permission(&input.to_permission_arn)
+            .cloned()
+            .ok_or_else(|| {
+                ReplacePermissionAssociationsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_permission_message(
+                            &input.to_permission_arn,
+                        ),
+                    },
+                )
+            })?;
+        // "A resource share can have only one permission per resource type"
+        // (`AssociateResourceSharePermission$replace`), and a managed permission governs
+        // the resources of exactly one type, so a replacement holds only between two
+        // permissions for the same resource type.
+        if !crate::state::resource_type_matches(&from.resource_type, &to.resource_type) {
+            return Err(
+                ReplacePermissionAssociationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: crate::state::permission_resource_type_mismatch_message(
+                            &from.arn,
+                            &from.resource_type,
+                            &to.arn,
+                            &to.resource_type,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "The operation always associates the version that is currently the default for
+        // the specified managed permission" (`toPermissionArn`'s own documentation).
+        let to_version = to
+            .version(None)
+            .map(|version| version.version)
+            .ok_or_else(|| {
+                ReplacePermissionAssociationsErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_permission_message(
+                            &input.to_permission_arn,
+                        ),
+                    },
+                )
+            })?;
+
+        let work = store
+            .start_permission_replacement(
+                &input.from_permission_arn,
+                input.from_permission_version,
+                &input.to_permission_arn,
+                to_version,
+                now,
+            )
+            .ok_or_else(|| {
+                ReplacePermissionAssociationsErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: "The operation failed because the service isn't available. Try \
+                                  again later."
+                            .to_string(),
+                    },
+                )
+            })?;
+
+        // RAM generates a token when the request omits one and reports it either way, so a
+        // caller can repeat the call idempotently. The task the call started is what the
+        // token answers for, so its id is what the record remembers.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(Self::NAME, &client_token, fingerprint, work.id.clone());
+
+        Ok(ReplacePermissionAssociationsOutput {
+            replace_permission_associations_work: Some(work.view()),
+            client_token: Some(client_token),
+        })
     }
 }
