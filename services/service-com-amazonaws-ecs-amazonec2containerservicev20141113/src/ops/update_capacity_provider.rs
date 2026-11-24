@@ -328,25 +328,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A name that resolves to no LIVE provider of this account names nothing to update:
         // a retired provider is a tombstone no update can bring back. Amazon ECS answers an
-        // identifier it cannot RESOLVE in `ClientException` — "it might be specifying an
+        // identifier it cannot act on in `ClientException` — "it might be specifying an
         // identifier that isn't valid" — keeping `InvalidParameterException` for a parameter
         // value it will not accept, so a client branching on the code can tell "no such
-        // provider" from "bad request". The sentence is the one every report of this
-        // condition carries
-        // ([`crate::state::CAPACITY_PROVIDER_MISSING_MESSAGE`]), which a batch read reports
-        // as a `Failure$reason` because it has a channel for it and this operation reports
-        // as its error because it has none.
-        let Some(stored) = guard
-            .capacity_providers
-            .get_mut(&name)
-            .filter(|provider| provider.status != crate::state::CAPACITY_PROVIDER_INACTIVE)
-        else {
-            return Err(UpdateCapacityProviderErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::CAPACITY_PROVIDER_MISSING_MESSAGE.to_string()),
-                },
-            )
-            .into());
+        // provider" from "bad request".
+        //
+        // WHICH of the two conditions it is is reported too, since a delete KEEPS the
+        // provider as a tombstone the reads still report: a reference that resolves to that
+        // tombstone is refused for the provider HAVING BEEN deleted, and only one that
+        // resolves to no record of the account at all for naming no provider — the
+        // distinction [`crate::state::unresolved_capacity_provider_message`] draws, which is
+        // what lets a client reconciling a delete it made against an update still in flight
+        // tell it from an identifier it got wrong.
+        let stored = match guard.capacity_providers.get_mut(&name) {
+            Some(provider)
+                if provider.status != crate::state::CAPACITY_PROVIDER_INACTIVE =>
+            {
+                provider
+            }
+            resolved => {
+                let message = crate::state::capacity_provider_update_refusal_message(
+                    resolved.is_some(),
+                );
+                return Err(UpdateCapacityProviderErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
         };
 
         // `UpdateCapacityProvider$cluster`: "Managed instances capacity providers are

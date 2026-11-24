@@ -974,6 +974,13 @@ const UPDATE_POLL_BUDGET: Duration = Duration::from_secs(60);
 const UPDATE_UNRESOLVED_PROVIDER: &str = "The specified capacity provider does not exist. \
                                           Specify a valid name or ARN and try again.";
 
+/// The whole sentence an update whose `name` resolves to the TOMBSTONE a delete left behind
+/// is refused with instead, in the same class: the provider is still there to be read, and
+/// what it no longer is is updatable. [`crate::capacity_provider_tombstone_update`] is the
+/// suite that holds this rule.
+const UPDATE_DELETED_PROVIDER: &str =
+    "The capacity provider could not be updated because it has been deleted.";
+
 /// The whole sentence an update of a CLUSTER-SCOPED provider that does not name its own
 /// cluster earns, which is the whole of the `cluster` member's own rule.
 const CLUSTER_SCOPED_UPDATE_REFUSAL: &str = "Managed instances capacity providers are \
@@ -1465,7 +1472,7 @@ async fn an_update_that_cannot_be_satisfied_is_refused_and_writes_nothing() {
                 })
             },
             code: "ClientException",
-            message: UPDATE_UNRESOLVED_PROVIDER,
+            message: UPDATE_DELETED_PROVIDER,
             untouched: Some("retired"),
         },
         UpdateRefusalCase {

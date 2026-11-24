@@ -39,6 +39,38 @@ pub const CAPACITY_PROVIDER_DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 /// the delete it was asked for did not happen.
 pub const CAPACITY_PROVIDER_DELETE_FAILED: &str = "DELETE_FAILED";
 
+/// `ClientException$message` for an update of a capacity provider this account DELETED.
+///
+/// A delete KEEPS the provider as a tombstone ([`CapacityProviderRecord::retire`]) that every
+/// later read still reports, so such a reference RESOLVES — to a provider nothing can be
+/// written onto, which is what this sentence states, as against the one a reference resolving
+/// to NO record of the account earns ([`CAPACITY_PROVIDER_MISSING_MESSAGE`]). The two are
+/// what let a client reconciling a delete of its own against an update still in flight tell
+/// that provider from an identifier it got wrong.
+///
+/// Fixed text for this class: the sentence names no provider, no cluster and no value, so
+/// nothing in it comes from the request or from the store.
+pub const DELETED_CAPACITY_PROVIDER_UPDATE_MESSAGE: &str =
+    "The capacity provider could not be updated because it has been deleted.";
+
+/// Which sentence an UPDATE of the capacity provider a reference names earns when that
+/// reference names no LIVE provider of the account: `resolved` is whether the account still
+/// holds a RECORD under the name — the tombstone a delete left behind
+/// ([`DELETED_CAPACITY_PROVIDER_UPDATE_MESSAGE`]) rather than a name no provider of the
+/// account ever answered to ([`CAPACITY_PROVIDER_MISSING_MESSAGE`]).
+///
+/// The ONE place that distinction is drawn for the update, which is the operation whose
+/// outcome depends on it: a delete of a provider that is already retired is `@idempotent` and
+/// reports that provider rather than refusing it, and a batch read reports both conditions as
+/// the provider it describes.
+pub fn capacity_provider_update_refusal_message(resolved: bool) -> &'static str {
+    if resolved {
+        DELETED_CAPACITY_PROVIDER_UPDATE_MESSAGE
+    } else {
+        CAPACITY_PROVIDER_MISSING_MESSAGE
+    }
+}
+
 /// `InvalidParameterException$message` for a delete of a CLUSTER-SCOPED capacity provider
 /// that does not name the cluster the provider is scoped to. The
 /// `DeleteCapacityProvider$cluster` doc states the whole rule in one sentence: "Managed
