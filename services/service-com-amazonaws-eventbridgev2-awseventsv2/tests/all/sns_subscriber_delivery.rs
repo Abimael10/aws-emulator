@@ -137,7 +137,7 @@ fn authorization(service: &str) -> String {
 
 /// One rpcv2Cbor call against EventBridge V2, requiring a 200 and decoding the
 /// typed output.
-async fn eventsv2_ok<O: Operation>(
+pub(crate) async fn eventsv2_ok<O: Operation>(
     router: &MultiServiceRouter,
     input: &O::Input,
     case: &str,
