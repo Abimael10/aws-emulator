@@ -561,7 +561,8 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 
 /// The generations the AWS-managed catalogue publishes, as `(base image id,
 /// generation, the base-image version that generation ships, the instant AWS published
-/// that generation as epoch seconds, the CPU architectures that generation supports)`.
+/// that generation as epoch MILLISECONDS, the CPU architectures that generation
+/// supports)`.
 ///
 /// An entry of the catalogue is ADDRESSED by a plain integer GENERATION counter — not
 /// the `major.minor` form this service mints for an account's own images
@@ -588,18 +589,23 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 ///
 /// A generation's version label and its publication INSTANT are both published metadata
 /// of AWS's own catalogue, not anything this emulator or an account does, so each is a
-/// constant of this table: the same value on every read, for the life of the entry. The
-/// labels and instants below are chosen (this emulator holds neither AWS's own release
-/// labels nor its publication dates), the instants anchored on the API version this
-/// service serves the catalogue under, and both ordered as the generations are: a later
-/// generation ships a later release and is published later.
+/// constant of this table: the same value on every read, for the life of the entry, and
+/// both ordered as the generations are — a later generation ships a later release and is
+/// published later.
+///
+/// The publication instants are the ones AWS's catalogue publishes for these generations
+/// (recorded AWS behaviour), kept where the catalogue's own metadata belongs rather than
+/// anchored on this service's API-version date. They carry the MILLISECOND component AWS
+/// publishes them with, which is the resolution every instant of this service is kept and
+/// reported at ([`millisecond_precision`]), so a client that keys a cache or a rebuild
+/// decision on an entry's `updatedAt` reads the same value AWS gives it. The release
+/// labels are chosen (this emulator does not hold AWS's own release labels).
 pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, &str, i64, &[&str])] = &[
-    // Generation 1, shipping base-image release 1.0, published 2025-10-14T00:00:00Z.
-    ("al2023-1", "1", "1.0", 1_760_400_000, ARCHITECTURE_VALUES),
+    // Generation 1, shipping base-image release 1.0, published 2026-09-29T17:29:38.629Z.
+    ("al2023-1", "1", "1.0", 1_790_702_978_629, ARCHITECTURE_VALUES),
     // Generation 0, shipping the pre-release 0.1 of the same base image, published
-    // 2025-09-09T00:00:00Z — the service's own API version date, the first instant it
-    // could have published a base image under.
-    ("al2023-1", "0", "0.1", 1_757_376_000, ARCHITECTURE_VALUES),
+    // 2026-06-17T17:00:10.862Z.
+    ("al2023-1", "0", "0.1", 1_781_715_610_862, ARCHITECTURE_VALUES),
 ];
 
 /// A `ManagedMicrovmImageVersionStatus` value
@@ -652,7 +658,9 @@ pub fn managed_base_image_supported_architectures(
 ///
 /// The instant is the table's own ([`MANAGED_BASE_IMAGE_VERSIONS`]) rather than any
 /// clock this emulator reads, so every read of the catalogue reports the same value for
-/// a given entry and a client can cache it, diff it and key its own records on it.
+/// a given entry and a client can cache it, diff it and key its own records on it. It
+/// carries the published millisecond, the resolution this service keeps every instant at
+/// ([`millisecond_precision`]).
 pub fn managed_base_image_version_published_at(
     image_id: &str,
     image_version: &str,
@@ -661,7 +669,7 @@ pub fn managed_base_image_version_published_at(
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
             .find(|(id, generation, ..)| *id == image_id && *generation == image_version)
-            .map(|(.., published_at, _)| DateTime::from_secs(*published_at)),
+            .map(|(.., published_at, _)| DateTime::from_millis(*published_at)),
         false => None,
     }
 }
@@ -719,8 +727,8 @@ pub fn managed_base_image_publication(image_id: &str) -> Option<(DateTime, DateT
     let created_at = *published.first()?;
     let updated_at = *published.last()?;
     Some((
-        DateTime::from_secs(created_at),
-        DateTime::from_secs(updated_at),
+        DateTime::from_millis(created_at),
+        DateTime::from_millis(updated_at),
     ))
 }
 

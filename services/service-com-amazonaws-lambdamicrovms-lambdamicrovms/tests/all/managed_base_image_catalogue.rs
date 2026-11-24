@@ -79,7 +79,7 @@ fn hex_token(value: &str) -> String {
 
 /// The instants the catalogue published the entry `item` reports with
 /// (`state::managed_base_image_publication`, keyed by the base image id its `imageArn`
-/// names), as the epoch-seconds numbers a listing reports them as.
+/// names), as the epoch-seconds-with-fraction numbers a listing reports them as.
 fn published_instants(item: &Value, case: &str) -> (Option<f64>, Option<f64>) {
     let image_arn = item["imageArn"]
         .as_str()
@@ -91,8 +91,8 @@ fn published_instants(item: &Value, case: &str) -> (Option<f64>, Option<f64>) {
     let (created_at, updated_at) = managed_base_image_publication(image_id)
         .unwrap_or_else(|| panic!("case {case}: the catalogue publishes {image_id}"));
     (
-        Some(created_at.secs() as f64),
-        Some(updated_at.secs() as f64),
+        Some(created_at.as_secs_f64()),
+        Some(updated_at.as_secs_f64()),
     )
 }
 
