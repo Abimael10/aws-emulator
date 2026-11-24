@@ -12,6 +12,26 @@ Issue-Key: apigateway__cloudformation__lambda.cfn-custom-resource-lambda-missing
 Issue-Key: apigateway__cloudformation__lambda.sam-invalid-document-error-taxonomy-rejected|run#4|AssertionError|assert described["Status"] == "FAILED", (
 Issue-Commit: b7ef27c459f4b9552530df460b80da7c4b39527f
 
+> _Disposition of the four numbered causes, so this record does not claim more than was done:_
+>
+> * _Cause 1 (Outputs carry no `OutputValue`) — ALREADY FIXED in the tree this was re-read
+>   against (`src/state/stack.rs`'s output evaluation and `src/state.rs`'s `output_views`), and
+>   now PINNED end to end: `tests/all/custom_resource_data_and_sibling_outputs.rs`,
+>   `tests/all/nested_stack_output_values.rs` and the new
+>   `tests/all/stack_role_authorizes_the_provider_call.rs`, which asserts every reported output
+>   carries its value._
+> * _Cause 2 (a provider answering `FAILED` never rolls the stack back) — ALREADY FIXED
+>   (`src/state/provisioning.rs`), pinned by `tests/all/raised_custom_resource_create_rollback.rs`
+>   and `tests/all/rolled_back_create_stays_describable.rs`._
+> * _Cause 3 (the stack service role does not authorize the provider invoke) — ALREADY FIXED
+>   (`src/state/service_role.rs`'s `refusal_without_a_grant`, called from
+>   `src/state/provisioning/custom_resource.rs`), and now pinned end to end by the new
+>   `tests/all/stack_role_authorizes_the_provider_call.rs`._
+> * _Cause 4 (the Serverless transform validates nothing) — ALREADY FIXED
+>   (`src/state/sam/validation.rs`), and now pinned end to end by the new
+>   `tests/all/sam_invalid_document_change_set.rs` over the whole fault taxonomy._
+
+
 # apigateway__cloudformation__lambda: 4 net-new root causes — stack Outputs carry no OutputValue, a failed custom resource never rolls the stack back, the stack service role is not enforced, and the SAM transform validates nothing
 
 > _Note: this issue was identified against the code base at commit `b7ef27c459f4b9552530df460b80da7c4b39527f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
