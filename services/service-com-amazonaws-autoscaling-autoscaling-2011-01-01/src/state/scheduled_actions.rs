@@ -54,7 +54,14 @@
 //! group's bounds, so it is taken against the same rules as the other writers of them
 //! ([`super::max_below_min_message`], [`super::desired_capacity_out_of_bounds_message`],
 //! [`super::size_past_ceiling`]), with the bound the request omits read from the group the
-//! action belongs to — exactly as `UpdateAutoScalingGroup` reads it. On top of those:
+//! action belongs to — exactly as `UpdateAutoScalingGroup` reads it.
+//!
+//! What a put is REFUSED for, though, is only what the action itself STATES: the occurrence
+//! runs at a future instant, when the group's own bounds may be anything, so an inverted pair
+//! of bounds and a capacity outside them are refused where the ACTION states them, and a
+//! bound the action leaves to the group is brought to bear when the occurrence runs rather
+//! than when it is stored. The ceiling this process holds a group to is absolute and is
+//! checked whichever way the sizes were reached. On top of those:
 //!
 //! * "You must specify at least one of the following properties: MaxSize, MinSize, or
 //!   DesiredCapacity" (`PutScheduledUpdateGroupActionType$DesiredCapacity`): an action that
@@ -63,16 +70,36 @@
 //!   when the recurring action starts and stops"
 //!   (`PutScheduledUpdateGroupActionType$Recurrence`): boundaries that do not open — an end
 //!   at or before the start — bound no run of the action;
+//! * "If you try to schedule your action in the past, Amazon EC2 Auto Scaling returns an
+//!   error message"
+//!   (`smithy_query(query="operation",operation="PutScheduledUpdateGroupAction")`): an
+//!   instant the clock has already passed names no occurrence the action could run at;
 //! * a `Recurrence` is the crontab expression that member documents and a `TimeZone` is a
 //!   canonical IANA name, both read by [`super::recurrence`]: a value either reader cannot
-//!   read states no schedule.
+//!   read states no schedule. WHEN the action would run is read before WHICH sizes it would
+//!   leave the group with, since a schedule that names no occurrence leaves nothing for the
+//!   sizes to be taken against.
 //!
 //! # The instant a read reports
 //!
 //! A scheduled action reports the instant it next RUNS at. For an action the request timed
 //! itself, that is the instant it stated; for a purely recurring one, it is the next
-//! occurrence of its recurrence, resolved when the action is stored — so a read reports what
-//! the store holds and two reads of one action report the same instant.
+//! occurrence of its recurrence, resolved when the action is stored — and once an occurrence
+//! has been reached, the next one after it. Both instants are held to WHOLE SECONDS
+//! ([`ScheduledActionPut::in_whole_seconds`]), the granularity the schedule acts on.
+//!
+//! # What a due occurrence does, and when an action stops being held
+//!
+//! A stored action is a capacity change the CLOCK owes: when an occurrence comes due the
+//! action's sizes are applied to the group it belongs to, through the one capacity path every
+//! writer of a group's sizes takes ([`super::AutoScalingState::run_due_scheduled_actions`]).
+//! Performing one is the group's own `ScheduledActions` process, so a group that has
+//! suspended it skips the occurrence rather than deferring it.
+//!
+//! An action that has run its last occurrence, and one whose `EndTime` has passed, is no
+//! longer scheduled: the store stops holding it
+//! ([`StoredScheduledAction::has_elapsed`]), so a read reports what is still pending and
+//! nothing that is spent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -138,48 +165,19 @@ impl ScheduledActionPut {
     ///
     /// Checked BEFORE anything is written, so a refused put leaves the group's scheduled
     /// actions exactly as they were.
-    pub fn validate(&self, group: &StoredGroup) -> Result<(), ScheduledActionRefusal> {
+    pub fn validate(
+        &self,
+        group: &StoredGroup,
+        now: SystemTime,
+    ) -> Result<(), ScheduledActionRefusal> {
         if self.min_size.is_none() && self.max_size.is_none() && self.desired_capacity.is_none()
         {
             return Err(ScheduledActionRefusal::NoSizeStated);
         }
-        if let Some(min_size) = self.min_size.filter(|min_size| *min_size < 0) {
-            return Err(ScheduledActionRefusal::NegativeMinSize(min_size));
-        }
-        // The bounds the action leaves the group with: a bound it does not state keeps the
-        // one the group already has, the way every other writer of those bounds reads them.
-        let min_size = self.min_size.unwrap_or(group.min_size);
-        let max_size = self.max_size.unwrap_or(group.max_size);
-        if max_size < min_size {
-            return Err(ScheduledActionRefusal::MaxBelowMin { max_size, min_size });
-        }
-        if let Some(desired_capacity) = self.desired_capacity {
-            if desired_capacity < min_size || desired_capacity > max_size {
-                return Err(ScheduledActionRefusal::DesiredCapacityOutOfBounds {
-                    desired_capacity,
-                    min_size,
-                    max_size,
-                });
-            }
-        }
-        // Those checks are all RELATIVE, so none of them bounds the absolute size: the
-        // capacity this action would have the group RUN is stored instances, so THAT is
-        // what is held to the same ceiling every writer of a group's sizes holds a
-        // capacity to — the bounds the action states are stored verbatim and hold no
-        // instance of their own.
-        let capacity_after_run = super::capacity_within_bounds(
-            self.desired_capacity.unwrap_or(group.desired_capacity),
-            min_size,
-            max_size,
-        );
-        if let Some(size) = super::size_past_ceiling(&[capacity_after_run]) {
-            return Err(ScheduledActionRefusal::SizePastCeiling(size));
-        }
-        if let (Some(start_time), Some(end_time)) = (self.start_time, self.end_time) {
-            if end_time.as_secs_f64() <= start_time.as_secs_f64() {
-                return Err(ScheduledActionRefusal::EndNotAfterStart);
-            }
-        }
+        // WHEN the action would run is read before WHICH sizes it would leave the group with:
+        // a schedule this service cannot read names no occurrence at all, so there is no run
+        // for those sizes to be taken against, and the caller is pointed at the schedule
+        // rather than at numbers that are not what the request got wrong.
         if let Some(recurrence) = self
             .recurrence
             .as_deref()
@@ -196,7 +194,82 @@ impl ScheduledActionPut {
         {
             return Err(ScheduledActionRefusal::InvalidTimeZone);
         }
+        if let (Some(start_time), Some(end_time)) = (self.start_time, self.end_time) {
+            if end_time.as_secs_f64() <= start_time.as_secs_f64() {
+                return Err(ScheduledActionRefusal::EndNotAfterStart);
+            }
+        }
+        // "If you try to schedule your action in the past, Amazon EC2 Auto Scaling returns an
+        // error message"
+        // (`smithy_query(query="operation",operation="PutScheduledUpdateGroupAction")`): an
+        // instant the clock has already passed names no occurrence the action could still be
+        // run at. Taken to the SECOND, which is the granularity a stored instant holds
+        // ([`Self::in_whole_seconds`]), so an action timed at the current second is still in
+        // time.
+        if self
+            .start_time
+            .is_some_and(|start_time| start_time.secs() < whole_seconds_since_epoch(now))
+        {
+            return Err(ScheduledActionRefusal::StartTimeInPast);
+        }
+        if let Some(min_size) = self.min_size.filter(|min_size| *min_size < 0) {
+            return Err(ScheduledActionRefusal::NegativeMinSize(min_size));
+        }
+        // The bounds the action leaves the group with: a bound it does not state keeps the
+        // one the group already has, the way every other writer of those bounds reads them —
+        // which is what the sentences below report, because that is what the caller has to
+        // change.
+        let min_size = self.min_size.unwrap_or(group.min_size);
+        let max_size = self.max_size.unwrap_or(group.max_size);
+        // What a put is REFUSED for, though, is only what the action itself states: the
+        // action runs at a FUTURE instant, when the group's own bounds may be anything at
+        // all, so a bound the action leaves to the group is not a bound this put could be
+        // taken against — the run brings the capacity inside whatever is in force then
+        // ([`super::AutoScalingState::run_due_scheduled_actions`]).
+        if self.min_size.is_some() && self.max_size.is_some() && max_size < min_size {
+            return Err(ScheduledActionRefusal::MaxBelowMin { max_size, min_size });
+        }
+        if let Some(desired_capacity) = self.desired_capacity.filter(|desired_capacity| {
+            self.min_size
+                .is_some_and(|min_size| *desired_capacity < min_size)
+                || self
+                    .max_size
+                    .is_some_and(|max_size| *desired_capacity > max_size)
+        }) {
+            return Err(ScheduledActionRefusal::DesiredCapacityOutOfBounds {
+                desired_capacity,
+                min_size,
+                max_size,
+            });
+        }
+        // Those checks are all RELATIVE, so none of them bounds the absolute size: the
+        // capacity this action would have the group RUN is stored instances, so THAT is
+        // what is held to the same ceiling every writer of a group's sizes holds a
+        // capacity to — the bounds the action states are stored verbatim and hold no
+        // instance of their own.
+        let capacity_after_run = super::capacity_within_bounds(
+            self.desired_capacity.unwrap_or(group.desired_capacity),
+            min_size,
+            max_size,
+        );
+        if let Some(size) = super::size_past_ceiling(&[capacity_after_run]) {
+            return Err(ScheduledActionRefusal::SizePastCeiling(size));
+        }
         Ok(())
+    }
+
+    /// This put with every instant it states truncated to WHOLE SECONDS.
+    ///
+    /// `StartTime` and `EndTime` are "the date and time […] in UTC. For example,
+    /// \"2021-06-01T00:00:00Z\"" (`PutScheduledUpdateGroupActionType$StartTime`,
+    /// `$EndTime`), and an occurrence is reached at minute granularity, so the sub-second
+    /// fraction of a stated instant names nothing a schedule can act on: it is dropped on
+    /// write rather than carried, so what a read reports is what the schedule holds.
+    #[must_use]
+    pub fn in_whole_seconds(mut self) -> Self {
+        self.start_time = self.start_time.map(whole_seconds);
+        self.end_time = self.end_time.map(whole_seconds);
+        self
     }
 
     /// The instant the action this put states next RUNS at, resolved as the action is
@@ -236,6 +309,13 @@ pub struct StoredScheduledAction {
     pub max_size: Option<i32>,
     pub desired_capacity: Option<i32>,
     pub time_zone: Option<String>,
+    /// Whether the action's LAST occurrence has already been reached, so it names no
+    /// further run: a one-time action that has run, or a recurring one whose recurrence
+    /// has no occurrence left inside its own window.
+    ///
+    /// Distinct from "names no run at all": an action stating neither an instant nor a
+    /// recurrence was never scheduled to run and is not spent.
+    pub spent: bool,
 }
 
 impl StoredScheduledAction {
@@ -253,7 +333,69 @@ impl StoredScheduledAction {
             max_size: put.max_size,
             desired_capacity: put.desired_capacity,
             time_zone: put.time_zone,
+            // A put states the action WHOLE, so the definition it leaves behind is one
+            // nothing has run yet, however many occurrences the name it replaced had spent.
+            spent: false,
         }
+    }
+
+    /// The occurrence of this action the clock has made due at `now`, when one is.
+    ///
+    /// `None` for an action whose next run is still ahead, and for one that names no run at
+    /// all. When several occurrences fell due while nobody called, this answers the LATEST of
+    /// them: the group's sizes after a run of identical occurrences are the sizes after the
+    /// last one, so the schedule is caught up without replaying what it would have done in
+    /// between. Bounded by [`MAX_CAUGHT_UP_OCCURRENCES`] per pass, with whatever is left
+    /// still due and caught up by the next one.
+    #[must_use]
+    pub fn due_occurrence(&self, now: SystemTime) -> Option<DueOccurrence> {
+        let first = super::from_date_time(self.start_time?);
+        if self.spent || first > now {
+            return None;
+        }
+        // Read ONCE for the whole catch-up below: the expression and the zone are the same
+        // at every occurrence of one action, so nothing re-reads them per step.
+        let schedule = self.schedule();
+        let end_time = self.end_time.map(super::from_date_time);
+        let mut at = first;
+        let mut next = occurrence_after(schedule.as_ref(), end_time, first);
+        let mut caught_up = 0usize;
+        while let Some(candidate) = next.filter(|candidate| *candidate <= now) {
+            if caught_up >= MAX_CAUGHT_UP_OCCURRENCES {
+                break;
+            }
+            at = candidate;
+            next = occurrence_after(schedule.as_ref(), end_time, candidate);
+            caught_up += 1;
+        }
+        Some(DueOccurrence { at, next })
+    }
+
+    /// The recurring schedule this action states, read: the crontab expression and the zone
+    /// it is read in.
+    ///
+    /// `None` for an action with no recurrence — it runs at the one instant it states and no
+    /// other — and for a value neither reader can read, which states no schedule at all
+    /// ([`super::recurrence`]).
+    #[must_use]
+    fn schedule(&self) -> Option<(super::recurrence::Recurrence, ::chrono_tz::Tz)> {
+        let recurrence = super::recurrence::parse(self.recurrence.as_deref()?)?;
+        let zone = super::recurrence::time_zone(self.time_zone.as_deref())?;
+        Some((recurrence, zone))
+    }
+
+    /// Whether this action is no longer SCHEDULED at `now`, so the store stops holding it.
+    ///
+    /// Either it has reached its last occurrence ([`Self::spent`]) or its own `EndTime` has
+    /// passed: the boundaries a window states are where the action stops, so neither leaves
+    /// anything for a later occurrence to run.
+    #[must_use]
+    pub fn has_elapsed(&self, now: SystemTime) -> bool {
+        self.spent
+            || self
+                .end_time
+                .map(super::from_date_time)
+                .is_some_and(|end_time| end_time <= now)
     }
 
     /// THE ONE projection of a stored action onto the wire shape.
@@ -329,7 +471,11 @@ impl super::AutoScalingState {
         let Some(group) = self.groups.get(group_name) else {
             return Ok(None);
         };
-        put.validate(group)?;
+        // The instants the action is held to are the whole seconds the schedule acts on, so
+        // the put is normalized BEFORE it is taken against any rule: what the rules read and
+        // what the store holds are then the one value ([`ScheduledActionPut::in_whole_seconds`]).
+        let put = put.in_whole_seconds();
+        put.validate(group, now)?;
         let region = group.region.clone();
         let held_arn = group
             .scheduled_actions
@@ -384,6 +530,307 @@ impl super::AutoScalingState {
         }
         absent
     }
+
+    /// Run every scheduled action the clock has made due at `now`, and stop holding the
+    /// actions that are no longer scheduled.
+    ///
+    /// A stored action is not only a record: it is a capacity change the CLOCK owes. When an
+    /// occurrence comes due the action's `MinSize`, `MaxSize` and `DesiredCapacity` are
+    /// applied to the group it belongs to — a bound it does not state keeping the one the
+    /// group already has, exactly as `UpdateAutoScalingGroup` leaves it — so the change is
+    /// observable on every read of the group and the instances follow it through the ONE
+    /// capacity path ([`super::AutoScalingState::apply_capacity`]).
+    ///
+    /// Performing a due occurrence is the group's `ScheduledActions` process
+    /// ([`super::suspended_processes::PROCESS_SCHEDULED_ACTIONS`]), so a group that has
+    /// suspended it SKIPS the occurrence: the schedule moves on to the occurrence after it
+    /// and the group's sizes are left exactly where they are, which is why resuming the
+    /// process does not bring back the occurrence that was missed.
+    ///
+    /// An action that has run its last occurrence, and one whose `EndTime` has passed, is no
+    /// longer scheduled and is dropped ([`StoredScheduledAction::has_elapsed`]) — so a client
+    /// reconciling its schedule against `DescribeScheduledActions` sees a spent action drop
+    /// out, and the per-group count of them falls with it.
+    ///
+    /// A change the clock owes, which is why [`super::AutoScalingState::materialize_due`]
+    /// retires it and a REPORTING operation materialises it: the occurrence was due at `now`
+    /// whether or not anybody called.
+    pub fn run_due_scheduled_actions<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        now: SystemTime,
+    ) {
+        // Read whole before anything is applied: applying one occurrence borrows the group it
+        // belongs to, and launches instances in the account's own Amazon EC2 store.
+        let due: Vec<DueScheduledAction> = self
+            .groups
+            .values()
+            .flat_map(|group| {
+                group
+                    .scheduled_actions
+                    .iter()
+                    .filter_map(move |(action_name, action)| {
+                        action.due_occurrence(now).map(|occurrence| {
+                            DueScheduledAction {
+                                group_name: group.name.clone(),
+                                action_name: action_name.clone(),
+                                occurrence,
+                                performed: group.performs_scheduled_actions(),
+                                min_size: action.min_size,
+                                max_size: action.max_size,
+                                desired_capacity: action.desired_capacity,
+                            }
+                        })
+                    })
+            })
+            .collect();
+        for action in due {
+            // The occurrence is CONSUMED whether or not the group performed it: a schedule
+            // moves with the clock, so an occurrence a suspended process skipped is one the
+            // group never goes back for.
+            if let Some(stored) = self
+                .groups
+                .get_mut(&action.group_name)
+                .and_then(|group| group.scheduled_actions.get_mut(&action.action_name))
+            {
+                match action.occurrence.next {
+                    Some(next) => stored.start_time = Some(super::to_date_time(next)),
+                    None => stored.spent = true,
+                }
+            }
+            if action.performed {
+                self.apply_scheduled_action(engine, &action);
+            } else {
+                self.record_skipped_scheduled_action(&action);
+            }
+        }
+        for group in self.groups.values_mut() {
+            group
+                .scheduled_actions
+                .retain(|_, action| !action.has_elapsed(now));
+        }
+    }
+
+    /// Apply one due occurrence's sizes to the group it belongs to, at the instant it came
+    /// due.
+    ///
+    /// Applied AT that instant rather than at the instant somebody looked, exactly as a
+    /// deferred capacity change is: the instances it launches and the cooldown it starts are
+    /// anchored there, so what a caller sees does not depend on when they read. The capacity
+    /// is re-applied only when there is something to do — a change of capacity, or instances
+    /// still to launch for it — so an occurrence that leaves the group where it already was
+    /// starts no cooldown.
+    fn apply_scheduled_action<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        action: &DueScheduledAction,
+    ) {
+        let Some(group) = self.groups.get_mut(&action.group_name) else {
+            return;
+        };
+        let held_capacity = group.desired_capacity;
+        // The bounds the action leaves the group with, read the way every writer of them
+        // reads them, and kept consistent with each other however the group's own bounds
+        // have moved since the action was stored.
+        let min_size = action.min_size.unwrap_or(group.min_size).max(0);
+        let max_size = action.max_size.unwrap_or(group.max_size).max(min_size);
+        let desired_capacity = super::capacity_within_bounds(
+            action.desired_capacity.unwrap_or(held_capacity),
+            min_size,
+            max_size,
+        )
+        .clamp(0, super::MAX_GROUP_CAPACITY);
+        group.min_size = min_size;
+        group.max_size = max_size;
+        // The group's own sizes are one half of the difference its warm pool maintains, so
+        // this change owes the preparation of whatever the pool is now short of, from the
+        // instant the occurrence came due.
+        group.owe_warm_pool_preparation(action.occurrence.at);
+        let group_arn = group.arn.clone();
+        let owes_launch = group.launches_needed(desired_capacity) > 0;
+        let cause = Self::constraints_change_cause(
+            action.occurrence.at,
+            &scheduled_action_cause_subject(&action.action_name),
+            (min_size, max_size, desired_capacity),
+            held_capacity,
+            desired_capacity,
+        );
+        // The EXECUTION of the action is itself a step the group took, so it is recorded as
+        // one activity of the group's own history — a step that is over the instant it
+        // happened, naming the schedule that took it. The steps the capacity change then
+        // takes (an instance launched, one scaled in) are activities of their own, recorded
+        // by the one capacity path below.
+        self.record_activity(
+            engine,
+            &super::ActivityRecord {
+                group_name: &action.group_name,
+                group_arn: &group_arn,
+                description: scheduled_action_description(&action.action_name),
+                cause: cause.clone(),
+                group_state: super::GROUP_STATE_IN_SERVICE,
+                start_time: action.occurrence.at,
+                completes_at: None,
+                milestone: super::ActivityMilestone::InProgress,
+                instance_id: None,
+            },
+        );
+        if desired_capacity != held_capacity || owes_launch {
+            self.apply_capacity(
+                engine,
+                &action.group_name,
+                desired_capacity,
+                &cause,
+                action.occurrence.at,
+            );
+        }
+    }
+
+    /// Record the occurrence a group SKIPPED because the process that performs one is
+    /// suspended.
+    ///
+    /// A skip is a step of the group's history as much as an execution is: the occurrence
+    /// came due and the group did not take it, which is the only signal a client has that
+    /// the suspension — rather than a schedule that never fired — is why the group did not
+    /// move. The activity is terminal the instant it was due, carries the sizes the group
+    /// still holds, and states the process that is suspended as the reason nothing was done.
+    fn record_skipped_scheduled_action(&mut self, action: &DueScheduledAction) {
+        let Some(group) = self.groups.get(&action.group_name) else {
+            return;
+        };
+        let group_arn = group.arn.clone();
+        self.record_failed_activity(
+            &action.group_name,
+            &group_arn,
+            skipped_scheduled_action_description(&action.action_name),
+            SKIPPED_SCHEDULED_ACTION_MESSAGE.to_string(),
+            super::ACTIVITY_CANCELLED,
+            Self::reason_cause(
+                action.occurrence.at,
+                &skipped_scheduled_action_subject(&action.action_name),
+            ),
+            action.occurrence.at,
+        );
+    }
+}
+
+/// The occurrence of one action the clock has made due, and the occurrence that follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DueOccurrence {
+    /// The instant the occurrence came due at, which the change it makes is anchored to.
+    pub at: SystemTime,
+    /// The instant the action next runs at after it, or `None` when it has none left.
+    pub next: Option<SystemTime>,
+}
+
+/// One due occurrence as the pass that runs it reads it: which action of which group, what it
+/// sets, and whether the group performs its scheduled actions at all.
+#[derive(Debug, Clone)]
+struct DueScheduledAction {
+    group_name: String,
+    action_name: String,
+    occurrence: DueOccurrence,
+    performed: bool,
+    min_size: Option<i32>,
+    max_size: Option<i32>,
+    desired_capacity: Option<i32>,
+}
+
+/// How many occurrences of ONE action a single pass catches up on.
+///
+/// The pass answers the LATEST occurrence that fell due, so a bound is needed only because a
+/// per-minute recurrence names arbitrarily many of them across a long gap; whatever is left
+/// is still due and is caught up by the next pass. Kept small, because the pass runs under
+/// this store's own lock.
+const MAX_CAUGHT_UP_OCCURRENCES: usize = 100;
+
+/// The occurrence of a recurring schedule strictly after `after`, within the window its
+/// `EndTime` closes.
+///
+/// `None` for an action with no readable recurrence — it runs at the one instant it states and
+/// no other — and `None` past that end: "when StartTime and EndTime are specified with
+/// Recurrence, they form the boundaries of when the recurring action starts and stops"
+/// (`PutScheduledUpdateGroupActionType$Recurrence`), so an occurrence beyond the end is
+/// outside the schedule.
+#[must_use]
+fn occurrence_after(
+    schedule: Option<&(super::recurrence::Recurrence, ::chrono_tz::Tz)>,
+    end_time: Option<SystemTime>,
+    after: SystemTime,
+) -> Option<SystemTime> {
+    let (recurrence, zone) = schedule?;
+    let next = recurrence.next_occurrence(after, *zone)?;
+    end_time
+        .is_none_or(|end_time| next <= end_time)
+        .then_some(next)
+}
+
+/// What the scaling activity a scheduled action's occurrence records names as having asked
+/// for the capacity: the scheduled action itself, BY NAME, in the clause this service states
+/// a change of a group's CONSTRAINTS in
+/// ([`super::AutoScalingState::constraints_change_cause`]).
+///
+/// The resource that drove the change is what the subject of a cause names — the policy a
+/// request performed, the alarm and policy an alarm-driven execution performed
+/// ([`super::policy_execution::alarm_execution_cause`]) — so a client reading a group's
+/// activity history can tell WHICH schedule moved it, and tell one occurrence of it from
+/// another change of the same group.
+#[must_use]
+fn scheduled_action_cause_subject(action_name: &str) -> String {
+    format!("a scheduled action {action_name} update of AutoScalingGroup constraints")
+}
+
+/// What the activity the EXECUTION of an occurrence records says the group set out to do:
+/// that it performed the scheduled action, and which one.
+///
+/// `Activity$Description` is "a friendly, more verbose description of the scaling activity"
+/// (`smithy_query(query="shape",shape="Activity")`), so it states the step rather than the
+/// reason the cause above carries. The action's name is its only variable part.
+#[must_use]
+fn scheduled_action_description(action_name: &str) -> String {
+    format!("Executing scheduled action {action_name}")
+}
+
+/// What the activity a SKIPPED occurrence records says the group set out to do: that it
+/// skipped the scheduled action, which one, and the process that is turned off — so the one
+/// line a client reads in the history says both what did not happen and why. The action's
+/// name is its only variable part.
+#[must_use]
+fn skipped_scheduled_action_description(action_name: &str) -> String {
+    format!("Skipped scheduled action {action_name}")
+}
+
+/// The subject of the cause a skipped occurrence records: that the schedule came due and the
+/// group did not perform it, naming the action and the process that is turned off.
+#[must_use]
+fn skipped_scheduled_action_subject(action_name: &str) -> String {
+    format!(
+        "a scheduled action {action_name} was not performed because the {} process of the \
+         group is suspended",
+        super::suspended_processes::PROCESS_SCHEDULED_ACTIONS
+    )
+}
+
+/// What a skipped occurrence's activity reports as its `StatusMessage`: why nothing was done,
+/// naming the suspended process. Fixed text — the reason is the same whichever action was
+/// skipped, which the description above names.
+pub const SKIPPED_SCHEDULED_ACTION_MESSAGE: &str =
+    "The scheduled action came due, but the ScheduledActions process is suspended.";
+
+/// `time` truncated to whole seconds: the granularity a scheduled action's instants are held
+/// and acted on at ([`ScheduledActionPut::in_whole_seconds`]).
+#[must_use]
+fn whole_seconds(time: DateTime) -> DateTime {
+    DateTime::from_secs(time.secs())
+}
+
+/// `at` as whole seconds since the epoch, for comparing a stated instant against the clock at
+/// the granularity the store holds it.
+#[must_use]
+fn whole_seconds_since_epoch(at: SystemTime) -> i64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since_epoch| i64::try_from(since_epoch.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 /// Why a scheduled action could not be stored, for the operation to answer the error class
@@ -408,6 +855,10 @@ pub enum ScheduledActionRefusal {
     SizePastCeiling(i32),
     /// The action's `EndTime` is not after its `StartTime`, so its boundaries bound no run.
     EndNotAfterStart,
+    /// The instant the action would start at has already passed, so it names no occurrence
+    /// the action could still run at. Carries nothing: the refusal states the rule rather
+    /// than the instant that broke it ([`START_TIME_IN_PAST_MESSAGE`]).
+    StartTimeInPast,
     /// The `Recurrence` is not the crontab expression the member documents; carries what the
     /// request stated.
     InvalidRecurrence(String),
@@ -448,6 +899,7 @@ impl ScheduledActionRefusal {
                 super::MAX_GROUP_CAPACITY
             ),
             Self::EndNotAfterStart => END_TIME_MESSAGE.to_string(),
+            Self::StartTimeInPast => START_TIME_IN_PAST_MESSAGE.to_string(),
             Self::InvalidRecurrence(recurrence) => invalid_recurrence_message(recurrence),
             Self::InvalidTimeZone => INVALID_TIME_ZONE_MESSAGE.to_string(),
             Self::LimitExceeded => too_many_scheduled_actions_message(),
@@ -521,6 +973,11 @@ pub const SIZE_REQUIRED_MESSAGE: &str =
 /// The sentence a put whose boundaries do not open is refused with: the defect is the ORDER
 /// of the two instants rather than either of them, so no part of the request appears in it.
 pub const END_TIME_MESSAGE: &str = "Given end time must be after start time";
+
+/// The sentence a put whose start time the clock has already passed is refused with: the
+/// defect is that the instant is behind the clock rather than anything about the value, so no
+/// part of the request appears in it. Entirely fixed text.
+pub const START_TIME_IN_PAST_MESSAGE: &str = "Given start time is in the past";
 
 /// The sentence a put whose `Recurrence` the crontab reader cannot read is refused with: the
 /// wording this service's own recorded refusal states, which quotes the rejected value and

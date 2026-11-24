@@ -693,13 +693,14 @@ async fn a_definition_that_cannot_be_scheduled_is_refused_and_stores_nothing() {
             INVALID_TIME_ZONE_MESSAGE.to_string(),
         ),
         (
-            "a desired capacity above the bounds the action leaves the group with",
+            "a desired capacity above the maximum the action itself sets",
             group,
             vec![
                 ("StartTime", "2030-06-01T12:00:00Z"),
+                ("MaxSize", "3"),
                 ("DesiredCapacity", "9"),
             ],
-            desired_capacity_message(9, GROUP_MIN_SIZE, GROUP_MAX_SIZE),
+            desired_capacity_message(9, GROUP_MIN_SIZE, 3),
         ),
         (
             "a desired capacity below the minimum the action itself sets",

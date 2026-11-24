@@ -119,6 +119,16 @@ pub const PROCESS_HEALTH_CHECK: &str = "HealthCheck";
 /// replacement owed, so the group then performs it with no further call from anybody.
 pub const PROCESS_REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
 
+/// The process that PERFORMS the scheduled actions of a group, as the catalog names it.
+///
+/// What it does is apply a stored `ScheduledUpdateGroupAction`'s sizes to the group when one
+/// of its occurrences comes due, so while it is suspended the group skips the occurrence
+/// entirely: the schedule moves on to the next one and the group's sizes are left where they
+/// are ([`super::AutoScalingState::run_due_scheduled_actions`]). Resuming the process has the
+/// group perform the occurrences that fall due from then on, and never the ones that fell due
+/// while it was suspended — those instants have passed.
+pub const PROCESS_SCHEDULED_ACTIONS: &str = "ScheduledActions";
+
 /// The process that REGISTERS a group's instances with the load balancers and target groups
 /// the group is attached to, as the catalog names it.
 ///
@@ -225,6 +235,16 @@ impl StoredGroup {
     #[must_use]
     pub fn replaces_unhealthy_instances(&self) -> bool {
         !self.is_process_suspended(PROCESS_REPLACE_UNHEALTHY)
+    }
+
+    /// Whether this group PERFORMS a scheduled action whose occurrence has come due: the
+    /// process that applies one is running ([`PROCESS_SCHEDULED_ACTIONS`]).
+    ///
+    /// THE ONE reading of that question, for every occurrence of every action the group
+    /// holds.
+    #[must_use]
+    pub fn performs_scheduled_actions(&self) -> bool {
+        !self.is_process_suspended(PROCESS_SCHEDULED_ACTIONS)
     }
 
     /// Whether this group REGISTERS an instance it brings into service with the load
