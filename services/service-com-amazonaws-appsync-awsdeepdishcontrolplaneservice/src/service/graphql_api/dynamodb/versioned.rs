@@ -24,9 +24,12 @@
 //! The write the resolver asked for carries the version the caller believes is current (the
 //! request object's own [`VERSION_ATTRIBUTE`]). Where the resolver's `syncConfig` asks for
 //! version-based detection ("`VERSION`: Detect conflicts based on object versions",
-//! `SyncConfig$conflictDetection`), that value has to equal the stored one for the write to be
-//! applied; where it does not, the write is a CONFLICT and what becomes of it is the
-//! `conflictHandler` the resolver names (`SyncConfig$conflictHandler`):
+//! `SyncConfig$conflictDetection`), the row the write was built from has to still be the row the
+//! key holds for the write to be applied ([`conflicts`]): a put CREATES the item, so a key that
+//! already holds a row is a conflict unless the request stated grounds of its own to be refused
+//! on, and an update and a delete change the row the caller read, so the version that row carried
+//! has to be the stored one. Where it is not, the write is a CONFLICT and what becomes of it is
+//! the `conflictHandler` the resolver names (`SyncConfig$conflictHandler`):
 //!
 //! * `OPTIMISTIC_CONCURRENCY` — "Resolve conflicts by rejecting mutations when versions don't
 //!   match the latest version at the server", and so does a resolver naming `NONE` or naming no
@@ -35,7 +38,8 @@
 //!   caller needs to build the write it retries with;
 //! * `AUTOMERGE` — "Resolve conflicts with the Automerge conflict resolution strategy": the
 //!   write is merged into the stored row without asking anyone ([`automerged`]) and the merged
-//!   row is written as the item's next version;
+//!   row is written as the item's next version — except a conflicting DELETE, which has no
+//!   change to compose into that row and is rejected like any unresolved conflict;
 //! * `LAMBDA` — "Resolve conflicts with an Lambda function supplied in the
 //!   `LambdaConflictHandlerConfig`": that function is INVOKED with the row as it stands and the
 //!   row the write would make, and its answer decides — a resolved item is written as the next
@@ -113,7 +117,10 @@ const REMOVE_ACTION: &str = "REMOVE";
 
 /// The prefix the placeholders of this module's own update expressions carry, so no name or
 /// value a request object states can collide with them.
-const PLACEHOLDER_PREFIX: &str = "appsyncSystem";
+///
+/// `pub(super)`: the term a delta sync adds to the selection it reads the changed rows with
+/// names the same attribute under a placeholder of the same family.
+pub(super) const PLACEHOLDER_PREFIX: &str = "appsyncSystem";
 
 /// How many seconds a minute of a retention window is, and how many milliseconds a second is:
 /// the window is stated in minutes and the reaping marker is an epoch-SECOND stamp, while the
@@ -197,13 +204,36 @@ impl Syncing<'_> {
     /// Whether this resolver asks for the version comparison: only the value naming it does, so
     /// a resolver carrying no sync configuration compares nothing and its writes are applied as
     /// they stand.
-    ///
-    /// What is compared is the version the REQUEST OBJECT states against the stored one, so a
-    /// request that states none makes no claim about the version it read: there is nothing to
-    /// detect a conflict against, and such a write is applied and advances the version like any
-    /// other accepted one.
     fn detects_versions(&self) -> bool {
         self.detection == Some(VERSION_DETECTION)
+    }
+}
+
+/// Whether the write `asked` for CONFLICTS with the row `held` the key already holds.
+///
+/// What a conflict is follows from what each write does to that row:
+///
+/// * a `PutItem` CREATES the item — it carries the whole row to write rather than a change to
+///   one — so a key that already holds a row is a conflict whatever version the request states:
+///   the row that is there is not one this write was built from, and the caller has to be shown
+///   it before it can write again. A request that states a CONDITION of its own has named the
+///   grounds its write is to be refused on, and those grounds are weighed by the service whose
+///   expression language they are written in ([`carry_condition`]), so the call is made and its
+///   refusal is reported as that service worded it — but the version such a request states is
+///   still a claim about the row that is there, and it is compared like any other;
+/// * an `UpdateItem` and a `DeleteItem` CHANGE the row the caller read, and the version that
+///   row carried is what the request states ([`stated_version`]): the write is applied where
+///   that version is the stored one and conflicts where it is not. A request stating no version
+///   makes no claim about the row it read, so there is nothing to compare and the write is
+///   applied like any other.
+fn conflicts(asked: &Asked<'_>, held: &Json) -> bool {
+    let states_another_version = || {
+        stated_version(asked.requested)
+            .is_some_and(|stated| stated != version_held(held).unwrap_or_default())
+    };
+    match asked.write {
+        Write::Put if asked.body.get(CONDITION_EXPRESSION_INPUT).is_none() => true,
+        Write::Put | Write::Update | Write::Delete => states_another_version(),
     }
 }
 
@@ -247,6 +277,18 @@ pub async fn written(
     asked: &Asked<'_>,
 ) -> Result<Json, Refused> {
     let key = wire_values(&object(asked.requested, KEY_MEMBER).map_err(Refused::request)?);
+    // The write TAKES A TURN on the item it addresses, held for the whole read-compare-write:
+    // the version this write stamps is the one after the version it reads, so a write that read
+    // the same version as another would stamp the same one and discard it
+    // ([`crate::state::versioned_writes`]). Every write of one item is therefore compared
+    // against what the write before it left and advances the version exactly once.
+    let turn = {
+        let mut store = context.state.lock();
+        store
+            .versioned_writes
+            .turn(asked.region, asked.table, &key)
+    };
+    let _writing = turn.lock().await;
     let held = stored(context, asked, &key).await?;
     // A delete of a row that is not there removes nothing and leaves no tombstone: there is no
     // version to advance and nothing for a client to sync, so the call is made as it stands.
@@ -263,10 +305,8 @@ pub async fn written(
         }
         return applied(context, source, asked, &key, None).await;
     };
-    let stated = stated_version(asked.requested);
-    let mismatched = sync.detects_versions()
-        && stated.is_some_and(|stated| stated != version_held(&held).unwrap_or_default());
-    if !mismatched {
+    let conflicted = sync.detects_versions() && conflicts(asked, &held);
+    if !conflicted {
         return applied(context, source, asked, &key, Some(&held)).await;
     }
     let handler = sync.handler.unwrap_or_default();
@@ -572,20 +612,27 @@ fn restoring_put(table: &str, held: &Json) -> Json {
 
 /// What AUTOMERGE makes of this conflict.
 ///
-/// The strategy merges the two rows rather than asking anyone, so it never rejects a write it has
-/// a row for: the merged row is written as the item's next version. The row a conflicting DELETE
-/// would make is the stored row MARKED deleted ([`intended`]), so merging it in adds that marker
-/// and the removal goes through as the next version, which is the same reading as for every other
-/// write — what the server holds for an attribute both rows carry stands, and what the write adds
-/// is added.
+/// The strategy MERGES the two rows rather than asking anyone, so it never rejects a write whose
+/// change it can compose into the row at the server: the merged row is written as the item's next
+/// version — what the server holds for an attribute both rows carry stands, and what the write
+/// adds is added.
+///
+/// A conflicting DELETE is the one write it cannot resolve: a removal is no change to an
+/// attribute of the row, so there is nothing to compose into the row at the server, and the row
+/// the caller believed it was removing is not the row that is there. Nothing is written — no
+/// tombstone either — and the conflict is reported unresolved, which is what lets the caller
+/// decide the removal again against the row as it now stands.
 fn automerge(write: Write, held: &Json, intended: &Json) -> Decided {
+    if write == Write::Delete {
+        return Decided::Reject;
+    }
     let held = held.as_object().cloned().unwrap_or_default();
     let Some(incoming) = intended.as_object() else {
         return Decided::Reject;
     };
     Decided::Write {
         row: automerged(&held, incoming, 0),
-        tombstone: write == Write::Delete,
+        tombstone: false,
     }
 }
 
@@ -855,7 +902,11 @@ fn reaped_at(changed_at: i64, minutes: i64) -> i64 {
 }
 
 /// This write's own time, in epoch milliseconds.
-fn now_millis() -> i64 {
+///
+/// `pub(super)`: the moment a delta sync STARTED is read in the same units, because that is the
+/// moment a client carries into its next sync as `lastSync` and compares against this very
+/// attribute ([`LAST_CHANGED_AT_ATTRIBUTE`]).
+pub(super) fn now_millis() -> i64 {
     ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .ok()
@@ -886,6 +937,7 @@ mod tests {
             ("a read", Call::GetItem, None),
             ("a query", Call::Query, None),
             ("a scan", Call::Scan, None),
+            ("a delta sync", Call::Sync, None),
             ("a read batch", Call::BatchGetItem, None),
             ("a write batch", Call::BatchPutItem, None),
             ("a delete batch", Call::BatchDeleteItem, None),

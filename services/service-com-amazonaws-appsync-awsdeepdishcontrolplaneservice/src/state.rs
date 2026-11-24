@@ -32,6 +32,11 @@ pub mod graphql_data_plane;
 /// decision may be reused in is read under the same lock as the API that configured it.
 pub mod lambda_authorizer_cache;
 
+/// The turn each item of a VERSIONED `AMAZON_DYNAMODB` data source is written under, so two
+/// writes of one item cannot read the same version and stamp the same next one. A field of
+/// the store below, because the turns are shared by every request this emulator serves.
+pub mod versioned_writes;
+
 /// The ENTRIES a GraphQL API's server-side cache holds: what its GraphQL endpoint already
 /// answered, for as long as each answer may be served again. A field of the cache INSTANCE
 /// ([`ApiCacheRecord`]), so the teardown of the instance takes its entries with it.
@@ -2333,6 +2338,10 @@ pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// The decisions each GraphQL API's `AWS_LAMBDA` authorizer has taken, for as long as
     /// each may be reused ([`lambda_authorizer_cache`]).
     pub lambda_authorizer_cache: lambda_authorizer_cache::LambdaAuthorizerCache,
+    /// The turn each item being written through a VERSIONED `AMAZON_DYNAMODB` data source is
+    /// written under ([`versioned_writes`]), so two writes of one item are each compared
+    /// against what the one before it left.
+    pub versioned_writes: versioned_writes::VersionedWrites,
     /// Advanced once per minted id, so no id is ever a function of the request.
     id_seed: u64,
     /// Advanced once per created resource, giving each record its creation order.

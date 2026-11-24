@@ -268,7 +268,11 @@ async fn signed_graphql(case: &str, graphql: &str, document: &Value) -> Value {
 
 /// One Amazon DynamoDB call over its own wire (`awsJson1_0`, `POST /` with `X-Amz-Target`),
 /// asserting it was served.
-async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+///
+/// `pub(crate)`: the versioned-data-source suite
+/// ([`crate::graphql_api_dynamodb_versioned_data_source`]) reads what the table holds through
+/// this same client, so both suites reach that service one way.
+pub(crate) async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -372,7 +376,14 @@ async fn create_table(router: &MultiServiceRouter) -> String {
 /// Both documents are written compactly and free of the characters an
 /// `application/x-www-form-urlencoded` body treats specially (`&`, `=`, `+`, `%`, space), so
 /// they need no encoding.
-async fn create_role(router: &MultiServiceRouter, name: &str, table_arn: &str) -> String {
+///
+/// `pub(crate)`: every suite whose data source reaches a table needs such a role, so there is
+/// one reading of how it is created.
+pub(crate) async fn create_role(
+    router: &MultiServiceRouter,
+    name: &str,
+    table_arn: &str,
+) -> String {
     let trust = format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Principal\":{{\"Service\":\"{APPSYNC_PRINCIPAL}\"}},\

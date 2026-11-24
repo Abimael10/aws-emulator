@@ -12,6 +12,13 @@
 //! ([`plain_value`]): a single-item operation answers the item itself, and `Query` and `Scan`
 //! answer `items`, `nextToken` and `scannedCount`.
 //!
+//! A DELTA SYNC (`Sync`) is the operation of the same data source a client that holds a copy of
+//! the data reads its CHANGES with: it answers the page of rows changed after the moment the
+//! client last synced at — the tombstones a versioned delete left among them — beside the
+//! `nextToken` that continues that page and the `startedAt` the client carries into its next
+//! sync. The rows it selects on are the ones a versioned write stamps ([`versioned`]), so it is
+//! served over the very table those writes went to.
+//!
 //! Three things make this a real call rather than a reported one:
 //!
 //! * the request reaches Amazon DynamoDB ITSELF — the in-process hop into this same emulator
@@ -163,8 +170,17 @@ pub async fn answered(
             .await;
         }
     }
+    let started_at = (call == Call::Sync).then(versioned::now_millis);
     let answer = called(context, region, call.target(), &body).await?;
-    Ok(call.read_answer(&body, &answer))
+    let mut result = call.read_answer(&body, &answer);
+    // A delta sync's page is reported with the moment that sync STARTED, which is the value a
+    // client carries into its NEXT sync as `lastSync`. It is read before the page is, so a
+    // write accepted while the page was being read is one the next sync still answers rather
+    // than one neither page carries.
+    if let (Some(started_at), Some(page)) = (started_at, result.as_object_mut()) {
+        page.insert(STARTED_AT_MEMBER.to_string(), json!(started_at));
+    }
+    Ok(result)
 }
 
 /// The sentence this call is refused with when the permissions in force do not admit it, or
@@ -211,6 +227,7 @@ enum Call {
     DeleteItem,
     Query,
     Scan,
+    Sync,
     BatchGetItem,
     BatchPutItem,
     BatchDeleteItem,
@@ -225,6 +242,7 @@ impl Call {
         "DeleteItem",
         "Query",
         "Scan",
+        "Sync",
         "BatchGetItem",
         "BatchPutItem",
         "BatchDeleteItem",
@@ -239,6 +257,7 @@ impl Call {
             "DeleteItem" => Some(Self::DeleteItem),
             "Query" => Some(Self::Query),
             "Scan" => Some(Self::Scan),
+            "Sync" => Some(Self::Sync),
             "BatchGetItem" => Some(Self::BatchGetItem),
             "BatchPutItem" => Some(Self::BatchPutItem),
             "BatchDeleteItem" => Some(Self::BatchDeleteItem),
@@ -260,7 +279,11 @@ impl Call {
     ///
     /// A batch operation of this data source is one DynamoDB call over many items: the two
     /// WRITE batches are both that service's `BatchWriteItem`, which takes a put and a delete
-    /// request alike, and the read batch is its `BatchGetItem`.
+    /// request alike, and the read batch is its `BatchGetItem`. A delta SYNC is that service's
+    /// `Scan` over the table the data source names: what it answers is the rows of that table
+    /// whose last change is later than the moment the caller synced at, and that moment is a
+    /// value of the rows themselves rather than of any key, so it is read by scanning the
+    /// table and selecting on it ([`Self::wire_request`]).
     fn target(self) -> &'static str {
         match self {
             Self::GetItem => "GetItem",
@@ -268,7 +291,7 @@ impl Call {
             Self::UpdateItem => "UpdateItem",
             Self::DeleteItem => "DeleteItem",
             Self::Query => "Query",
-            Self::Scan => "Scan",
+            Self::Scan | Self::Sync => "Scan",
             Self::BatchGetItem => "BatchGetItem",
             Self::BatchPutItem | Self::BatchDeleteItem => "BatchWriteItem",
         }
@@ -362,6 +385,35 @@ impl Call {
                 carry_number(&mut input, requested, SEGMENT_MEMBER, SEGMENT_INPUT)?;
                 carry_number(&mut input, requested, TOTAL_SEGMENTS_MEMBER, TOTAL_SEGMENTS_INPUT)?;
             }
+            // A delta SYNC answers the rows that changed since the moment the caller last
+            // synced at: `lastSync` is that moment in epoch milliseconds, and every write of a
+            // versioned data source stamps the moment of the change onto the row itself
+            // ([`versioned::LAST_CHANGED_AT_ATTRIBUTE`]), so the page is the table's rows
+            // SELECTED on that attribute — the tombstones a versioned delete left among them,
+            // which is how a client observes a removal. A request stating no such moment asks
+            // for the whole table, which is the sync a client makes when it holds nothing yet.
+            Self::Sync => {
+                let mut selection = expression(requested, FILTER_MEMBER)?;
+                if let Some(since) = changed_since(requested)? {
+                    let name = format!("#{}Since", versioned::PLACEHOLDER_PREFIX);
+                    let placeholder = format!(":{}Since", versioned::PLACEHOLDER_PREFIX);
+                    let term = format!("{name} > {placeholder}");
+                    // The caller's own filter still holds: both have to, so the two are
+                    // conjoined and the caller's is bracketed, which is what keeps an
+                    // expression of its own that reads `a OR b` from widening the page.
+                    selection.expression = Some(match selection.expression {
+                        Some(stated) => format!("({stated}) AND {term}"),
+                        None => term,
+                    });
+                    selection.names.insert(
+                        name,
+                        Json::String(versioned::LAST_CHANGED_AT_ATTRIBUTE.to_string()),
+                    );
+                    selection.values.insert(placeholder, json!({NUMBER: since}));
+                }
+                selection.carry(&mut input, FILTER_EXPRESSION_INPUT);
+                carry_selection(&mut input, requested)?;
+            }
             // Both write batches are one `BatchWriteItem` over the write requests the tables
             // the request names carry: a put request per item written, a delete request per
             // key removed. How MANY writes one such call may carry is bounded before any of
@@ -449,6 +501,9 @@ impl Call {
     /// it removed — and a selection answers the page it read: its items, the token that
     /// continues it and how many values it examined. `null` is the result of a read that found
     /// no item, which is what a field whose item is not there resolves to.
+    ///
+    /// A delta SYNC answers the page it read too, and the moment that sync STARTED beside it,
+    /// which is stamped on by [`answered`] because it is read BEFORE the page.
     fn read_answer(self, requested: &Json, answered: &Json) -> Json {
         match self {
             Self::GetItem => plain_member(answered, ITEM_OUTPUT),
@@ -460,23 +515,17 @@ impl Call {
                 .map_or(Json::Null, plain_value),
             Self::UpdateItem | Self::DeleteItem => plain_member(answered, ATTRIBUTES_OUTPUT),
             Self::Query | Self::Scan => {
-                let items: Vec<Json> = answered
-                    .get(ITEMS_OUTPUT)
-                    .and_then(Json::as_array)
-                    .map(|items| items.iter().map(plain_value).collect())
-                    .unwrap_or_default();
-                json!({
-                    ITEMS_MEMBER: items,
-                    NEXT_TOKEN_MEMBER: answered
-                        .get(LAST_EVALUATED_KEY_OUTPUT)
-                        .filter(|key| !key.is_null())
-                        .map_or(Json::Null, |key| Json::String(encoded_token(key))),
-                    SCANNED_COUNT_MEMBER: answered
+                let mut page = read_page(answered);
+                page.insert(
+                    SCANNED_COUNT_MEMBER.to_string(),
+                    answered
                         .get(SCANNED_COUNT_OUTPUT)
                         .cloned()
                         .unwrap_or_else(|| json!(0)),
-                })
+                );
+                Json::Object(page)
             }
+            Self::Sync => Json::Object(read_page(answered)),
             // What a write batch came to is what it wrote or removed, per table, which the
             // request itself describes: `BatchWriteItem` answers only what it did NOT carry
             // out, which is reported beside it under the member that batch states it in.
@@ -501,6 +550,55 @@ impl Call {
             Self::BatchGetItem => read_batch_answer(requested, answered),
         }
     }
+}
+
+/// The page every selection answers, read out of what the call answered: the items it read,
+/// unmarshalled, and the token that continues the selection where it left off — `null` where
+/// the call read the selection to its end.
+///
+/// The one reading of a page, so a `Query`, a `Scan` and a delta `Sync` report the items they
+/// read and the cursor that continues them the same way.
+fn read_page(answered: &Json) -> JsonMap<String, Json> {
+    let items: Vec<Json> = answered
+        .get(ITEMS_OUTPUT)
+        .and_then(Json::as_array)
+        .map(|items| items.iter().map(plain_value).collect())
+        .unwrap_or_default();
+    let mut page = JsonMap::new();
+    page.insert(ITEMS_MEMBER.to_string(), Json::Array(items));
+    page.insert(
+        NEXT_TOKEN_MEMBER.to_string(),
+        answered
+            .get(LAST_EVALUATED_KEY_OUTPUT)
+            .filter(|key| !key.is_null())
+            .map_or(Json::Null, |key| Json::String(encoded_token(key))),
+    );
+    page
+}
+
+/// The moment a delta sync is to report the changes made AFTER, in epoch milliseconds, or
+/// `None` for a request that states none — the sync of a client that holds nothing yet, which
+/// is answered the whole table.
+///
+/// "`lastSync`" is that moment as the caller last read it off a sync's own `startedAt`, so a
+/// value that is no whole number of milliseconds is refused by its member rather than read as
+/// no moment at all — a moment carried as a fractional number is that same whole moment where
+/// it has no fraction, which is the form a field typed as a timestamp renders it in. A moment at
+/// or before the epoch is no claim about what the caller holds, and is the same whole-table sync.
+fn changed_since(requested: &Json) -> Result<Option<i64>, String> {
+    let held = match requested.get(LAST_SYNC_MEMBER) {
+        None | Some(Json::Null) => return Ok(None),
+        Some(held) => held,
+    };
+    let since = held
+        .as_i64()
+        .or_else(|| {
+            held.as_f64()
+                .filter(|moment| moment.fract() == 0.0)
+                .map(|moment| moment as i64)
+        })
+        .ok_or_else(|| format!("{A_COUNT_IS_A_NUMBER} {LAST_SYNC_MEMBER}."))?;
+    Ok(Some(since).filter(|since| *since > 0))
 }
 
 /// The result of one READ batch: for every table the request named, the item answered for each
@@ -1164,6 +1262,13 @@ const SELECT_MEMBER: &str = "select";
 const SEGMENT_MEMBER: &str = "segment";
 const TOTAL_SEGMENTS_MEMBER: &str = "totalSegments";
 const NEXT_TOKEN_MEMBER: &str = "nextToken";
+/// The members a delta SYNC states and reports: the moment the caller last synced at, and the
+/// moment this sync started — both in epoch milliseconds, because that is the unit every write
+/// of a versioned data source stamps the moment of its change in
+/// ([`versioned::LAST_CHANGED_AT_ATTRIBUTE`]), and the one is what a client carries back as the
+/// other.
+const LAST_SYNC_MEMBER: &str = "lastSync";
+const STARTED_AT_MEMBER: &str = "startedAt";
 /// The members a BATCH request and its result carry: the tables it addresses, the keys a read
 /// batch states per table, and the two members the result reports under.
 const TABLES_MEMBER: &str = "tables";
@@ -1451,6 +1556,66 @@ mod tests {
                     "Select": "ALL_ATTRIBUTES",
                 }),
             ),
+            (
+                "a delta Sync of the changes after one moment",
+                json!({"operation": "Sync", "lastSync": 1_700_000_000_000_i64, "limit": 2}),
+                json!({
+                    "TableName": "items",
+                    "Limit": 2,
+                    // The rows selected are the ones whose last change is later than the
+                    // moment the caller synced at, which is an attribute of the rows.
+                    "FilterExpression": "#appsyncSystemSince > :appsyncSystemSince",
+                    "ExpressionAttributeNames": {"#appsyncSystemSince": "_lastChangedAt"},
+                    "ExpressionAttributeValues": {
+                        ":appsyncSystemSince": {"N": "1700000000000"},
+                    },
+                }),
+            ),
+            (
+                "the same moment carried as a fractional number, as a timestamp field renders \
+                 one",
+                json!({"operation": "Sync", "lastSync": 1_700_000_000_000.0_f64, "limit": 2}),
+                json!({
+                    "TableName": "items",
+                    "Limit": 2,
+                    "FilterExpression": "#appsyncSystemSince > :appsyncSystemSince",
+                    "ExpressionAttributeNames": {"#appsyncSystemSince": "_lastChangedAt"},
+                    "ExpressionAttributeValues": {
+                        ":appsyncSystemSince": {"N": "1700000000000"},
+                    },
+                }),
+            ),
+            (
+                "a delta Sync of a client that holds nothing yet, which selects the whole table",
+                json!({"operation": "Sync"}),
+                json!({"TableName": "items"}),
+            ),
+            (
+                "a delta Sync whose own filter holds beside the moment it syncs from",
+                json!({
+                    "operation": "Sync",
+                    "lastSync": 10,
+                    "filter": {
+                        "expression": "#o = :o OR #o = :p",
+                        "expressionNames": {"#o": "owner"},
+                        "expressionValues": {":o": {"S": "ada"}, ":p": {"S": "bob"}},
+                    },
+                }),
+                json!({
+                    "TableName": "items",
+                    "FilterExpression":
+                        "(#o = :o OR #o = :p) AND #appsyncSystemSince > :appsyncSystemSince",
+                    "ExpressionAttributeNames": {
+                        "#o": "owner",
+                        "#appsyncSystemSince": "_lastChangedAt",
+                    },
+                    "ExpressionAttributeValues": {
+                        ":o": {"S": "ada"},
+                        ":p": {"S": "bob"},
+                        ":appsyncSystemSince": {"N": "10"},
+                    },
+                }),
+            ),
         ];
         for (case, requested, expected) in rows {
             let operation = requested
@@ -1503,6 +1668,11 @@ mod tests {
                 "a Scan whose limit is no whole number",
                 json!({"operation": "Scan", "limit": "ten"}),
                 "limit",
+            ),
+            (
+                "a Sync whose lastSync is no whole number of milliseconds",
+                json!({"operation": "Sync", "lastSync": "yesterday"}),
+                "lastSync",
             ),
             (
                 "a GetItem whose consistentRead is no flag",
@@ -1564,7 +1734,7 @@ mod tests {
             ("a value that is no text", json!(7)),
             ("a value that is a document", json!({"id": {"S": "A-1"}})),
         ];
-        for operation in ["Query", "Scan"] {
+        for operation in ["Query", "Scan", "Sync"] {
             let call = Call::named(operation).expect("the operation must be served");
             for (form, token) in carried {
                 let case = format!("{operation} carrying {form}");
@@ -1863,6 +2033,34 @@ mod tests {
             written,
             json!({"id": "A-1", "n": 2}),
             "case a put: expected the item it wrote, got {written}"
+        );
+        // A delta sync's page is the rows it read and the cursor that continues them, read the
+        // same way a selection's is.
+        let synced = Call::Sync.read_answer(
+            &Json::Null,
+            &json!({
+                "Items": [
+                    {"id": {"S": "A-1"}, "_version": {"N": "2"}},
+                    {"id": {"S": "A-2"}, "_version": {"N": "3"}, "_deleted": {"BOOL": true}},
+                ],
+                "LastEvaluatedKey": {"id": {"S": "A-2"}},
+            }),
+        );
+        assert_eq!(
+            synced["items"],
+            json!([
+                {"id": "A-1", "_version": 2},
+                // The tombstone a versioned delete left travels in the page, marked deleted,
+                // which is how a client observes the removal.
+                {"id": "A-2", "_version": 3, "_deleted": true},
+            ]),
+            "case a delta sync: expected the changed rows, got {synced}"
+        );
+        assert_eq!(
+            decoded_token(synced["nextToken"].as_str().unwrap_or_default()),
+            Some(json!({"id": {"S": "A-2"}})),
+            "case a delta sync with more to read: expected a token for the key it ended on, got \
+             {synced}"
         );
     }
 
