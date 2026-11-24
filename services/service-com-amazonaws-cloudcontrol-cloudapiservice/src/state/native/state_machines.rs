@@ -117,6 +117,32 @@ const UNAPPLIED_PROPERTIES: &[&str] = &[
     "TracingConfiguration",
 ];
 
+/// EVERY property this type's registry schema declares, which is the set a resource model of
+/// it may carry and no more.
+///
+/// Catalog source: the `properties` object of the `AWS::StepFunctions::StateMachine` resource
+/// provider schema, as CloudFormation publishes it (`DescribeType`) — the properties the
+/// model reading below has an arm for, named by the constants above, together with the ones
+/// it does not apply ([`UNAPPLIED_PROPERTIES`]), so the set and the reading cannot name
+/// different things. Published for the stage that judges a model's SHAPE against the schema
+/// before any handler is asked ([`crate::state::registry_schema`]).
+pub const DECLARED_PROPERTIES: &[&str] = &[
+    IDENTIFIER_PROPERTY,
+    DEFINITION,
+    "DefinitionS3Location",
+    DEFINITION_STRING,
+    "DefinitionSubstitutions",
+    "EncryptionConfiguration",
+    "LoggingConfiguration",
+    NAME,
+    ROLE_ARN,
+    STATE_MACHINE_NAME,
+    STATE_MACHINE_REVISION_ID,
+    STATE_MACHINE_TYPE,
+    TAGS,
+    "TracingConfiguration",
+];
+
 /// The Step Functions state machines of one engine, as Cloud Control API resources.
 pub struct StateMachineProvider {
     /// The owning service's store. A handle, so every answer is read from the live store.

@@ -2109,23 +2109,93 @@ fn content_within_size(content: &str) -> Result<(), ContentRejection> {
 /// carried.
 ///
 /// ONE budget for every caller-supplied expression of this service, so no reader of one can
-/// be more generous than another ([`parameter_pattern`],
-/// `crate::ops::put_parameter`'s `AllowedPattern` reading).
+/// be more generous than another ([`compiled_pattern`], and the two readings built on it:
+/// [`parameter_pattern`] and [`allowed_pattern_rejection`]).
 pub const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
 
 /// See [`COMPILED_PATTERN_LIMIT`].
 pub const PATTERN_DFA_LIMIT: usize = 64 * 1024;
 
 /// `pattern`, as supplied by a caller, compiled under this service's budget for one
-/// ([`COMPILED_PATTERN_LIMIT`]) — `None` for an expression this service cannot evaluate,
-/// which restricts nothing rather than making the document that carries it unusable (the
-/// framework's own treatment of a pattern it cannot compile).
-pub fn parameter_pattern(pattern: &str) -> Option<::regex::Regex> {
+/// ([`COMPILED_PATTERN_LIMIT`]) — or the compiler's own reason for an expression this service
+/// cannot evaluate, which is what a refusal about the PATTERN itself states.
+///
+/// The one place that budget is applied, so every reading of a supplied expression here is
+/// bounded alike.
+fn compiled_pattern(pattern: &str) -> Result<::regex::Regex, ::regex::Error> {
     ::regex::RegexBuilder::new(pattern)
         .size_limit(COMPILED_PATTERN_LIMIT)
         .dfa_size_limit(PATTERN_DFA_LIMIT)
         .build()
-        .ok()
+}
+
+/// `pattern`, as supplied by a caller, compiled under this service's budget for one
+/// ([`COMPILED_PATTERN_LIMIT`]) — `None` for an expression this service cannot evaluate,
+/// which restricts nothing rather than making the document that carries it unusable (the
+/// framework's own treatment of a pattern it cannot compile).
+pub fn parameter_pattern(pattern: &str) -> Option<::regex::Regex> {
+    compiled_pattern(pattern).ok()
+}
+
+/// Why a value is not one an `AllowedPattern` accepts, named by the modelled error that
+/// reports it.
+///
+/// The two mean opposite things, so they are never reported interchangeably: one says
+/// the caller's VALUE is wrong, the other that the caller's PATTERN is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllowedPatternRejection {
+    /// The supplied `AllowedPattern` is not a regular expression at all:
+    /// `InvalidAllowedPatternException` ("The request doesn't meet the regular
+    /// expression requirement").
+    Pattern(String),
+    /// The value does not satisfy a well-formed `AllowedPattern`:
+    /// `ParameterPatternMismatchException`.
+    Value(String),
+}
+
+/// Why `value` does not satisfy `pattern`, or `None` when it does (or when the write named
+/// no pattern).
+///
+/// `AllowedPattern` is "a regular expression used to validate the parameter value", so
+/// the value is matched against it in full — the whole value, not a substring, the way
+/// a regular-expression constraint on a member reads. A `StringList`'s value is not one
+/// value but a list ("Items in a StringList must be separated by a comma (,)"), so the
+/// constraint holds of each ITEM of it rather than of the comma-joined whole; every
+/// other type, `SecureString` included, is matched as the one value it is — and a
+/// `SecureString` is matched on the plaintext the request carried, before it is sealed.
+///
+/// The expression comes from the caller, so it is evaluated by the `regex` crate, whose
+/// matching is linear in the input and has no backtracking blowup, under this service's own
+/// compiled-size budget for a supplied expression ([`compiled_pattern`]); the modelled
+/// `AllowedPattern` length (0..1024) bounds what is compiled.
+///
+/// This is the ONE reading of the rule for this service: `PutParameter` asks it of the write
+/// it is about to make, and so does every other path that stores a parameter version,
+/// whichever API that path belongs to.
+pub fn allowed_pattern_rejection(
+    pattern: Option<&str>,
+    type_: &str,
+    value: &str,
+) -> Option<AllowedPatternRejection> {
+    let pattern = pattern.filter(|pattern| !pattern.is_empty())?;
+    let anchored = format!("^(?:{pattern})$");
+    let expression = match compiled_pattern(&anchored) {
+        Ok(expression) => expression,
+        Err(why) => {
+            return Some(AllowedPatternRejection::Pattern(format!(
+                "AllowedPattern '{pattern}' is not a regular expression this service can \
+                 evaluate: {why}"
+            )))
+        }
+    };
+    let satisfied = if type_ == TYPE_STRING_LIST {
+        value
+            .split(STRING_LIST_SEPARATOR)
+            .all(|item| expression.is_match(item))
+    } else {
+        expression.is_match(value)
+    };
+    (!satisfied).then(|| AllowedPatternRejection::Value(allowed_pattern_mismatch_message(pattern)))
 }
 
 /// The `PingStatus` a node that has just pinged the service carries (from the modelled

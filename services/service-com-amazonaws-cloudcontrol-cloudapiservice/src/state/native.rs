@@ -123,6 +123,69 @@ pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 /// service generated an error, and the handler has no verdict of its own for it.
 pub const HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION: &str = "GeneralServiceException";
 
+/// EVERY property each resource type's registry schema declares, by `TypeName`.
+///
+/// One row per type whose provider reads a resource model: the set is the PROVIDER's, stated
+/// beside the reading that has an arm per property, so there is one catalogue of what a type
+/// declares rather than one per stage. The stage that judges a model's shape against the
+/// schema before any handler is asked reads it from here
+/// ([`crate::state::registry_schema`]), and a type with no row is one that stage judges the
+/// shape of nowhere — the position every catalogue of this crate takes about what it does not
+/// state.
+pub const DECLARED_PROPERTIES: &[(&str, &[&str])] = &[
+    (alarms::TYPE_NAME, alarms::DECLARED_PROPERTIES),
+    (log_groups::TYPE_NAME, log_groups::DECLARED_PROPERTIES),
+    (log_streams::TYPE_NAME, log_streams::DECLARED_PROPERTIES),
+    (parameters::TYPE_NAME, parameters::DECLARED_PROPERTIES),
+    (
+        state_machines::TYPE_NAME,
+        state_machines::DECLARED_PROPERTIES,
+    ),
+];
+
+/// The properties `type_name`'s registry schema declares, or none where no row states them
+/// ([`DECLARED_PROPERTIES`]).
+#[must_use]
+pub fn declared_properties(type_name: &str) -> &'static [&'static str] {
+    DECLARED_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map_or(&[], |(_, properties)| *properties)
+}
+
+/// The sentence a resource type's handler states when a call it made on the OWNING service
+/// raised an error it maps to no verdict of its own ([`NativeRefusal::Rejected`]).
+///
+/// The handler does not relay what the downstream service said: it reports the fixed text of
+/// that class around its one variable part, the owning service's API operation it was
+/// making — which is the action named without the namespace an IAM action carries it under.
+/// So a caller reading a failed request learns which downstream call did not happen, and
+/// nothing of the downstream service's own wording is passed through as Cloud Control API's.
+///
+/// ONE sentence for every resource type, because it is the sentence of that FAILURE CLASS
+/// rather than of a type: what differs between two types' handlers is which call they make,
+/// which is why the call is read from each provider's own published calls
+/// ([`downstream_call`]) instead of being written per type.
+pub fn downstream_failure(call: &str) -> String {
+    let operation = call.rsplit_once(':').map_or(call, |(_, operation)| operation);
+    format!("Error occurred during operation '{operation}'.")
+}
+
+/// The owning service's call a refusal `provider` raised about `operation` is reported
+/// against: the FIRST action that provider publishes for the operation
+/// ([`NativeResourceProvider::handler_calls`]), which is the call that carries the operation
+/// out — the others are the ones it makes around that call.
+///
+/// `None` for an operation the provider publishes no call for, which states nothing about
+/// what the handler was doing: such a refusal keeps the owning service's own diagnostic, the
+/// position every catalogue of this crate takes about what it does not state.
+pub fn downstream_call(
+    provider: &dyn NativeResourceProvider,
+    operation: &str,
+) -> Option<&'static str> {
+    provider.handler_calls(operation).first().copied()
+}
+
 /// WHERE the identifiers a resource operation reports lead, for a type whose primary
 /// identifier is an ADDRESS the owning service announces rather than a name.
 ///

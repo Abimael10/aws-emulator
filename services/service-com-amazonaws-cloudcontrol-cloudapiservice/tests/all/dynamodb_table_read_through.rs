@@ -762,10 +762,12 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
     // The rows differ along WHICH rule the desired state breaks, and so along which handler
     // verdict the refusal carries: the owning service's own rules for a declared table (a key
     // attribute nothing defines, an attribute no key uses, a capacity stated for an on-demand
-    // table, a name outside the form a table name takes) are that service's own error, while
-    // a property this handler does not apply and a property the type does not declare at all
-    // are faults the handler judges against the type's schema. Each expected sentence is the
-    // OWNING service's own, which is what a client of this API reads.
+    // table, a name outside the form a table name takes) are that service's own error, which
+    // the handler reports as the downstream call it was making rather than in that service's
+    // own words, while a property this handler does not apply and a property the type does
+    // not declare at all are faults the handler judges against the type's schema and states
+    // in its own.
+    let downstream = "Error occurred during operation 'CreateTable'.".to_string();
     let rows: [(&str, &str, Value, String, &str); 6] = [
         (
             "a key attribute no AttributeDefinitions entry declares",
@@ -776,12 +778,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "AttributeDefinitions": [{ "AttributeName": "other", "AttributeType": "S" }],
                 "BillingMode": "PAY_PER_REQUEST",
             }),
-            // The owning service states its parameter-value sentence over the two lists the
-            // caller has to reconcile: the whole key schema at fault, and every attribute
-            // name the declaration defines.
-            "One or more parameter values were invalid: Some index key attributes are not \
-             defined in AttributeDefinitions. Keys: [id], AttributeDefinitions: [other]"
-                .to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (
@@ -796,7 +793,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 ],
                 "BillingMode": "PAY_PER_REQUEST",
             }),
-            "Some AttributeDefinitions are not used in any KeySchema: spare".to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (
@@ -812,9 +809,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                     "WriteCapacityUnits": 1,
                 },
             }),
-            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
-             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
-                .to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (
@@ -826,9 +821,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "AttributeDefinitions": [{ "AttributeName": "id", "AttributeType": "S" }],
                 "BillingMode": "PAY_PER_REQUEST",
             }),
-            "1 validation error detected: Value 'ab' at 'tableName' failed to satisfy \
-             constraint: Member must have length greater than or equal to 3"
-                .to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (

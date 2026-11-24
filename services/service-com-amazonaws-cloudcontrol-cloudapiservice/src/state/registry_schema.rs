@@ -8,14 +8,17 @@
 //! A resource model a request carries — the `DesiredState` of a create, the model a patch
 //! leaves behind on an update — is validated against the resource type's registry schema
 //! BEFORE anything the request names is resolved, before any handler is asked and before a
-//! resource operation request is minted. A property whose value is outside a constraint that
-//! schema declares for it is therefore a fault in the CALL: it is refused synchronously, with
-//! the model validator's own diagnostic naming the property's JSON pointer in the validated
-//! document and the schema keyword the value failed ([`failure`]).
+//! resource operation request is minted. A model that is not a model of the type is therefore
+//! a fault in the CALL: a property whose value is outside a constraint or the JSON type that
+//! schema declares for it, a property the schema declares `required` that the model names no
+//! value for, or a property the schema does not declare at all. It is refused synchronously,
+//! with the model validator's own diagnostic naming the offending property — its JSON pointer
+//! in the validated document for a value, the key itself for a presence — and what it failed
+//! ([`failure`], [`required_failure`], [`extraneous_failure`]).
 //!
 //! That is a different plane from a handler's verdict about the input. A handler verdict is
 //! reached asynchronously, after the request has been accepted, and is reported on the
-//! request's own terminal event — so a caller has to poll for it. A value the type's schema
+//! request's own terminal event — so a caller has to poll for it. A model the type's schema
 //! could never admit needs no handler to decide it, and a caller must not have to poll to
 //! learn that the model it wrote is not a model of the type. Everything the schema does NOT
 //! state — the owning service's own naming rules, the prefixes it keeps for itself, a quota,
@@ -23,24 +26,33 @@
 //!
 //! ## What a row carries, and where it comes from
 //!
-//! [`TYPE_SCHEMAS`] is a catalogue: one row per resource type, carrying the properties of
-//! that type whose value its registry schema constrains, each with the JSON `type` the
-//! schema declares and the constraint keywords it states for it ([`Constraint`]). Catalog
-//! source: the `properties` object of each type's resource provider schema, as
-//! CloudFormation publishes it (`DescribeType`). Where a schema republishes a value set or a
-//! bound the OWNING service's own API publishes — a parameter's tiers, a log group's
-//! retention catalogue, an alarm's evaluation periods — the row reads that service's own
-//! published set rather than restating it, so the two cannot drift apart.
+//! [`TYPE_SCHEMAS`] is a catalogue: one row per resource type, carrying the properties whose
+//! VALUE this stage judges — each with the JSON `type` the schema declares and the constraint
+//! keywords it states for it ([`Constraint`]) — and the properties that schema declares
+//! `required`. Catalog source: the `properties` and `required` of each type's resource
+//! provider schema, as CloudFormation publishes it (`DescribeType`). Where a schema
+//! republishes a value set or a bound the OWNING service's own API publishes — a parameter's
+//! tiers, a log group's retention catalogue, an alarm's evaluation periods — the row reads
+//! that service's own published set rather than restating it, so the two cannot drift apart.
+//!
+//! WHICH properties a type declares at all is not stated here: that set belongs to the type's
+//! provider, the module that reads a model of the type property by property, and is read from
+//! there ([`super::native::declared_properties`]) — so one catalogue answers it for every
+//! stage, and this one cannot refuse as undeclared a property that module reads.
+//!
+//! Three keywords of the schema are therefore answered here, all of them about the
+//! document's own root:
+//!
+//! * `type` and the constraint keywords, judged against the value a property carries;
+//! * `required`, the properties a model of the type cannot be without;
+//! * `additionalProperties`, which every resource provider schema states as `false` — so a
+//!   property the type does not declare is one no model of it may carry.
 //!
 //! The catalogue is deliberately PARTIAL and fail-open, as every schema catalogue in this
-//! crate is: a property no row names, and a type with no row at all, are left to the owning
-//! service's handler, which is the authority on everything the schema does not state. Only
-//! the properties of the type ITSELF are judged here, at the document's own root, so a value
-//! nested inside a property's own object or list is left there too.
-//!
-//! PRESENCE is not this stage's question: which properties a model must carry, and which it
-//! may carry at all, are the schema's `required` and `additionalProperties` keywords and are
-//! answered where each type's model is read.
+//! crate is: a type with no row at all is left to the owning service's handler, which is the
+//! authority on everything the schema does not state, and so is every value of a property no
+//! row judges. Only the properties of the type ITSELF are judged here, at the document's own
+//! root, so a value nested inside a property's own object or list is left there too.
 
 use ::std::collections::BTreeMap;
 use ::std::sync::OnceLock;
@@ -62,6 +74,8 @@ enum DeclaredType {
     Integer,
     /// `"type": "number"`, which every integer is one of.
     Number,
+    /// `"type": "boolean"`.
+    Flag,
 }
 
 impl DeclaredType {
@@ -71,6 +85,7 @@ impl DeclaredType {
             Self::Text => "String",
             Self::Integer => "Integer",
             Self::Number => "Number",
+            Self::Flag => "Boolean",
         }
     }
 
@@ -81,6 +96,7 @@ impl DeclaredType {
             Self::Text => value.is_string(),
             Self::Integer => is_integer(value),
             Self::Number => value.is_number(),
+            Self::Flag => value.is_boolean(),
         }
     }
 }
@@ -98,7 +114,7 @@ fn is_integer(value: &Value) -> bool {
 fn found_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "Null",
-        Value::Bool(_) => "Boolean",
+        Value::Bool(_) => DeclaredType::Flag.name(),
         Value::Number(_) if is_integer(value) => DeclaredType::Integer.name(),
         Value::Number(_) => DeclaredType::Number.name(),
         Value::String(_) => DeclaredType::Text.name(),
@@ -201,14 +217,30 @@ impl PropertySchema {
     }
 }
 
-/// One resource type's constrained properties.
+/// One resource type's declared properties.
 #[derive(Debug, Clone, Copy)]
 struct TypeSchema {
     /// The type, as a request names it (`TypeName`).
     type_name: &'static str,
-    /// Its properties this stage judges, in the order the schema publishes them — which is
-    /// observable only in which property a model breaking several of them is reported for.
+    /// The properties its schema declares `required`: the ones a model of the type cannot
+    /// be without, in the order the schema lists them.
+    required: &'static [&'static str],
+    /// Its properties whose VALUE this stage judges, in the order the schema publishes them
+    /// — which is observable only in which property a model breaking several of them is
+    /// reported for.
     properties: &'static [PropertySchema],
+}
+
+impl TypeSchema {
+    /// Whether this type's schema declares `property` at all.
+    ///
+    /// The DECLARED SET is the type's provider's ([`super::native::declared_properties`]) —
+    /// the module that reads a model of the type, property by property — so there is one
+    /// catalogue of what the type declares and this stage cannot refuse as undeclared a
+    /// property that module reads.
+    fn declares(&self, property: &str) -> bool {
+        super::native::declared_properties(self.type_name).contains(&property)
+    }
 }
 
 /// The character class `AWS::Logs::LogGroup`'s and `AWS::Logs::LogStream`'s schemas state for
@@ -236,7 +268,16 @@ const TYPE_SCHEMAS: &[TypeSchema] = &[
     // threshold the alarm compares against is a number rather than text.
     TypeSchema {
         type_name: "AWS::CloudWatch::Alarm",
+        // "The arithmetic operation to use when comparing the specified statistic and
+        // threshold" and "the number of periods over which data is compared to the specified
+        // threshold" are the two the schema declares `required`.
+        required: &["ComparisonOperator", "EvaluationPeriods"],
         properties: &[
+            PropertySchema {
+                property: "ActionsEnabled",
+                declared: DeclaredType::Flag,
+                constraints: &[],
+            },
             PropertySchema {
                 property: "AlarmName",
                 declared: DeclaredType::Text,
@@ -279,6 +320,9 @@ const TYPE_SCHEMAS: &[TypeSchema] = &[
     // read from that service rather than restated here — and the bound on the key id.
     TypeSchema {
         type_name: "AWS::Logs::LogGroup",
+        // A log group is the name it answers to, and the schema declares even that optional:
+        // "if you don't specify a name, CloudFormation generates a unique physical ID".
+        required: &[],
         properties: &[
             PropertySchema {
                 property: "KmsKeyId",
@@ -310,6 +354,9 @@ const TYPE_SCHEMAS: &[TypeSchema] = &[
     // group's own type, and the stream's own name.
     TypeSchema {
         type_name: "AWS::Logs::LogStream",
+        // A stream is always IN a group, so the group's name is the one property the schema
+        // declares `required`; the stream's own name follows the generated-name rule.
+        required: &["LogGroupName"],
         properties: &[
             PropertySchema {
                 property: "LogGroupName",
@@ -336,7 +383,40 @@ const TYPE_SCHEMAS: &[TypeSchema] = &[
     // create — and the tiers AWS Systems Manager publishes for a parameter.
     TypeSchema {
         type_name: "AWS::SSM::Parameter",
+        // A parameter IS the value it holds, under the type that value is stored as: the two
+        // the schema declares `required`.
+        required: &["Type", "Value"],
         properties: &[
+            PropertySchema {
+                property: "AllowedPattern",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "Arn",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "DataType",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "Description",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "Name",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "Policies",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
             PropertySchema {
                 property: "Tier",
                 declared: DeclaredType::Text,
@@ -347,13 +427,41 @@ const TYPE_SCHEMAS: &[TypeSchema] = &[
                 declared: DeclaredType::Text,
                 constraints: &[Constraint::AdmittedText(PARAMETER_TYPES)],
             },
+            PropertySchema {
+                property: "Value",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
         ],
     },
     // `AWS::StepFunctions::StateMachine`: the name's length and the workflow types AWS Step
     // Functions publishes, read from that service's own model.
     TypeSchema {
         type_name: "AWS::StepFunctions::StateMachine",
+        // A state machine runs AS a role, so the role's ARN is the one property the schema
+        // declares `required` — the definition being declarable in either of its forms.
+        required: &["RoleArn"],
         properties: &[
+            PropertySchema {
+                property: "Arn",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "DefinitionString",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "Name",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
+            PropertySchema {
+                property: "RoleArn",
+                declared: DeclaredType::Text,
+                constraints: &[],
+            },
             PropertySchema {
                 property: "StateMachineName",
                 declared: DeclaredType::Text,
@@ -381,20 +489,49 @@ const ENUM_KEYWORD: &str = "enum";
 const ROOT: &str = "#";
 
 /// The diagnostic Cloud Control API refuses `model` as a resource of `type_name` with, or
-/// `None` where the type's registry schema admits every value it carries.
+/// `None` where the type's registry schema admits it.
 ///
-/// The properties are judged in the order the type's row publishes them, so a model breaking
-/// several constraints is always reported for the same one.
+/// The three keywords are judged in one order, so a model breaking several of them is always
+/// reported for the same one: the VALUE of every property the model carries first, then the
+/// properties it must carry, then the properties it may carry at all. Within the first, the
+/// properties are judged in the order the type's row publishes them.
 pub fn model_validation_failure(type_name: &str, model: &Value) -> Option<String> {
     let schema = TYPE_SCHEMAS
         .iter()
         .find(|schema| schema.type_name == type_name)?;
     let properties = model.as_object()?;
-    schema.properties.iter().find_map(|property| {
+    let value_failure = schema.properties.iter().find_map(|property| {
         properties
             .get(property.property)
             .and_then(|value| property.failure(value))
-    })
+    });
+    if value_failure.is_some() {
+        return value_failure;
+    }
+    if let Some(missing) = schema
+        .required
+        .iter()
+        .find(|required| !properties.contains_key(**required))
+    {
+        return Some(required_failure(missing));
+    }
+    properties
+        .keys()
+        .find(|property| !schema.declares(property))
+        .map(|extraneous| extraneous_failure(extraneous))
+}
+
+/// How the model validator states a property the model must carry and does not: the key it
+/// looked for, at the root of the document it looked in.
+fn required_failure(property: &str) -> String {
+    format!("Model validation failed ({ROOT}: required key [{property}] not found)")
+}
+
+/// How the model validator states a property the type's schema does not declare: a schema
+/// that permits no additional property refuses the key itself, at the root of the document
+/// that carried it.
+fn extraneous_failure(property: &str) -> String {
+    format!("Model validation failed ({ROOT}: extraneous key [{property}] is not permitted)")
 }
 
 /// How the model validator states a value outside a constraint its schema declares: its own
@@ -467,15 +604,16 @@ fn declared_patterns() -> impl Iterator<Item = &'static str> {
 mod tests {
     use super::*;
 
-    /// RULE: a value outside a constraint the type's schema declares is refused with the
-    /// validator's diagnostic naming THAT property and THAT keyword, whichever type,
-    /// property and keyword it is — and a value the schema admits is refused by nothing
-    /// here.
+    /// RULE: a model that is not a model of the type is refused with the validator's own
+    /// diagnostic naming what it failed — a value outside a constraint or the declared JSON
+    /// type, a required key the model does not carry, or a key the schema does not declare —
+    /// whichever type, property and keyword it is; and a model the schema admits is refused
+    /// by nothing here.
     ///
     /// The rows span every keyword the catalogue states, across several types, and each
     /// keyword's own admitted side.
     #[test]
-    fn a_value_outside_a_declared_constraint_is_refused_naming_the_keyword() {
+    fn a_model_outside_the_declared_schema_is_refused_naming_what_it_failed() {
         let cases: &[(&str, &str, Value, Option<String>)] = &[
             (
                 "a log group name carrying a character the class excludes",
@@ -546,8 +684,69 @@ mod tests {
             (
                 "a parameter tier the owning service publishes",
                 "AWS::SSM::Parameter",
-                ::serde_json::json!({"Name": "/orders/db", "Tier": "Intelligent-Tiering"}),
+                ::serde_json::json!({
+                    "Name": "/orders/db",
+                    "Type": "String",
+                    "Value": "v",
+                    "Tier": "Intelligent-Tiering",
+                }),
                 None,
+            ),
+            (
+                "a parameter value stated as a number where the schema declares text",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({"Name": "/orders/db", "Type": "String", "Value": 12_345}),
+                Some(type_failure("Value", "String", "Integer")),
+            ),
+            (
+                "a parameter model carrying no value at all",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({"Name": "/orders/db", "Type": "String"}),
+                Some(required_failure("Value")),
+            ),
+            (
+                "a parameter model carrying no type, the first required key the schema lists",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({"Name": "/orders/db", "Value": "v"}),
+                Some(required_failure("Type")),
+            ),
+            (
+                "a parameter model carrying a property the schema does not declare",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({
+                    "Name": "/orders/db",
+                    "Type": "String",
+                    "Value": "v",
+                    "NotAProperty": "x",
+                }),
+                Some(extraneous_failure("NotAProperty")),
+            ),
+            (
+                "a parameter model carrying every property the schema declares",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({
+                    "Name": "/orders/db",
+                    "Type": "String",
+                    "Value": "v",
+                    "AllowedPattern": "^v$",
+                    "DataType": "text",
+                    "Description": "the database",
+                    "Tier": "Standard",
+                    "Tags": {"team": "orders"},
+                }),
+                None,
+            ),
+            (
+                "a log group model carrying a property the schema does not declare",
+                "AWS::Logs::LogGroup",
+                ::serde_json::json!({"LogGroupName": "orders", "Flavour": "vanilla"}),
+                Some(extraneous_failure("Flavour")),
+            ),
+            (
+                "a log stream model naming no group to be in",
+                "AWS::Logs::LogStream",
+                ::serde_json::json!({"LogStreamName": "host-1"}),
+                Some(required_failure("LogGroupName")),
             ),
             (
                 "a threshold stated as text",
@@ -558,8 +757,39 @@ mod tests {
             (
                 "a threshold stated as a whole number, which a number admits",
                 "AWS::CloudWatch::Alarm",
-                ::serde_json::json!({"AlarmName": "cpu", "Threshold": 80}),
+                ::serde_json::json!({
+                    "AlarmName": "cpu",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "EvaluationPeriods": 1,
+                    "Threshold": 80,
+                }),
                 None,
+            ),
+            (
+                "an alarm that enables its actions with text rather than a flag",
+                "AWS::CloudWatch::Alarm",
+                ::serde_json::json!({
+                    "AlarmName": "cpu",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "EvaluationPeriods": 1,
+                    "ActionsEnabled": "true",
+                }),
+                Some(type_failure("ActionsEnabled", "Boolean", "String")),
+            ),
+            (
+                "an alarm comparing nothing: the first required key the schema lists",
+                "AWS::CloudWatch::Alarm",
+                ::serde_json::json!({"AlarmName": "cpu", "EvaluationPeriods": 1}),
+                Some(required_failure("ComparisonOperator")),
+            ),
+            (
+                "an alarm evaluating over no periods",
+                "AWS::CloudWatch::Alarm",
+                ::serde_json::json!({
+                    "AlarmName": "cpu",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                }),
+                Some(required_failure("EvaluationPeriods")),
             ),
             (
                 "no period at all to evaluate over",
@@ -570,7 +800,11 @@ mod tests {
             (
                 "the fewest periods the alarm may evaluate over",
                 "AWS::CloudWatch::Alarm",
-                ::serde_json::json!({"AlarmName": "cpu", "EvaluationPeriods": 1}),
+                ::serde_json::json!({
+                    "AlarmName": "cpu",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "EvaluationPeriods": 1,
+                }),
                 None,
             ),
             (
@@ -586,9 +820,29 @@ mod tests {
                 Some(failure("StateMachineName", "maxLength")),
             ),
             (
+                "a state machine naming no role to run as",
+                "AWS::StepFunctions::StateMachine",
+                ::serde_json::json!({
+                    "StateMachineName": "orders",
+                    "DefinitionString": "{}",
+                }),
+                Some(required_failure("RoleArn")),
+            ),
+            (
+                "a state machine model the schema admits every part of",
+                "AWS::StepFunctions::StateMachine",
+                ::serde_json::json!({
+                    "StateMachineName": "orders",
+                    "StateMachineType": "STANDARD",
+                    "RoleArn": "arn:aws:iam::123456789012:role/states",
+                    "DefinitionString": "{}",
+                }),
+                None,
+            ),
+            (
                 "a type the catalogue holds no row for",
                 "AWS::SQS::Queue",
-                ::serde_json::json!({"QueueName": "orders:1"}),
+                ::serde_json::json!({"QueueName": "orders:1", "Flavour": "vanilla"}),
                 None,
             ),
             (
@@ -629,6 +883,16 @@ mod tests {
              failed validation constraint for keyword [enum])",
             "expected the validator's wording for a published set"
         );
+        assert_eq!(
+            required_failure("Value"),
+            "Model validation failed (#: required key [Value] not found)",
+            "expected the validator's wording for a required key"
+        );
+        assert_eq!(
+            extraneous_failure("NotAProperty"),
+            "Model validation failed (#: extraneous key [NotAProperty] is not permitted)",
+            "expected the validator's wording for an undeclared key"
+        );
     }
 
     /// Every regular expression the catalogue declares compiles, so no row is a rule this
@@ -643,7 +907,8 @@ mod tests {
         }
     }
 
-    /// Every row names one type once and every property of a row once, and a row's declared
+    /// Every row names one type once and every property of a row once, every property it
+    /// judges and every required key is one the type DECLARES, and a row's declared
     /// constraints are ones its declared type can fail: a length or a pattern over a number,
     /// or a smallest value over text, would be a rule nothing could break.
     #[test]
@@ -692,6 +957,66 @@ mod tests {
                         property.declared
                     );
                 }
+            }
+            // A property whose value this row judges is one the type declares: a row judging
+            // a property the type does not have would be a rule nothing can reach.
+            for property in schema.properties {
+                assert!(
+                    schema.declares(property.property),
+                    "case {:?}: {:?} is judged and not declared",
+                    schema.type_name,
+                    property.property
+                );
+            }
+            // And every required key is a property the type declares: a key no model could
+            // satisfy without being refused as extraneous would be a rule nothing can pass.
+            for required in schema.required {
+                assert!(
+                    schema.declares(required),
+                    "case {:?}: {required:?} is required and not declared",
+                    schema.type_name
+                );
+            }
+            // A type this stage judges states its declared set somewhere, or the keyword
+            // that rests on it would judge nothing.
+            assert!(
+                !crate::state::native::declared_properties(schema.type_name).is_empty(),
+                "case {:?}: expected the type's provider to state its declared properties",
+                schema.type_name
+            );
+        }
+    }
+
+    /// The DECLARED SET each row rests on carries every property the resource type's schema
+    /// states, checked against the OTHER reading of that schema this emulator holds: the
+    /// complete property set the CloudFormation service judges a template's property document
+    /// against (`property_validation::declared_properties`). The two stages judge different
+    /// documents — a template's declaration there, a resource model here — and under different
+    /// rules, but the set of properties the type HAS is the schema's, so neither may name a
+    /// property the other does not.
+    ///
+    /// Stated one way round: a property that catalogue declares and this one does not would
+    /// be refused as extraneous by this stage while the real service accepts it. This one MAY
+    /// declare more, since a property the read handler of this API reports is part of the
+    /// model a client round-trips here and not of a template's declaration.
+    #[test]
+    fn the_declared_set_carries_every_property_the_other_reading_of_the_schema_states() {
+        for other in
+            ::service_com_amazonaws_cloudformation_cloudformation::state::property_validation::declared_properties::DECLARED_PROPERTIES
+        {
+            let Some(schema) = TYPE_SCHEMAS
+                .iter()
+                .find(|schema| schema.type_name == other.resource_type)
+            else {
+                continue;
+            };
+            for property in other.declared {
+                assert!(
+                    schema.declares(property),
+                    "case {:?}: {property:?} is a property of the type that the declared set \
+                     does not carry",
+                    schema.type_name
+                );
             }
         }
     }

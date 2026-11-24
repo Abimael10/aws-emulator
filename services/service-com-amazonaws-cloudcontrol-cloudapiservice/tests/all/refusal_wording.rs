@@ -491,7 +491,11 @@ async fn an_unknown_request_token_is_refused_naming_the_token() {
     // A token this service DID mint resolves, so the refusal above is about the token
     // and not about the operation.
     let accepted = emulator
-        .create_ok(PARAMETER, &json!({ "Name": "polled-parameter" }), None)
+        .create_ok(
+            PARAMETER,
+            &json!({ "Name": "polled-parameter", "Type": "String", "Value": "v" }),
+            None,
+        )
         .await;
     let (status, _) = emulator.status(&text(&accepted, "RequestToken")).await;
     assert_eq!(status, 200, "a token this service minted must resolve");

@@ -511,17 +511,25 @@ async fn a_patch_through_cloud_control_is_a_new_version_of_the_parameter_systems
     }
 
     // A patch asking for a property of the type no handler here applies is not applied at
-    // all: the request reaches the owning handler's verdict, and the parameter keeps the
-    // model it had.
+    // all, and one asking for a value the OWNING service will not take is not applied
+    // either: the request reaches that verdict, and the parameter keeps the model it had.
     let rows = [
-        ("the allowed pattern", "AllowedPattern", json!("^[0-9]+$")),
+        (
+            "the allowed pattern, which the value the parameter holds does not satisfy",
+            "AllowedPattern",
+            json!("^[0-9]+$"),
+            "GeneralServiceException",
+            "Error occurred during operation 'PutParameter'.".to_string(),
+        ),
         (
             "the parameter policies",
             "Policies",
             json!("[{\"Type\":\"Expiration\",\"Version\":\"1.0\"}]"),
+            "InvalidRequest",
+            format!("Policies is a property of {PARAMETER} this emulator's handler does not apply"),
         ),
     ];
-    for (case, property, value) in rows {
+    for (case, property, value, expected_code, expected_message) in rows {
         let (status, accepted) = emulator
             .update(
                 PARAMETER,
@@ -545,15 +553,12 @@ async fn a_patch_through_cloud_control_is_a_new_version_of_the_parameter_systems
         );
         assert_eq!(
             text(&event, "ErrorCode"),
-            "InvalidRequest",
+            expected_code,
             "case {case:?}: expected the owning handler's verdict, got {event:?}"
         );
         assert_eq!(
             text(&event, "StatusMessage"),
-            format!(
-                "{property} is a property of {PARAMETER} this emulator's handler does not \
-                 apply"
-            ),
+            expected_message,
             "case {case:?}: unexpected wording, got {event:?}"
         );
         let parameter = served(&emulator, case, name).await;
@@ -569,54 +574,43 @@ async fn a_patch_through_cloud_control_is_a_new_version_of_the_parameter_systems
 #[tokio::test]
 async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdict() {
     let emulator = Emulator::with_ssm();
-    // The rows differ along WHICH rule the desired state breaks, and so along which handler
-    // verdict the refusal carries: the naming rules the OWNING service holds every parameter
-    // name to (the hierarchy's leading separator, the prefixes it keeps for itself) are that
-    // service's own, so its error is reported as one; the two properties the schema declares
-    // required and a property the type does not declare at all are faults the handler judges
-    // against that schema.
+    // The rows differ along WHICH rule the desired state breaks. Every row here is a rule the
+    // OWNING service holds the parameter to — the hierarchy's leading separator, the prefixes
+    // it keeps for itself, the expression a write states for its own value — so each is that
+    // service's error, which the handler reports as the downstream call it was making rather
+    // than in that service's own words.
     //
-    // A value outside a set the TYPE'S REGISTRY SCHEMA publishes — a parameter type or tier
-    // it does not carry — is not a row here: such a model never reaches a handler at all, the
-    // front door refusing the call before a request is minted
-    // (`front_door_model_validation`).
-    let rows: [(&str, &str, Value, String, &str); 5] = [
+    // A model the TYPE'S REGISTRY SCHEMA itself excludes — a parameter type or tier it does
+    // not carry, a required property left out, a property it does not declare at all — is not
+    // a row here: such a model never reaches a handler, the front door refusing the call
+    // before a request is minted (`front_door_model_validation`).
+    let downstream = "Error occurred during operation 'PutParameter'.".to_string();
+    let rows: [(&str, &str, Value, String, &str); 3] = [
         (
             "a hierarchical name with no leading separator",
             "Dev/DBServer",
             json!({ "Name": "Dev/DBServer", "Type": "String", "Value": "v" }),
-            "Parameter name must be a fully qualified name.".to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (
             "a name in the hierarchy the owning service keeps for itself",
             "/aws/reserved",
             json!({ "Name": "/aws/reserved", "Type": "String", "Value": "v" }),
-            "Name '/aws/reserved' is prefixed with 'aws': a parameter name can't be \
-             prefixed with aws or ssm (case-insensitive)"
-                .to_string(),
+            downstream.clone(),
             "GeneralServiceException",
         ),
         (
-            "a model that names no value",
-            "refused-valueless",
-            json!({ "Name": "refused-valueless", "Type": "String" }),
-            format!("Value is required by {PARAMETER}"),
-            "InvalidRequest",
-        ),
-        (
-            "a model that names no type",
-            "refused-typeless",
-            json!({ "Name": "refused-typeless", "Value": "v" }),
-            format!("Type is required by {PARAMETER}"),
-            "InvalidRequest",
-        ),
-        (
-            "a property the type does not declare",
-            "refused-stranger",
-            json!({ "Name": "refused-stranger", "Type": "String", "Value": "v", "Nope": "1" }),
-            format!("Nope is not a property of {PARAMETER}"),
-            "InvalidRequest",
+            "a value the expression the write itself states does not admit",
+            "/refused/patterned",
+            json!({
+                "Name": "/refused/patterned",
+                "Type": "String",
+                "Value": "not-a-number",
+                "AllowedPattern": "^[0-9]+$",
+            }),
+            downstream.clone(),
+            "GeneralServiceException",
         ),
     ];
 

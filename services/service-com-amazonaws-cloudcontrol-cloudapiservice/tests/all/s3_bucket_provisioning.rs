@@ -345,7 +345,7 @@ async fn a_delete_waits_for_the_owning_service_to_allow_it() {
     );
     assert_eq!(
         text(&blocked, "StatusMessage"),
-        "The bucket you tried to delete is not empty",
+        "Error occurred during operation 'DeleteBucket'.",
         "the delete of a bucket that is not empty: unexpected wording"
     );
     assert!(
@@ -488,7 +488,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
         );
         assert_eq!(
             text(&failed, "StatusMessage"),
-            "The specified bucket is not valid.",
+            "Error occurred during operation 'CreateBucket'.",
             "case {case:?}: unexpected wording"
         );
         assert!(
@@ -567,7 +567,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "BucketName": "reserved-tag-bucket",
                 "Tags": [tag("aws:created-by", "me")],
             }),
-            "System tags cannot be added/updated by requester",
+            "Error occurred during operation 'CreateBucket'.",
             "GeneralServiceException",
         ),
     ];

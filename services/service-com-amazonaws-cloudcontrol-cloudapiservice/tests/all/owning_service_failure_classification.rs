@@ -7,21 +7,25 @@
 //! refuse under a rule only it holds the value to — is reported under the handler code for a
 //! downstream error, `GeneralServiceException`, because that is the code for "the downstream
 //! service generated an error that doesn't map to any other handler error code"
-//! (`smithy_query(query="doc",shape="GeneralServiceException")`); `InvalidRequest`, which is
+//! (`smithy_query(query="doc",shape="GeneralServiceException")`), and its `StatusMessage` is
+//! the handler's own sentence about the CALL it was making rather than the downstream
+//! service's diagnosis, which the handler does not relay; `InvalidRequest`, which is
 //! the code for "invalid input from the user has generated a generic exception"
 //! (`smithy_query(query="doc",shape="InvalidRequestException")`), is reserved for a fault the
-//! handler itself judges in the model against the type's registry schema — a property the
-//! schema does not declare, one it declares that this handler does not apply, a required
-//! property the model names no value for, or a value outside a set that schema itself
-//! publishes.**
+//! handler itself judges in the model against the type's registry schema — a property that
+//! schema declares which this handler does not apply — and states in its own words.**
+//!
+//! A fault the SCHEMA itself states — a property it does not declare, one it declares
+//! `required` that the model leaves out, a value outside a constraint or the JSON type it
+//! declares — is not a case here at all: the front door refuses such a call before a handler
+//! is asked (`front_door_model_validation`).
 //!
 //! The rows differ along what the rule generalises over: which owning service answers for the
 //! type, which kind of rule the model breaks (a name's charset, a name and a flag that
-//! contradict each other, a value outside a range, an attribute that does not apply, a
-//! property the schema does not declare, a required property left out), and whether the
-//! refusal arises on a create or on an update. The controls are the refusals that DO map to a
-//! verdict of their own — a resource already there, one that is not there — which keep those
-//! codes, and the consistent model of each refused pair, which is accepted.
+//! contradict each other, a value outside a range, an attribute that does not apply), and
+//! whether the refusal arises on a create or on an update. The controls are the refusals that
+//! DO map to a verdict of their own — a resource already there, one that is not there — which
+//! keep those codes, and the consistent model of each refused pair, which is accepted.
 
 use serde_json::{json, Value};
 
@@ -31,6 +35,13 @@ use super::sqs_queue_read_through::{queue_url, QUEUE};
 /// The handler code for an error the OWNING service raised that the type's handler maps to
 /// no other verdict.
 const DOWNSTREAM: &str = "GeneralServiceException";
+
+/// The sentence such a refusal carries on the CREATE path of `AWS::SQS::Queue`: the handler
+/// names the call it was making, which for a create of a queue is `sqs:CreateQueue`.
+const DOWNSTREAM_CREATE: &str = "Error occurred during operation 'CreateQueue'.";
+
+/// The same sentence on the UPDATE path, where the handler changes a queue it already holds.
+const DOWNSTREAM_UPDATE: &str = "Error occurred during operation 'SetQueueAttributes'.";
 
 /// The handler code for a fault the handler itself judges in the model.
 const MODEL_FAULT: &str = "InvalidRequest";
@@ -76,36 +87,37 @@ async fn a_create_the_owning_service_refuses_carries_the_downstream_handler_code
     // The rows differ along the kind of rule the model breaks. The first four are rules only
     // Amazon SQS holds the value to — the FIFO suffix a name must or must not carry, the
     // character set a queue name admits, the range an attribute's integer lies in — and the
-    // last two are faults in the model against the type's registry schema. The diagnostic is
-    // the sentence whichever of the two worded it, which every row pins.
+    // last two are properties the type's schema does not declare, which this type's handler
+    // judges itself: Amazon SQS has no row in the model-validation catalogue, so its schema
+    // is read where its model is ([`crate::state::native`]). The diagnostic is the sentence
+    // whichever of the two worded it, which every row pins.
     let rows: [(&str, Value, &str, &str); 6] = [
         (
             "a name ending in the FIFO suffix on a queue that is not one",
             json!({ "QueueName": "classified-standard.fifo", "FifoQueue": false }),
             DOWNSTREAM,
-            // The sentence the owning service states a standard queue's name rule in.
-            "Can only include alphanumeric characters, hyphens, or underscores.",
+            // The sentence the handler states about the call it was making, whichever rule of
+            // the owning service's own refused that call.
+            DOWNSTREAM_CREATE,
         ),
         (
             "a FIFO queue whose name lacks the suffix",
             json!({ "QueueName": "classified-fifo", "FifoQueue": true }),
             DOWNSTREAM,
-            // And the one it states a FIFO queue's in, the suffix included.
-            "The name of a FIFO queue can only include alphanumeric characters, hyphens, or \
-             underscores, must end with .fifo suffix",
+            DOWNSTREAM_CREATE,
         ),
         (
             "a name carrying a character the owning service's charset excludes",
             json!({ "QueueName": "classified queue!" }),
             DOWNSTREAM,
-            "Can only include alphanumeric characters, hyphens, or underscores.",
+            DOWNSTREAM_CREATE,
         ),
         (
             "an attribute value one past the range the owning service admits",
             // "Valid values: An integer from 0 to 43,200 (12 hours)" (`VisibilityTimeout`).
             json!({ "QueueName": "classified-timeout", "VisibilityTimeout": 43_201 }),
             DOWNSTREAM,
-            "Invalid value for the parameter VisibilityTimeout.",
+            DOWNSTREAM_CREATE,
         ),
         (
             "a property the type's schema does not declare",
@@ -134,7 +146,7 @@ async fn a_create_the_owning_service_refuses_carries_the_downstream_handler_code
              {detail:?}"
         );
         // A refusal the handler judged states the handler's own diagnostic; one the owning
-        // service raised relays that service's own sentence.
+        // service raised states the call the handler was making.
         assert!(
             detail.contains(expected_detail),
             "case {case:?}: expected a diagnostic carrying {expected_detail:?}, got {detail:?}"
@@ -266,8 +278,13 @@ async fn the_classification_is_the_same_whichever_service_owns_the_type() {
             DOWNSTREAM,
         ),
         (
-            "a property the type's schema declares required that the model leaves out",
-            json!({ "Name": "/classified/valueless", "Type": "String" }),
+            "a property the type's schema declares that this handler does not apply",
+            json!({
+                "Name": "/classified/policed",
+                "Type": "String",
+                "Value": "v",
+                "Policies": "[{\"Type\":\"Expiration\",\"Version\":\"1.0\"}]",
+            }),
             MODEL_FAULT,
         ),
     ];
@@ -296,7 +313,7 @@ async fn an_update_the_owning_service_refuses_carries_the_downstream_handler_cod
             "an attribute value one past the range the owning service admits",
             json!([{ "op": "replace", "path": "/VisibilityTimeout", "value": 43_201 }]),
             DOWNSTREAM,
-            "Invalid value for the parameter VisibilityTimeout.",
+            DOWNSTREAM_UPDATE,
         ),
         (
             "an attribute that applies to no queue of this kind",
@@ -304,7 +321,7 @@ async fn an_update_the_owning_service_refuses_carries_the_downstream_handler_cod
             // queues", and this queue is a standard one.
             json!([{ "op": "add", "path": "/ContentBasedDeduplication", "value": true }]),
             DOWNSTREAM,
-            "Unknown Attribute ContentBasedDeduplication.",
+            DOWNSTREAM_UPDATE,
         ),
         (
             "a property the type's schema does not declare",

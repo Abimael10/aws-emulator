@@ -357,18 +357,21 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
     let emulator = Emulator::with_cloudwatch_logs();
     // The rows differ along which rule the model breaks, and so along WHICH handler verdict
     // the refusal is reported under: a rule the OWNING service holds the value to is that
-    // service's own error (`GeneralServiceException`), while a fault in the model against the
-    // type's schema is the handler's own judgement (`InvalidRequest`).
+    // service's own error (`GeneralServiceException`), reported as the downstream call the
+    // handler was making rather than in that service's own words, while a fault in the model
+    // against the type's schema is the handler's own judgement (`InvalidRequest`), reported
+    // in its own.
     //
-    // A value the TYPE'S REGISTRY SCHEMA itself excludes — a name outside the class that
-    // schema states, a retention or a class outside a set it publishes — is not a row here:
-    // such a model never reaches a handler at all, the front door refusing the call before a
-    // request is minted (`front_door_model_validation`).
+    // A model the TYPE'S REGISTRY SCHEMA itself excludes — a name outside the class that
+    // schema states, a retention or a class outside a set it publishes, a property it does
+    // not declare at all — is not a row here: such a model never reaches a handler, the
+    // front door refusing the call before a request is minted
+    // (`front_door_model_validation`).
     let rows = [
         (
             "a name in the prefix the owning service keeps",
             json!({ "LogGroupName": "aws/refused" }),
-            "logGroupName must not start with the string 'aws/'",
+            "Error occurred during operation 'CreateLogGroup'.",
             "GeneralServiceException",
         ),
         (
@@ -391,14 +394,8 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
                 "LogGroupName": "refused-tag",
                 "Tags": [{ "Key": "aws:billing", "Value": "no" }],
             }),
-            "Tags starting with 'AWS:' are reserved for AWS use.",
+            "Error occurred during operation 'CreateLogGroup'.",
             "GeneralServiceException",
-        ),
-        (
-            "a property the type does not declare",
-            json!({ "LogGroupName": "refused-property", "Flavour": "vanilla" }),
-            "Flavour is not a property of AWS::Logs::LogGroup",
-            "InvalidRequest",
         ),
     ];
 
@@ -513,8 +510,7 @@ async fn a_delete_the_owning_service_refuses_leaves_the_resource_where_it_is() {
     );
     assert_eq!(
         text(&settled, "StatusMessage"),
-        "LogGroup has delete protection enabled. Disable delete protection before attempting \
-         to delete the resource.",
+        "Error occurred during operation 'DeleteLogGroup'.",
         "unexpected wording, got {settled:?}"
     );
     assert_eq!(

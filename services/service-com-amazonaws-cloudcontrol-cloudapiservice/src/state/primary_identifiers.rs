@@ -314,10 +314,14 @@ fn malformed_identifier(reference: &str, properties: &[&str]) -> String {
 /// made of, because a type may declare more than one way to be addressed; a type of this
 /// emulator declares the one its `primaryIdentifier` does, and no secondary identifier, so
 /// the list carries that one.
+///
+/// Every word of the template but the pointer list is FIXED text, the closing clause
+/// included: it is what states what is disallowed, so a caller reading the refusal learns
+/// that nothing may be specified beside the one identifier.
 fn json_identifier_message(declared: &[String]) -> String {
     format!(
         "When specifying the identifier as JSON, you must specify exactly one identifier \
-         from [[{}]], and no additional properties.",
+         from [[{}]], and no additional properties can be specified",
         pointer_list(declared.iter().cloned())
     )
 }
@@ -552,7 +556,8 @@ mod tests {
                 "{\"LogGroupName\":\"app\"}",
                 Err("When specifying the identifier as JSON, you must specify exactly one \
                      identifier from [[/properties/LogGroupName, \
-                     /properties/LogStreamName]], and no additional properties."),
+                     /properties/LogStreamName]], and no additional properties can be \
+                     specified"),
             ),
             (
                 "a compound type addressed by a JSON object carrying one property too many",
@@ -561,7 +566,8 @@ mod tests {
                 "{\"LogGroupName\":\"app\",\"LogStreamName\":\"host\",\"Extra\":\"x\"}",
                 Err("When specifying the identifier as JSON, you must specify exactly one \
                      identifier from [[/properties/LogGroupName, \
-                     /properties/LogStreamName]], and no additional properties."),
+                     /properties/LogStreamName]], and no additional properties can be \
+                     specified"),
             ),
             (
                 "a JSON object naming a property that identifies no resource",
@@ -569,8 +575,8 @@ mod tests {
                 Some("QueueUrl"),
                 "{\"VisibilityTimeout\":\"30\"}",
                 Err("When specifying the identifier as JSON, you must specify exactly one \
-                     identifier from [[/properties/QueueUrl]], and no additional \
-                     properties."),
+                     identifier from [[/properties/QueueUrl]], and no additional properties \
+                     can be specified"),
             ),
             (
                 "a JSON object naming two properties where one identifies the resource",
@@ -578,8 +584,8 @@ mod tests {
                 Some("QueueUrl"),
                 "{\"QueueUrl\":\"https://queue/url\",\"QueueName\":\"orders\"}",
                 Err("When specifying the identifier as JSON, you must specify exactly one \
-                     identifier from [[/properties/QueueUrl]], and no additional \
-                     properties."),
+                     identifier from [[/properties/QueueUrl]], and no additional properties \
+                     can be specified"),
             ),
         ];
         for (case, type_name, assigned, reference, expected) in rows {

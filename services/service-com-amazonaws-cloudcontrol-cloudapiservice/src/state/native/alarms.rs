@@ -127,6 +127,42 @@ const UNIT: &str = "Unit";
 /// The alarm's tag set (`Tags`), a list of `{ Key, Value }` pairs.
 const TAGS: &str = "Tags";
 
+/// EVERY property this type's registry schema declares, which is the set a resource model of
+/// it may carry and no more.
+///
+/// Catalog source: the `properties` object of the `AWS::CloudWatch::Alarm` resource provider
+/// schema, as CloudFormation publishes it (`DescribeType`) — the same properties the model
+/// reading below has an arm for, named by the constants above, so the set and the reading
+/// cannot name different things. Published for the stage that judges a model's SHAPE against
+/// the schema before any handler is asked ([`crate::state::registry_schema`]): a property
+/// this set does not name is one no model of the type may carry, and one it names that this
+/// path does not apply is refused as that rather than as a property the type does not have.
+pub const DECLARED_PROPERTIES: &[&str] = &[
+    ACTIONS_ENABLED,
+    ALARM_ACTIONS,
+    ALARM_DESCRIPTION,
+    IDENTIFIER_PROPERTY,
+    ARN,
+    COMPARISON_OPERATOR,
+    DATAPOINTS_TO_ALARM,
+    DIMENSIONS,
+    EVALUATE_LOW_SAMPLE_COUNT_PERCENTILE,
+    EVALUATION_PERIODS,
+    EXTENDED_STATISTIC,
+    INSUFFICIENT_DATA_ACTIONS,
+    METRIC_NAME,
+    METRICS,
+    NAMESPACE,
+    OK_ACTIONS,
+    PERIOD,
+    STATISTIC,
+    TAGS,
+    THRESHOLD,
+    THRESHOLD_METRIC_ID,
+    TREAT_MISSING_DATA,
+    UNIT,
+];
+
 /// The CloudWatch store the resources of the `AWS::CloudWatch::Alarm` type live in — that
 /// service's OWN state struct, reached through the shared engine, so an alarm this emulator
 /// holds is the alarm Cloud Control API acts on whichever API created it.
@@ -439,7 +475,9 @@ impl DesiredModel {
                 // A property of the type the OWNING service resolves on its own write path,
                 // which this one does not run; see this module's header. No read reports it,
                 // so a model naming it asks for work nothing here performs.
-                METRICS => return Err(super::unsupported(TYPE_NAME, METRICS)),
+                other if DECLARED_PROPERTIES.contains(&other) => {
+                    return Err(super::unsupported(TYPE_NAME, other));
+                }
                 other => {
                     return Err(NativeRefusal::Invalid(format!(
                         "{other} is not a property of {TYPE_NAME}"

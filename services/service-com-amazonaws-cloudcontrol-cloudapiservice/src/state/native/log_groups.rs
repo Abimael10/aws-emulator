@@ -78,6 +78,25 @@ const FIELD_INDEX_POLICIES: &str = "FieldIndexPolicies";
 /// the shared reading of a tag set every provider uses.
 const TAGS: &str = "Tags";
 
+/// EVERY property this type's registry schema declares, which is the set a resource model of
+/// it may carry and no more.
+///
+/// Catalog source: the `properties` object of the `AWS::Logs::LogGroup` resource provider
+/// schema, as CloudFormation publishes it (`DescribeType`) — the same properties the model
+/// reading below has an arm for, named by the constants above, so the set and the reading
+/// cannot name different things. Published for the stage that judges a model's SHAPE against
+/// the schema before any handler is asked ([`crate::state::registry_schema`]).
+pub const DECLARED_PROPERTIES: &[&str] = &[
+    ARN,
+    DATA_PROTECTION_POLICY,
+    FIELD_INDEX_POLICIES,
+    KMS_KEY_ID,
+    LOG_GROUP_CLASS,
+    IDENTIFIER_PROPERTY,
+    RETENTION_IN_DAYS,
+    TAGS,
+];
+
 /// The CloudWatch Logs log groups of one engine, as Cloud Control API resources.
 pub struct LogGroupProvider {
     /// The owning service's store. A handle, so every answer is read from the live store.
@@ -358,8 +377,8 @@ impl DesiredModel {
                 TAGS => desired.tags = tag_set(value)?,
                 // Properties of the type the OWNING service installs with a call of its
                 // own, which this path does not make; see this module's header.
-                DATA_PROTECTION_POLICY | FIELD_INDEX_POLICIES => {
-                    return Err(unsupported(property));
+                other if DECLARED_PROPERTIES.contains(&other) => {
+                    return Err(unsupported(other));
                 }
                 other => {
                     return Err(NativeRefusal::Invalid(format!(

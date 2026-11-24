@@ -403,9 +403,11 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
     // (case, desired state, the diagnostic the handler reports, the verdict it carries)
     //
     // A value outside a set only the OWNING service publishes is that service's own error,
-    // while a property the type's schema declares required and a property it does not declare
-    // at all are faults the handler judges against that schema.
-    let rows: [(&str, Value, &str, &str); 4] = [
+    // which the handler reports as the downstream call it was making rather than in that
+    // service's own words; a property the type's schema declares required and one it does
+    // not declare at all are the SCHEMA's faults and never reach a handler at all — the
+    // front door refuses them (`front_door_model_validation`).
+    let rows: [(&str, Value, &str, &str); 2] = [
         (
             "a comparison operator outside the set the owning service admits",
             json!({
@@ -413,7 +415,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "EvaluationPeriods": 1,
                 "ComparisonOperator": "GreaterThanish",
             }),
-            "ComparisonOperator must be one of",
+            "Error occurred during operation 'PutMetricAlarm'.",
             "GeneralServiceException",
         ),
         (
@@ -424,25 +426,8 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "ComparisonOperator": "GreaterThanThreshold",
                 "Statistic": "Median",
             }),
-            "Statistic must be one of",
+            "Error occurred during operation 'PutMetricAlarm'.",
             "GeneralServiceException",
-        ),
-        (
-            "no comparison operator at all",
-            json!({ "AlarmName": "incomplete-alarm", "EvaluationPeriods": 1 }),
-            "ComparisonOperator is required of AWS::CloudWatch::Alarm",
-            "InvalidRequest",
-        ),
-        (
-            "a property the type does not declare",
-            json!({
-                "AlarmName": "unknown-alarm",
-                "EvaluationPeriods": 1,
-                "ComparisonOperator": "GreaterThanThreshold",
-                "Secret": "s3cret",
-            }),
-            "Secret is not a property of AWS::CloudWatch::Alarm",
-            "InvalidRequest",
         ),
     ];
     let mut accepted = Vec::new();

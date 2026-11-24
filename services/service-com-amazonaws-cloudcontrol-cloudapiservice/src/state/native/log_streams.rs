@@ -40,6 +40,16 @@ const GROUP_PROPERTY: &str = "LogGroupName";
 /// (`/properties/LogStreamName`).
 const STREAM_PROPERTY: &str = "LogStreamName";
 
+/// EVERY property this type's registry schema declares, which is the set a resource model of
+/// it may carry and no more.
+///
+/// Catalog source: the `properties` object of the `AWS::Logs::LogStream` resource provider
+/// schema, as CloudFormation publishes it (`DescribeType`) — the two properties of its own
+/// identity and nothing else, which is why the model reading below is an identity check.
+/// Published for the stage that judges a model's SHAPE against the schema before any handler
+/// is asked ([`crate::state::registry_schema`]).
+pub const DECLARED_PROPERTIES: &[&str] = &[GROUP_PROPERTY, STREAM_PROPERTY];
+
 /// The shortest and longest a stream's name may be, and the characters it may not carry:
 /// the domain the OWNING service's model gives `LogStreamName` (`@length 1..512`,
 /// `@pattern ^[^:*]*$`), so nothing is created here under a name that service's own API

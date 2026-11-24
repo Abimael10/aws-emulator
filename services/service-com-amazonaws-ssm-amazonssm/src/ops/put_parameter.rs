@@ -254,6 +254,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The `AllowedPattern` reading this operation asks of the write it is about to make, which
+// is this service's ONE reading of that rule: every path that stores a parameter version
+// holds the value to the same expression, under the same budget for compiling it, whichever
+// API the path belongs to.
+use crate::state::AllowedPatternRejection;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -336,18 +342,6 @@ struct Existing {
     /// stops it from being displaced — and is the version the refusal names.
     labelled_oldest: Option<i64>,
 }
-
-/// How large an `AllowedPattern` may compile to, in bytes of compiled program, and how
-/// large the lazy-DFA cache it may use: this service's one budget for an expression a
-/// request carries ([`crate::state::COMPILED_PATTERN_LIMIT`]).
-///
-/// The haystack is bounded too: `PutParameter` refuses a `Value` larger than the content
-/// size limit of the tier it resolved before this runs, so neither factor of the matching
-/// cost is caller-unbounded.
-const COMPILED_PATTERN_LIMIT: usize = crate::state::COMPILED_PATTERN_LIMIT;
-
-/// See [`COMPILED_PATTERN_LIMIT`].
-const PATTERN_DFA_LIMIT: usize = crate::state::PATTERN_DFA_LIMIT;
 
 /// What a put that carries both `Overwrite` and tags is refused with: entirely fixed text,
 /// with no part of it taken from the request.
@@ -476,71 +470,6 @@ fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
         ));
     }
     Ok(carried)
-}
-
-/// Why a value is not one the request's `AllowedPattern` accepts, named by the modelled
-/// error that reports it.
-///
-/// The two mean opposite things, so they are never reported interchangeably: one says
-/// the caller's VALUE is wrong, the other that the caller's PATTERN is.
-#[derive(Debug)]
-enum PatternRejection {
-    /// The supplied `AllowedPattern` is not a regular expression at all:
-    /// `InvalidAllowedPatternException` ("The request doesn't meet the regular
-    /// expression requirement").
-    Pattern(String),
-    /// The value does not satisfy a well-formed `AllowedPattern`:
-    /// `ParameterPatternMismatchException`.
-    Value(String),
-}
-
-/// Why `value` does not satisfy `pattern`, or `None` when it does (or when the request
-/// named no pattern).
-///
-/// `AllowedPattern` is "a regular expression used to validate the parameter value", so
-/// the value is matched against it in full — the whole value, not a substring, the way
-/// a regular-expression constraint on a member reads. A `StringList`'s value is not one
-/// value but a list ("Items in a StringList must be separated by a comma (,)"), so the
-/// constraint holds of each ITEM of it rather than of the comma-joined whole; every
-/// other type, `SecureString` included, is matched as the one value it is — and a
-/// `SecureString` is matched on the plaintext the request carried, before it is sealed.
-///
-/// The expression comes from the request, so it is evaluated by the `regex` crate, whose
-/// matching is linear in the input and has no backtracking blowup, under that crate's
-/// own compiled-size limit; the modelled `AllowedPattern` length (0..1024) bounds what
-/// is compiled.
-fn allowed_pattern_rejection(
-    pattern: Option<&str>,
-    type_: &str,
-    value: &str,
-) -> Option<PatternRejection> {
-    let pattern = pattern.filter(|pattern| !pattern.is_empty())?;
-    let anchored = format!("^(?:{pattern})$");
-    // An explicit compiled-size budget, so a pattern inside the modelled 1024-character
-    // `AllowedPattern` length still cannot compile into an arbitrarily large automaton.
-    let expression = match ::regex::RegexBuilder::new(&anchored)
-        .size_limit(COMPILED_PATTERN_LIMIT)
-        .dfa_size_limit(PATTERN_DFA_LIMIT)
-        .build()
-    {
-        Err(why) => {
-            return Some(PatternRejection::Pattern(format!(
-                "AllowedPattern '{pattern}' is not a regular expression this service can \
-                 evaluate: {why}"
-            )))
-        }
-        Ok(expression) => expression,
-    };
-    let satisfied = if type_ == crate::state::TYPE_STRING_LIST {
-        value
-            .split(crate::state::STRING_LIST_SEPARATOR)
-            .all(|item| expression.is_match(item))
-    } else {
-        expression.is_match(value)
-    };
-    (!satisfied).then(|| {
-        PatternRejection::Value(crate::state::allowed_pattern_mismatch_message(pattern))
-    })
 }
 
 /// The `PutParameter` operation.
@@ -927,15 +856,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against is bounded. A value that fails a well-formed pattern is the VALUE's fault;
         // a pattern that is no regular expression is the PATTERN's, and the two are reported
         // as the different refusals they are.
-        match allowed_pattern_rejection(allowed_pattern.as_deref(), &type_, &input.value) {
+        match crate::state::allowed_pattern_rejection(
+            allowed_pattern.as_deref(),
+            &type_,
+            &input.value,
+        ) {
             None => {}
-            Some(PatternRejection::Pattern(why)) => {
+            Some(AllowedPatternRejection::Pattern(why)) => {
                 return Err(PutParameterErrorModeled::InvalidAllowedPatternException(
                     InvalidAllowedPatternException { message: Some(why) },
                 )
                 .into())
             }
-            Some(PatternRejection::Value(why)) => {
+            Some(AllowedPatternRejection::Value(why)) => {
                 return Err(PutParameterErrorModeled::ParameterPatternMismatchException(
                     ParameterPatternMismatchException { message: Some(why) },
                 )

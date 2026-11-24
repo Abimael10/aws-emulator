@@ -17,9 +17,9 @@
 //! same way, and the authorization answer is a fact about the call rather than about the
 //! resource model the handler judged — so it is reported as that service's error
 //! ([`NativeRefusal::Rejected`]), in the sentence a handler states for a call of the owning
-//! service that raised an error it maps to no verdict of its own ([`downstream_failure`]),
-//! which is the rule this module's neighbours follow for everything the owning service
-//! decides.
+//! service that raised an error it maps to no verdict of its own
+//! ([`super::downstream_failure`]), which is the rule this module's neighbours follow for
+//! everything the owning service decides.
 //!
 //! The pieces, each held in exactly one place:
 //!
@@ -132,21 +132,9 @@ impl RolePermissions {
                 }),
             };
             if !allowed {
-                return Some(NativeRefusal::Rejected(downstream_failure(call)));
+                return Some(NativeRefusal::Rejected(super::downstream_failure(call)));
             }
         }
         None
     }
-}
-
-/// The sentence a resource type's handler states when a call it made on the owning service
-/// raised an error it maps to no verdict of its own — which is what a call the credentials it
-/// ran with may not make comes to.
-///
-/// The fixed text of that class, with its one variable part taken from the call: the OWNING
-/// service's API operation the handler was making, which is the action named without the
-/// namespace an IAM action carries it under.
-fn downstream_failure(call: &str) -> String {
-    let operation = call.rsplit_once(':').map_or(call, |(_, operation)| operation);
-    format!("Error occurred during operation '{operation}'.")
 }

@@ -454,6 +454,10 @@ impl From<NativeRefusal> for EffectFailure {
     /// The owning service's refusal, as this store reports it: the two verdicts every type
     /// shares are reported in Cloud Control API's own generic terms, and anything the
     /// owning service states in its own terms carries that statement.
+    ///
+    /// A refusal raised by a type's PROVIDER is read through [`EffectFailure::of`] instead,
+    /// which is what states a downstream error in the handler's own sentence about the call
+    /// it was making.
     fn from(refusal: NativeRefusal) -> Self {
         match &refusal {
             NativeRefusal::NotFound => Self::ResourceGone,
@@ -469,6 +473,28 @@ impl From<NativeRefusal> for EffectFailure {
 }
 
 impl EffectFailure {
+    /// A provider's refusal of work this record owed, as the record reports it.
+    ///
+    /// A refusal the OWNING service raised that the type's handler maps to no verdict of its
+    /// own is reported in the handler's own sentence about the CALL it was making
+    /// ([`native::downstream_failure`]) rather than in the downstream service's words: the
+    /// handler does not relay that service's diagnosis, so neither does the request's
+    /// terminal event. Every other refusal is the handler's own verdict and keeps its own
+    /// wording ([`Self::from`]).
+    fn of(
+        refusal: NativeRefusal,
+        provider: &dyn native::NativeResourceProvider,
+        operation: &str,
+    ) -> Self {
+        match (&refusal, native::downstream_call(provider, operation)) {
+            (NativeRefusal::Rejected(_), Some(call)) => Self::Owning {
+                code: refusal.handler_error_code(),
+                detail: native::downstream_failure(call),
+            },
+            _ => Self::from(refusal),
+        }
+    }
+
     /// The `HandlerErrorCode` the record reports (`ProgressEvent$ErrorCode`), which is
     /// the owning resource type's handler verdict: a resource the handler could not find
     /// is `NotFound`, and one that is already there is `AlreadyExists`.
@@ -630,15 +656,21 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 } => provider
                     .create(&region, &identifier, &properties, now)
                     .map(|model| Some(rendered_properties(&record.type_name, &model)))
-                    .map_err(EffectFailure::from),
+                    .map_err(|refusal| {
+                        EffectFailure::of(refusal, provider, &record.operation)
+                    }),
                 ResourceEffect::Update { properties, region } => provider
                     .update(&region, &identifier, &properties, now)
                     .map(|model| Some(rendered_properties(&record.type_name, &model)))
-                    .map_err(EffectFailure::from),
+                    .map_err(|refusal| {
+                        EffectFailure::of(refusal, provider, &record.operation)
+                    }),
                 ResourceEffect::Delete { region } => provider
                     .delete(&region, &identifier, now)
                     .map(|()| None)
-                    .map_err(EffectFailure::from),
+                    .map_err(|refusal| {
+                        EffectFailure::of(refusal, provider, &record.operation)
+                    }),
                 ResourceEffect::Awaiting { .. } => Ok(record.resource_model.clone()),
             };
         }

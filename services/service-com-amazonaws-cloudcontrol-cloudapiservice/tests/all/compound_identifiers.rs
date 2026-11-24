@@ -229,16 +229,20 @@ async fn a_compound_identifier_cannot_be_half_named_or_patched() {
         .await;
 
     // A desired state that names only part of the combination identifies no resource, so it
-    // is refused by the front door naming the part that is missing.
-    for (case, desired, offending) in [
+    // is refused by the front door naming the part that is missing — as the model validation
+    // failure it is where the schema declares that part `required`, and as the identifier it
+    // cannot form where the schema leaves it to the generated-name rule.
+    for (case, desired, expected_code, offending) in [
         (
             "the first segment missing",
             json!({ "LogStreamName": "orphan" }),
+            "ValidationException",
             "LogGroupName",
         ),
         (
             "the second segment missing",
             json!({ "LogGroupName": "patched" }),
+            "InvalidRequestException",
             "LogStreamName",
         ),
     ] {
@@ -249,7 +253,7 @@ async fn a_compound_identifier_cannot_be_half_named_or_patched() {
         );
         assert_eq!(
             code(&body),
-            "InvalidRequestException",
+            expected_code,
             "case {case:?}: unexpected error code in {body:?}"
         );
         assert!(
@@ -424,7 +428,8 @@ async fn a_resource_is_addressable_by_a_json_identifier_of_the_schemas_propertie
             message(&body),
             format!(
                 "When specifying the identifier as JSON, you must specify exactly one \
-                 identifier from [[{declared}]], and no additional properties."
+                 identifier from [[{declared}]], and no additional properties can be \
+                 specified"
             ),
             "case {case:?}: unexpected wording"
         );

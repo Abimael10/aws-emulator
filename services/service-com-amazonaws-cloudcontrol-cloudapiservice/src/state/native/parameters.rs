@@ -38,19 +38,23 @@
 //! for one is refused rather than accepted and dropped — a property a caller sets has to be
 //! one the owning service then holds:
 //!
-//! * `AllowedPattern`, because it is "a regular expression used to validate the parameter
-//!   value" that the owning service evaluates against the value of every write it accepts,
-//!   and this path, applying the work the clock owes under the store's guard, runs no
-//!   caller-supplied expression;
 //! * `Policies`, because a policy document is one the owning service validates, admits only
 //!   on an advanced parameter and then enforces on a schedule of its own.
 //!
-//! A model may still CARRY either of them with the value the parameter already holds — the
-//! owning service's own read reports them, so a model assembled from there carries them —
-//! which is what lets an update patch something else on a parameter that has one. Carrying
-//! one unchanged asks for nothing, and a parameter keeps the pattern and the policies it
-//! holds across every write here ([`DesiredModel::version`]), so a model that names
-//! neither — which is every model this API reports — asks for nothing either.
+//! A model may still CARRY it with the value the parameter already holds — the owning
+//! service's own read reports it, so a model assembled from there carries it — which is what
+//! lets an update patch something else on a parameter that has one. Carrying it unchanged
+//! asks for nothing, and a parameter keeps the policies it holds across every write here
+//! ([`DesiredModel::version`]), so a model that names none — which is every model this API
+//! reports — asks for nothing either.
+//!
+//! `AllowedPattern` IS applied: it is "a regular expression used to validate the parameter
+//! value", so a write that states one is a write the owning service evaluates the value
+//! against and then holds the expression for. Both halves are that service's own — its one
+//! reading of the rule, under its own budget for compiling a supplied expression
+//! ([`ssm::allowed_pattern_rejection`]) — so a value the pattern does not admit is refused
+//! here exactly as that service's own `PutParameter` refuses it, and the parameter the write
+//! leaves behind reports the pattern through that service's own reads.
 //!
 //! Two further rules of the owning service hold of every answer here:
 //!
@@ -99,8 +103,8 @@ const TIER: &str = "Tier";
 const DATA_TYPE: &str = "DataType";
 
 /// The regular expression the owning service validates the value against
-/// (`AllowedPattern`) — one of the schema's write-only properties, and applied by nothing
-/// here (see this module's header).
+/// (`AllowedPattern`) — one of the schema's write-only properties, applied by the write this
+/// path makes (see this module's header).
 const ALLOWED_PATTERN: &str = "AllowedPattern";
 
 /// The parameter policies the owning service holds on the parameter (`Policies`), applied
@@ -110,6 +114,28 @@ const POLICIES: &str = "Policies";
 /// The parameter's tag set (`Tags`), which this type publishes as a MAP of tag key to tag
 /// value ([`tag_map`], [`tag_object`]).
 const TAGS: &str = "Tags";
+
+/// EVERY property this type's registry schema declares, which is the set a resource model of
+/// it may carry and no more.
+///
+/// Catalog source: the `properties` object of the `AWS::SSM::Parameter` resource provider
+/// schema, as CloudFormation publishes it (`DescribeType`), with the read-only `Arn` this
+/// type's READ handler reports beside them — the same properties the model reading below has
+/// an arm for, named by the constants above, so the set and the reading cannot name different
+/// things. Published for the stage that judges a model's SHAPE against the schema before any
+/// handler is asked ([`crate::state::registry_schema`]).
+pub const DECLARED_PROPERTIES: &[&str] = &[
+    ALLOWED_PATTERN,
+    ARN,
+    DATA_TYPE,
+    DESCRIPTION,
+    IDENTIFIER_PROPERTY,
+    POLICIES,
+    TAGS,
+    TIER,
+    TYPE,
+    VALUE,
+];
 
 /// The `Type` values this resource type admits.
 ///
@@ -220,9 +246,9 @@ impl NativeResourceProvider for ParameterProvider {
             name,
             properties,
             // No parameter holds a version yet: this create is what settles every one of
-            // these, and a pattern or a policy is one this path cannot apply at all. The
-            // ARN is the owning service's own function of the Region and the name, so the
-            // parameter this create describes already has one.
+            // these, and a policy is one this path cannot apply at all. The ARN is the
+            // owning service's own function of the Region and the name, so the parameter
+            // this create describes already has one.
             &Held::fresh(region, name),
         )?;
         let mut store = self.state.lock();
@@ -523,6 +549,9 @@ struct DesiredModel {
     /// The data type of its value, or `None` for a model that names none — which is the
     /// owning service's own default.
     data_type: Option<String>,
+    /// The expression the owning service is to validate its value against, or `None` to keep
+    /// the one the parameter already holds.
+    allowed_pattern: Option<String>,
     /// The tag set it is to carry.
     tags: BTreeMap<String, String>,
 }
@@ -547,6 +576,7 @@ impl DesiredModel {
             description: None,
             tier: None,
             data_type: None,
+            allowed_pattern: None,
             tags: BTreeMap::new(),
         };
         for (property, value) in model {
@@ -594,11 +624,12 @@ impl DesiredModel {
                     // form is judged where the version is built ([`Self::version`]).
                     desired.data_type = Some(text(property, value)?);
                 }
-                // Properties the OWNING service judges and enforces itself, which this path
+                // The expression the owning service validates the value against, which this
+                // path applies: a write that states one asks that service to hold it and to
+                // judge the value by it.
+                ALLOWED_PATTERN => desired.allowed_pattern = Some(text(property, value)?),
+                // A property the OWNING service judges and enforces itself, which this path
                 // does not; see this module's header.
-                ALLOWED_PATTERN => {
-                    require_held(TYPE_NAME, property, value, held.allowed_pattern.as_deref())?;
-                }
                 POLICIES => {
                     require_held(TYPE_NAME, property, value, held.policies.as_deref())?;
                 }
@@ -706,6 +737,24 @@ impl DesiredModel {
                  {data_type} {DATA_TYPE}"
             )));
         }
+        // The expression the write is judged against is the one IN FORCE: the model's own,
+        // else the one the parameter already carries — the same reading the owning service's
+        // own write makes, asked of it rather than restated here, so the expression is
+        // compiled under that service's own budget for a supplied one and the match runs
+        // through its own bounded cache ([`ssm::allowed_pattern_rejection`]). Asked only now
+        // that the value is known to be within the tier's content size limit, so the haystack
+        // is bounded too. Either way the refusal is that service's own: a value its API would
+        // not store is one no version of is stored here either.
+        let allowed_pattern = self
+            .allowed_pattern
+            .clone()
+            .or_else(|| held.and_then(|held| held.allowed_pattern.clone()));
+        if let Some(
+            ssm::AllowedPatternRejection::Pattern(why) | ssm::AllowedPatternRejection::Value(why),
+        ) = ssm::allowed_pattern_rejection(allowed_pattern.as_deref(), &type_, &value)
+        {
+            return Err(NativeRefusal::Rejected(why));
+        }
         Ok(ssm::ParameterVersionRecord {
             version: held.map_or(1, |held| held.next_version),
             value,
@@ -713,9 +762,10 @@ impl DesiredModel {
             data_type,
             tier,
             description: self.description.clone(),
-            // Carried by the parameter rather than applied here: the version keeps what the
-            // parameter already holds, which is the only value a model may carry for it.
-            allowed_pattern: held.and_then(|held| held.allowed_pattern.clone()),
+            // The expression this write asks for, else the one the parameter already holds:
+            // "if you don't specify a value, the parameter keeps the one it has" is the
+            // owning service's own rule for every attribute of a write.
+            allowed_pattern,
             policies: held.and_then(|held| held.policies.clone()),
             // Only a `SecureString` is stored under a key, and this type creates none.
             key_id: None,
