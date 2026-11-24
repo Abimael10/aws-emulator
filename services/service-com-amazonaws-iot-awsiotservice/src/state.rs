@@ -3421,9 +3421,10 @@ pub use audit_configuration::{
 // `crate::state::<name>`.
 pub mod audit_tasks;
 pub use audit_tasks::{
-    run_checks, targetable_checks, too_many_audit_tasks_message, AuditCheckRun, AuditTask,
-    AuditTaskRefusal, AUDIT_SPAN, AUDIT_TASK_CANCELED, AUDIT_TASK_COMPLETED,
-    AUDIT_TASK_IN_PROGRESS, MAX_AUDIT_TASKS, ON_DEMAND_AUDIT_TASK_TYPE,
+    mint_audit_task_id, run_checks, targetable_checks, too_many_audit_tasks_message,
+    AuditCheckRun, AuditTask, AuditTaskRefusal, AUDIT_SPAN, AUDIT_TASK_CANCELED,
+    AUDIT_TASK_COMPLETED, AUDIT_TASK_ID_ALPHABET, AUDIT_TASK_ID_LENGTH, AUDIT_TASK_IN_PROGRESS,
+    MAX_AUDIT_TASKS, ON_DEMAND_AUDIT_TASK_TYPE,
 };
 
 // What a DEVICE DEFENDER SCHEDULED AUDIT is — the record one holds, the schedule a

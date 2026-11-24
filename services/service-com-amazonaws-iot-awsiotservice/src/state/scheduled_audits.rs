@@ -82,8 +82,7 @@ pub fn scheduled_audit_arn(region: &str, scheduled_audit_name: &str) -> String {
 /// account holds — for a reader of one, a writer of one and a delete of one.
 ///
 /// The DEVICE DEFENDER family states the miss of the resource the request named, so the
-/// fixed text is the family's and the only variable part is the name asked about, exactly
-/// as that family states a missing audit task ([`super::missing_audit_task_message`]).
+/// fixed text is this family's own and the only variable part is the name asked about.
 pub fn missing_scheduled_audit_message(scheduled_audit_name: &str) -> String {
     format!("Scheduled audit {scheduled_audit_name} does not exist.")
 }

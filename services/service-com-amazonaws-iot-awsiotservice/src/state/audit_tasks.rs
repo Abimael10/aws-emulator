@@ -76,6 +76,22 @@ pub const CHECK_CANCELED: &str = "CANCELED";
 /// [`super::MAX_TOPIC_RULES`]).
 pub const MAX_AUDIT_TASKS: usize = 1_000;
 
+/// How many characters an audit task id has.
+///
+/// `AuditTaskId` is modelled `length 1..40, pattern ^[a-zA-Z0-9\-]+$`
+/// (`smithy_query(query="shape",shape="AuditTaskId")`), and AWS IoT Device Defender hands
+/// an audit task an OPAQUE token of this width, not an identifier of another family: 20
+/// characters drawn from [`AUDIT_TASK_ID_ALPHABET`], so a client that stores or validates
+/// audit task ids against the width and character class it observes reads one of them
+/// here too.
+pub const AUDIT_TASK_ID_LENGTH: usize = 20;
+
+/// The characters an audit task id is drawn from: mixed-case ASCII letters and digits,
+/// the character class of the id AWS answers an audit with — a subset of what the modelled
+/// `AuditTaskId` pattern admits, with no hyphen in it.
+pub const AUDIT_TASK_ID_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
 /// The audit check whose rule is about the account's logging configuration.
 pub const LOGGING_DISABLED_CHECK: &str = "LOGGING_DISABLED_CHECK";
 
@@ -120,6 +136,10 @@ const MAX_THRESHOLD_DAYS: u64 = 10_000 * 365;
 /// `InvalidRequestException` ("The request is not valid", HTTP 400) by the handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditTaskRefusal {
+    /// The account has set up no audit configuration at all
+    /// ([`super::AccountAuditConfiguration::is_configured`]), so no check of it can be
+    /// enabled and no audit of it can run.
+    AccountNotConfigured,
     /// `targetCheckNames` named no check at all, so there is no audit to perform:
     /// "Which checks are performed during the audit" is what the member carries.
     NoTargetCheck,
@@ -136,6 +156,13 @@ impl AuditTaskRefusal {
     /// so the caller can fix the request from the text alone.
     pub fn message(&self) -> String {
         match self {
+            // The ACCOUNT-LEVEL precondition, which is about the account and not about
+            // any check the request named: entirely fixed text, so a caller branching on
+            // it is told to set the account up rather than to enable one check.
+            Self::AccountNotConfigured => {
+                "Account Audit Configuration for your account have not been set up yet"
+                    .to_string()
+            }
             Self::NoTargetCheck => {
                 "targetCheckNames must specify at least one audit check".to_string()
             }
@@ -193,17 +220,19 @@ impl AuditCheckRun {
 
     /// This run as the modelled `AuditCheckDetails` a reader hands back.
     ///
-    /// While the audit is still in progress the check reports that status and no counts:
-    /// the numbers are what the completed check amounts to, and reporting them early would
-    /// state an outcome the task has not reached. Nothing suppresses a finding in this
-    /// account — an audit suppression is a record `CreateAuditSuppression` writes and this
-    /// service holds none — so no non-compliant resource of this run is suppressed.
+    /// The three RESOURCE COUNTERS are reported on EVERY check entry — "the number of
+    /// resources on which the check was performed", "the number of resources that were
+    /// found noncompliant during the check" and how many of those were suppressed — so a
+    /// reader computing a compliance ratio always reads numbers rather than nulls. A check
+    /// that has performed no resource yet reports them as zero and states no compliance
+    /// verdict at all ([`unperformed_check_details`]); the numbers it will amount to are
+    /// the completed check's, and reporting them early would state an outcome the task has
+    /// not reached. Nothing suppresses a finding in this account — an audit suppression is
+    /// a record `CreateAuditSuppression` writes and this service holds none — so no
+    /// non-compliant resource of this run is suppressed.
     fn details(&self, running: bool) -> AuditCheckDetails {
         if running {
-            return AuditCheckDetails {
-                check_run_status: Some(CHECK_IN_PROGRESS.to_string()),
-                ..AuditCheckDetails::default()
-            };
+            return unperformed_check_details(CHECK_IN_PROGRESS);
         }
         AuditCheckDetails {
             check_run_status: Some(
@@ -221,6 +250,23 @@ impl AuditCheckRun {
             error_code: None,
             message: None,
         }
+    }
+}
+
+/// The `AuditCheckDetails` of a check in `check_run_status` that has PERFORMED NO
+/// RESOURCE: one the audit has not run yet, and one the cancel of its audit stopped.
+///
+/// It reports the three resource counters as zero — no resource was performed on, so none
+/// was found non-compliant and none of those was suppressed — and no `checkCompliant`:
+/// "true if the check is COMPLETE and found all resources compliant" is a verdict a check
+/// that never ran has not reached.
+fn unperformed_check_details(check_run_status: &str) -> AuditCheckDetails {
+    AuditCheckDetails {
+        check_run_status: Some(check_run_status.to_string()),
+        total_resources_count: Some(0),
+        non_compliant_resources_count: Some(0),
+        suppressed_non_compliant_resources_count: Some(0),
+        ..AuditCheckDetails::default()
     }
 }
 
@@ -388,10 +434,10 @@ impl AuditTask {
                     .iter()
                     .map(|(check_name, run)| {
                         let details = if canceled {
-                            AuditCheckDetails {
-                                check_run_status: Some(CHECK_CANCELED.to_string()),
-                                ..AuditCheckDetails::default()
-                            }
+                            // The cancel stopped the check before it performed any
+                            // resource, so it reports the cancelled status and the
+                            // counters of a check that performed none.
+                            unperformed_check_details(CHECK_CANCELED)
                         } else {
                             run.details(running)
                         };
@@ -403,16 +449,68 @@ impl AuditTask {
     }
 }
 
+/// Mint an audit task id no audit of this account is recorded under, or `None` when the
+/// system random source this service draws every secret and every opaque token from
+/// cannot be read.
+///
+/// The loop re-mints on the (astronomically unlikely) collision, so two
+/// `StartOnDemandAuditTask` calls can never be handed the same id.
+pub fn mint_audit_task_id(store: &ComAmazonawsIotAwsiotserviceState) -> Option<String> {
+    loop {
+        let candidate = fresh_audit_task_id()?;
+        if !store.audit_tasks.contains_key(&candidate) {
+            return Some(candidate);
+        }
+    }
+}
+
+/// A fresh audit task id: [`AUDIT_TASK_ID_LENGTH`] characters of
+/// [`AUDIT_TASK_ID_ALPHABET`], drawn from the system random source.
+///
+/// The alphabet does not divide the 256 values a byte holds, so a byte at or above the
+/// largest multiple of it a byte reaches is DROPPED rather than folded onto the first few
+/// characters, and the next draw tops the id up: every character is uniform over the
+/// alphabet. `None` when the random source cannot be read at all — the id is never
+/// completed from anything less, which is the same answer certificate material gives
+/// ([`super::certificates`]).
+fn fresh_audit_task_id() -> Option<String> {
+    /// The byte values that map onto the alphabet without bias.
+    const UNBIASED: usize = 256 - 256 % AUDIT_TASK_ID_ALPHABET.len();
+
+    let mut id = String::with_capacity(AUDIT_TASK_ID_LENGTH);
+    while id.len() < AUDIT_TASK_ID_LENGTH {
+        let mut drawn = [0u8; AUDIT_TASK_ID_LENGTH];
+        ::aws_lc_rs::rand::fill(&mut drawn).ok()?;
+        for byte in drawn.into_iter().map(usize::from).filter(|b| *b < UNBIASED) {
+            if id.len() == AUDIT_TASK_ID_LENGTH {
+                break;
+            }
+            id.push(char::from(
+                AUDIT_TASK_ID_ALPHABET[byte % AUDIT_TASK_ID_ALPHABET.len()],
+            ));
+        }
+    }
+    Some(id)
+}
+
 /// Check that every name in `target_check_names` is an audit check this account has
 /// ENABLED, which is what `StartOnDemandAuditTask` documents as the condition on its
 /// target: "the checks you specify must be enabled for your account or an exception
 /// occurs".
+///
+/// WHETHER THE ACCOUNT HAS AN AUDIT CONFIGURATION AT ALL is read FIRST: an account that
+/// never set one up has no check to enable, so the precondition it broke is the
+/// account-level one and not a per-check one — the two call for different remediations
+/// (`UpdateAccountAuditConfiguration` against enabling one check).
 ///
 /// Checked before anything is written, so a refused request starts no audit.
 pub fn targetable_checks(
     store: &ComAmazonawsIotAwsiotserviceState,
     target_check_names: &[String],
 ) -> Result<(), AuditTaskRefusal> {
+    if !store.audit_configuration.is_configured() {
+        return Err(AuditTaskRefusal::AccountNotConfigured);
+    }
     if target_check_names.is_empty() {
         return Err(AuditTaskRefusal::NoTargetCheck);
     }

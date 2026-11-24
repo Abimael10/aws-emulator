@@ -4,9 +4,12 @@
 //!
 //! Starts an on-demand Device Defender audit over the checks the request targets.
 //!
-//! Every targeted name must be an audit check this account has ENABLED ("the checks you
-//! specify must be enabled for your account or an exception occurs"), which is checked
-//! before anything is written, so a refused request starts no audit.
+//! The account must have an audit configuration at all before any of this request's checks
+//! is looked at: an account that never set one up is refused the account-level precondition
+//! (`UpdateAccountAuditConfiguration` is what sets it up), and only then must every targeted
+//! name be an audit check this account has ENABLED ("the checks you specify must be enabled
+//! for your account or an exception occurs"). Both are checked before anything is written,
+//! so a refused request starts no audit.
 //!
 //! The audit is PERFORMED by this call: each targeted check is evaluated over the
 //! account's resources and what it amounted to is recorded on the task
@@ -191,14 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over the resources the account holds right now, and what each amounted to is what
         // the task then reports.
         let checks = crate::state::run_checks(&store, &input.target_check_names, started_at);
-        let task = crate::state::AuditTask::on_demand(
-            // "The ID of the on-demand audit you started" — minted here, unique to this
-            // audit, and within `AuditTaskId`'s modelled length and pattern (a canonical
-            // UUID is 36 characters of 40, of hex digits and hyphens).
-            crate::state::fresh_uuid(),
-            started_at,
-            checks,
-        );
+        // "The ID of the on-demand audit you started" — an opaque token of the width and
+        // character class AWS answers an audit with, unique to this audit, and within
+        // `AuditTaskId`'s modelled length and pattern. An id can only be minted from the
+        // system random source, so a source that cannot be read starts no audit.
+        let task_id = crate::state::mint_audit_task_id(&store).ok_or_else(|| {
+            StartOnDemandAuditTaskErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("an audit task id could not be minted".to_string()),
+            })
+        })?;
+        let task = crate::state::AuditTask::on_demand(task_id, started_at, checks);
         // The response is built from the record that is about to be persisted, so what this
         // call reports and what the next `DescribeAuditTask` reads are one value.
         let output = StartOnDemandAuditTaskOutput {

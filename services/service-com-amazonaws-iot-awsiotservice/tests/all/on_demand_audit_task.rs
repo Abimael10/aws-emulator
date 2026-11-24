@@ -808,7 +808,7 @@ async fn describe_audit_task_refuses_an_id_no_audit_was_started_under() {
         );
         assert_eq!(
             reply.error_message(),
-            format!("Audit task {task_id} does not exist."),
+            format!("Audit task with TaskId={task_id} was not found"),
             "case {task_id:?}: expected the refusal to name the audit asked about, got {}",
             reply.text()
         );

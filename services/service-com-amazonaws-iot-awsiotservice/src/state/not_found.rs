@@ -16,8 +16,8 @@
 //! * The AUTHORIZER family words it `Authorizer <name> not found`.
 //! * The BILLING GROUP family words it `Billing group <name> does not exist`
 //!   ([`missing_billing_group_message`]).
-//! * The DEVICE DEFENDER family words it `Audit task <id> does not exist.`
-//!   ([`missing_audit_task_message`]).
+//! * The DEVICE DEFENDER audit-task family words it
+//!   `Audit task with TaskId=<id> was not found` ([`missing_audit_task_message`]).
 //! * The BULK THING REGISTRATION task family words it with a sentence that carries no
 //!   variable part at all ([`MISSING_THING_REGISTRATION_TASK_MESSAGE`]): the task id is
 //!   not interpolated.
@@ -212,11 +212,12 @@ pub const MISSING_THING_REGISTRATION_TASK_MESSAGE: &str = "Task doesn't exist";
 /// How this service states that a `taskId` names no Device Defender audit task this
 /// account holds — for a reader of one and for a cancel of one.
 ///
-/// The DEVICE DEFENDER family states the miss of the resource the request named, so the
-/// variable part is the id the request asked about and the rest is fixed: the audit is
-/// either an audit this account started or no audit at all.
+/// The AUDIT TASK sentence names the `TaskId` the request asked about: the fixed text is
+/// `Audit task with TaskId=` and ` was not found`, and the only variable part is the id
+/// the request sent, so the audit is either an audit this account started or no audit at
+/// all.
 pub fn missing_audit_task_message(task_id: &str) -> String {
-    format!("Audit task {task_id} does not exist.")
+    format!("Audit task with TaskId={task_id} was not found")
 }
 
 /// How this service refuses an `indexName` that is no fleet index of this service at all.
