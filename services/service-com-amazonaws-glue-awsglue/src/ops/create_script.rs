@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScript
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScript`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScript::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Transforms a directed acyclic graph into code. The graph the request states IS the
+//! script's own record of itself: every node carries what it does (`NodeType`), the name it
+//! binds (`Id`) and its properties as name-value pairs (`Args`), and every edge says which
+//! node's frame another node reads and under which parameter. This operation writes that
+//! graph out as a Glue ETL script — the codegen annotations above each node (`@type`,
+//! `@args`, `@return`, `@inputs`) and then the statement binding the node's name to the call
+//! its type names, applied to the frames the edges name into it — inside the Glue job
+//! skeleton every generated script is written in ([`crate::ops::get_plan::script_frame`],
+//! shared with the plan generator so both write one skeleton).
+//!
+//! The nodes are written in an order every node's frames are bound BEFORE it is read in, so
+//! the script a graph generates is a script that runs: the request's own order is kept
+//! wherever it already satisfies that. A node's type picks the call its statement makes — a
+//! `DataSource` reads through the Glue context's reader and a `DataSink` writes through its
+//! writer, each addressed by catalog table or by connection options according to the
+//! properties the node carries, and any other type is the Glue transform of that name applied
+//! to the frames it reads — and a property is passed under the parameter the Glue ETL library
+//! of the requested language takes it as.
+//!
+//! `Language` picks which member carries the answer: `SCALA` answers `ScalaCode`, and
+//! `PYTHON` or no language at all answers `PythonScript`. Nothing is persisted and nothing is
+//! read out of the store: the code is computed from the graph alone, so two identical calls
+//! answer the same script and a graph transformed here changes nothing a later caller sees.
+//! The transformation is the inverse of the reading `GetDataflowGraph` performs, so the graph
+//! read out of a script this emulator generated writes that same script back.
+//!
+//! A graph the model's own shapes cannot describe is refused with `InvalidInputException`: a
+//! name bound by two nodes is not "unique within the node's graph" (`CodeGenNode$Id`), an
+//! edge naming an end no node of the graph binds names a frame the script could not read,
+//! and nodes that read one another's frames are not a directed ACYCLIC graph. A graph
+//! carrying more nodes than [`MAX_DAG_NODES`] or more edges than [`MAX_DAG_EDGES`] is refused
+//! for its size, before anything is generated.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +98,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::HashMap;
+
+use super::get_plan::{requested_language, script_frame, ScriptFrame, ScriptLanguage};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -104,6 +134,511 @@ impl From<CreateScriptErrorModeled> for CreateScriptError {
     fn from(modeled: CreateScriptErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The most nodes one graph this operation writes out may carry. The model bounds `DagNodes`
+/// not at all, so the bound is this emulator's own — a property of the REQUEST, answered
+/// before anything is generated, like the request-size bounds `GetPlan` enforces for itself.
+pub const MAX_DAG_NODES: usize = 500;
+
+/// The most edges one graph may carry, for the same reason: every edge is one frame a node's
+/// statement reads, so the script a graph generates grows with them.
+pub const MAX_DAG_EDGES: usize = 2_000;
+
+/// The node type that READS a dataset into the script rather than transforming a frame.
+const DATA_SOURCE_TYPE: &str = "DataSource";
+
+/// The node type that WRITES a frame out of the script.
+const DATA_SINK_TYPE: &str = "DataSink";
+
+/// The property naming the kind of connection a source or sink is addressed by, which is
+/// what distinguishes one addressed by connection options from one addressed by a Data
+/// Catalog table ("connection_type" / "connectionType" in the Glue ETL library's reader and
+/// writer, as `GetPlan` generates them for a `Location` sink).
+const CONNECTION_TYPE_ARG: &str = "connection_type";
+
+/// The node type whose mapping the Glue ETL library takes under a different name than the
+/// graph carries it: `ApplyMapping` is applied as `ApplyMapping.apply(frame, mappings, …)`
+/// in the Glue PySpark transforms and `frame.applyMapping(mappings = …)` in Scala, where the
+/// node's own property is the singular `mapping` — which is also how this emulator's plan
+/// generator annotates and calls it (`crate::ops::get_plan`).
+const APPLY_MAPPING_TYPE: &str = "ApplyMapping";
+
+/// That node's own property name, and the parameter the transform takes it as.
+const MAPPING_ARG: &str = "mapping";
+const MAPPINGS_PARAMETER: &str = "mappings";
+
+/// The transformation context a Glue codegen node carries, as the graph spells it and as the
+/// Scala Glue ETL library takes it (the Python library takes it under the graph's own name).
+const TRANSFORMATION_CTX_ARG: &str = "transformation_ctx";
+const TRANSFORMATION_CONTEXT_PARAMETER: &str = "transformationContext";
+
+/// The connection options a source or sink carries, and the parameter the Scala reader and
+/// writer take them as (`options = JsonOptions(…)`, as `GetPlan` generates for Scala).
+const CONNECTION_OPTIONS_ARG: &str = "connection_options";
+const OPTIONS_PARAMETER: &str = "options";
+
+/// The staging directory the Scala Data Catalog source and sink take beside the table they
+/// address. Glue codegen writes it empty where the graph carries no staging directory of its
+/// own, which is what this emulator's plan generator writes for Scala too.
+const REDSHIFT_TMP_DIR_PARAMETER: &str = "redshiftTmpDir";
+
+/// The Scala parameter naming the database a catalog source or sink reads or writes, and the
+/// one naming its table: the two the staging directory is written after.
+const DATABASE_PARAMETER: &str = "database";
+const TABLE_NAME_PARAMETER: &str = "tableName";
+
+/// This operation's modelled client refusal, carrying `message`.
+fn invalid_input(message: String) -> CreateScriptError {
+    CreateScriptErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The refusal for a graph carrying more nodes than this operation writes out.
+fn nodes_limit_message(carried: usize) -> String {
+    format!(
+        "the graph carries {carried} nodes, more than the {MAX_DAG_NODES} nodes one graph may \
+         carry"
+    )
+}
+
+/// The refusal for a graph carrying more edges than this operation writes out.
+fn edges_limit_message(carried: usize) -> String {
+    format!(
+        "the graph carries {carried} edges, more than the {MAX_DAG_EDGES} edges one graph may \
+         carry"
+    )
+}
+
+/// The refusal for a name two nodes bind: a node's identifier is "unique within the node's
+/// graph" (`CodeGenNode$Id`).
+fn duplicate_node_message(id: &str) -> String {
+    format!("{id} names a node the graph already names")
+}
+
+/// The refusal for an edge naming an end no node of the graph binds.
+fn unknown_end_message(missing: &str, source: &str, target: &str) -> String {
+    format!("the edge from {source} to {target} names {missing}, which is no node of the graph")
+}
+
+/// The refusal for nodes that read one another's frames: a graph with a cycle in it is no
+/// directed acyclic graph, so there is no order its nodes can be written in.
+fn cycle_message(ids: &str) -> String {
+    format!(
+        "the nodes {ids} read one another's frames, so the graph is not the directed acyclic \
+         graph a script is generated from"
+    )
+}
+
+/// One frame a node reads: the node binding it, and the parameter the edge names it as — none
+/// where the edge names no parameter, which is a frame read positionally.
+struct Frame<'dag> {
+    parameter: Option<&'dag str>,
+    source: &'dag str,
+}
+
+/// One node as the script writes it out: the node the request stated, and the frames the
+/// edges name into it, in the order the request listed those edges.
+struct Scripted<'dag> {
+    node: &'dag CodeGenNode,
+    frames: Vec<Frame<'dag>>,
+}
+
+/// The parameter an edge names its frame as, and `None` where it names none: an edge stating
+/// an empty parameter names no parameter, so its frame is read positionally.
+fn edge_parameter(edge: &CodeGenEdge) -> Option<&str> {
+    edge.target_parameter
+        .as_deref()
+        .map(str::trim)
+        .filter(|parameter| !parameter.is_empty())
+}
+
+/// The nodes of the graph in the order the script writes them: every node after the nodes
+/// binding the frames it reads, keeping the request's own order wherever that order already
+/// satisfies it. A graph whose names or edges cannot describe a script is refused here.
+fn ordered<'dag>(
+    nodes: &'dag [CodeGenNode],
+    edges: &'dag [CodeGenEdge],
+) -> Result<Vec<Scripted<'dag>>, CreateScriptError> {
+    let mut at: HashMap<&str, usize> = HashMap::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        if at.insert(node.id.as_str(), index).is_some() {
+            return Err(invalid_input(duplicate_node_message(&node.id)));
+        }
+    }
+
+    let mut frames: Vec<Vec<Frame<'dag>>> = nodes.iter().map(|_| Vec::new()).collect();
+    // The nodes each node reads a frame of, which is what it has to be written after.
+    let mut reads: Vec<Vec<usize>> = nodes.iter().map(|_| Vec::new()).collect();
+    for edge in edges {
+        let Some(&source) = at.get(edge.source.as_str()) else {
+            return Err(invalid_input(unknown_end_message(
+                &edge.source,
+                &edge.source,
+                &edge.target,
+            )));
+        };
+        let Some(&target) = at.get(edge.target.as_str()) else {
+            return Err(invalid_input(unknown_end_message(
+                &edge.target,
+                &edge.source,
+                &edge.target,
+            )));
+        };
+        frames[target].push(Frame {
+            parameter: edge_parameter(edge),
+            source: nodes[source].id.as_str(),
+        });
+        reads[target].push(source);
+    }
+
+    let mut written: Vec<bool> = nodes.iter().map(|_| false).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(nodes.len());
+    while order.len() < nodes.len() {
+        let before = order.len();
+        for index in 0..nodes.len() {
+            if written[index] || !reads[index].iter().all(|&source| written[source]) {
+                continue;
+            }
+            written[index] = true;
+            order.push(index);
+        }
+        if order.len() == before {
+            // Nothing could be written this pass, so every node left reads a frame of a node
+            // that is itself waiting on one: that is a cycle.
+            let waiting: Vec<&str> = nodes
+                .iter()
+                .zip(written.iter())
+                .filter(|(_, written)| !**written)
+                .map(|(node, _)| node.id.as_str())
+                .collect();
+            return Err(invalid_input(cycle_message(&waiting.join(", "))));
+        }
+    }
+
+    // The frames are moved out of the per-node lists in the order the script writes the
+    // nodes, so each node carries the edges that name into it and nothing is cloned.
+    let mut taken: Vec<Option<Vec<Frame<'dag>>>> = frames.into_iter().map(Some).collect();
+    Ok(order
+        .into_iter()
+        .map(|index| Scripted {
+            node: &nodes[index],
+            frames: taken[index].take().unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// The properties a node is annotated with, as the graph spells them: each property's own
+/// name and the text its value is carried as, which is what a reading of the script reads
+/// back as that node's `Args`.
+fn annotated_args(args: &[CodeGenNodeArg]) -> String {
+    args.iter()
+        .map(|arg| format!("{name} = {value}", name = arg.name, value = arg.value))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// The frames a node is annotated with: each under the parameter its edge names it as, and
+/// bare where the edge names none.
+fn annotated_inputs(frames: &[Frame<'_>]) -> String {
+    frames
+        .iter()
+        .map(|frame| match frame.parameter {
+            Some(parameter) => format!("{parameter} = {source}", source = frame.source),
+            None => frame.source.to_string(),
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// Whether a node is addressed by a connection rather than by a Data Catalog table, which is
+/// what picks the reader or writer its statement calls.
+fn addressed_by_connection(args: &[CodeGenNodeArg]) -> bool {
+    args.iter().any(|arg| arg.name == CONNECTION_TYPE_ARG)
+}
+
+/// The parameter the Glue PySpark library takes one of a node's properties as: its own name,
+/// save for the mapping an `ApplyMapping` carries ([`APPLY_MAPPING_TYPE`]).
+fn python_parameter(node_type: &str, name: &str) -> String {
+    if node_type == APPLY_MAPPING_TYPE && name == MAPPING_ARG {
+        return MAPPINGS_PARAMETER.to_string();
+    }
+    name.to_string()
+}
+
+/// The same for the Scala library, which spells a parameter in lowerCamelCase
+/// (`table_name` → `tableName`), takes the transformation context as
+/// [`TRANSFORMATION_CONTEXT_PARAMETER`] and a source's or sink's connection options as
+/// [`OPTIONS_PARAMETER`].
+fn scala_parameter(node_type: &str, name: &str) -> String {
+    if node_type == APPLY_MAPPING_TYPE && name == MAPPING_ARG {
+        return MAPPINGS_PARAMETER.to_string();
+    }
+    match name {
+        TRANSFORMATION_CTX_ARG => TRANSFORMATION_CONTEXT_PARAMETER.to_string(),
+        CONNECTION_OPTIONS_ARG => OPTIONS_PARAMETER.to_string(),
+        other => lower_camel(other),
+    }
+}
+
+/// `snake_case` as the Scala Glue ETL library spells the same name: the first word as it
+/// stands and every later word capitalised.
+fn lower_camel(name: &str) -> String {
+    let mut spelled = String::with_capacity(name.len());
+    for (index, word) in name.split('_').filter(|word| !word.is_empty()).enumerate() {
+        if index == 0 {
+            spelled.push_str(word);
+            continue;
+        }
+        let mut characters = word.chars();
+        if let Some(first) = characters.next() {
+            spelled.extend(first.to_uppercase());
+            spelled.push_str(characters.as_str());
+        }
+    }
+    if spelled.is_empty() {
+        // A name of nothing but separators is spelled as it stands rather than dropped: the
+        // generated code carries what the graph carries.
+        return name.to_string();
+    }
+    spelled
+}
+
+/// A property's value as Scala spells the same literal: a list is a `Seq`, a key-value object
+/// is the `JsonOptions` document the Scala reader and writer take, and every other value is
+/// spelled the same in both languages.
+fn scala_value(value: &str) -> String {
+    let text = value.trim();
+    if let Some(inner) = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        return format!("Seq({inner})");
+    }
+    if text.starts_with('{') && text.ends_with('}') {
+        return format!("JsonOptions(\"\"\"{text}\"\"\")");
+    }
+    text.to_string()
+}
+
+/// The node's properties as the Python call passes them, in the order the graph carries them.
+fn python_args(node: &CodeGenNode) -> Vec<String> {
+    node.args
+        .iter()
+        .map(|arg| {
+            format!(
+                "{parameter} = {value}",
+                parameter = python_parameter(&node.node_type, &arg.name),
+                value = arg.value,
+            )
+        })
+        .collect()
+}
+
+/// The same for the Scala call.
+fn scala_args(node: &CodeGenNode) -> Vec<String> {
+    node.args
+        .iter()
+        .map(|arg| {
+            format!(
+                "{parameter} = {value}",
+                parameter = scala_parameter(&node.node_type, &arg.name),
+                value = scala_value(&arg.value),
+            )
+        })
+        .collect()
+}
+
+/// The frames a Python call reads, as it passes them: the ones read positionally first,
+/// because Python takes a positional argument only before a named one, and then the ones
+/// their edges name a parameter for.
+fn python_frames(frames: &[Frame<'_>]) -> Vec<String> {
+    let mut passed: Vec<String> = frames
+        .iter()
+        .filter(|frame| frame.parameter.is_none())
+        .map(|frame| frame.source.to_string())
+        .collect();
+    passed.extend(frames.iter().filter_map(|frame| {
+        frame
+            .parameter
+            .map(|parameter| format!("{parameter} = {source}", source = frame.source))
+    }));
+    passed
+}
+
+/// The Python statement one node of the script stands on: the name the node binds, bound to
+/// the call its type names over the frames it reads and the properties it carries.
+fn python_statement(scripted: &Scripted<'_>) -> String {
+    let node = scripted.node;
+    let mut passed = python_frames(&scripted.frames);
+    passed.extend(python_args(node));
+    let arguments = passed.join(", ");
+    let call = match node.node_type.as_str() {
+        DATA_SOURCE_TYPE => format!(
+            "glueContext.create_dynamic_frame.{reader}({arguments})",
+            reader = if addressed_by_connection(&node.args) {
+                "from_options"
+            } else {
+                "from_catalog"
+            },
+        ),
+        DATA_SINK_TYPE => format!(
+            "glueContext.write_dynamic_frame.{writer}({arguments})",
+            writer = if addressed_by_connection(&node.args) {
+                "from_options"
+            } else {
+                "from_catalog"
+            },
+        ),
+        // Every other node type is a Glue transform of that name, which the PySpark library
+        // applies to the frames the node reads.
+        transform => format!("{transform}.apply({arguments})"),
+    };
+    format!("{id} = {call}", id = node.id)
+}
+
+/// The Scala catalog source's and sink's arguments: the node's properties with the staging
+/// directory the Scala reader and writer take written after the table they address, where the
+/// graph carries none of its own.
+fn with_staging_directory(mut arguments: Vec<String>) -> Vec<String> {
+    let names = |argument: &String| {
+        argument
+            .split_once(" = ")
+            .map(|(parameter, _)| parameter.to_string())
+            .unwrap_or_default()
+    };
+    if arguments.iter().any(|argument| {
+        let parameter = names(argument);
+        parameter == REDSHIFT_TMP_DIR_PARAMETER
+    }) {
+        return arguments;
+    }
+    let after = arguments
+        .iter()
+        .rposition(|argument| {
+            let parameter = names(argument);
+            parameter == TABLE_NAME_PARAMETER || parameter == DATABASE_PARAMETER
+        })
+        .map_or(0, |at| at + 1);
+    arguments.insert(after, format!("{REDSHIFT_TMP_DIR_PARAMETER} = \"\""));
+    arguments
+}
+
+/// The Scala statement one node stands on. A transform is a method of the frame it reads, and
+/// a source or sink is the Glue context's reader or writer: the frame a sink writes is the
+/// one its edge names, and the further frames a transform reads are passed as its edges name
+/// them.
+fn scala_statement(scripted: &Scripted<'_>) -> String {
+    let node = scripted.node;
+    let arguments = scala_args(node);
+    let read = scripted.frames.first().map(|frame| frame.source);
+    let call = match node.node_type.as_str() {
+        DATA_SOURCE_TYPE => {
+            let arguments = if addressed_by_connection(&node.args) {
+                arguments
+            } else {
+                with_staging_directory(arguments)
+            };
+            format!(
+                "glueContext.{reader}({arguments}).getDynamicFrame()",
+                reader = if addressed_by_connection(&node.args) {
+                    "getSourceWithFormat"
+                } else {
+                    "getCatalogSource"
+                },
+                arguments = arguments.join(", "),
+            )
+        }
+        DATA_SINK_TYPE => {
+            let arguments = if addressed_by_connection(&node.args) {
+                arguments
+            } else {
+                with_staging_directory(arguments)
+            };
+            format!(
+                "glueContext.{writer}({arguments}).writeDynamicFrame({frame})",
+                writer = if addressed_by_connection(&node.args) {
+                    "getSinkWithFormat"
+                } else {
+                    "getCatalogSink"
+                },
+                arguments = arguments.join(", "),
+                frame = read.unwrap_or_default(),
+            )
+        }
+        transform => {
+            // The transform is a method of the FIRST frame the node reads; the frames after
+            // it are passed as their edges name them.
+            let mut passed: Vec<String> = scripted
+                .frames
+                .iter()
+                .skip(1)
+                .map(|frame| match frame.parameter {
+                    Some(parameter) => {
+                        format!("{parameter} = {source}", source = frame.source)
+                    }
+                    None => frame.source.to_string(),
+                })
+                .collect();
+            passed.extend(arguments);
+            let applied = format!(
+                "{method}({arguments})",
+                method = lower_camel_type(transform),
+                arguments = passed.join(", "),
+            );
+            match read {
+                Some(frame) => format!("{frame}.{applied}"),
+                // A transform the graph gives no frame to has no frame to be a method of, so
+                // it is spelled as the call alone.
+                None => applied,
+            }
+        }
+    };
+    format!("val {id} = {call}", id = node.id)
+}
+
+/// A node type as the Scala Glue ETL library spells the method that applies it:
+/// `ApplyMapping` is applied as `applyMapping`.
+fn lower_camel_type(node_type: &str) -> String {
+    let mut characters = node_type.chars();
+    match characters.next() {
+        Some(first) => {
+            let mut spelled: String = first.to_lowercase().collect();
+            spelled.push_str(characters.as_str());
+            spelled
+        }
+        None => node_type.to_string(),
+    }
+}
+
+/// The script a graph generates, in one language: the language's preamble, then each node
+/// annotated with its type, its properties, the name it binds and the frames it reads, and
+/// then the language's close.
+fn script(nodes: &[Scripted<'_>], language: ScriptLanguage) -> String {
+    let ScriptFrame {
+        comment,
+        indent,
+        preamble,
+        epilogue,
+    } = script_frame(language);
+    let mut script = String::from(preamble);
+    for scripted in nodes {
+        script.push_str(&format!(
+            "{indent}{comment} @type: {node_type}\n{indent}{comment} @args: [{args}]\n\
+             {indent}{comment} @return: {id}\n{indent}{comment} @inputs: [{inputs}]\n",
+            node_type = scripted.node.node_type,
+            args = annotated_args(&scripted.node.args),
+            id = scripted.node.id,
+            inputs = annotated_inputs(&scripted.frames),
+        ));
+        let statement = match language {
+            ScriptLanguage::Python => python_statement(scripted),
+            ScriptLanguage::Scala => scala_statement(scripted),
+        };
+        script.push_str(&format!("{indent}{statement}\n"));
+    }
+    script.push_str(epilogue);
+    script
 }
 
 /// The `CreateScript` operation.
@@ -142,18 +677,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScript` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScriptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScript"))
+        // The code is generated from the graph the request carries and from nothing else:
+        // this operation reads no resource of the catalog and persists nothing, so neither
+        // the store behind the engine nor anything `ctx` carries is read.
+        let _ = (ctx, &self.engine);
+        // A request stating no node states the empty graph, which generates the script's
+        // skeleton rather than a refusal: neither list is a required member of the request
+        // (`smithy_query operation=CreateScript`).
+        let nodes = input.dag_nodes.as_deref().unwrap_or_default();
+        let edges = input.dag_edges.as_deref().unwrap_or_default();
+        // The size of the graph is a property of the request, so it is answered before the
+        // graph is read and before the script allocates anything.
+        if nodes.len() > MAX_DAG_NODES {
+            return Err(invalid_input(nodes_limit_message(nodes.len())));
+        }
+        if edges.len() > MAX_DAG_EDGES {
+            return Err(invalid_input(edges_limit_message(edges.len())));
+        }
+        let scripted = ordered(nodes, edges)?;
+
+        // The answer carries the code in the language the request asked for, and only that
+        // one: the other member states no code the caller asked for.
+        match requested_language(input.language.as_ref()) {
+            ScriptLanguage::Python => Ok(CreateScriptOutput {
+                python_script: Some(script(&scripted, ScriptLanguage::Python)),
+                scala_code: None,
+            }),
+            ScriptLanguage::Scala => Ok(CreateScriptOutput {
+                python_script: None,
+                scala_code: Some(script(&scripted, ScriptLanguage::Scala)),
+            }),
+        }
     }
 }

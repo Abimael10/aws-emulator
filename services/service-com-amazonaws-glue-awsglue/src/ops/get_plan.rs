@@ -145,7 +145,7 @@ impl From<GetPlanErrorModeled> for GetPlanError {
 /// an absent `Language`, is the Python one. The member is an enum of exactly `PYTHON` and
 /// `SCALA` (`smithy_query shape=Language`), and the enum's value set is enforced before
 /// this handler runs, so these two are all that reach it.
-const SCALA_LANGUAGE: &str = "SCALA";
+pub(crate) const SCALA_LANGUAGE: &str = "SCALA";
 
 /// The type a mapped field carries when neither the request's mapping entry nor the stored
 /// column it names declares one: `Column$Type` is not required, and a DynamicFrame field of
@@ -158,18 +158,22 @@ const UNTYPED_FIELD_TYPE: &str = "string";
 const MATCH_CATALOG_CHOICE: &str = "MATCH_CATALOG";
 
 /// Which language's member of the answer carries the generated code.
+///
+/// ONE copy, shared with `CreateScript` ([`crate::ops::create_script`]): both operations
+/// answer the code in the language the request's `Language` asks for, and the member that
+/// language's code comes back in is the same choice in both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlanLanguage {
+pub(crate) enum ScriptLanguage {
     Python,
     Scala,
 }
 
-/// The language a request asks the plan in.
-fn requested_language(language: Option<&String>) -> PlanLanguage {
+/// The language a request asks the generated code in.
+pub(crate) fn requested_language(language: Option<&String>) -> ScriptLanguage {
     if language.is_some_and(|asked| asked == SCALA_LANGUAGE) {
-        PlanLanguage::Scala
+        ScriptLanguage::Scala
     } else {
-        PlanLanguage::Python
+        ScriptLanguage::Python
     }
 }
 
@@ -714,7 +718,7 @@ fn scala_call(kind: &NodeKind, name: &str, input: &str) -> String {
 
 /// What every generated Python script opens with: the Glue job's context and the job the
 /// script's nodes run in.
-const PYTHON_PREAMBLE: &str = "\
+pub(crate) const PYTHON_PREAMBLE: &str = "\
 import sys
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
@@ -732,10 +736,10 @@ job.init(args['JOB_NAME'], args)
 ";
 
 /// What it closes with: the job commit that ends a Glue script.
-const PYTHON_EPILOGUE: &str = "job.commit()\n";
+pub(crate) const PYTHON_EPILOGUE: &str = "job.commit()\n";
 
 /// The same for Scala: the object and `main` the nodes run in.
-const SCALA_PREAMBLE: &str = "\
+pub(crate) const SCALA_PREAMBLE: &str = "\
 import com.amazonaws.services.glue.ChoiceOption
 import com.amazonaws.services.glue.GlueContext
 import com.amazonaws.services.glue.util.GlueArgParser
@@ -754,20 +758,55 @@ object GlueApp {
 ";
 
 /// And its close.
-const SCALA_EPILOGUE: &str = "    Job.commit()\n  }\n}\n";
+pub(crate) const SCALA_EPILOGUE: &str = "    Job.commit()\n  }\n}\n";
+
+/// The skeleton a generated script is written in, in one language: how a codegen annotation
+/// is commented, how far a statement is indented, and the preamble and close the nodes stand
+/// between.
+///
+/// ONE copy, shared with `CreateScript` ([`crate::ops::create_script`]), which generates the
+/// same Glue codegen script from a graph the request states rather than from a mapping this
+/// operation plans: both write their nodes into the same skeleton, so it is described once.
+pub(crate) struct ScriptFrame {
+    /// What opens a codegen annotation comment in this language.
+    pub(crate) comment: &'static str,
+    /// How far a statement of this language's script is indented.
+    pub(crate) indent: &'static str,
+    /// What the script opens with.
+    pub(crate) preamble: &'static str,
+    /// What it closes with.
+    pub(crate) epilogue: &'static str,
+}
+
+/// The skeleton one language's script is written in.
+pub(crate) fn script_frame(language: ScriptLanguage) -> ScriptFrame {
+    match language {
+        ScriptLanguage::Python => ScriptFrame {
+            comment: "##",
+            indent: "",
+            preamble: PYTHON_PREAMBLE,
+            epilogue: PYTHON_EPILOGUE,
+        },
+        ScriptLanguage::Scala => ScriptFrame {
+            comment: "//",
+            indent: "    ",
+            preamble: SCALA_PREAMBLE,
+            epilogue: SCALA_EPILOGUE,
+        },
+    }
+}
 
 /// The script the plan generates, in one language: the language's preamble, then each node
 /// annotated with its type, arguments, the name it binds and the frame it reads, and then
 /// the language's close.
-fn script(nodes: &[Node], language: PlanLanguage) -> String {
-    let (comment, indent) = match language {
-        PlanLanguage::Python => ("##", ""),
-        PlanLanguage::Scala => ("//", "    "),
-    };
-    let mut script = String::from(match language {
-        PlanLanguage::Python => PYTHON_PREAMBLE,
-        PlanLanguage::Scala => SCALA_PREAMBLE,
-    });
+fn script(nodes: &[Node], language: ScriptLanguage) -> String {
+    let ScriptFrame {
+        comment,
+        indent,
+        preamble,
+        epilogue,
+    } = script_frame(language);
+    let mut script = String::from(preamble);
     for (index, node) in nodes.iter().enumerate() {
         let name = node_name(&node.kind, index);
         let input = node
@@ -786,19 +825,16 @@ fn script(nodes: &[Node], language: PlanLanguage) -> String {
             args = annotated_args(&node.kind, &name),
         ));
         let statement = match language {
-            PlanLanguage::Python => {
+            ScriptLanguage::Python => {
                 format!("{name} = {}", python_call(&node.kind, &name, &input))
             }
-            PlanLanguage::Scala => {
+            ScriptLanguage::Scala => {
                 format!("val {name} = {}", scala_call(&node.kind, &name, &input))
             }
         };
         script.push_str(&format!("{indent}{statement}\n"));
     }
-    script.push_str(match language {
-        PlanLanguage::Python => PYTHON_EPILOGUE,
-        PlanLanguage::Scala => SCALA_EPILOGUE,
-    });
+    script.push_str(epilogue);
     script
 }
 
@@ -912,13 +948,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The answer carries the code in the language the request asked for, and only that
         // one: the other member states no code the caller asked for.
         match requested_language(input.language.as_ref()) {
-            PlanLanguage::Python => Ok(GetPlanOutput {
-                python_script: Some(script(&nodes, PlanLanguage::Python)),
+            ScriptLanguage::Python => Ok(GetPlanOutput {
+                python_script: Some(script(&nodes, ScriptLanguage::Python)),
                 scala_code: None,
             }),
-            PlanLanguage::Scala => Ok(GetPlanOutput {
+            ScriptLanguage::Scala => Ok(GetPlanOutput {
                 python_script: None,
-                scala_code: Some(script(&nodes, PlanLanguage::Scala)),
+                scala_code: Some(script(&nodes, ScriptLanguage::Scala)),
             }),
         }
     }
