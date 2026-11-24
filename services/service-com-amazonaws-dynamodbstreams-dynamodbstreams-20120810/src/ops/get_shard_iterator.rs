@@ -350,7 +350,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 other => {
                     return Err(crate::scaffolded::Scaffolded::validation(format!(
                         "ShardIteratorType {other} is not one of {}",
-                        SHARD_ITERATOR_TYPE_VALUES.join(", ")
+                        // Listed in the one order this service states this type's value
+                        // set in — the order its own table of those values is walked
+                        // (`crate::service::validation`) — rather than in a second order
+                        // of its own.
+                        ::service_common::validation_message::hashed_enum_order(
+                            SHARD_ITERATOR_TYPE_VALUES
+                        )
+                        .join(", ")
                     )))
                 }
             }

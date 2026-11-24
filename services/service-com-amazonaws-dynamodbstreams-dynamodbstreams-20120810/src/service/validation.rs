@@ -22,6 +22,16 @@
 //! alike: the page sizes and record counts a `@range` floors, and the stream ARNs, shard
 //! ids, shard iterators and sequence numbers a `@length` window admits.
 //!
+//! The one thing this module decides about what goes INSIDE a clause is the ORDER an
+//! enumerated type's value set is listed in: this front door holds the admissible values
+//! in a table keyed on each value's own text and lists them as that table is walked —
+//! ascending bucket of the value's string hash
+//! ([`service_common::validation_message::in_hashed_enum_order`], the fleet's one home for
+//! the derivation) — which is neither the order the model declares the type's members in
+//! nor lexicographic. The order is computed from the values themselves, so it belongs to
+//! the enumerated TYPE rather than to a member, an operation or a depth: one type is listed
+//! alike wherever it is carried, and a type this model gains needs nothing added here.
+//!
 //! One refusal is worded earlier still and never reaches here: a `ListStreams` table
 //! name the model's own constraints do not admit draws one sentence stating the length
 //! window a name has to fit ([`super::table_name_refusal`]), with no envelope around it.
@@ -33,8 +43,22 @@ use smithy_server_runtime::{Refusal, Refused, Violation};
 /// `None` covers what is not an input-constraint refusal: an authentication refusal is a
 /// different failure, with a code and a status that are not this service's to change.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    // An enumerated type's admissible values are listed in the order this front door's own
+    // table of them is walked rather than in the order the schema presented them, so each
+    // violation is re-ordered BEFORE the envelope words it: only the values move, and every
+    // other violation class comes back untouched. Doing it on the one refusal this service
+    // states is what makes the order hold for every enum of this model.
+    let stated = Refusal::Invalid(
+        violations
+            .iter()
+            .map(service_common::validation_message::in_hashed_enum_order)
+            .collect(),
+    );
     service_common::validation_message::aws_validation_refusal_withholding_violations(
-        refusal,
+        &stated,
         states_no_value,
     )
 }
@@ -97,6 +121,9 @@ mod tests {
                  than or equal to 100",
             ),
             (
+                // The set is listed in the order the table of these values is walked
+                // (`LATEST` sits in a lower bucket than `TRIM_HORIZON`), which is not the
+                // order they were handed over in.
                 "an enumerated type's value set",
                 violation(
                     "shardIteratorType",
@@ -107,7 +134,7 @@ mod tests {
                     Some("SOMETIME"),
                 ),
                 "Value at 'shardIteratorType' failed to satisfy constraint: Member must \
-                 satisfy enum value set: [TRIM_HORIZON, LATEST]",
+                 satisfy enum value set: [LATEST, TRIM_HORIZON]",
             ),
             (
                 "a member absent from the request, which carried no value to withhold",
@@ -126,6 +153,50 @@ mod tests {
                 format!("1 validation error detected: {clause}"),
                 "case {case:?}: expected the clause {clause:?}, got {:?}",
                 stated.message
+            );
+        }
+    }
+
+    /// The ORDER an enumerated type's value set is listed in belongs to the TYPE: it is
+    /// derived from the values themselves, so the same set is listed the same way whichever
+    /// order the schema presented it in, under whatever member path carried the bad value.
+    ///
+    /// The rows differ along what the derivation generalises over: the order the set is
+    /// presented in (declared, reversed, rotated) and the member path it is reported at.
+    #[test]
+    fn an_enum_value_set_is_listed_in_the_order_the_table_is_walked() {
+        let declared = crate::ops::types::SHARD_ITERATOR_TYPE_VALUES;
+        let listed = format!(
+            "[{}]",
+            service_common::validation_message::hashed_enum_order(declared).join(", ")
+        );
+        let reversed: Vec<&str> = declared.iter().rev().copied().collect();
+        let mut rotated: Vec<&str> = declared.to_vec();
+        rotated.rotate_left(2);
+        let rows: [(&str, &str, Vec<&str>); 3] = [
+            ("as the model declares it", "shardIteratorType", declared.to_vec()),
+            ("reversed", "shardIteratorType", reversed),
+            ("rotated, at another member path", "iteratorType", rotated),
+        ];
+
+        for (case, path, presented) in rows {
+            let refusal = Refusal::Invalid(vec![violation(
+                path,
+                ViolationKind::EnumValue(
+                    presented.iter().map(|value| (*value).to_string()).collect(),
+                ),
+                Some("SOMETIME"),
+            )]);
+            let stated = refused(&refusal)
+                .unwrap_or_else(|| panic!("case {case:?}: the refusal must be stated"))
+                .message;
+            let expected = format!(
+                "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+                 Member must satisfy enum value set: {listed}"
+            );
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
             );
         }
     }

@@ -15,8 +15,12 @@
 //! beside the neighbouring class the rule must not swallow: every value the model DOES
 //! declare passes the set, and the two that need no further member are served.
 //!
-//! The value set is the model's, from
-//! `smithy_query(query="shape", shape="ShardIteratorType")`.
+//! WHICH values the set holds is the model's, from
+//! `smithy_query(query="shape", shape="ShardIteratorType")`. The ORDER they are listed in
+//! is not the model's declaration order: this front door holds the admissible values in a
+//! table keyed on each value's own text and lists them as that table is walked, ascending
+//! bucket of the value's string hash (`service_common::validation_message::hashed_enum_order`,
+//! the fleet's one home for the derivation).
 //!
 //! Every row goes over the wire (`POST /` +
 //! `X-Amz-Target: DynamoDBStreams_20120810.GetShardIterator`), so nothing is asserted
@@ -26,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
+use service_common::validation_message::{enum_value_bucket, hashed_enum_order};
 use smithy_server_runtime::MultiServiceRouter;
 use streams::ops::types::KeySchemaElement;
 use streams::state::{
@@ -41,14 +46,26 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 const REGION: &str = "us-east-1";
 
-/// The values the model declares for `ShardIteratorType`, in the order it declares them,
-/// which is the order the refusal lists the set in.
+/// The values the model declares for `ShardIteratorType`, in the order it declares them
+/// (`smithy_query(query="shape", shape="ShardIteratorType")`), which is NOT the order the
+/// refusal lists the set in.
 const SHARD_ITERATOR_TYPES: [&str; 5] = [
     "TRIM_HORIZON",
     "LATEST",
     "AT_SEQUENCE_NUMBER",
     "AFTER_SEQUENCE_NUMBER",
     "AT_TIMESTAMP",
+];
+
+/// The order the refusal lists that same set in: the order this service's own table of the
+/// admissible values is walked, which is neither the model's declaration order nor
+/// lexicographic.
+const LISTED_SHARD_ITERATOR_TYPES: [&str; 5] = [
+    "AFTER_SEQUENCE_NUMBER",
+    "LATEST",
+    "AT_TIMESTAMP",
+    "AT_SEQUENCE_NUMBER",
+    "TRIM_HORIZON",
 ];
 
 /// The two declared values that name a start point needing no further member, so a
@@ -112,7 +129,7 @@ fn value_set_refusal() -> String {
     format!(
         "1 validation error detected: Value at 'shardIteratorType' failed to satisfy \
          constraint: Member must satisfy enum value set: [{}]",
-        SHARD_ITERATOR_TYPES.join(", ")
+        LISTED_SHARD_ITERATOR_TYPES.join(", ")
     )
 }
 
@@ -211,6 +228,62 @@ async fn an_unmodelled_iterator_type_states_the_value_set_and_no_value() {
         assert!(
             !stated.contains("Value '"),
             "case {case:?}: the clause must quote no submitted value, got {stated:?}"
+        );
+    }
+}
+
+/// The ORDER the clause lists the value set in is the order this service's own table of
+/// the admissible values is walked — ascending bucket of each value's string hash — which
+/// belongs to the enumerated TYPE rather than to the request, the member or the model's
+/// declaration.
+///
+/// Three claims, so the listing cannot be a transcription of one listing anyone saw:
+/// the published order is the one the shared derivation computes; that derivation is
+/// ascending in the bucket each value hashes to; and it does not depend on the order the
+/// values are presented in.
+#[test]
+fn the_value_set_is_listed_in_the_order_the_table_is_walked() {
+    let derived = hashed_enum_order(&SHARD_ITERATOR_TYPES);
+    assert_eq!(
+        derived,
+        LISTED_SHARD_ITERATOR_TYPES.to_vec(),
+        "case the declared set: expected {LISTED_SHARD_ITERATOR_TYPES:?}, got {derived:?}"
+    );
+    assert_ne!(
+        derived,
+        SHARD_ITERATOR_TYPES.to_vec(),
+        "case the declared set: the listing must not be the model's declaration order, got \
+         {derived:?}"
+    );
+
+    // Ascending in the bucket each listed value hashes to, which is what walking the table
+    // means — and no two of this type's values share a bucket, so the listing is total.
+    let buckets: Vec<u32> = derived.iter().map(|value| enum_value_bucket(value)).collect();
+    let mut ascending = buckets.clone();
+    ascending.sort_unstable();
+    ascending.dedup();
+    assert_eq!(
+        buckets, ascending,
+        "case the declared set: expected the buckets {ascending:?} in ascending order, got \
+         {buckets:?}"
+    );
+
+    // The same set presented in other orders is listed the same way: the order is the
+    // type's, not the schema's.
+    let reversed: Vec<&str> = SHARD_ITERATOR_TYPES.iter().rev().copied().collect();
+    let mut rotated: Vec<&str> = SHARD_ITERATOR_TYPES.to_vec();
+    rotated.rotate_left(3);
+    let mut lexicographic: Vec<&str> = SHARD_ITERATOR_TYPES.to_vec();
+    lexicographic.sort_unstable();
+    for (case, presented) in [
+        ("reversed", reversed),
+        ("rotated", rotated),
+        ("lexicographic", lexicographic),
+    ] {
+        let listed = hashed_enum_order(&presented);
+        assert_eq!(
+            listed, derived,
+            "case {case:?}: expected {derived:?}, got {listed:?}"
         );
     }
 }
