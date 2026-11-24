@@ -69,7 +69,10 @@ const SETTLE_POLL: Duration = Duration::from_millis(25);
 /// the accelerated-recovery status and the failure reasons of a features
 /// change, neither of which a zone has a status for until a features update
 /// configures one, plus the public-DNS fallback status every zone has.
-const FEATURES_MEMBERS: [&str; 3] = [
+///
+/// `pub(crate)` so a sibling suite holding a listed zone's container to the
+/// MODELLED member set names the same one rather than growing a second copy.
+pub(crate) const FEATURES_MEMBERS: [&str; 3] = [
     "AcceleratedRecoveryStatus",
     "FailureReasons",
     PUBLIC_DNS_FALLBACK_STATUS,
@@ -79,7 +82,9 @@ const FEATURES_MEMBERS: [&str; 3] = [
 /// public DNS: the posture the account-wide listing reports for every zone it
 /// projects, while a single-zone projection carries it only for a zone something
 /// turned the feature ON for.
-const PUBLIC_DNS_FALLBACK_STATUS: &str = "PublicDNSFallbackStatus";
+///
+/// `pub(crate)` for the same reason [`FEATURES_MEMBERS`] is.
+pub(crate) const PUBLIC_DNS_FALLBACK_STATUS: &str = "PublicDNSFallbackStatus";
 
 /// A router with just this service mounted on a fresh shared engine.
 fn router() -> MultiServiceRouter {
@@ -189,7 +194,9 @@ fn assert_features(case: &str, block: &str, status: Option<&str>, fallback: Opti
 
 /// The name of every element opened directly or indirectly inside one stretch
 /// of XML, in document order.
-fn element_names(block: &str) -> Vec<&str> {
+///
+/// `pub(crate)` for the same reason [`hosted_zone_blocks`] is.
+pub(crate) fn element_names(block: &str) -> Vec<&str> {
     let mut names = Vec::new();
     let mut rest = block;
     while let Some(at) = rest.find('<') {
@@ -216,7 +223,10 @@ fn element_names(block: &str) -> Vec<&str> {
 /// statuses means reading them inside the element the zone is projected as.
 /// `<HostedZone>` and the `<HostedZones>` wrapper around it are told apart by
 /// the closing angle bracket.
-fn hosted_zone_blocks(body: &str) -> Vec<&str> {
+///
+/// `pub(crate)` so a sibling suite reading the zones a listing projects reads
+/// them through the SAME reader rather than growing a second copy.
+pub(crate) fn hosted_zone_blocks(body: &str) -> Vec<&str> {
     let mut blocks = Vec::new();
     let mut rest = body;
     while let Some(at) = rest.find("<HostedZone>") {

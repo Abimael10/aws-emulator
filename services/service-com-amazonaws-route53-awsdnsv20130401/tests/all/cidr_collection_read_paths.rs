@@ -42,6 +42,18 @@
 //!    contents, the hosted-zone paths, a refusal), and holds every ARN any of them renders
 //!    to the layout, to the set of resources the account actually holds, and to the id its
 //!    own response identifies that resource by.
+//! 5. Rule 1 as the projection rule it is a case of, over BOTH account-wide listings this
+//!    service serves (the collection listing above and the hosted-zone one): every row a
+//!    listing reports is a COMPLETE projection of the resource it reports — each member
+//!    the resource's state fills is serialised with that value rather than as an empty
+//!    element, a structure the resource has nothing for is left out instead, and the
+//!    identifiers the row carries (the resource's own id, and the Route 53-layout ARN over
+//!    it) address that resource through its own read path. One row is read at the ELEMENT
+//!    level, because a member reported empty and a member reported with the stored value
+//!    flatten to the same text; the rows span collection names and version counters, zone
+//!    label counts, public/private zones and zones with and without a comment, and the
+//!    whole listing as well as a bounded page of it, because the rule is about a row
+//!    rather than about one resource or one page.
 //!
 //! Every test drives the service through the real router, using the SAME harness the
 //! sibling CIDR-collection suites use, so what is asserted is the HTTP/restXml behaviour a
@@ -51,11 +63,17 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
+use service_com_amazonaws_route53_awsdnsv20130401::state::{
+    DEFAULT_PAGE_SIZE, PUBLIC_DNS_FALLBACK_DISABLED,
+};
 
 use crate::cidr_collection_blocks::{change, change_collection, create_collection, DELETE_IF_EXISTS, PUT};
 use crate::cidr_collections::create_collection as create_collection_under;
-use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
+use crate::hosted_zone_features_envelope::{
+    element_names, hosted_zone_blocks, FEATURES_MEMBERS, PUBLIC_DNS_FALLBACK_STATUS,
+};
+use crate::hosted_zone_records::{call, create_zone_body, create_zone_ok, router, Reply};
+use crate::resource_tags::element_text;
 
 /// The wire error code of the refusal of a collection id the account does not hold
 /// (`NoSuchCidrCollectionException`, the shape name the model declares).
@@ -1174,5 +1192,325 @@ async fn every_drawn_set_of_holdings_reconciles_to_the_listing_by_arn() {
             &held,
         )
         .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: every row of an account-wide listing is a COMPLETE projection that
+// addresses its own resource
+// ---------------------------------------------------------------------------
+
+/// The contents of every `<member>` element of a body, in document order — the element one
+/// `CollectionSummaries` row is serialised as, that list's member declaring no `xmlName`
+/// (smithy_query(query="shape",shape="com.amazonaws.route53#CollectionSummaries")).
+///
+/// Read out of the RAW body rather than out of the flattened document, because the question
+/// here is whether each member of the row is serialised WITH ITS VALUE: an element reported
+/// empty and one the response left out both flatten to no text.
+fn collection_rows_in(body: &str) -> Vec<&str> {
+    let mut rows = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("<member>") {
+        let inner = &rest[at + "<member>".len()..];
+        let end = inner
+            .find("</member>")
+            .unwrap_or_else(|| panic!("a member element must be closed; body {body}"));
+        rows.push(&inner[..end]);
+        rest = &inner[end..];
+    }
+    rows
+}
+
+/// The text one row serialises for `<name>`, held to being serialised at all and to
+/// carrying the value the store holds rather than an empty element.
+fn filled_member(case: &str, block: &str, name: &str) -> String {
+    let text = element_text(block, name).unwrap_or_else(|| {
+        panic!("case {case:?}: the row must serialise {name}; row {block:?}")
+    });
+    assert!(
+        !text.trim().is_empty(),
+        "case {case:?}: {name} must carry the value the store holds for it, got the empty \
+         element; row {block:?}"
+    );
+    text
+}
+
+/// Assert one `CollectionSummary` row reports a collection the account holds WHOLE — every
+/// member of the summary filled from that collection's state, under the ARN that names it —
+/// and answer the id the row identifies the collection by.
+fn assert_collection_row(case: &str, row: &str, held: &[ListedCollection]) -> String {
+    let reported = ListedCollection {
+        arn: filled_member(case, row, "Arn"),
+        id: filled_member(case, row, "Id"),
+        name: filled_member(case, row, "Name"),
+        version: filled_member(case, row, "Version"),
+    };
+    // The ARN is the collection's own, over the id this very row identifies it by.
+    assert_collection_arn(case, &reported.arn, &reported.id);
+    let expected = held
+        .iter()
+        .find(|candidate| candidate.id == reported.id)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the row {reported:?} must name a collection the account holds \
+                 (one of {held:?})"
+            )
+        });
+    assert_eq!(
+        &reported, expected,
+        "case {case:?}: the row must report the collection as the store holds it, got \
+         {reported:?}"
+    );
+    reported.id
+}
+
+/// Assert one listed `HostedZone` reports a zone WHOLE — every member its state fills
+/// serialised with that value, the `Features` structure carrying the zone's feature
+/// statuses rather than standing empty, and no container for the state the zone has none of
+/// — and answer the `(bare id, Name)` the row identifies the zone by.
+fn assert_listed_zone(case: &str, zone: &str) -> (String, String) {
+    let id = filled_member(case, zone, "Id");
+    let name = filled_member(case, zone, "Name");
+    filled_member(case, zone, "CallerReference");
+    filled_member(case, zone, "ResourceRecordSetCount");
+    // `Config` "includes the Comment and PrivateZone elements": `PrivateZone` has a default,
+    // so every zone has one to report and the container is never empty.
+    let config = element_text(zone, "Config")
+        .unwrap_or_else(|| panic!("case {case:?}: a listed zone reports its Config; zone {zone:?}"));
+    assert!(
+        !config.trim().is_empty(),
+        "case {case:?}: Config must carry the zone's private flag, got the empty element; \
+         zone {zone:?}"
+    );
+    // `Features` is "the features configuration for the hosted zone": a STRUCTURE of feature
+    // statuses, so a listed zone's container carries the statuses it has — never a scalar and
+    // never an empty element.
+    let features = element_text(zone, "Features").unwrap_or_else(|| {
+        panic!("case {case:?}: a listed zone reports its features configuration; zone {zone:?}")
+    });
+    assert!(
+        !features.trim().is_empty(),
+        "case {case:?}: Features is the structure of the zone's feature statuses, so it must \
+         carry them as child elements, got the empty element; zone {zone:?}"
+    );
+    for element in element_names(&features) {
+        assert!(
+            FEATURES_MEMBERS.contains(&element),
+            "case {case:?}: {element:?} is not a HostedZoneFeatures member; container \
+             {features:?}"
+        );
+    }
+    // Every listed zone has a public-DNS fallback posture, and nothing this API version
+    // models turns the feature on, so each row reports the off status.
+    let fallback = filled_member(case, &features, PUBLIC_DNS_FALLBACK_STATUS);
+    assert_eq!(
+        fallback, PUBLIC_DNS_FALLBACK_DISABLED,
+        "case {case:?}: expected the off posture in the Features container, got {fallback:?}; \
+         container {features:?}"
+    );
+    // The other side of the same rule: a zone the client created itself was created by no
+    // other service, so the container for that state is left OUT rather than reported empty.
+    assert!(
+        element_text(zone, "LinkedService").is_none(),
+        "case {case:?}: a zone no other service created carries no LinkedService container, \
+         got {:?}; zone {zone:?}",
+        element_text(zone, "LinkedService")
+    );
+    (
+        id.trim_start_matches("/hostedzone/").to_string(),
+        name,
+    )
+}
+
+/// The collections the projection test seeds: a case, the collection's name and how many
+/// changes have moved its version counter.
+///
+/// The names span the length and character classes `CollectionName` admits (`len 1..64,
+/// pattern ^[0-9A-Za-z_\-]+$`) and the rows differ in how far the counter has moved, because
+/// the projection rule holds for every row rather than for one collection in one state.
+const PROJECTED_COLLECTIONS: &[(&str, &str, usize)] = &[
+    ("the shortest name the model allows", "p", 0),
+    ("a hyphenated name", "projected-ranges", 1),
+    ("an underscored name with digits", "projected_ranges_2", 2),
+];
+
+/// The zones the projection test seeds: a case, the zone's name and the
+/// `HostedZoneConfig`/`VPC` block its create carries. They differ in label count, in
+/// public/private and in whether the zone holds a comment, so the rows asserted are not one
+/// renamed zone.
+const PROJECTED_ZONES: &[(&str, &str, &str)] = &[
+    ("a public zone created with no HostedZoneConfig", "projected-plain.example.com", ""),
+    (
+        "a public zone created with a comment",
+        "projected-commented.example.com",
+        "<HostedZoneConfig><Comment>projected</Comment></HostedZoneConfig>",
+    ),
+    (
+        "a four-label public zone named with a trailing dot",
+        "zone.sub.projected.example.net.",
+        "",
+    ),
+    (
+        "a private zone with one VPC",
+        "projected-private.example.com",
+        "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>\
+         <VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-4c3b2a19</VPCId></VPC>",
+    ),
+];
+
+/// The form Route 53 reports a hosted zone's name in: the fully qualified name, so a name
+/// given without the trailing dot is reported with one.
+fn fully_qualified(requested: &str) -> String {
+    if requested.ends_with('.') {
+        requested.to_string()
+    } else {
+        format!("{requested}.")
+    }
+}
+
+/// `ListHostedZones` with the query string `query` (`""` for none):
+/// `GET /2013-04-01/hostedzone`, as the model binds it.
+async fn list_zones(router: &MultiServiceRouter, query: &str) -> Reply {
+    call(router, "GET", &format!("/2013-04-01/hostedzone{query}"), "").await
+}
+
+#[tokio::test]
+async fn every_listing_row_is_a_complete_projection_addressing_its_own_resource() {
+    let router = router();
+
+    // The account's collections, each with the version counter its changes left it at.
+    let mut held: Vec<ListedCollection> = Vec::new();
+    for (case, name, changes) in PROJECTED_COLLECTIONS {
+        let id = create_collection(&router, name).await;
+        for index in 0..*changes {
+            let applied = change_collection(
+                &router,
+                &id,
+                None,
+                &change("east", PUT, &[&format!("198.51.100.{index}/32")]),
+            )
+            .await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?}: expected 200 from ChangeCidrCollection, got {} with body {}",
+                applied.status, applied.body
+            );
+        }
+        held.push(ListedCollection {
+            arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+            id,
+            name: (*name).to_string(),
+            // "A sequential counter that Route 53 sets to 1 when you create a CIDR
+            // collection and increments by 1 each time you update settings for the CIDR
+            // collection."
+            version: (1 + changes).to_string(),
+        });
+    }
+
+    // ...and the account's hosted zones, by the name each is reported under.
+    let mut zones: Vec<String> = Vec::new();
+    for (index, (case, name, extra)) in PROJECTED_ZONES.iter().enumerate() {
+        let created = call(
+            &router,
+            "POST",
+            "/2013-04-01/hostedzone",
+            &create_zone_body(name, &format!("projected-zone-{index}"), extra),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            created.status, created.body
+        );
+        zones.push(fully_qualified(name));
+    }
+
+    // The whole listing and a bounded page of it: the rule is about a ROW, so it holds
+    // however many rows one response carries.
+    for (case, query, rows_expected) in [
+        ("the whole collection listing", "", held.len()),
+        ("one page of the collection listing", "?maxresults=1", 1),
+    ] {
+        let reply = list_collections(&router, query).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200 from ListCidrCollections, got {} with body {}",
+            reply.status, reply.body
+        );
+        let rows = collection_rows_in(&reply.body);
+        assert_eq!(
+            rows.len(),
+            rows_expected,
+            "case {case:?}: expected {rows_expected} row(s), got {}; body {}",
+            rows.len(),
+            reply.body
+        );
+        for row in rows {
+            let id = assert_collection_row(case, row, &held);
+            // The id the row carries addresses the collection it reports: both reads bound
+            // to a collection answer for it.
+            for (read, uri) in [
+                ("ListCidrLocations", format!("/2013-04-01/cidrcollection/{id}")),
+                (
+                    "ListCidrBlocks",
+                    format!("/2013-04-01/cidrcollection/{id}/cidrblocks"),
+                ),
+            ] {
+                let addressed = call(&router, "GET", &uri, "").await;
+                assert_eq!(
+                    addressed.status, 200,
+                    "case {case:?}: the id {id:?} the row carries must address its collection \
+                     through {read}, got {} with body {}",
+                    addressed.status, addressed.body
+                );
+            }
+        }
+    }
+
+    for (case, query, rows_expected) in [
+        ("the whole hosted zone listing", "", zones.len()),
+        ("one page of the hosted zone listing", "?maxitems=1", 1),
+    ] {
+        let reply = list_zones(&router, query).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200 from ListHostedZones, got {} with body {}",
+            reply.status, reply.body
+        );
+        let blocks = hosted_zone_blocks(&reply.body);
+        assert_eq!(
+            blocks.len(),
+            rows_expected,
+            "case {case:?}: expected {rows_expected} zone(s), got {}; body {}",
+            blocks.len(),
+            reply.body
+        );
+        for block in blocks {
+            let (id, name) = assert_listed_zone(case, block);
+            assert!(
+                zones.contains(&name),
+                "case {case:?}: the row must name a zone the account holds (one of {zones:?}), \
+                 got {name:?}; body {}",
+                reply.body
+            );
+            // The id the row carries addresses the zone it reports, and that read reports the
+            // same zone — so a client that enumerates the account and then addresses a zone by
+            // the id the listing gave it reaches the zone the row was about.
+            let addressed = call(&router, "GET", &format!("/2013-04-01/hostedzone/{id}"), "").await;
+            assert_eq!(
+                addressed.status, 200,
+                "case {case:?}: the id {id:?} the row carries must address its zone, got {} \
+                 with body {}",
+                addressed.status, addressed.body
+            );
+            assert_eq!(
+                addressed.first("HostedZone/Name"),
+                Some(name.as_str()),
+                "case {case:?}: the read of {id:?} must report the zone the row named, got \
+                 {:?}; body {}",
+                addressed.first("HostedZone/Name"),
+                addressed.body
+            );
+        }
     }
 }
