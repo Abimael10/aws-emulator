@@ -1,0 +1,42 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-alarm-echoes-declared-period cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-workflow
+Issue-Key: cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-alarm-echoes-declared-period|_assert_update_replaces_task_not_service#34|AssertionError|assert final == "UPDATE_COMPLETE", f"the parent update ended {final!r}"
+Issue-Key: cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-workflow|_assert_update_replaces_task_not_service#34|AssertionError|assert final == "UPDATE_COMPLETE", f"the parent update ended {final!r}"
+Issue-Commit: dd0dfa661ba492304c3b4ddf1bd869b805afe51f
+
+# cloudformation__cloudwatch__ecr__ecs__elbv2__logs: a parameter-only UpdateStack on the nested-stack microservice platform parent ends UPDATE_ROLLBACK_FAILED instead of UPDATE_COMPLETE
+
+> _Note: this issue was identified against the code base at commit `dd0dfa661ba492304c3b4ddf1bd869b805afe51f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateStack
+
+## Description
+Cause 1 of 1: an UpdateStack on a parent stack whose only change is parameter values passed down into its AWS::CloudFormation::Stack children settles in UPDATE_ROLLBACK_FAILED. The nested microservice-platform parent (three children: network = SG/ALB/listener/target group, observability = AWS::Logs::LogGroup + MetricFilter + AWS::CloudWatch::Alarm, service = AWS::ECR::Repository + ECS cluster/task definition/Fargate service) is re-submitted with the SAME template body and two changed parameters: Marker (which rewrites the task definition's container Command, a REPLACEMENT of AWS::ECS::TaskDefinition into a new revision of the same family) and RetentionDays=14 (an in-place property change on the child's AWS::Logs::LogGroup). Failing checks: cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-alarm-echoes-declared-period, cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-workflow.
+
+AWS: recorded behavior only for the resource-handler semantics (CloudFormation's provisioning engine is not described by the Smithy model); the status vocabulary is modeled — Smithy: com.amazonaws.cloudformation#StackStatus includes UPDATE_COMPLETE, UPDATE_ROLLBACK_IN_PROGRESS, UPDATE_ROLLBACK_COMPLETE and UPDATE_ROLLBACK_FAILED. On AWS this update succeeds: each nested child is UPDATED IN PLACE (its stack id is unchanged), the task definition is replaced by a higher revision inside the same family, the ECS service keeps its physical id (a modify, not a replacement), the log group reports retentionInDays 14, and DescribeStacks on the parent reports StackStatus UPDATE_COMPLETE. UPDATE_ROLLBACK_FAILED is reserved for the case where the ROLLBACK of a failed update could not itself be carried out (a resource the rollback could not restore), and a stack in it requires ContinueUpdateRollback before any further update — it is never the outcome of a successful parameter change.
+
+Emulator: the parent update polls to the terminal status UPDATE_ROLLBACK_FAILED, so two things diverge at once — the update failed where AWS completes it, and the rollback of that failure also failed rather than reaching UPDATE_ROLLBACK_COMPLETE. The stack is left in a status from which no subsequent UpdateStack is accepted. Both checks stop at the same assertion in their shared update leg (_assert_update_replaces_task_not_service): AssertionError: the parent update ended 'UPDATE_ROLLBACK_FAILED'. Everything the update leg gates on is therefore never observed: child stack ids preserved, the new task-definition revision, the service's unchanged physical id, retentionInDays 14, and the load balancer serving the new marker.
+
+Why: a caller that updates a nested-stack estate — the shape of every CDK/CFN rolling deployment, where a new image tag or container command is pushed by changing a parameter on the root stack — gets a wedged stack instead of a deployed revision. Because the terminal status is UPDATE_ROLLBACK_FAILED and not UPDATE_ROLLBACK_COMPLETE, the caller cannot even retry: AWS requires ContinueUpdateRollback first, and automation that treats UPDATE_ROLLBACK_FAILED as operator-intervention territory halts the pipeline.
+
+Fix: the CloudFormation provisioner's update path for AWS::CloudFormation::Stack children (propagating changed Parameters into an in-place child update rather than failing it) and the update/rollback executor that decides the parent's terminal status, plus the two resource handlers this update touches — the AWS::ECS::TaskDefinition replacement update (new revision in the same family, service left as a modify) and the AWS::Logs::LogGroup RetentionInDays in-place update. The rollback executor must also be able to undo whatever it attempted, so a failed update lands in UPDATE_ROLLBACK_COMPLETE rather than UPDATE_ROLLBACK_FAILED.
+
+Traces: cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-alarm-echoes-declared-period and cloudformation__cloudwatch__ecr__ecs__elbv2__logs.cfn-nested-stack-microservice-platform-workflow, both at _assert_update_replaces_task_not_service. Related but NOT covering this: open issue 20261115T073242Z-cloudformation-cloudwatch-ecr-ecs-elbv2-logs-the-nested--r2.md covers the CREATE of this same estate ending ROLLBACK_COMPLETE (the create now gets far enough that the update leg is reached, which is why this failure is new), and fixed issue 20261111T111216Z-cloudformation-3-net-new-causes-cloudformation-hooks-are-never.md reported the opposite symptom (UPDATE_ROLLBACK_FAILED never reached at all).
+
+## Evidence
+Expected (AWS): DescribeStacks on the parent after the parameter-only UpdateStack reports StackStatus "UPDATE_COMPLETE"; each nested child keeps its stack id and is UPDATE_COMPLETE; AWS::ECS::TaskDefinition is a new, higher revision of the same family; AWS::ECS::Service keeps its physical id; the child log group reports retentionInDays 14; the ALB serves the new marker body.
+Actual (emulator, both checks): the parent's terminal status is "UPDATE_ROLLBACK_FAILED".
+  - cfn-nested-stack-microservice-platform-alarm-echoes-declared-period: AssertionError: the parent update ended 'UPDATE_ROLLBACK_FAILED' (check file line 957, called from the leg at line 149).
+  - cfn-nested-stack-microservice-platform-workflow: AssertionError: the parent update ended 'UPDATE_ROLLBACK_FAILED' (check file line 974, called from the leg at line 151).
+The diverging facts are the status strings themselves: "UPDATE_ROLLBACK_FAILED" where AWS serves "UPDATE_COMPLETE" (and, had the update genuinely failed, "UPDATE_ROLLBACK_COMPLETE" after a rollback that succeeded). Stack names, generated resource names and marker values in the run are per-run values and not part of the requirement.
+
+## Steps to Reproduce
+1. Replay the behavioral suite and re-run the two checks in trace_ids.
+2. CreateStack the nested microservice-platform parent (platform-parent.yaml) with its three AWS::CloudFormation::Stack children (platform-network.yaml, platform-observability.yaml, platform-service.yaml), wired only through Fn::GetAtt <Child>.Outputs.<Key>; wait for CREATE_COMPLETE.
+3. UpdateStack the parent with the SAME TemplateBody and Capabilities=[CAPABILITY_IAM, CAPABILITY_NAMED_IAM], changing only two parameters: Marker (new value, which rewrites the container Command and so replaces AWS::ECS::TaskDefinition) and RetentionDays=14 (in-place change on the child's AWS::Logs::LogGroup).
+4. Poll DescribeStacks on the parent to a terminal update status — the emulator reports UPDATE_ROLLBACK_FAILED; AWS reports UPDATE_COMPLETE.
+5. DescribeStackEvents on the parent and each child to see which child/resource update failed and which resource the rollback could not restore.
+6. Confirm the gated observations once fixed: child stack ids unchanged, task definition revision incremented within the same family, ECS service physical id unchanged, DescribeLogGroups retentionInDays 14, and an HTTP GET through the ALB returning 200 with the new marker.
