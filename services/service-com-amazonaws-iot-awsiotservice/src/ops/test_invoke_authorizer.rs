@@ -2,20 +2,22 @@
 
 //! @op TestInvokeAuthorizer
 //!
-//! RUNS the custom authorizer the request names: it resolves the authorizer in this
-//! service's authorizer store, verifies the presented token signature against the
-//! authorizer's token signing public keys unless the authorizer disables signing, and
-//! invokes the authorizer's Lambda function with the authorization event — the answer
-//! is the one that function returned.
+//! RUNS the custom authorizer the request names: it refuses a request that names none of
+//! the three protocol contexts — there is no authorization request to test then — resolves
+//! the authorizer in this service's authorizer store, verifies the presented token
+//! signature against the authorizer's token signing public keys unless the authorizer
+//! disables signing, and invokes the authorizer's Lambda function with the authorization
+//! event — the answer is the one that function returned.
 //!
 //! The signature check and the function invocation both live in
 //! [`crate::state::custom_authorizer`], so what this handler does is order them and
 //! turn each refusal into the modelled error for it: `ResourceNotFoundException` (404)
-//! for a name the store does not hold, `InvalidRequestException` (400) for a token
-//! whose signature verifies against none of the authorizer's keys (and for a missing
-//! token or signature where the authorizer validates one), and
-//! `InvalidResponseException` (400) where the function answered something other than
-//! an authorization answer, or was never reached at all.
+//! for a name the store does not hold, `InvalidRequestException` (400) for a request
+//! carrying no protocol context and for a token whose signature verifies against none of
+//! the authorizer's keys (and for a missing token or signature where the authorizer
+//! validates one), and `InvalidResponseException` (400) where the function answered
+//! something other than an authorization answer, or where AWS Lambda refused the
+//! invocation so no function ran at all.
 //!
 //! ## Shape of an operation
 //!
@@ -184,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authorizer registered ([`crate::state::MAX_TOKEN_SIGNING_PUBLIC_KEYS`]), and
         // holding the lock across either that check or the invocation would make every
         // other request of this service wait behind them.
-        let (function_arn, signing_disabled, public_keys) = {
+        let (function_arn, authorizer_arn, signing_disabled, public_keys) = {
             let store = state.lock();
             let authorizer = store.authorizers.get(&input.authorizer_name).ok_or_else(|| {
                 TestInvokeAuthorizerErrorModeled::ResourceNotFoundException(
@@ -197,10 +199,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
             (
                 authorizer.authorizer_function_arn.clone(),
+                authorizer.authorizer_arn.clone(),
                 authorizer.signing_disabled,
                 authorizer.token_signing_public_keys.clone().unwrap_or_default(),
             )
         };
+
+        // Which authorization request is being tested is what the three protocol contexts
+        // say, and every one of them is optional — so a request carrying none of them asks
+        // for nothing to be authorized. That is a statement about the REQUEST, so it is
+        // refused with the modelled `InvalidRequestException` (HTTP 400) before the
+        // authorizer is run.
+        if input.http_context.is_none()
+            && input.mqtt_context.is_none()
+            && input.tls_context.is_none()
+        {
+            return Err(TestInvokeAuthorizerErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::MISSING_AUTHORIZATION_CONTEXT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "Specifies whether IoT validates the token signature in an authorization
         // request": an authorizer that validates one is given a token and a signature
@@ -250,15 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let region = crate::state::request_region(ctx.parts());
-        // Either failure — a function that was never reached, and one that answered
-        // something other than an authorization answer — is the modelled
-        // `InvalidResponseException`: the authorization answer the caller asked for does
-        // not exist. The two are worded apart, so the refusal never claims an answer
-        // that never existed.
+        // Either failure — an invocation AWS Lambda refused, so no function ran, and a
+        // function that answered something other than an authorization answer — is the
+        // modelled `InvalidResponseException`: the authorization answer the caller asked
+        // for does not exist. The two are worded apart, so the refusal never claims an
+        // answer that never existed. The invocation this call makes is identified by its
+        // own id, which the refusal of one carries.
+        let invocation_id = crate::state::fresh_uuid();
         let answered = async {
-            let payload =
-                crate::state::invoke_authorizer_function(ctx, &function_arn, &region, &event)
-                    .await?;
+            let payload = crate::state::invoke_authorizer_function(
+                ctx,
+                &function_arn,
+                &authorizer_arn,
+                &region,
+                &event,
+            )
+            .await?;
             crate::state::read_verdict(&payload)
         }
         .await;
@@ -268,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policies apply.
         let verdict = answered.map_err(|failure| {
             TestInvokeAuthorizerErrorModeled::InvalidResponseException(InvalidResponseException {
-                message: Some(failure.message(&input.authorizer_name)),
+                message: Some(failure.message(&input.authorizer_name, &invocation_id)),
             })
         })?;
 

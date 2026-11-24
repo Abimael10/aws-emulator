@@ -231,10 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let is_continuous = job.target_selection.as_deref()
             == Some(::service_common::iot_jobs::TARGET_SELECTION_CONTINUOUS);
         if !is_continuous {
-            return Err(invalid(
-                "The job must have been created with the targetSelection field set to CONTINUOUS"
-                    .to_string(),
-            ));
+            return Err(invalid(crate::state::job_target_selection_refusal_message(
+                &input.job_id,
+                job.target_selection.as_deref(),
+            )));
         }
         let job_status =
             crate::state::job_progress(job, &executions.lock()).status;

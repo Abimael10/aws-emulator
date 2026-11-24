@@ -1657,6 +1657,22 @@ pub const MAX_JOB_TARGETS: usize = 100;
 /// ([`resolve_job_targets`]).
 pub const TARGET_ARN_SYNTAX_MESSAGE: &str = "Target ARN not in proper syntax.";
 
+/// How this service refuses the association of targets with a job whose `targetSelection`
+/// is not `CONTINUOUS`.
+///
+/// "Targets can be added to a job that has target selection CONTINUOUS"
+/// (`AssociateTargetsWithJob`): a job that is not continuous "will be complete after all
+/// those things specified as targets have completed the job" (`Job$targetSelection`), so
+/// nothing joins it later. The fixed text is the sentence this refusal carries, and the two
+/// variable parts are the `jobId` the REQUEST named in its path and the selection the job
+/// RECORD holds — `TargetSelection` defines exactly two values
+/// (`smithy_query(query="shape",shape="TargetSelection")`), so a job that is not continuous
+/// is a snapshot job, which is what a record carrying no selection at all is reported as.
+pub fn job_target_selection_refusal_message(job_id: &str, target_selection: Option<&str>) -> String {
+    let selection = target_selection.unwrap_or(iot_jobs::TARGET_SELECTION_SNAPSHOT);
+    format!("Targets cannot be associated with a job {job_id} with {selection} target selection.")
+}
+
 /// Why a request's `targets` cannot be turned into job executions.
 ///
 /// Each variant carries the message the refusal states and names the modelled error
@@ -3634,10 +3650,20 @@ pub use certificate_provider_function::{
 // `state/custom_authorizer.rs`, beside the authorizer record it runs.
 pub mod custom_authorizer;
 pub use custom_authorizer::{
-    authorizer_event, invalid_response_message, invoke_authorizer_function,
-    missing_token_message, missing_token_signature_message, not_invoked_message, read_verdict,
-    signature_mismatch_message, token_signature_verifies, AuthorizerFailure, AuthorizerVerdict,
+    authorizer_event, invalid_response_message, invocation_refused_message,
+    invoke_authorizer_function, missing_token_message, missing_token_signature_message,
+    read_verdict, signature_mismatch_message, token_signature_verifies, AuthorizerFailure,
+    AuthorizerVerdict, MISSING_AUTHORIZATION_CONTEXT_MESSAGE,
 };
+
+// Whether a LAMBDA FUNCTION this service invokes as its own service principal is one the
+// function's resource-based policy ADMITS that invocation of — the one reading of the
+// IoT -> Lambda authorization boundary, shared by the certificate provider's function, the
+// rules engine's `lambda` action and a custom authorizer's function — lives in
+// `state/lambda_invoke_grant.rs`. Its names are re-exported here so a handler reaches them
+// as `crate::state::<name>`.
+pub mod lambda_invoke_grant;
+pub use lambda_invoke_grant::{invocation_grant, InvocationGrant};
 
 // What a FLEET PROVISIONING TEMPLATE is — the record one holds, its versions and which
 // of them is the default — lives in `state/provisioning_templates.rs`.

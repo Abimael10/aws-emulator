@@ -23,7 +23,10 @@
 //!    run of that authorizer checks a presented signature against each of them.
 //! 2. **The function.** The authorizer's Lambda function is invoked synchronously with
 //!    the token, whether the signature verified, and the protocol context of the
-//!    authorization request; what it returns IS the authorization answer — the
+//!    authorization request — as this SERVICE PRINCIPAL, so the function's own
+//!    resource-based policy has to admit the invocation
+//!    ([`super::lambda_invoke_grant`]) and one no grant admits is refused rather than
+//!    made; what the function returns IS the authorization answer — the
 //!    `isAuthenticated`, `principalId`, `policyDocuments`, `refreshAfterInSeconds` and
 //!    `disconnectAfterInSeconds` of the response — so nothing here decides any of them.
 //!
@@ -71,35 +74,51 @@ pub fn invalid_response_message(authorizer_name: &str, detail: &str) -> String {
     format!("Invalid response from authorizer {authorizer_name}: {detail}")
 }
 
-/// How this service states that the authorizer's function was never reached, so there
-/// is no answer to read at all: `detail` is what AWS Lambda said about the invocation.
+/// How this service states that AWS Lambda REFUSED the invocation of the authorizer's
+/// function, so no function answered and there is no authorization answer to read.
 ///
-/// Worded apart from [`invalid_response_message`] on purpose — a function the account
-/// does not hold answered nothing, and saying its response was invalid would assert an
-/// answer that never existed.
-pub fn not_invoked_message(authorizer_name: &str, detail: &str) -> String {
-    format!("Authorizer {authorizer_name} could not be invoked: {detail}")
+/// The fixed text is the sentence this failure class carries — the error class AWS Lambda
+/// refused the invocation with, then ` encountered when invoking lambda; requestId: ` —
+/// and the two variable parts are that class and the id of the invocation this call made.
+/// Neither the authorizer nor the function it resolved to is named: which function an
+/// authorizer authorizes with is the account's configuration and not a statement about the
+/// refusal, and the caller already named the authorizer.
+pub fn invocation_refused_message(error_class: &str, request_id: &str) -> String {
+    format!("{error_class} encountered when invoking lambda; requestId: {request_id}")
 }
+
+/// How this service refuses a `TestInvokeAuthorizer` that describes no authorization
+/// request at all.
+///
+/// An `httpContext` "specifies a test HTTP authorization request", an `mqttContext` a test
+/// MQTT one and a `tlsContext` a test TLS one, and every one of the three is optional — so
+/// a request carrying none of them asks for no authorization request to be tested, which
+/// is refused with the modelled `InvalidRequestException` (HTTP 400) BEFORE the authorizer
+/// is run. FIXED text with no variable part: the requirement is the same whatever was
+/// sent.
+pub const MISSING_AUTHORIZATION_CONTEXT_MESSAGE: &str = "Request must have Http/Mqtt/Tls context.";
 
 /// Why running an authorizer produced no authorization answer.
 ///
 /// Both are the operation's modelled `InvalidResponseException` ("The response is
 /// invalid", HTTP 400) — the authorization answer the caller asked for does not exist
-/// either way — but they are WORDED apart, because a function that was never reached
-/// answered nothing and a function that answered answered something wrong.
+/// either way — but they are WORDED apart, because an invocation Lambda refused reached no
+/// function at all and a function that answered answered something wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizerFailure {
-    /// The invocation never reached a function, or was never answered at all.
+    /// AWS Lambda refused the invocation, so no function ran; it carries the error CLASS
+    /// the refusal named.
     NotInvoked(String),
     /// The function answered, and what it answered is not an authorization answer.
     AnsweredWrongly(String),
 }
 
 impl AuthorizerFailure {
-    /// The message this failure carries for the authorizer the request named.
-    pub fn message(&self, authorizer_name: &str) -> String {
+    /// The message this failure carries for the authorizer the request named, for the
+    /// invocation identified by `request_id`.
+    pub fn message(&self, authorizer_name: &str, request_id: &str) -> String {
         match self {
-            Self::NotInvoked(detail) => not_invoked_message(authorizer_name, detail),
+            Self::NotInvoked(error_class) => invocation_refused_message(error_class, request_id),
             Self::AnsweredWrongly(detail) => invalid_response_message(authorizer_name, detail),
         }
     }
@@ -376,8 +395,20 @@ pub(crate) const LAMBDA_ARN_NAMESPACE: &str = "lambda";
 /// able to answer its caller instead of holding it for ever.
 const INVOCATION_CEILING: ::std::time::Duration = ::std::time::Duration::from_secs(960);
 
-/// What an invocation that was never answered inside [`INVOCATION_CEILING`] reports.
-const INVOCATION_NOT_ANSWERED: &str = "the authorizer function did not answer";
+/// The class AWS Lambda refuses an invocation its resource-based policy does not admit
+/// with.
+///
+/// A principal the policy grants nothing is not told whether the function is there: the
+/// authorization decision is taken on the policy, and a function no statement grants this
+/// service — including one this account does not hold, which carries no policy at all —
+/// refuses the invocation as a denial rather than as an answer about the function.
+const ACCESS_DENIED_CLASS: &str = "AccessDeniedException";
+
+/// The class an invocation AWS Lambda never answered reports: `Invoke` models
+/// `ServiceException` for "the Lambda service encountered an internal error", which is
+/// what a call that produced no answer inside [`INVOCATION_CEILING`], or that could not be
+/// dispatched at all, amounts to from here.
+const SERVICE_EXCEPTION_CLASS: &str = "ServiceException";
 
 /// Invoke the authorizer's Lambda function with `event` and hand back the payload it
 /// returned, or why it produced no answer.
@@ -387,6 +418,14 @@ const INVOCATION_NOT_ANSWERED: &str = "the authorizer function did not answer";
 /// long that wait can be is the function's own configured timeout, which Lambda
 /// enforces on the run — and [`INVOCATION_CEILING`] above it, so this operation always
 /// answers.
+///
+/// It is made BY THIS SERVICE PRINCIPAL, not under a role the authorizer carries — an
+/// authorizer names only its `authorizerFunctionArn` — so the function's own resource-based
+/// policy has to admit it, read with the AUTHORIZER's ARN as the source
+/// ([`super::lambda_invoke_grant`], the one reading of that boundary). An invocation no
+/// grant admits is never made, and is refused as the denial it is; a grant nothing answered
+/// about refuses nothing, so the invocation is made and whatever Lambda then says about it
+/// is what is reported.
 ///
 /// The Region is the one the authorizer's own `authorizerFunctionArn` names, so a
 /// function in another Region is reached through that Region's Lambda endpoint, and an
@@ -398,9 +437,23 @@ const INVOCATION_NOT_ANSWERED: &str = "the authorizer function did not answer";
 pub async fn invoke_authorizer_function(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     function_arn: &str,
+    authorizer_arn: &str,
     request_region: &str,
     event: &Value,
 ) -> Result<Vec<u8>, AuthorizerFailure> {
+    if super::lambda_invoke_grant::invocation_grant(
+        ctx,
+        request_region,
+        function_arn,
+        authorizer_arn,
+    )
+    .await
+        == super::lambda_invoke_grant::InvocationGrant::Denied
+    {
+        return Err(AuthorizerFailure::NotInvoked(
+            ACCESS_DENIED_CLASS.to_string(),
+        ));
+    }
     let region = ::service_common::arn::region_of(function_arn, LAMBDA_ARN_NAMESPACE)
         .unwrap_or(request_region);
     let invocation = lambda_client(ctx, region)
@@ -413,18 +466,17 @@ pub async fn invoke_authorizer_function(
         .send();
     let Ok(answer) = ::tokio::time::timeout(INVOCATION_CEILING, invocation).await else {
         return Err(AuthorizerFailure::NotInvoked(
-            INVOCATION_NOT_ANSWERED.to_string(),
+            SERVICE_EXCEPTION_CLASS.to_string(),
         ));
     };
     let output = match answer {
         Ok(output) => output,
-        // Lambda refused the invocation — the authorizer names a function it does not
-        // hold, or one it cannot run — so no function answered, and no answer is
-        // invented for one.
+        // Lambda refused the invocation, so no function answered: the CLASS it refused
+        // with is what says why, and no answer is invented for a function that never ran.
         Err(error) => {
             return Err(AuthorizerFailure::NotInvoked(
-                ::aws_smithy_types::error::metadata::ProvideErrorMetadata::message(&error)
-                    .unwrap_or(INVOCATION_NOT_ANSWERED)
+                ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(&error)
+                    .unwrap_or(SERVICE_EXCEPTION_CLASS)
                     .to_string(),
             ));
         }
