@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -124,6 +114,22 @@ impl<Eng> TagResource<Eng> {
     }
 }
 
+/// The modelled refusal of a call that would leave a resource holding more tags than
+/// [`crate::state::MAX_TAGS_PER_RESOURCE`], stated once so both the request-count
+/// ceiling and the stored-count ceiling word it alike.
+///
+/// `TooManyTagsException` is documented as "you have reached the limit on the number of
+/// tags that can be assigned", which is the sentence it carries; the limit is not
+/// restated in it.
+fn too_many_tags() -> TagResourceError {
+    TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+        message: Some(
+            "You have reached the limit on the number of tags that can be assigned".to_string(),
+        ),
+    })
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for TagResource<Eng>
 {
@@ -141,18 +147,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Every resource is addressed by its ARN here, and an ARN carries its own
+        // Region, so this write is not windowed by the request's endpoint.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::DirectConnectServerException(
+                DirectConnectServerException {
+                    message: Some(
+                        "the Direct Connect store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The tag-count ceiling is checked FIRST, so it bounds the per-tag work every
+        // later step does on a caller-chosen list length: every tag the request names
+        // has to end up on the resource, and "each resource can have a maximum of 50
+        // tags", so a longer list cannot be satisfied at all.
+        if input.tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(too_many_tags());
+        }
+
+        // "Each tag consists of a key and an optional value", so one key may be
+        // written once per call: a request naming a key twice does not say which
+        // value it means.
+        if crate::state::first_duplicate_tag_key(&input.tags).is_some() {
+            return Err(TagResourceErrorModeled::DuplicateTagKeysException(
+                DuplicateTagKeysException {
+                    message: Some("A tag key was specified more than once".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialise only what the clock already made due, exactly as every other
+        // call on this store does.
+        store.settle_due_transitions();
+
+        let Some(tags) = crate::state::tags_of_resource_mut(&mut store, &input.resource_arn) else {
+            return Err(TagResourceErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(crate::state::resource_arn_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If a tag with the same key is already associated with the resource, this
+        // action updates its value" — so the write MERGES by key rather than appending
+        // a second entry under one key, and the resource keeps the tags the request
+        // does not name.
+        let mut merged = tags.clone();
+        for tag in input.tags {
+            match merged.iter_mut().find(|held| held.key == tag.key) {
+                Some(held) => held.value = tag.value,
+                None => merged.push(tag),
+            }
+        }
+
+        // "Each resource can have a maximum of 50 tags": the ceiling is on what the
+        // resource would HOLD, so a call that only updates the values of tags already
+        // on it is not refused, and a refused call writes nothing.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(too_many_tags());
+        }
+        *tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

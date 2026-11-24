@@ -37,20 +37,13 @@ use service_com_amazonaws_directconnect_overtureservice::state::resiliency_group
     RESILIENCY_GROUP_STATE_PENDING, RESILIENCY_GROUP_TYPE_MANAGED,
 };
 use service_com_amazonaws_directconnect_overtureservice::state::{
-    too_many_resources_message, ComAmazonawsDirectconnectOvertureserviceState,
-    DEFAULT_AMAZON_SIDE_ASN, MAX_RECORDS_PER_STORE, MAX_RESOURCES_PER_CALL, MAX_RESULT_SET_SIZE,
-    MAX_TAGS_PER_RESOURCE, PRIVATE_AMAZON_SIDE_ASN_RANGES,
+    too_many_resources_message, too_many_tag_keys_message,
+    ComAmazonawsDirectconnectOvertureserviceState, DEFAULT_AMAZON_SIDE_ASN, MAX_RECORDS_PER_STORE,
+    MAX_RESOURCES_PER_CALL, MAX_RESULT_SET_SIZE, MAX_TAGS_PER_RESOURCE,
+    PRIVATE_AMAZON_SIDE_ASN_RANGES,
 };
 
 use crate::connection_and_virtual_interface_lifecycle::{error_code, Emulator};
-
-/// Long enough for the `pending` span the service owes the clock to fall due —
-/// its own `TRANSITION_DELAY` plus slack.
-///
-/// Awaited with `std::thread::sleep` rather than `tokio::time::sleep`: the
-/// workspace enables tokio's `macros`/`rt` features only, so `tokio::time` is not
-/// available here. Nothing else is pending on the test's runtime.
-const SETTLE: Duration = Duration::from_millis(900);
 
 /// The group lengths of a UUID (`8-4-4-4-12`), the form AWS reports a
 /// `directConnectGatewayId` in.
@@ -58,6 +51,9 @@ const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
 
 /// One row of the create table: case, name, `amazonSideAsn`, tags.
 type GatewayRow<'a> = (&'a str, &'a str, Option<i64>, &'a [(&'a str, &'a str)]);
+
+/// One row of the projection table: case, name, tags.
+type ProjectionRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
 /// Whether `id` is a server-minted gateway id: lowercase hex in UUID groups.
 fn is_minted_gateway_id(id: &Value) -> bool {
@@ -139,16 +135,6 @@ async fn describe(dx: &Emulator, body: Value) -> (Vec<Value>, Value) {
     )
 }
 
-/// `gateway` without its state, so a round-trip comparison does not race the
-/// `pending` -> `available` transition the clock owes.
-fn without_state(gateway: &Value) -> Value {
-    let mut copy = gateway.clone();
-    if let Some(object) = copy.as_object_mut() {
-        object.remove("directConnectGatewayState");
-    }
-    copy
-}
-
 #[tokio::test]
 async fn a_created_gateway_is_minted_stored_and_read_back_field_for_field() {
     let dx = Emulator::new();
@@ -215,8 +201,8 @@ async fn a_created_gateway_is_minted_stored_and_read_back_field_for_field() {
         );
         assert_eq!(
             created["directConnectGatewayState"],
-            json!("pending"),
-            "case {case:?}: pending is the initial state after the create, got {:?}",
+            json!("available"),
+            "case {case:?}: a gateway is ready for use from the create on, got {:?}",
             created["directConnectGatewayState"]
         );
         assert_eq!(
@@ -244,11 +230,12 @@ async fn a_created_gateway_is_minted_stored_and_read_back_field_for_field() {
             "case {case:?}: no state advance has failed, got {:?}",
             created["stateChangeError"]
         );
+        // The tag list is PRESENT whatever the create carried: the tags themselves
+        // when it carried any, and an empty list when it carried none.
         assert_eq!(
-            created["tags"].as_array().map_or(0, Vec::len),
-            tags.len(),
-            "case {case:?}: expected {} tags, got {:?}",
-            tags.len(),
+            created["tags"],
+            tag_list(tags),
+            "case {case:?}: expected the tags the create carried, got {:?}",
             created["tags"]
         );
 
@@ -265,8 +252,7 @@ async fn a_created_gateway_is_minted_stored_and_read_back_field_for_field() {
             "case {case:?}: a single-item page is the last one, got {next_token:?}"
         );
         assert_eq!(
-            without_state(&described[0]),
-            without_state(&created),
+            described[0], created,
             "case {case:?}: the describe must render the stored record, got {:?}",
             described[0]
         );
@@ -293,43 +279,167 @@ async fn a_created_gateway_is_minted_stored_and_read_back_field_for_field() {
 }
 
 #[tokio::test]
-async fn a_pending_gateway_becomes_available_when_the_clock_makes_it_due() {
+async fn a_created_gateway_is_ready_from_the_create_on_and_no_read_moves_it() {
+    // A create that allocates no network capacity leaves nothing to settle, so the
+    // gateway is reported ready from the create response on and no later read has a
+    // state to advance it to.
     let dx = Emulator::new();
-    let id = gateway(&dx, "clock-owed").await;
+    let id = gateway(&dx, "ready-from-the-create").await;
 
-    // The span is never zero, so a caller reading straight back still observes
-    // the transient state the model documents.
     let (described, _) = describe(&dx, json!({"directConnectGatewayId": &id})).await;
     assert_eq!(
-        described[0]["directConnectGatewayState"],
-        json!("pending"),
-        "case {id:?}: a gateway read straight back is still pending, got {:?}",
-        described[0]["directConnectGatewayState"]
+        described.len(),
+        1,
+        "case {id:?}: expected exactly the named gateway, got {described:?}"
     );
-
-    std::thread::sleep(SETTLE);
-
-    let (described, _) = describe(&dx, json!({"directConnectGatewayId": &id})).await;
     assert_eq!(
         described[0]["directConnectGatewayState"],
         json!("available"),
-        "case {id:?}: the pending span has elapsed, so the gateway is available, got {:?}",
+        "case {id:?}: a gateway read straight back is ready for use, got {:?}",
         described[0]["directConnectGatewayState"]
     );
     assert_eq!(
         described[0]["directConnectGatewayId"],
         json!(&id),
-        "case {id:?}: the id must not change when the state advances, got {:?}",
+        "case {id:?}: the read must answer the gateway the create minted, got {:?}",
         described[0]["directConnectGatewayId"]
     );
-    // Reading it again answers the same state: the read materialised only what
-    // the clock already owed.
+
+    // Reading it again answers the same record: a read changes nothing a later
+    // caller sees.
     let (again, _) = describe(&dx, json!({"directConnectGatewayId": &id})).await;
     assert_eq!(
         again[0], described[0],
         "case {id:?}: a second read must answer the same record, got {:?}",
         again[0]
     );
+}
+
+#[tokio::test]
+async fn every_gateway_record_carries_its_arn_its_type_and_its_tag_list() {
+    // RULE: ONE projection renders a stored Direct Connect gateway, and every operation
+    // that answers a `DirectConnectGateway` renders through it — so create, describe,
+    // update and delete report the same member set for the same gateway: the gateway's
+    // own ARN (this service's namespace, NO Region because a gateway is global, the
+    // owning account and the `dx-gateway/<id>` resource path), the gateway type, the tag
+    // list (present and empty when nothing tagged it) and the state the record is
+    // actually in.
+    //
+    // The rows differ in what the rule generalises over — the tag count (none, one,
+    // several) and the name shape — since none of those changes the member set.
+    let dx = Emulator::new();
+
+    // (case, name, tags)
+    let rows: &[ProjectionRow<'_>] = &[
+        ("no tags at all", "projection-untagged", &[]),
+        ("one tag", "Projection With Spaces", &[("env", "prod")]),
+        (
+            "several tags",
+            "projection.tagged_9",
+            &[("env", "test"), ("team", "network"), ("tier", "edge")],
+        ),
+    ];
+
+    for (case, name, tags) in rows {
+        let (status, response) = dx
+            .call("CreateDirectConnectGateway", create_gateway_body(name, None, tags))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {response}"
+        );
+        let created = response["directConnectGateway"].clone();
+        let id = created["directConnectGatewayId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let expected_arn = direct_connect_arn("", "dx-gateway", &id);
+        assert_eq!(
+            (
+                created["directConnectGatewayArn"].clone(),
+                // The one type a gateway this service mints is of.
+                created["directConnectGatewayType"].clone(),
+                created["tags"].clone(),
+                created["directConnectGatewayState"].clone(),
+            ),
+            (
+                json!(expected_arn),
+                json!("Default"),
+                tag_list(tags),
+                json!("available"),
+            ),
+            "case {case:?}: expected the create to report the gateway's ARN, type, tag list \
+             and state, got {created}"
+        );
+
+        // The read path renders the SAME projection, member for member.
+        let (described, _) = describe(&dx, json!({"directConnectGatewayId": &id})).await;
+        assert_eq!(
+            described,
+            vec![created.clone()],
+            "case {case:?}: the describe must render the same record as the create, got \
+             {described:?}"
+        );
+
+        // The ARN the gateway publishes is the one this service resolves back to that
+        // same gateway, so a client can tag or read tags by what it was handed.
+        let (status, tagged) = dx
+            .call("DescribeTags", json!({"resourceArns": [&expected_arn]}))
+            .await;
+        let expected_tags = json!([{"resourceArn": &expected_arn, "tags": tag_list(tags)}]);
+        assert_eq!(
+            (status, tagged["resourceTags"].clone()),
+            (200, expected_tags),
+            "case {case:?}: the published ARN must resolve to this gateway, got {status} with \
+             {tagged}"
+        );
+
+        // A rename changes the name and NOTHING else of the projection, and the read
+        // path serves the new name.
+        let renamed_to = format!("{name}-renamed");
+        let (status, renamed) = dx
+            .call(
+                "UpdateDirectConnectGateway",
+                json!({
+                    "directConnectGatewayId": &id,
+                    "newDirectConnectGatewayName": &renamed_to,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the rename to succeed, got {status} with {renamed}"
+        );
+        let mut expected = created.clone();
+        expected["directConnectGatewayName"] = json!(&renamed_to);
+        assert_eq!(
+            renamed["directConnectGateway"], expected,
+            "case {case:?}: expected the rename to change only the name, got {renamed}"
+        );
+        let (described, _) = describe(&dx, json!({"directConnectGatewayId": &id})).await;
+        assert_eq!(
+            described,
+            vec![expected.clone()],
+            "case {case:?}: the read path must serve the renamed record, got {described:?}"
+        );
+
+        // The delete answers the same projection, in the state the delete put the
+        // gateway in.
+        let (status, deleted) = dx
+            .call(
+                "DeleteDirectConnectGateway",
+                json!({"directConnectGatewayId": &id}),
+            )
+            .await;
+        let mut torn_down = expected;
+        torn_down["directConnectGatewayState"] = json!("deleting");
+        assert_eq!(
+            (status, deleted["directConnectGateway"].clone()),
+            (200, torn_down),
+            "case {case:?}: expected the delete to answer the same record deleting, got \
+             {status} with {deleted}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2086,6 +2196,291 @@ async fn renaming_a_gateway_keeps_its_id_and_is_refused_once_it_is_torn_down() {
     );
 }
 
+/// `count` tags a bulk write carries, keyed `bulk-<n>`.
+fn bulk_tags(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| json!({"key": format!("bulk-{index}"), "value": "x"}))
+            .collect(),
+    )
+}
+
+/// The keys [`bulk_tags`] writes, as a `tagKeys` list.
+fn bulk_keys(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| json!(format!("bulk-{index}")))
+            .collect(),
+    )
+}
+
+/// The tags `DescribeTags` reports for the one resource `resource_arn` names.
+async fn tags_of(dx: &Emulator, resource_arn: &str) -> Value {
+    let (status, described) = dx
+        .call("DescribeTags", json!({"resourceArns": [resource_arn]}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected DescribeTags 200 for {resource_arn}, got {status} with {described}"
+    );
+    described["resourceTags"][0]["tags"].clone()
+}
+
+#[tokio::test]
+async fn tags_are_written_merged_and_removed_by_the_arn_a_resource_publishes() {
+    // RULE: `TagResource` writes the tags of the resource its ARN names — merging by
+    // key, since "if a tag with the same key is already associated with the resource,
+    // this action updates its value", and bounded by the number of tags one resource may
+    // hold — and `UntagResource` removes the keys it names and keeps the rest. Both
+    // reach the SAME stored tag list every read of that resource reports, and an ARN
+    // this account holds no resource under names nothing to tag.
+    //
+    // The rows span the resource kinds the ARN resolution distinguishes: a Direct
+    // Connect gateway and a resiliency group, whose ARNs carry no Region, and a
+    // connection, whose ARN carries its own.
+    let dx = Emulator::new();
+    let gateway_id = gateway(&dx, "tag-write-gateway").await;
+    let group_id = group(&dx, "tag-write-group", "basic-resiliency").await;
+    let (status, connection) = dx
+        .call(
+            "CreateConnection",
+            json!({
+                "connectionName": "tag-write-connection",
+                "location": "EqDC2-EQ",
+                "bandwidth": "1Gbps",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateConnection to succeed, got {status} with {connection}"
+    );
+    let connection_id = connection["connectionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let rows: &[(&str, String)] = &[
+        (
+            "a Direct Connect gateway, whose ARN carries no Region",
+            direct_connect_arn("", "dx-gateway", &gateway_id),
+        ),
+        (
+            "a resiliency group, whose ARN carries no Region",
+            direct_connect_arn("", "dx-resiliency-group", &group_id),
+        ),
+        (
+            "a connection, whose ARN carries its own Region",
+            direct_connect_arn("us-east-1", "dxcon", &connection_id),
+        ),
+    ];
+
+    for (case, arn) in rows {
+        // A write is read back by the same ARN it was made under.
+        let (status, written) = dx
+            .call(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": tag_list(&[("env", "prod"), ("team", "network")])}),
+            )
+            .await;
+        assert_eq!(
+            (status, written.clone()),
+            (200, json!({})),
+            "case {case:?}: expected the tag write to be accepted, got {status} with {written}"
+        );
+        assert_eq!(
+            tags_of(&dx, arn).await,
+            tag_list(&[("env", "prod"), ("team", "network")]),
+            "case {case:?}: expected the tags just written, got {:?}",
+            tags_of(&dx, arn).await
+        );
+
+        // A second write MERGES: the value of a key already held is updated in place,
+        // a key the resource does not hold is added, and a key the request does not
+        // name is kept.
+        let (status, merged) = dx
+            .call(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": tag_list(&[("env", "staging"), ("tier", "edge")])}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the merging write to be accepted, got {status} with {merged}"
+        );
+        assert_eq!(
+            tags_of(&dx, arn).await,
+            tag_list(&[("env", "staging"), ("team", "network"), ("tier", "edge")]),
+            "case {case:?}: expected one entry per key, the named ones updated, got {:?}",
+            tags_of(&dx, arn).await
+        );
+
+        // One key per call: a request naming a key twice does not say which value it
+        // means, and the refused write leaves the resource as it was.
+        let (status, duplicated) = dx
+            .call(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": tag_list(&[("env", "a"), ("env", "b")])}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&duplicated)),
+            (400, "DuplicateTagKeysException".to_string()),
+            "case {case:?}: expected a repeated key to be refused, got {status} with {duplicated}"
+        );
+
+        // The ceiling is on what the resource would HOLD: three keys are already on it,
+        // so a write that takes it one past the ceiling is refused and writes nothing,
+        // and one that lands exactly at the ceiling is accepted.
+        let past = MAX_TAGS_PER_RESOURCE - 2;
+        let (status, too_many) = dx
+            .call(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": bulk_tags(past)}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&too_many)),
+            (400, "TooManyTagsException".to_string()),
+            "case {case:?}: expected a write past the ceiling to be refused, got {status} with \
+             {too_many}"
+        );
+        assert_eq!(
+            tags_of(&dx, arn).await,
+            tag_list(&[("env", "staging"), ("team", "network"), ("tier", "edge")]),
+            "case {case:?}: a refused write must change nothing, got {:?}",
+            tags_of(&dx, arn).await
+        );
+        let at_ceiling = MAX_TAGS_PER_RESOURCE - 3;
+        let (status, filled) = dx
+            .call(
+                "TagResource",
+                json!({"resourceArn": arn, "tags": bulk_tags(at_ceiling)}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a write up to the ceiling to be accepted, got {status} with \
+             {filled}"
+        );
+        assert_eq!(
+            tags_of(&dx, arn).await.as_array().map_or(0, Vec::len),
+            MAX_TAGS_PER_RESOURCE,
+            "case {case:?}: expected the resource to hold the ceiling, got {:?}",
+            tags_of(&dx, arn).await
+        );
+
+        // Removing keys: the named ones go, a key the resource does not carry removes
+        // nothing, and the rest are kept.
+        let mut keys = bulk_keys(at_ceiling);
+        if let Some(list) = keys.as_array_mut() {
+            list.push(json!("never-written"));
+        }
+        let (status, removed) = dx
+            .call(
+                "UntagResource",
+                json!({"resourceArn": arn, "tagKeys": keys}),
+            )
+            .await;
+        assert_eq!(
+            (status, removed.clone()),
+            (200, json!({})),
+            "case {case:?}: expected the tag removal to be accepted, got {status} with {removed}"
+        );
+        assert_eq!(
+            tags_of(&dx, arn).await,
+            tag_list(&[("env", "staging"), ("team", "network"), ("tier", "edge")]),
+            "case {case:?}: expected only the named keys removed, got {:?}",
+            tags_of(&dx, arn).await
+        );
+    }
+
+    // A single call cannot name more tags than one resource may hold, nor more keys to
+    // remove than one resource may carry: every tag it names would have to end up
+    // there, and every key it names would have to be there to remove.
+    let gateway_arn = direct_connect_arn("", "dx-gateway", &gateway_id);
+    let (status, oversized) = dx
+        .call(
+            "TagResource",
+            json!({"resourceArn": &gateway_arn, "tags": bulk_tags(MAX_TAGS_PER_RESOURCE + 1)}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&oversized)),
+        (400, "TooManyTagsException".to_string()),
+        "expected a call naming more tags than a resource may hold to be refused, got {status} \
+         with {oversized}"
+    );
+    for (case, count, accepted) in [
+        ("a key list exactly at the ceiling", MAX_TAGS_PER_RESOURCE, true),
+        ("one key past the ceiling", MAX_TAGS_PER_RESOURCE + 1, false),
+    ] {
+        let (status, response) = dx
+            .call(
+                "UntagResource",
+                json!({"resourceArn": &gateway_arn, "tagKeys": bulk_keys(count)}),
+            )
+            .await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the removal to be accepted, got {status} with {response}"
+            );
+        } else {
+            assert_eq!(
+                (
+                    status,
+                    error_code(&response),
+                    error_message(&response)
+                ),
+                (
+                    400,
+                    "DirectConnectClientException".to_string(),
+                    too_many_tag_keys_message(count),
+                ),
+                "case {case:?}: expected the key-count ceiling to refuse the removal, got \
+                 {status} with {response}"
+            );
+        }
+    }
+
+    // The gateway's own record reports the tags the write reached, so the tag write and
+    // every gateway read see one tag list.
+    let (described, _) = describe(&dx, json!({"directConnectGatewayId": &gateway_id})).await;
+    assert_eq!(
+        described[0]["tags"],
+        tag_list(&[("env", "staging"), ("team", "network"), ("tier", "edge")]),
+        "expected the gateway record to report the tags the write reached, got {:?}",
+        described[0]
+    );
+
+    // An ARN this account holds no resource under names nothing to tag or untag.
+    let unknown = direct_connect_arn("", "dx-gateway", "00000000-0000-4000-8000-000000000000");
+    for (case, target, body) in [
+        (
+            "a write naming no resource",
+            "TagResource",
+            json!({"resourceArn": &unknown, "tags": tag_list(&[("env", "prod")])}),
+        ),
+        (
+            "a removal naming no resource",
+            "UntagResource",
+            json!({"resourceArn": &unknown, "tagKeys": ["env"]}),
+        ),
+    ] {
+        let (status, refused) = dx.call(target, body).await;
+        assert_eq!(
+            (status, error_code(&refused), error_message(&refused)),
+            (
+                400,
+                "DirectConnectClientException".to_string(),
+                format!("Resource {unknown} does not exist"),
+            ),
+            "case {case:?}: expected the unresolved-ARN refusal, got {status} with {refused}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn describe_tags_reports_the_tags_of_each_kind_of_resource_by_its_arn() {
     // RULE: "Describes the tags associated with the SPECIFIED Direct Connect resources" —
@@ -2202,7 +2597,7 @@ async fn describe_tags_reports_the_tags_of_each_kind_of_resource_by_its_arn() {
             {"resourceArn": &interface_arn, "tags": tag_list(&[("kind", "virtual-interface")])},
             {"resourceArn": &gateway_arn, "tags": tag_list(&[("kind", "gateway")])},
             {"resourceArn": &group_arn, "tags": tag_list(&[("kind", "group")])},
-            {"resourceArn": &untagged_arn},
+            {"resourceArn": &untagged_arn, "tags": tag_list(&[])},
         ]),
         "expected one element per ARN this account holds a resource under, in request order, \
          got {described}"

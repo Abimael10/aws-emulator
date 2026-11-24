@@ -227,18 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let gateway = crate::state::DirectConnectGateway {
             direct_connect_gateway_id: gateway_id.clone(),
             direct_connect_gateway_name: name,
+            direct_connect_gateway_type: crate::state::DIRECT_CONNECT_GATEWAY_TYPE_DEFAULT
+                .to_string(),
             amazon_side_asn,
             owner_account: ::engine::emulator_account_id().to_string(),
-            // "pending: The initial state after calling
-            // CreateDirectConnectGateway"; "available: The Direct Connect gateway
-            // is ready for use" is what the clock owes from here.
-            direct_connect_gateway_state: "pending".to_string(),
+            // A gateway is ready for use from the create on: creating one allocates
+            // no network capacity, so this create has nothing left to settle and
+            // owes the clock no later move. `pending` is the state a gateway whose
+            // creation has NOT completed is reported in, not a span every create
+            // passes through.
+            direct_connect_gateway_state: "available".to_string(),
             state_change_error: None,
             tags,
-            due: Some(crate::state::DueTransition {
-                at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
-                to: "available".to_string(),
-            }),
+            due: None,
         };
 
         let output = store.gateway_output(&gateway);

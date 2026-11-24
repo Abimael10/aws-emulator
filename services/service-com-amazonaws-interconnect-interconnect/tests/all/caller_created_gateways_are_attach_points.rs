@@ -18,7 +18,7 @@ use serde_json::json;
 
 use crate::emulator::{
     available_bandwidths, carries_connections, creatable_environments, identifiers, text, Emulator,
-    ATTACH_POINT_TYPE,
+    ATTACH_POINT_TYPE, GATEWAY_READY_STATE,
 };
 
 /// A well-formed `DirectConnectGatewayAttachPoint` (36 characters in the UUID groups the
@@ -97,10 +97,10 @@ async fn a_created_gateway_becomes_a_listed_attach_point() {
     }
 }
 
-/// RULE: a gateway is an attach point once Direct Connect reports it ready for use
-/// (`available`); while it is still being created (`pending`) it is not one yet.
+/// RULE: a gateway is an attach point only while Direct Connect reports it ready for use
+/// (`available`); in any other state — a gateway being torn down, or gone — it is not one.
 #[tokio::test]
-async fn a_gateway_is_an_attach_point_once_direct_connect_reports_it_available() {
+async fn a_gateway_is_an_attach_point_only_while_direct_connect_reports_it_available() {
     let emulator = Emulator::new();
     // An environment that can carry a Connection, so what the listing turns on below is
     // the gateway's own lifecycle state and nothing else.
@@ -110,36 +110,45 @@ async fn a_gateway_is_an_attach_point_once_direct_connect_reports_it_available()
         "environmentId",
     );
 
-    // Rows differ in the gateway's name and ASN; each is read straight back (the
-    // transient state the clock owes is never zero-length) and then after it settles.
-    for (name, asn) in [("ic-pending-a", None), ("ic-pending-b", Some(64_512))] {
+    // Rows differ in the gateway's name and ASN. Direct Connect answers a created
+    // gateway ready for use, so each one is an attach point from the create on, and the
+    // state the listing turns on is exercised by tearing it down again.
+    for (name, asn) in [("ic-ready-a", None), ("ic-ready-b", Some(64_512))] {
         let id = emulator.create_gateway(name, asn).await;
         let state = emulator.gateway_state(&id).await;
         assert_eq!(
-            state, "pending",
-            "case {name:?}: expected a gateway read straight back to be pending, got {state:?}"
+            state, GATEWAY_READY_STATE,
+            "case {name:?}: expected a created gateway to be reported ready for use, got {state:?}"
         );
-        let pending = emulator.attach_points(&environment_id).await;
+        let ready = emulator.attach_points(&environment_id).await;
         assert!(
-            !identifiers(&pending).contains(&id),
-            "case {name:?}: expected a {state} gateway not to be an attach point yet, got {pending:?}"
+            identifiers(&ready).contains(&id),
+            "case {name:?}: expected a {state} gateway to be an attach point, got {ready:?}"
         );
 
-        // Once the clock has made the transition due, the same gateway is listed.
-        let started = std::time::Instant::now();
-        let available = loop {
-            if emulator.gateway_state(&id).await == "available" {
-                break emulator.attach_points(&environment_id).await;
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "case {name:?}: expected the gateway to become available within 5s"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
+        // A gateway the account is tearing down is not ready for use, so it stops being
+        // an attach point — whether Direct Connect still reports it `deleting` or has
+        // reached the `deleted` tombstone the clock owes it.
+        let (status, torn_down) = emulator
+            .dx(
+                "DeleteDirectConnectGateway",
+                json!({ "directConnectGatewayId": &id }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the tear-down to be accepted, got {status} with {torn_down}"
+        );
+        let state = emulator.gateway_state(&id).await;
+        assert_ne!(
+            state, GATEWAY_READY_STATE,
+            "case {name:?}: expected a gateway being torn down not to be ready for use, got \
+             {state:?}"
+        );
+        let gone = emulator.attach_points(&environment_id).await;
         assert!(
-            identifiers(&available).contains(&id),
-            "case {name:?}: expected an available gateway to be an attach point, got {available:?}"
+            !identifiers(&gone).contains(&id),
+            "case {name:?}: expected a {state} gateway not to be an attach point, got {gone:?}"
         );
     }
 }

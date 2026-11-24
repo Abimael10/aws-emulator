@@ -174,9 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             resource_tags.push(ResourceTag {
                 resource_arn: Some(resource_arn.clone()),
-                // `TagList` is `@length 1..`, so a resource nobody tagged publishes
-                // no list at all rather than an empty one.
-                tags: (!tags.is_empty()).then_some(tags),
+                // The tag list is always PRESENT, empty when nothing tagged the
+                // resource, rather than absent: a client reading it never has to tell
+                // "no tags" from "not reported".
+                tags: Some(tags),
             });
         }
 

@@ -34,13 +34,31 @@ pub const DIRECT_CONNECT_ARN_NAMESPACE: &str = "directconnect";
 /// The resource path a Direct Connect GATEWAY's ARN carries before the gateway's own
 /// id.
 ///
-/// A `DirectConnectGateway` publishes no ARN member of its own, so an ARN naming one is
-/// only ever READ here ([`tags_of_resource`]): the resource type AWS Resource Groups
-/// Tagging and IAM name a Direct Connect gateway under is `dx-gateway`, which is the
-/// segment `arn:<partition>:directconnect::<account>:dx-gateway/<id>` carries. A
-/// gateway "is global and visible in any Amazon Web Services Region after it is
-/// created", so such an ARN carries no Region at all.
+/// The resource type AWS Resource Groups Tagging and IAM name a Direct Connect gateway
+/// under is `dx-gateway`, which is the segment
+/// `arn:<partition>:directconnect::<account>:dx-gateway/<id>` carries. A gateway "is
+/// global and visible in any Amazon Web Services Region after it is created", so such an
+/// ARN carries no Region at all. The one path, both WRITTEN
+/// ([`direct_connect_gateway_arn`]) and READ ([`tags_of_resource`]) here, so a gateway
+/// cannot publish an ARN its own tag read does not resolve.
 pub const DIRECT_CONNECT_GATEWAY_ARN_PATH: &str = "dx-gateway";
+
+/// The ARN of the Direct Connect gateway `direct_connect_gateway_id`, owned by
+/// `owner_account`: this service's ARN namespace, NO Region (the gateway is global), the
+/// owning account and the [`DIRECT_CONNECT_GATEWAY_ARN_PATH`] resource path followed by
+/// the gateway's own id.
+pub fn direct_connect_gateway_arn(owner_account: &str, direct_connect_gateway_id: &str) -> String {
+    format!(
+        "arn:aws:{DIRECT_CONNECT_ARN_NAMESPACE}::{owner_account}:\
+         {DIRECT_CONNECT_GATEWAY_ARN_PATH}/{direct_connect_gateway_id}"
+    )
+}
+
+/// The `directConnectGatewayType` a gateway this service mints is reported under.
+///
+/// A gateway created through `CreateDirectConnectGateway` is the ordinary, default kind,
+/// and that is the type every such gateway carries on the wire.
+pub const DIRECT_CONNECT_GATEWAY_TYPE_DEFAULT: &str = "Default";
 
 /// The resource paths a CONNECTION's and a VIRTUAL INTERFACE's ARN carry before the
 /// resource's own id (`arn:<partition>:directconnect:<region>:<account>:dxcon/<id>`
@@ -50,12 +68,12 @@ pub const DIRECT_CONNECT_GATEWAY_ARN_PATH: &str = "dx-gateway";
 pub const CONNECTION_ARN_PATH: &str = "dxcon";
 pub const VIRTUAL_INTERFACE_ARN_PATH: &str = "dxvif";
 
-/// The tags this account holds on the Direct Connect resource `resource_arn`, or
-/// `None` where it holds no resource under that ARN.
+/// Which kind of this service's resources an ARN names, and the identifier and Region
+/// it names it under.
 ///
 /// The ONE resolution of an ARN to a tagged resource of this service, so every caller
-/// that reads tags by ARN resolves the same four kinds — a connection, a virtual
-/// interface, a Direct Connect gateway and a resiliency group — and none of them
+/// that reads OR writes tags by ARN resolves the same four kinds — a connection, a
+/// virtual interface, a Direct Connect gateway and a resiliency group — and none of them
 /// resolves one kind differently.
 ///
 /// The ARN is PARSED once ([`::service_common::arn::parse`], the one reading of an ARN
@@ -65,36 +83,122 @@ pub const VIRTUAL_INTERFACE_ARN_PATH: &str = "dxvif";
 /// rather than by rebuilding every candidate ARN. The Region the ARN carries is held to
 /// what the resource's own ARN carries: none for a gateway or a group (both are global),
 /// and the resource's own Region for a connection or a virtual interface.
-pub fn tags_of_resource(
-    store: &ComAmazonawsDirectconnectOvertureserviceState,
-    resource_arn: &str,
-) -> Option<Vec<Tag>> {
+enum TaggedResource<'a> {
+    Connection { id: &'a str, region: &'a str },
+    VirtualInterface { id: &'a str, region: &'a str },
+    Gateway { id: &'a str },
+    ResiliencyGroup { id: &'a str },
+}
+
+/// What `resource_arn` names, or `None` where it is not an ARN of a resource kind this
+/// service tags. See [`TaggedResource`].
+fn tagged_resource(resource_arn: &str) -> Option<TaggedResource<'_>> {
     let arn = ::service_common::arn::parse(resource_arn)?;
     if arn.vendor != DIRECT_CONNECT_ARN_NAMESPACE {
         return None;
     }
-    let (path, resource_id) = arn.resource.split_once('/')?;
+    let (path, id) = arn.resource.split_once('/')?;
     match path {
-        CONNECTION_ARN_PATH => store
-            .connections
-            .get(resource_id)
-            .filter(|connection| connection.region == arn.region)
-            .map(|connection| connection.tags.clone()),
-        VIRTUAL_INTERFACE_ARN_PATH => store
-            .virtual_interfaces
-            .get(resource_id)
-            .filter(|interface| interface.region == arn.region)
-            .map(|interface| interface.tags.clone()),
-        DIRECT_CONNECT_GATEWAY_ARN_PATH if arn.region.is_empty() => store
-            .gateways
-            .get(resource_id)
-            .map(|gateway| gateway.tags.clone()),
-        resiliency_groups::RESILIENCY_GROUP_ARN_PATH if arn.region.is_empty() => store
-            .resiliency_groups
-            .get(resource_id)
-            .map(|group| group.tags.clone()),
+        CONNECTION_ARN_PATH => Some(TaggedResource::Connection {
+            id,
+            region: arn.region,
+        }),
+        VIRTUAL_INTERFACE_ARN_PATH => Some(TaggedResource::VirtualInterface {
+            id,
+            region: arn.region,
+        }),
+        DIRECT_CONNECT_GATEWAY_ARN_PATH if arn.region.is_empty() => {
+            Some(TaggedResource::Gateway { id })
+        }
+        resiliency_groups::RESILIENCY_GROUP_ARN_PATH if arn.region.is_empty() => {
+            Some(TaggedResource::ResiliencyGroup { id })
+        }
         _ => None,
     }
+}
+
+/// The tags this account holds on the Direct Connect resource `resource_arn`, or
+/// `None` where it holds no resource under that ARN.
+pub fn tags_of_resource(
+    store: &ComAmazonawsDirectconnectOvertureserviceState,
+    resource_arn: &str,
+) -> Option<Vec<Tag>> {
+    let tags = match tagged_resource(resource_arn)? {
+        TaggedResource::Connection { id, region } => store
+            .connections
+            .get(id)
+            .filter(|connection| connection.region == region)
+            .map(|connection| &connection.tags),
+        TaggedResource::VirtualInterface { id, region } => store
+            .virtual_interfaces
+            .get(id)
+            .filter(|interface| interface.region == region)
+            .map(|interface| &interface.tags),
+        TaggedResource::Gateway { id } => store.gateways.get(id).map(|gateway| &gateway.tags),
+        TaggedResource::ResiliencyGroup { id } => {
+            store.resiliency_groups.get(id).map(|group| &group.tags)
+        }
+    };
+    tags.cloned()
+}
+
+/// The tags this account holds on the Direct Connect resource `resource_arn`, to be
+/// CHANGED in the record that holds them, or `None` where it holds no resource under
+/// that ARN.
+///
+/// The write side of [`tags_of_resource`], resolving the ARN the same way, so a tag a
+/// caller writes by an ARN is read back by that same ARN.
+pub fn tags_of_resource_mut<'a>(
+    store: &'a mut ComAmazonawsDirectconnectOvertureserviceState,
+    resource_arn: &str,
+) -> Option<&'a mut Vec<Tag>> {
+    match tagged_resource(resource_arn)? {
+        TaggedResource::Connection { id, region } => store
+            .connections
+            .get_mut(id)
+            .filter(|connection| connection.region == region)
+            .map(|connection| &mut connection.tags),
+        TaggedResource::VirtualInterface { id, region } => store
+            .virtual_interfaces
+            .get_mut(id)
+            .filter(|interface| interface.region == region)
+            .map(|interface| &mut interface.tags),
+        TaggedResource::Gateway { id } => {
+            store.gateways.get_mut(id).map(|gateway| &mut gateway.tags)
+        }
+        TaggedResource::ResiliencyGroup { id } => store
+            .resiliency_groups
+            .get_mut(id)
+            .map(|group| &mut group.tags),
+    }
+}
+
+/// How this service STATES a refusal of a tag call naming an ARN it holds no resource
+/// under.
+///
+/// Every client fault of this service shares the one error shape and the one 400
+/// status, so the sentence is the whole discriminator: the ARN the request submitted,
+/// then fixed text. Stated here beside this service's other refusal wording, so the tag
+/// write and the tag removal word it alike.
+pub fn resource_arn_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} does not exist")
+}
+
+/// How a tag REMOVAL states a refusal of a key list longer than the tag set a resource
+/// can hold: the count the request named, then the fixed sentence naming the ceiling.
+///
+/// `TagKeyList` carries no `@length`
+/// (`smithy_query(query="operation",operation="UntagResource")`) and `UntagResource`
+/// models no quota error, so the bound is enforced as the one client fault this
+/// operation has — and it is a bound on the REQUEST, since a resource holds at most
+/// [`MAX_TAGS_PER_RESOURCE`] tags and a longer list therefore names keys no resource of
+/// this service can carry. Stated here beside the bound it reports, so the sentence and
+/// the number cannot drift apart.
+pub fn too_many_tag_keys_message(named: usize) -> String {
+    format!(
+        "{named} tag keys were specified; a Direct Connect resource holds at most \
+         {MAX_TAGS_PER_RESOURCE} tags"
+    )
 }
 
 /// The Region a request names in its SigV4 credential scope when it carries no
@@ -306,6 +410,9 @@ pub struct Connection {
 pub struct DirectConnectGateway {
     pub direct_connect_gateway_id: String,
     pub direct_connect_gateway_name: String,
+    /// The kind of gateway this record is, reported as `directConnectGatewayType`:
+    /// [`DIRECT_CONNECT_GATEWAY_TYPE_DEFAULT`] for every gateway a create mints.
+    pub direct_connect_gateway_type: String,
     pub amazon_side_asn: i64,
     pub owner_account: String,
     pub direct_connect_gateway_state: String,
@@ -486,7 +593,12 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     ) -> crate::ops::types::DirectConnectGateway {
         crate::ops::types::DirectConnectGateway {
             direct_connect_gateway_id: Some(gateway.direct_connect_gateway_id.clone()),
+            direct_connect_gateway_arn: Some(direct_connect_gateway_arn(
+                &gateway.owner_account,
+                &gateway.direct_connect_gateway_id,
+            )),
             direct_connect_gateway_name: Some(gateway.direct_connect_gateway_name.clone()),
+            direct_connect_gateway_type: Some(gateway.direct_connect_gateway_type.clone()),
             amazon_side_asn: Some(gateway.amazon_side_asn),
             owner_account: Some(gateway.owner_account.clone()),
             direct_connect_gateway_state: Some(gateway.direct_connect_gateway_state.clone()),
@@ -494,7 +606,10 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             total_prefix_pool_allocations: Some(
                 self.gateway_prefix_allocations(&gateway.direct_connect_gateway_id),
             ),
-            tags: (!gateway.tags.is_empty()).then(|| gateway.tags.clone()),
+            // A gateway's tag list is always PRESENT, empty when nothing tagged it,
+            // rather than absent: a client reading it never has to tell "no tags" from
+            // "not reported".
+            tags: Some(gateway.tags.clone()),
         }
     }
 

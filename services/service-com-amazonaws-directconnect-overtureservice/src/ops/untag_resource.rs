@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +125,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every resource is addressed by its ARN here, and an ARN carries its own
+        // Region, so this write is not windowed by the request's endpoint.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::DirectConnectServerException(
+                DirectConnectServerException {
+                    message: Some(
+                        "the Direct Connect store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The key count is bounded BEFORE the store is locked, so neither the set
+        // built below nor the work it costs grows with the length of the list a
+        // request chose: a resource holds at most
+        // [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so a longer list names keys
+        // no resource of this service can carry.
+        if input.tag_keys.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(UntagResourceErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(crate::state::too_many_tag_keys_message(
+                        input.tag_keys.len(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialise only what the clock already made due, exactly as every other
+        // call on this store does.
+        store.settle_due_transitions();
+
+        let Some(tags) = crate::state::tags_of_resource_mut(&mut store, &input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(crate::state::resource_arn_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Removes one or more tags from the specified Direct Connect resource": what
+        // the call asks for is that the named keys are GONE, so a key the resource
+        // does not carry is already in that state and removes nothing, and the tags
+        // the request does not name are kept.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The keys are read into a set first, so the removal costs O(n log k) in what
+        // the resource HOLDS rather than the product of that and the caller-chosen
+        // key count.
+        let removed: std::collections::BTreeSet<&str> =
+            input.tag_keys.iter().map(String::as_str).collect();
+        tags.retain(|tag| !removed.contains(tag.key.as_str()));
+
+        Ok(UntagResourceOutput {})
     }
 }
