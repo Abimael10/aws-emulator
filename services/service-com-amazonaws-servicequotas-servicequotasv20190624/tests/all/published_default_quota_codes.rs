@@ -186,8 +186,8 @@ const SERVICES: &[ServiceRow] = &[
         spot_checks: &[
             Published {
                 quota_code: "L-7705D2CB",
-                quota_name: "Controls per framework",
-                value: 50.0,
+                quota_name: "Backup vaults per Region per account",
+                value: 300.0,
                 unit: "None",
                 adjustable: true,
             },

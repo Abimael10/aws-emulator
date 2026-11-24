@@ -257,7 +257,10 @@ const PUBLISHED_ROWS: &[Published] = &[
              automatically approved for values less than or equal to 500.",
         ),
         period: Some((1, "HOUR")),
-        metric: Some(resource_count("AWS AppConfig", "ConfigurationProfile")),
+        metric: Some(resource_count(
+            "AWS AppConfig",
+            "ConfigurationProfilesPerApplication",
+        )),
     },
     Published {
         service_code: "appconfig",

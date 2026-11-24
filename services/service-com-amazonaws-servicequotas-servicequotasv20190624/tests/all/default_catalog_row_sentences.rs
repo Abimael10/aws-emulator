@@ -73,7 +73,9 @@ const ROWS: &[Row] = &[
     // apigateway — the three planes this catalog had bound to a neighbouring quota: the
     // size of one request's payload (in megabytes, and not adjustable), the account's
     // client certificates, and the longest an integration may take to answer (in
-    // milliseconds). This service publishes no sentence for them.
+    // milliseconds). Each carries the sentence the recording states for it: a phrase of
+    // the quota's own, the counted-plane voice, and a sentence that names the API types
+    // the limit may be raised for.
     Row {
         service_code: "apigateway",
         quota_code: "L-46624B39",
@@ -81,7 +83,7 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "Megabytes",
         adjustable: false,
-        description: None,
+        description: Some("Maximum payload size for non WebSocket API."),
         period: None,
     },
     Row {
@@ -91,7 +93,10 @@ const ROWS: &[Row] = &[
         value: 60.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of certificates that you can associate with this account \
+             in the current region",
+        ),
         period: None,
     },
     Row {
@@ -101,11 +106,15 @@ const ROWS: &[Row] = &[
         value: 29_000.0,
         unit: "Milliseconds",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum integration timeout (in milliseconds) allowed for your account \
+             in the current region. This limit can only be increased for Regional and \
+             private APIs.",
+        ),
         period: None,
     },
     // appconfig — the environment plane, published over the resource planes' one-hour
-    // window, and the size limit of a configuration this service does not host itself.
+    // window, and the size limit of ONE deployment.
     Row {
         service_code: "appconfig",
         quota_code: "L-A52E46BE",
@@ -119,7 +128,7 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "appconfig",
         quota_code: "L-A5FC0339",
-        quota_name: "Configuration size limit in other configuration stores",
+        quota_name: "Deployment size limit",
         value: 1024.0,
         unit: "Kilobytes",
         adjustable: true,
@@ -139,6 +148,22 @@ const ROWS: &[Row] = &[
         description: Some(
             "The maximum number of scalable targets that you can register for the \
              Comprehend namespace in this account in the current Region. A scalable \
+             target identifies the resource that Application Auto Scaling can scale.",
+        ),
+        period: None,
+    },
+    // The custom-resource plane, whose service AWS names in the PLURAL and whose
+    // namespace its sentence names in the singular.
+    Row {
+        service_code: "application-autoscaling",
+        quota_code: "L-4A11ECEB",
+        quota_name: "Scalable targets for custom resources",
+        value: 500.0,
+        unit: "None",
+        adjustable: true,
+        description: Some(
+            "The maximum number of scalable targets that you can register for the \
+             custom resource namespace in this account in the current Region. A scalable \
              target identifies the resource that Application Auto Scaling can scale.",
         ),
         period: None,
@@ -249,8 +274,9 @@ const ROWS: &[Row] = &[
         period: None,
     },
     // backup — the counted voice on the largest default in these catalogs, on the plane
-    // counted for ONE resource, on the framework controls of the account, on a row the
-    // issue never cited, and on the plane published as not adjustable.
+    // counted for ONE resource, the ACCOUNT voice on the framework controls and on the
+    // frameworks of the account (a row the issue never cited), and the counted voice on
+    // the per-service plane published as not adjustable.
     Row {
         service_code: "backup",
         quota_code: "L-514878B6",
@@ -278,7 +304,7 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: true,
-        description: Some("Number of framework controls per Region per account"),
+        description: Some("Number of framework controls in this account in the current Region"),
         period: None,
     },
     Row {
@@ -288,17 +314,19 @@ const ROWS: &[Row] = &[
         value: 10.0,
         unit: "None",
         adjustable: true,
-        description: Some("Number of frameworks per Region per account"),
+        description: Some("Number of frameworks in this account in the current Region"),
         period: None,
     },
     Row {
         service_code: "backup",
         quota_code: "L-FFD6444F",
-        quota_name: "Tags per backup plan",
-        value: 50.0,
+        quota_name: "Concurrent backup copies per supported service per account",
+        value: 5.0,
         unit: "None",
         adjustable: false,
-        description: Some("Number of tags per backup plan"),
+        description: Some(
+            "Number of concurrent backup copies per supported service per account",
+        ),
         period: None,
     },
 ];

@@ -299,7 +299,10 @@ const ROWS: &[Row] = &[
 const PAGED_SERVICES: &[&str] = &["iam", "lambda", "vpc", "ec2"];
 
 /// The `Resource` dimension of a record's usage metric, when it publishes one.
-fn metric_resource(record: &Value) -> Option<&str> {
+///
+/// `pub(crate)` so the sibling catalog suites read a record's usage series through ONE
+/// helper instead of each growing a copy.
+pub(crate) fn metric_resource(record: &Value) -> Option<&str> {
     record["UsageMetric"]["MetricDimensions"]["Resource"].as_str()
 }
 
