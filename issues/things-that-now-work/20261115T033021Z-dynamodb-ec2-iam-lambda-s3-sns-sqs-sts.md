@@ -9,6 +9,23 @@ Issue-Commit: 2bc939698b9a959721d42e691c2ca676c39ad8ba
 
 > _Note: this issue was identified against the code base at commit `2bc939698b9a959721d42e691c2ca676c39ad8ba`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> **Resolution: cause 1 of 1 DECLINED — the reported defect does not exist, and the one byte
+> that still differs is blocked outside every path a fix may change.** The refusal DOES
+> announce the protocol media type: the reply to this very call carries
+> `content-type: application/x-amz-json-1.0` beside its `__type`, its `Message` and no
+> `x-amzn-query-error`, confirmed on the wire three ways — the assembled router with request
+> authentication on, a raw HTTP/1.1 socket against a served endpoint, and the built emulator
+> binary on its own HTTPS data port. The only difference left from the recorded AWS reply is
+> the LETTER CASE of the field name (`Content-Type` against `content-type`), which HTTP field
+> names make insensitive and which the vendored HTTP/1.1 writer folds on EVERY response of
+> EVERY service, successes included: it is decided in `vendor/server/src/lib.rs`
+> (`serve_production_on_address`, which hands hyper neither `http1_preserve_header_case` nor
+> an `OriginalHeaderCaseMap`), a read-only tree, and `aws_smithy_runtime_api::http::Headers`
+> is an `http::HeaderMap`, whose `HeaderName` is lower-cased on construction, so no service
+> crate can spell a field name otherwise. The rule the report is about is pinned over a real
+> connection by
+> `services/service-com-amazonaws-dynamodb-dynamodb-20120810/tests/all/refusal_reply_media_type.rs`.
+
 ## Operation
 ListTables
 
