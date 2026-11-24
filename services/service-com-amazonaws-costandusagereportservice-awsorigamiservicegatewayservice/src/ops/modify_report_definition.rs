@@ -182,14 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The same Parquet-preference gate the create path runs: the replacement has to be
-        // a definition the service could deliver, so an inconsistent one is refused and
+        // The same Parquet-preference gate the create path runs, answered with the same
+        // refusal (`crate::state::parquet_preference_not_usable`): the replacement has to
+        // be a definition the service could deliver, so an inconsistent one is refused and
         // the stored definition is left as it was.
         if !crate::state::parquet_preference_is_usable(&input.report_definition) {
             return Err(ModifyReportDefinitionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::PARQUET_PREFERENCE_MESSAGE.to_string()),
-                },
+                crate::state::parquet_preference_not_usable(),
             )
             .into());
         }

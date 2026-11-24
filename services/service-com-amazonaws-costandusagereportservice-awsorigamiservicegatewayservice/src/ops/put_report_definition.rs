@@ -191,9 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // but could never deliver is not a report. The same gate runs on the update path.
         if !crate::state::parquet_preference_is_usable(&input.report_definition) {
             return Err(PutReportDefinitionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::PARQUET_PREFERENCE_MESSAGE.to_string()),
-                },
+                crate::state::parquet_preference_not_usable(),
             )
             .into());
         }

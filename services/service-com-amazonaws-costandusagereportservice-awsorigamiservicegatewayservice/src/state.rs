@@ -166,8 +166,9 @@ pub fn report_timestamp(at: SystemTime) -> Option<String> {
 ///
 /// Fixed text, with nothing from the request in it: a report's Parquet preference is
 /// stated by several members at once, so the refusal names the whole rule rather than one
-/// member.
-pub const PARQUET_PREFERENCE_MESSAGE: &str = "For valid Parquet preference, report format \
+/// member. Private, because [`parquet_preference_not_usable`] is the only thing that puts
+/// it on the wire.
+const PARQUET_PREFERENCE_MESSAGE: &str = "For valid Parquet preference, report format \
      and compression must be 'Parquet' and cannot subscribe to QuickSight and/or Redshift";
 
 /// How `ReportFormat` and `CompressionFormat` both spell Parquet
@@ -200,6 +201,22 @@ pub fn parquet_preference_is_usable(definition: &ReportDefinition) -> bool {
             .iter()
             .flatten()
             .any(|artifact| NON_PARQUET_ARTIFACTS.contains(&artifact.as_str()))
+}
+
+/// The refusal for a definition whose Parquet preference is not usable
+/// ([`parquet_preference_is_usable`]).
+///
+/// The condition is reported under `ValidationException` — "The input fails to satisfy the
+/// constraints specified by an Amazon Web Services service" — carrying
+/// [`PARQUET_PREFERENCE_MESSAGE`] as its `Message`, because that text is the only thing
+/// that says which of the conditions this one error code multiplexes was hit. Both
+/// operations that take a `ReportDefinition` answer the same rule, so the error shape it
+/// is reported under and the member the text goes in live here alone and the create and
+/// the update path cannot drift apart.
+pub fn parquet_preference_not_usable() -> ValidationException {
+    ValidationException {
+        message: Some(PARQUET_PREFERENCE_MESSAGE.to_string()),
+    }
 }
 
 /// Why a tag merge was refused: it would leave the report holding more tags than
