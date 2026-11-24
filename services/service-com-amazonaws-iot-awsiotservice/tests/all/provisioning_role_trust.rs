@@ -207,7 +207,11 @@ impl Reply {
 
 /// A trust policy admitting each of `principals` to assume the role; one admitting nobody
 /// when the list is empty.
-fn trust_policy(principals: &[&str]) -> String {
+///
+/// Shared with the suites that resolve another caller-supplied role against this same IAM
+/// (`crate::dependent_resource_preflight`), so one spelling of a trust document serves
+/// them all.
+pub(crate) fn trust_policy(principals: &[&str]) -> String {
     let statements: Vec<Value> = principals
         .iter()
         .map(|principal| {

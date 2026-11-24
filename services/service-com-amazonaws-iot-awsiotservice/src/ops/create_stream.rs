@@ -184,6 +184,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A stream is READ UNDER the role it names, so that role is resolved against the
+        // account's own IAM records BEFORE anything else about the files is established and
+        // before anything is written: a role IAM answered this service cannot assume is a
+        // stream whose files could never be fetched, and it is refused with the modelled
+        // `InvalidRequestException` (HTTP 400) in the sentence that refusal states. The
+        // role comes first because it is what the file read itself would be made under —
+        // nothing can be said about an object this service could not reach. Only what IAM
+        // ANSWERED grounds the refusal — see `service_common::iam_role`, whose hop is this
+        // emulator's own in-process callback, so it opens no socket, resolves no host name
+        // and reaches nothing off this process — and the question is asked with no lock
+        // held, the same way this crate's other role pre-flights ask it
+        // (`ops::create_provisioning_template`).
+        if ::service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &input.role_arn,
+            crate::state::SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(CreateStreamErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::unassumable_stream_role_message(
+                        &input.role_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // A file is the S3 object it names, so a file pointed at an object the account's
         // object storage ANSWERS it holds nothing at could never be streamed to a device:
         // the create is refused with the modelled `InvalidRequestException` (HTTP 400)

@@ -87,6 +87,21 @@ pub struct DynamicGroupQuery {
     pub query_version: String,
 }
 
+/// How this service refuses a DYNAMIC thing group while the fleet index that would back
+/// it is not enabled: the modelled `ResourceNotFoundException` (HTTP 404).
+///
+/// A dynamic group's members are the things its query selects out of the fleet index
+/// ([`DynamicGroupQuery`]), so with no index there is nothing for the group to be a view
+/// of — which is why the refusal is the NOT-FOUND one and why the sentence names the
+/// operation that creates the index
+/// ([`set_thing_indexing_configuration`](super::ComAmazonawsIotAwsiotserviceState::set_thing_indexing_configuration)
+/// is what `UpdateIndexingConfiguration` writes). It is entirely fixed text: it names
+/// neither the group nor the index, because what it states is that the account has no
+/// fleet indexing at all.
+pub const FLEET_INDEXING_DISABLED_MESSAGE: &str = "AWS IoT Fleet Indexing is not enabled. \
+                                                   Please enable index by calling \
+                                                   UpdateIndexingConfiguration.";
+
 /// How this service states that a thing group a request named is DYNAMIC, so its
 /// membership is the query's to decide and not a caller's to write.
 ///

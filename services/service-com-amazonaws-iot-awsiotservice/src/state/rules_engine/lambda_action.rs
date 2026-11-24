@@ -44,11 +44,15 @@ pub const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
 
 /// The condition key a grant narrowed to ONE invoking resource names the source by, which for
 /// a topic rule's action is the RULE the message matched.
-const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+///
+/// Public because every reading of a grant AWS IoT invokes a function under states the same
+/// key: a certificate provider's own function is resolved against it too
+/// ([`super::super::certificate_provider_function`]), with the PROVIDER's ARN as the source.
+pub const SOURCE_ARN_KEY: &str = "aws:SourceArn";
 
 /// The condition key a grant narrowed to the account that owns the invoking resource names it
-/// by.
-const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+/// by, shared with the other readings of such a grant for the reason [`SOURCE_ARN_KEY`] is.
+pub const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 
 /// How long one invocation may take to be ACCEPTED before this engine stops waiting on it.
 ///

@@ -316,7 +316,27 @@ impl Emulator {
 
     /// `CreateDynamicThingGroup`: `POST /dynamic-thing-groups/{thingGroupName}`, the other
     /// kind of group — the one deleted through `DeleteDynamicThingGroup`.
+    ///
+    /// A dynamic group is a view of the THING fleet index, which AWS requires to be enabled
+    /// before it will create one, so the index is enabled here first
+    /// (`UpdateIndexingConfiguration`, `POST /indexing/config`); the configuration is one
+    /// record for the account, so stating it again for a second group changes nothing.
     async fn create_dynamic_group(&self, thing_group_name: &str, request: &Value) -> Reply {
+        let enabled = self
+            .call(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
+                })),
+                &[],
+            )
+            .await;
+        assert_eq!(
+            enabled.status, 200,
+            "thing indexing must be enabled before a dynamic group is created, got {} ({})",
+            enabled.status, enabled.body
+        );
         self.call(
             "POST",
             &format!("/dynamic-thing-groups/{thing_group_name}"),

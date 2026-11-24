@@ -216,6 +216,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The provider IS the Lambda function it names — every `CreateCertificateFromCsr`
+        // of the account will invoke it — so that function is resolved against THIS
+        // EMULATOR'S OWN AWS Lambda before anything is written: a function Lambda answers
+        // this account does not hold, or whose resource policy admits this service's
+        // invocation nothing, is a provider that could never sign a certificate, and the
+        // create is refused with the modelled `InvalidRequestException` (HTTP 400) in the
+        // sentence that refusal states. Only what Lambda ANSWERED grounds the refusal, so a
+        // deployment with no Lambda mounted to ask refuses nothing — see
+        // `crate::state::certificate_provider_function`, which also states why no part of
+        // this request can reach an address: the hop is the emulator's own in-process
+        // callback (no socket is opened, no host name is resolved, nothing off this process
+        // is reachable) and its endpoint is built from a Region LABEL alone. The question is
+        // asked with no lock held, the way this crate's other dependency pre-flights ask
+        // theirs (`ops::create_provisioning_template`).
+        //
+        // The ARN is minted here rather than after the checks because it is the
+        // `aws:SourceArn` a grant for THIS provider is narrowed by, and it is the value the
+        // record is then persisted with, so the grant that was read and the provider that
+        // was written name one resource.
+        let certificate_provider_arn =
+            crate::state::certificate_provider_arn(&region, &input.certificate_provider_name);
+        match crate::state::validate_provider_function(
+            ctx,
+            &region,
+            &certificate_provider_arn,
+            &input.lambda_function_arn,
+        )
+        .await
+        {
+            crate::state::FunctionValidation::Denied => {
+                return Err(
+                    CreateCertificateProviderErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::lambda_validation_denied_message(
+                                &input.lambda_function_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The function is there and admits the invocation, or nothing answered about it
+            // at all; neither is a ground to refuse this create on. Stated as arms rather
+            // than as a comparison so a further outcome cannot silently read as "go ahead".
+            crate::state::FunctionValidation::Admitted
+            | crate::state::FunctionValidation::Unanswered => {}
+        }
+
         let mut store = state.lock();
 
         // The name is the provider's identity, so a name already taken is a conflict:
@@ -278,10 +326,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let certificate_provider_arn = crate::state::certificate_provider_arn(
-            &region,
-            &input.certificate_provider_name,
-        );
         let provider = crate::state::RegisteredCertificateProvider::new(
             input.certificate_provider_name,
             certificate_provider_arn,

@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let now = ::std::time::SystemTime::now();
 
@@ -179,26 +179,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let mut store = state.lock();
-
         // The name is the provider's identity, so a name the account holds no provider
         // under is the modelled `ResourceNotFoundException` (HTTP 404), worded with this
-        // family's own not-found sentence — the same refusal the readers give.
-        if !store
-            .certificate_providers
-            .contains_key(&input.certificate_provider_name)
-        {
-            return Err(
-                UpdateCertificateProviderErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::missing_certificate_provider_message(
-                            &input.certificate_provider_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // family's own not-found sentence — the same refusal the readers give. The record's
+        // ARN is read out here, under the guard, because the function pre-flight below is
+        // made for THAT provider and the guard is released before it.
+        let certificate_provider_arn = {
+            let store = state.lock();
+            let Some(provider) = store
+                .certificate_providers
+                .get(&input.certificate_provider_name)
+            else {
+                return Err(
+                    UpdateCertificateProviderErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::missing_certificate_provider_message(
+                                &input.certificate_provider_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            provider.certificate_provider_arn.clone()
+        };
+
+        // Repointing the provider at a function is the same claim the create makes about
+        // one, so it is held to the same pre-flight: a function AWS Lambda answers this
+        // account does not hold, or whose resource policy admits this service's invocation
+        // nothing, is refused with the modelled `InvalidRequestException` (HTTP 400) and
+        // NOTHING is written, rather than repointing a live provider at a function that
+        // cannot sign. The resolution is the create's own
+        // (`crate::state::certificate_provider_function`): this emulator's OWN AWS Lambda,
+        // over the in-process callback that opens no socket and resolves no host name, at
+        // an endpoint built from a Region LABEL alone, and only what Lambda ANSWERED
+        // refuses. Asked with no lock held, like the create's
+        // (`ops::create_certificate_provider`).
+        if let Some(lambda_function_arn) = input.lambda_function_arn.as_deref() {
+            match crate::state::validate_provider_function(
+                ctx,
+                &region,
+                &certificate_provider_arn,
+                lambda_function_arn,
+            )
+            .await
+            {
+                crate::state::FunctionValidation::Denied => {
+                    return Err(
+                        UpdateCertificateProviderErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(crate::state::lambda_validation_denied_message(
+                                    lambda_function_arn,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // Neither a function that admits the invocation nor a non-answer is a ground
+                // to refuse the update on; stated as arms so a further outcome cannot
+                // silently read as "go ahead".
+                crate::state::FunctionValidation::Admitted
+                | crate::state::FunctionValidation::Unanswered => {}
+            }
         }
+
+        let mut store = state.lock();
 
         // An operation has ONE account default, so claiming one ANOTHER provider holds is
         // refused and nothing is written; a provider re-stating the claim it already holds
@@ -226,11 +272,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the members the request carries change: an update states the new value of
         // what it names and leaves every other member of the stored record as it was, and
-        // the write moves the record's last-modified instant.
-        let provider = store
+        // the write moves the record's last-modified instant. The record is resolved again
+        // here because the guard was released for the pre-flight above: a provider deleted
+        // in between is a provider this update has nothing left to write to, which is the
+        // same miss the lookup above reports.
+        let Some(provider) = store
             .certificate_providers
             .get_mut(&input.certificate_provider_name)
-            .expect("the provider was found under this name above");
+        else {
+            return Err(
+                UpdateCertificateProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_certificate_provider_message(
+                            &input.certificate_provider_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
         if let Some(lambda_function_arn) = input.lambda_function_arn {
             provider.lambda_function_arn = lambda_function_arn;
         }

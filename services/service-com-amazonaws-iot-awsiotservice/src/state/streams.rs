@@ -80,6 +80,19 @@ pub fn existing_stream_message(stream_id: &str) -> String {
     format!("Requested stream {stream_id} stream already exists.")
 }
 
+/// The refusal a create whose `roleArn` names a role AWS IoT cannot assume is answered
+/// with: the modelled `InvalidRequestException` (HTTP 400).
+///
+/// A stream is READ under that role — `CreateStream$roleArn` is "An IAM role that allows
+/// the IoT service principal to access your S3 files"
+/// (`smithy_query(query="operation",operation="CreateStream")`) — so a role this service
+/// cannot take on is a stream whose files could never be served to a device. The fixed
+/// text is the sentence this error class carries, down to the full stop that closes it,
+/// and the one variable part is the role ARN the request named.
+pub fn unassumable_stream_role_message(role_arn: &str) -> String {
+    format!("Permission denied when attempting to assume role {role_arn}.")
+}
+
 /// The refusal a create whose file names an object the account's object storage holds
 /// nothing at is answered with: the modelled `InvalidRequestException` (HTTP 400).
 ///

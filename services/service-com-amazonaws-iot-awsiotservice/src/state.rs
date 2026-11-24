@@ -3542,8 +3542,8 @@ pub use fleet_metrics::{
 pub mod thing_group_membership;
 pub use thing_group_membership::{
     named_thing, named_thing_group, DynamicGroupQuery, MembershipRefusal,
-    DEFAULT_DYNAMIC_GROUP_QUERY_VERSION, DYNAMIC_GROUP_ACTIVE, MAX_DYNAMIC_THING_GROUPS,
-    MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
+    DEFAULT_DYNAMIC_GROUP_QUERY_VERSION, DYNAMIC_GROUP_ACTIVE, FLEET_INDEXING_DISABLED_MESSAGE,
+    MAX_DYNAMIC_THING_GROUPS, MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
 };
 
 // The CONNECTIVITY of one thing — which broker session belongs to a thing, what a reader
@@ -3602,6 +3602,16 @@ pub use certificate_providers::{
     CERTIFICATE_PROVIDER_OPERATIONS, MAX_CERTIFICATE_PROVIDERS,
 };
 
+// Whether the LAMBDA FUNCTION a certificate provider names is one this service could call
+// at all — the function's existence and the resource-policy grant that admits this
+// service's invocation of it — lives in `state/certificate_provider_function.rs`, beside
+// the record whose create it gates. Its names are re-exported here so a handler reaches
+// them as `crate::state::<name>`.
+pub mod certificate_provider_function;
+pub use certificate_provider_function::{
+    lambda_validation_denied_message, validate_provider_function, FunctionValidation,
+};
+
 // How a CUSTOM AUTHORIZER is RUN — the token-signature check, the event its Lambda
 // function is invoked with and the authorization answer read back out of it — lives in
 // `state/custom_authorizer.rs`, beside the authorizer record it runs.
@@ -3637,7 +3647,8 @@ pub use thing_provisioning::{
 pub mod streams;
 pub use streams::{
     absent_stream_file, absent_stream_file_message, missing_stream_message, stream_arn,
-    RegisteredStream, FIRST_STREAM_VERSION, MAX_STREAMS, MAX_STREAM_TAGS,
+    unassumable_stream_role_message, RegisteredStream, FIRST_STREAM_VERSION, MAX_STREAMS,
+    MAX_STREAM_TAGS,
 };
 
 // WHEN an authorizer may be deleted — the status a record must carry before a delete of

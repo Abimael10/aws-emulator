@@ -108,7 +108,28 @@ impl Emulator {
     }
 
     /// Create one dynamic thing group, whose membership is its query's.
+    ///
+    /// A dynamic group is a view of the THING fleet index, and AWS refuses the create
+    /// while that index is not enabled, so the index is enabled here first
+    /// (`UpdateIndexingConfiguration`, `POST /indexing/config`) — once per group, which is
+    /// idempotent because the configuration is one record for the account.
     async fn create_dynamic_group(&self, case: &str, group_name: &str) {
+        let enabled = self
+            .dispatch(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
+                })),
+            )
+            .await;
+        assert_eq!(
+            enabled.status,
+            200,
+            "case {case}: expected UpdateIndexingConfiguration to answer 200, got {} body {}",
+            enabled.status,
+            enabled.text()
+        );
         let reply = self
             .dispatch(
                 "POST",

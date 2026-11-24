@@ -252,7 +252,11 @@ async fn rest(
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory
 /// the way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+///
+/// Shared with the suites that stage a function for another half of this service to resolve
+/// (`crate::dependent_resource_preflight`), so one spelling of a deployment package serves
+/// them all.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     use std::io::Write as _;
     let mut buffer = std::io::Cursor::new(Vec::new());
     {

@@ -17,7 +17,9 @@
 //! * an operation has ONE account default: a provider claiming one another provider
 //!   holds is refused `InvalidRequestException` (400) with nothing created, and the
 //!   claim is free again as soon as the provider holding it is deleted;
-//! * a name the account holds no provider under is `ResourceNotFoundException` (404);
+//! * a name the account holds no provider under is `ResourceNotFoundException` (404) for
+//!   the readers and the update, while a DELETE of such a name has nothing left to do and
+//!   answers 200 with an empty body, as AWS answers it;
 //! * an update rewrites exactly the members the request names, leaves every other member
 //!   of the stored record as it was, and is refused `ResourceNotFoundException` (404) for
 //!   a name the account holds no provider under;
@@ -432,20 +434,26 @@ async fn one_provider_at_a_time_holds_an_operations_account_default() {
         "case the claim reclaimed: the new provider must be readable"
     );
 
-    // A delete of a provider the account does not hold is the same 404 the read is.
+    // A delete of a provider the account does not hold has nothing left to do, and AWS
+    // answers it as it answers a delete that removed a record: 200 with an empty body, so
+    // an idempotent cleanup that runs twice succeeds both times.
     let deleted_twice = emulator.delete_provider("holder").await;
     assert_eq!(
         deleted_twice.status,
-        404,
-        "case deleting a provider the account does not hold: expected 404, got {} body {}",
+        200,
+        "case deleting a provider the account does not hold: expected 200, got {} body {}",
         deleted_twice.status,
         deleted_twice.text()
     );
-    assert_eq!(
-        deleted_twice.error_message(),
-        "Certificate provider with name [holder] not found",
-        "case deleting a provider the account does not hold: got {}",
+    assert!(
+        matches!(deleted_twice.text().as_str(), "" | "{}"),
+        "case deleting a provider the account does not hold: expected an empty body, got {}",
         deleted_twice.text()
+    );
+    assert_eq!(
+        emulator.describe_provider("holder").await.status,
+        404,
+        "case deleting a provider the account does not hold: the read still reports the miss"
     );
 }
 

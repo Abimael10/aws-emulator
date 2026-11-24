@@ -148,25 +148,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // The record IS the claim on the operation's account default, so removing it is
-        // what frees that slot for the next create: nothing else has to be unwound. A
-        // name the account holds no provider under is the modelled
-        // `ResourceNotFoundException` (HTTP 404), which this operation declares.
-        let removed = state
+        // what frees that slot for the next create: nothing else has to be unwound.
+        //
+        // A name the account holds NO provider under is a delete that has nothing left to
+        // do, and AWS answers it the way it answers a delete that removed a record: 200
+        // with an empty body. The record is gone either way, which is what the caller
+        // asked for, so an idempotent cleanup that runs twice — or that runs after a
+        // create AWS refused — succeeds here as it does against AWS, and the modelled
+        // `ResourceNotFoundException` is left to the operations that have something to
+        // report about a name they cannot resolve (the readers and
+        // `UpdateCertificateProvider`).
+        state
             .lock()
             .certificate_providers
             .remove(&input.certificate_provider_name);
-        if removed.is_none() {
-            return Err(
-                DeleteCertificateProviderErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::missing_certificate_provider_message(
-                            &input.certificate_provider_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
         Ok(DeleteCertificateProviderOutput {})
     }
 }

@@ -316,14 +316,25 @@ fn cases() -> Vec<Case> {
         });
 
         // The two kinds of group share one namespace, so a DYNAMIC create under a name a
-        // static group holds is the thing-group family's collision.
+        // static group holds is the thing-group family's collision. The THING fleet index
+        // the dynamic group would be a view of is enabled first, because AWS refuses such a
+        // create outright while the account has no index.
         rows.push(Case {
             case: format!("CreateDynamicThingGroup on the registered group {name:?}"),
-            setup: vec![Call::new(
-                "POST",
-                format!("/thing-groups/{name}"),
-                Some(json!({ "thingGroupProperties": { "thingGroupDescription": "first" } })),
-            )],
+            setup: vec![
+                Call::new(
+                    "POST",
+                    "/indexing/config".to_string(),
+                    Some(json!({
+                        "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
+                    })),
+                ),
+                Call::new(
+                    "POST",
+                    format!("/thing-groups/{name}"),
+                    Some(json!({ "thingGroupProperties": { "thingGroupDescription": "first" } })),
+                ),
+            ],
             retry: Call::new(
                 "POST",
                 format!("/dynamic-thing-groups/{name}"),

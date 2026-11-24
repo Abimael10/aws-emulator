@@ -218,6 +218,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A dynamic group is a VIEW OF THE FLEET INDEX — the things it holds are the things
+        // its query selects out of that index — so the index the group names has to be one
+        // the account has: with fleet indexing not enabled there is nothing for the group
+        // to be a view of, and AWS refuses the create with the modelled
+        // `ResourceNotFoundException` (HTTP 404), telling the caller to enable the index.
+        // Read off the stored indexing configuration
+        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::fleet_index_enabled`]), which
+        // is the same record every reader of the index answers from, so a group is
+        // creatable exactly while the index it would query exists.
+        if !store.fleet_index_enabled(&index_name) {
+            return Err(
+                CreateDynamicThingGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::FLEET_INDEXING_DISABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The name is the group's identity, and the two kinds of group share one
         // namespace — the model binds `thingGroupName` as the `@httpLabel` of both
         // `/thing-groups/{thingGroupName}` and `/dynamic-thing-groups/{thingGroupName}`

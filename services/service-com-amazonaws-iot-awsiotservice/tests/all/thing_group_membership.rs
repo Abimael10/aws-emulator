@@ -106,6 +106,29 @@ impl Emulator {
         .await
     }
 
+    /// Enable the THING fleet index (`UpdateIndexingConfiguration`, `POST
+    /// /indexing/config`), which is what a dynamic thing group is a view of: with the
+    /// index not enabled AWS refuses the create, so every case below that creates one
+    /// enables it first.
+    async fn given_thing_indexing(&self) {
+        let enabled = self
+            .dispatch(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
+                })),
+            )
+            .await;
+        assert_eq!(
+            enabled.status,
+            200,
+            "thing indexing must be enabled before a dynamic group is created, got {} body {}",
+            enabled.status,
+            enabled.text()
+        );
+    }
+
     async fn delete_dynamic_group(&self, group_name: &str) -> Reply {
         self.dispatch("DELETE", &format!("/dynamic-thing-groups/{group_name}"), None)
             .await
@@ -338,6 +361,7 @@ async fn an_added_thing_is_reported_by_the_groups_own_reader() {
 #[tokio::test]
 async fn a_membership_between_records_that_do_not_exist_is_refused() {
     let emulator = Emulator::new();
+    emulator.given_thing_indexing().await;
     assert_eq!(emulator.create_thing("sensor-a").await.status, 200);
     assert_eq!(
         emulator.create_group("fleet", &json!({})).await.status,
@@ -515,6 +539,7 @@ async fn a_recursive_listing_covers_the_groups_below_it() {
 #[tokio::test]
 async fn a_group_targeted_job_runs_on_the_groups_members() {
     let emulator = Emulator::new();
+    emulator.given_thing_indexing().await;
     assert_eq!(
         emulator.create_group("fleet", &json!({})).await.status,
         200
@@ -654,6 +679,7 @@ async fn a_group_targeted_job_runs_on_the_groups_members() {
 #[tokio::test]
 async fn an_omitted_dynamic_group_default_is_recorded_and_reported() {
     let emulator = Emulator::new();
+    emulator.given_thing_indexing().await;
 
     // Each row: what the create sent beside `queryString`, and the `indexName` and
     // `queryVersion` the group is then recorded under. The defaults are the model's own
@@ -781,6 +807,7 @@ async fn an_omitted_dynamic_group_default_is_recorded_and_reported() {
 #[tokio::test]
 async fn a_dynamic_thing_group_is_its_query() {
     let emulator = Emulator::new();
+    emulator.given_thing_indexing().await;
 
     // The rows span the forms a fleet-indexing query takes: a field-qualified term, a
     // wildcard, a range, quoted text, the boolean operators and grouping.
@@ -1055,6 +1082,7 @@ async fn a_bulk_update_leaves_the_thing_in_the_groups_the_update_names() {
 #[tokio::test]
 async fn a_refused_bulk_update_changes_no_membership() {
     let emulator = Emulator::new();
+    emulator.given_thing_indexing().await;
     for group_name in ["alpha", "beta"] {
         assert_eq!(
             emulator.create_group(group_name, &json!({})).await.status,
