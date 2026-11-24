@@ -38,11 +38,16 @@ pub const MAX_JOBS: usize = 100;
 /// `CreateBrandProfileFromRegistration`, `CreateRegistrationsFromBrandProfile`,
 /// `UpdateBrandProfileFromRegistration`, `UpdateRegistrationsFromBrandProfile`). No
 /// other operation of this service starts a job, so no other value can name one.
+///
+/// Listed in the order this API states them in the refusal of any other value
+/// ([`invalid_job_operation_type`]): the pair that derives registrations from a brand
+/// profile, then the pair that derives a brand profile from a registration, the create of
+/// each before its update. Membership is all any other reader asks of the set.
 pub const JOB_OPERATION_TYPE_VALUES: &[&str] = &[
-    "CreateBrandProfileFromRegistration",
     "CreateRegistrationsFromBrandProfile",
-    "UpdateBrandProfileFromRegistration",
     "UpdateRegistrationsFromBrandProfile",
+    "CreateBrandProfileFromRegistration",
+    "UpdateBrandProfileFromRegistration",
 ];
 
 /// The `JobStatus` of a job whose work has not finished yet, as
@@ -252,15 +257,18 @@ pub fn is_job_operation_type(operation_type: &str) -> bool {
 ///
 /// `JobOperationType` declares no value set, so the gate is the service's own rather
 /// than a modelled constraint, and this API states such a refusal as a sentence of its
-/// own — the value it refused, in single quotes, and the set the value had to come from
-/// — rather than in the boundary validator's constraint envelope, which states a
-/// modelled constraint this value does not break. The fixed text is this refusal's; the
-/// variable parts are the value the request gave and the supported set. `fieldList`
-/// names the member at fault by its own name, as this service's own gates report one.
+/// own — the member it is about, the value it refused, and the set that value had to come
+/// from, the four operations pipe-separated in the order
+/// [`JOB_OPERATION_TYPE_VALUES`] lists them — rather than in the boundary validator's
+/// constraint envelope, which states a modelled constraint this value does not break.
+/// The fixed text is this refusal's; its one variable part is the value the request gave.
+/// `fieldList` names the member at fault by its own name, as this service's own gates
+/// report one.
 pub fn invalid_job_operation_type(operation_type: &str) -> crate::ops::types::ValidationException {
     let stated = format!(
-        "Invalid operationType '{operation_type}'. Supported values: {}",
-        JOB_OPERATION_TYPE_VALUES.join(", ")
+        "Invalid value for '{OPERATION_TYPE_MEMBER}': unknown operation type: \
+         {operation_type}. Valid values: {}",
+        JOB_OPERATION_TYPE_VALUES.join(" | ")
     );
     crate::ops::types::ValidationException {
         message: stated.clone(),

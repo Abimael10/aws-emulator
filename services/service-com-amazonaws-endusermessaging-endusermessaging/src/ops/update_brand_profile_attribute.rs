@@ -267,10 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which member carries an attribute's content follows from the type the STORED
         // attribute has — an update cannot change that type — so a request offering the
         // other type's member asks for something this attribute cannot hold, and is
-        // refused before any member is applied. An update replaces an attribute's content
-        // with what the request carries, so a media attribute's content comes from its
-        // media member alone here; naming a LOCATION for it is a create-time import
-        // ([`crate::ops::create_brand_profile_attributes`]), not an update.
+        // refused before any member is applied. A `TEXT` attribute stores an inline value
+        // and holds no media at all, so none may be supplied for one.
         let carries_media = crate::state::carries_media(&attribute.attribute_type);
         if !carries_media && input.attachment_body.is_some() {
             return Err(
@@ -284,17 +282,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if carries_media && input.attribute_value.is_some() {
-            return Err(
-                UpdateBrandProfileAttributeErrorModeled::ValidationException(
-                    crate::state::member_not_for_attribute_type(
-                        "/attributeValue",
-                        "attributeValue",
-                        &attribute.attribute_type,
-                    ),
-                )
-                .into(),
-            );
+        // An `IMAGE` or `DOCUMENT` attribute holds media rather than text, so its text
+        // member names WHERE that media lives — an `s3://<bucket>/<key>` object, as on the
+        // create path — and its media member carries the bytes themselves. A text value
+        // that is no such location names no content this attribute can hold either way, so
+        // it is refused before any member is applied and the stored media is left as it
+        // was.
+        if carries_media {
+            if let Some(value) = input.attribute_value.as_deref() {
+                if crate::state::media_location_key(value).is_none() {
+                    return Err(
+                        UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                            crate::state::media_attribute_content_required(
+                                "/attributeValue",
+                                &attribute.attribute_type,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            }
         }
         // The supplied media REPLACES what the attribute held, so what the store would
         // then hold is everything else plus these bytes. Past the ceiling the request is

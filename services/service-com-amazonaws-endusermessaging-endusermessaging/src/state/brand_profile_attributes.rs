@@ -246,15 +246,15 @@ pub fn invalid_category(pointer: &str, category: &str) -> crate::ops::types::Val
 
 /// The file types the media an attribute holds may be, as this API names them in the
 /// refusal of anything else, each with the MIME type that format's own signature announces
-/// ([`media_content_type`]).
+/// ([`media_content_type`]) and the file-name extension that format is downloaded under.
 ///
 /// An `IMAGE` or `DOCUMENT` attribute's media is content this API serves back to a caller
 /// (`mediaDownloadUrl`), so it holds only the formats it serves; the set is this service's
 /// own, as its refusal lists it.
-const SUPPORTED_MEDIA_FILE_TYPES: [(&str, &str); 3] = [
-    ("PDF", "application/pdf"),
-    ("JPEG", "image/jpeg"),
-    ("PNG", "image/png"),
+const SUPPORTED_MEDIA_FILE_TYPES: [(&str, &str, &str); 3] = [
+    ("PDF", "application/pdf", "pdf"),
+    ("JPEG", "image/jpeg", "jpeg"),
+    ("PNG", "image/png", "png"),
 ];
 
 /// Whether media announcing `content_type` is one of [`SUPPORTED_MEDIA_FILE_TYPES`].
@@ -268,7 +268,33 @@ const SUPPORTED_MEDIA_FILE_TYPES: [(&str, &str); 3] = [
 pub fn is_supported_media_file_type(content_type: &str) -> bool {
     SUPPORTED_MEDIA_FILE_TYPES
         .iter()
-        .any(|(_, mime)| *mime == content_type)
+        .any(|(_, mime, _)| *mime == content_type)
+}
+
+/// The file-name extension media announcing `content_type` is downloaded under, or `None`
+/// for a type no attribute's media is held as ([`SUPPORTED_MEDIA_FILE_TYPES`]).
+///
+/// A download of attribute media names the file it serves, and what names its FORMAT is the
+/// type the content's own signature announces rather than anything a request wrote: one
+/// table therefore states both the types this API holds and the extension each of them is
+/// served under.
+#[must_use]
+pub fn media_file_extension(content_type: &str) -> Option<&'static str> {
+    SUPPORTED_MEDIA_FILE_TYPES
+        .iter()
+        .find(|(_, mime, _)| *mime == content_type)
+        .map(|(_, _, extension)| *extension)
+}
+
+/// The file name a download of one attribute's media is served under: the attribute's own
+/// name, and the extension of the type its content announces
+/// ([`media_file_extension`]) where that type names one.
+#[must_use]
+pub fn attribute_media_file_name(attribute_name: &str, content_type: &str) -> String {
+    match media_file_extension(content_type) {
+        Some(extension) => format!("{attribute_name}.{extension}"),
+        None => attribute_name.to_string(),
+    }
 }
 
 /// `ValidationException` for media whose file type is not one this API holds, reported
@@ -284,7 +310,7 @@ pub fn unsupported_media_file_type(
 ) -> crate::ops::types::ValidationException {
     let allowed: Vec<&str> = SUPPORTED_MEDIA_FILE_TYPES
         .iter()
-        .map(|(label, _)| *label)
+        .map(|(label, _, _)| *label)
         .collect();
     stated_about_member(
         pointer,
@@ -348,6 +374,32 @@ pub fn attribute_value_not_a_media_location(
         format!(
             "attributeValue must be an S3 URL (s3://bucket/key) for {attribute_type} attribute \
              '{attribute_name}'"
+        ),
+    )
+}
+
+/// `ValidationException` for an UPDATE of a media attribute whose content the request names
+/// neither way, reported against the text member at `pointer`.
+///
+/// An update REPLACES the content of the attribute it addresses, and the content of an
+/// `IMAGE` or `DOCUMENT` attribute is named either by the `s3://bucket/key` location of the
+/// media in its text member or by the bytes of `attachmentBody`: a text value that is no
+/// such location names no content at all, so the request is refused before anything is
+/// written. The fixed text is the `Either attributeValue (S3 URL) or attachmentBody must be
+/// provided for … attribute` sentence; its one variable part is the type of the attribute
+/// addressed, which the request only ADDRESSES rather than describes — unlike the create
+/// path, whose sentence also names the attribute the request named
+/// ([`attribute_value_not_a_media_location`]).
+#[must_use]
+pub fn media_attribute_content_required(
+    pointer: &str,
+    attribute_type: &str,
+) -> crate::ops::types::ValidationException {
+    stated_about_member(
+        pointer,
+        format!(
+            "Either attributeValue (S3 URL) or attachmentBody must be provided for \
+             {attribute_type} attribute"
         ),
     )
 }

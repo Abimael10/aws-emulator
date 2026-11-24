@@ -663,31 +663,26 @@ async fn an_operation_type_that_starts_no_job_of_this_service_is_refused() {
             reply.error,
             reply.body
         );
-        let message = reply.body["message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case}: the refusal states a message: {:?}", reply.body));
-        assert!(
-            message.contains("operationType") && message.contains(operation_type),
-            "case {case}: the refusal must name the member and the value it refused, \
-             got {message:?}"
+        // The sentence this API words that refusal with: the member, the value it refused
+        // and the set that value had to come from, pipe-separated in the order the service
+        // lists it.
+        let expected = format!(
+            "Invalid value for 'operationType': unknown operation type: {operation_type}. \
+             Valid values: {}",
+            JOB_OPERATION_TYPE_VALUES.join(" | ")
         );
-        let field = &reply.body["fieldList"][0];
         assert_eq!(
-            field["path"].as_str(),
-            Some("operationType"),
+            reply.body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case}: unexpected refusal message, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.body["fieldList"],
+            json!([{ "path": "operationType", "message": expected }]),
             "case {case}: the refusal must point at the member it refused, got {:?}",
             reply.body
         );
-        let stated = field["message"].as_str().unwrap_or_else(|| {
-            panic!("case {case}: the listed field states a message: {:?}", reply.body)
-        });
-        for permitted in JOB_OPERATION_TYPE_VALUES {
-            assert!(
-                stated.contains(permitted),
-                "case {case}: the refusal must state the set the value had to come from, \
-                 {permitted} is missing from {stated:?}"
-            );
-        }
     }
 
     // And every operation type this service does run jobs for is served, whether or

@@ -17,7 +17,10 @@
 //!   `ListBrandProfileAttributes` report exactly what was stored;
 //! * `mediaDownloadUrl` is reported for the media an `IMAGE` or `DOCUMENT` attribute
 //!   HOLDS, and for nothing else, and a `GET` of it serves the very bytes
-//!   `attachmentBody` carried, under the media type those bytes announce;
+//!   `attachmentBody` carried, under the media type those bytes announce, named after the
+//!   attribute and that type's file extension — including after a replacement;
+//! * an update of a media attribute takes an `s3://bucket/key` location in its text member
+//!   or bytes in its media member, and refuses a text value that is neither;
 //! * an `attributeName` the profile already holds, or one the request names twice, is
 //!   `ConflictException` (409), and the batch is atomic: nothing is created;
 //! * an entry carrying content its `attributeType` does not take is `ValidationException`
@@ -82,11 +85,13 @@ impl Reply {
     }
 }
 
-/// One fetch of a published URL: the status, the media type and the bytes served.
+/// One fetch of a published URL: the status, the media type, how the download is presented
+/// and named, and the bytes served.
 #[derive(Debug)]
 struct Fetched {
     status: u16,
     content_type: Option<String>,
+    content_disposition: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -178,9 +183,15 @@ impl Emulator {
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let content_disposition = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         Fetched {
             status,
             content_type,
+            content_disposition,
             bytes: response.into_body().to_vec(),
         }
     }
@@ -389,6 +400,18 @@ fn expected_media_type(media: &[u8]) -> &'static str {
         GIF => "image/gif",
         PDF => "application/pdf",
         _ => GENERIC_MEDIA_TYPE,
+    }
+}
+
+/// The file-name extension media of each type an attribute holds is downloaded under, over
+/// the set this API serves attribute media as (`PDF`, `JPEG`, `PNG`, as
+/// `state::is_supported_media_file_type` admits them).
+fn expected_extension(media_type: &str) -> &'static str {
+    match media_type {
+        "application/pdf" => "pdf",
+        "image/jpeg" => "jpeg",
+        "image/png" => "png",
+        other => panic!("no attribute media is held as {other}"),
     }
 }
 
@@ -644,6 +667,16 @@ async fn media_is_served_from_the_url_the_service_reports() {
             Some(media_type),
             "case {case}: unexpected served media type"
         );
+        // And the download names itself: served inline, under the attribute's own name and
+        // the extension of the type the bytes announce.
+        let expected_disposition =
+            format!("inline; filename=\"Asset.{}\"", expected_extension(media_type));
+        assert_eq!(
+            fetched.content_disposition.as_deref(),
+            Some(expected_disposition.as_str()),
+            "case {case}: expected Content-Disposition {expected_disposition:?}, got {:?}",
+            fetched.content_disposition
+        );
 
         // The reader of one attribute reports the same address, and it serves the same
         // bytes.
@@ -656,6 +689,12 @@ async fn media_is_served_from_the_url_the_service_reports() {
             "case {case}: the URL a read reports must serve the same media, got {} / {} bytes",
             refetched.status,
             refetched.bytes.len()
+        );
+        assert_eq!(
+            refetched.content_disposition.as_deref(),
+            Some(expected_disposition.as_str()),
+            "case {case}: the URL a read reports must name the download too, got {:?}",
+            refetched.content_disposition
         );
     }
 }
@@ -2426,38 +2465,23 @@ async fn an_update_carrying_content_the_attribute_type_does_not_take_is_refused(
     let em = Emulator::new();
     let profile = em.profile("Update validation owner").await;
 
-    // A `TEXT` attribute holds no media and a media attribute's content is replaced through
-    // its media member, so each stored type refuses the other member — asserted for every
-    // type, and for a media attribute both with and without media already held. Each row
-    // states the member at fault and the sentence the refusal words.
+    // A `TEXT` attribute stores an inline value and holds no media at all, so an update
+    // offering one media is refused whatever the attribute already holds. Each row states
+    // the member at fault and the sentence the refusal words.
     let cases: Vec<(&str, Attribute, Value, &str, String)> = vec![
         (
-            "media on a TEXT attribute",
+            "media on a TEXT attribute holding a value",
             Attribute::text("Inline", Some("v")),
             json!({ "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PNG) }),
             "attachmentBody",
             "attachmentBody cannot be provided for TEXT attribute".to_string(),
         ),
         (
-            "an inline value on an IMAGE attribute holding media",
-            Attribute::media("Picture", "IMAGE", Some(PNG)),
-            json!({ "attributeValue": "not a picture" }),
-            "attributeValue",
-            "attributeValue cannot be provided for IMAGE attribute".to_string(),
-        ),
-        (
-            "an inline value on a DOCUMENT attribute holding no media",
-            Attribute::media("Paper", "DOCUMENT", None),
-            json!({ "attributeValue": "x" }),
-            "attributeValue",
-            "attributeValue cannot be provided for DOCUMENT attribute".to_string(),
-        ),
-        (
-            "an S3 location on a media attribute, which an update does not import",
-            Attribute::media("Imported", "IMAGE", None),
-            json!({ "attributeValue": "s3://media-bucket/logo.png" }),
-            "attributeValue",
-            "attributeValue cannot be provided for IMAGE attribute".to_string(),
+            "media on a TEXT attribute holding no value yet",
+            Attribute::text("Empty", None),
+            json!({ "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PDF) }),
+            "attachmentBody",
+            "attachmentBody cannot be provided for TEXT attribute".to_string(),
         ),
     ];
 
@@ -2497,6 +2521,281 @@ async fn an_update_carrying_content_the_attribute_type_does_not_take_is_refused(
             stored_projection(&em.get_attribute(&profile, attribute.name).await),
             stored_projection(&before),
             "case {case}: a refused update must leave the stored attribute as it was"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_of_a_media_attribute_names_its_content_by_an_s3_location_or_by_bytes() {
+    let em = Emulator::new();
+
+    // An `IMAGE` or `DOCUMENT` attribute holds media, so its text member names WHERE that
+    // media lives: an `s3://<bucket>/<key>` object, the same reading the create path has of
+    // it. The rows differ in the FORM of the value — a sentence that is no URL, the empty
+    // value the member admits, another spelling of the same object, an S3 URI naming a
+    // bucket and no object, one whose key is empty, one missing the authority separator,
+    // and another scheme's URI — and are asserted against every media type, both for an
+    // attribute already holding media and for one holding none yet.
+    let refused_values: [(&str, &str); 7] = [
+        ("a sentence that is no URL at all", "not a url"),
+        ("the empty value the member admits", ""),
+        (
+            "an HTTPS URL of the same object",
+            "https://media-bucket.s3.amazonaws.com/logo.png",
+        ),
+        ("an S3 URI naming a bucket and no object", "s3://media-bucket"),
+        ("an S3 URI whose key is empty", "s3://media-bucket/"),
+        (
+            "an S3 URI missing the authority separator",
+            "s3:/media-bucket/logo.png",
+        ),
+        ("another scheme's URI", "file:///tmp/logo.png"),
+    ];
+    let attributes: [(&str, Attribute); 4] = [
+        (
+            "an IMAGE attribute holding media",
+            Attribute::media("Logo Value", "IMAGE", Some(PNG)),
+        ),
+        (
+            "an IMAGE attribute holding no media yet",
+            Attribute::media("Pending Logo", "IMAGE", None),
+        ),
+        (
+            "a DOCUMENT attribute holding media",
+            Attribute::media("Terms", "DOCUMENT", Some(PDF)),
+        ),
+        (
+            "a DOCUMENT attribute holding no media yet",
+            Attribute::media("Pending Terms", "DOCUMENT", None),
+        ),
+    ];
+
+    for (attribute_case, attribute) in &attributes {
+        let profile = em.profile("Media content owner").await;
+        let created = em
+            .create_attributes(&profile, batch(std::slice::from_ref(attribute)))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {attribute_case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+        let before = em.get_attribute(&profile, attribute.name).await;
+        let expected = format!(
+            "Either attributeValue (S3 URL) or attachmentBody must be provided for {} attribute",
+            attribute.attribute_type
+        );
+
+        for (value_case, value) in &refused_values {
+            let case = format!("{value_case} on {attribute_case}");
+            let refused = em
+                .update_attribute(&profile, attribute.name, json!({ "attributeValue": value }))
+                .await;
+            assert_eq!(
+                (refused.status, refused.error.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case}: expected 400 ValidationException, got {} / {:?}",
+                refused.status,
+                refused.body
+            );
+            assert_eq!(
+                refused.string("message"),
+                expected,
+                "case {case}: unexpected refusal message"
+            );
+            assert_eq!(
+                refused.body["fieldList"],
+                json!([{ "path": "/attributeValue", "message": expected }]),
+                "case {case}: the refusal must name the member at fault, got {:?}",
+                refused.body
+            );
+            // The refused update wrote nothing: the media the attribute held is still
+            // reported exactly as it was, `updatedAt` included.
+            assert_eq!(
+                stored_projection(&em.get_attribute(&profile, attribute.name).await),
+                stored_projection(&before),
+                "case {case}: a refused update must leave the stored attribute as it was"
+            );
+        }
+
+        // A value that IS an object location names content the attribute can hold, so the
+        // update applies it and leaves the media the attribute holds alone.
+        for (location_case, location) in [
+            ("a key at the root of a bucket", "s3://media-bucket/logo.png"),
+            (
+                "a key nested under prefixes",
+                "s3://brand-assets/profiles/2026/logo-v2.png",
+            ),
+        ] {
+            let case = format!("{location_case} on {attribute_case}");
+            let applied = em
+                .update_attribute(
+                    &profile,
+                    attribute.name,
+                    json!({ "attributeValue": location }),
+                )
+                .await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case}: expected the update to be applied, got {} / {:?}",
+                applied.status, applied.body
+            );
+            assert_eq!(
+                applied.string("attributeValue"),
+                location,
+                "case {case}: the update must report the location it stored"
+            );
+            for member in ["mediaContentType", "mediaSizeBytes"] {
+                assert_eq!(
+                    applied.member(member),
+                    before.member(member),
+                    "case {case}: {member} must be left as it was, got {:?}",
+                    applied.member(member)
+                );
+            }
+            let read = em.get_attribute(&profile, attribute.name).await;
+            assert_eq!(
+                read.member("attributeValue"),
+                &json!(location),
+                "case {case}: a later read must report the stored location, got {:?}",
+                read.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_download_names_the_attribute_and_the_type_the_served_bytes_announce() {
+    let em = Emulator::new();
+
+    // A download of attribute media is named after the attribute it belongs to and the
+    // format the served bytes announce, whichever call last supplied those bytes. The rows
+    // differ in the attribute's type, in its name — which is what the download is named
+    // after — and in the formats before and after the replacement, including a replacement
+    // of the same format by different bytes.
+    let longer_pdf: Vec<u8> = PDF
+        .iter()
+        .copied()
+        .chain((0..4096).map(|index| (index % 251) as u8))
+        .collect();
+    let cases: Vec<(&str, Attribute, Vec<u8>, &'static str)> = vec![
+        (
+            "a JPEG image replaced by a PNG",
+            Attribute::media("logo", "IMAGE", Some(JPEG)),
+            PNG.to_vec(),
+            "image/png",
+        ),
+        (
+            "a PNG image replaced by a JPEG, under a name carrying a space",
+            Attribute::media("Brand Logo", "IMAGE", Some(PNG)),
+            JPEG.to_vec(),
+            "image/jpeg",
+        ),
+        (
+            "a PDF document replaced by a longer PDF",
+            Attribute::media("Terms_of_Service", "DOCUMENT", Some(PDF)),
+            longer_pdf,
+            "application/pdf",
+        ),
+    ];
+
+    for (case, attribute, replacement, replacement_type) in cases {
+        let profile = em.profile("Download naming owner").await;
+        let created = em
+            .create_attributes(&profile, batch(std::slice::from_ref(&attribute)))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+
+        // The download served for the media the create stored.
+        let original = attribute.media.expect("every row creates media");
+        let original_type = expected_media_type(original);
+        let url = created.attributes()[0]["mediaDownloadUrl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: no mediaDownloadUrl in {:?}", created.body))
+            .to_string();
+        let fetched = em.fetch(&url).await;
+        let expected_disposition = format!(
+            "inline; filename=\"{}.{}\"",
+            attribute.name,
+            expected_extension(original_type)
+        );
+        assert_eq!(
+            (
+                fetched.status,
+                fetched.content_type.as_deref(),
+                fetched.content_disposition.as_deref(),
+            ),
+            (
+                200,
+                Some(original_type),
+                Some(expected_disposition.as_str()),
+            ),
+            "case {case}: unexpected download of the created media, got {:?}",
+            fetched
+        );
+
+        // The replacement, which changes both the bytes served and what names them.
+        let applied = em
+            .update_attribute(
+                &profile,
+                attribute.name,
+                json!({
+                    "attachmentBody":
+                        base64::engine::general_purpose::STANDARD.encode(&replacement),
+                }),
+            )
+            .await;
+        assert_eq!(
+            applied.status, 200,
+            "case {case}: the replacement must be applied, got {} / {:?}",
+            applied.status, applied.body
+        );
+        assert_eq!(
+            (
+                applied.member("mediaContentType"),
+                applied.member("mediaSizeBytes"),
+            ),
+            (
+                &json!(replacement_type),
+                &json!(i64::try_from(replacement.len()).expect("a representable size")),
+            ),
+            "case {case}: the update must report the replacement media, got {:?}",
+            applied.body
+        );
+
+        // And the download the read now reports serves the replacement bytes, named after
+        // the attribute and the type THOSE bytes announce.
+        let read = em.get_attribute(&profile, attribute.name).await;
+        let replaced = em.fetch(&read.string("mediaDownloadUrl")).await;
+        let expected_disposition = format!(
+            "inline; filename=\"{}.{}\"",
+            attribute.name,
+            expected_extension(replacement_type)
+        );
+        assert_eq!(
+            (
+                replaced.status,
+                replaced.content_type.as_deref(),
+                replaced.content_disposition.as_deref(),
+            ),
+            (
+                200,
+                Some(replacement_type),
+                Some(expected_disposition.as_str()),
+            ),
+            "case {case}: unexpected download of the replacement media, got {} / {:?} / {:?}",
+            replaced.status,
+            replaced.content_type,
+            replaced.content_disposition
+        );
+        assert_eq!(
+            replaced.bytes, replacement,
+            "case {case}: the download must serve the replacement bytes, got {} bytes",
+            replaced.bytes.len()
         );
     }
 }

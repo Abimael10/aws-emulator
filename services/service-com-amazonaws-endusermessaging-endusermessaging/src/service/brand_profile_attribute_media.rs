@@ -22,6 +22,12 @@
 //! An attribute nothing has supplied media for serves nothing: no bytes are invented for
 //! it, so such an address names no object, exactly as an address naming an attribute or a
 //! profile the store does not hold does.
+//!
+//! What a download serves is also NAMED: the bytes are the artifact an attribute points at,
+//! so the answer carries the attribute's own name and the file extension of the type those
+//! bytes announce ([`content_disposition`]), which is what lets a caller render or save it
+//! under a name. The name follows from the attribute in the store, so a download served
+//! after an update is named exactly as the media it replaced would have been.
 
 use std::sync::Arc;
 
@@ -100,8 +106,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AttributeMediaRoute<Eng> {
         let answer = match self.claims(req) {
             Some((brand_profile_id, attribute_name)) => {
                 match self.stored_media(&brand_profile_id, &attribute_name) {
-                    Some((media_type, bytes)) => media_response(200, &media_type, bytes),
-                    None => media_response(404, PLAIN_MEDIA_TYPE, NO_MEDIA.as_bytes().to_vec()),
+                    Some((media_type, bytes)) => media_response(
+                        200,
+                        &media_type,
+                        bytes,
+                        Some(content_disposition(&attribute_name, &media_type)),
+                    ),
+                    None => media_response(
+                        404,
+                        PLAIN_MEDIA_TYPE,
+                        NO_MEDIA.as_bytes().to_vec(),
+                        None,
+                    ),
                 }
             }
             // Unreachable through an `override_operation` that hands this route only the
@@ -119,8 +135,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AttributeMediaRoute<Eng> {
     }
 }
 
-/// One download response: the bytes, their media type and their length.
-fn media_response(status: u16, media_type: &str, body: Vec<u8>) -> RtResponse {
+/// One download response: the bytes, their media type, their length and — for the media of
+/// an attribute — how the download is to be presented and named.
+fn media_response(
+    status: u16,
+    media_type: &str,
+    body: Vec<u8>,
+    disposition: Option<String>,
+) -> RtResponse {
     let length = body.len();
     let mut response = RtResponse::new(media_status(status), SdkBody::from(body));
     // Inserted through the FALLIBLE `try_insert`, never the panicking `insert`: the media
@@ -137,10 +159,33 @@ fn media_response(status: u16, media_type: &str, body: Vec<u8>) -> RtResponse {
             ::service_common::web_media_type::GENERIC_MEDIA_TYPE,
         );
     }
+    if let Some(disposition) = disposition {
+        // Fallible for the same reason: the attribute name this is built from reaches the
+        // route off the request's own path, so a name that no HTTP header value can carry
+        // leaves the media served unnamed rather than panicking inside a request.
+        let _ = response
+            .headers_mut()
+            .try_insert("content-disposition", disposition);
+    }
     let _ = response
         .headers_mut()
         .try_insert("content-length", length.to_string());
     response
+}
+
+/// How a download of one attribute's media is presented and named: served INLINE — this is
+/// the artifact the attribute points at, which a caller renders — under the attribute's own
+/// name and the file extension of the type its content announces
+/// (`crate::state::attribute_media_file_name`).
+///
+/// Built for every download this route serves, whichever call last supplied the bytes: the
+/// name follows from the attribute in the store and the type of the media it now holds, so a
+/// replacement is named exactly as the media it replaced would have been.
+fn content_disposition(attribute_name: &str, media_type: &str) -> String {
+    format!(
+        "inline; filename=\"{}\"",
+        crate::state::attribute_media_file_name(attribute_name, media_type)
+    )
 }
 
 /// A status this route answers with. Every call site passes a constant, so the conversion
