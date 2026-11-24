@@ -76,6 +76,89 @@ fn counted_from_no_executions() -> JobProcessDetails {
     }
 }
 
+/// What ONE job's executions amount to, counted record by record.
+///
+/// It is the counting half of [`job_progress`], kept apart from the job's own record so
+/// that the executions of EVERY job can be counted in ONE pass over the store
+/// ([`tally_job_executions`]) instead of walking the whole store once per job: a reader of
+/// one job and a reader of every job count the same way, and neither costs more than one
+/// pass.
+#[derive(Debug, Clone)]
+pub struct JobExecutionTally {
+    /// `Job$jobProcessDetails`: one counter per `JobExecutionStatus`.
+    details: JobProcessDetails,
+    /// How many executions were counted at all.
+    total: usize,
+    /// How many of them are still pending.
+    pending: usize,
+    /// When the last execution that is NOT pending was last written.
+    finished_at: Option<i64>,
+}
+
+impl Default for JobExecutionTally {
+    /// A tally before a single execution has been counted into it: every per-status
+    /// counter at ZERO ([`counted_from_no_executions`]), which is what a job whose
+    /// executions include none in a status reports for it.
+    fn default() -> Self {
+        Self {
+            details: counted_from_no_executions(),
+            total: 0,
+            pending: 0,
+            finished_at: None,
+        }
+    }
+}
+
+impl JobExecutionTally {
+    /// Count one execution of the job into the tally.
+    pub fn count(&mut self, record: &JobExecutionRecord) {
+        self.total += 1;
+        // The modelled `JobExecutionStatus` values
+        // (`super::types::JOB_EXECUTION_STATUS_VALUES`), each counted into the member
+        // `JobProcessDetails` declares for it.
+        let bucket = match record.status.as_str() {
+            "QUEUED" => &mut self.details.number_of_queued_things,
+            "IN_PROGRESS" => &mut self.details.number_of_in_progress_things,
+            "SUCCEEDED" => &mut self.details.number_of_succeeded_things,
+            "FAILED" => &mut self.details.number_of_failed_things,
+            "REJECTED" => &mut self.details.number_of_rejected_things,
+            "TIMED_OUT" => &mut self.details.number_of_timed_out_things,
+            "CANCELED" => &mut self.details.number_of_canceled_things,
+            "REMOVED" => &mut self.details.number_of_removed_things,
+            // A status outside the enum counts towards no bucket rather than towards
+            // the wrong one.
+            _ => return,
+        };
+        *bucket = Some(bucket.unwrap_or(0).saturating_add(1));
+        if record.is_pending() {
+            self.pending += 1;
+        } else {
+            self.finished_at = Some(
+                self.finished_at
+                    .unwrap_or(record.last_updated_at)
+                    .max(record.last_updated_at),
+            );
+        }
+    }
+}
+
+/// Every job's tally, counted in ONE pass over the shared execution store, keyed by the
+/// `jobId` each execution was queued under.
+///
+/// What a reader of MANY jobs counts with: asking [`job_progress`] per job would walk the
+/// whole store once per job, so the cost of such a listing would be the product of the two
+/// stores rather than their sum.
+pub fn tally_job_executions(executions: &JobExecutionStore) -> BTreeMap<String, JobExecutionTally> {
+    let mut tallies: BTreeMap<String, JobExecutionTally> = BTreeMap::new();
+    for record in executions.executions() {
+        tallies
+            .entry(record.job_id.clone())
+            .or_default()
+            .count(record);
+    }
+    tallies
+}
+
 /// How far a job's targets have got with it, from the executions the shared store
 /// holds.
 ///
@@ -93,40 +176,19 @@ fn counted_from_no_executions() -> JobProcessDetails {
 /// create hands every target its execution before it answers, so the member is reported
 /// for none of them ([`counted_from_no_executions`]).
 pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobProgress {
-    let mut details = counted_from_no_executions();
-    let (mut total, mut pending) = (0usize, 0usize);
-    let mut finished_at: Option<i64> = None;
+    let mut tally = JobExecutionTally::default();
     for record in executions.executions_of_job(&job.job_id) {
-        total += 1;
-        // The modelled `JobExecutionStatus` values
-        // (`super::types::JOB_EXECUTION_STATUS_VALUES`), each counted into the member
-        // `JobProcessDetails` declares for it.
-        let bucket = match record.status.as_str() {
-            "QUEUED" => &mut details.number_of_queued_things,
-            "IN_PROGRESS" => &mut details.number_of_in_progress_things,
-            "SUCCEEDED" => &mut details.number_of_succeeded_things,
-            "FAILED" => &mut details.number_of_failed_things,
-            "REJECTED" => &mut details.number_of_rejected_things,
-            "TIMED_OUT" => &mut details.number_of_timed_out_things,
-            "CANCELED" => &mut details.number_of_canceled_things,
-            "REMOVED" => &mut details.number_of_removed_things,
-            // A status outside the enum counts towards no bucket rather than towards
-            // the wrong one.
-            _ => continue,
-        };
-        *bucket = Some(bucket.unwrap_or(0).saturating_add(1));
-        if record.is_pending() {
-            pending += 1;
-        } else {
-            finished_at = Some(
-                finished_at
-                    .unwrap_or(record.last_updated_at)
-                    .max(record.last_updated_at),
-            );
-        }
+        tally.count(record);
     }
+    job_progress_from_tally(job, &tally)
+}
 
-    let completed = !job.is_terminal() && job.is_snapshot() && total > 0 && pending == 0;
+/// [`job_progress`] for a job whose executions are ALREADY counted
+/// ([`tally_job_executions`]) — the one place the rules above are applied, so a reader of
+/// one job and a reader of every job report one status for one record.
+pub fn job_progress_from_tally(job: &RegisteredJob, tally: &JobExecutionTally) -> JobProgress {
+    let completed =
+        !job.is_terminal() && job.is_snapshot() && tally.total > 0 && tally.pending == 0;
     let status = if completed {
         iot_jobs::JOB_STATUS_COMPLETED.to_string()
     } else {
@@ -144,8 +206,8 @@ pub fn job_progress(job: &RegisteredJob, executions: &JobExecutionStore) -> JobP
     JobProgress {
         status,
         // The job was completed when its last execution finished.
-        completed_at: completed.then_some(finished_at).flatten(),
-        details,
+        completed_at: completed.then_some(tally.finished_at).flatten(),
+        details: tally.details.clone(),
         is_concurrent,
     }
 }

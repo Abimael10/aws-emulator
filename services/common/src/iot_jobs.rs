@@ -294,6 +294,31 @@ impl IotJobStore {
         self.jobs.get_mut(job_id)
     }
 
+    /// Every job the account holds, in `jobId` order.
+    ///
+    /// The order is the store's own and therefore STABLE across calls, which is what lets
+    /// a lister page over it: a page boundary is a position in this order, so a later page
+    /// resumes after the job the previous one ended on however many jobs were created or
+    /// deleted in between ([`Self::jobs_after`]).
+    pub fn jobs(&self) -> impl Iterator<Item = &IotJob> {
+        self.jobs_after(None)
+    }
+
+    /// The jobs ordered strictly AFTER `after`, or every job when it is `None`.
+    ///
+    /// The resume point of a page, looked up in the store's order rather than walked to:
+    /// a listing that continues after a job does no work for the jobs before it, whatever
+    /// page it is on.
+    pub fn jobs_after(&self, after: Option<&str>) -> impl Iterator<Item = &IotJob> {
+        let start = match after {
+            Some(job_id) => std::ops::Bound::Excluded(job_id),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.jobs
+            .range::<str, _>((start, std::ops::Bound::Unbounded))
+            .map(|(_, job)| job)
+    }
+
     /// Whether a job exists under `job_id`.
     #[must_use]
     pub fn contains(&self, job_id: &str) -> bool {
@@ -413,6 +438,55 @@ mod tests {
             Some("arn:aws:iot:us-east-1:111122223333:job/deploy-1"),
             "case \"the registered id\": a reader answers the ARN the creator reported"
         );
+    }
+
+    /// RULE: the store walks every job it holds exactly once, in `jobId` order, whatever
+    /// order the creates arrived in — the stable order a lister pages over — and a page
+    /// resumes strictly after the job it ended on.
+    #[test]
+    fn every_job_is_walked_once_in_id_order() {
+        let mut store = IotJobStore::default();
+        // Ids whose create order disagrees with their order as strings, including two
+        // sharing a prefix and one differing only in case.
+        for job_id in ["deploy-10", "deploy-2", "Deploy-2", "deploy-1", "rollback"] {
+            store
+                .register(job(job_id))
+                .unwrap_or_else(|refusal| panic!("registering {job_id}: {refusal}"));
+        }
+
+        let walked: Vec<&str> = store.jobs().map(|held| held.job_id.as_str()).collect();
+        assert_eq!(
+            walked,
+            vec!["Deploy-2", "deploy-1", "deploy-10", "deploy-2", "rollback"],
+            "case \"five jobs created out of order\": expected the walk in id order, \
+             got {walked:?}"
+        );
+        assert_eq!(
+            walked.len(),
+            store.len(),
+            "case \"five jobs created out of order\": every job is walked exactly once, \
+             got {walked:?} of {} jobs",
+            store.len()
+        );
+
+        // A page resumes strictly after the job it ended on, in that same order — and an
+        // id no job carries resumes after the position it would hold.
+        for (case, after, expected) in [
+            ("the first job", Some("Deploy-2"), &walked[1..]),
+            ("the last job", Some("rollback"), &walked[5..]),
+            ("a job in the middle", Some("deploy-10"), &walked[3..]),
+            ("an id no job carries", Some("deploy-100"), &walked[3..]),
+            ("no resume point", None, &walked[..]),
+        ] {
+            let resumed: Vec<&str> = store
+                .jobs_after(after)
+                .map(|held| held.job_id.as_str())
+                .collect();
+            assert_eq!(
+                resumed, expected,
+                "case {case:?}: expected {expected:?} after {after:?}, got {resumed:?}"
+            );
+        }
     }
 
     /// Registering is bounded and reversible: one id is one job, a cancelled status is

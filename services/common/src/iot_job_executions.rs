@@ -1089,6 +1089,13 @@ impl JobExecutionStore {
         removed
     }
 
+    /// Every execution the store holds, on whichever thing it was queued on, in thing
+    /// order — what a reader of EVERY job counts in ONE pass, instead of asking per job
+    /// and walking the whole store once per job.
+    pub fn executions(&self) -> impl Iterator<Item = &JobExecutionRecord> {
+        self.things.values().flatten()
+    }
+
     /// Every execution of `job_id`, on whichever thing it was queued on, in thing
     /// order — what a reader of the JOB counts to report how its targets are getting
     /// on with it.
@@ -1222,6 +1229,25 @@ impl JobExecutionStore {
         };
         let mut moved = 0usize;
         for record in executions.iter_mut() {
+            if record.time_out_if_due(now) {
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// Materialise the `TIMED_OUT` transition EVERY execution the store holds has
+    /// already come due for, and answer how many moved — the store-wide counterpart of
+    /// [`Self::time_out_due_executions_of_job`], for a reader of every job at once,
+    /// which would otherwise ask job by job and walk the whole store once per job.
+    ///
+    /// See [`JobExecutionRecord::time_out_if_due`] for why a reporting handler may write
+    /// it: each move was owed at that execution's own deadline, whether or not this call
+    /// happened, so materialising them all at one instant is what keeps every reader of
+    /// the store agreeing about the status each execution is in.
+    pub fn time_out_due_executions_everywhere(&mut self, now: i64) -> usize {
+        let mut moved = 0usize;
+        for record in self.things.values_mut().flatten() {
             if record.time_out_if_due(now) {
                 moved += 1;
             }
