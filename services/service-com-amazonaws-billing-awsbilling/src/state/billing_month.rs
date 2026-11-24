@@ -7,9 +7,11 @@
 //! (`^\d{4}-(0[1-9]|1[0-2])$`), compares it with the month the clock is in and
 //! reports the UTC period its charges accrued in, so that reading of a month —
 //! the parse, the clock's month and the comparison of the two
-//! ([`requested_month`]), and the past-month gate the Enterprise Support reads
-//! apply to it ([`require_past_billing_month`]) — lives here rather than beside
-//! each handler.
+//! ([`requested_month`]), and the gate each report applies to that placement:
+//! the current-or-earlier gate the Business Support reads apply
+//! ([`require_current_or_past_billing_month`]) and the past-month gate of the
+//! Enterprise Support reads ([`require_past_billing_month`]) — lives here
+//! rather than beside each handler.
 //!
 //! The same civil-calendar arithmetic answers how wide "one calendar month" is
 //! from a given instant ([`one_calendar_month_after`]), which is the bound
@@ -192,6 +194,31 @@ pub fn requested_month(
         ::std::cmp::Ordering::Equal => RequestedMonth::Current,
         ::std::cmp::Ordering::Greater => RequestedMonth::Future,
     })
+}
+
+/// The gate the modeled `BusinessSupportBillingMonth` states: "Supports the
+/// current month (estimated charges) and past months (finalized charges)."
+///
+/// A month that has not begun is neither, so it is refused rather than answered
+/// with an empty month: a caller that mistyped a month cannot tell such an
+/// answer from a month that genuinely records nothing. Every read whose month
+/// targets that shape applies the gate through here — the way the Enterprise
+/// Support reads apply theirs through [`require_past_billing_month`] — so all of
+/// them refuse the same months, naming the same member and the same constraint,
+/// and the placement the gate already made is handed back for a caller that
+/// also reports whether the month's charges are still estimated.
+pub fn require_current_or_past_billing_month(
+    billing_month: &str,
+    at: ::std::time::SystemTime,
+) -> Result<RequestedMonth, BillingMonthRefusal> {
+    let requested = requested_month(billing_month, at)?;
+    if requested == RequestedMonth::Future {
+        return Err(BillingMonthRefusal::InvalidField {
+            member: BILLING_MONTH_MEMBER,
+            constraint: "must be the current billing month or an earlier one",
+        });
+    }
+    Ok(requested)
 }
 
 /// The gate the modeled `EnterpriseSupportBillingMonth` states: "This must be a

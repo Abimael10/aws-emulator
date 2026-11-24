@@ -20,6 +20,12 @@
 //! filtered to one account when the request names one, ascending by account and
 //! then by contract start, and paged by `maxResults`/`nextToken`.
 //!
+//! The month a request names is one the shared `BusinessSupportBillingMonth`
+//! shape documents support for — the current month or an earlier one — so a
+//! month that has not begun is refused with the modeled `ValidationException`
+//! rather than answered with an empty history, the same gate the charge report
+//! of that month applies.
+//!
 //! NOTE: nothing in this emulator writes those bills yet — spend and its
 //! subscription accrue from a billing run, and the emulator performs none. So
 //! on a running emulator this reports no contracts until an operation that
@@ -211,14 +217,29 @@ fn resume_key(
 /// `billingMonth` doc, "If you don't specify a value, defaults to the current
 /// month" — the month the clock is in.
 ///
-/// `None` only when the clock names no month, which the caller answers as a
-/// server error rather than as an empty history.
-fn requested_month(billing_month: Option<&str>) -> Option<String> {
-    if let Some(month) = billing_month {
-        return Some(month.to_string());
-    }
-    let (year, month) = crate::state::billing_period(::std::time::SystemTime::now())?;
-    Some(format!("{year:04}-{month:02}"))
+/// A month a caller named is then placed against the clock by the one gate in
+/// `crate::state` every read of a modeled `BusinessSupportBillingMonth`
+/// applies, so this history answers for exactly the months that shape documents
+/// support for — the current month and past ones — and a month that has not
+/// begun is refused rather than answered with an empty history. The month the
+/// clock is in passes that gate by construction.
+fn resolved_billing_month(
+    billing_month: Option<&str>,
+    at: ::std::time::SystemTime,
+) -> Result<String, crate::state::BillingMonthRefusal> {
+    let month = match billing_month {
+        Some(month) => month.to_string(),
+        None => {
+            let (year, month) = crate::state::billing_period(at).ok_or(
+                crate::state::BillingMonthRefusal::Unavailable {
+                    what: "the current billing month",
+                },
+            )?;
+            format!("{year:04}-{month:02}")
+        }
+    };
+    crate::state::require_current_or_past_billing_month(&month, at)?;
+    Ok(month)
 }
 
 impl<Eng> ListBusinessSupportSubscriptionHistory<Eng> {
@@ -250,7 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every modeled constraint (the `billingMonth` and `accountId`
         // patterns, `maxResults` 1..100, the `nextToken` pattern and length) is
         // refused by the boundary validator before this runs; what is checked
-        // here is the documented relationship between the two dates.
+        // here is which months the operation documents answers for, and the
+        // documented relationship between the two dates.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBusinessSupportSubscriptionHistoryErrorModeled::InternalServerException(
@@ -263,12 +285,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reading the same history see the same answer.
         let state = state.lock();
 
-        let billing_month = requested_month(input.billing_month.as_deref()).ok_or_else(|| {
-            ListBusinessSupportSubscriptionHistoryErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the current billing month is unavailable".to_string(),
-                },
-            )
+        let billing_month = resolved_billing_month(
+            input.billing_month.as_deref(),
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|refusal| match refusal {
+            crate::state::BillingMonthRefusal::InvalidField { member, constraint } => {
+                invalid_field(member, constraint)
+            }
+            crate::state::BillingMonthRefusal::Unavailable { what } => {
+                ListBusinessSupportSubscriptionHistoryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!("{what} is unavailable"),
+                    },
+                )
+                .into()
+            }
         })?;
         let (month_start, month_end) = crate::state::month_period(&billing_month)
             .ok_or_else(|| invalid_field("billingMonth", "must name a calendar month"))?;

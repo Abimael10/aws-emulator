@@ -180,8 +180,8 @@ const MAX_SPEND_BY_SERVICE_LINES: usize = 50;
 // service's other charge report — amounts in minor units
 // (`crate::state::MINOR_UNITS_PER_UNIT`) and rates in basis points.
 use crate::state::{
-    amount, apply_rate, month_period, rate_decimal, requested_month, BillingMonthRefusal,
-    RequestedMonth, MINOR_UNITS_PER_UNIT,
+    amount, apply_rate, month_period, rate_decimal, require_current_or_past_billing_month,
+    BillingMonthRefusal, RequestedMonth, MINOR_UNITS_PER_UNIT,
 };
 
 /// One tier of a Support plan's monthly price: the top of the spend slice it
@@ -479,35 +479,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reading the same month see the same answer.
         let state = state.lock();
 
-        // Where the requested month sits relative to the month the clock is in,
-        // decided by the one placement in `crate::state` this service's charge
-        // reports share; what this operation's `billingMonth` doc admits of
-        // that placement is its own.
-        let requested = requested_month(&input.billing_month, ::std::time::SystemTime::now())
-            .map_err(|refusal| match refusal {
-                BillingMonthRefusal::InvalidField { member, constraint } => {
-                    invalid_field(member, constraint)
-                }
-                BillingMonthRefusal::Unavailable { what } => {
-                    ListBusinessSupportAccountChargesErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: format!("{what} is unavailable"),
-                        },
-                    )
-                    .into()
-                }
-            })?;
-        // The `billingMonth` doc: "You can request the current month (charges
-        // will be estimated) or a past month (charges will be finalized)" — a
-        // month that has not begun is neither, so it is refused rather than
-        // answered with an empty one, and the current month is exactly the one
-        // whose charges are still estimated.
-        if requested == RequestedMonth::Future {
-            return Err(invalid_field(
-                "billingMonth",
-                "must be the current billing month or an earlier one",
-            ));
-        }
+        // Which months this read answers for, decided by the one gate in
+        // `crate::state` every read of a modeled `BusinessSupportBillingMonth`
+        // applies: the shape documents the current month (estimated charges)
+        // and past months (finalized charges), so a month that has not begun is
+        // neither and is refused rather than answered with an empty one. The
+        // placement it hands back says which of the two the month is, and the
+        // current month is exactly the one whose charges are still estimated.
+        let requested = require_current_or_past_billing_month(
+            &input.billing_month,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|refusal| match refusal {
+            BillingMonthRefusal::InvalidField { member, constraint } => {
+                invalid_field(member, constraint)
+            }
+            BillingMonthRefusal::Unavailable { what } => {
+                ListBusinessSupportAccountChargesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!("{what} is unavailable"),
+                    },
+                )
+                .into()
+            }
+        })?;
         let is_estimated = requested == RequestedMonth::Current;
 
         // The key the store's tokens are authenticated under, taken off the

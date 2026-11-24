@@ -789,3 +789,146 @@ async fn refuses_a_request_it_cannot_answer() {
         }
     }
 }
+
+/// The refusal a month that has not begun earns, in the wording every read of a
+/// modeled `BusinessSupportBillingMonth` answers it with.
+const FUTURE_MONTH_REFUSAL: &str = "InvalidArgument: billingMonth \
+     (DetailedCode=billingMonth must be the current billing month or an earlier one)";
+
+/// Which months this read answers for.
+///
+/// Source: the doc of the `BusinessSupportBillingMonth` shape both this
+/// operation's and `ListBusinessSupportAccountCharges`' `billingMonth` targets —
+/// "A billing month in YYYY-MM format. Supports the current month (estimated
+/// charges) and past months (finalized charges)." A month that has not begun is
+/// neither, so it is refused rather than answered with an empty history, which a
+/// caller that mistyped a month could not tell from a month that genuinely
+/// records no contracts.
+///
+/// The rows span the months on both sides of the clock — the month it is in, the
+/// months before it, the omitted member the doc makes the current month, and
+/// months one, two and thirteen ahead plus a mistyped year — and none of them is
+/// the month the derivation table asks about.
+#[tokio::test]
+async fn answers_only_the_months_the_billing_month_shape_supports() {
+    let (router, engine) = emulator();
+    persist(&engine, &[(caller_account_id(), MARCH, SUPPORT_PLAN_BUSINESS)]);
+
+    let supported: Vec<(String, Value)> = vec![
+        (
+            "the current month".to_string(),
+            json!({ "billingMonth": month_from_now(0) }),
+        ),
+        (
+            "one month back".to_string(),
+            json!({ "billingMonth": month_from_now(-1) }),
+        ),
+        (
+            "thirteen months back".to_string(),
+            json!({ "billingMonth": month_from_now(-13) }),
+        ),
+        (
+            "a long-past month, which holds the seeded contract".to_string(),
+            json!({ "billingMonth": MARCH }),
+        ),
+        (
+            "no billingMonth, the documented default of the current month".to_string(),
+            json!({}),
+        ),
+    ];
+    for (case, request) in supported {
+        let (status, body) = history(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 for {request}, got {status} {body}"
+        );
+        assert!(
+            body["subscriptionContracts"].is_array(),
+            "case {case:?}: expected a reported history, got {body}"
+        );
+    }
+    // The supported month that holds the seeded bill answers with its contract,
+    // so a 200 above is an answer about the month and not an empty page.
+    let (_, march) = history(&router, &json!({ "billingMonth": MARCH })).await;
+    assert_eq!(
+        reported(&march),
+        vec![(
+            caller_account_id().to_string(),
+            SUPPORT_PLAN_BUSINESS.to_string(),
+            instant("2024-03-01T00:00:00Z"),
+            instant("2024-04-01T00:00:00Z"),
+        )],
+        "case \"a long-past month, which holds the seeded contract\": expected the seeded contract, got {march}"
+    );
+
+    for offset in [1_i32, 2, 13] {
+        let future = month_from_now(offset);
+        let case = format!("{offset} months ahead");
+        let (status, body) = history(&router, &json!({ "billingMonth": future })).await;
+        // The calendar can turn over between naming the month and the answer,
+        // which would make the month named a supported one; only a month still
+        // ahead of the clock is the case under test.
+        if month_from_now(offset) != future {
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {future}, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException for {future}, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(FUTURE_MONTH_REFUSAL),
+            "case {case:?}: expected the refusal message {FUTURE_MONTH_REFUSAL:?}, got {body}"
+        );
+        assert_eq!(
+            body["fieldList"][0]["name"].as_str(),
+            Some("billingMonth"),
+            "case {case:?}: expected the refusal to name billingMonth, got {body}"
+        );
+    }
+
+    // A mistyped year names a month far past any clock this emulator runs under,
+    // so it is refused whatever the date is.
+    let case = "a mistyped year";
+    let (status, body) = history(&router, &json!({ "billingMonth": "2999-12" })).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(FUTURE_MONTH_REFUSAL),
+        "case {case:?}: expected the refusal message {FUTURE_MONTH_REFUSAL:?}, got {body}"
+    );
+
+    // One rule, one wording: the charge report whose `billingMonth` targets the
+    // same shape refuses the same month the same way.
+    let (charges_status, charges_body) = call(
+        &router,
+        "ListBusinessSupportAccountCharges",
+        &json!({ "billingMonth": "2999-12" }),
+    )
+    .await;
+    assert_eq!(
+        charges_status, 400,
+        "case \"the sibling read of the same shape\": expected HTTP 400, got {charges_status} {charges_body}"
+    );
+    assert_eq!(
+        charges_body["message"].as_str(),
+        Some(FUTURE_MONTH_REFUSAL),
+        "case \"the sibling read of the same shape\": expected the refusal message \
+         {FUTURE_MONTH_REFUSAL:?}, got {charges_body}"
+    );
+
+    assert_eq!(
+        resident(&engine),
+        1,
+        "case \"reads do not write\": expected the one seeded record, got {}",
+        resident(&engine)
+    );
+}
