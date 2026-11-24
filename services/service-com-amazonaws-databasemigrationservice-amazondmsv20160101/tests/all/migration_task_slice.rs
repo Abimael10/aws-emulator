@@ -3,7 +3,8 @@
 //! End-to-end cover for the DMS migration-task slice this crate implements:
 //! `CreateReplicationInstance`, `CreateEndpoint`, `CreateReplicationTask`,
 //! `DescribeReplicationInstances`, `DescribeEndpoints`, `DescribeReplicationTasks`,
-//! `StartReplicationTask`, `DeleteReplicationTask` and `DeleteEndpoint`.
+//! `ModifyReplicationInstance`, `StartReplicationTask`, `DeleteReplicationTask` and
+//! `DeleteEndpoint`.
 //!
 //! Every case drives the real wire path — `POST /` with
 //! `X-Amz-Target: AmazonDMSv20160101.<Operation>` through the multi-service router — so
@@ -15,9 +16,10 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
-    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, INSTANCE_DELETING, LOG_COMPONENTS,
-    LOG_SEVERITY_DEFAULT, MAX_RECORDS_MAX, MAX_RECORDS_MIN, RESOURCE_IDENTIFIER_MAX_LEN,
-    TRANSITION_DELAY,
+    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, INSTANCE_DELETING,
+    INSTANCE_IDENTIFIER_MAX_LEN, INSTANCE_MODIFYING, LOG_COMPONENTS, LOG_SEVERITY_DEFAULT,
+    MAX_RECORDS_MAX, MAX_RECORDS_MIN, NETWORK_TYPE_DUAL, NETWORK_TYPE_IPV4,
+    RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
 };
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -2409,12 +2411,13 @@ async fn poll_until_no_instance_matches(emulator: &Emulator, case: &str, request
     }
 }
 
-/// Push every removal the store still owes a replication instance an hour out, so a case
-/// about the `deleting` state a delete creates reads that state.
+/// Push every transition the store still owes a replication instance an hour out, so a
+/// case about the transient state a call created — the `deleting` span of a delete, the
+/// `modifying` span of a modify applied immediately — reads that state.
 ///
-/// This writes only the due instant the emulator itself stores; the removal is still
+/// This writes only the due instant the emulator itself stores; the transition is still
 /// applied by the store's own settling on the next request, exactly as in production.
-fn hold_instance_removals(engine: &engine::InMemoryEngine) {
+fn hold_instance_transitions(engine: &engine::InMemoryEngine) {
     let store = engine.state::<
         service_com_amazonaws_databasemigrationservice_amazondmsv20160101::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
     >();
@@ -2556,7 +2559,7 @@ async fn a_deleting_replication_instance_is_still_held_until_its_removal_falls_d
         .await;
     // Hold the removal the store owes, so the case reads the state the delete created
     // rather than whichever side of the span the host happened to land on.
-    hold_instance_removals(emulator.engine());
+    hold_instance_transitions(emulator.engine());
 
     let described = emulator
         .ok(
@@ -3221,4 +3224,825 @@ async fn a_report_narrowed_to_a_task_the_account_does_not_hold_is_refused() {
         json!([{ "Name": "replication-task-arn", "Values": [task_arn] }]),
     )
     .await;
+}
+
+// ---- ModifyReplicationInstance --------------------------------------------------------
+//
+// The rule: a modify applies the settings its request names to the replication instance
+// its `ReplicationInstanceArn` resolves to, and the instance it answers with is read back
+// out of the store, so every later read reports the same. A setting whose change needs an
+// outage — each member `ReplicationPendingModifiedValues` models — is applied at once only
+// when `ApplyImmediately` is set, and is otherwise reported as a pending modified value
+// while the instance keeps running with the value it already holds; every other setting is
+// applied "as soon as possible" either way. An instance really applying a change is
+// `modifying` until the change is through, and an ARN that resolves to no instance of the
+// account is refused as a resource DMS could not find, with nothing written.
+//
+// The rows span what the rule generalises over: which member changes (compute, storage,
+// engine version, deployment, addressing, identifier, maintenance window, automatic minor
+// upgrades, security groups, kerberos settings), how many change in one call, whether the
+// call asks for the change immediately or leaves it for the maintenance window, and
+// whether the value even differs from the one the instance holds.
+
+/// The compute capacity every modify case starts from.
+const BASELINE_CLASS: &str = "dms.t3.medium";
+
+/// The storage every modify case starts from, in gigabytes.
+const BASELINE_STORAGE: i64 = 100;
+
+/// The engine version every modify case starts from.
+const BASELINE_ENGINE_VERSION: &str = "3.5.4";
+
+/// A version of the SAME major engine version, which needs no upgrade permission.
+const NEWER_MINOR_VERSION: &str = "3.6.1";
+
+/// A version of ANOTHER major engine version, which `AllowMajorVersionUpgrade` governs.
+const NEWER_MAJOR_VERSION: &str = "4.0.0";
+
+/// The maintenance window every modify case starts from, in the documented
+/// `ddd:hh24:mi-ddd:hh24:mi` format.
+const BASELINE_WINDOW: &str = "sun:03:00-sun:03:30";
+
+/// The replication instance every modify case is applied to: one instance, with an
+/// explicit value for each setting a modify can change, so a case asserts a CHANGE rather
+/// than a default.
+fn modify_baseline(identifier: &str) -> Value {
+    json!({
+        "ReplicationInstanceIdentifier": identifier,
+        "ReplicationInstanceClass": BASELINE_CLASS,
+        "AllocatedStorage": BASELINE_STORAGE,
+        "EngineVersion": BASELINE_ENGINE_VERSION,
+        "MultiAZ": false,
+        "NetworkType": NETWORK_TYPE_IPV4,
+        "PreferredMaintenanceWindow": BASELINE_WINDOW,
+        "AutoMinorVersionUpgrade": true,
+    })
+}
+
+/// The value at `pointer` in `value`, or `Value::Null` where there is none: a member a
+/// response omits and one it reports as null say the same thing about the resource.
+fn member_at(value: &Value, pointer: &str) -> Value {
+    value.pointer(pointer).cloned().unwrap_or(Value::Null)
+}
+
+/// One `ModifyReplicationInstance` call the rule is asserted over.
+struct ModifyRow {
+    /// What this row varies, named in every assertion of it.
+    case: &'static str,
+    /// The members the call carries beside `ReplicationInstanceArn`.
+    request: Value,
+    /// What the instance the modify ANSWERS WITH must report, as `(pointer, value)` into
+    /// the reported instance.
+    answered: Vec<(&'static str, Value)>,
+    /// What a later read must report once every transition the modify owes has settled.
+    settled: Vec<(&'static str, Value)>,
+}
+
+/// Every modify case, each over the baseline instance above.
+fn modify_rows() -> Vec<ModifyRow> {
+    let standby = json!(format!("{REGION}b"));
+    vec![
+        ModifyRow {
+            case: "a compute change applied immediately",
+            request: json!({ "ReplicationInstanceClass": "dms.c5.large", "ApplyImmediately": true }),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!("dms.c5.large")),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceClass", json!("dms.c5.large")),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+        },
+        ModifyRow {
+            case: "a compute change left for the maintenance window",
+            request: json!({ "ReplicationInstanceClass": "dms.c5.large" }),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                (
+                    "/PendingModifiedValues/ReplicationInstanceClass",
+                    json!("dms.c5.large"),
+                ),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                (
+                    "/PendingModifiedValues/ReplicationInstanceClass",
+                    json!("dms.c5.large"),
+                ),
+            ],
+        },
+        ModifyRow {
+            case: "more storage applied immediately",
+            request: json!({ "AllocatedStorage": 200, "ApplyImmediately": true }),
+            answered: vec![
+                ("/AllocatedStorage", json!(200)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+            ],
+            settled: vec![
+                ("/AllocatedStorage", json!(200)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+        },
+        ModifyRow {
+            case: "more storage left for the maintenance window",
+            request: json!({ "AllocatedStorage": 200 }),
+            answered: vec![
+                ("/AllocatedStorage", json!(BASELINE_STORAGE)),
+                ("/PendingModifiedValues/AllocatedStorage", json!(200)),
+            ],
+            settled: vec![
+                ("/AllocatedStorage", json!(BASELINE_STORAGE)),
+                ("/PendingModifiedValues/AllocatedStorage", json!(200)),
+            ],
+        },
+        ModifyRow {
+            case: "a newer minor engine version applied immediately",
+            request: json!({ "EngineVersion": NEWER_MINOR_VERSION, "ApplyImmediately": true }),
+            answered: vec![
+                ("/EngineVersion", json!(NEWER_MINOR_VERSION)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+            ],
+            settled: vec![
+                ("/EngineVersion", json!(NEWER_MINOR_VERSION)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+            ],
+        },
+        ModifyRow {
+            case: "a newer minor engine version left for the maintenance window",
+            request: json!({ "EngineVersion": NEWER_MINOR_VERSION }),
+            answered: vec![
+                ("/EngineVersion", json!(BASELINE_ENGINE_VERSION)),
+                (
+                    "/PendingModifiedValues/EngineVersion",
+                    json!(NEWER_MINOR_VERSION),
+                ),
+            ],
+            settled: vec![
+                ("/EngineVersion", json!(BASELINE_ENGINE_VERSION)),
+                (
+                    "/PendingModifiedValues/EngineVersion",
+                    json!(NEWER_MINOR_VERSION),
+                ),
+            ],
+        },
+        ModifyRow {
+            case: "another major engine version, with the upgrade allowed",
+            request: json!({
+                "EngineVersion": NEWER_MAJOR_VERSION,
+                "AllowMajorVersionUpgrade": true,
+                "ApplyImmediately": true,
+            }),
+            answered: vec![
+                ("/EngineVersion", json!(NEWER_MAJOR_VERSION)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+            ],
+            settled: vec![
+                ("/EngineVersion", json!(NEWER_MAJOR_VERSION)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+            ],
+        },
+        ModifyRow {
+            case: "a Multi-AZ deployment applied immediately",
+            request: json!({ "MultiAZ": true, "ApplyImmediately": true }),
+            answered: vec![
+                ("/MultiAZ", json!(true)),
+                ("/SecondaryAvailabilityZone", standby.clone()),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+            ],
+            settled: vec![
+                ("/MultiAZ", json!(true)),
+                ("/SecondaryAvailabilityZone", standby.clone()),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+            ],
+        },
+        ModifyRow {
+            case: "a Multi-AZ deployment left for the maintenance window",
+            request: json!({ "MultiAZ": true }),
+            answered: vec![
+                ("/MultiAZ", json!(false)),
+                ("/SecondaryAvailabilityZone", json!(null)),
+                ("/PendingModifiedValues/MultiAZ", json!(true)),
+            ],
+            settled: vec![
+                ("/MultiAZ", json!(false)),
+                ("/PendingModifiedValues/MultiAZ", json!(true)),
+            ],
+        },
+        ModifyRow {
+            case: "dual-stack addressing applied immediately",
+            request: json!({ "NetworkType": NETWORK_TYPE_DUAL, "ApplyImmediately": true }),
+            answered: vec![
+                ("/NetworkType", json!(NETWORK_TYPE_DUAL)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+            ],
+            settled: vec![
+                ("/NetworkType", json!(NETWORK_TYPE_DUAL)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+            ],
+        },
+        ModifyRow {
+            case: "dual-stack addressing left for the maintenance window",
+            request: json!({ "NetworkType": NETWORK_TYPE_DUAL }),
+            answered: vec![
+                ("/NetworkType", json!(NETWORK_TYPE_IPV4)),
+                (
+                    "/PendingModifiedValues/NetworkType",
+                    json!(NETWORK_TYPE_DUAL),
+                ),
+            ],
+            settled: vec![
+                ("/NetworkType", json!(NETWORK_TYPE_IPV4)),
+                (
+                    "/PendingModifiedValues/NetworkType",
+                    json!(NETWORK_TYPE_DUAL),
+                ),
+            ],
+        },
+        ModifyRow {
+            // The identifier is not a member `ReplicationPendingModifiedValues` models, so
+            // the rename needs no outage and is applied without `ApplyImmediately`. "This
+            // parameter is stored as a lowercase string".
+            case: "a rename, which needs no outage",
+            request: json!({ "ReplicationInstanceIdentifier": "Renamed-Rep-Instance" }),
+            answered: vec![
+                (
+                    "/ReplicationInstanceIdentifier",
+                    json!("renamed-rep-instance"),
+                ),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![(
+                "/ReplicationInstanceIdentifier",
+                json!("renamed-rep-instance"),
+            )],
+        },
+        ModifyRow {
+            case: "the maintenance window and automatic minor upgrades, which need no outage",
+            request: json!({
+                "PreferredMaintenanceWindow": "tue:04:30-tue:05:30",
+                "AutoMinorVersionUpgrade": false,
+            }),
+            answered: vec![
+                (
+                    "/PreferredMaintenanceWindow",
+                    json!("tue:04:30-tue:05:30"),
+                ),
+                ("/AutoMinorVersionUpgrade", json!(false)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                (
+                    "/PreferredMaintenanceWindow",
+                    json!("tue:04:30-tue:05:30"),
+                ),
+                ("/AutoMinorVersionUpgrade", json!(false)),
+            ],
+        },
+        ModifyRow {
+            case: "the VPC security groups the instance works with",
+            request: json!({
+                "VpcSecurityGroupIds": ["sg-0dms0000000000001", "sg-0dms0000000000002"],
+            }),
+            answered: vec![
+                (
+                    "/VpcSecurityGroups/0/VpcSecurityGroupId",
+                    json!("sg-0dms0000000000001"),
+                ),
+                ("/VpcSecurityGroups/0/Status", json!("active")),
+                (
+                    "/VpcSecurityGroups/1/VpcSecurityGroupId",
+                    json!("sg-0dms0000000000002"),
+                ),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                (
+                    "/VpcSecurityGroups/0/VpcSecurityGroupId",
+                    json!("sg-0dms0000000000001"),
+                ),
+                (
+                    "/VpcSecurityGroups/1/VpcSecurityGroupId",
+                    json!("sg-0dms0000000000002"),
+                ),
+            ],
+        },
+        ModifyRow {
+            case: "the kerberos authentication settings the instance replicates with",
+            request: json!({
+                "KerberosAuthenticationSettings": {
+                    "KeyCacheSecretId": "dms-kerberos-cache",
+                    "KeyCacheSecretIamArn": "arn:aws:iam::000000000000:role/dms-kerberos",
+                },
+            }),
+            answered: vec![
+                (
+                    "/KerberosAuthenticationSettings/KeyCacheSecretId",
+                    json!("dms-kerberos-cache"),
+                ),
+                (
+                    "/KerberosAuthenticationSettings/KeyCacheSecretIamArn",
+                    json!("arn:aws:iam::000000000000:role/dms-kerberos"),
+                ),
+            ],
+            settled: vec![(
+                "/KerberosAuthenticationSettings/KeyCacheSecretId",
+                json!("dms-kerberos-cache"),
+            )],
+        },
+        ModifyRow {
+            case: "a request that names nothing but the instance",
+            request: json!({}),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/AllocatedStorage", json!(BASELINE_STORAGE)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+        },
+        ModifyRow {
+            // Nothing CHANGES, so there is no outage to take and nothing to wait for,
+            // whatever `ApplyImmediately` said.
+            case: "the values the instance already holds",
+            request: json!({
+                "ReplicationInstanceClass": BASELINE_CLASS,
+                "AllocatedStorage": BASELINE_STORAGE,
+                "ApplyImmediately": true,
+            }),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+        },
+        ModifyRow {
+            case: "four settings at once, applied immediately",
+            request: json!({
+                "ReplicationInstanceClass": "dms.r5.large",
+                "AllocatedStorage": 300,
+                "EngineVersion": NEWER_MINOR_VERSION,
+                "NetworkType": NETWORK_TYPE_DUAL,
+                "ApplyImmediately": true,
+            }),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!("dms.r5.large")),
+                ("/AllocatedStorage", json!(300)),
+                ("/EngineVersion", json!(NEWER_MINOR_VERSION)),
+                ("/NetworkType", json!(NETWORK_TYPE_DUAL)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_MODIFYING)),
+                ("/PendingModifiedValues", json!(null)),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceClass", json!("dms.r5.large")),
+                ("/AllocatedStorage", json!(300)),
+                ("/EngineVersion", json!(NEWER_MINOR_VERSION)),
+                ("/NetworkType", json!(NETWORK_TYPE_DUAL)),
+                ("/ReplicationInstanceStatus", json!(INSTANCE_AVAILABLE)),
+            ],
+        },
+        ModifyRow {
+            case: "four settings at once, left for the maintenance window",
+            request: json!({
+                "ReplicationInstanceClass": "dms.r5.large",
+                "AllocatedStorage": 300,
+                "EngineVersion": NEWER_MINOR_VERSION,
+                "MultiAZ": true,
+            }),
+            answered: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                ("/AllocatedStorage", json!(BASELINE_STORAGE)),
+                ("/EngineVersion", json!(BASELINE_ENGINE_VERSION)),
+                ("/MultiAZ", json!(false)),
+                (
+                    "/PendingModifiedValues/ReplicationInstanceClass",
+                    json!("dms.r5.large"),
+                ),
+                ("/PendingModifiedValues/AllocatedStorage", json!(300)),
+                (
+                    "/PendingModifiedValues/EngineVersion",
+                    json!(NEWER_MINOR_VERSION),
+                ),
+                ("/PendingModifiedValues/MultiAZ", json!(true)),
+            ],
+            settled: vec![
+                ("/ReplicationInstanceClass", json!(BASELINE_CLASS)),
+                (
+                    "/PendingModifiedValues/ReplicationInstanceClass",
+                    json!("dms.r5.large"),
+                ),
+                ("/PendingModifiedValues/AllocatedStorage", json!(300)),
+            ],
+        },
+    ]
+}
+
+/// A modify applies every setting it names that needs no outage, applies the rest only
+/// when it is asked to, and the instance it answers with is the one a later describe
+/// reports.
+#[tokio::test]
+async fn a_modify_applies_what_it_names_and_holds_what_needs_an_outage() {
+    let emulator = Emulator::new();
+
+    for (index, row) in modify_rows().into_iter().enumerate() {
+        let case = row.case;
+        let identifier = format!("modified-instance-{index}");
+        let created = emulator
+            .ok(case, "CreateReplicationInstance", &modify_baseline(&identifier))
+            .await;
+        let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+        poll_until_instance_available(&emulator, case, &arn).await;
+
+        let mut request = row.request.clone();
+        request["ReplicationInstanceArn"] = json!(arn);
+        let modified = emulator
+            .ok(case, "ModifyReplicationInstance", &request)
+            .await;
+        let answered = member_at(&modified, "/ReplicationInstance");
+        assert_eq!(
+            member_at(&answered, "/ReplicationInstanceArn"),
+            json!(arn),
+            "case {case:?}: expected the modify to answer with the instance it was given, \
+             got {modified}"
+        );
+        for (pointer, expected) in &row.answered {
+            let actual = member_at(&answered, pointer);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected {pointer} to be {expected} right after the modify, \
+                 got {actual}"
+            );
+        }
+
+        // The instance the modify answered with is the instance the store holds: once
+        // every transition the call owes has settled, a describe reports the settings it
+        // accepted — and goes on reporting what is still waiting to be applied.
+        poll_until_instance_available(&emulator, case, &arn).await;
+        let described = emulator
+            .ok(case, "DescribeReplicationInstances", &by_instance_arn(&arn))
+            .await;
+        let read_back = member_at(&described, "/ReplicationInstances/0");
+        for (pointer, expected) in &row.settled {
+            let actual = member_at(&read_back, pointer);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected {pointer} to be {expected} once the modify had \
+                 settled, got {actual}"
+            );
+        }
+    }
+}
+
+/// A value a modify left for the maintenance window is state, not a reading of the
+/// request that named it: a later modify that asks for its changes immediately applies
+/// the waiting value too, and leaves nothing pending.
+#[tokio::test]
+async fn a_waiting_change_is_applied_by_a_later_modify_that_asks_for_it_immediately() {
+    let case = "a held change applied by a later modify";
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &modify_baseline("deferred-then-applied"),
+        )
+        .await;
+    let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(&emulator, case, &arn).await;
+
+    let held = emulator
+        .ok(
+            case,
+            "ModifyReplicationInstance",
+            &json!({
+                "ReplicationInstanceArn": arn,
+                "ReplicationInstanceClass": "dms.c5.xlarge",
+                "AllocatedStorage": 250,
+            }),
+        )
+        .await;
+    assert_eq!(
+        (
+            member_at(
+                &held,
+                "/ReplicationInstance/PendingModifiedValues/ReplicationInstanceClass"
+            ),
+            member_at(
+                &held,
+                "/ReplicationInstance/PendingModifiedValues/AllocatedStorage"
+            ),
+            member_at(&held, "/ReplicationInstance/ReplicationInstanceClass"),
+        ),
+        (json!("dms.c5.xlarge"), json!(250), json!(BASELINE_CLASS)),
+        "case {case:?}: expected the first modify to leave both values waiting, got {held}"
+    );
+
+    // The second call names NO setting of its own: everything it applies comes from the
+    // state the first one left behind.
+    let applied = emulator
+        .ok(
+            case,
+            "ModifyReplicationInstance",
+            &json!({ "ReplicationInstanceArn": arn, "ApplyImmediately": true }),
+        )
+        .await;
+    assert_eq!(
+        (
+            member_at(&applied, "/ReplicationInstance/ReplicationInstanceClass"),
+            member_at(&applied, "/ReplicationInstance/AllocatedStorage"),
+            member_at(&applied, "/ReplicationInstance/PendingModifiedValues"),
+            member_at(&applied, "/ReplicationInstance/ReplicationInstanceStatus"),
+        ),
+        (
+            json!("dms.c5.xlarge"),
+            json!(250),
+            json!(null),
+            json!(INSTANCE_MODIFYING)
+        ),
+        "case {case:?}: expected the second modify to apply what was waiting, got {applied}"
+    );
+
+    poll_until_instance_available(&emulator, case, &arn).await;
+    let described = emulator
+        .ok(case, "DescribeReplicationInstances", &by_instance_arn(&arn))
+        .await;
+    let read_back = member_at(&described, "/ReplicationInstances/0");
+    assert_eq!(
+        (
+            member_at(&read_back, "/ReplicationInstanceClass"),
+            member_at(&read_back, "/AllocatedStorage"),
+            member_at(&read_back, "/PendingModifiedValues"),
+        ),
+        (json!("dms.c5.xlarge"), json!(250), json!(null)),
+        "case {case:?}: expected the applied values to be what the account holds, got \
+         {described}"
+    );
+}
+
+/// An instance really applying a change is `modifying` for a later reader too, and takes
+/// no second modify while it is: what it is owed is `available` again.
+#[tokio::test]
+async fn an_instance_applying_a_change_is_modifying_and_takes_no_second_modify() {
+    let case = "an instance inside its modifying span";
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &modify_baseline("modifying-instance"),
+        )
+        .await;
+    let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(&emulator, case, &arn).await;
+
+    emulator
+        .ok(
+            case,
+            "ModifyReplicationInstance",
+            &json!({
+                "ReplicationInstanceArn": arn,
+                "ReplicationInstanceClass": "dms.c5.large",
+                "ApplyImmediately": true,
+            }),
+        )
+        .await;
+    // Hold the transition the store owes, so the case reads the state the modify created
+    // rather than whichever side of the span the host happened to land on.
+    hold_instance_transitions(emulator.engine());
+
+    let described = emulator
+        .ok(case, "DescribeReplicationInstances", &by_instance_arn(&arn))
+        .await;
+    assert_eq!(
+        member_at(
+            &described,
+            "/ReplicationInstances/0/ReplicationInstanceStatus"
+        ),
+        json!(INSTANCE_MODIFYING),
+        "case {case:?}: expected a later read to see the instance applying the change, got \
+         {described}"
+    );
+
+    let (status, refused) = emulator
+        .call(
+            "ModifyReplicationInstance",
+            &json!({
+                "ReplicationInstanceArn": arn,
+                "AllocatedStorage": 400,
+                "ApplyImmediately": true,
+            }),
+        )
+        .await;
+    let message = text(&refused, "/message");
+    assert_eq!(
+        (
+            status,
+            error_code(&refused),
+            message.contains(&arn),
+            message.contains(INSTANCE_MODIFYING),
+        ),
+        (
+            400,
+            "InvalidResourceStateFault".to_string(),
+            true,
+            true
+        ),
+        "case {case:?}: expected a second modify to be refused while the instance is \
+         applying the first, got {status} {refused}"
+    );
+
+    // The refused call wrote nothing: the instance is still applying only the change the
+    // first one accepted.
+    let again = emulator
+        .ok(case, "DescribeReplicationInstances", &by_instance_arn(&arn))
+        .await;
+    let read_back = member_at(&again, "/ReplicationInstances/0");
+    assert_eq!(
+        (
+            member_at(&read_back, "/ReplicationInstanceClass"),
+            member_at(&read_back, "/AllocatedStorage"),
+        ),
+        (json!("dms.c5.large"), json!(BASELINE_STORAGE)),
+        "case {case:?}: expected the refused modify to have written nothing, got {again}"
+    );
+}
+
+/// What a modify refuses, and with which code and message: the rows span the member that
+/// cannot be resolved or accepted, and every one of them leaves the instance exactly as
+/// it was.
+#[tokio::test]
+async fn a_modify_is_refused_when_a_member_names_nothing_the_service_accepts() {
+    let case_prefix = "refused modify";
+    let emulator = Emulator::new();
+
+    let created = emulator
+        .ok(
+            case_prefix,
+            "CreateReplicationInstance",
+            &modify_baseline("modify-target"),
+        )
+        .await;
+    let arn = text(&created, "/ReplicationInstance/ReplicationInstanceArn");
+    // A second instance, so a rename can collide with an identifier the account holds.
+    let bystander = emulator.available_instance("modify-bystander").await;
+    poll_until_instance_available(&emulator, case_prefix, &arn).await;
+    let absent_arn = format!("arn:aws:dms:{REGION}:{ACCOUNT}:rep:ABSENTINSTANCEID00000000000000");
+    let endpoint_arn = emulator
+        .endpoint("modify-refusal-endpoint", "source", "postgres")
+        .await;
+
+    // `(case, the ARN the call names, the other members it carries, expected code, text
+    // the message must carry)`.
+    let rows: Vec<(&str, String, Value, &str, String)> = vec![
+        (
+            "an ARN no replication instance of the account carries",
+            absent_arn.clone(),
+            json!({}),
+            "ResourceNotFoundFault",
+            format!("Replication Instance not found: {absent_arn}"),
+        ),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn".to_string(),
+            json!({}),
+            "ResourceNotFoundFault",
+            "Replication Instance not found: not-an-arn".to_string(),
+        ),
+        (
+            "the ARN of an endpoint rather than of an instance",
+            endpoint_arn.clone(),
+            json!({}),
+            "ResourceNotFoundFault",
+            format!("Replication Instance not found: {endpoint_arn}"),
+        ),
+        (
+            "a class whose family DMS does not run",
+            arn.clone(),
+            json!({ "ReplicationInstanceClass": "dms.z9.large" }),
+            "InvalidParameterValueException",
+            "Invalid ReplicationInstance class".to_string(),
+        ),
+        (
+            "a size the class's family is not offered in",
+            arn.clone(),
+            json!({ "ReplicationInstanceClass": "dms.t3.enormous" }),
+            "InvalidParameterValueException",
+            "Invalid ReplicationInstance class".to_string(),
+        ),
+        (
+            "an identifier another instance of the account holds",
+            arn.clone(),
+            json!({ "ReplicationInstanceIdentifier": "modify-bystander" }),
+            "ResourceAlreadyExistsFault",
+            "modify-bystander".to_string(),
+        ),
+        (
+            "an identifier with two consecutive hyphens",
+            arn.clone(),
+            json!({ "ReplicationInstanceIdentifier": "modify--target" }),
+            "ValidationException",
+            "ReplicationInstanceIdentifier".to_string(),
+        ),
+        (
+            "an identifier that does not begin with a letter",
+            arn.clone(),
+            json!({ "ReplicationInstanceIdentifier": "9-modify-target" }),
+            "ValidationException",
+            "ReplicationInstanceIdentifier".to_string(),
+        ),
+        (
+            "an identifier one character past the documented maximum",
+            arn.clone(),
+            json!({
+                "ReplicationInstanceIdentifier":
+                    format!("i{}", "d".repeat(INSTANCE_IDENTIFIER_MAX_LEN)),
+            }),
+            "ValidationException",
+            "ReplicationInstanceIdentifier".to_string(),
+        ),
+        (
+            "another major engine version without the upgrade allowed",
+            arn.clone(),
+            json!({ "EngineVersion": NEWER_MAJOR_VERSION }),
+            "ValidationException",
+            "AllowMajorVersionUpgrade".to_string(),
+        ),
+    ];
+
+    for (case, named_arn, members, expected_code, expected_text) in rows {
+        let mut request = members.clone();
+        request["ReplicationInstanceArn"] = json!(named_arn);
+        let (status, refused) = emulator.call("ModifyReplicationInstance", &request).await;
+        let code = error_code(&refused);
+        let message = text(&refused, "/message");
+        assert_eq!(
+            (status, code.as_str()),
+            (400, expected_code),
+            "case {case:?}: expected the modify to be refused with {expected_code}, got \
+             {status} {refused}"
+        );
+        assert!(
+            message.contains(&expected_text),
+            "case {case:?}: expected the refusal to say {expected_text:?}, got {message:?}"
+        );
+
+        // Nothing was written: the instance still holds every baseline setting, under the
+        // identifier it was created with.
+        let described = emulator
+            .ok(case, "DescribeReplicationInstances", &by_instance_arn(&arn))
+            .await;
+        let read_back = member_at(&described, "/ReplicationInstances/0");
+        assert_eq!(
+            (
+                member_at(&read_back, "/ReplicationInstanceIdentifier"),
+                member_at(&read_back, "/ReplicationInstanceClass"),
+                member_at(&read_back, "/EngineVersion"),
+                member_at(&read_back, "/ReplicationInstanceStatus"),
+                member_at(&read_back, "/PendingModifiedValues"),
+            ),
+            (
+                json!("modify-target"),
+                json!(BASELINE_CLASS),
+                json!(BASELINE_ENGINE_VERSION),
+                json!(INSTANCE_AVAILABLE),
+                json!(null)
+            ),
+            "case {case:?}: a refused modify must write nothing, got {described}"
+        );
+    }
+
+    // The bystander is untouched too, and the longest identifier the member doc allows is
+    // accepted — the bound itself, not only the value past it.
+    let longest = "i".repeat(INSTANCE_IDENTIFIER_MAX_LEN);
+    let renamed = emulator
+        .ok(
+            case_prefix,
+            "ModifyReplicationInstance",
+            &json!({
+                "ReplicationInstanceArn": bystander,
+                "ReplicationInstanceIdentifier": longest,
+            }),
+        )
+        .await;
+    assert_eq!(
+        member_at(&renamed, "/ReplicationInstance/ReplicationInstanceIdentifier"),
+        json!(longest),
+        "case {case_prefix:?}: expected the longest documented identifier to be accepted, \
+         got {renamed}"
+    );
 }

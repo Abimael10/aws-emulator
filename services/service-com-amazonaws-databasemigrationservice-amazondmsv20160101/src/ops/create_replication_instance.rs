@@ -301,8 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateReplicationInstanceErrorModeled::ResourceAlreadyExistsFault(
                     ResourceAlreadyExistsFault {
-                        message: Some(format!(
-                            "replication instance {identifier} already exists as {existing}"
+                        message: Some(crate::state::instance_identifier_in_use_message(
+                            &identifier,
+                            existing,
                         )),
                         resource_arn: Some(existing.clone()),
                     },
@@ -380,6 +381,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             network_type: input.network_type,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             replication_subnet_group,
+            // "Specifies the settings required for kerberos authentication when creating
+            // the replication instance": what the request carried, so the instance
+            // reports the settings it was created with.
+            kerberos_authentication_settings: input.kerberos_authentication_settings,
+            // A created instance is already running with every setting this call accepted,
+            // so nothing is waiting to be applied to it; only a modify leaves a pending
+            // modified value behind.
+            pending_modified_values: None,
             tags: crate::state::tags_for(&arn, input.tags),
             // `creating` is not terminal: the instance is owed `available`, so a caller
             // that creates a task straight away still sees the transient status.

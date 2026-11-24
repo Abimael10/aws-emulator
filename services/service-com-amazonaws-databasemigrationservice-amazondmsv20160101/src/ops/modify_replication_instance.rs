@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyReplicationInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyReplicationInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyReplicationInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +191,281 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyReplicationInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyReplicationInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyReplicationInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        // A rename is held to the grammar the member doc publishes, and "This parameter is
+        // stored as a lowercase string" (`ReplicationInstanceIdentifier` doc), so the
+        // identifier is folded before it is validated, indexed or echoed.
+        let renamed_to = match &input.replication_instance_identifier {
+            Some(identifier) => {
+                let folded = identifier.to_lowercase();
+                if let Some(refusal) = crate::state::identifier_refusal(
+                    "ReplicationInstanceIdentifier",
+                    &folded,
+                    Some(crate::state::INSTANCE_IDENTIFIER_MAX_LEN),
+                ) {
+                    return Err(crate::scaffolded::Scaffolded::validation(refusal));
+                }
+                Some(folded)
+            }
+            None => None,
+        };
+
+        // A `ReplicationInstanceClass` has to name a class DMS offers, resolved against the
+        // one catalog in `crate::state` the create path resolves one against, and refused
+        // with the same fixed text when it names none.
+        if let Some(class) = &input.replication_instance_class {
+            if !crate::state::is_known_replication_instance_class(class) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    "Invalid ReplicationInstance class",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(stored) = store
+            .replication_instances
+            .get(&input.replication_instance_arn)
+        else {
+            return Err(instance_not_found(&input.replication_instance_arn));
+        };
+
+        // Only an instance that has finished provisioning takes new settings: one that is
+        // still being created, is already applying a change or is on its way out of the
+        // account is owed a transition of its own, so there is no settled instance for this
+        // call to reconfigure.
+        if stored.status != crate::state::INSTANCE_AVAILABLE {
+            return Err(invalid_state(format!(
+                "replication instance {} is {} and cannot be modified in that status",
+                stored.arn, stored.status
+            )));
+        }
+
+        // "This parameter must be set to true when specifying a value for the EngineVersion
+        // parameter that is a different major version than the replication instance's
+        // current version" (`AllowMajorVersionUpgrade` doc), so an engine version that
+        // crosses a major version without that permission is a combination of members that
+        // cannot hold together.
+        if let Some(engine_version) = &input.engine_version {
+            if !input.allow_major_version_upgrade
+                && major_version(engine_version) != major_version(&stored.engine_version)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AllowMajorVersionUpgrade must be set to true to change EngineVersion from \
+                     {} to {engine_version}, which is a different major version",
+                    stored.engine_version
+                )));
+            }
+        }
+
+        // The settings whose change needs an outage are exactly the members
+        // `ReplicationPendingModifiedValues` models. The value each will hold once
+        // everything DMS has accepted for this instance is applied is the one the instance
+        // runs with, overlaid with a change still waiting, overlaid with what THIS request
+        // named.
+        let waiting = stored.pending_modified_values.clone().unwrap_or_default();
+        let current_class = stored.instance_class.clone();
+        let current_storage = stored.allocated_storage;
+        let current_multi_az = stored.multi_az;
+        let current_engine_version = stored.engine_version.clone();
+        let current_network_type = stored.network_type.clone();
+        let previous_identifier = stored.identifier.clone();
+
+        let target_class = input
+            .replication_instance_class
+            .clone()
+            .or(waiting.replication_instance_class)
+            .unwrap_or_else(|| current_class.clone());
+        let target_storage = input
+            .allocated_storage
+            .or(waiting.allocated_storage)
+            .unwrap_or(current_storage);
+        let target_multi_az = input
+            .multi_az
+            .or(waiting.multi_az)
+            .unwrap_or(current_multi_az);
+        let target_engine_version = input
+            .engine_version
+            .clone()
+            .or(waiting.engine_version)
+            .unwrap_or_else(|| current_engine_version.clone());
+        let target_network_type = input
+            .network_type
+            .clone()
+            .or(waiting.network_type)
+            .or_else(|| current_network_type.clone());
+
+        let class_changes = target_class != current_class;
+        let storage_changes = target_storage != current_storage;
+        let multi_az_changes = target_multi_az != current_multi_az;
+        let engine_version_changes = target_engine_version != current_engine_version;
+        let network_type_changes = target_network_type != current_network_type;
+
+        let identifier = renamed_to.unwrap_or_else(|| previous_identifier.clone());
+        // A `ReplicationInstanceIdentifier` names ONE instance of the account, so a rename
+        // onto an identifier another instance holds is refused and nothing is written.
+        if identifier != previous_identifier {
+            if let Some(existing) = store.instance_arn_by_identifier.get(&identifier) {
+                return Err(
+                    ModifyReplicationInstanceErrorModeled::ResourceAlreadyExistsFault(
+                        ResourceAlreadyExistsFault {
+                            message: Some(crate::state::instance_identifier_in_use_message(
+                                &identifier,
+                                existing,
+                            )),
+                            resource_arn: Some(existing.clone()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The instance the write runs on. It is resolved a second time only because the
+        // read above borrows the store immutably; the same guard covers both, so this is
+        // the instance just read.
+        let Some(instance) = store
+            .replication_instances
+            .get_mut(&input.replication_instance_arn)
+        else {
+            return Err(instance_not_found(&input.replication_instance_arn));
+        };
+
+        // Every setting whose change DMS applies "as soon as possible" — each member
+        // `ReplicationPendingModifiedValues` does NOT model — becomes the instance's own
+        // whatever `ApplyImmediately` said, and a member the request omitted keeps the
+        // value the instance already held.
+        instance.identifier = identifier.clone();
+        if let Some(preferred_maintenance_window) = input.preferred_maintenance_window {
+            instance.preferred_maintenance_window = preferred_maintenance_window;
+        }
+        if let Some(auto_minor_version_upgrade) = input.auto_minor_version_upgrade {
+            instance.auto_minor_version_upgrade = auto_minor_version_upgrade;
+        }
+        if let Some(vpc_security_group_ids) = input.vpc_security_group_ids {
+            instance.vpc_security_group_ids = vpc_security_group_ids;
+        }
+        if let Some(kerberos_authentication_settings) = input.kerberos_authentication_settings {
+            instance.kerberos_authentication_settings = Some(kerberos_authentication_settings);
+        }
+
+        if input.apply_immediately {
+            // "Indicates whether the changes should be applied immediately": the instance
+            // takes every value DMS has accepted for it, so nothing is left waiting, and
+            // one whose compute, storage, engine version, deployment or addressing really
+            // changes is `modifying` until the change is through.
+            if multi_az_changes {
+                // "Specifies whether the replication instance is a Multi-AZ deployment": a
+                // Multi-AZ deployment keeps a standby in a second zone of the Region, and
+                // a single-AZ one has none.
+                instance.secondary_availability_zone =
+                    target_multi_az.then(|| crate::state::availability_zone_for(&region, 1));
+            }
+            instance.instance_class = target_class;
+            instance.allocated_storage = target_storage;
+            instance.multi_az = target_multi_az;
+            instance.engine_version = target_engine_version;
+            instance.network_type = target_network_type;
+            instance.pending_modified_values = None;
+            if class_changes
+                || storage_changes
+                || multi_az_changes
+                || engine_version_changes
+                || network_type_changes
+            {
+                instance.status = crate::state::INSTANCE_MODIFYING.to_string();
+                // `modifying` is not terminal: the instance is owed `available` again, so a
+                // caller that reads straight after the modify sees the outage the change
+                // costs and the state errors that go with it.
+                instance.pending = Some(crate::state::Pending::after(
+                    now,
+                    crate::state::Owed::ToStatus(crate::state::INSTANCE_AVAILABLE),
+                ));
+            }
+        } else {
+            // "...or during the next maintenance window": the instance keeps running with
+            // the settings it has, and reports every value that is still to be applied as a
+            // pending modified value. A value equal to the one the instance already holds
+            // leaves nothing pending for that member.
+            let pending_modified_values = ReplicationPendingModifiedValues {
+                replication_instance_class: class_changes.then_some(target_class),
+                allocated_storage: storage_changes.then_some(target_storage),
+                multi_az: multi_az_changes.then_some(target_multi_az),
+                engine_version: engine_version_changes.then_some(target_engine_version),
+                network_type: if network_type_changes {
+                    target_network_type
+                } else {
+                    None
+                },
+            };
+            instance.pending_modified_values = (class_changes
+                || storage_changes
+                || multi_az_changes
+                || engine_version_changes
+                || network_type_changes)
+                .then_some(pending_modified_values);
+        }
+
+        if identifier != previous_identifier {
+            // The index holds one entry per identifier an instance of the account holds, so
+            // the renamed instance releases the identifier it held and takes the new one,
+            // and a create may then take the released one.
+            store.instance_arn_by_identifier.remove(&previous_identifier);
+            store
+                .instance_arn_by_identifier
+                .insert(identifier, input.replication_instance_arn.clone());
+        }
+
+        // "The modified replication instance", through the one projection every operation
+        // that answers with an instance goes through: the record is read back out of the
+        // store, so this response and a later describe report the same instance.
+        let replication_instance = store
+            .replication_instances
+            .get(&input.replication_instance_arn)
+            .map(|record| record.to_shape(&store.replication_subnet_groups));
+
+        Ok(ModifyReplicationInstanceOutput {
+            replication_instance,
+        })
     }
+}
+
+/// What DMS answers a `ReplicationInstanceArn` that names no replication instance the
+/// account holds: the error this operation models for a resource it could not find, in
+/// DMS's own fixed sentence for it, whose only variable part is the ARN the CALLER sent.
+fn instance_not_found(replication_instance_arn: &str) -> ModifyReplicationInstanceError {
+    ModifyReplicationInstanceErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+        message: Some(format!(
+            "Replication Instance not found: {replication_instance_arn}"
+        )),
+    })
+    .into()
+}
+
+/// The error this operation models for a resource that cannot be used for a database
+/// migration in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> ModifyReplicationInstanceError {
+    ModifyReplicationInstanceErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The major version an engine version names, which is the part before its first
+/// separator: `3.5.4` is a version of the engine's major version `3`.
+fn major_version(engine_version: &str) -> &str {
+    engine_version
+        .split_once('.')
+        .map_or(engine_version, |(major, _)| major)
 }

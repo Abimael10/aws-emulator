@@ -43,11 +43,11 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AvailabilityZone, DmsTransferSettings, DocDbSettings, DynamoDbSettings, ElasticsearchSettings,
-    Endpoint, GcpMySQLSettings, IBMDb2Settings, KafkaSettings, KinesisSettings,
-    MicrosoftSQLServerSettings, MongoDbSettings, MySQLSettings, NeptuneSettings, OracleSettings,
-    PostgreSQLSettings, RedisSettings, RedshiftSettings, ReplicationInstance,
-    ReplicationSubnetGroup, ReplicationTask, S3Settings, Subnet, SybaseSettings, Tag,
-    TimestreamSettings, VpcSecurityGroupMembership,
+    Endpoint, GcpMySQLSettings, IBMDb2Settings, KafkaSettings, KerberosAuthenticationSettings,
+    KinesisSettings, MicrosoftSQLServerSettings, MongoDbSettings, MySQLSettings, NeptuneSettings,
+    OracleSettings, PostgreSQLSettings, RedisSettings, RedshiftSettings, ReplicationInstance,
+    ReplicationPendingModifiedValues, ReplicationSubnetGroup, ReplicationTask, S3Settings, Subnet,
+    SybaseSettings, Tag, TimestreamSettings, VpcSecurityGroupMembership,
 };
 
 /// A replication instance `CreateReplicationInstance` has accepted but not finished
@@ -62,6 +62,14 @@ pub const INSTANCE_AVAILABLE: &str = "available";
 /// instance leaving. One of the values the `ReplicationInstance$ReplicationInstanceStatus`
 /// doc publishes.
 pub const INSTANCE_DELETING: &str = "deleting";
+
+/// The status a replication instance carries while a setting whose change needs an
+/// outage is being applied to it, which is what `ModifyReplicationInstance` accepts with
+/// `ApplyImmediately`. The record is owed [`INSTANCE_AVAILABLE`] again
+/// ([`Owed::ToStatus`]), so a caller that reads straight after the modify still sees the
+/// instance working on it. One of the values the
+/// `ReplicationInstance$ReplicationInstanceStatus` doc publishes.
+pub const INSTANCE_MODIFYING: &str = "modifying";
 
 /// The status an endpoint carries once it is usable. DMS creates an endpoint ready —
 /// it provisions nothing — so this is the status every create reports.
@@ -555,6 +563,13 @@ pub struct ReplicationInstanceRecord {
     /// when the instance is reported, so a group that has left the store is not
     /// reported as though it were still there.
     pub replication_subnet_group: Option<String>,
+    /// The kerberos authentication settings the caller attached to the instance, if any.
+    pub kerberos_authentication_settings: Option<KerberosAuthenticationSettings>,
+    /// The settings `ModifyReplicationInstance` accepted for the instance but has not
+    /// applied to it: a change that needs an outage waits for the maintenance window
+    /// unless the modify asked for it to be applied immediately, so the instance keeps
+    /// running with the values above until then and reports the waiting ones here.
+    pub pending_modified_values: Option<ReplicationPendingModifiedValues>,
     /// The instance's tags.
     pub tags: Vec<Tag>,
     /// The transition the clock owes this instance, if any.
@@ -595,8 +610,9 @@ impl ReplicationInstanceRecord {
                 .and_then(|identifier| subnet_groups.get(identifier))
                 .map(ReplicationSubnetGroupRecord::to_shape),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
-            // Only `ModifyReplicationInstance` leaves pending modifications behind.
-            pending_modified_values: None,
+            // The modifications DMS has accepted for the instance but not applied yet,
+            // which only `ModifyReplicationInstance` leaves behind.
+            pending_modified_values: self.pending_modified_values.clone(),
             multi_az: self.multi_az,
             engine_version: Some(self.engine_version.clone()),
             auto_minor_version_upgrade: self.auto_minor_version_upgrade,
@@ -615,9 +631,8 @@ impl ReplicationInstanceRecord {
             free_until: None,
             dns_name_servers: self.dns_name_servers.clone(),
             network_type: self.network_type.clone(),
-            // Kerberos settings are only attached by a request that carries them, and
-            // this slice stores none.
-            kerberos_authentication_settings: None,
+            // Kerberos settings are only attached by a request that carries them.
+            kerberos_authentication_settings: self.kerberos_authentication_settings.clone(),
         }
     }
 }
@@ -1500,6 +1515,18 @@ pub fn subnet_group_absent_message(identifier: &str) -> String {
 /// serves both operations that take an identifier, `CreateEndpoint` and `ModifyEndpoint`.
 pub fn endpoint_identifier_in_use_message(identifier: &str) -> String {
     format!(r#"ReplicationEndpoint "{identifier}" already in use."#)
+}
+
+/// What DMS answers a `ReplicationInstanceIdentifier` an instance of the account already
+/// holds.
+///
+/// An identifier names ONE replication instance of the account, so the refusal reports
+/// the identifier the caller sent and the instance that holds it. It serves both
+/// operations that take one, `CreateReplicationInstance` and
+/// `ModifyReplicationInstance`, so a duplicate and a rename onto a taken identifier are
+/// reported identically.
+pub fn instance_identifier_in_use_message(identifier: &str, existing_arn: &str) -> String {
+    format!("replication instance {identifier} already exists as {existing_arn}")
 }
 
 /// DMS's sentence for a service access role it cannot use, naming the role ARN the
