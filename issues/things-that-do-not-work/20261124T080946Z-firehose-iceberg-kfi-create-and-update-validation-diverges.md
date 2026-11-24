@@ -1,0 +1,74 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: firehose-kfi-traj-fix-table-via-update-destination
+Issue-Step: task#13
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: firehose-kfi-traj-fix-table-via-update-destination firehose-kfi-traj-iceberg-option-mistakes firehose-kfi-traj-kinesis-source-mistakes
+Issue-Shape-Id: com.amazonaws.firehose#Firehose_20150804
+Issue-Key: firehose|UpdateDestination|2xx->4xx|status
+Issue-Key: firehose|CreateDeliveryStream|4xx->2xx|$.__type
+Issue-Key: firehose|CreateDeliveryStream|4xx->2xx|$.message
+Issue-Key: firehose|CreateDeliveryStream|4xx->2xx|status
+Issue-Key: firehose|CreateDeliveryStream|4xx->4xx|$.message
+Issue-Commit: 1abd039a0ef34b1090046da85ad527c3874a2bd6
+
+# firehose Iceberg/KFI create and update validation diverges: 3 net-new causes — CreateDeliveryStream accepts an unresolvable Glue destination table, UpdateDestination refuses the corrective Iceberg update, and the DeliveryStreamType enum ValidationException lists the value set out of model order
+
+> _Note: this issue was identified against the code base at commit `1abd039a0ef34b1090046da85ad527c3874a2bd6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateDeliveryStream
+
+## Description
+Three net-new root causes on the Firehose control-plane argument-validation path exercised by the recorded KFI (Kinesis-Firehose-Iceberg) trajectories. All three are wire divergences replayed from the simparity-wire-aws-v1 corpus; they are 3 causes and must all be closed.
+
+No open issue covers them. 20261028T122732Z-firehose-glue-kinesis-s3-the-apache-iceberg-path.md describes the same missing create-time glue:GetTable check, but it is a BEHAVIORAL issue against simparity-behavioral-ga-prod-v1 and carries no wire replay key for these fixture steps, and it says nothing about UpdateDestination refusing a corrective Iceberg update or about the enum-constraint message wording. 20261117T165539Z-firehose-5-net-new-causes-the-awsjson1-1.md owns the awsJson1_1 protocol-error surface and the DescribeDeliveryStream timestamp precision (the other clusters in this replay), not these three. 20261118T002623Z-firehose-3-net-new-causes-the-tagkey-pattern.md owns the TagKey constraint refusal, a different member and a different error class.
+
+Cause 1 of 3: UpdateDestination refuses a same-type Apache Iceberg destination update that AWS accepts, so a delivery stream pointed at the wrong Data Catalog table can never be corrected.
+AWS: Smithy: UpdateDestination takes DeliveryStreamName (required), CurrentDeliveryStreamVersionId (required, @pattern ^[0-9]+$), DestinationId (required, @pattern ^[a-zA-Z0-9-]+$) and exactly one destination update member — here IcebergDestinationUpdate (members DestinationTableConfigurationList, CatalogConfiguration, RoleARN, S3Configuration, BufferingHints, ...); output UpdateDestinationOutput is EMPTY. Modeled errors are ConcurrentModificationException, InvalidArgumentException, ResourceInUseException and ResourceNotFoundException, all client/HTTP 400. Updating an Iceberg destination to another Iceberg destination is NOT a destination-type change: the model documents that "If the destination type is the same, Firehose merges the configuration parameters specified with the destination configuration that already exists", so an update that supplies only a corrected DestinationTableConfigurationList (with the stream ACTIVE, the version id current and the destination id the one the stream reports) is accepted with HTTP 200 and an empty body, and the stream's VersionId is bumped while it stays ACTIVE.
+Emulator: the same request is answered HTTP 400 instead of 200 (the replay reports only the status divergence for this step; the step expected 200 and the body it expected is the empty output document).
+Why: the documented remediation for a delivery stream whose Iceberg destination names the wrong database/table — repoint it with UpdateDestination — is impossible. A client that created a stream and then discovers its catalog target is wrong has no way forward: the stream is stuck on a destination it cannot deliver to, and every subsequent step of a fix-up workflow (re-describe, re-put, read back) is unreachable. Automation that treats a 400 as a permanent argument fault will stop retrying and report a client bug that does not exist.
+Fix: the Iceberg branch of the UpdateDestination handler's pre-write validation, services/service-com-amazonaws-firehose-firehose-20150804/src/ops/update_destination.rs — the Iceberg-specific gates it runs before rewriting the stored destination (unresolvable_update_target, the FixedType::Iceberg same-type/type-change decision in `applied`, and crate::state::unsupported_iceberg_configuration in src/state.rs, which re-asks the single-default-destination-table and S3BackupMode questions over the MERGED configuration) must let an Iceberg→Iceberg update whose merged result names a resolvable table through, and answer the empty 200 output. Hypothesis: the merged configuration is being re-judged as if it were a type change or as if the merge dropped DestinationTableConfigurationList, so one of those gates raises InvalidArgumentException on a configuration AWS accepts; the recorded step shows only the status, so the mechanism must be confirmed against the handler.
+Traces: firehose-kfi-traj-fix-table-via-update-destination step task#13 (UpdateDestination, expected 200, got 400).
+
+Cause 2 of 3: CreateDeliveryStream accepts an Apache Iceberg destination whose Data Catalog table cannot be resolved, instead of refusing it with InvalidArgumentException.
+AWS: Smithy: CreateDeliveryStream is modeled with InvalidArgumentException (client, HTTP 400, member `message`) and takes IcebergDestinationConfiguration (CatalogConfiguration.CatalogARN, DestinationTableConfigurationList of {DestinationDatabaseName, DestinationTableName}, RoleARN). Real Firehose performs a glue:GetTable with the supplied RoleARN at create time and refuses a destination whose table — or whose database — it cannot read, with InvalidArgumentException. Recorded response: HTTP 400, __type `InvalidArgumentException`, message `Role <RoleARN> is not authorized to perform: glue:GetTable for the given table or the table does not exist.` — that sentence is FIXED text and its only variable part is the RoleARN taken from the request (the recording's `arn:aws:iam::000000000000:role/sim2real-probe-kfi-role-71ac7fed` is one run's value, not part of the requirement). AWS deliberately conflates "not authorized" with "does not exist", so an absent database yields the same table-worded sentence.
+Emulator: HTTP 200 with a created delivery stream — no __type and no message at all; the glue:GetTable resolution never happens on the create path. Replayed on two independent recordings (the Iceberg-option trajectory and the Kinesis-source trajectory), so it is not specific to one destination shape.
+Why: the caller loses the only create-time signal that its catalog target is wrong. The stream goes ACTIVE and then silently delivers nowhere, every record put to it is lost with a success response, and a typo in the database or table name is never reported. Code that branches on the create failing (to create the table and retry) takes the success path instead and never notices.
+Fix: the Iceberg destination validation of the CreateDeliveryStream handler, services/service-com-amazonaws-firehose-firehose-20150804/src/ops/create_delivery_stream.rs — every DestinationTableConfigurationList entry must be resolved against the Glue catalog with the request's RoleARN before the stream is minted, and a failure raised as InvalidArgumentException carrying AWS's fixed sentence with the request's RoleARN interpolated; a refused create must leave no delivery stream behind.
+Traces: firehose-kfi-traj-iceberg-option-mistakes step task#12 and firehose-kfi-traj-kinesis-source-mistakes step task#9 (CreateDeliveryStream, expected 400 InvalidArgumentException, got 200).
+
+Cause 3 of 3: the constraint-violation message for an invalid DeliveryStreamType lists the enum value set in the wrong order.
+AWS: Smithy: CreateDeliveryStreamInput$DeliveryStreamType targets the enum DeliveryStreamType, whose values are declared, in order, DirectPut, KinesisStreamAsSource, MSKAsSource, DatabaseAsSource. An unmodeled value is refused HTTP 400 with the standard constraint sentence, whose fixed template is `<N> validation error(s) detected: Value at '<member>' failed to satisfy constraint: Member must satisfy enum value set: [<the enum's values, in the model's declaration order>]` — the variable parts are the error count, the member path and the offending value; the value SET and its ORDER come from the model, not from the request. The recorded step asserts the message's shape rather than one run's literal text, and the emulator's text fails that assertion.
+Emulator: HTTP 400 (the status and the error type do match) with message `1 validation error detected: Value at 'deliveryStreamType' failed to satisfy constraint: Member must satisfy enum value set: [DirectPut, DatabaseAsSource, MSKAsSource, KinesisStreamAsSource]` — the value set is enumerated in a different order from the model's declaration (KinesisStreamAsSource and DatabaseAsSource are transposed).
+Why: the enumerated set in this message is the documentation a caller reads to repair the request, and it is routinely parsed or snapshot-asserted by SDK tests and by operators diffing emulator against AWS. A set emitted in a per-implementation order makes the refusal non-reproducible and makes a correct client look wrong. Hypothesis: the ordering comes from iterating a hashed/unordered collection of enum values rather than the model's declared sequence; any residual difference in the member path spelling is not decidable from this step.
+Fix: the shared constraint-violation message builder used by CreateDeliveryStream's input validation (services/service-com-amazonaws-firehose-firehose-20150804/src/ops/create_delivery_stream.rs and the validation layer it delegates to) must enumerate an enum's values in the model's declaration order.
+Traces: firehose-kfi-traj-kinesis-source-mistakes step task#10 (CreateDeliveryStream, HTTP 400 both sides, $.message diverges).
+
+## Evidence
+Cause 1 — fixture firehose-kfi-traj-fix-table-via-update-destination, step task#13, UpdateDestination:
+  expected: HTTP 200 with the empty UpdateDestinationOutput document (the Iceberg destination is repointed and the stream's VersionId is bumped)
+  actual:   HTTP 400
+  replay detail: "status: expected 200, got 400"
+
+Cause 2 — fixtures firehose-kfi-traj-iceberg-option-mistakes step task#12 and firehose-kfi-traj-kinesis-source-mistakes step task#9, CreateDeliveryStream:
+  expected: HTTP 400, $.__type = 'InvalidArgumentException', $.message = 'Role <RoleARN> is not authorized to perform: glue:GetTable for the given table or the table does not exist.' (fixed sentence; RoleARN interpolated from the request — the recording shows arn:aws:iam::000000000000:role/sim2real-probe-kfi-role-71ac7fed for that run)
+  actual:   HTTP 200, $.__type missing, $.message missing — the delivery stream is created
+  replay detail: "status: expected 400, got 200 / $.__type: missing (expected 'InvalidArgumentException', got None) / $.message: missing"
+
+Cause 3 — fixture firehose-kfi-traj-kinesis-source-mistakes, step task#10, CreateDeliveryStream:
+  expected: HTTP 400 whose message matches AWS's constraint template with the DeliveryStreamType value set in the model's declared order [DirectPut, KinesisStreamAsSource, MSKAsSource, DatabaseAsSource]
+  actual:   HTTP 400 with message "1 validation error detected: Value at 'deliveryStreamType' failed to satisfy constraint: Member must satisfy enum value set: [DirectPut, DatabaseAsSource, MSKAsSource, KinesisStreamAsSource]"
+  replay detail: "$.message: value_mismatch (expected '<shaped-not-asserted>', got \"1 validation error detected: Value at 'deliveryStreamType' failed to satisfy constraint: Member must satisfy enum value set: [DirectPut, DatabaseAsSource, MSKAsSource, KinesisStreamAsSource]\")"
+
+Model citations used: firehose Smithy model services/service-com-amazonaws-firehose-firehose-20150804/smithy-model/com-amazonaws-firehose-firehose-20150804.json — CreateDeliveryStream errors {InvalidArgumentException, InvalidKMSResourceException, LimitExceededException, ResourceInUseException} all client/400; UpdateDestination errors {ConcurrentModificationException, InvalidArgumentException, ResourceInUseException, ResourceNotFoundException}, output shape UpdateDestinationOutput empty; enum DeliveryStreamType values [DirectPut, KinesisStreamAsSource, MSKAsSource, DatabaseAsSource]; InvalidArgumentException errorKind client, httpError 400, member `message`.
+
+## Steps to Reproduce
+Shared setup (as the recorded trajectories do): an S3 bucket, an IAM role trusted by firehose.amazonaws.com with s3/glue/logs permissions, a Glue database and a Glue Iceberg table, and CatalogARN arn:aws:glue:<region>:<account>:catalog.
+
+Cause 1: create a DirectPut delivery stream with an IcebergDestinationConfiguration, wait for ACTIVE, DescribeDeliveryStream to read VersionId and the destination's DestinationId, then call UpdateDestination(DeliveryStreamName=<stream>, CurrentDeliveryStreamVersionId=<that VersionId>, DestinationId=<that DestinationId>, IcebergDestinationUpdate={DestinationTableConfigurationList:[{DestinationDatabaseName:<existing db>, DestinationTableName:<existing table>}]}). It must answer HTTP 200 with an empty body; the emulator answers 400. Replay firehose-kfi-traj-fix-table-via-update-destination step task#13.
+
+Cause 2: call CreateDeliveryStream(DeliveryStreamType='DirectPut', IcebergDestinationConfiguration with DestinationTableConfigurationList=[{DestinationDatabaseName:<existing db>, DestinationTableName:<a table that does not exist>}], RoleARN=<the role>). It must fail HTTP 400 InvalidArgumentException with 'Role <RoleARN> is not authorized to perform: glue:GetTable for the given table or the table does not exist.' and leave no stream in ListDeliveryStreams; the emulator returns 200 and creates the stream. Repeat with a KinesisStreamAsSource stream for the second recording. Replay firehose-kfi-traj-iceberg-option-mistakes step task#12 and firehose-kfi-traj-kinesis-source-mistakes step task#9.
+
+Cause 3: call CreateDeliveryStream with DeliveryStreamType set to a value the enum does not declare (e.g. 'KinesisStream'). The 400 message's enum value set must be enumerated in the model's declaration order [DirectPut, KinesisStreamAsSource, MSKAsSource, DatabaseAsSource]; the emulator emits [DirectPut, DatabaseAsSource, MSKAsSource, KinesisStreamAsSource]. Replay firehose-kfi-traj-kinesis-source-mistakes step task#10.
