@@ -238,7 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is eligible when a web ACL the subscription already covers fronts it, exactly as
         // it would have been had the same resources been named at create time. Only the
         // resources THIS request names can be refused — what the subscription already
-        // covers was admitted when it joined.
+        // covers was admitted when it joined — and the refusal is worded for the question
+        // that refused them: the plan the subscription is on, or the resources themselves.
         let ineligible = crate::state::ineligible_resources(
             ctx,
             &region,
@@ -246,27 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &plan_tier,
             &covering,
         )
-        .await;
-        let ineligible: Vec<String> = resource_arns
-            .iter()
-            .filter(|named| ineligible.contains(named))
-            .cloned()
-            .collect();
-        if !ineligible.is_empty() {
+        .await
+        .only_named(&resource_arns);
+        if let Some(refusal) = ineligible.refusal(&plan_tier) {
             return Err(
-                AssociateResourcesToSubscriptionErrorModeled::ValidationException(
-                    ValidationException {
-                        message: crate::state::ineligible_resources_message(&ineligible),
-                        // "The identifier of the resource that failed validation" — which
-                        // is a single resource only when exactly one failed; the message
-                        // carries the whole list either way.
-                        resource_id: match ineligible.as_slice() {
-                            [only] => Some(only.clone()),
-                            _ => None,
-                        },
-                    },
-                )
-                .into(),
+                AssociateResourcesToSubscriptionErrorModeled::ValidationException(refusal).into(),
             );
         }
 

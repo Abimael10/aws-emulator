@@ -1755,15 +1755,14 @@ async fn associated_resources_join_the_subscription_and_read_back() {
     }
 }
 
-/// The fixed text AWS states a resource-eligibility refusal with; the ineligible ARNs the
-/// request named follow it, in the order it named them, and then the full stop.
-const NOT_ELIGIBLE_PREFIX: &str =
-    "The following resources are not eligible for this subscription tier: ";
-
 /// A resource the subscription's plan TIER does not cover is refused with the modelled
-/// business-rule error naming it, and nothing is stored — on the call that creates a
-/// subscription over it and on the call that adds it to one. Every tier that does cover it
-/// admits the very same resource.
+/// business-rule error stating the plan tier, and nothing is stored — on the call that
+/// creates a subscription over it and on the call that adds it to one. Every tier that does
+/// cover it admits the very same resource.
+///
+/// The sentence the refusal states is the tier suite's — `plan_tier_incompatibility_refusal`
+/// writes it once — and that suite carries the rest of the rule: the refusal is inert and
+/// the two eligibility classes are worded apart.
 ///
 /// The rows differ along the tier (every published one, and one the docs do not publish),
 /// the resource kinds one request names, how many of them the tier does not cover, and
@@ -1832,14 +1831,8 @@ async fn a_resource_the_tier_does_not_cover_is_refused_on_create_and_on_associat
         // so rows naming the same resources are independent accounts rather than one.
         let router = router();
         let label = case.label;
-        let refused_message = format!(
-            "{NOT_ELIGIBLE_PREFIX}{}.",
-            case.ineligible
-                .iter()
-                .map(|position| case.named[*position].clone())
-                .collect::<Vec<String>>()
-                .join(", ")
-        );
+        let refused_message =
+            super::plan_tier_incompatibility_refusal::incompatible_with_tier(case.tier);
 
         // (1) named at create time: a refused call stores no subscription at all.
         let arns_before = all_arns(&router).await;

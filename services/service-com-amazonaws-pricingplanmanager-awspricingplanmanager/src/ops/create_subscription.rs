@@ -276,7 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must be fronted by the WAF web ACL the same request names, which is a fact
         // CloudFront holds, and the free tier does not cover a KeyValueStore
         // (`crate::state::resource_eligibility`). The gate runs before anything is
-        // minted, so a refused call leaves no subscription behind.
+        // minted, so a refused call leaves no subscription behind, and the refusal is
+        // worded for the question that refused it: the plan asked for, or the resources
+        // themselves.
         let ineligible = crate::state::ineligible_resources(
             ctx,
             &region,
@@ -285,20 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource_arns,
         )
         .await;
-        if !ineligible.is_empty() {
-            return Err(CreateSubscriptionErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::ineligible_resources_message(&ineligible),
-                    // "The identifier of the resource that failed validation" — which is
-                    // a single resource only when exactly one failed; the message carries
-                    // the whole list either way.
-                    resource_id: match ineligible.as_slice() {
-                        [only] => Some(only.clone()),
-                        _ => None,
-                    },
-                },
-            )
-            .into());
+        if let Some(refusal) = ineligible.refusal(&plan_tier) {
+            return Err(CreateSubscriptionErrorModeled::ValidationException(refusal).into());
         }
 
         let mut store = state.lock();

@@ -20,17 +20,24 @@
 //! rule validation") and nothing is stored.
 //!
 //! The second needs nobody: within that same family, what a plan covers depends on the
-//! TIER it is bought at, which is what the service's own refusal states — "not eligible
-//! for this subscription tier"
-//! ([`ineligible_resources_message`]). That same note says a subscription may also cover
-//! "other supported
+//! TIER it is bought at. That same note says a subscription may also cover "other supported
 //! resources, such as Amazon Route 53 hosted zones, and CloudFront KeyValueStores", and
 //! those two are not covered alike: the free tier — the lowest of the published tiers
 //! "`FREE`, `PRO`, `BUSINESS`, or `PREMIUM`"
 //! (`smithy_query(query="doc",shape="Subscription",member="planTier")`) — carries a
 //! hosted zone but not a KeyValueStore, which AWS covers only from a paid tier up. So a
-//! KeyValueStore named for a free-tier CloudFront subscription is refused with that same
-//! message, while every tier that is not the free one covers it.
+//! KeyValueStore named for a free-tier CloudFront subscription is refused, while every
+//! tier that is not the free one covers it.
+//!
+//! The two questions are refused in DIFFERENT words, because their remedies are opposite.
+//! A resource the plan tier does not cover is a statement about the plan — the resource set
+//! and the tier are incompatible, and the caller either drops the resource or buys a tier
+//! that covers it ([`resources_incompatible_with_plan_tier_message`]), so the sentence
+//! names the tier and no resource. A resource whose prerequisite association is absent is a
+//! statement about those resources — the caller must fix each one, so the sentence names
+//! them ([`prerequisite_unmet_message`]). Both travel in the same modelled business-rule
+//! error, so the message is the only thing that tells a client which rule it broke, and
+//! [`IneligibleResources::refusal`] is the one place either is worded.
 //!
 //! CloudFront is asked the way the framework documents a handler reaching another
 //! emulated service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK
@@ -69,23 +76,106 @@ const KEY_VALUE_STORE_RESOURCE_TYPE: &str = "key-value-store";
 const WAFV2_VENDOR: &str = "wafv2";
 const WEB_ACL_SEGMENT: &str = "/webacl/";
 
-/// How this service states a request whose resources are not eligible for the plan it
-/// asks for, as AWS words that refusal: the fixed sentence, then the resources that
-/// failed it, then the full stop.
+/// How this service states resources the plan TIER does not cover, as AWS words that
+/// refusal: one fixed sentence whose only variable part is the tier the subscription is on,
+/// quoted.
+///
+/// The refusal is about the resource SET against the plan, not about any one resource, so
+/// it names no resource ARN: the remedy it states is to change the set or the tier.
+pub fn resources_incompatible_with_plan_tier_message(plan_tier: &str) -> String {
+    format!(
+        "Resources are incompatible with plan tier '{plan_tier}': modify resources or \
+         select a different tier."
+    )
+}
+
+/// How this service states resources whose documented prerequisite — the association the
+/// service that OWNS them must already hold — is absent: the fixed sentence, then the
+/// resources that failed it, then the full stop.
 ///
 /// The variable part is the ineligible ARNs THE REQUEST named, in the order it named
-/// them, so a caller can match each one against the list it sent.
-pub fn ineligible_resources_message(ineligible: &[String]) -> String {
+/// them, so a caller can match each one against the list it sent and fix it.
+pub fn prerequisite_unmet_message(ineligible: &[String]) -> String {
     format!(
         "The following resources are not eligible for this subscription tier: {}.",
         ineligible.join(", ")
     )
 }
 
-/// The resources among `resource_arns` that are NOT eligible for the plan
-/// `plan_family`/`plan_tier` names, in the order the request named them; empty when every
-/// named resource is eligible, and when nothing of the kind could be established (see the
-/// module docs).
+/// The resources a request named that are NOT eligible for the plan it asks for, split by
+/// WHICH of the two questions refused them, in the order the request named them.
+///
+/// Both halves empty is an eligible request — and also a request about which nothing of
+/// the kind could be established (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IneligibleResources {
+    /// The resources the plan TIER does not cover.
+    pub outside_plan_tier: Vec<String>,
+    /// The resources whose documented prerequisite association the owning service does not
+    /// hold.
+    pub prerequisite_unmet: Vec<String>,
+}
+
+impl IneligibleResources {
+    /// Whether every named resource is eligible.
+    pub fn is_empty(&self) -> bool {
+        self.outside_plan_tier.is_empty() && self.prerequisite_unmet.is_empty()
+    }
+
+    /// The same finding narrowed to the resources `named` lists, keeping their order.
+    ///
+    /// An operation that weighs the set a subscription WOULD cover asks about resources the
+    /// subscription already carries as well, and those were admitted when they joined: only
+    /// what THIS request names can be refused.
+    pub fn only_named(&self, named: &[String]) -> Self {
+        let retain = |found: &Vec<String>| -> Vec<String> {
+            found
+                .iter()
+                .filter(|arn| named.contains(arn))
+                .cloned()
+                .collect()
+        };
+        Self {
+            outside_plan_tier: retain(&self.outside_plan_tier),
+            prerequisite_unmet: retain(&self.prerequisite_unmet),
+        }
+    }
+
+    /// The modelled business-rule refusal for this finding, worded for the question that
+    /// refused it, or `None` when nothing was refused.
+    ///
+    /// `plan_tier` is the tier the request asks for, which is what a tier refusal states.
+    /// A request both questions refuse is answered with the plan-tier sentence: the tier
+    /// does not cover the set at all, so no prerequisite the caller could fix would admit
+    /// it.
+    pub fn refusal(&self, plan_tier: &str) -> Option<crate::ops::types::ValidationException> {
+        if !self.outside_plan_tier.is_empty() {
+            return Some(crate::ops::types::ValidationException {
+                message: resources_incompatible_with_plan_tier_message(plan_tier),
+                // "The identifier of the resource that failed validation" — and what failed
+                // here is the set against the tier rather than one resource, which is why
+                // AWS's sentence names none either.
+                resource_id: None,
+            });
+        }
+        if self.prerequisite_unmet.is_empty() {
+            return None;
+        }
+        Some(crate::ops::types::ValidationException {
+            message: prerequisite_unmet_message(&self.prerequisite_unmet),
+            // "The identifier of the resource that failed validation" — which is a single
+            // resource only when exactly one failed; the message carries the whole list
+            // either way.
+            resource_id: match self.prerequisite_unmet.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+        })
+    }
+}
+
+/// Which of the resources in `resource_arns` are not eligible for the plan
+/// `plan_family`/`plan_tier` names, and which question refused each.
 ///
 /// `region` is the Region the request was signed for, which is the one the owning service
 /// is reached in.
@@ -95,11 +185,12 @@ pub async fn ineligible_resources(
     plan_family: &str,
     plan_tier: &str,
     resource_arns: &[String],
-) -> Vec<String> {
+) -> IneligibleResources {
+    let mut ineligible = IneligibleResources::default();
     // Only the CloudFront family's resources are documented, so only within it is a
     // resource placed at all: every other family establishes nothing and refuses nothing.
     if !plan_family.eq_ignore_ascii_case(CLOUDFRONT_PLAN_FAMILY) {
-        return Vec::new();
+        return ineligible;
     }
     // The web ACLs the SAME request names: the association a distribution must carry to
     // be eligible is one of these, because that is the pair the subscription covers.
@@ -109,18 +200,17 @@ pub async fn ineligible_resources(
         .filter(|arn| names_a_web_acl(arn))
         .collect();
 
-    let mut ineligible: Vec<String> = Vec::new();
     for resource_arn in resource_arns {
         // What the TIER covers needs no other service to answer.
         if !covered_by_plan_tier(plan_tier, resource_arn) {
-            ineligible.push(resource_arn.clone());
+            ineligible.outside_plan_tier.push(resource_arn.clone());
             continue;
         }
         let Some(id) = distribution_id(resource_arn) else {
             continue;
         };
         if protected_by_a_named_web_acl(ctx, region, id, &named_web_acls).await == Some(false) {
-            ineligible.push(resource_arn.clone());
+            ineligible.prerequisite_unmet.push(resource_arn.clone());
         }
     }
     ineligible
@@ -407,27 +497,143 @@ mod tests {
         }
     }
 
-    /// The refusal states the fixed sentence, the ineligible resources in the order the
-    /// request named them, and the full stop.
+    /// Each refusal class is worded for its own question: the tier refusal states the tier
+    /// the subscription is on and names no resource, while the prerequisite refusal states
+    /// the resources in the order the request named them. The class that answers a finding
+    /// refused by both is the tier one.
     #[test]
-    fn the_refusal_lists_the_ineligible_resources() {
-        let one = ["arn:aws:cloudfront::000000000000:distribution/E1".to_string()];
-        assert_eq!(
-            ineligible_resources_message(&one),
-            "The following resources are not eligible for this subscription tier: \
-             arn:aws:cloudfront::000000000000:distribution/E1.",
-            "one ineligible resource must be stated on its own"
+    fn each_refusal_class_is_worded_for_its_own_question() {
+        let first = "arn:aws:cloudfront::000000000000:distribution/E1".to_string();
+        let second = "arn:aws:cloudfront::000000000000:distribution/E2".to_string();
+        let store = "arn:aws:cloudfront::000000000000:key-value-store/kvs-1".to_string();
+
+        let nothing = IneligibleResources::default();
+        assert!(nothing.is_empty(), "an empty finding refuses nothing");
+        assert!(
+            nothing.refusal(super::super::FREE_PLAN_TIER).is_none(),
+            "an empty finding must produce no refusal"
         );
-        let two = [
-            "arn:aws:cloudfront::000000000000:distribution/E1".to_string(),
-            "arn:aws:cloudfront::000000000000:distribution/E2".to_string(),
-        ];
+
+        // The tier class, over every published tier: the sentence quotes the tier it is
+        // given and carries no ARN.
+        for tier in super::super::PLAN_TIERS_ASCENDING {
+            let finding = IneligibleResources {
+                outside_plan_tier: vec![store.clone()],
+                prerequisite_unmet: Vec::new(),
+            };
+            let refusal = finding
+                .refusal(tier)
+                .expect("a resource outside the tier must be refused");
+            assert_eq!(
+                refusal.message,
+                format!(
+                    "Resources are incompatible with plan tier '{tier}': modify resources \
+                     or select a different tier."
+                ),
+                "case {tier:?}: unexpected tier-refusal message {:?}",
+                refusal.message
+            );
+            assert!(
+                !refusal.message.contains(&store),
+                "case {tier:?}: the tier refusal must name no resource, got {:?}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.resource_id, None,
+                "case {tier:?}: the tier refusal identifies no single resource, got {:?}",
+                refusal.resource_id
+            );
+        }
+
+        // The prerequisite class: one resource, then several, in the order they were named.
+        let one = IneligibleResources {
+            outside_plan_tier: Vec::new(),
+            prerequisite_unmet: vec![first.clone()],
+        };
+        let refusal = one.refusal("PRO").expect("a prerequisite failure is refused");
         assert_eq!(
-            ineligible_resources_message(&two),
-            "The following resources are not eligible for this subscription tier: \
-             arn:aws:cloudfront::000000000000:distribution/E1, \
-             arn:aws:cloudfront::000000000000:distribution/E2.",
-            "every ineligible resource must be stated, in the order the request named them"
+            refusal.message,
+            format!("The following resources are not eligible for this subscription tier: {first}."),
+            "one ineligible resource must be stated on its own, got {:?}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.resource_id,
+            Some(first.clone()),
+            "a single prerequisite failure names the resource that failed, got {:?}",
+            refusal.resource_id
+        );
+        let two = IneligibleResources {
+            outside_plan_tier: Vec::new(),
+            prerequisite_unmet: vec![first.clone(), second.clone()],
+        };
+        let refusal = two.refusal("PRO").expect("a prerequisite failure is refused");
+        assert_eq!(
+            refusal.message,
+            format!(
+                "The following resources are not eligible for this subscription tier: \
+                 {first}, {second}."
+            ),
+            "every ineligible resource must be stated, in the order the request named them, \
+             got {:?}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.resource_id, None,
+            "several prerequisite failures identify no single resource, got {:?}",
+            refusal.resource_id
+        );
+
+        // Both questions at once: the tier sentence answers, because no prerequisite the
+        // caller could fix would admit the set on this tier.
+        let both = IneligibleResources {
+            outside_plan_tier: vec![store.clone()],
+            prerequisite_unmet: vec![first.clone()],
+        };
+        let refusal = both
+            .refusal(super::super::FREE_PLAN_TIER)
+            .expect("a finding of either class is refused");
+        assert_eq!(
+            refusal.message,
+            resources_incompatible_with_plan_tier_message(super::super::FREE_PLAN_TIER),
+            "a finding of both classes must be worded as the tier refusal, got {:?}",
+            refusal.message
+        );
+    }
+
+    /// A finding narrowed to the resources one request named drops every resource it did
+    /// not, in either class, and keeps the rest in order.
+    #[test]
+    fn a_finding_narrowed_to_one_requests_resources_keeps_only_those() {
+        let held = "arn:aws:cloudfront::000000000000:distribution/E1".to_string();
+        let added = "arn:aws:cloudfront::000000000000:distribution/E2".to_string();
+        let store = "arn:aws:cloudfront::000000000000:key-value-store/kvs-1".to_string();
+        let finding = IneligibleResources {
+            outside_plan_tier: vec![store.clone()],
+            prerequisite_unmet: vec![held.clone(), added.clone()],
+        };
+
+        let narrowed = finding.only_named(&[added.clone(), store.clone()]);
+        assert_eq!(
+            narrowed,
+            IneligibleResources {
+                outside_plan_tier: vec![store.clone()],
+                prerequisite_unmet: vec![added.clone()],
+            },
+            "only the resources the request named may be refused, got {narrowed:?}"
+        );
+        let narrowed = finding.only_named(std::slice::from_ref(&held));
+        assert_eq!(
+            narrowed,
+            IneligibleResources {
+                outside_plan_tier: Vec::new(),
+                prerequisite_unmet: vec![held.clone()],
+            },
+            "a request naming none of the other findings must not carry them, got {narrowed:?}"
+        );
+        assert!(
+            finding.only_named(&[]).is_empty(),
+            "a request naming nothing refuses nothing"
         );
     }
 }

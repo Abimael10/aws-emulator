@@ -37,7 +37,8 @@ pub mod subscription_resources;
 pub mod subscription_identity;
 
 pub use resource_eligibility::{
-    ineligible_resources, ineligible_resources_message, CLOUDFRONT_PLAN_FAMILY,
+    ineligible_resources, prerequisite_unmet_message, resources_incompatible_with_plan_tier_message,
+    IneligibleResources, CLOUDFRONT_PLAN_FAMILY,
 };
 
 pub use plan_catalog::{
