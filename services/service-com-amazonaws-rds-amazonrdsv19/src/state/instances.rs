@@ -383,6 +383,12 @@ pub struct DbInstanceRecord {
     /// ([`ActivityStreamPolicy`]). `None` for an instance whose policy nothing has modified,
     /// which reports no policy status at all.
     pub activity_stream_policy: Option<ActivityStreamPolicy>,
+    /// This instance's DATABASE ACTIVITY STREAM, for an instance a `StartActivityStream`
+    /// started one on — what the `DBInstance$ActivityStream*` members report
+    /// ([`ActivityStream`]). `None` for an instance whose stream nothing started, and for one
+    /// whose stop this service's clock has made due, each of which reports the `stopped`
+    /// status and no stream configuration at all.
+    pub activity_stream: Option<ActivityStream>,
     /// The recovery points this instance's CONTINUOUS BACKUP holds, oldest first: the data it
     /// held at each instant a session committed a change, which is what
     /// `RestoreDBInstanceToPointInTime` restores an instant's data from
@@ -412,6 +418,15 @@ impl DbInstanceRecord {
         // status ([`ActivityStreamPolicy`]).
         if let Some(policy) = self.activity_stream_policy.as_mut() {
             policy.settle(now);
+        }
+        // And so does the start or stop of the stream itself: a stop that has run its course
+        // leaves no stream on the instance ([`ActivityStream`]).
+        if self
+            .activity_stream
+            .as_mut()
+            .is_some_and(|stream| stream.settle(now, self.preferred_maintenance_window.as_deref()))
+        {
+            self.activity_stream = None;
         }
         let due = self
             .pending_status
@@ -768,15 +783,26 @@ impl DbInstanceRecord {
             .map(|(_, log)| log)
     }
 
-    /// `ActivityStreamStatus` for this instance's database activity stream: the `stopped`
-    /// member for an instance no activity stream was started for, which is every instance
-    /// this service holds ([`ACTIVITY_STREAM_STOPPED`]).
+    /// `ActivityStreamStatus` for this instance's database activity stream: the status the
+    /// stream stands in, and the `stopped` member for an instance that holds none
+    /// ([`Self::activity_stream`]).
     ///
     /// One reader for the status, so the instance's own report
     /// (`DBInstance$ActivityStreamStatus`) and what a call on the stream answers cannot
     /// drift apart.
     pub fn activity_stream_status(&self) -> &str {
-        ACTIVITY_STREAM_STOPPED
+        self.activity_stream
+            .as_ref()
+            .map_or(ACTIVITY_STREAM_STOPPED, ActivityStream::status)
+    }
+
+    /// The instance's activity stream as every report of it reads it, with the Kinesis stream
+    /// name derived from the instance's immutable `DbiResourceId`; `None` for an instance that
+    /// holds no stream.
+    pub fn activity_stream_delivery(&self) -> Option<ActivityStreamDelivery> {
+        self.activity_stream
+            .as_ref()
+            .map(|stream| stream.delivery(&self.dbi_resource_id))
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -1106,6 +1132,9 @@ impl DbInstanceRecord {
             || instance_attributes_are_cluster_managed(&self.engine))
         .then_some(db_cluster)
         .map(|cluster| ClusterManagedAttributes::of(&self.engine, cluster));
+        // One reading of the instance's database activity stream, so every member it fills
+        // describes the same stream.
+        let activity_stream = self.activity_stream_delivery();
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
             db_instance_class: Some(self.db_instance_class.clone()),
@@ -1322,6 +1351,20 @@ impl DbInstanceRecord {
             customer_owned_ip_enabled: Some(self.customer_owned_ip_enabled),
             network_type: Some(self.network_type.clone()),
             activity_stream_status: Some(self.activity_stream_status().to_string()),
+            // The configuration of the stream a `StartActivityStream` recorded, which only an
+            // instance that HAS one running carries: its mode, the key its messages are
+            // encrypted under, the Kinesis data stream they are delivered to and whether
+            // engine-native audit fields travel with them.
+            activity_stream_mode: activity_stream.as_ref().map(|stream| stream.mode.clone()),
+            activity_stream_kms_key_id: activity_stream
+                .as_ref()
+                .map(|stream| stream.kms_key_id.clone()),
+            activity_stream_kinesis_stream_name: activity_stream
+                .as_ref()
+                .map(|stream| stream.kinesis_stream_name.clone()),
+            activity_stream_engine_native_audit_fields_included: activity_stream
+                .as_ref()
+                .and_then(|stream| stream.engine_native_audit_fields_included),
             // `ActivityStreamPolicyStatus`: the state of the audit policy of this instance's
             // activity stream, for an instance a `ModifyActivityStream` has set one on, and
             // absent for one whose policy nothing has modified.

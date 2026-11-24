@@ -1151,6 +1151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 requested_tags
             },
+            // A restored cluster carries no database activity stream: the stream is started
+            // on the resource `StartActivityStream` names, and no call has named this one.
+            activity_stream: None,
         };
 
         // The restored cluster's own ENGINE ENDPOINT, opened with the state lock released,

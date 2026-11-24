@@ -3788,10 +3788,11 @@ pub const DEFAULT_MONITORING_INTERVAL: i32 = 0;
 /// User Guide).
 pub const GP3_BASELINE_STORAGE_THROUGHPUT: i32 = 125;
 
-/// The activity-stream status of an instance no activity stream was started for: the
+/// The activity-stream status of a resource that holds no database activity stream: the
 /// `stopped` member of `ActivityStreamStatus` (`stopped | starting | started |
-/// stopping`). Nothing here starts one — `StartActivityStream` is still a stub — so
-/// this is the status every instance this service holds reports.
+/// stopping`). The status a DB cluster or DB instance no `StartActivityStream` started a
+/// stream on reports, and the one a stream whose stop has come due leaves behind
+/// ([`ActivityStream`]).
 pub const ACTIVITY_STREAM_STOPPED: &str = "stopped";
 
 /// `DocdbAnalyticsEnabled` for a cluster created without the Amazon DocumentDB analytics

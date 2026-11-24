@@ -825,6 +825,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // source's is the SOURCE's. Named explicitly so the source's is not swept
                 // in by the update below.
                 activity_stream_policy: None,
+                // Nor a database activity stream of its own: `StartActivityStream` starts
+                // one on the resource it names, and the source's stream is the SOURCE's.
+                activity_stream: None,
                 // Everything else is the source's, and is never the request's: the engine
                 // and its version, the database the replica serves and the master credential
                 // a login is verified against are all the source's by definition — a replica
@@ -1483,6 +1486,9 @@ fn resolve_source_cluster(
         // Nor the cluster's activity stream audit policy state: `ModifyActivityStream` sets
         // that on the DB INSTANCE it names, so a replica created here has none.
         activity_stream_policy: None,
+        // Nor a database activity stream: `StartActivityStream` starts one on the resource it
+        // names, so a replica created here has none.
+        activity_stream: None,
     };
     let resolved = ResolvedSource::Cluster(cluster.identifier.clone());
     Ok((settings, resolved))

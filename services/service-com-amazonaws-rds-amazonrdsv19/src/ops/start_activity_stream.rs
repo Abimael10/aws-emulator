@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartActivityStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartActivityStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartActivityStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the DATABASE ACTIVITY STREAM of the DB cluster or DB instance its `ResourceArn`
+//! names: it records the mode, the KMS key and the engine-native-audit-fields setting on that
+//! resource, mints no delivery target of its own — the Kinesis data stream is named after the
+//! resource's immutable resource id — and reports the stream `starting` until this service's
+//! clock makes the start due. The write, the preconditions and the refusal wording live in
+//! [`crate::state::ComAmazonawsRdsAmazonrdsv19State::start_activity_stream`], beside the stop
+//! and the audit-policy write of the same stream, so the three cannot drift; this file is the
+//! ONLY one to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +140,49 @@ impl From<StartActivityStreamErrorModeled> for StartActivityStreamError {
     }
 }
 
+/// This operation's answer to a refused start, in its own error channel: the four faults the
+/// model declares for the two resource kinds a stream belongs to, plus the member refusal a
+/// `ResourceArn` that names neither is answered on.
+///
+/// One mapping for the start and the stop of a stream, written per handler because each has
+/// its own generated error enum.
+fn refusal_of(refusal: crate::state::ActivityStreamDeliveryRefusal) -> StartActivityStreamError {
+    use crate::state::ActivityStreamDeliveryRefusal as Refusal;
+    match refusal {
+        Refusal::UnusableArn(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        Refusal::ClusterNotFound(message) => {
+            StartActivityStreamErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        Refusal::InstanceNotFound(message) => {
+            StartActivityStreamErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        Refusal::InvalidClusterState(message) => {
+            StartActivityStreamErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        Refusal::InvalidInstanceState(message) => {
+            StartActivityStreamErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `StartActivityStream` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -177,18 +219,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartActivityStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartActivityStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartActivityStream"))
+        let region =
+            crate::state::request_region(ctx).map_err(StartActivityStreamError::validation)?;
+        // The model leaves the three required members `clientOptional`, but each is the only
+        // handle the request has on what it asks for: a call that carries no `ResourceArn`
+        // names no resource, one that carries no `Mode` asks for no mode of delivery, and one
+        // that carries no `KmsKeyId` names no key the messages can be encrypted under. Each
+        // is refused on the member that carried it rather than filled in here.
+        let resource_arn = input.resource_arn;
+        crate::state::check_not_empty("ResourceArn", &resource_arn)
+            .map_err(StartActivityStreamError::invalid_parameter_value)?;
+        let mode = input.mode;
+        crate::state::check_not_empty("Mode", &mode)
+            .map_err(StartActivityStreamError::invalid_parameter_value)?;
+        let kms_key_id = input.kms_key_id;
+        crate::state::check_not_empty("KmsKeyId", &kms_key_id)
+            .map_err(StartActivityStreamError::invalid_parameter_value)?;
+        // `KmsKeyId` is "the Amazon Web Services KMS key identifier for encrypting messages
+        // in the database activity stream", so the stream is encrypted only under a key KMS
+        // ANSWERS for. The key is resolved against this emulator's own KMS over the
+        // in-process callback, which cannot be done under the store's guard, so it is asked
+        // here with nothing written yet — and a key KMS will not encrypt under is the
+        // modelled `KMSKeyNotAccessibleFault`, the same check and the same sentence every
+        // other operation of this front door that takes a key answers
+        // ([`crate::state::kms_key_is_inaccessible`]).
+        if crate::state::kms_key_is_inaccessible(ctx, &region, &kms_key_id).await {
+            return Err(StartActivityStreamErrorModeled::KMSKeyNotAccessibleFault(
+                KMSKeyNotAccessibleFault {
+                    message: Some(crate::state::kms_key_not_accessible_message(&kms_key_id)),
+                },
+            )
+            .into());
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all; 501 is the honest answer, never a stream
+        // nothing started.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // "Specifies whether or not the database activity stream is to start as soon as
+        // possible, regardless of the maintenance window for the database": a start the
+        // caller did not ask for immediately waits for that window, which is the default
+        // every `ApplyImmediately` member of this front door carries.
+        let apply_immediately = input.apply_immediately == Some(true);
+        // The write is taken under the store's guard, which is released with the block: what
+        // follows is a call to the service that OWNS data streams, and nothing of this store
+        // is read while it runs.
+        let started = {
+            let mut store = state.lock();
+            // The transitions the clock already made due, so the start is judged against the
+            // state the resource and its stream are really in.
+            store.settle_due_transitions(&region);
+            match store.start_activity_stream(
+                &region,
+                &resource_arn,
+                &mode,
+                &kms_key_id,
+                input.engine_native_audit_fields_included,
+                apply_immediately,
+            ) {
+                Ok(started) => started,
+                Err(refusal) => return Err(refusal_of(refusal)),
+            }
+        };
+
+        // The Kinesis data stream the activity is delivered to is Amazon RDS's to create —
+        // the caller named no target — so it is created in the account's own Kinesis now that
+        // the stream this call accepted is recorded
+        // ([`crate::state::provision_activity_stream_delivery_target`]).
+        crate::state::provision_activity_stream_delivery_target(
+            ctx,
+            &region,
+            &started.kinesis_stream_name,
+        )
+        .await;
+
+        Ok(StartActivityStreamOutput {
+            // The stream as the write left it: its status — `starting` until the clock makes
+            // the start due — beside the configuration the resource's own describe now
+            // reports, with the Kinesis data stream the activity is delivered to named after
+            // that resource.
+            status: Some(started.status),
+            mode: Some(started.mode),
+            kms_key_id: Some(started.kms_key_id),
+            kinesis_stream_name: Some(started.kinesis_stream_name),
+            // "This option applies to an Oracle or Microsoft SQL Server DB instance": a
+            // stream on a resource the option does not apply to reports no such member
+            // rather than a setting nothing can act on.
+            engine_native_audit_fields_included: started.engine_native_audit_fields_included,
+            // "Indicates whether or not the database activity stream will start as soon as
+            // possible, regardless of the maintenance window for the database" — what this
+            // request asked for, which is what decided when the start comes due.
+            apply_immediately: Some(apply_immediately),
+        })
     }
 }

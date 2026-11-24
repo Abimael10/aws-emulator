@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopActivityStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopActivityStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopActivityStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the DATABASE ACTIVITY STREAM of the DB cluster or DB instance its `ResourceArn`
+//! names: the delivery the start recorded keeps running — and keeps being reported — until
+//! this service's clock makes the stop due, after which the resource reports the `stopped`
+//! status and no stream at all. The write, the preconditions and the refusal wording live in
+//! [`crate::state::ComAmazonawsRdsAmazonrdsv19State::stop_activity_stream`], beside the start
+//! of the same stream, so the two cannot drift; this file is the ONLY one to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +122,44 @@ impl From<StopActivityStreamErrorModeled> for StopActivityStreamError {
     }
 }
 
+/// This operation's answer to a refused stop, in its own error channel: the four faults the
+/// model declares for the two resource kinds a stream belongs to, plus the member refusal a
+/// `ResourceArn` that names neither is answered on.
+fn refusal_of(refusal: crate::state::ActivityStreamDeliveryRefusal) -> StopActivityStreamError {
+    use crate::state::ActivityStreamDeliveryRefusal as Refusal;
+    match refusal {
+        Refusal::UnusableArn(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        Refusal::ClusterNotFound(message) => {
+            StopActivityStreamErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        Refusal::InstanceNotFound(message) => {
+            StopActivityStreamErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        Refusal::InvalidClusterState(message) => {
+            StopActivityStreamErrorModeled::InvalidDBClusterStateFault(InvalidDBClusterStateFault {
+                message: Some(message),
+            })
+            .into()
+        }
+        Refusal::InvalidInstanceState(message) => {
+            StopActivityStreamErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `StopActivityStream` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +196,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopActivityStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopActivityStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopActivityStream"))
+        let region =
+            crate::state::request_region(ctx).map_err(StopActivityStreamError::validation)?;
+        // The model leaves `ResourceArn` `clientOptional`, but it is the only handle the
+        // request has on the resource whose stream is to stop: a call that carries none, or
+        // carries it empty, names no resource at all and is refused for that member rather
+        // than acting on something it did not name.
+        let resource_arn = input.resource_arn;
+        crate::state::check_not_empty("ResourceArn", &resource_arn)
+            .map_err(StopActivityStreamError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot resolve the resource at all; 501 is the honest answer, never a stream
+        // nothing stopped.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // "Specifies whether or not the database activity stream is to stop as soon as
+        // possible, regardless of the maintenance window for the database": a stop the caller
+        // did not ask for immediately waits for that window.
+        let apply_immediately = input.apply_immediately == Some(true);
+        // The write is taken under the store's guard, which is released with the block: what
+        // follows is a call to the service that OWNS data streams, and nothing of this store
+        // is read while it runs.
+        let stopped = {
+            let mut store = state.lock();
+            // The transitions the clock already made due, so the stop is judged against the
+            // state the resource and its stream are really in.
+            store.settle_due_transitions(&region);
+            match store.stop_activity_stream(&region, &resource_arn, apply_immediately) {
+                Ok(stopped) => stopped,
+                Err(refusal) => return Err(refusal_of(refusal)),
+            }
+        };
+
+        // The Kinesis data stream the activity was delivered to is Amazon RDS's to manage, so
+        // stopping the stream takes it away again
+        // ([`crate::state::release_activity_stream_delivery_target`]).
+        crate::state::release_activity_stream_delivery_target(
+            ctx,
+            &region,
+            &stopped.kinesis_stream_name,
+        )
+        .await;
+
+        Ok(StopActivityStreamOutput {
+            // The stream as the write left it: `stopping` until the clock makes the stop due,
+            // beside the delivery target and the key of the stream that is being stopped —
+            // the ones the start recorded, which this operation reports rather than invents.
+            status: Some(stopped.status),
+            kinesis_stream_name: Some(stopped.kinesis_stream_name),
+            kms_key_id: Some(stopped.kms_key_id),
+        })
     }
 }

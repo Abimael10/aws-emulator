@@ -891,10 +891,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // its continuous backup starts from the data the restore loaded.
                 general_query_log: crate::state::InstanceLog::default(),
                 recovery_points: Vec::new(),
-                // And it carries no activity stream audit policy state: a restore creates a
-                // new DB instance, for which no activity stream was started and no
-                // `ModifyActivityStream` has set one.
+                // And it carries no database activity stream and no audit policy state for
+                // one: a restore creates a new DB instance, for which no
+                // `StartActivityStream` has started a stream and no `ModifyActivityStream`
+                // has set a policy state.
                 activity_stream_policy: None,
+                activity_stream: None,
             };
             record.engine_log.record(format!(
                 "DB instance {} restored from {}; status {}",

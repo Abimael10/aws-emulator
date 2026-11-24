@@ -154,6 +154,12 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # callback with (`src/state/sns_topics.rs`), exactly as the EC2 client above resolves a
 # subnet. Only the generated client is needed — the emulator supplies the transport.
 aws-sdk-sns = { version = "1", default-features = false }
+# A database activity stream is DELIVERED to a Kinesis data stream that Amazon RDS creates and
+# deletes for the caller: this is the Kinesis client the start and the stop of one provision
+# and release that stream with, over the in-process callback through the one shared client
+# construction in `service-common` (`src/state/activity_stream.rs`). Only the generated client
+# is needed — the emulator supplies the transport.
+aws-sdk-kinesis = { version = "1", default-features = false }
 # The export writes each table as the Apache Parquet file Amazon RDS exports a snapshot as
 # ("the data is exported in Apache Parquet format", Exporting DB snapshot data to Amazon S3):
 # `parquet` is the Apache implementation of that format, used through its low-level row-group
@@ -212,6 +218,10 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # the assembled router mounts it, so the topic a subscription delivers to is a real topic of
 # this emulator, created through Amazon SNS's own `CreateTopic`.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# The activity-stream suite mounts Amazon Kinesis beside this service on one engine, exactly
+# as the assembled router mounts it, so the data stream a started activity stream is delivered
+# to is a real stream of this emulator, read back through Kinesis's own operations.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 # The default-bus suite mounts EventBridge and Amazon SQS beside this service on one engine,
 # exactly as the assembled router mounts them: without them there is nowhere for a recorded
 # RDS event to be delivered, and what that suite asserts is the message a rule's targets

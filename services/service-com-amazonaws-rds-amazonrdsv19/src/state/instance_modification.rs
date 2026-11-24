@@ -86,13 +86,11 @@ impl DeferredModification {
     /// `false` for a resource whose window cannot be read as a schedule and that owes no
     /// instant, which leaves the settings pending until a request applies them rather than
     /// applying them at a time no window names.
+    ///
+    /// The rule itself is [`maintenance_window::change_is_due`], which every deferrable write
+    /// of this service reads, so none of them can drift from the others.
     pub fn is_due(&self, window: Option<&str>, now: Instant) -> bool {
-        if self.apply_at.is_some_and(|due_at| now >= due_at) {
-            return true;
-        }
-        window.is_some_and(|window| {
-            maintenance_window::window_is_open(window, SystemTime::now())
-        })
+        maintenance_window::change_is_due(self.apply_at, window, now)
     }
 
     /// Whether anything is staged at all. An instance with nothing staged reports no

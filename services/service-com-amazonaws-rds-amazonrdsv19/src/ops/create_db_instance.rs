@@ -994,9 +994,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what it came up with until a session commits a change to it.
             recovery_points: Vec::new(),
             // No activity stream was started for the new instance and nothing has set the
-            // audit policy state of one, so it carries none: `ModifyActivityStream` is what
-            // sets it.
+            // audit policy state of one, so it carries neither: `StartActivityStream` starts
+            // the stream and `ModifyActivityStream` sets the policy state.
             activity_stream_policy: None,
+            activity_stream: None,
         };
         record.engine_log.record(format!(
             "DB instance {} created with engine {}; status {}",

@@ -59,6 +59,25 @@ pub fn window_is_open(window: &str, at: SystemTime) -> bool {
     }
 }
 
+/// Whether a change this service owes a resource is DUE: the instant an IMMEDIATE change was
+/// owed has passed, or `window` has come round for one that waits for it.
+///
+/// The one rule every deferrable write of this service reads — the settings
+/// [`super::instance_modification`] stages for a DB instance, and the start or stop of a
+/// database activity stream ([`super::activity_stream`]) — because both are decided by the
+/// same documented parameter: `ApplyImmediately` enabled asks for the change "as soon as
+/// possible", which is the instant `apply_at` records, and disabled leaves it for "the next
+/// maintenance window", which is open when [`window_is_open`] says so.
+///
+/// `false` for a resource whose window cannot be read as a schedule and that owes no instant,
+/// which leaves the change pending rather than applying it at a time no window names.
+pub fn change_is_due(apply_at: Option<Instant>, window: Option<&str>, now: Instant) -> bool {
+    if apply_at.is_some_and(|due_at| now >= due_at) {
+        return true;
+    }
+    window.is_some_and(|window| window_is_open(window, SystemTime::now()))
+}
+
 /// How far into the week each end of `window` falls, in seconds from the start of Monday,
 /// or `None` where the value is not of the documented `ddd:hh24:mi-ddd:hh24:mi` form.
 fn window_span_in_week(window: &str) -> Option<(u64, u64)> {

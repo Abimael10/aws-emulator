@@ -1337,6 +1337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // member created first is its primary; see `DbClusterRecord::writer_identifier`.
             writer_identifier: None,
             tags,
+            // And no database activity stream: `StartActivityStream` starts one on the
+            // cluster it names, so a cluster this call just created has none.
+            activity_stream: None,
         };
 
         // The cluster's own ENGINE ENDPOINT, opened with the state lock released. It is

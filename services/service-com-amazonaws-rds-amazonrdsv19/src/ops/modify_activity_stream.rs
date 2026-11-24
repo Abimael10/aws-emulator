@@ -240,17 +240,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // required".
             policy_status: Some(report.policy_status),
             status: Some(report.status),
-            // The Kinesis data stream the activity stream is delivered to, the key its
-            // messages are encrypted under, its mode and whether it carries engine-native
-            // audit fields are the configuration of a STARTED stream, which is what
-            // `StartActivityStream` records — an operation of its own, still a stub. No
-            // instance this service holds has a started stream, so there is no such
-            // configuration to report and these members are absent rather than carrying a
-            // value nothing configured.
-            kinesis_stream_name: None,
-            kms_key_id: None,
-            mode: None,
-            engine_native_audit_fields_included: None,
+            // The Kinesis data stream the activity is delivered to, the key its messages are
+            // encrypted under, its mode and whether it carries engine-native audit fields are
+            // the configuration of a STARTED stream, which `StartActivityStream` records: an
+            // instance whose stream is running reports it here, and one no stream was started
+            // for has no such configuration to report, so these members are absent rather
+            // than carrying a value nothing configured.
+            kinesis_stream_name: report
+                .stream
+                .as_ref()
+                .map(|stream| stream.kinesis_stream_name.clone()),
+            kms_key_id: report
+                .stream
+                .as_ref()
+                .map(|stream| stream.kms_key_id.clone()),
+            mode: report.stream.as_ref().map(|stream| stream.mode.clone()),
+            engine_native_audit_fields_included: report
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.engine_native_audit_fields_included),
         })
     }
 }

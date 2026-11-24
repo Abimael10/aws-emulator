@@ -270,6 +270,12 @@ pub struct DbClusterRecord {
     /// [`MAX_BACKTRACKS_PER_CLUSTER`] ([`Self::record_backtrack`]), and dropped with the
     /// cluster, which is the only thing that can be backtracked.
     pub backtracks: Vec<BacktrackRecord>,
+    /// The cluster's DATABASE ACTIVITY STREAM, for a cluster a `StartActivityStream` started
+    /// one on — what the four `DBCluster$ActivityStream*` members report
+    /// ([`ActivityStream`]). `None` for a cluster whose stream nothing started, and for one
+    /// whose stop this service's clock has made due, each of which reports the `stopped`
+    /// status and no stream configuration at all.
+    pub activity_stream: Option<ActivityStream>,
 }
 
 /// Emulator resource guard, NOT an AWS quota: how many performed backtracks one DB cluster
@@ -371,6 +377,16 @@ impl DbClusterRecord {
     /// step before it was due, so a read that comes after the whole progression reports where
     /// the clock has taken it rather than one step per read.
     pub(super) fn settle(&mut self, now: Instant) -> bool {
+        // The start or stop of the cluster's database activity stream settles on its own
+        // clock, whatever the cluster's status is doing: a stream is not the cluster's status
+        // ([`ActivityStream`]). A stop that has run its course leaves no stream behind.
+        if self
+            .activity_stream
+            .as_mut()
+            .is_some_and(|stream| stream.settle(now, Some(&self.preferred_maintenance_window)))
+        {
+            self.activity_stream = None;
+        }
         while self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
             match pending.change {
@@ -388,6 +404,28 @@ impl DbClusterRecord {
             }
         }
         false
+    }
+
+    /// `ActivityStreamStatus` for this cluster's database activity stream: the status the
+    /// stream stands in, and the `stopped` member for a cluster that holds none
+    /// ([`Self::activity_stream`]).
+    ///
+    /// One reader for the status, so the cluster's own report
+    /// (`DBCluster$ActivityStreamStatus`) and what a call on the stream answers cannot drift
+    /// apart.
+    pub fn activity_stream_status(&self) -> &str {
+        self.activity_stream
+            .as_ref()
+            .map_or(ACTIVITY_STREAM_STOPPED, ActivityStream::status)
+    }
+
+    /// The cluster's activity stream as every report of it reads it, with the Kinesis stream
+    /// name derived from the cluster's immutable `DbClusterResourceId`; `None` for a cluster
+    /// that holds no stream.
+    pub fn activity_stream_delivery(&self) -> Option<ActivityStreamDelivery> {
+        self.activity_stream
+            .as_ref()
+            .map(|stream| stream.delivery(&self.resource_id))
     }
 
     /// `arn:aws:rds:<region>:<account>:cluster:<identifier>`, from the stored region and
@@ -907,6 +945,9 @@ impl DbClusterRecord {
         // One reading of the restore window, so the two members it fills name the two ends
         // of the SAME window rather than two instants a moment apart.
         let restorable = self.restore_window();
+        // And one reading of the cluster's database activity stream, so the four members it
+        // fills describe the same stream.
+        let activity_stream = self.activity_stream_delivery();
         DBCluster {
             db_cluster_identifier: Some(self.identifier.clone()),
             db_cluster_arn: Some(self.arn()),
@@ -1055,13 +1096,21 @@ impl DbClusterRecord {
             engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
             db_system_id: self.db_system_id.clone(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
-            // `StartActivityStream` is still a stub, so no cluster this service holds has
-            // a database activity stream running. The recorded cluster envelope of this
-            // front door carries the status under a member name of its own as well, for a
-            // cluster of EVERY engine it serves, so the one status is reported under both
-            // names.
-            activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
-            db_activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            // The cluster's database activity stream: its status, which every cluster
+            // reports — `stopped` for one that holds no stream — and the configuration of
+            // the stream a `StartActivityStream` recorded, which only a cluster that HAS one
+            // carries. The recorded cluster envelope of this front door carries the status
+            // under a member name of its own as well, for a cluster of EVERY engine it
+            // serves, so the one status is reported under both names.
+            activity_stream_status: Some(self.activity_stream_status().to_string()),
+            db_activity_stream_status: Some(self.activity_stream_status().to_string()),
+            activity_stream_mode: activity_stream.as_ref().map(|stream| stream.mode.clone()),
+            activity_stream_kms_key_id: activity_stream
+                .as_ref()
+                .map(|stream| stream.kms_key_id.clone()),
+            activity_stream_kinesis_stream_name: activity_stream
+                .as_ref()
+                .map(|stream| stream.kinesis_stream_name.clone()),
             // The two capability flags the recorded envelope carries on every cluster this
             // front door reports, whatever its engine: neither capability is turned on for
             // a cluster created here, which is what reporting them `false` says.

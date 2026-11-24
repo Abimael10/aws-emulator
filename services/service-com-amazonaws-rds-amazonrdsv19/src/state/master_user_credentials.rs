@@ -167,8 +167,10 @@ mod tests {
             enabled_cloudwatch_logs_exports: Vec::new(),
             general_query_log: InstanceLog::default(),
             recovery_points: Vec::new(),
-            // And no activity stream audit policy state: nothing modified one on it.
+            // And no activity stream, nor an audit policy state for one: nothing started a
+            // stream on it and nothing modified a policy.
             activity_stream_policy: None,
+            activity_stream: None,
         }
     }
 }
