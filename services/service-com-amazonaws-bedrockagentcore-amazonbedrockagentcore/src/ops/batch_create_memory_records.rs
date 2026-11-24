@@ -171,8 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writing a record: the resource this call addresses is the memory container the
         // `memoryId` names, built from the request alone, so a caller no identity-based
         // policy allows to write this container's records is refused without being told
-        // whether it exists.
-        crate::state::authorize(
+        // whether it exists. It is a call of the MEMORY plane, so it is refused in that
+        // plane's own wording; it publishes NO value for the namespace condition key,
+        // because the request has no `namespace` member — each entry carries its own
+        // `namespaces` list — and nothing is guessed for a key the request does not name.
+        crate::state::authorize_memory(
             &*self.engine,
             ctx,
             Self::NAME,
@@ -180,6 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 &input.memory_id,
             ),
+            crate::state::AddressedNamespace::NoNamespaceMember,
         )
         .map_err(BatchCreateMemoryRecordsErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

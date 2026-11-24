@@ -162,10 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // IAM decides FIRST, ahead of the service resolving anything the request named:
-        // the resource this call addresses is the memory container the `memoryId` names,
-        // built from the request alone, so a caller no identity-based policy allows to
-        // delete this container's records is refused without being told whether it exists.
-        crate::state::authorize(
+        // the resource this call addresses is the memory container the `memoryId` names and
+        // the `namespace` the request carries is published as the condition key AWS scopes
+        // this delete by — which is what the model documents that member for — both built
+        // from the request alone, so a caller no identity-based policy allows to delete
+        // this record is refused without being told whether it exists.
+        crate::state::authorize_memory(
             &*self.engine,
             ctx,
             Self::NAME,
@@ -173,6 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 &input.memory_id,
             ),
+            crate::state::AddressedNamespace::Named(input.namespace.as_deref()),
         )
         .map_err(DeleteMemoryRecordErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -208,8 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_memory_records(now);
 
         // `namespace` is not a lookup key here: the model documents it as the value IAM
-        // condition key authorization reads. The delete addresses ONE record by its
-        // `memoryRecordId`, so every other record of this memory container stays.
+        // condition key authorization reads, which the gate above took it as. The delete
+        // addresses ONE record by its `memoryRecordId`, so every other record of this
+        // memory container stays.
         match store.remove_memory_record(&memory_id, &input.memory_record_id) {
             Some(removed) => Ok(DeleteMemoryRecordOutput {
                 memory_record_id: removed.memory_record_id,

@@ -195,10 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // IAM decides FIRST, ahead of the service resolving anything the request named:
-        // the resource this call addresses is the memory container the `memoryId` names,
-        // built from the request alone, so a caller no identity-based policy allows to
-        // read this container's records is refused without being told whether it exists.
-        crate::state::authorize(
+        // the resource this call addresses is the memory container the `memoryId` names and
+        // the namespace it asks for is published as the condition key AWS scopes this read
+        // by, both built from the request alone, so a caller no identity-based policy
+        // allows to read this container's records in that namespace is refused without
+        // being told whether it exists.
+        crate::state::authorize_memory(
             &*self.engine,
             ctx,
             Self::NAME,
@@ -206,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 &input.memory_id,
             ),
+            // The EXACT namespace the listing asks for is the one value the key carries; a
+            // request narrowing by `namespacePath` asks for a whole hierarchy rather than
+            // one namespace, so it names none.
+            crate::state::AddressedNamespace::Named(input.namespace.as_deref()),
         )
         .map_err(ListMemoryRecordsErrorModeled::AccessDeniedException)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

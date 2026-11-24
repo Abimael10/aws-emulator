@@ -1,15 +1,39 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: bedrock-agentcore.invoke-harness-managed-orchestration-result bedrock-agentcore.namespace-condition-key-blocks-cross-namespace-memory-read
+Issue-Trace-Ids: bedrock-agentcore.namespace-condition-key-blocks-cross-namespace-memory-read
 Issue-Shape-Id: com.amazonaws.bedrockagentcore#AmazonBedrockAgentCore
-Issue-Key: bedrock-agentcore.invoke-harness-managed-orchestration-result|run#16|AssertionError|assert expected in reply_text.replace(",", ""), (
 Issue-Key: bedrock-agentcore.namespace-condition-key-blocks-cross-namespace-memory-read|_poll_until#23|Timeout|time.sleep(interval_s)
 Issue-Commit: 95ac6b97296b25f638775ef6173e027be717227c
 
 # bedrock-agentcore: 2 net-new causes — InvokeHarness streams a fixed "no language model runs" notice instead of the harness turn's answer, and the data-plane authorizer never publishes bedrock-agentcore:namespace so a namespace-conditioned Allow refuses even the namespace it allows
 
 > _Note: this issue was identified against the code base at commit `95ac6b97296b25f638775ef6173e027be717227c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Resolution
+
+Cause 2 of 2 (the data-plane authorizer never publishing `bedrock-agentcore:namespace`) is
+FIXED: the memory plane's gate now publishes the namespace a request addresses as that
+condition key, so a `Condition` over it is evaluated — the namespace a scoped policy allows
+is served and only the others are refused — and the refusal carries the sentence this plane's
+recorded denial states. Its check
+(`bedrock-agentcore.namespace-condition-key-blocks-cross-namespace-memory-read`) passes.
+
+Cause 1 of 2 (InvokeHarness serving the fixed "no language model runs in this emulator"
+notice as the assistant turn) is NOT fixed and is NOT closed. It needs a language model
+running in-process, which this platform does not provide: every inference surface of this
+emulator answers from one generation stage whose whole output is that notice
+(`services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/src/state/generation.rs`),
+Cargo.lock carries no inference runtime or model-weights crate, and computing the answer from
+the prompt's text is the fabrication `vendor/engine/src/lib.rs` forbids. It therefore remains
+filed, on its own, as
+`issues/things-that-do-not-work/20261124T000000Z-bedrock-agentcore-invokeharness-streams-a-fixed-notice-instead-of-the-turns-answer.md`,
+which is the record that OWNS its trace id and `Issue-Key` from here on — both were removed
+from this closed report's metadata above so a scan or replay over it cannot re-own a check
+that still diverges. The "BOTH must be closed" sentence below belongs to the original bundle
+and is superseded by this split.
+
+The two causes below are the report as filed.
 
 ## Operation
 InvokeHarness

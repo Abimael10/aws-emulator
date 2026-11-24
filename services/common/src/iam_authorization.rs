@@ -962,6 +962,22 @@ pub fn not_authorized_to_access_resource(principal: &str) -> String {
     format!("User: {principal} is not authorized to access this resource")
 }
 
+/// The sentence a service refuses an unauthorized request with when it names the calling
+/// principal and the fact that the OPERATION was not permitted, and nothing further.
+///
+/// Stated beside [`not_authorized_to_perform`] and [`not_authorized_to_access_resource`] so
+/// the whole family of this refusal's wordings stays in one place. It is the form of a
+/// service whose recorded denial names neither the action nor the resource the request
+/// asked for — one sentence for an explicit `Deny` and for IAM's default deny alike, so a
+/// caller learns from it only that the call was not permitted. A gate reaches for it only
+/// where a recording of its OWN service's refusal shows this spelling; every other refusal
+/// takes [`not_authorized_by_identity_policy`] with the clause naming the rule that
+/// withheld the grant, or [`not_authorized_to_perform`] without one.
+#[must_use]
+pub fn not_authorized_to_perform_this_operation(principal: &str) -> String {
+    format!("User: {principal} is not authorized to perform this operation")
+}
+
 /// How many trailing digits of the account a refusal that masks it reports unmasked.
 const UNMASKED_ACCOUNT_DIGITS: usize = 4;
 

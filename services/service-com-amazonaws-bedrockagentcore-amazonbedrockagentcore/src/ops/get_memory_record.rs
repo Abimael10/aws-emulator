@@ -161,10 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // IAM decides FIRST, ahead of the service resolving anything the request named:
-        // the resource this call addresses is the memory container the `memoryId` names,
-        // built from the request alone, so a caller no identity-based policy allows to
-        // read this container is refused without being told whether it exists.
-        crate::state::authorize(
+        // the resource this call addresses is the memory container the `memoryId` names and
+        // the `namespace` the request carries is published as the condition key AWS scopes
+        // this read by — which is what the model documents that member for — both built
+        // from the request alone, so a caller no identity-based policy allows to read this
+        // record is refused without being told whether it exists.
+        crate::state::authorize_memory(
             &*self.engine,
             ctx,
             Self::NAME,
@@ -172,6 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::request_region(ctx.parts()),
                 &input.memory_id,
             ),
+            crate::state::AddressedNamespace::Named(input.namespace.as_deref()),
         )
         .map_err(GetMemoryRecordErrorModeled::AccessDeniedException)?;
 
@@ -210,8 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_memory_records(now);
 
         // `namespace` is not a lookup key here: the model documents it as the value IAM
-        // condition key authorization reads, and the record is addressed by its
-        // `memoryRecordId` alone.
+        // condition key authorization reads, which the gate above took it as, and the
+        // record is addressed by its `memoryRecordId` alone.
         match store.memory_record(&memory_id, &input.memory_record_id) {
             Some(record) => Ok(GetMemoryRecordOutput {
                 memory_record: record.to_memory_record(),

@@ -6,12 +6,20 @@
 //! data-plane call whose signing principal is allowed `bedrock-agentcore:<OperationName>` on
 //! the resource the request addresses by the identity-based policies in force on it reaches
 //! the operation, and one no such policy allows is refused `AccessDeniedException`
-//! (HTTP 403) naming the principal, the action and that resource — before anything the
-//! request named is resolved, so a refusal discloses nothing about what exists. A call IAM
-//! permits then resolves what it named against the component that owns it: an agent
-//! runtime, an endpoint alias on one and a harness all belong to the AgentCore CONTROL
-//! plane, so an identifier that plane holds nothing for is the modelled
-//! `ResourceNotFoundException` (404).
+//! (HTTP 403) in the wording the plane serving it states — the memory plane names the
+//! principal alone, the runtime and harness invocations name the principal, the action and
+//! that resource — before anything the request named is resolved, so a refusal discloses
+//! nothing about what exists. A call IAM permits then resolves what it named against the
+//! component that owns it: an agent runtime, an endpoint alias on one and a harness all
+//! belong to the AgentCore CONTROL plane, so an identifier that plane holds nothing for is
+//! the modelled `ResourceNotFoundException` (404).
+//!
+//! RULE: the memory plane's decision is also a function of the NAMESPACE the request
+//! addresses: a memory-record call publishes it as the `bedrock-agentcore:namespace`
+//! condition key, so a statement whose `Allow` is conditioned on that key grants exactly the
+//! namespaces its clause covers. The crate-local suite
+//! (`services/service-com-amazonaws-bedrockagentcore-amazonbedrockagentcore/tests/all/workload_access_token_authorization.rs`)
+//! holds that table; the rows here are the unconditioned half of the same gate.
 //!
 //! RULE: an invocation of a harness that IAM permits and the control plane holds answers
 //! HTTP 200 with an `application/vnd.amazon.eventstream` body: the `messageStart`,
@@ -546,6 +554,28 @@ impl Probe {
         self.resource().replace("ghost", "other")
     }
 
+    /// The whole `AccessDeniedException` message this call is refused with, in the wording
+    /// the plane serving it states.
+    ///
+    /// The MEMORY plane names the principal and nothing further; the runtime and harness
+    /// invocations state IAM's full sentence, naming the action, the resource the request
+    /// addressed and which of IAM's rules withheld the grant
+    /// ([`refusal_message`]). Each is the wording a recorded refusal of that plane carries,
+    /// which is why one service answers two.
+    fn refusal(self, principal: &str, denied: bool) -> String {
+        match self {
+            Self::GetMemoryRecord
+            | Self::DeleteMemoryRecord
+            | Self::ListMemoryRecords
+            | Self::BatchCreateMemoryRecords => {
+                format!("User: {principal} is not authorized to perform this operation")
+            }
+            Self::InvokeAgentRuntime | Self::StopRuntimeSession | Self::InvokeHarness => {
+                refusal_message(principal, self.action(), &self.resource(), denied)
+            }
+        }
+    }
+
     /// Make the call as `access_key_id`.
     async fn send(self, router: &MultiServiceRouter, access_key_id: &str) -> (u16, Value) {
         match self {
@@ -774,8 +804,8 @@ async fn the_data_plane_refuses_a_call_no_identity_based_policy_allows() {
             );
             assert_eq!(
                 message(&refused),
-                refusal_message(&principal, action, &resource, denied),
-                "case {case:?} on {probe:?}: expected IAM's sentence, got {:?}",
+                probe.refusal(&principal, denied),
+                "case {case:?} on {probe:?}: expected the refusal this plane words, got {:?}",
                 message(&refused)
             );
         }

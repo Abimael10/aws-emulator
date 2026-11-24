@@ -1053,11 +1053,12 @@ pub const IAM_ACTION_NAMESPACE: &str = "lambda";
 /// the same one `sts:GetCallerIdentity` answers with
 /// (`service_common::caller_principal`), so the sentence carries nothing of the request:
 /// the service refuses the OPERATION on a resource of AWS's own, naming neither an action
-/// nor a resource a caller could ever be granted.
+/// nor a resource a caller could ever be granted. The sentence itself is spelled once for
+/// every service that records it
+/// (`service_common::iam_authorization::not_authorized_to_perform_this_operation`).
 pub fn access_denied_message() -> String {
-    format!(
-        "User: {} is not authorized to perform this operation",
-        ::service_common::caller_principal::ambient_user_arn()
+    ::service_common::iam_authorization::not_authorized_to_perform_this_operation(
+        &::service_common::caller_principal::ambient_user_arn(),
     )
 }
 

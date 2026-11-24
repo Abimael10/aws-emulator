@@ -70,10 +70,32 @@
 //! spelling, so every action it asks for is refused. (A session the authenticating layer has
 //! already refused never reaches a handler at all.)
 //!
-//! What is NOT modelled here: a statement's `Condition` clauses. The decision is taken with
-//! an empty request context, so a statement conditioned on a key this emulator does not
-//! supply is read as the shared evaluator reads an undecided clause. Nothing here guesses a
-//! condition value.
+//! ## The condition keys a request publishes
+//!
+//! A statement's `Condition` is decided only for the keys the REQUEST carries a value for,
+//! so a gate that passes an empty context leaves every conditioned statement undecided —
+//! and an undecided `Allow` never grants
+//! ([`::service_common::iam_authorization`]'s fail-closed reading). This plane therefore
+//! publishes the condition key its own model names: a call of the MEMORY plane carries the
+//! namespace its request addresses under [`MEMORY_NAMESPACE_CONDITION_KEY`]
+//! ([`authorize_memory`]), which is what the model says that member is for ("This value is
+//! used for IAM condition key authorization", `smithy_query(query="doc",
+//! shape="GetMemoryRecordInput", member="namespace")`). The key is DECLARED by every call
+//! whose request HAS that member, whether or not it carries a value for it, so its absence
+//! is decidable rather than unknown — a request addressing a whole namespace hierarchy
+//! carries no value for it, and a clause that compares one then does not hold.
+//!
+//! Nothing here guesses a condition value: a request with no `namespace` member at all
+//! ([`AddressedNamespace::NoNamespaceMember`]) publishes none, and a statement conditioned
+//! on the key stays undecided for it.
+//!
+//! ## How a refusal is worded
+//!
+//! Two sentences, each where a recording of THIS service's own refusal shows it: a call of
+//! the memory plane names the principal and nothing further, and the identity plane's mints
+//! name the principal, the action, the resource and which of IAM's rules withheld the grant.
+//! The decision itself is one function either way, so the two cannot diverge in anything but
+//! the wording.
 
 use std::time::SystemTime;
 
@@ -87,6 +109,90 @@ use crate::ops::types::AccessDeniedException;
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
 const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 
+/// The condition key a memory-record call of this plane publishes the namespace it
+/// addresses under.
+///
+/// A service's own condition keys are named `<arn namespace>:<key>` — this service's
+/// [`super::ARN_SERVICE`] — and the model documents the `namespace` member of a
+/// memory-record request as the value that key carries: "The namespace of the memory record
+/// to retrieve. This value is used for IAM condition key authorization"
+/// (`smithy_query(query="doc", shape="GetMemoryRecordInput", member="namespace")`).
+pub const MEMORY_NAMESPACE_CONDITION_KEY: &str = "bedrock-agentcore:namespace";
+
+/// What a MEMORY call publishes for that key: the one namespace its request addresses, or
+/// the fact that its request has no such member at all.
+///
+/// The distinction matters because the shared evaluator reads absence two ways: a key the
+/// request MODELS and carries no value for is decidably absent, while a key the request does
+/// not model at all leaves a clause over it undecided. Only a request with a `namespace`
+/// member can say the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressedNamespace<'a> {
+    /// The `namespace` member of a memory-record request — the member the model documents as
+    /// the value this key carries — as the request carried it: `Some` for a call addressing
+    /// one namespace, `None` for one that left the member out or asked for a whole namespace
+    /// hierarchy instead, which addresses no single namespace.
+    Named(Option<&'a str>),
+    /// The request has NO `namespace` member to publish: a batch write carries one
+    /// `namespaces` list per entry rather than one namespace the whole call addresses. Such
+    /// a call publishes no value for the key and does not claim to carry none either, so a
+    /// statement conditioned on the key stays undecided and grants nothing — nothing here
+    /// guesses what AWS would populate it with.
+    NoNamespaceMember,
+}
+
+/// What one request publishes to the decision: the `(key, value)` pairs its own members
+/// populate, and every key it MODELS — the keys whose absence from the context means this
+/// request carries no value for them rather than that this emulator does not model them.
+#[derive(Debug, Clone, Default)]
+struct PublishedConditions {
+    carried: Vec<(String, String)>,
+    published: Vec<&'static str>,
+}
+
+impl PublishedConditions {
+    /// What a call that publishes no condition key of its own carries.
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// What a MEMORY call publishes: this plane's namespace key, declared as modelled by
+    /// every call whose request HAS the member, and carrying the namespace that member named
+    /// when it named one.
+    ///
+    /// Declaring the key is what makes its absence decidable: a request that addresses a
+    /// whole namespace hierarchy rather than one namespace carries no value for it, so a
+    /// clause comparing the key to a value does not hold while a negated one does.
+    fn of_memory_call(namespace: AddressedNamespace<'_>) -> Self {
+        let AddressedNamespace::Named(named) = namespace else {
+            return Self::none();
+        };
+        Self {
+            carried: named
+                .filter(|named| !named.is_empty())
+                .map(|named| (MEMORY_NAMESPACE_CONDITION_KEY.to_string(), named.to_string()))
+                .into_iter()
+                .collect(),
+            published: vec![MEMORY_NAMESPACE_CONDITION_KEY],
+        }
+    }
+}
+
+/// A refused decision: the principal that was refused, and which of IAM's rules refused it.
+/// How the refusal is WORDED is the calling surface's own (see the module docs), so nothing
+/// is spelled here.
+#[derive(Debug, Clone)]
+struct Refused {
+    principal: String,
+    reason: String,
+}
+
+/// The IAM action one operation of this service asks about: this service's `arnNamespace`
+/// and the operation's own name.
+fn action_of(operation: &str) -> String {
+    format!("{}:{operation}", super::ARN_SERVICE)
+}
+
 /// Authorize this request on `resource`, where `operation` is the operation's own name
 /// ([`smithy_server_runtime::Operation::NAME`]).
 ///
@@ -94,45 +200,94 @@ const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 /// the module docs); the modelled refusal otherwise, which each operation lifts into its own
 /// error channel. Call it FIRST in a handler, before anything is minted, read or written.
 ///
-/// Resolving the caller goes through STS's own `resolve_caller`, which materialises the
-/// session expiries the clock has already made due; that write is owed at the same instant
-/// whether or not anybody called, which is why a REPORTING operation of this service may
-/// take this decision too.
+/// The decision carries no condition key of this request's own, which is right for an
+/// operation whose model publishes none; a call of the MEMORY plane takes
+/// [`authorize_memory`] instead.
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
-    let action = format!("{}:{operation}", super::ARN_SERVICE);
+    let action = action_of(operation);
+    decide(engine, ctx, &action, resource, &PublishedConditions::none())
+        .map_err(|refused| not_authorized(&refused.principal, &action, resource, &refused.reason))
+}
+
+/// Authorize a call of the MEMORY plane on the memory container `memory_arn` its `memoryId`
+/// addresses, publishing the namespace it addresses as
+/// [`MEMORY_NAMESPACE_CONDITION_KEY`].
+///
+/// Publishing the key is what makes a grant conditioned on it decidable: a statement
+/// allowing the action on the container only for one namespace (or one namespace prefix)
+/// grants exactly the calls whose namespace the clause covers, and refuses every other one.
+///
+/// The refusal is this PLANE's own sentence rather than IAM's full one: a recorded refusal
+/// of a memory-record call names the principal and nothing further
+/// ([`::service_common::iam_authorization::not_authorized_to_perform_this_operation`]), so
+/// every call of this plane states it alike — a caller must not be able to tell two
+/// operations of one plane apart by the wording of a denial. The identity plane's mints keep
+/// IAM's full sentence, which is what a recording of THEIR refusal carries, and that is the
+/// split [`authorize`] serves.
+pub fn authorize_memory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    memory_arn: &str,
+    namespace: AddressedNamespace<'_>,
+) -> Result<(), AccessDeniedException> {
+    decide(
+        engine,
+        ctx,
+        &action_of(operation),
+        memory_arn,
+        &PublishedConditions::of_memory_call(namespace),
+    )
+    .map_err(|refused| AccessDeniedException {
+        message: Some(iam::not_authorized_to_perform_this_operation(
+            &refused.principal,
+        )),
+    })
+}
+
+/// The decision itself: whether the identity-based policies in force on the caller allow
+/// `action` on `resource`, with `conditions` as the request's condition context.
+///
+/// Resolving the caller goes through STS's own `resolve_caller`, which materialises the
+/// session expiries the clock has already made due; that write is owed at the same instant
+/// whether or not anybody called, which is why a REPORTING operation of this service may
+/// take this decision too.
+fn decide<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+    conditions: &PublishedConditions,
+) -> Result<(), Refused> {
     let caller = caller(engine, ctx);
+    let refused = |reason: String| Refused {
+        principal: caller.arn.clone(),
+        reason,
+    };
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
     // such element, and this service publishes no resource-based policy (see the module
-    // docs), so the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, resource, &caller.principals);
+    // docs), so the decision below rests on the action, the resource and the conditions.
+    let request = iam::Request::new(action, resource, &caller.principals)
+        .with_context(&conditions.carried)
+        .with_published_keys(&conditions.published);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
     // statement allows (see the module docs).
     if identity_said == Decision::Denied {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            iam::IDENTITY_POLICY_EXPLICIT_DENY,
-        ));
+        return Err(refused(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string()));
     }
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return Err(not_authorized(
-            &caller.arn,
-            &action,
-            resource,
-            &iam::no_identity_policy_allows(&action),
-        ));
+        return Err(refused(iam::no_identity_policy_allows(action)));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
     // grant" (IAM, permissions boundaries): a grant the boundary does not also allow is not
@@ -144,9 +299,9 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             // it; a boundary that merely states nothing withheld the grant the
             // identity-based policies gave.
             Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated => iam::no_permissions_boundary_allows(&action),
+            Decision::NotStated => iam::no_permissions_boundary_allows(action),
         };
-        return Err(not_authorized(&caller.arn, &action, resource, &reason));
+        return Err(refused(reason));
     }
     Ok(())
 }
@@ -365,6 +520,86 @@ mod tests {
             )),
             "case \"IAM's default deny\": expected IAM's wording, got {:?}",
             refusal.message
+        );
+    }
+
+    /// RULE: the condition key a memory call publishes is named after this service's own ARN
+    /// namespace, as every service-specific condition key is.
+    #[test]
+    fn the_namespace_condition_key_carries_this_services_namespace() {
+        let expected = format!("{}:namespace", super::super::ARN_SERVICE);
+        assert_eq!(
+            MEMORY_NAMESPACE_CONDITION_KEY, expected,
+            "case \"the published key\": expected {expected:?}, got \
+             {MEMORY_NAMESPACE_CONDITION_KEY:?}"
+        );
+    }
+
+    /// RULE: a memory call publishes the namespace it addresses under that key and declares
+    /// the key whenever its request HAS the member — including a request that names no
+    /// namespace, which therefore carries no value for it — while a request with no such
+    /// member publishes nothing at all.
+    #[test]
+    fn a_memory_call_publishes_the_namespace_it_addresses() {
+        // (case, what the request addresses, the values the key carries, whether it is
+        // declared as modelled)
+        let rows: &[(&str, AddressedNamespace<'_>, &[&str], bool)] = &[
+            (
+                "a request naming one namespace",
+                AddressedNamespace::Named(Some("/t/tenant/actor/alpha/facts/")),
+                &["/t/tenant/actor/alpha/facts/"],
+                true,
+            ),
+            (
+                "a request naming a sibling namespace",
+                AddressedNamespace::Named(Some("/t/tenant/actor/beta/facts/")),
+                &["/t/tenant/actor/beta/facts/"],
+                true,
+            ),
+            (
+                "a request whose member is absent",
+                AddressedNamespace::Named(None),
+                &[],
+                true,
+            ),
+            (
+                "a request naming an empty namespace",
+                AddressedNamespace::Named(Some("")),
+                &[],
+                true,
+            ),
+            (
+                "a request with no namespace member at all",
+                AddressedNamespace::NoNamespaceMember,
+                &[],
+                false,
+            ),
+        ];
+        for (case, addressed, expected, declared) in rows {
+            let conditions = PublishedConditions::of_memory_call(*addressed);
+            let carried: Vec<&str> = conditions
+                .carried
+                .iter()
+                .filter(|(key, _)| key == MEMORY_NAMESPACE_CONDITION_KEY)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(
+                carried, *expected,
+                "case {case:?}: expected the key to carry {expected:?}, got {carried:?}"
+            );
+            assert_eq!(
+                conditions
+                    .published
+                    .contains(&MEMORY_NAMESPACE_CONDITION_KEY),
+                *declared,
+                "case {case:?}: expected the key declared as modelled = {declared}, got {:?}",
+                conditions.published
+            );
+        }
+        assert!(
+            PublishedConditions::none().published.is_empty(),
+            "case \"a call publishing no key of its own\": expected no modelled key, got {:?}",
+            PublishedConditions::none().published
         );
     }
 }
