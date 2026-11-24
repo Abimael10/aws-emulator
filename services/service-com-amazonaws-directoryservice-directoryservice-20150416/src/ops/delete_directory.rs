@@ -171,10 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })?;
 
-            // The directory stops serving its OBJECTS with the same call: a directory that is
-            // gone answers no data-plane call, so the shared inventory that plane reads must
-            // not keep claiming the account holds it. The record goes whole — the directory's
-            // domain name, its data-access switch and its accounts describe nothing any more.
+            // The directory stops serving its OBJECTS with the same call: a directory that
+            // has left service answers no data-plane call, so the shared inventory that plane
+            // reads must not keep claiming the account holds it. The record goes whole — the
+            // directory's domain name, its data-access switch and its accounts describe
+            // nothing any more.
             if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
                 inventory.lock().forget(&teardown.directory_id);
             }

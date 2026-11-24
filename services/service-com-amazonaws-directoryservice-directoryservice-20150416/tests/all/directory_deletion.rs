@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The teardown `DeleteDirectory` performs, driven end to end over HTTP.
+//! The teardown `DeleteDirectory` starts, driven end to end over HTTP.
 //!
 //! Every case goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: DirectoryService_20150416.<Operation>` and an `awsJson1_1` body,
@@ -24,15 +24,19 @@
 //! chain's terminal `Deleted`, and only once the record has left does the id FILTER the
 //! reporting call to an empty page and stop being named by the unfiltered inventory. That is
 //! the window a delete-and-wait client polls, so each case here waits for the CONDITION it is
-//! about rather than for a span of time.
+//! about rather than for a span of time — and the stages it ever reads for the directory are
+//! that chain, in that order ([`TEARDOWN_CHAIN`]).
 //!
-//! The rows differ along what the two creates persist — create operation, directory type,
+//! The rows differ along what the three creates persist — create operation, directory type,
 //! size, edition and network type — and every pass keeps a control directory in the same
 //! store, so a teardown is shown to be per-directory rather than per-store.
+
+use std::cell::RefCell;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ad_connector::{connect_directory, minimal_connect};
 use crate::directory_lifecycle::{
     await_in_service, call, create_directory, describe_all, descriptions, minimal_create, ok,
     service, string, PASSWORD, STAGE_ACTIVE,
@@ -42,6 +46,11 @@ use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
     STAGE_DELETED, STAGE_DELETING,
 };
+
+/// The stages of the modelled `DirectoryStage` enum a teardown is reported in, in the order
+/// the chain reaches them: the stage the delete leaves the directory in, then the terminal
+/// stage it settles on before the record leaves the account's records.
+const TEARDOWN_CHAIN: [&str; 2] = [STAGE_DELETING, STAGE_DELETED];
 
 /// Well-formed `DirectoryId`s (`^d-[0-9a-f]{10}$`) this account is never issued, so each one
 /// reaches a read as a value the account has NEVER held — neither stored nor deleted. Varied
@@ -59,11 +68,12 @@ struct Row {
 async fn create(router: &MultiServiceRouter, row: &Row) -> String {
     match row.operation {
         "CreateMicrosoftAD" => create_microsoft_ad(router, row.body.clone(), row.case).await,
+        "ConnectDirectory" => connect_directory(router, row.body.clone(), row.case).await,
         _ => create_directory(router, row.body.clone(), row.case).await,
     }
 }
 
-/// The table: rows differing along everything the two creates persist, so the rule is not
+/// The table: rows differing along everything the three creates persist, so the rule is not
 /// asserted on one shape of directory.
 fn rows() -> Vec<Row> {
     vec![
@@ -100,6 +110,11 @@ fn rows() -> Vec<Row> {
                     "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d"]
                 }
             }),
+        },
+        Row {
+            case: "an AD Connector",
+            operation: "ConnectDirectory",
+            body: minimal_connect("gone-connected.example.com"),
         },
     ]
 }
@@ -146,6 +161,48 @@ async fn delete(router: &MultiServiceRouter, directory_id: &str, case: &str) {
         json!(directory_id),
         "case {case:?}: expected the delete to report the id it was asked about, got {answer}"
     );
+}
+
+/// Read the account's UNFILTERED inventory again and again until it no longer names
+/// `directory_id`, and answer every DISTINCT stage it reported for the directory on the way,
+/// in the order it was first seen.
+///
+/// Read from the unfiltered listing, in ONE call per pass, so the stage and the account still
+/// naming the directory are the same observation — a teardown is REPORTED rather than hidden,
+/// and no step of the chain can fall due between two reads of one pass.
+///
+/// Polled through the harness's one loop, so the wait is for the CONDITION the chain ends in
+/// rather than for a span of time; the reads only READ — each step was owed at the instant it
+/// fell due whether or not anybody called — so what this collects is the chain the delete
+/// started.
+async fn stages_until_gone(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Vec<String> {
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    poll_until_reported(
+        case,
+        &format!("{directory_id} to leave the account's records"),
+        POLL_DEADLINE,
+        || async {
+            let reported = describe_all(router, case)
+                .await
+                .into_iter()
+                .find(|described| string(described, "DirectoryId", case) == directory_id)
+                .map(|described| string(&described, "Stage", case));
+            if let Some(stage) = reported.clone() {
+                let mut seen = seen.borrow_mut();
+                if seen.last() != Some(&stage) {
+                    seen.push(stage);
+                }
+            }
+            reported
+        },
+        |observed: &Option<String>| observed.is_none(),
+    )
+    .await;
+    seen.into_inner()
 }
 
 /// This service's refusal envelope: the diagnostic, then the call's OWN request id — which is
@@ -372,6 +429,43 @@ async fn a_delete_takes_the_directory_out_of_service_and_reports_its_teardown() 
 }
 
 #[tokio::test]
+async fn the_stages_a_teardown_is_reported_in_are_the_modelled_chain_in_order() {
+    let router = service();
+    let rows = rows();
+
+    let mut ids: Vec<(&Row, String)> = Vec::new();
+    for row in &rows {
+        ids.push((row, create(&router, row).await));
+    }
+    for (row, id) in &ids {
+        await_in_service(&router, id, row.case).await;
+    }
+
+    for (row, id) in &ids {
+        let case = row.case;
+        delete(&router, id, case).await;
+
+        // The stages a client ever reads for the directory after its delete are the stages
+        // the model carries for a teardown, in the order the chain reaches them and no
+        // other — read off the account's UNFILTERED inventory, which names the directory for
+        // as long as its teardown is reported — and the chain always ends with the record
+        // gone, which is what this poll settles on.
+        let observed = stages_until_gone(&router, id, case).await;
+        assert_eq!(
+            observed,
+            TEARDOWN_CHAIN.map(str::to_string).to_vec(),
+            "case {case:?}: expected the teardown to be reported through {TEARDOWN_CHAIN:?} \
+             and then be gone, observed {observed:?}"
+        );
+        assert_eq!(
+            reported_stage(&router, id, case).await,
+            None,
+            "case {case:?}: expected the record of {id} to stay gone once the chain ended"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_deleted_id_is_told_apart_from_one_the_account_was_never_issued() {
     let router = service();
     let case = "the two absences";
@@ -385,7 +479,7 @@ async fn a_deleted_id_is_told_apart_from_one_the_account_was_never_issued() {
     poll_until_absent(&router, &deleted, case).await;
 
     // An id this account HAD: the reporting call filtered by it is SERVED, with an empty
-    // page, and a live id beside it is still reported.
+    // page for it, and the live id beside it is still reported.
     let mixed = ok(
         &router,
         "DescribeDirectories",

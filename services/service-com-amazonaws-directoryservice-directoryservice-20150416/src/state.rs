@@ -25,7 +25,8 @@
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
 //!   walking the phases of its application (and a cancelled one its rollback), a domain controller leaving
 //!   `Creating` (and a retired one
-//!   leaving the store)).
+//!   leaving the store), a directory whose teardown is running leaving `Deleting` (and one
+//!   that has reported the chain's terminal `Deleted` leaving the store)).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -3584,7 +3585,8 @@ fn optional_list(values: &[String]) -> Option<Vec<String>> {
 /// Per-service state for com-amazonaws-directoryservice-directoryservice-20150416. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
-    /// Every stored directory, keyed by its `DirectoryId`.
+    /// Every directory this account HOLDS, keyed by its `DirectoryId` — the directories a
+    /// call of this service acts on.
     pub directories: BTreeMap<String, Directory>,
     /// Every stored directory assessment, keyed by its `AssessmentId`.
     pub assessments: BTreeMap<String, AssessmentRecord>,
@@ -3949,7 +3951,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// `EnableCAEnrollmentPolicy` or `DisableCAEnrollmentPolicy` ran, a directory
     /// setting's status when
     /// `UpdateSettings` ran, a domain controller's status when the placement or the
-    /// retirement of it ran.
+    /// retirement of it ran, a directory's teardown stage when `DeleteDirectory` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         // The stage chain a DELETE owes, for the records it took out of service: the
         // teardown walks `Deleting` then `Deleted` and the record then leaves the account's
