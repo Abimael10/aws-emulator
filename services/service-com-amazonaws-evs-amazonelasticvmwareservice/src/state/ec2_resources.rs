@@ -686,10 +686,12 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
 /// doc), so a host that is deleted from its environment cannot leave that instance
 /// running in the account — `DescribeInstances` would report an instance of a host no
 /// Amazon EVS environment holds, and the account would keep paying for it. The change is
-/// written through EC2's own record exactly as that service's own termination writes it:
-/// `shutting-down` with the move to `terminated` the clock owes it, and the terminated
-/// record kept, so the instance is indistinguishable from one `TerminateInstances`
-/// stopped.
+/// written through EC2's OWN termination writer, the one that service publishes for every
+/// path that terminates an instance, so a deleted host's instance is indistinguishable
+/// from one `TerminateInstances` stopped: `shutting-down` with the move to `terminated`
+/// the clock owes it, the reason EC2 records for a shutdown a caller asked for, and the
+/// terminated record kept. What that record looks like, and that a termination is
+/// idempotent, stay EC2's rule to state rather than being restated here.
 ///
 /// `false` when the EC2 store cannot be read at all, when it holds no instance of that
 /// id, or when the instance is already on its way to `terminated` — nothing to do in any
@@ -705,26 +707,12 @@ pub fn terminate_host_instance<Eng: Send + Sync + 'static>(
         return false;
     };
     let mut store = state.lock();
-    let Some(instance) = store.instances.get_mut(instance_id) else {
-        return false;
-    };
-    if instance.state.is_terminating() {
-        return false;
-    }
-    instance.state = ec2::InstanceStateName::ShuttingDown;
-    instance.pending_transition = Some(ec2::PendingTransition::starting_now(
-        ec2::InstanceStateName::Terminated,
-    ));
-    // The caller asked for the host to go, so the shutdown is the client's, which is the
-    // reason EC2 records for a termination a caller asked for.
-    instance.state_transition_reason = Some(ec2::user_initiated_reason(
-        ::std::time::SystemTime::now(),
-    ));
-    instance.state_reason = Some((
-        "Client.UserInitiatedShutdown".to_string(),
-        "Client.UserInitiatedShutdown: User initiated shutdown".to_string(),
-    ));
-    true
+    // The writer answers the state the instance was in, and `None` when the store holds no
+    // instance of that id: this call moved one exactly when it found one that was not
+    // already on its way to `terminated`.
+    store
+        .begin_instance_termination(instance_id, ::std::time::SystemTime::now())
+        .is_some_and(|previous| !previous.is_terminating())
 }
 
 /// What came of asking Amazon EC2 to record the association of an Elastic IP allocation
