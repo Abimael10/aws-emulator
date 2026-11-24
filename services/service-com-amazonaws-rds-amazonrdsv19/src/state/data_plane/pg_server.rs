@@ -986,6 +986,21 @@ fn role_row(oid: i64, name: &str, attributes: RoleAttributes) -> Vec<Option<Stri
     ]
 }
 
+/// The wait-event TYPE `pg_stat_activity` reports for a backend blocked on a row another
+/// transaction holds: `Lock`, "the backend is waiting for a heavyweight lock".
+///
+/// Source: the wait-event tables of PostgreSQL's "The Statistics Collector" chapter, which
+/// publish the `Lock` type and, under it, the `transactionid` event — "waiting for a
+/// transaction to finish", which is the lock a row-level conflict waits on.
+///
+/// `pub(super)` because the monitoring surface names the same event: Performance Insights
+/// composes the two into one `<type>:<event>` name
+/// ([`super::activity_samples`]), so the two readings are this one pair rather than two.
+pub(super) const ROW_LOCK_WAIT_EVENT_TYPE: &str = "Lock";
+
+/// The wait EVENT reported beside [`ROW_LOCK_WAIT_EVENT_TYPE`]; same source.
+pub(super) const ROW_LOCK_WAIT_EVENT: &str = "transactionid";
+
 /// Replace `pg_stat_activity` with the sessions this endpoint holds open right now, which
 /// is what the endpoint's own session registry holds.
 fn refresh_activity(
@@ -1002,6 +1017,15 @@ fn refresh_activity(
         .live_sessions()
         .into_iter()
         .map(|session| {
+            // `wait_event_type` and `wait_event` are "the type of event for which the backend
+            // is waiting" and the event itself, and are NULL for a backend that is waiting for
+            // none. A session blocked on a row another transaction holds is waiting for that
+            // transaction to end, which PostgreSQL reports as the `transactionid` event of the
+            // `Lock` type (the documented `pg_stat_activity` wait-event table). WHETHER it is
+            // blocked is read from the lock table that is making it wait
+            // (`LockTable::is_waiting`, the wait-for graph), so the view reports the waits the
+            // engine really holds and nothing else.
+            let waiting = database.locks().is_waiting(session.pid);
             vec![
                 Some(session.pid.to_string()),
                 Some(FIRST_USER_OID.to_string()),
@@ -1013,13 +1037,8 @@ fn refresh_activity(
                 Some(session.backend_start),
                 None,
                 session.query_start,
-                // `wait_event_type` and `wait_event` are "the type of event for which the
-                // backend is waiting" and the event itself, and are NULL for a backend that
-                // is waiting for none. No session this endpoint serves ever waits: a row
-                // another transaction holds is refused rather than queued
-                // ([`super::row_locks`]), so there is no event to report.
-                None,
-                None,
+                waiting.then(|| ROW_LOCK_WAIT_EVENT_TYPE.to_string()),
+                waiting.then(|| ROW_LOCK_WAIT_EVENT.to_string()),
                 Some(session.state),
                 Some(session.query),
                 Some("client backend".to_string()),

@@ -196,10 +196,13 @@ async fn a_served_clusters_published_endpoint_is_the_address_its_engine_listener
         assert_served_endpoint_pair(row.case, row.identifier, REGION, &endpoint, &reader);
         let listener = listener_address(&engine, row.case, row.identifier);
         assert_eq!(
-            port, listener.1,
-            "case {:?}: expected the port the cluster's own listener answers on ({}), got \
-             {port}",
-            row.case, listener.1
+            (endpoint.as_str(), port),
+            (listener.0.as_str(), listener.1),
+            "case {:?}: expected the address the cluster's own listener answers on ({}:{}), got \
+             {endpoint}:{port}",
+            row.case,
+            listener.0,
+            listener.1
         );
         let resolved: Vec<std::net::SocketAddr> =
             tokio::net::lookup_host((endpoint.as_str(), port))

@@ -2247,7 +2247,10 @@ fn take_the_rows_it_locks(
     let deadline = super::sql_engine::statement_deadline(&server_view(facts)).0;
     // Taking the rows is where a statement WAITS: the time spent here is the time the
     // session was blocked on a row another transaction held, which the sampler files under
-    // the engine's own row-lock wait event ([`super::activity_samples`]).
+    // the engine's own row-lock wait event ([`super::activity_samples`]) — and for as long as
+    // it lasts the lock table records the wait in its wait-for graph, which is what reports
+    // the blocked session to another one (`LockTable::is_waiting`, read by
+    // [`super::pg_server`]).
     let asked_at = ::std::time::Instant::now();
     let outcome = database.locks().acquire(
         facts.connection_id,

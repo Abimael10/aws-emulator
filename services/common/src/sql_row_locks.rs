@@ -290,6 +290,19 @@ impl LockTable {
         self.released.notify_all();
     }
 
+    /// Whether `session` is WAITING for a row another transaction holds right now: its entry
+    /// in the wait-for graph above, which this table writes while a statement of that session
+    /// is blocked and takes away the moment the rows are granted, refused or the wait runs out.
+    ///
+    /// The ONE place that fact is kept, so a server that REPORTS a blocked session — the
+    /// `wait_event_type`/`wait_event` of PostgreSQL's `pg_stat_activity` — reports the wait this
+    /// table is actually making the statement wait on, rather than a second copy of it, and
+    /// reports it for a session blocked through any surface that shares this table.
+    #[must_use]
+    pub fn is_waiting(&self, session: u32) -> bool {
+        self.state().waiting.contains_key(&session)
+    }
+
     /// How many rows are held right now, for the tests that pin that a transaction's locks
     /// go when it does.
     #[must_use]

@@ -152,16 +152,28 @@ const APPLICATION_NAME_SETTING: &str = "application_name";
 /// suspended on while it waits for a row lock, which the Performance Schema groups under
 /// `synch`) for the MySQL ones. The TYPE is the class each engine groups the event under,
 /// which is what a request grouping by wait-event type reports.
+///
+/// The PostgreSQL pair is READ from the one place that states it
+/// ([`super::pg_server::ROW_LOCK_WAIT_EVENT_TYPE`] and its event), which is also what
+/// `pg_stat_activity` reports in its own two columns, so this name and that view cannot drift
+/// apart; this surface differs only in composing the two into one name.
 #[must_use]
 fn row_lock_wait_event(wire: EngineWire) -> WaitEvent {
     let (name, event_type) = match wire {
-        EngineWire::Postgres => ("Lock:transactionid", "Lock"),
-        EngineWire::MySql => ("synch/cond/mysys/my_thread_var::suspend", "synch"),
+        EngineWire::Postgres => (
+            format!(
+                "{}:{}",
+                super::pg_server::ROW_LOCK_WAIT_EVENT_TYPE,
+                super::pg_server::ROW_LOCK_WAIT_EVENT
+            ),
+            super::pg_server::ROW_LOCK_WAIT_EVENT_TYPE.to_string(),
+        ),
+        EngineWire::MySql => (
+            "synch/cond/mysys/my_thread_var::suspend".to_string(),
+            "synch".to_string(),
+        ),
     };
-    WaitEvent {
-        name: name.to_string(),
-        event_type: event_type.to_string(),
-    }
+    WaitEvent { name, event_type }
 }
 
 /// `sql` with its LITERAL values replaced by a placeholder: the digest form, which is what

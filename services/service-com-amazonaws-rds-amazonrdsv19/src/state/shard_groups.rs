@@ -95,8 +95,9 @@ impl DbShardGroupRecord {
 
     /// `Endpoint`: "the connection endpoint for the DB shard group", in the RDS endpoint
     /// form `<name>.<server-assigned label>.<region>.rds.amazonaws.com` that
-    /// [`DbClusterRecord::endpoint`] states for a cluster, with the label a DB shard
-    /// group's own endpoint carries.
+    /// [`cluster_endpoint_names`] states for a cluster this emulator serves no data plane
+    /// for, with the label a DB shard group's own endpoint carries: this emulator opens no
+    /// listener for a shard group, so a name is all there is to publish for it.
     pub fn endpoint(&self) -> String {
         format!(
             "{}.shardgrp-{}.{}.rds.amazonaws.com",
