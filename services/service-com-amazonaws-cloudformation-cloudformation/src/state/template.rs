@@ -3039,6 +3039,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // service mints for it and the instants of its clock.
     BCM_DASHBOARD,
     BCM_SCHEDULED_REPORT,
+    // The three Amazon Bedrock DATA AUTOMATION types, each publishing the ARN Amazon Bedrock
+    // Data Automation mints for the resource — the identity its `Ref` returns.
+    BEDROCK_BLUEPRINT,
+    BEDROCK_DATA_AUTOMATION_LIBRARY,
+    BEDROCK_DATA_AUTOMATION_PROJECT,
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",

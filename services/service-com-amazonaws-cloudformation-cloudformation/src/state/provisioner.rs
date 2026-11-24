@@ -1371,6 +1371,17 @@ pub(super) enum Provisioner {
     /// — the two forms every call on a session takes as its `sessionIdentifier` — so both are
     /// read off that create's own answer and the ARN is the identity a `Ref` resolves to.
     BedrockSession,
+    /// One of the three resources of Amazon Bedrock DATA AUTOMATION's build-time control
+    /// plane — the blueprint an `AWS::Bedrock::Blueprint` declares, the project an
+    /// `AWS::Bedrock::DataAutomationProject` declares and the library an
+    /// `AWS::Bedrock::DataAutomationLibrary` declares — which that service's own
+    /// `CreateBlueprint`, `CreateDataAutomationProject` and `CreateDataAutomationLibrary`
+    /// create, its updates change and its deletes remove. Every one of those creates MINTS the
+    /// ARN the type publishes — the handle each of that plane's calls on the resource takes —
+    /// so it is read off the create's own answer and is the identity a `Ref` resolves to. Which
+    /// of the three it is travels with the variant, so the one set of arms serves all three
+    /// ([`bedrock_data_automation`]).
+    BedrockDataAutomation(bedrock_data_automation::Resource),
     /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
     /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
     /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
@@ -2076,11 +2087,16 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         // to that file alone; the Amazon VPC Lattice family's are catalogued beside its own
         // arms the same way ([`vpc_lattice_resources`]); every other type answers `None` and
         // is left declared-only.
-        _ => agentcore_provisioner_for(resource_type).or_else(|| {
-            vpc_lattice_provisioner_for(resource_type)
-                .map(Provisioner::VpcLatticeResource)
-                .or_else(|| lex_bots::kind_of(resource_type).map(Provisioner::LexBot))
-        }),
+        _ => agentcore_provisioner_for(resource_type)
+            .or_else(|| {
+                vpc_lattice_provisioner_for(resource_type)
+                    .map(Provisioner::VpcLatticeResource)
+                    .or_else(|| lex_bots::kind_of(resource_type).map(Provisioner::LexBot))
+            })
+            .or_else(|| {
+                bedrock_data_automation_provisioner_for(resource_type)
+                    .map(Provisioner::BedrockDataAutomation)
+            }),
     }
 }
 impl Provisioner {
@@ -3070,6 +3086,12 @@ impl Provisioner {
             Self::VpcLatticeResource(kind) => {
                 delete_vpc_lattice_resource(ctx, region, kind, physical_resource_id).await
             }
+            // Each Amazon Bedrock Data Automation delete addresses its resource by the ARN that
+            // service minted for it, which is this resource's physical id and the one handle
+            // those calls bind as their URI label.
+            Self::BedrockDataAutomation(kind) => {
+                delete_bedrock_data_automation(ctx, region, kind, physical_resource_id).await
+            }
             // Each Amazon Lex delete addresses its resource by the handle the create answered,
             // which is this resource's physical id: a bot by the `botId`, and a version or an
             // alias by the pair its own identity is composed of.
@@ -3525,6 +3547,20 @@ use rekognition_resources::*;
 pub(in crate::state) mod vpc_lattice_resources;
 use vpc_lattice_resources::{
     create_vpc_lattice_resource, delete_vpc_lattice_resource, vpc_lattice_provisioner_for,
+};
+
+/// The Amazon Bedrock DATA AUTOMATION family — the blueprint, the data automation project and
+/// the data automation library a template declares — whose arms are
+/// [`bedrock_data_automation`]'s. Visible to the rest of this service's state because that
+/// module names the three types it serves and the ARN attribute each of them publishes, which
+/// the catalogue of declarable types, the return-value catalogue and the primary-identifier
+/// table each key an entry by.
+pub(in crate::state) mod bedrock_data_automation;
+use bedrock_data_automation::{
+    bedrock_data_automation_provisioner_for, bedrock_data_automation_readiness,
+    bedrock_data_automation_ready_attributes, bedrock_data_automation_removal,
+    create_bedrock_data_automation, delete_bedrock_data_automation,
+    describe_bedrock_data_automation, update_bedrock_data_automation,
 };
 
 /// The three Amazon Lex V2 types — the bot, the immutable version of one and the alias that

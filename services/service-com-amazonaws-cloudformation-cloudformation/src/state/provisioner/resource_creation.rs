@@ -1201,6 +1201,13 @@ impl Provisioner {
             Self::VpcLatticeResource(kind) => {
                 create_vpc_lattice_resource(ctx, region, kind, resource, propagated).await
             }
+            // Each Amazon Bedrock Data Automation type publishes `Tags` as the `[{Key, Value}]`
+            // list its create's own `tags` member takes, so a blueprint, a project or a library
+            // a stack creates carries the tags CloudFormation gives it beside the ones its
+            // declaration asks for.
+            Self::BedrockDataAutomation(kind) => {
+                create_bedrock_data_automation(ctx, region, kind, resource, propagated).await
+            }
             // `AWS::Lex::Bot` publishes `BotTags` and `TestBotAliasTags` and `AWS::Lex::BotAlias`
             // publishes `BotAliasTags`, each the tag MAP that resource's own create takes, so a
             // bot and an alias a stack creates carry the tags CloudFormation gives them beside

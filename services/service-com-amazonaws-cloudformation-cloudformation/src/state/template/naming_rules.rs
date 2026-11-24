@@ -956,6 +956,15 @@ pub(super) fn database_port(
 pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        // Amazon Bedrock Data Automation's `CreateDataAutomationProject` takes a `projectName`
+        // and `CreateDataAutomationLibrary` a `libraryName`, so each type takes `ProjectName` /
+        // `LibraryName`, where the types' last segments are `DataAutomationProject` and
+        // `DataAutomationLibrary`: neither `DataAutomationProjectName` nor `Name` finds either,
+        // and a generated `<stack>-<logical id>-<unique id>` would name no resource that service
+        // holds. (A BLUEPRINT needs no row: its property is `BlueprintName`, which the
+        // convention already finds.)
+        BEDROCK_DATA_AUTOMATION_PROJECT => Some("ProjectName"),
+        BEDROCK_DATA_AUTOMATION_LIBRARY => Some("LibraryName"),
         // Amazon RDS takes a cluster snapshot's own identifier as
         // `CreateDBClusterSnapshot.DBClusterSnapshotIdentifier` — the identifier this type's
         // `Ref` returns and every call on the snapshot takes — where the type's last segment

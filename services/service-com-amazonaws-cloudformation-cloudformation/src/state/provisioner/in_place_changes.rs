@@ -336,6 +336,16 @@ impl Provisioner {
             Self::BedrockSession => {
                 update_bedrock_session(ctx, region, resource, declared).await
             }
+            // Each Amazon Bedrock Data Automation update takes the resource's ARN together with
+            // the configuration it is to carry — a blueprint's schema and stage, a project's
+            // stage, description and output configurations, a library's description — so a
+            // changed declaration is applied to the resource the stack created rather than
+            // replacing it; its identity is the ARN that service minted, which an update leaves
+            // alone. A changed tag list is no part of those calls, which that arm reports as not
+            // applied.
+            Self::BedrockDataAutomation(kind) => {
+                update_bedrock_data_automation(ctx, region, kind, resource, declared).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 update_workload_identity(ctx, region, resource, declared)
                     .await

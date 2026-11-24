@@ -2154,6 +2154,40 @@ pub(crate) fn return_values(
             attributes.insert(BEDROCK_SESSION_ID_ATTRIBUTE.to_string(), session_id);
             (arn, attributes)
         }
+        // Amazon Bedrock Data Automation's build-time control plane: the blueprint, the data
+        // automation project and the data automation library a template declares. `Ref` returns
+        // each resource's ARN (the type's primary identifier), which `Fn::GetAtt` reads beside
+        // the status and the instants that service keeps. Every one of those creates takes the
+        // resource's NAME and answers the ARN IT minted — the resource segment carries 12 to 36
+        // characters of `[a-zA-Z0-9-]` that service drew, which no name CloudFormation decides
+        // is — so the value here is a STAND-IN of that form and `super::provisioning` re-points
+        // it at the ARN the create really answered
+        // ([`super::provisioner::Provisioner::BedrockDataAutomation`]). The status and the
+        // instants are that service's to report and reach the resource off its create's own
+        // answer rather than being computed here.
+        BEDROCK_BLUEPRINT | BEDROCK_DATA_AUTOMATION_PROJECT | BEDROCK_DATA_AUTOMATION_LIBRARY => {
+            let (path, salt, attribute) = match resource_type {
+                BEDROCK_BLUEPRINT => (BLUEPRINT_PATH, BLUEPRINT_ID_SALT, BLUEPRINT_ARN_ATTRIBUTE),
+                BEDROCK_DATA_AUTOMATION_PROJECT => (
+                    DATA_AUTOMATION_PROJECT_PATH,
+                    DATA_AUTOMATION_PROJECT_ID_SALT,
+                    PROJECT_ARN_ATTRIBUTE,
+                ),
+                _ => (
+                    DATA_AUTOMATION_LIBRARY_PATH,
+                    DATA_AUTOMATION_LIBRARY_ID_SALT,
+                    LIBRARY_ARN_ATTRIBUTE,
+                ),
+            };
+            let id = service_assigned_label(salt, name, BEDROCK_DATA_AUTOMATION_ID_DIGITS);
+            let arn = ::emulator_server::emulator_arn(
+                BEDROCK_ARN_NAMESPACE,
+                region,
+                &format!("{path}/{id}"),
+            );
+            attributes.insert(attribute.to_string(), arn.clone());
+            (arn, attributes)
+        }
         // The Billing and Cost Management Dashboards control plane: the dashboard an
         // `AWS::BCM::Dashboard` declares and the scheduled report an
         // `AWS::BCM::ScheduledReport` declares. "Ref returns the Arn" for either, and

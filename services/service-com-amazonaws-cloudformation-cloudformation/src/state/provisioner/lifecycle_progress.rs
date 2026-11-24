@@ -208,6 +208,14 @@ impl Provisioner {
             // invoked — so the resource is held open until Amazon Bedrock Agent reports the
             // flow `Prepared`.
             Self::BedrockFlow => flow_readiness(ctx, region, physical_resource_id).await,
+            // `CreateDataAutomationProject` answers the project `IN_PROGRESS` — Amazon Bedrock
+            // Data Automation is still building it, and an inference run against it in that
+            // state has nothing to run — so the resource is held open until that service reports
+            // the project `COMPLETED`. A blueprint and a library are complete as their creates
+            // answer, which is what that arm says of them.
+            Self::BedrockDataAutomation(kind) => {
+                bedrock_data_automation_readiness(ctx, region, kind, physical_resource_id).await
+            }
             // `ImportHypervisorConfiguration` leaves the hypervisor `PENDING` — the first of
             // the states `HypervisorDetails$State` documents, in which Backup Gateway has not
             // reached the host yet, so no gateway can be associated with it and no metadata
@@ -462,6 +470,13 @@ impl Provisioner {
             // that service has prepared it, so the type's attributes are read off the flow
             // again when it reports it `Prepared`.
             Self::BedrockFlow => flow_ready_attributes(ctx, region, physical_resource_id).await,
+            // A project's `status` and the instants Amazon Bedrock Data Automation records for it
+            // are not the ones its create answered once that service has built it, so the type's
+            // attributes are read off the project again when it reports it `COMPLETED`.
+            Self::BedrockDataAutomation(kind) => {
+                bedrock_data_automation_ready_attributes(ctx, region, kind, physical_resource_id)
+                    .await
+            }
             // A pipe's `CurrentState`, its `StateReason` and the instant it was last
             // modified are not the ones its create answered with once that service has
             // brought it up, so the type's attributes are read off the pipe again when it
@@ -619,6 +634,14 @@ impl Provisioner {
             // deletion is finished once that service no longer holds it.
             Self::BedrockDataSource => {
                 data_source_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteDataAutomationLibrary` ACCEPTS the delete and answers the library
+            // `DELETING` — that service still holds it, and a library it holds still occupies
+            // the `libraryName` the declaration asked for — so the deletion is finished once it
+            // no longer answers for the library. A blueprint and a project are gone as their
+            // deletes answer, which is what that arm says of them.
+            Self::BedrockDataAutomation(kind) => {
+                bedrock_data_automation_removal(ctx, region, kind, physical_resource_id).await
             }
             // `DeleteEnvironment` leaves the environment `DELETING` — "the request to delete
             // the environment is in progress" — so it is still there when the delete answers

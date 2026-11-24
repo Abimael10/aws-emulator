@@ -371,6 +371,14 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // keeps are that service's clock and reach the resource off its own report of the
         // session, exactly as a flow's do.
         BEDROCK_SESSION => BEDROCK_SESSION_ATTRIBUTES,
+        // A blueprint, a data automation project and a data automation library each publish the
+        // ARN Amazon Bedrock Data Automation minted for the resource — the one return value
+        // these naming rules compute a stand-in for before the resource exists. Each one's
+        // status and the instants of that service's clock reach the resource off its own report
+        // of it, exactly as a flow's do.
+        BEDROCK_BLUEPRINT => &[BLUEPRINT_ARN_ATTRIBUTE],
+        BEDROCK_DATA_AUTOMATION_PROJECT => &[PROJECT_ARN_ATTRIBUTE],
+        BEDROCK_DATA_AUTOMATION_LIBRARY => &[LIBRARY_ARN_ATTRIBUTE],
         // A VPC Lattice service network publishes the ARN its `Ref` also returns, the id
         // that service minted and the two instants of its clock; a subscription publishes the
         // same ARN and id beside the monitored resource that service resolved. Only each ARN
@@ -1129,6 +1137,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // name CloudFormation decides is either, so the identity in force is the one that
         // service answered.
         || resource_type == BEDROCK_SESSION
+        // The three Amazon Bedrock DATA AUTOMATION types are three more: none of their creates
+        // takes an identifier for the resource — each takes the name the declaration states —
+        // and each answers the ARN that service minted, whose resource segment carries 12 to 36
+        // characters of `[a-zA-Z0-9-]` it drew. That ARN is what every call on the resource
+        // takes and what the type's `Ref` returns, so no name CloudFormation decides is the
+        // identity and the one in force is what that service answered.
+        || resource_type == BEDROCK_BLUEPRINT
+        || resource_type == BEDROCK_DATA_AUTOMATION_PROJECT
+        || resource_type == BEDROCK_DATA_AUTOMATION_LIBRARY
         // An Amazon Braket SPENDING LIMIT is one more: `CreateSpendingLimit` takes no
         // identifier for the limit — the declaration states the device, the amount and the
         // period — and answers the `spendingLimitArn` that service minted, whose resource

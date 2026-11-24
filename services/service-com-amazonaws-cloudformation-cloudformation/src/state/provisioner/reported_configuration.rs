@@ -748,6 +748,11 @@ impl Provisioner {
             Self::BedrockSession => {
                 describe_bedrock_session(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock Data Automation's own read of the blueprint, the project or the
+            // library the stack created, by the ARN it minted for it.
+            Self::BedrockDataAutomation(kind) => {
+                describe_bedrock_data_automation(ctx, region, kind, physical_resource_id).await
+            }
             // Amazon Redshift's own read of the parameter group the stack created, by the
             // name it was created under.
             Self::RedshiftClusterParameterGroup => {

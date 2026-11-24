@@ -103,6 +103,7 @@ use super::template::{
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
     BCM_DASHBOARD, BCM_SCHEDULED_REPORT,
     BEDROCK_SESSION,
+    BEDROCK_BLUEPRINT, BEDROCK_DATA_AUTOMATION_LIBRARY, BEDROCK_DATA_AUTOMATION_PROJECT,
     BRAKET_SPENDING_LIMIT,
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
@@ -347,6 +348,12 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Bedrock::Flow",
     "AWS::Bedrock::Guardrail",
     "AWS::Bedrock::KnowledgeBase",
+    // The three resources of Amazon Bedrock DATA AUTOMATION's build-time control plane, each
+    // created there by its own API (`super::provisioner`): `CreateBlueprint`,
+    // `CreateDataAutomationProject` and `CreateDataAutomationLibrary`.
+    BEDROCK_BLUEPRINT,
+    BEDROCK_DATA_AUTOMATION_LIBRARY,
+    BEDROCK_DATA_AUTOMATION_PROJECT,
     // The SESSION of the Bedrock Agent RUNTIME plane, whose `CreateSession` a stack's
     // deployment mints one through (`super::provisioner`).
     BEDROCK_SESSION,

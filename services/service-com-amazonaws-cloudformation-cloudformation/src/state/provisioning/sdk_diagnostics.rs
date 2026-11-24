@@ -537,7 +537,92 @@ const SDK_SHARED_NAME_SERVICES: &[(&str, &str, &str, SdkDiagnostic)] = &[
         BEDROCK_AGENT_RUNTIME_SDK_NAME,
         SdkDiagnostic::Operation,
     ),
+    // Amazon Bedrock Data Automation's BUILD-TIME plane, the fourth claimant of that signing
+    // name, named by that model's own `sdkId` VERBATIM, the spaces included (`Bedrock Data
+    // Automation`, `smithy_query(query="service_info")` on that service's model). The shape is
+    // the one the family's other claimant above words — the refused OPERATION and that
+    // service's error code inside the envelope — there being no recording of one of these calls
+    // to word it otherwise; a recording of one is what would correct it. One row per call the
+    // arms that provision this family's types make
+    // ([`provisioner::bedrock_data_automation`]), so no other claimant of the shared name
+    // gains a diagnostic from one of them.
+    (
+        "bedrock",
+        "CreateBlueprint",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "GetBlueprint",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "UpdateBlueprint",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "DeleteBlueprint",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "CreateDataAutomationProject",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "GetDataAutomationProject",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "UpdateDataAutomationProject",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "DeleteDataAutomationProject",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "CreateDataAutomationLibrary",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "GetDataAutomationLibrary",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "UpdateDataAutomationLibrary",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "DeleteDataAutomationLibrary",
+        BEDROCK_DATA_AUTOMATION_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
 ];
+
+/// The name the SDK of Amazon Bedrock Data Automation states for it, written once so the rows
+/// above cannot spell it differently.
+const BEDROCK_DATA_AUTOMATION_SDK_NAME: &str = "Bedrock Data Automation";
 
 /// The name the SDK of the Bedrock Agent runtime states for it, written once so the rows
 /// above cannot spell it differently.

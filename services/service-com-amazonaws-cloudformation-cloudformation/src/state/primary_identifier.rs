@@ -110,6 +110,13 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // every call on a session takes as its `sessionIdentifier`; the type declares no name a
         // client could name one by.
         BEDROCK_SESSION => BEDROCK_SESSION_ARN_ATTRIBUTE,
+        // The three Amazon Bedrock DATA AUTOMATION resources, each identified by the ARN that
+        // service minted for it ("Ref returns the ARN") — the handle every call of that
+        // build-time plane on the resource takes. Each type's own name is only what the
+        // resource is called, and no call of that service addresses one by it.
+        BEDROCK_BLUEPRINT => BLUEPRINT_ARN_ATTRIBUTE,
+        BEDROCK_DATA_AUTOMATION_PROJECT => PROJECT_ARN_ATTRIBUTE,
+        BEDROCK_DATA_AUTOMATION_LIBRARY => LIBRARY_ARN_ATTRIBUTE,
         // An Amazon Braket spending limit, identified by the ARN that service minted for it
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.

@@ -58,6 +58,45 @@ pub const BEDROCK_FLOW: &str = "AWS::Bedrock::Flow";
 /// (`arn:aws:bedrock:<region>:<account>:guardrail/<id>`, from `GuardrailArn`'s pattern).
 pub const BEDROCK_ARN_NAMESPACE: &str = "bedrock";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the three Amazon Bedrock DATA
+/// AUTOMATION resources a template declares: the blueprint that describes what to extract, the
+/// data automation project an inference run names, and the data automation library a project
+/// reads its entities from. The middle segment is `Bedrock`, the `cloudFormationName` every
+/// type of that estate carries, while the owning API is Amazon Bedrock Data Automation's own
+/// build-time service (`CreateBlueprint`, `CreateDataAutomationProject`,
+/// `CreateDataAutomationLibrary`).
+///
+/// `Ref` returns each resource's ARN — the type's primary identifier — which that service
+/// MINTS: every one of those creates takes the resource's NAME and answers an ARN whose
+/// resource segment is 12 to 36 characters of `[a-zA-Z0-9-]` it drew (`BlueprintArn`,
+/// `DataAutomationProjectArn` and `DataAutomationLibraryArn` each fix that form), which is why
+/// [`identity_is_service_assigned`] names all three.
+pub const BEDROCK_BLUEPRINT: &str = "AWS::Bedrock::Blueprint";
+pub const BEDROCK_DATA_AUTOMATION_PROJECT: &str = "AWS::Bedrock::DataAutomationProject";
+pub const BEDROCK_DATA_AUTOMATION_LIBRARY: &str = "AWS::Bedrock::DataAutomationLibrary";
+
+/// The attribute each of those three types publishes the ARN its owning service minted as,
+/// which is also the resource's physical id: one name, read by the return-value catalogue, the
+/// primary-identifier table and the arms that provision the type
+/// (`super::super::provisioner::bedrock_data_automation`).
+pub const BLUEPRINT_ARN_ATTRIBUTE: &str = "BlueprintArn";
+pub const PROJECT_ARN_ATTRIBUTE: &str = "ProjectArn";
+pub const LIBRARY_ARN_ATTRIBUTE: &str = "LibraryArn";
+
+/// The resource PATH each of those ARNs carries, which is the segment that service's own ARN
+/// patterns fix before the identifier.
+pub(super) const BLUEPRINT_PATH: &str = "blueprint";
+pub(super) const DATA_AUTOMATION_PROJECT_PATH: &str = "data-automation-project";
+pub(super) const DATA_AUTOMATION_LIBRARY_PATH: &str = "data-automation-library";
+
+/// The salt the identifier stand-in of each of those resources is derived under, and how many
+/// characters it carries: the three ARN patterns admit 12 to 36 characters of `[a-zA-Z0-9-]`,
+/// so a stand-in of twelve lower-case hexadecimal digits is inside every one of them.
+pub(super) const BEDROCK_DATA_AUTOMATION_ID_DIGITS: usize = 12;
+pub(super) const BLUEPRINT_ID_SALT: &str = "bedrock/blueprint";
+pub(super) const DATA_AUTOMATION_PROJECT_ID_SALT: &str = "bedrock/data-automation-project";
+pub(super) const DATA_AUTOMATION_LIBRARY_ID_SALT: &str = "bedrock/data-automation-library";
+
 /// The salt the guardrail-id stand-in is derived under, and how many characters it carries:
 /// `GuardrailId` is `^[a-z0-9]+$` with `@length(max: 64)`, so the stand-in is lower-case
 /// alphanumeric and carries no separator. Twelve characters is the length Amazon Bedrock's
