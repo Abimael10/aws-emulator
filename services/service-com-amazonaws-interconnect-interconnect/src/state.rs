@@ -1868,6 +1868,32 @@ pub fn apply_acceptance(
     stored.pending_transition = owed_progression(ACCEPTED_CONNECTION_STATE, now);
 }
 
+/// Hand a connection to the clock in a transient provisioning state: the ONE writer of
+/// "the call that was just made enters `transient` now, and the clock settles the
+/// connection into `settles_into` one [`PROVISIONING_SPAN`] later".
+///
+/// Every call of this service that starts provisioning work on an existing connection —
+/// a re-provisioning bandwidth change ([`apply_bandwidth_change`]) and a teardown
+/// ([`apply_deletion`]) — is that one computation over a different pair of states, so it
+/// lives here once: the transient state and the due instant cannot drift apart between
+/// the writers, and [`PendingTransition`] is constructed in this module alone. The due
+/// instant is stored and materialised by whichever call comes next
+/// ([`ComAmazonawsInterconnectInterconnectState::materialise_due_transitions`]); nothing
+/// ever waits for it, and the span is non-zero, so a caller reading straight back still
+/// observes the transient state and the refusals that go with it.
+fn enter_transient_state(
+    stored: &mut StoredConnection,
+    transient: &str,
+    settles_into: String,
+    now: Instant,
+) {
+    stored.connection.state = transient.to_string();
+    stored.pending_transition = Some(PendingTransition {
+        due: now + PROVISIONING_SPAN,
+        state: settles_into,
+    });
+}
+
 /// Apply a new bandwidth to a connection: the ONE writer of what a re-provisioning
 /// change does to the record.
 ///
@@ -1879,16 +1905,38 @@ pub fn apply_acceptance(
 /// the accepted state ("pending: the connection has been accepted…"), so a connection
 /// whose proposal is still awaiting one comes back awaiting it, and whatever the
 /// restored state owes ([`owed_progression`]) is re-armed from the instant it is
-/// restored. The due instant is stored and materialised by whichever call comes next;
-/// nothing ever waits for it.
+/// restored. The handoff to the clock is the shared one ([`enter_transient_state`]), so
+/// the due instant is stored and materialised by whichever call comes next; nothing ever
+/// waits for it.
 pub fn apply_bandwidth_change(stored: &mut StoredConnection, bandwidth: String, now: Instant) {
     let came_from = stored.connection.state.clone();
     stored.connection.bandwidth = bandwidth;
-    stored.connection.state = UPDATING_CONNECTION_STATE.to_string();
-    stored.pending_transition = Some(PendingTransition {
-        due: now + PROVISIONING_SPAN,
-        state: came_from,
-    });
+    enter_transient_state(stored, UPDATING_CONNECTION_STATE, came_from, now);
+}
+
+/// Tear a connection down: the ONE writer of what a delete does to the record.
+///
+/// "deleting: the connection is being deleted" -> "deleted: the connection has been
+/// deleted". Tearing the circuit down is no more instantaneous than re-provisioning one,
+/// so the call enters the transient state and the clock settles the terminal one a span
+/// later through the same handoff a bandwidth change uses
+/// ([`enter_transient_state`]) — which is why a caller reading straight back still sees
+/// the teardown rather than the terminal state. The record itself is KEPT: the terminal
+/// state is what a later `GetConnection` / `ListConnections` must report, and the record
+/// leaves the store only once [`DELETED_RECORD_RETENTION`] has elapsed, which the same
+/// clock-driven pass applies.
+///
+/// Whether a delete is to be applied at all is the caller's verdict, not this writer's:
+/// a connection already in one of those two states is left exactly as it is, so a
+/// retried delete neither restarts the transition nor fails
+/// ([`is_deleted_or_deleting`]).
+pub fn apply_deletion(stored: &mut StoredConnection, now: Instant) {
+    enter_transient_state(
+        stored,
+        DELETING_CONNECTION_STATE,
+        DELETED_CONNECTION_STATE.to_string(),
+        now,
+    );
 }
 
 /// Whether accepting `connection`'s proposal with `attach_point`, `description` and

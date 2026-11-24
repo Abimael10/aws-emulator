@@ -166,18 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "deleting: the connection is being deleted" -> "deleted: the connection has
-        // been deleted". The call starts the first and the clock owes the second, so
-        // a caller reading straight back still sees `deleting`.
+        // been deleted", written by the one state-module writer of what a delete does to
+        // a record (`crate::state::apply_deletion`), which hands the connection to the
+        // clock the way every other re-provisioning write of this service does. The call
+        // starts the first state and the clock owes the second, so a caller reading
+        // straight back still sees `deleting`.
         //
         // @idempotent: a connection already in one of those two states is left
         // exactly as it is, and the same record is returned — a retried delete
-        // neither restarts the transition nor fails.
+        // neither restarts the transition nor fails. The verdict stays here, where it
+        // is made; only the write it decides on is shared.
         if !crate::state::is_deleted_or_deleting(&stored.connection.state) {
-            stored.connection.state = crate::state::DELETING_CONNECTION_STATE.to_string();
-            stored.pending_transition = Some(crate::state::PendingTransition {
-                due: now + crate::state::PROVISIONING_SPAN,
-                state: crate::state::DELETED_CONNECTION_STATE.to_string(),
-            });
+            crate::state::apply_deletion(stored, now);
         }
 
         // The record is kept rather than dropped: the terminal state is what a later
