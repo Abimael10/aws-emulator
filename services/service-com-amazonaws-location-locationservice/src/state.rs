@@ -974,10 +974,33 @@ pub fn field_validation_exception(
         message: why.clone(),
         reason: FIELD_VALIDATION_FAILED.to_string(),
         field_list: vec![crate::ops::types::ValidationExceptionField {
-            name: member.to_string(),
+            name: field_name(member),
             message: why,
         }],
     }
+}
+
+/// The `fieldList` entry's `name` for a refusal whose sentence names the member path
+/// `member`: the INPUT MEMBER the rejected value was read from, which is that path
+/// with every list subscript dropped.
+///
+/// `ValidationExceptionField$Name` is documented "The field name where the invalid
+/// entry was detected" — a field, so a refusal about one element of a list member is
+/// reported under the LIST member and WHICH element it was is stated by that entry's
+/// `message` alone (`Geometry.Polygon[1]` is a refusal about `Geometry.Polygon`). A
+/// path with no subscript is already a member name and is carried through unchanged.
+fn field_name(member: &str) -> String {
+    let mut name = String::with_capacity(member.len());
+    let mut depth = 0usize;
+    for character in member.chars() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => name.push(character),
+            _ => {}
+        }
+    }
+    name
 }
 
 /// The `ValidationExceptionReason` a bad member value carries: the model's enum member

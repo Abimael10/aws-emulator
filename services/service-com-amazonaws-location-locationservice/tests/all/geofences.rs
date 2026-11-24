@@ -453,10 +453,21 @@ async fn one_batch_stores_every_entry_it_carries() {
 struct RejectedCase {
     case: &'static str,
     geometry: fn() -> Value,
-    /// The member path the refusal is about, as the request-level
-    /// `ValidationException`'s `fieldList` entry names it.
+    /// The member path the refusal's sentence is about. The request-level
+    /// `ValidationException`'s `fieldList` entry names the INPUT MEMBER it belongs
+    /// to, which is this path with its list subscripts dropped
+    /// ([`field_name_of`]).
     member: &'static str,
     message: &'static str,
+}
+
+/// The `fieldList` entry's `name` a refusal whose sentence names `path` is reported
+/// under: the input member the rejected value was read from, which is `path` with its
+/// list subscripts dropped. Source: `ValidationExceptionField$Name`, documented "The
+/// field name where the invalid entry was detected" — a field name, so which element
+/// of a list member it was is stated by the entry's `message` alone.
+fn field_name_of(path: &str) -> String {
+    path.split('[').next().unwrap_or(path).to_string()
 }
 
 /// The rejected-geometry table. Rows differ along which constraint the geometry
@@ -1269,15 +1280,23 @@ async fn a_single_put_with_a_rejected_geometry_refuses_the_request_and_stores_no
                 .map(|entries| entries
                     .iter()
                     .map(|entry| (
-                        entry.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                         entry
                             .get("message")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
+                            .to_string()
                     ))
                     .collect::<Vec<_>>()),
-            Some(vec![(rejected.member, rejected.message)]),
-            "case {:?}: fieldList must name the member the sentence is about and repeat the sentence, got {body}",
+            Some(vec![(
+                field_name_of(rejected.member),
+                rejected.message.to_string()
+            )]),
+            "case {:?}: fieldList must name the input member the sentence is about and repeat the sentence, got {body}",
             rejected.case
         );
 
@@ -1940,7 +1959,7 @@ async fn every_ring_topology_a_polygon_may_not_have_is_refused_by_both_writes() 
                             .to_string()
                     ))
                     .collect::<Vec<_>>()),
-            Some(vec![(refused.member.to_string(), expected.clone())]),
+            Some(vec![(field_name_of(refused.member), expected.clone())]),
             "case {:?}: fieldList must name the polygon the refusal is about and repeat the sentence, got {body}",
             refused.case
         );

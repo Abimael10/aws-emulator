@@ -93,6 +93,11 @@ pub const MAX_GEOMETRY_VERTICES: usize = 1_000;
 /// `ValidationException`'s `FieldList` entry names the member AND repeats the
 /// sentence — so the member a check is about is carried out of the check rather
 /// than re-derived from its wording.
+///
+/// The path is the SENTENCE's subject, so it reaches down to the list element the
+/// check read (`Geometry.Polygon[0]`); the field name a `FieldList` entry reports it
+/// under is the input member that path belongs to, which
+/// [`super::field_validation_exception`] derives from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeometryRefusal {
     /// The member path, as the sentence names it (`Geometry.Polygon[0]`).
