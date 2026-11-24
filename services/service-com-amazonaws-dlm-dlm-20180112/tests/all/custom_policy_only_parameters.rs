@@ -213,6 +213,16 @@ fn custom_snapshot_details() -> Value {
     })
 }
 
+/// A complete custom snapshot policy configuration that targets INSTANCE, which
+/// is the policy the `[Custom snapshot policies that target instances only]`
+/// optional parameters belong to — a member documented for one target resource
+/// type is judged by that rule, which `policy_configuration_validation.rs` owns.
+fn custom_instance_snapshot_details() -> Value {
+    let mut details = custom_snapshot_details();
+    details["ResourceTypes"] = json!(["INSTANCE"]);
+    details
+}
+
 /// A complete event-based policy configuration — the kind the event members
 /// belong to.
 fn event_based_details() -> Value {
@@ -321,7 +331,10 @@ fn custom_policy_only_members() -> Vec<Member> {
             case: "Parameters excluding the boot volume",
             member: "Parameters",
             value: json!({"ExcludeBootVolume": true}),
-            custom_details: custom_snapshot_details,
+            // `ExcludeBootVolume` is "[Custom snapshot policies that target
+            // instances only]", so the custom policy that takes it targets
+            // instances.
+            custom_details: custom_instance_snapshot_details,
             reported_verbatim: true,
         },
         Member {

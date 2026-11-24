@@ -37,6 +37,16 @@
 //!   retention: You must specify Interval and IntervalUnit"
 //!   (`smithy_query(query="doc", shape="RetainRule")`).
 //!
+//! And which members a configuration may state at all follows what the policy
+//! TARGETS: `Parameters` documents that "the set of valid parameters depends on
+//! the combination of policy type and target resource type"
+//! (`smithy_query(query="shape", shape="Parameters")`), and the members
+//! documented for policies that target one `PolicyDetails$ResourceTypes` value
+//! only — `Schedule$VariableTags` and `Parameters$ExcludeBootVolume` /
+//! `Parameters$ExcludeDataVolumeTags` for instances, `Schedule$ArchiveRule` for
+//! volumes — are refused for a policy that targets the other, naming the target
+//! stated and the members refused, before anything is stored or changed.
+//!
 //! Each table spans the class rather than the requests an issue cited: every
 //! policy kind, every member each kind is built from (one at a time and all at
 //! once), both either/or forms of each rule and every incomplete form of each,
@@ -1014,5 +1024,383 @@ async fn a_configuration_read_back_is_accepted_again() {
             reported,
             "case {case:?}: re-sending the reported configuration must leave it unchanged"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which configuration members the resource type the policy TARGETS admits.
+// ---------------------------------------------------------------------------
+
+/// Every `ResourceTypeValues` member, verbatim from the model
+/// (`smithy_query(query="shape", shape="ResourceTypeValues")`): the two targets
+/// `PolicyDetails$ResourceTypes` selects between, so each row below is driven on
+/// the target its member admits AND on the other one.
+const RESOURCE_TYPE_VALUES: [&str; 2] = ["VOLUME", "INSTANCE"];
+
+/// A creation frequency a schedule that archives its snapshots may run at: the
+/// cron form naming the first day of every month. `CreateRule`'s note requires a
+/// schedule carrying an `ArchiveRule` to create at least every 28 days
+/// (`archive_creation_frequency.rs` owns that rule), which no interval form can
+/// state, so the archiving row states the frequency as an expression.
+const MONTHLY_CRON: &str = "cron(0 0 1 * ? *)";
+
+/// One configuration member the documentation admits for policies that target
+/// ONE resource type, with the target it admits and a complete configuration to
+/// state it inside.
+struct TargetRestricted {
+    case: &'static str,
+    /// The member's own wire name, which is how the refusal names it.
+    member: &'static str,
+    /// The `ResourceTypeValues` member its documentation admits.
+    admitted: &'static str,
+    /// A complete configuration for a policy targeting the given resource type,
+    /// WITHOUT this member — what the update rows patch the member onto.
+    base: fn(&str) -> Value,
+    /// The JSON pointer, inside the configuration, of the structure that carries
+    /// the member.
+    parent: &'static str,
+    /// The value a request states for it.
+    value: Value,
+}
+
+/// A complete custom EBS snapshot configuration targeting `target` and carrying
+/// `schedules`.
+fn snapshot_details_targeting(target: &str, schedules: Value) -> Value {
+    let mut details = custom_snapshot_details();
+    details["ResourceTypes"] = json!([target]);
+    details["Schedules"] = schedules;
+    details
+}
+
+/// The base configuration of the rows whose member sits on a schedule: one
+/// schedule the service accepts on its own.
+fn one_schedule_details(target: &str) -> Value {
+    snapshot_details_targeting(target, json!([good_schedule("daily")]))
+}
+
+/// The same with a SECOND schedule, so a member stated on a later element of
+/// `Schedules` is judged too.
+fn two_schedule_details(target: &str) -> Value {
+    snapshot_details_targeting(
+        target,
+        json!([good_schedule("daily"), good_schedule("weekly")]),
+    )
+}
+
+/// The base configuration of the archiving row: a schedule whose creation
+/// frequency is one it may archive at.
+fn archiving_details(target: &str) -> Value {
+    snapshot_details_targeting(
+        target,
+        json!([{
+            "Name": "archived",
+            "CreateRule": {"CronExpression": MONTHLY_CRON},
+            "RetainRule": {"Count": 2},
+        }]),
+    )
+}
+
+/// The base configuration of the rows whose member sits in `Parameters`: the
+/// optional-parameter structure, stating none of them yet.
+fn parameter_details(target: &str) -> Value {
+    let mut details = one_schedule_details(target);
+    details["Parameters"] = json!({});
+    details
+}
+
+/// `details` with `member` stated inside the structure at `parent`.
+fn stating(mut details: Value, parent: &str, member: &str, value: &Value) -> Value {
+    let holder = details
+        .pointer_mut(parent)
+        .expect("the base configuration carries the member's parent structure");
+    holder[member] = value.clone();
+    details
+}
+
+/// Every configuration member documented for one target resource type only, each
+/// with a value its target shape admits.
+///
+/// Source: `smithy_query(query="shape", shape="Schedule")` — `VariableTags` opens
+/// "[AMI policies and snapshot policies that target instances only]" and its
+/// values "must be in one of the two following formats: `$(instance-id)` or
+/// `$(timestamp)`", and `ArchiveRule` opens "[Custom snapshot policies that
+/// target volumes only]" — and `smithy_query(query="shape",
+/// shape="Parameters")`, where `ExcludeBootVolume` and `ExcludeDataVolumeTags`
+/// both open "[Custom snapshot policies that target instances only]".
+fn target_restricted_members() -> Vec<TargetRestricted> {
+    vec![
+        TargetRestricted {
+            // The member the issue reproduced, in the first of its two documented
+            // value formats.
+            case: "VariableTags resolved from the instance",
+            member: "VariableTags",
+            admitted: "INSTANCE",
+            base: one_schedule_details,
+            parent: "/Schedules/0",
+            value: json!([{"Key": "tracker", "Value": "$(instance-id)"}]),
+        },
+        TargetRestricted {
+            // The other value format, on a LATER element of `Schedules`: the rule
+            // is judged on every schedule, not just the first.
+            case: "VariableTags resolved from the clock, on the second schedule",
+            member: "VariableTags",
+            admitted: "INSTANCE",
+            base: two_schedule_details,
+            parent: "/Schedules/1",
+            value: json!([{"Key": "stamped", "Value": "$(timestamp)"}]),
+        },
+        TargetRestricted {
+            // The member restricted to the OTHER target, so the rule is exercised
+            // in both directions.
+            case: "an ArchiveRule on the schedule",
+            member: "ArchiveRule",
+            admitted: "VOLUME",
+            base: archiving_details,
+            parent: "/Schedules/0",
+            value: json!({"RetainRule": {"RetentionArchiveTier": {"Count": 90}}}),
+        },
+        TargetRestricted {
+            case: "Parameters excluding the boot volume",
+            member: "ExcludeBootVolume",
+            admitted: "INSTANCE",
+            base: parameter_details,
+            parent: "/Parameters",
+            value: json!(true),
+        },
+        TargetRestricted {
+            case: "Parameters excluding tagged data volumes",
+            member: "ExcludeDataVolumeTags",
+            admitted: "INSTANCE",
+            base: parameter_details,
+            parent: "/Parameters",
+            value: json!([{"Key": "data", "Value": "exclude"}]),
+        },
+    ]
+}
+
+/// The refusal wording this service answers for members the resource type a
+/// policy targets does not admit: the fixed text, the target the request stated
+/// wrapped in braces, and the members refused.
+fn invalid_for_target(target: &str, members: &[&str]) -> String {
+    format!(
+        "The following parameter(s) are invalid for Resource Type {{{target}}}: {}",
+        members.join(", ")
+    )
+}
+
+/// Assert `answer` is the modelled refusal naming exactly `members` for `target`.
+fn assert_refused_for_target(case: &str, answer: &Answer, target: &str, members: &[&str]) {
+    assert_refusal(case, answer);
+    let expected = invalid_for_target(target, members);
+    assert_eq!(
+        answer.message(),
+        expected,
+        "case {case:?}: expected {expected:?}, got {:?}",
+        answer.message()
+    );
+    // Neither structured list: the members refused are not parameters of the
+    // request itself, and none of them was omitted or stated beside a parameter
+    // it cannot be combined with.
+    assert_no_parameter_list(case, answer, "RequiredParameters");
+    assert_no_parameter_list(case, answer, "MutuallyExclusiveParameters");
+}
+
+/// RULE — a configuration member the documentation admits for policies that
+/// target one resource type only is refused by a create for a policy that
+/// targets the other, naming the target and the member, and is accepted and
+/// reported back by a policy that targets the one it admits.
+///
+/// The rows span every such member, both targets, both documented `VariableTags`
+/// value formats, the first and a later element of `Schedules`, and a member of
+/// each structure that carries one.
+#[tokio::test]
+async fn a_create_refuses_a_member_the_target_resource_type_does_not_admit() {
+    let router = emulator();
+    for row in target_restricted_members() {
+        for target in RESOURCE_TYPE_VALUES {
+            let case = format!("{} on a policy targeting {target}", row.case);
+            let case = case.as_str();
+            let details = stating((row.base)(target), row.parent, row.member, &row.value);
+            let before = policy_count(&router).await;
+            let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+
+            if target == row.admitted {
+                assert_owed(case, &answer, &Owed::Accepted);
+                let pointer = format!("/PolicyDetails{}/{}", row.parent, row.member);
+                let read = get(&router, &answer.policy_id()).await;
+                assert_eq!(
+                    at(read.policy(), &pointer),
+                    row.value,
+                    "case {case:?}: expected {pointer} to report {:?}, got {:?}",
+                    row.value,
+                    at(read.policy(), &pointer)
+                );
+                assert_eq!(
+                    policy_count(&router).await,
+                    before + 1,
+                    "case {case:?}: an accepted create must store its policy"
+                );
+            } else {
+                assert_refused_for_target(case, &answer, target, &[row.member]);
+                assert_eq!(
+                    policy_count(&router).await,
+                    before,
+                    "case {case:?}: a refused create must leave no policy behind"
+                );
+            }
+        }
+    }
+}
+
+/// The refusal names EVERY member the stated target does not admit, once each,
+/// in the order the configuration declares them.
+#[tokio::test]
+async fn the_refusal_names_every_member_the_target_does_not_admit() {
+    let router = emulator();
+    let variable_tags = json!([{"Key": "tracker", "Value": "$(instance-id)"}]);
+
+    // Three instance-only members at once on a volume-targeting policy: the two
+    // structures that carry one, named in the order `PolicyDetails` declares
+    // them (`Schedules` before `Parameters`) and each shape declares its own.
+    let case = "a volume-targeting policy stating every instance-only member";
+    let details = stating(
+        stating(
+            stating(
+                parameter_details("VOLUME"),
+                "/Schedules/0",
+                "VariableTags",
+                &variable_tags,
+            ),
+            "/Parameters",
+            "ExcludeBootVolume",
+            &json!(false),
+        ),
+        "/Parameters",
+        "ExcludeDataVolumeTags",
+        &json!([{"Key": "data", "Value": "exclude"}]),
+    );
+    let before = policy_count(&router).await;
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_refused_for_target(
+        case,
+        &answer,
+        "VOLUME",
+        &["VariableTags", "ExcludeBootVolume", "ExcludeDataVolumeTags"],
+    );
+
+    // The same member on two schedules is one member to correct, so it is named
+    // once.
+    let case = "a volume-targeting policy stating VariableTags on both schedules";
+    let details = stating(
+        stating(
+            two_schedule_details("VOLUME"),
+            "/Schedules/0",
+            "VariableTags",
+            &variable_tags,
+        ),
+        "/Schedules/1",
+        "VariableTags",
+        &variable_tags,
+    );
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_refused_for_target(case, &answer, "VOLUME", &["VariableTags"]);
+
+    assert_eq!(
+        policy_count(&router).await,
+        before,
+        "a refused create must leave no policy behind"
+    );
+}
+
+/// The rule holds across the POLICY TYPES that take the restricted member, not
+/// only the snapshot type the table above drives: an AMI policy, which the
+/// `VariableTags` sentence names beside "snapshot policies that target instances
+/// only", states and reports the member on the target that sentence admits.
+///
+/// Whether a policy of that type may target volumes at all is
+/// `PolicyDetails$ResourceTypes`' own question, which this rule does not answer,
+/// so no row here states one.
+#[tokio::test]
+async fn an_ami_policy_states_variable_tags_on_the_target_they_are_valid_for() {
+    let router = emulator();
+    let variable_tags = json!([{"Key": "tracker", "Value": "$(instance-id)"}]);
+    let case = "an AMI policy targeting INSTANCE with VariableTags";
+    let details = stating(
+        custom_image_details(),
+        "/Schedules/0",
+        "VariableTags",
+        &variable_tags,
+    );
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_owed(case, &answer, &Owed::Accepted);
+    let read = get(&router, &answer.policy_id()).await;
+    assert_eq!(
+        at(read.policy(), "/PolicyDetails/Schedules/0/VariableTags"),
+        variable_tags,
+        "case {case:?}: the accepted variable tags must be reported back, got {:?}",
+        at(read.policy(), "/PolicyDetails/Schedules/0/VariableTags")
+    );
+
+    // And the other direction on that same policy type: the volume-only member
+    // is refused for what this policy targets, naming the target it stated.
+    let case = "an AMI policy targeting INSTANCE with an ArchiveRule";
+    let mut details = custom_image_details();
+    details["Schedules"] = json!([{
+        "Name": "archived",
+        "CreateRule": {"CronExpression": MONTHLY_CRON},
+        "RetainRule": {"Count": 2},
+        "ArchiveRule": {"RetainRule": {"RetentionArchiveTier": {"Count": 90}}},
+    }]);
+    let answer = create(&router, create_request(case, json!({"PolicyDetails": details}))).await;
+    assert_refused_for_target(case, &answer, "INSTANCE", &["ArchiveRule"]);
+}
+
+/// `UpdateLifecyclePolicy` follows the same rule, so an accepted policy cannot be
+/// mutated into a shape its target admits nowhere: a replacement configuration
+/// adding such a member is refused and the stored policy is left exactly as it
+/// was, while the same member is applied to a policy whose target admits it.
+#[tokio::test]
+async fn an_update_refuses_a_member_the_target_resource_type_does_not_admit() {
+    let router = emulator();
+    for row in target_restricted_members() {
+        for target in RESOURCE_TYPE_VALUES {
+            let case = format!("{} patched onto a policy targeting {target}", row.case);
+            let case = case.as_str();
+            let base = (row.base)(target);
+            let created = create(
+                &router,
+                create_request(case, json!({"PolicyDetails": base.clone()})),
+            )
+            .await;
+            assert_owed(case, &created, &Owed::Accepted);
+            let id = created.policy_id();
+            let stored = at(get(&router, &id).await.policy(), "/PolicyDetails");
+
+            let replacement = stating(base, row.parent, row.member, &row.value);
+            let answer = update(&router, &id, json!({"PolicyDetails": replacement})).await;
+            let pointer = format!("/PolicyDetails{}/{}", row.parent, row.member);
+
+            if target == row.admitted {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: expected HTTP 200, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    at(get(&router, &id).await.policy(), &pointer),
+                    row.value,
+                    "case {case:?}: expected {pointer} to report {:?} after the update, got {:?}",
+                    row.value,
+                    at(get(&router, &id).await.policy(), &pointer)
+                );
+            } else {
+                assert_refused_for_target(case, &answer, target, &[row.member]);
+                assert_eq!(
+                    at(get(&router, &id).await.policy(), "/PolicyDetails"),
+                    stored,
+                    "case {case:?}: a refused update must leave the stored policy as it was"
+                );
+            }
+        }
     }
 }

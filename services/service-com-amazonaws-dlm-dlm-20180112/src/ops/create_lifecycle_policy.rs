@@ -379,6 +379,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And which configuration members the resource type the policy TARGETS
+        // admits: `Parameters` documents that "the set of valid parameters
+        // depends on the combination of policy type and target resource type",
+        // and the members documented for policies that target one of the two
+        // resource types only are refused for a policy that targets the other.
+        // Refused before anything is stored, so no policy is left carrying a
+        // member its target admits nowhere for a read to report.
+        if let Some(refusal) =
+            crate::state::target_resource_type_violation(input.policy_details.as_ref())
+        {
+            return Err(
+                CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // A caller may not SET a tag key under the reserved `aws:` prefix, here
         // or through `TagResource`, and the refusal is the same class, status and
         // prose on both paths (`crate::state::reserved_tag_key_refused`).

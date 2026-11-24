@@ -30,6 +30,13 @@ pub use archive_creation_frequency::{
     archive_creation_frequency_violation, ARCHIVE_CREATION_FREQUENCY_MIN_DAYS,
 };
 
+/// Which configuration members the resource type a policy TARGETS admits, which
+/// both write paths judge through [`target_resource_type_violation`] before the
+/// first write.
+mod target_resource_type;
+
+pub use target_resource_type::target_resource_type_violation;
+
 /// The region a request belongs to — the policies it reaches, and the region a
 /// policy ARN it mints names — when it carries no SigV4 credential scope to read
 /// one from.

@@ -326,6 +326,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // And, by the same rule as at create, which configuration members the
+        // resource type the policy TARGETS admits: a replacement configuration
+        // may state none that the target it restates does not admit, so an
+        // accepted policy cannot be mutated into a shape AWS would never have
+        // created. Judged before the first write, so a refused update leaves the
+        // stored policy exactly as it was.
+        if let Some(refusal) =
+            crate::state::target_resource_type_violation(input.policy_details.as_ref())
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // The documented numeric domain of a default policy's cadence, as at
         // create: the creation frequency's 1-to-7 days, the retention period's
         // 2-to-14 days, and a retention period greater than the creation
