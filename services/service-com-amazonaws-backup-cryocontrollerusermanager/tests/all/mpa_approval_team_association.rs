@@ -42,7 +42,7 @@ const MEMBER: &str = "MpaApprovalTeamArn";
 
 /// The retention window every air-gapped vault in this suite is created with: the
 /// documented floor of `MinRetentionDays` and a year.
-const WINDOW: &str = r#"{"MinRetentionDays": 7, "MaxRetentionDays": 365}"#;
+pub(crate) const WINDOW: &str = r#"{"MinRetentionDays": 7, "MaxRetentionDays": 365}"#;
 
 /// The routing header AWS Organizations is reached by (that crate's `OPERATIONS.md`:
 /// `POST /` with `X-Amz-Target: AWSOrganizationsV20161128.<Op>`).
@@ -52,8 +52,12 @@ const ORGANIZATIONS_TARGET: &str = "AWSOrganizationsV20161128.CreateOrganization
 /// router: the team a vault is put under is the approval service's own resource, so that
 /// service has to be mounted for a team to resolve at all, and Organizations has to be
 /// mounted for a team to be creatable in the first place.
-struct Emulator {
-    router: MultiServiceRouter,
+///
+/// `pub(crate)`, so the sibling suite covering the ORDER this operation decides in
+/// (`mpa_association_denial_precedes_the_team_lookup.rs`) drives the same three mounted
+/// services instead of growing a second copy of this harness.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -61,7 +65,7 @@ impl Emulator {
     /// The three services as the emulator mounts them, with the caller's own account made
     /// the management account of an organization through Organizations' OWN API — the
     /// state in which a client may create an approval team.
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -150,7 +154,7 @@ impl Emulator {
     /// The attached policy comes from that service's own published catalog, listed over the
     /// wire: an attachment it cannot resolve is refused, so the reference is taken from the
     /// catalog rather than spelled here.
-    async fn create_approval_team(&self, name: &str) -> String {
+    pub(crate) async fn create_approval_team(&self, name: &str) -> String {
         let (status, listed) = self.mpa("POST", "/policies/?List", None).await;
         assert_eq!(
             status, 200,
@@ -207,7 +211,7 @@ impl Emulator {
 
     /// `PUT /backup-vaults/{BackupVaultName}/mpaApprovalTeam`, as the model binds the
     /// association.
-    async fn associate(&self, vault: &str, team_arn: &str) -> (u16, String, Value) {
+    pub(crate) async fn associate(&self, vault: &str, team_arn: &str) -> (u16, String, Value) {
         call_reported(
             &self.router,
             "PUT",
@@ -231,7 +235,7 @@ impl Emulator {
 
     /// Create a logically air-gapped vault — the one type multi-party approval is a
     /// facility of — under `name`.
-    async fn create_vault(&self, name: &str) {
+    pub(crate) async fn create_vault(&self, name: &str) {
         let (status, created) = create_air_gapped(&self.router, name, WINDOW).await;
         assert_eq!(
             status, 200,
@@ -242,7 +246,7 @@ impl Emulator {
 
     /// `MpaApprovalTeamArn` as `DescribeBackupVault` reports it, or `"<unset>"` when the
     /// vault carries none.
-    async fn reported_team(&self, vault: &str) -> String {
+    pub(crate) async fn reported_team(&self, vault: &str) -> String {
         let (status, described) =
             call(&self.router, "GET", &format!("/backup-vaults/{vault}"), None).await;
         assert_eq!(

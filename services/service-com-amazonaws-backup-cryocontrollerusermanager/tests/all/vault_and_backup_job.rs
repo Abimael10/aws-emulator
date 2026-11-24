@@ -181,13 +181,26 @@ pub(crate) async fn call_in_region(
     path: &str,
     body: Option<&str>,
 ) -> (u16, Value) {
+    let (status, _errortype, parsed) =
+        call_reported_in_region(router, region, method, path, body).await;
+    (status, parsed)
+}
+
+/// The SAME Region-signed request as [`call_in_region`], with the error shape the
+/// response NAMES to a client beside the status and the body — [`call_reported`]
+/// for a client bound to `region`.
+pub(crate) async fn call_reported_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, String, Value) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}/backup/aws4_request, \
          SignedHeaders=host, Signature=00"
     );
-    let (status, _errortype, parsed) =
-        dispatch_signed(router, &authorization, method, path, body).await;
-    (status, parsed)
+    dispatch_signed(router, &authorization, method, path, body).await
 }
 
 /// `CreateBackupVault` through a client bound to `region`, so the vault belongs
