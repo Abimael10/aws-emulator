@@ -2,7 +2,9 @@
 
 //! @op UpdateBillingView
 //! Mutates the persisted billing view in place — only the members the request
-//! carries — stamps `updatedAt`, and answers with the ARN and that instant. An ARN
+//! carries — stamps `updatedAt`, moves `viewDefinitionLastUpdatedAt` only when
+//! the request actually CHANGES the view's definition (its data filter
+//! expression), and answers with the ARN and that instant. An ARN
 //! outside the caller's own account is an `AccessDeniedException` (403); an ARN
 //! that names no existing `CUSTOM` view of this account — absent, or the
 //! account's `PRIMARY` view — is a `ValidationException` (400), because only a
@@ -231,11 +233,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             view.description = Some(description);
         }
         if let Some(expression) = input.data_filter_expression {
-            view.data_filter_expression = Some(expression);
             // `viewDefinitionLastUpdatedAt` is "the timestamp of when the billing
             // view definition was last updated": the data filter expression IS
-            // that definition, so only a request that changes it moves this.
-            view.view_definition_last_updated_at = Some(updated_at);
+            // that definition, so only a request that changes it moves this. A
+            // request re-sending the expression the view already holds — a
+            // read-modify-write that resubmits what it just read, or a retry of
+            // an update that already landed — changes no definition, exactly as
+            // re-associating a source view the view already draws from changes
+            // none (`AssociateSourceViews`).
+            let changed = view.data_filter_expression.as_ref() != Some(&expression);
+            view.data_filter_expression = Some(expression);
+            if changed {
+                view.view_definition_last_updated_at = Some(updated_at);
+            }
         }
         view.updated_at = Some(updated_at);
 

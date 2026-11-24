@@ -172,8 +172,15 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ValidationExceptionFie
     }
 }
 
+/// `Expression`, the data filter a billing view's definition carries.
+///
+/// Compares by value (`PartialEq`), because a writer of a view's definition has
+/// to tell a request that CHANGES the filter from one that re-sends the filter
+/// the view already holds: only the former moves
+/// `viewDefinitionLastUpdatedAt`. Two expressions are the same filter when every
+/// modelled member matches, nested lists included.
 #[smithy_macros::smithy(shape = "com.amazonaws.billing#Expression")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Expression {
     pub dimensions: Option<DimensionValues>,
     pub tags: Option<TagValues>,
@@ -182,28 +189,28 @@ pub struct Expression {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billing#DimensionValues")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DimensionValues {
     pub key: String,
     pub values: Vec<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billing#TagValues")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TagValues {
     pub key: String,
     pub values: Vec<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billing#CostCategoryValues")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CostCategoryValues {
     pub key: String,
     pub values: Vec<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billing#TimeRange")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeRange {
     pub begin_date_inclusive: Option<::aws_smithy_types::DateTime>,
     pub end_date_inclusive: Option<::aws_smithy_types::DateTime>,
