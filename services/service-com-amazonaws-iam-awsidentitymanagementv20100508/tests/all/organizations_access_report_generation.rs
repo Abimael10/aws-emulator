@@ -7,7 +7,8 @@
 //! signed in using your Organizations management account credentials" — so an account that
 //! is in no organization (the standalone account this emulator presents until something
 //! records otherwise), a member account, and the management account of another organization
-//! than the path names are each refused HTTP 403 `AccessDenied` with no job recorded; the
+//! than the path names are each refused HTTP 403 `AccessDenied`, with AWS's fixed sentence
+//! for an unauthorized caller ([`NOT_AUTHORIZED`]) and no job recorded; the
 //! management account of the organization the path names is served, and the job its `JobId`
 //! identifies is the one `GetOrganizationsAccessReport` then reports. IAM authorizes its own
 //! API first, so the caller's identity-based policies decide the call before the
@@ -115,15 +116,15 @@ fn organization_of(entity_path: &str) -> &str {
         .expect("an entity path carries an organization segment")
 }
 
-/// The whole `AccessDenied` message a caller that does not manage `organization_id` is
-/// refused with: the requirement the operation's own documentation states, naming the
-/// organization the request asked about.
-fn not_the_management_account(organization_id: &str) -> String {
-    format!(
-        "To call this operation, you must be signed in using the Organizations management \
-         account credentials of organization {organization_id}."
-    )
-}
+/// The whole `AccessDenied` message a caller that does not manage the organization the
+/// entity path names is refused with.
+///
+/// Recorded behaviour (the model types `Message` as a plain string): AWS's sentence for an
+/// unauthorized caller of this operation is FIXED text with no variable part — it names
+/// neither the operation, nor the organization the request asked about, nor the credentials
+/// that would have been needed. So the refusal is the same sentence whichever entity path was
+/// asked for, and it discloses no organization id, which the rows assert separately.
+const NOT_AUTHORIZED: &str = "You are not authorized to perform this operation.";
 
 /// Record that `management_account_id` manages `organization_id` in the service's OWN store.
 ///
@@ -214,9 +215,14 @@ async fn an_account_that_manages_no_organization_is_refused_every_entity_path() 
             );
             assert_eq!(
                 element(&body, "Message"),
-                not_the_management_account(organization_of(&entity_path)),
-                "case {case:?}: the refusal must state the requirement, naming the \
-                 organization the request asked about"
+                NOT_AUTHORIZED,
+                "case {case:?}: the refusal must carry AWS's fixed sentence for an \
+                 unauthorized caller"
+            );
+            assert!(
+                !element(&body, "Message").contains(organization_of(&entity_path)),
+                "case {case:?}: the refusal must disclose no organization id, got {:?}",
+                element(&body, "Message")
             );
             assert!(
                 held_jobs(&engine).is_empty(),
@@ -336,9 +342,14 @@ async fn only_the_management_account_of_the_organization_the_path_names_is_serve
                 );
                 assert_eq!(
                     element(&body, "Message"),
-                    not_the_management_account(organization_of(&entity_path)),
-                    "case {case:?}: the refusal must state the requirement, naming the \
-                     organization the request asked about"
+                    NOT_AUTHORIZED,
+                    "case {case:?}: the refusal must carry AWS's fixed sentence for an \
+                     unauthorized caller"
+                );
+                assert!(
+                    !element(&body, "Message").contains(organization_of(&entity_path)),
+                    "case {case:?}: the refusal must disclose no organization id, got {:?}",
+                    element(&body, "Message")
                 );
                 assert!(
                     held_jobs(&engine).is_empty(),
@@ -346,6 +357,102 @@ async fn only_the_management_account_of_the_organization_the_path_names_is_serve
                     held_jobs(&engine)
                 );
             }
+        }
+    }
+}
+
+/// RULE: the READ of an Organizations access report carries the same requirement as the
+/// generate — "to call this operation, you must be signed in to the management account in
+/// your organization" — and it is decided BEFORE the job is read, so a caller that is not one
+/// is refused with the same fixed sentence for a job id the account holds no report under and
+/// for one it does, learning nothing about which ids name a report.
+#[tokio::test]
+async fn only_a_management_account_can_read_an_access_report() {
+    // The id of a report no account of this emulator generated, spelled as `jobIDType`
+    // requires (36 characters).
+    let never_issued = "00000000-0000-0000-0000-000000000000";
+
+    // Rows spanning what the caller's account can be, against the one read: in no
+    // organization at all, a member of one, and the management account of one.
+    for (case, organization, refused) in [
+        ("an account in no organization", None, true),
+        (
+            "a member account",
+            Some((ORGANIZATION.to_string(), ANOTHER_ACCOUNT.to_string())),
+            true,
+        ),
+        (
+            "the management account",
+            Some((ORGANIZATION.to_string(), account_id().to_string())),
+            false,
+        ),
+    ] {
+        let (router, engine) = router_with_engine();
+        if let Some((organization_id, management_account_id)) = organization.as_ref() {
+            record_organization(&engine, organization_id, management_account_id);
+        }
+
+        let (status, body) = call_signed_by(
+            &router,
+            None,
+            "GetOrganizationsAccessReport",
+            &[("JobId", never_issued)],
+        )
+        .await;
+
+        if refused {
+            assert_eq!(
+                status, 403,
+                "case {case:?}: expected HTTP 403 for a caller that is not a management \
+                 account, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "AccessDenied",
+                "case {case:?}: expected the error code AccessDenied, got {:?}: {body}",
+                error_code(&body)
+            );
+            assert_eq!(
+                element(&body, "Message"),
+                NOT_AUTHORIZED,
+                "case {case:?}: the refusal must carry AWS's fixed sentence for an \
+                 unauthorized caller"
+            );
+        } else {
+            // The management account reaches the job id, which names no report here.
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the management account to reach the job id, got \
+                 {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "NoSuchEntity",
+                "case {case:?}: expected the error code NoSuchEntity, got {:?}: {body}",
+                error_code(&body)
+            );
+
+            // And the report it DID generate is served back to it, so the refusals above are
+            // about the caller's account and not about the read being inert.
+            let entity_path = format!("{ORGANIZATION}/r-f6g7h8i9j0example");
+            let (status, body) = generate(&router, None, &entity_path, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture generate must succeed, got {status}: {body}"
+            );
+            let job_id = element(&body, "JobId");
+            let (status, body) = call_signed_by(
+                &router,
+                None,
+                "GetOrganizationsAccessReport",
+                &[("JobId", &job_id)],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the generated report to be served back, got \
+                 {status}: {body}"
+            );
         }
     }
 }

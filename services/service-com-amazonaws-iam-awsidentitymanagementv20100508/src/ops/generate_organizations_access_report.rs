@@ -259,16 +259,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To call this operation, you must be signed in using your Organizations
         // management account credentials": a caller whose account does not manage the
-        // organization the entity path names is refused, worded from that documented
-        // requirement and the organization the request named, and no job is recorded. The
-        // account a request speaks for is this emulator's
-        // (`engine::emulator_account_id`), and whether it manages that organization is the
-        // one question the store answers.
+        // organization the entity path names is refused, and no job is recorded. The
+        // refusal is the authorization refusal it is, worded with the fixed sentence AWS
+        // answers an unauthorized caller of this operation with
+        // (`crate::state::NOT_AUTHORIZED_FOR_THIS_OPERATION`) — it names neither the
+        // organization nor the credentials that would have been needed, so a refusal
+        // discloses nothing about the account's organizations. The account a request speaks
+        // for is this emulator's (`engine::emulator_account_id`), and whether it manages
+        // that organization is the one question the store answers.
         if !store.manages_organization(::engine::emulator_account_id(), &organization_id) {
-            return Err(crate::scaffolded::Scaffolded::access_denied(format!(
-                "To call this operation, you must be signed in using the Organizations \
-                 management account credentials of organization {organization_id}."
-            )));
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::NOT_AUTHORIZED_FOR_THIS_OPERATION.to_string(),
+            ));
         }
 
         // "The maximum number of concurrent requests for this account are already

@@ -227,17 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name the account holds no user under, the ARN that name would carry at the
         // default path, since there is no other path to attribute it to. A refusal names
         // that user as the request named it (`user Bob`) rather than by ARN, and leaves
-        // the boundary in force, because the decision is made before the write.
+        // the boundary in force, because the decision is made before the write. The
+        // boundary the request SETS is handed to the gate, under the key IAM publishes it as
+        // (`iam:PermissionsBoundary`), so a grant admitting only the puts that attach one
+        // named ceiling decides this call from the ceiling it actually asked for.
         let resource = store.users.get(&user_key).map_or_else(
             || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
             |user| user.arn.clone(),
         );
-        crate::state::authorization::authorize_named(
+        crate::state::authorization::authorize_setting_boundary(
             &store,
             ctx,
             crate::state::authorization::PUT_USER_PERMISSIONS_BOUNDARY,
             &resource,
             &format!("user {}", input.user_name),
+            crate::state::authorization::WrittenTags::None,
+            Some(&input.permissions_boundary),
         )?;
 
         if !store.users.contains_key(&user_key) {

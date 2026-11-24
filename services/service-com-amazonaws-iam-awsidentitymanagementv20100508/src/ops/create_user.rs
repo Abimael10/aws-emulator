@@ -219,9 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entity to name by type and name. The tags the request attaches are handed to the
         // gate: creating a tagged resource is the other call `aws:RequestTag/<key>` and
         // `aws:TagKeys` are published for, so a grant conditioned on them admits exactly
-        // the tag sets it names. Nothing is created when it refuses.
+        // the tag sets it names, and so is the boundary the request sets, which is what
+        // `iam:PermissionsBoundary` carries — the delegation pattern where an administrator
+        // may create users only inside one named ceiling. Nothing is created when it
+        // refuses.
         let created_arn = crate::state::user_arn(&path, &input.user_name);
-        crate::state::authorization::authorize_written(
+        crate::state::authorization::authorize_setting_boundary(
             &store,
             ctx,
             crate::state::authorization::CREATE_USER,
@@ -230,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::authorization::WrittenTags::Pairs(
                 input.tags.as_deref().unwrap_or_default(),
             ),
+            input.permissions_boundary.as_deref(),
         )?;
 
         // A `PermissionsBoundary` is "the ARN of the managed policy that is used to set the

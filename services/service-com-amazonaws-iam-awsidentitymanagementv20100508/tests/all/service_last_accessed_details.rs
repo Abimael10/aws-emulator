@@ -1294,8 +1294,18 @@ async fn an_arn_or_job_id_naming_nothing_is_refused() {
     // id of an Organizations access report, which is a report of another kind read back by
     // another operation. That report is written straight into the service's own store:
     // `GenerateOrganizationsAccessReport` serves only the Organizations management
-    // account's credentials, which this unsigned harness does not present.
+    // account's credentials, which this unsigned harness does not present. The READ serves
+    // only that account too ("to call this operation, you must be signed in to the
+    // management account in your organization"), so the account is recorded as the
+    // management account of the organization the seeded report is about — otherwise the read
+    // is refused before it ever reaches a job id, which
+    // `tests/all/organizations_access_report_generation.rs` is the table for.
     let organizations_job = "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_string();
+    crate::organizations_access_report_generation::record_organization(
+        &engine,
+        "o-abcdefghij",
+        account,
+    );
     {
         let held = state::service_state(&*engine).expect("the IAM store");
         let created = state::now();

@@ -3319,14 +3319,23 @@ pub struct SourcedPolicy {
 /// Every condition context key the IAM policy documents in `documents` reference,
 /// folded to one entry per key and ordered.
 ///
-/// A policy references a context key by TESTING it: "context keys can be evaluated
+/// A policy references a context key in the two places IAM substitutes or tests one.
+/// It TESTS one in a statement's `Condition` element — "context keys can be evaluated
 /// by testing against a value in an IAM policy"
-/// (`GetContextKeysForPrincipalPolicy`), and the place a statement tests one is its
-/// `Condition` element, whose every condition-operator block is a map from context
-/// key to the values that key is tested against — so the keys of those blocks are
-/// the keys the document references. A statement with no `Condition` tests none, and
-/// `Statement` is read both as the list and as the single statement the IAM policy
-/// grammar admits.
+/// (`GetContextKeysForPrincipalPolicy`) — whose every condition-operator block is a map
+/// from context key to the values that key is tested against, so the keys of those
+/// blocks are referenced. And it SUBSTITUTES one through a policy VARIABLE,
+/// `${<context key>}`, which "IAM policy elements: variables and tags" admits in a
+/// statement's `Resource`/`NotResource` element and in a `Condition` clause's values:
+/// such an element cannot be matched at all without a value for that key, so the key it
+/// names is referenced just as a tested one is. The variable grammar is the one the
+/// evaluation substitutes through
+/// ([`::service_common::iam_authorization::policy_variable_keys`]), so a key reported
+/// here is a key a decision would ask the request for, and IAM's three literal escapes
+/// name characters rather than keys.
+///
+/// A statement with no `Condition` and no variable references none, and `Statement` is
+/// read both as the list and as the single statement the IAM policy grammar admits.
 ///
 /// Context key names are not distinguished by case, so two spellings of one key are
 /// one key: the folded name is the identity and the first spelling seen is the one
@@ -3334,6 +3343,10 @@ pub struct SourcedPolicy {
 /// a policy document refuse one ([`is_policy_document`]) before reaching here.
 pub fn context_keys_in_policies<'a, I: IntoIterator<Item = &'a str>>(documents: I) -> Vec<String> {
     let mut keys: BTreeMap<String, String> = BTreeMap::new();
+    let mut record = |key: &str| {
+        keys.entry(key.to_ascii_lowercase())
+            .or_insert_with(|| key.to_string());
+    };
     for document in documents {
         let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
             continue;
@@ -3346,19 +3359,36 @@ pub fn context_keys_in_policies<'a, I: IntoIterator<Item = &'a str>>(documents: 
             None => ::std::slice::from_ref(statement),
         };
         for statement in statements {
+            for element in RESOURCE_ELEMENTS {
+                for value in statement.get(element).map(element_values).unwrap_or_default() {
+                    for key in ::service_common::iam_authorization::policy_variable_keys(value) {
+                        record(key);
+                    }
+                }
+            }
             let Some(condition) = statement.get("Condition").and_then(|c| c.as_object()) else {
                 continue;
             };
             for tested in condition.values().filter_map(|block| block.as_object()) {
-                for key in tested.keys() {
-                    keys.entry(key.to_ascii_lowercase())
-                        .or_insert_with(|| key.clone());
+                for (key, compared) in tested {
+                    record(key);
+                    for value in element_values(compared) {
+                        for key in ::service_common::iam_authorization::policy_variable_keys(value)
+                        {
+                            record(key);
+                        }
+                    }
                 }
             }
         }
     }
     keys.into_values().collect()
 }
+
+/// The two elements of a statement that name RESOURCES, which is where IAM substitutes a
+/// policy variable outside a `Condition` clause: `Resource` and its complement
+/// `NotResource`.
+const RESOURCE_ELEMENTS: [&str; 2] = ["Resource", "NotResource"];
 
 /// The `Effect` value that makes a statement a GRANT rather than a refusal, as the
 /// IAM policy grammar spells it.
@@ -3389,8 +3419,9 @@ pub fn grants_service_access(document: &str, service_namespace: &str) -> bool {
     )
 }
 
-/// The string values one policy element carries: the IAM grammar writes
-/// `Action`/`NotAction` either as one string or as a list of them.
+/// The string values one policy element carries: the IAM grammar writes an element that
+/// names actions, resources or the values a condition key is tested against either as one
+/// string or as a list of them, and a value of any other JSON type names nothing.
 fn element_values(element: &::serde_json::Value) -> Vec<&str> {
     match element.as_array() {
         Some(values) => values.as_slice(),
@@ -4140,6 +4171,18 @@ pub const ACCESS_REPORT_GENERATION_SECONDS: i64 = 3;
 /// allowed to start work without limit. AWS publishes no figure for it, so the bound is
 /// the emulator's own.
 pub const MAX_CONCURRENT_ACCESS_REPORT_JOBS: usize = 5;
+
+/// The sentence AWS refuses an UNAUTHORIZED caller of this service's Organizations
+/// surface with: fixed text, with no variable part at all.
+///
+/// Recorded behaviour, which the model cannot state (`Message` is a plain string): the
+/// refusal says only that the caller is not authorized to perform the operation. It names
+/// neither the operation, nor the organization the request was about, nor the credentials
+/// that would have been needed — so a refusal served to a principal outside the
+/// organization's management account discloses nothing about the account's organizations,
+/// and a client matching AWS's text sees exactly it.
+pub const NOT_AUTHORIZED_FOR_THIS_OPERATION: &str =
+    "You are not authorized to perform this operation.";
 
 /// How many FINISHED report jobs of ONE kind the account keeps.
 ///

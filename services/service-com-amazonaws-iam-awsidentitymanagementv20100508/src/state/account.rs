@@ -1356,6 +1356,22 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         })
     }
 
+    /// Whether `account_id` is the MANAGEMENT ACCOUNT of its organization at all — the
+    /// question an operation served only to such an account is decided by when the request
+    /// names no organization of its own.
+    ///
+    /// "To call this operation, you must be signed in to the management account in your
+    /// organization" (`GetOrganizationsAccessReport`): a read addressed by a job id alone
+    /// names no organization, so what it requires of the caller is exactly this — false for a
+    /// standalone account and for a member account, true for the management account of the
+    /// one organization this store holds. [`Self::manages_organization`] is the same question
+    /// for a request that DOES name one.
+    pub fn manages_its_organization(&self, account_id: &str) -> bool {
+        self.organization
+            .as_ref()
+            .is_some_and(|organization| organization.management_account_id == account_id)
+    }
+
     /// The organization `account_id` may read and change centralized root access for, or
     /// the standing requirement of that access the account does not meet.
     ///

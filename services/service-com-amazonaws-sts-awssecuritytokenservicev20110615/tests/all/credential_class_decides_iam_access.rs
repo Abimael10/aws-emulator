@@ -63,6 +63,10 @@ const ACCOUNT_KEY: &str = "AKIDEMULATORCLASSES";
 /// The IAM operation every row calls.
 const LIST_USERS: &str = "ListUsers";
 
+/// The IAM action name of the OTHER read the rows use, as a policy statement names it: the
+/// sibling of [`LIST_USERS`] a document can allow one of without allowing the other.
+const LIST_ROLES_ACTION: &str = "iam:ListRoles";
+
 /// What IAM answers a request presenting a credential it does not accept — an authentication
 /// failure, so the class an SDK's credential-refresh path keys on — and the fixed sentence it
 /// carries for the stage that resolves a KEY ID, which is what these calls present (they
@@ -399,6 +403,89 @@ async fn the_class_of_a_credential_decides_whether_it_may_call_iam() {
                      {body}"
                 );
             }
+        }
+    }
+}
+
+/// RULE: a `GetSessionToken` credential IAM DOES accept — one whose mint answered the
+/// device's challenge — is judged on the identity-based documents in force on the IAM USER it
+/// is a session of, which "has the same permissions as the IAM user" (`GetSessionToken`): a
+/// call those documents allow is served, and one they do not is refused with the authorization
+/// denial naming that resolved user, never served unjudged. So the class deciding that such a
+/// credential may call IAM at all does not decide WHAT it may call: the user's documents do,
+/// read at the instant of the call like every other principal's.
+///
+/// The rows differ along what the user's own document allows (one IAM read, the other read, and
+/// nothing of IAM at all) and which read the session then makes, so no row's answer can come
+/// from the credential rather than from the documents.
+#[tokio::test]
+async fn a_session_token_credential_is_judged_on_its_users_documents() {
+    let (router, _engine) = emulator_with_iam();
+    // (the row, what the user's document allows beside sts:*, the reads that must be served)
+    let rows: [(&str, Option<&str>, &[&str]); 3] = [
+        (
+            "a user allowed one IAM read",
+            Some("iam:ListUsers"),
+            &[LIST_USERS],
+        ),
+        (
+            "a user allowed the other IAM read",
+            Some(LIST_ROLES_ACTION),
+            &["ListRoles"],
+        ),
+        ("a user allowed nothing of IAM", None, &[]),
+    ];
+
+    for (index, (row, allowed, served)) in rows.iter().enumerate() {
+        let user_name = format!("SessionTokenUser{index}");
+        let mut statements = vec![statement("Allow", "sts:*", None)];
+        if let Some(allowed) = allowed {
+            statements.push(statement("Allow", allowed, None));
+        }
+        let user_key = given_user(&router, row, &user_name, &document(&statements)).await;
+        let (serial_number, seed) =
+            given_enabled_device(&router, &user_name, &format!("session-token-device-{index}"))
+                .await;
+        let session = session_token(
+            &router,
+            row,
+            &user_key,
+            Some((
+                serial_number.as_str(),
+                pass_code(&seed, current_step(SystemTime::now())),
+            )),
+        )
+        .await;
+
+        for action in [LIST_USERS, "ListRoles"] {
+            let (status, body) = iam_call(&router, &session, action, &[]).await;
+            if served.contains(&action) {
+                assert_eq!(
+                    status, 200,
+                    "case {row:?}: the user's document allows {action}, so the session must be \
+                     served it, got {status}: {body}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, 403,
+                "case {row:?}: the user's documents do not allow {action}, so the session must \
+                 be refused it, got {status}: {body}"
+            );
+            let code = element(&body, "Code").unwrap_or_default();
+            assert_eq!(
+                code, AUTHORIZATION_DENIAL,
+                "case {row:?}: a resolved principal's missing grant is an authorization \
+                 denial, got {code:?}: {body}"
+            );
+            // The refusal names the USER the session speaks for — the identity whose documents
+            // were read — which is what tells a caller whose policy to widen.
+            let message = element(&body, "Message").unwrap_or_default();
+            let user_arn = format!("arn:aws:iam::{}:user/{user_name}", emulator_account());
+            assert!(
+                message.contains(&user_arn),
+                "case {row:?}: expected the refusal to name {user_arn:?}, got {message:?}"
+            );
         }
     }
 }

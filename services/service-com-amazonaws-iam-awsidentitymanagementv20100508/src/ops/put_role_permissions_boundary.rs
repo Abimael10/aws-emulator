@@ -229,19 +229,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or, for a name nothing holds, the ARN that name would carry at the
         // default path, since there is no other path to attribute it to. A refusal names
         // that role as the request named it (`role Deployer`) rather than by ARN, and
-        // leaves the boundary in force, because the decision is made before the write.
+        // leaves the boundary in force, because the decision is made before the write. The
+        // boundary the request SETS is handed to the gate under the key IAM publishes it as,
+        // exactly as `PutUserPermissionsBoundary` hands it the user's.
         let resource = crate::state::role_arn(
             addressed_path
                 .as_deref()
                 .unwrap_or(crate::state::DEFAULT_PATH),
             &input.role_name,
         );
-        crate::state::authorization::authorize_named(
+        crate::state::authorization::authorize_setting_boundary(
             &store,
             ctx,
             crate::state::authorization::PUT_ROLE_PERMISSIONS_BOUNDARY,
             &resource,
             &format!("role {}", input.role_name),
+            crate::state::authorization::WrittenTags::None,
+            Some(&input.permissions_boundary),
         )?;
 
         // The role's PATH is what tells this operation whether the role is

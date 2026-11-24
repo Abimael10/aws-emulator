@@ -23,7 +23,10 @@
 //!    map [`caller_identity`] resolves a nameless caller through, or — for a
 //!    TEMPORARY credential — the role session that key was vended for, read out of
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_sessions`], the
-//!    record the vending operation leaves in this store;
+//!    record the vending operation leaves in this store, and failing that the principal the
+//!    mint recorded beside the credential's class
+//!    ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::temporary_credentials`]),
+//!    which is what resolves a session of an IAM USER ([`signing_principal`]);
 //! 2. **what it may do** — the identity-based documents in force on that principal, from
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies`],
 //!    which for a user is the UNION of the documents embedded in and attached to the user
@@ -266,6 +269,19 @@ const TAG_KEYS_KEY: &str = "aws:TagKeys";
 /// no policy ARN, which is a claim about the key's availability per action that is not
 /// this gate's to make.
 const POLICY_ARN_KEY: &str = "iam:PolicyARN";
+
+/// The IAM-specific condition key carrying the ARN of the managed policy a request SETS AS
+/// A PERMISSIONS BOUNDARY: "`iam:PermissionsBoundary` — checks that the specified policy is
+/// attached as permissions boundary on the IAM principal resource", compared under IAM's ARN
+/// operators.
+///
+/// It is the value of that request's own `PermissionsBoundary` parameter, which is what lets
+/// a grant be scoped to the creates and puts that attach ONE named boundary — the delegation
+/// pattern where an administrator may create principals only inside a ceiling it cannot
+/// remove. Filled — and declared — only by the call sites that carry such a parameter and
+/// that IAM publishes the key for ([`authorize_setting_boundary`]): for every other call it
+/// stays undeclared, for the reason [`POLICY_ARN_KEY`] states.
+const PERMISSIONS_BOUNDARY_KEY: &str = "iam:PermissionsBoundary";
 
 /// The condition key carrying the ADDRESS the request was made from: "`aws:SourceIp` —
 /// the requester's IP address", which is what an IP clause compares against.
@@ -519,6 +535,48 @@ impl WrittenTags<'_> {
     }
 }
 
+/// What the REQUEST's own parameters contribute to the condition context, beside the action
+/// it asks for and the resource it is taken on: one entry per parameter IAM publishes as a
+/// condition key.
+///
+/// Held as ONE value rather than as a parameter apiece so that a call site hands the gate
+/// everything its request carries, and so that adding the next published parameter does not
+/// re-thread every spelling of [`authorize`]. A call that carries none of them is decided
+/// against the default, which declares nothing.
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestParameters<'a> {
+    /// The tags the call WRITES ([`WrittenTags`]).
+    written: WrittenTags<'a>,
+    /// The managed policy the call NAMES, for the attachment calls ([`POLICY_ARN_KEY`]).
+    policy_arn: Option<&'a str>,
+    /// The managed policy the call SETS AS A BOUNDARY, for the creates and puts that carry
+    /// such a parameter ([`WrittenBoundary`]).
+    permissions_boundary: WrittenBoundary<'a>,
+}
+
+/// What a request says about the permissions boundary it SETS, which is where
+/// [`PERMISSIONS_BOUNDARY_KEY`] comes from.
+///
+/// The three positions a request can be in are distinguished because two of them are facts
+/// about the request and the third is not: a call CARRYING a `PermissionsBoundary` parameter
+/// either sets one or sets none, and both are things this gate knows, so the key is declared
+/// for both and a clause over it is decided — a negated comparison or a `Null` asking for
+/// absence holding on the call that sets none. A call carrying no such parameter is a call
+/// IAM publishes no value of the key for at all, so there the key stays undeclared and a
+/// clause over it is left undecided, the fail-closed reading every key this gate cannot
+/// answer for gets.
+#[derive(Debug, Clone, Copy, Default)]
+enum WrittenBoundary<'a> {
+    /// A call that carries no `PermissionsBoundary` parameter — every operation but the
+    /// creates and the boundary puts.
+    #[default]
+    Unmodelled,
+    /// A call that carries the parameter and sets no boundary.
+    Unset,
+    /// A call that sets the boundary this ARN names.
+    Arn(&'a str),
+}
+
 /// WHO a signed request speaks for, as the decision reads it: the entity whose own
 /// condition keys describe the caller.
 ///
@@ -601,12 +659,14 @@ fn principal_tags(role: &Role, session_tags: &[(String, String)]) -> Vec<(String
 /// The principal's and the target's tags are the ones they hold NOW — nothing in the
 /// request carries them — so retagging either side changes what the same unchanged request
 /// decides, and untagging it takes the value away again.
+/// A call that NAMES a managed policy carries that ARN too, under the key IAM publishes it
+/// as ([`POLICY_ARN_KEY`]), and one that SETS a boundary carries the boundary's
+/// ([`PERMISSIONS_BOUNDARY_KEY`]) — both out of [`RequestParameters`].
 fn request_context(
     store: &IamState,
     caller: Caller<'_>,
     resource: &str,
-    written: WrittenTags<'_>,
-    policy_arn: Option<&str>,
+    parameters: RequestParameters<'_>,
     connection: &Connection,
     requested_region: Option<&str>,
 ) -> (Vec<(String, String)>, Vec<&'static str>) {
@@ -665,14 +725,30 @@ fn request_context(
         }
         published.extend_from_slice(PUBLISHED_RESOURCE_TAG_KEYS);
     }
-    context.extend(written.context());
+    context.extend(parameters.written.context());
     // The managed policy the request NAMES, for a call that carries one: a single value,
     // read off the request's own parameter rather than off anything stored, so an
     // `ArnEquals`/`ArnLike` clause scoping a grant to one policy is decided from the
     // policy the call actually asked about.
-    if let Some(policy_arn) = policy_arn {
+    if let Some(policy_arn) = parameters.policy_arn {
         context.push((POLICY_ARN_KEY.to_string(), policy_arn.to_string()));
         published.push(POLICY_ARN_KEY);
+    }
+    // The managed policy the request SETS AS A BOUNDARY, read off that parameter the same
+    // way for a call that carries one — whether it sets a boundary or sets none, both of
+    // which are facts about the request ([`WrittenBoundary`]) — so a grant admitting only
+    // the calls that attach one named ceiling is decided from the ceiling the call actually
+    // asked for.
+    match parameters.permissions_boundary {
+        WrittenBoundary::Unmodelled => {}
+        WrittenBoundary::Unset => published.push(PERMISSIONS_BOUNDARY_KEY),
+        WrittenBoundary::Arn(permissions_boundary) => {
+            context.push((
+                PERMISSIONS_BOUNDARY_KEY.to_string(),
+                permissions_boundary.to_string(),
+            ));
+            published.push(PERMISSIONS_BOUNDARY_KEY);
+        }
     }
     // Where the call came from and how it arrived, read from the connection and from
     // nothing the request's own parameters say ([`Connection`]).
@@ -760,7 +836,56 @@ pub fn authorize_written(
     named_as: &str,
     written: WrittenTags<'_>,
 ) -> Result<(), AccessDenied> {
-    authorize_request(store, ctx, action, resource, named_as, written, None)
+    authorize_request(
+        store,
+        ctx,
+        action,
+        resource,
+        named_as,
+        RequestParameters {
+            written,
+            ..RequestParameters::default()
+        },
+    )
+}
+
+/// [`authorize_written`] for a call that SETS A PERMISSIONS BOUNDARY — the creates and puts
+/// carrying a `PermissionsBoundary` parameter — which hands the gate that boundary's ARN so
+/// a clause over [`PERMISSIONS_BOUNDARY_KEY`] can be decided.
+///
+/// The ARN the request's `PermissionsBoundary` parameter carries is part of the request IAM
+/// decides: `iam:PermissionsBoundary` is read from it, so a grant admitting only the calls
+/// that attach ONE named ceiling permits exactly those and withholds every other — which is
+/// how a delegated administrator is allowed to create principals only inside a boundary it
+/// cannot leave off. A request that carries the parameter and sets NO boundary carries no
+/// value for the key and says so, so a negated clause over it holds there, while a call with
+/// no such parameter publishes nothing about the key at all ([`WrittenBoundary`]). The
+/// decision is still made against the ARN of the entity the call is taken on (`resource`),
+/// and it precedes the write, so a refusal leaves that entity as it was.
+pub fn authorize_setting_boundary(
+    store: &IamState,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+    named_as: &str,
+    written: WrittenTags<'_>,
+    permissions_boundary: Option<&str>,
+) -> Result<(), AccessDenied> {
+    authorize_request(
+        store,
+        ctx,
+        action,
+        resource,
+        named_as,
+        RequestParameters {
+            written,
+            permissions_boundary: match permissions_boundary {
+                Some(arn) => WrittenBoundary::Arn(arn),
+                None => WrittenBoundary::Unset,
+            },
+            ..RequestParameters::default()
+        },
+    )
 }
 
 /// [`authorize_named`] for a call that NAMES A MANAGED POLICY — the managed-policy
@@ -789,22 +914,23 @@ pub fn authorize_policy_attachment(
         action,
         resource,
         named_as,
-        WrittenTags::None,
-        Some(policy_arn),
+        RequestParameters {
+            policy_arn: Some(policy_arn),
+            ..RequestParameters::default()
+        },
     )
 }
 
 /// The ONE decision every spelling above reaches, handed everything the REQUEST itself
-/// contributes to the condition context: the tags it writes and the managed policy it
-/// names (see [`request_context`]).
+/// contributes to the condition context: the tags it writes, the managed policy it names and
+/// the boundary it sets (see [`request_context`]).
 fn authorize_request(
     store: &IamState,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     resource: &str,
     named_as: &str,
-    written: WrittenTags<'_>,
-    policy_arn: Option<&str>,
+    parameters: RequestParameters<'_>,
 ) -> Result<(), AccessDenied> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
     // A credential this account holds no IAM user for carries no identity-based
@@ -823,8 +949,7 @@ fn authorize_request(
         store,
         caller,
         resource,
-        written,
-        policy_arn,
+        parameters,
         &Connection::of(ctx.parts()),
         Some(REQUESTED_REGION),
     );
@@ -859,10 +984,17 @@ fn authorize_request(
     // cannot read — is capped by nothing, which is the same position as a boundary that
     // allows the call. A call an identity-based policy explicitly DENIES is already
     // refused on that deny, so no ceiling is read for it.
+    //
+    // The ceiling read is the one in force on the IDENTITY whose documents were collected
+    // (`identity`), not on the credential's own principal: a boundary "sets the maximum
+    // permissions that an identity-based policy can grant to an entity", so for a session of
+    // a role it is the ROLE's boundary that caps the session, exactly as the role's policies
+    // are what grant it. A session carries no boundary of its own, so reading one against
+    // the session's ARN would cap nothing whatever ceiling the role carries.
     let (capped, boundary) = if decided == Decision::Denied {
         (Decision::Allowed, None)
     } else {
-        match store.permissions_boundary_in_force(&principal) {
+        match store.permissions_boundary_in_force(&identity) {
             Some((boundary, document)) => (
                 iam::identity_decision(::std::slice::from_ref(&document), &request),
                 Some(boundary),
@@ -1099,10 +1231,10 @@ pub fn delegation_permission_check(
             store,
             caller,
             resource,
-            WrittenTags::None,
             // An ask is an `(action, resource)` pair read out of a policy document, not a
-            // call: it carries no request parameter, so no managed policy ARN either.
-            None,
+            // call: it carries no request parameter at all, so no written tag, no managed
+            // policy ARN and no boundary.
+            RequestParameters::default(),
             &connection,
             // Nor any Region: an ask names a resource of another service that no request
             // has addressed yet, so the Region such a request would be made to is not this
@@ -1177,13 +1309,18 @@ struct SigningPrincipal<'a> {
 /// The principal the access key id `access_key_id` speaks for, or `None` when the account
 /// holds no identity for that key.
 ///
-/// Two credentials carry identity-based policies: an IAM user's own long-term access key,
-/// resolved through the registry `CreateAccessKey` writes, and the temporary credential of
-/// a session of one of the account's roles, resolved through the record the operation that
-/// vended it left ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_session`]).
-/// A session is judged on the ROLE's policies — "the temporary security credentials …
-/// have the permissions of the role" (`AssumeRole`) — while the refusal names the session,
-/// because that is the principal the request speaks for.
+/// Three credentials carry identity-based policies: an IAM user's own long-term access key,
+/// resolved through the registry `CreateAccessKey` writes; the temporary credential of a
+/// session of one of the account's roles, resolved through the record the operation that
+/// vended it left ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_session`]);
+/// and every OTHER temporary credential this account minted, resolved through the principal
+/// the mint recorded beside its class
+/// ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::temporary_credential`]) — a
+/// session of an IAM USER, which "has the same permissions as the IAM user"
+/// (`GetSessionToken`, the STS model), and a session of a role whose own record this store no
+/// longer holds. A session is judged on the policies of the identity it is a session OF —
+/// "the temporary security credentials … have the permissions of the role" (`AssumeRole`) —
+/// while the refusal names the session, because that is the principal the request speaks for.
 fn signing_principal<'a>(
     store: &'a IamState,
     access_key_id: &str,
@@ -1200,27 +1337,67 @@ fn signing_principal<'a>(
             scope: ScopingPolicies::default(),
         });
     }
-    let session = store.role_session(access_key_id, super::now())?;
-    // The role the session is of, addressed by the ARN the account holds it under: a
-    // role deleted since the session was vended leaves the session speaking for an
-    // identity this account no longer holds policies for.
-    let role_name = ::service_common::iam_role::role_name(&session.role_arn)?;
-    let role = store.roles.get(&super::name_key(role_name))?;
-    let policies = store.principal_policies(&role.arn)?;
+    let now = super::now();
+    if let Some(session) = store.role_session(access_key_id, now) {
+        // The role the session is of, addressed by the ARN the account holds it under: a
+        // role deleted since the session was vended leaves the session speaking for an
+        // identity this account no longer holds policies for.
+        let role_name = ::service_common::iam_role::role_name(&session.role_arn)?;
+        let role = store.roles.get(&super::name_key(role_name))?;
+        let policies = store.principal_policies(&role.arn)?;
+        return Some(SigningPrincipal {
+            caller: Caller::RoleSession {
+                role,
+                session_name: ::service_common::iam_role::assumed_role_session_name(
+                    &session.session_arn,
+                )?,
+                session_tags: &session.tags,
+            },
+            arn: session.session_arn.clone(),
+            identity: role.arn.clone(),
+            policies,
+            // What the CREDENTIAL itself was scoped to, resolved at the instant of the
+            // request so a managed session policy edited since the mint scopes by what it
+            // says NOW.
+            scope: super::session_scoping_documents(Some(store), &session.scope),
+        });
+    }
+    // Every other temporary credential this account minted: the principal it speaks for is
+    // the one the mint recorded with its class, and the identity-based policies in force on
+    // it are that principal's. A session of an IAM user is the principal's own session, so
+    // the user's documents judge it; a session ARN naming a role is judged on that role's,
+    // the same reading the record above gives. No scope is recorded beside such a credential,
+    // so it is capped by nothing but the identity's own documents and ceiling.
+    let credential = store.temporary_credential(access_key_id, now)?;
+    let principal_arn = credential.principal_arn.as_str();
+    if let Some(role_name) =
+        ::service_common::iam_role::assumed_role_session_role_name(principal_arn)
+    {
+        let role = store.roles.get(&super::name_key(role_name))?;
+        let policies = store.principal_policies(&role.arn)?;
+        return Some(SigningPrincipal {
+            caller: Caller::RoleSession {
+                role,
+                session_name: ::service_common::iam_role::assumed_role_session_name(
+                    principal_arn,
+                )?,
+                session_tags: &[],
+            },
+            arn: principal_arn.to_string(),
+            identity: role.arn.clone(),
+            policies,
+            scope: ScopingPolicies::default(),
+        });
+    }
+    let user_name = ::service_common::iam_role::user_name(principal_arn)?;
+    let user = store.users.get(&super::name_key(user_name))?;
+    let policies = store.principal_policies(&user.arn)?;
     Some(SigningPrincipal {
-        caller: Caller::RoleSession {
-            role,
-            session_name: ::service_common::iam_role::assumed_role_session_name(
-                &session.session_arn,
-            )?,
-            session_tags: &session.tags,
-        },
-        arn: session.session_arn.clone(),
-        identity: role.arn.clone(),
+        caller: Caller::User(user),
+        arn: principal_arn.to_string(),
+        identity: user.arn.clone(),
         policies,
-        // What the CREDENTIAL itself was scoped to, resolved at the instant of the request
-        // so a managed session policy edited since the mint scopes by what it says NOW.
-        scope: super::session_scoping_documents(Some(store), &session.scope),
+        scope: ScopingPolicies::default(),
     })
 }
 

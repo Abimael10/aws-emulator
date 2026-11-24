@@ -1266,6 +1266,35 @@ fn push_pattern(glyphs: &mut Vec<(char, bool)>, text: &str) {
     );
 }
 
+/// The condition keys the policy VARIABLES in `value` name, in the order they are written.
+///
+/// A variable `${<condition key>}` is a placeholder for the value the request carries for
+/// that key (see the module docs), so an element carrying one REFERENCES that key — which is
+/// what IAM reports beside the keys a `Condition` clause tests when a caller asks which keys
+/// a document references. IAM's three literal escapes ([`VARIABLE_ESCAPES`]) name characters
+/// rather than keys, so they are not among them, and a `${` that is never closed opens no
+/// variable at all: the name is read exactly as [`expand`] reads it, down to the spaces
+/// inside the braces being part of it, so what a reader reports as referenced is the key an
+/// evaluation would look for a value of.
+#[must_use]
+pub fn policy_variable_keys(value: &str) -> Vec<&str> {
+    let mut keys: Vec<&str> = Vec::new();
+    let mut rest = value;
+    while let Some(at) = rest.find(VARIABLE_OPEN) {
+        let opened = &rest[at + VARIABLE_OPEN.len()..];
+        let Some(end) = opened.find('}') else {
+            break;
+        };
+        let name = &opened[..end];
+        rest = &opened[end + 1..];
+        if VARIABLE_ESCAPES.contains(&name) || name.is_empty() {
+            continue;
+        }
+        keys.push(name);
+    }
+    keys
+}
+
 /// `value` with every policy variable it names substituted from the request's condition
 /// context, or `None` when one of them has no single value there — an element this
 /// evaluation cannot match at all (see the module docs).
