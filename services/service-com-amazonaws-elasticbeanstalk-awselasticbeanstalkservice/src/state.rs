@@ -2437,6 +2437,36 @@ impl Environment {
         self.status == STATUS_TERMINATED
     }
 
+    /// Whether a MINIMUM-CAPACITY configuration is in force for this
+    /// environment — the unmodelled `MinCapacityEnabled` every described
+    /// environment carries (see
+    /// [`crate::ops::types::environment_description_wire`]).
+    ///
+    /// A minimum capacity is something an environment's CONFIGURATION turns on,
+    /// and a configuration option this service's published catalog does not
+    /// declare is refused before it can be stored
+    /// ([`Self::option_settings`] holds only options that catalog declares —
+    /// see [`configuration_setting_validation`]). That catalog publishes no
+    /// minimum-capacity option, so no environment of this store carries such a
+    /// configuration and every one of them reports the member `false`, which is
+    /// what the real service reports for an environment that has none.
+    pub fn min_capacity_enabled(&self) -> bool {
+        false
+    }
+
+    /// The alerts raised against this environment — the unmodelled `Alerts`
+    /// every described environment carries (see
+    /// [`crate::ops::types::environment_description_wire`]).
+    ///
+    /// An alert is raised ABOUT an environment by the service (a platform
+    /// version going out of support, a configuration that will stop working);
+    /// this store holds none for any environment, so the list is reported
+    /// EMPTY rather than absent, which is what the real service reports for an
+    /// environment with no alert against it.
+    pub fn alerts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// "Information about the most recent deployment to an instance" of this
     /// environment, which every one of its instances is running: the version
     /// that deployment carried, its id, and whether it has finished.
@@ -2989,12 +3019,21 @@ macro_rules! environment_description {
             resources: None,
             tier: env.tier.clone(),
             // "A list of links to other environments in the same group" — the
-            // links the manifest this environment was composed from declared,
-            // and absent for an environment with none.
-            environment_links: (!env.environment_links.is_empty())
-                .then(|| env.environment_links.clone()),
+            // links the manifest this environment was composed from declared.
+            // The member is reported for EVERY environment, as an empty list
+            // where the environment has no links, so a client that renders or
+            // iterates the links reads a list rather than having to tell an
+            // absent member from an empty one.
+            environment_links: Some(env.environment_links.clone()),
             environment_arn: Some(env.arn.clone()),
             operations_role: env.operations_role.clone(),
+            // The two members the WIRE carries beyond the model (see
+            // `$crate::ops::types::environment_description_wire`): whether a
+            // minimum-capacity configuration is in force for this environment,
+            // and the alerts raised against it. Both are reported for every
+            // environment, as the real service reports them.
+            min_capacity_enabled: Some(env.min_capacity_enabled()),
+            alerts: Some(env.alerts()),
         }
     }};
 }

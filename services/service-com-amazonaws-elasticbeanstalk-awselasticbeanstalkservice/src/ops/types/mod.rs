@@ -21,6 +21,14 @@
 #[macro_use]
 pub mod unmodelled_member_wire;
 
+// The one member list of `EnvironmentDescription`, which the scaffold emits as a
+// distinct struct per operation and whose wire carries two members the on-disk
+// model does not declare — see that module's own note. `#[macro_use]` and
+// declared after the machinery it builds on, so the macro is in the textual
+// scope of every `*_types` module below.
+#[macro_use]
+pub mod environment_description_wire;
+
 pub mod abort_environment_update_types;
 pub mod apply_environment_managed_action_types;
 pub mod associate_environment_operations_role_types;

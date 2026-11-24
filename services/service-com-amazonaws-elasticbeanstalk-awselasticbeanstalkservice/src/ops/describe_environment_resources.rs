@@ -168,6 +168,26 @@ fn environment_resource_description(
         // publishes no Amazon EKS-based platform, so no environment here runs
         // in that tier and the member stays absent.
         cluster: None,
+        // The sources the environment RUNS, beside the resources it is made of:
+        // one entry for the application version deployed in it, naming that
+        // application and version label (see [`RuntimeSource`]). An environment
+        // with no version deployed runs no application source, so the list is
+        // reported empty rather than absent.
+        runtime_sources: Some(
+            environment
+                .version_label
+                .as_ref()
+                .map(|version_label| {
+                    vec![RuntimeSource {
+                        parameter: Some(RUNTIME_SOURCE_PARAMETER_APP_SOURCE.to_string()),
+                        versions: Some(vec![RuntimeSourceVersion {
+                            application_name: Some(environment.application_name.clone()),
+                            version_label: Some(version_label.clone()),
+                        }]),
+                    }]
+                })
+                .unwrap_or_default(),
+        ),
     }
 }
 

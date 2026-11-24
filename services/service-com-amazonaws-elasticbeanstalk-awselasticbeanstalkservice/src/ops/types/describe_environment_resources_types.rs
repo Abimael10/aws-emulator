@@ -24,7 +24,15 @@ pub struct DescribeEnvironmentResourcesOutput {
     pub environment_resources: Option<EnvironmentResourceDescription>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#EnvironmentResourceDescription")]
+/// What `DescribeEnvironmentResources` reports: the modelled
+/// `EnvironmentResourceDescription`, plus the one member the real service's
+/// awsQuery responses carry beyond it — `RuntimeSources`, the sources the
+/// environment RUNS (see [`RuntimeSource`]).
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="EnvironmentResourceDescription")`,
+/// followed by the unmodelled one. See `types::unmodelled_member_wire` for why
+/// the shape is hand-written rather than derived.
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentResourceDescription {
     pub environment_name: Option<String>,
@@ -36,7 +44,160 @@ pub struct EnvironmentResourceDescription {
     pub load_balancers: Option<Vec<LoadBalancer>>,
     pub triggers: Option<Vec<Trigger>>,
     pub queues: Option<Vec<Queue>>,
+    /// Unmodelled; see [`RuntimeSource`].
+    pub runtime_sources: Option<Vec<RuntimeSource>>,
 }
+
+eb_schema_and_codec!(
+    EnvironmentResourceDescription,
+    ENVIRONMENT_RESOURCE_DESCRIPTION_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#EnvironmentResourceDescription",
+    "com.amazonaws.elasticbeanstalk",
+    "EnvironmentResourceDescription",
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "EnvironmentName",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_AUTO_SCALING_GROUPS,
+        auto_scaling_groups,
+        "AutoScalingGroups",
+        1,
+        opt,
+        list_of_struct(AutoScalingGroup)
+    ),
+    (M_CLUSTER, cluster, "Cluster", 2, opt, struct_of(Cluster)),
+    (
+        M_INSTANCES,
+        instances,
+        "Instances",
+        3,
+        opt,
+        list_of_struct(Instance)
+    ),
+    (
+        M_LAUNCH_CONFIGURATIONS,
+        launch_configurations,
+        "LaunchConfigurations",
+        4,
+        opt,
+        list_of_struct(LaunchConfiguration)
+    ),
+    (
+        M_LAUNCH_TEMPLATES,
+        launch_templates,
+        "LaunchTemplates",
+        5,
+        opt,
+        list_of_struct(LaunchTemplate)
+    ),
+    (
+        M_LOAD_BALANCERS,
+        load_balancers,
+        "LoadBalancers",
+        6,
+        opt,
+        list_of_struct(LoadBalancer)
+    ),
+    (
+        M_TRIGGERS,
+        triggers,
+        "Triggers",
+        7,
+        opt,
+        list_of_struct(Trigger)
+    ),
+    (M_QUEUES, queues, "Queues", 8, opt, list_of_struct(Queue)),
+    (
+        M_RUNTIME_SOURCES,
+        runtime_sources,
+        "RuntimeSources",
+        9,
+        opt,
+        list_of_struct(RuntimeSource)
+    ),
+);
+
+/// One source the environment's instances RUN, and which versions of it they
+/// run: `Parameter` names the kind of source and `Versions` the versions of it
+/// in force.
+///
+/// RECORDED BEHAVIOUR, not modelled: the on-disk model declares no
+/// `RuntimeSources` member of `EnvironmentResourceDescription` and no shape for
+/// its element, and the real service's awsQuery response carries one entry
+/// naming [`RUNTIME_SOURCE_PARAMETER_APP_SOURCE`] for the application version
+/// deployed in the environment. Hand-written for the reason
+/// `types::unmodelled_member_wire` gives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeSource {
+    pub parameter: Option<String>,
+    pub versions: Option<Vec<RuntimeSourceVersion>>,
+}
+
+eb_schema_and_codec!(
+    RuntimeSource,
+    RUNTIME_SOURCE_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#RuntimeSource",
+    "com.amazonaws.elasticbeanstalk",
+    "RuntimeSource",
+    (M_PARAMETER, parameter, "Parameter", 0, opt, string),
+    (
+        M_VERSIONS,
+        versions,
+        "Versions",
+        1,
+        opt,
+        list_of_struct(RuntimeSourceVersion)
+    ),
+);
+
+/// One version of a runtime source: the application it belongs to and its
+/// version label — the pair that names an application version everywhere else
+/// in this API (`ApplicationVersionDescription`).
+///
+/// RECORDED BEHAVIOUR, as [`RuntimeSource`] is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeSourceVersion {
+    pub application_name: Option<String>,
+    pub version_label: Option<String>,
+}
+
+eb_schema_and_codec!(
+    RuntimeSourceVersion,
+    RUNTIME_SOURCE_VERSION_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#RuntimeSourceVersion",
+    "com.amazonaws.elasticbeanstalk",
+    "RuntimeSourceVersion",
+    (
+        M_VERSION_APPLICATION_NAME,
+        application_name,
+        "ApplicationName",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_VERSION_LABEL,
+        version_label,
+        "VersionLabel",
+        1,
+        opt,
+        string
+    ),
+);
+
+/// The `Parameter` of the runtime source that is the APPLICATION the
+/// environment runs: the application version deployed in it.
+///
+/// RECORDED BEHAVIOUR: this is the fixed part of the recorded entry — the
+/// parameter name the real service reports the deployed application's source
+/// under; the application name and the version label beside it are the
+/// environment's own.
+pub const RUNTIME_SOURCE_PARAMETER_APP_SOURCE: &str = "AppSource";
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#AutoScalingGroup")]
 #[derive(Debug, Clone, Default)]

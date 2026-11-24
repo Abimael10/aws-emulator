@@ -30,31 +30,11 @@ pub struct ComposeEnvironmentsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#EnvironmentDescription")]
-#[derive(Debug, Clone, Default)]
-pub struct CreateEnvironmentOutput {
-    pub environment_name: Option<String>,
-    pub environment_id: Option<String>,
-    pub application_name: Option<String>,
-    pub version_label: Option<String>,
-    pub solution_stack_name: Option<String>,
-    pub platform_arn: Option<String>,
-    pub template_name: Option<String>,
-    pub description: Option<String>,
-    pub endpoint_url: Option<String>,
-    pub cname: Option<String>,
-    pub date_created: Option<::aws_smithy_types::DateTime>,
-    pub date_updated: Option<::aws_smithy_types::DateTime>,
-    pub status: Option<String>,
-    pub abortable_operation_in_progress: Option<bool>,
-    pub health: Option<String>,
-    pub health_status: Option<String>,
-    pub resources: Option<EnvironmentResourcesDescription>,
-    pub tier: Option<EnvironmentTier>,
-    pub environment_links: Option<Vec<EnvironmentLink>>,
-    pub environment_arn: Option<String>,
-    pub operations_role: Option<String>,
-}
+// What an environment reports: the modelled `EnvironmentDescription`, plus the
+// two members the real service's awsQuery responses carry beyond it. The member
+// list is stated once in `types::environment_description_wire`, which also says
+// why this shape is hand-written.
+eb_environment_description!(CreateEnvironmentOutput, CREATE_ENVIRONMENT_OUTPUT_SCHEMA);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#EnvironmentResourcesDescription")]
 #[derive(Debug, Clone, Default)]

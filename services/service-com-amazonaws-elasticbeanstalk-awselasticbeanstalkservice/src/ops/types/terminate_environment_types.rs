@@ -20,29 +20,10 @@ pub struct TerminateEnvironmentInput {
     pub force_terminate: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#EnvironmentDescription")]
-#[derive(Debug, Clone, Default)]
-pub struct TerminateEnvironmentOutput {
-    pub environment_name: Option<String>,
-    pub environment_id: Option<String>,
-    pub application_name: Option<String>,
-    pub version_label: Option<String>,
-    pub solution_stack_name: Option<String>,
-    pub platform_arn: Option<String>,
-    pub template_name: Option<String>,
-    pub description: Option<String>,
-    pub endpoint_url: Option<String>,
-    pub cname: Option<String>,
-    pub date_created: Option<::aws_smithy_types::DateTime>,
-    pub date_updated: Option<::aws_smithy_types::DateTime>,
-    pub status: Option<String>,
-    pub abortable_operation_in_progress: Option<bool>,
-    pub health: Option<String>,
-    pub health_status: Option<String>,
-    pub resources: Option<EnvironmentResourcesDescription>,
-    pub tier: Option<EnvironmentTier>,
-    pub environment_links: Option<Vec<EnvironmentLink>>,
-    pub environment_arn: Option<String>,
-    pub operations_role: Option<String>,
-}
+// The same shape `CreateEnvironmentOutput` carries: one member list, a struct
+// per operation the model binds it to.
+eb_environment_description!(
+    TerminateEnvironmentOutput,
+    TERMINATE_ENVIRONMENT_OUTPUT_SCHEMA
+);
 
