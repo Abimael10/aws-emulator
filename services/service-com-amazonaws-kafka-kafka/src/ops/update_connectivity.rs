@@ -24,6 +24,18 @@
 //! on the cluster its `ClusterArn` names, and that decision is taken on the ARN as
 //! submitted, before anything is resolved ([`crate::state::authorization`]).
 //!
+//! This call CHANGES how clients reach the cluster — the multi-VPC and public-access
+//! surface a cluster's own resource-based policy is attached for — so the decision
+//! takes one step more
+//! ([`crate::state::authorization::authorize_registered_cluster`]): an action on
+//! that surface can be allowed only by a document attached to the cluster it
+//! applies to or by one of the caller's own naming that cluster, so a well-formed
+//! cluster ARN this endpoint holds no cluster for is allowed by NOTHING and the call
+//! is refused as unauthorized rather than told the cluster is absent. That keeps
+//! "you may not" and "it is not there" the one answer on this surface and discloses
+//! nothing of what the registry holds, exactly as `RejectClientVpcConnection` —
+//! the other mutation of the same surface — already answers it.
+//!
 //! The scaffold notes below describe the framework; they are kept because they
 //! document the seams this handler uses.
 //!
@@ -207,6 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The rest of the cluster-scoped decision, still over the ARN as
+        // submitted and still before anything is resolved or any member of the
+        // body is read: this call changes how clients reach the cluster, which is
+        // the surface a cluster's own resource-based policy is attached for, so a
+        // cluster this endpoint holds no record of carries no document for the
+        // action to be granted by and the call is refused as unauthorized rather
+        // than told the cluster is absent. See
+        // [`crate::state::authorization::authorize_registered_cluster`].
+        crate::state::authorization::authorize_registered_cluster(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.cluster_arn,
+            &region,
+        )?;
+
         // Both members the operation can change are optional in the model, so a
         // request carrying neither asks for no change at all: there is no
         // connectivity configuration to apply and nothing for the cluster
@@ -235,19 +263,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         // Resolved through the settling lookup every other operation uses, so
         // the transitions the clock already owed this cluster are materialised
-        // before its state and version are judged. An ARN this endpoint's region
-        // holds no cluster for — absent, or belonging to another region — is a
-        // resource that does not exist here.
+        // before its state and version are judged. The decision above already
+        // found a cluster under this ARN at this endpoint, so reaching the miss
+        // means it was removed between that decision and this guard; the answer
+        // is the decision's own, nothing grants this action on a cluster the
+        // registry no longer holds.
         let Some(cluster) = state.settled_cluster_in_mut(&region, &input.cluster_arn, now) else {
-            return Err(
-                UpdateConnectivityErrorModeled::NotFoundException(NotFoundException {
-                    // The member that named the resource, as the other readers
-                    // of a cluster ARN report it.
-                    invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+            return Err(crate::state::authorization::no_resource_policy_for_cluster(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &input.cluster_arn,
+            ));
         };
 
         // A `CurrentVersion` is a token the SERVICE mints and the caller quotes

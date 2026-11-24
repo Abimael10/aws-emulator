@@ -21,7 +21,12 @@
 //! * only a caller the decision PERMITS is told about the target: a well-formed ARN
 //!   of this account that this endpoint's region holds no cluster for is
 //!   `NotFoundException` (HTTP 404) in the service's one sentence for a resource it
-//!   cannot resolve, and the cluster it DOES hold has the update accepted.
+//!   cannot resolve, and the cluster it DOES hold has the update accepted — except
+//!   where the mutation changes how clients REACH the cluster, the surface a
+//!   cluster's own resource-based policy is attached for: nothing can grant an action
+//!   on a cluster that carries no document, so there the permitted caller is refused
+//!   as unauthorized too, and learns nothing about the registry either
+//!   (`connectivity_absent_cluster_refusal.rs` drives that rule over its own table).
 //!
 //! The rows differ along what the rule generalises over: the document in force on
 //! the calling principal (a deny of exactly this action, a deny of every action of
@@ -90,6 +95,23 @@ struct Mutation {
     /// What follows the `ClusterArn` path label in the operation's URI.
     suffix: &'static str,
     members: Value,
+    /// What a PERMITTED caller is told about a well-formed ARN this endpoint holds
+    /// no cluster for.
+    absent: AbsentAnswer,
+}
+
+/// What a permitted caller is answered for a cluster this endpoint holds no record
+/// of — which depends on what the mutation changes.
+#[derive(Debug, Clone, Copy)]
+enum AbsentAnswer {
+    /// The service's one sentence for a resource it cannot resolve: the answer where
+    /// an identity-based document is what grants the action, so the permitted caller
+    /// reaches the operation's own resolution.
+    Reported,
+    /// The authorization refusal: the answer where the mutation changes how clients
+    /// reach the cluster, the surface a cluster's own resource-based policy is
+    /// attached for, so a cluster carrying no document grants the action by nothing.
+    Unauthorized,
 }
 
 impl Mutation {
@@ -125,18 +147,21 @@ fn mutations() -> Vec<Mutation> {
             method: "PUT",
             suffix: "/connectivity",
             members: json!({ "connectivityInfo": { "publicAccess": { "type": "SERVICE_PROVIDED_EIPS" } } }),
+            absent: AbsentAnswer::Unauthorized,
         },
         Mutation {
             operation: "UpdateBrokerCount",
             method: "PUT",
             suffix: "/nodes/count",
             members: json!({ "targetNumberOfBrokerNodes": 6 }),
+            absent: AbsentAnswer::Reported,
         },
         Mutation {
             operation: "UpdateMonitoring",
             method: "PUT",
             suffix: "/monitoring",
             members: json!({ "enhancedMonitoring": "PER_BROKER" }),
+            absent: AbsentAnswer::Reported,
         },
     ]
 }
@@ -271,14 +296,28 @@ async fn an_unauthorized_caller_is_refused_before_the_cluster_is_resolved() {
             }
         }
 
-        // A caller the decision PERMITS is the one told about the target.
+        // A caller the decision PERMITS is the one told about the target — as far as
+        // the mutation's own surface lets it be told at all.
         given_role_inline_policy(&emulator.engine, ROLE, Some(&document("Allow", &action)));
         let missed = call_as(&emulator, SESSION_KEY_ID, &mutation, &absent, &version).await;
+        let expected = match mutation.absent {
+            AbsentAnswer::Reported => (
+                NOT_FOUND_STATUS,
+                NOT_FOUND_CODE,
+                RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+            ),
+            AbsentAnswer::Unauthorized => (
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_CODE,
+                no_resource_policy_message(&principal, &action, &absent),
+            ),
+        };
         assert_eq!(
             (missed.status, missed.error_code(), missed.error_message()),
-            (NOT_FOUND_STATUS, NOT_FOUND_CODE, RESOURCE_NOT_FOUND_MESSAGE),
+            (expected.0, expected.1, expected.2.as_str()),
             "case \"an allow of this action\" / \"an ARN it holds nothing for\" / {operation}: \
-             expected the not-found refusal, got {} {}",
+             expected the {:?} answer, got {} {}",
+            mutation.absent,
             missed.status,
             missed.body
         );

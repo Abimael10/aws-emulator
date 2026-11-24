@@ -69,13 +69,18 @@
 //! OPERATION ([`authorize_cluster_operation_target`]), whose target is a resource
 //! of this service named by ARN just the same.
 //!
-//! An operation that CHANGES the cluster its ARN names and models no way to report
-//! the cluster's absence takes one step more ([`authorize_registered_cluster`]): an
-//! action scoped to a cluster is granted by a document attached to that cluster or
-//! by one of the caller's own naming it, so a cluster this endpoint holds no record
-//! of is granted by nothing, and the call is refused as unauthorized rather than
-//! described as an unusable reference — which is what keeps "you may not" and "it is
-//! not there" the one answer on an operation that can only say the first.
+//! An operation that CHANGES how clients reach the cluster its ARN names — the
+//! multi-VPC and public-access connectivity surface a cluster's own resource-based
+//! policy is attached for — takes one step more
+//! ([`authorize_registered_cluster`]): an action on that surface is allowed only by
+//! a document attached to the cluster it applies to or by one of the caller's own
+//! naming that cluster, so a cluster this endpoint holds no record of is allowed by
+//! nothing, and the call is refused as unauthorized rather than described as an
+//! absent or unusable resource — which keeps "you may not" and "it is not there" the
+//! one answer on that surface, whatever the registry holds. The operations that
+//! change OTHER parts of a cluster, and every one that merely REPORTS on it, answer
+//! an absence as the absence it is (the modelled `NotFoundException`), which is what
+//! this service's recorded answers show for them one by one.
 //!
 //! What the CALLER's own identity-based policies say about the action is the other
 //! half of the same question, and it is asked FIRST, inside
@@ -609,19 +614,21 @@ fn no_grant_for_cluster<Eng: Send + Sync + 'static, E>(
 }
 
 /// The decision for the control-plane action of `operation` on the CLUSTER
-/// `cluster_arn` names, for an operation that CHANGES that cluster and whose model
-/// gives it no channel for reporting that the cluster is absent.
+/// `cluster_arn` names, for an operation that CHANGES how clients reach that
+/// cluster.
 ///
-/// Such an action is granted only by a document attached to the cluster it applies
-/// to or by one of the caller's own that names that cluster, so a cluster this
-/// endpoint holds no record of is granted by NOTHING: there is no resource-based
-/// policy to allow it, which is the clause the refusal closes with
+/// The multi-VPC and public-access connectivity surface is what a cluster's own
+/// resource-based policy is attached for, so an action on it is allowed only by a
+/// document attached to the cluster it applies to or by one of the caller's own that
+/// names that cluster: a cluster this endpoint holds no record of is allowed by
+/// NOTHING — there is no resource-based policy to allow it, which is the clause the
+/// refusal closes with
 /// ([`::service_common::iam_authorization::not_authorized_by_resource_policy`]).
 /// The answer is therefore the authorization refusal — [`ACCESS_DENIED_CODE`] at
-/// [`ACCESS_DENIED_STATUS`] — and NOT a description of the reference: an operation
-/// with no way to report an absence does not report one, so "you may not" and "it
-/// is not there" are the one answer and nothing of what this registry holds is
-/// disclosed.
+/// [`ACCESS_DENIED_STATUS`] — and NOT a description of the resource: on this surface
+/// "you may not" and "it is not there" are the one answer, so nothing of what this
+/// registry holds is disclosed. The mutations of other parts of a cluster, and the
+/// operations that merely REPORT on one, answer an absence as the absence it is.
 ///
 /// Taken over the ARN AS SUBMITTED and before the operation resolves anything: the
 /// registry is only asked whether it holds a cluster under that ARN at this

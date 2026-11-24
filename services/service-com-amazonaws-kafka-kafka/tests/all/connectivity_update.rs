@@ -22,6 +22,7 @@
 //! which endpoints the new configuration exposes.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_kafka_kafka::state::authorization::caller_principal;
 
 use crate::cluster_lifecycle::BOOTSTRAP_MEMBERS;
 use crate::kafka_harness::{
@@ -455,15 +456,17 @@ async fn a_connectivity_update_lands_once_the_clock_makes_it_due() {
 /// RULE: the `NotFoundException` a request gets for a resource the service does
 /// not hold carries ONE wording, the service's own, whichever operation answers
 /// it and however the resource came to be missing.
+///
+/// `UpdateConnectivity` is not among the operations driven here: it changes how
+/// clients reach the cluster, the surface a cluster's own resource-based policy is
+/// attached for, so an ARN this endpoint holds no cluster for is refused as
+/// unauthorized there rather than reported as absent
+/// (`connectivity_absent_cluster_refusal.rs`).
 #[tokio::test]
 async fn an_absent_cluster_gets_one_wording_from_every_operation() {
     let emulator = Emulator::new();
     let arn = emulator.create_ok(&ClusterRequest::named("wording")).await;
     sleep_past_activation();
-    let version = member(&described(&emulator, "wording", &arn).await, "/currentVersion")
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
 
     // Rows: a well-formed ARN no cluster was ever created for, and a live
     // cluster's own ARN seen from another region's endpoint — the two ways a
@@ -478,21 +481,12 @@ async fn an_absent_cluster_gets_one_wording_from_every_operation() {
         ),
         ("another-region", arn.clone(), "ap-southeast-2"),
     ];
-    // Every operation in this crate that models `NotFoundException`, as
-    // `(case, method, uri suffix, body)`.
+    // Every operation in this crate that models `NotFoundException` and reports an
+    // absent cluster as one, as `(case, method, uri suffix, body)`.
     for (case, target, region) in &targets {
         let calls: Vec<(&str, &str, String, Option<Value>)> = vec![
             ("DescribeCluster", "GET", String::new(), None),
             ("DeleteCluster", "DELETE", String::new(), None),
-            (
-                "UpdateConnectivity",
-                "PUT",
-                "/connectivity".to_string(),
-                Some(json!({
-                    "currentVersion": version,
-                    "connectivityInfo": { "networkType": "DUAL" }
-                })),
-            ),
         ];
         for (operation, method, suffix, body) in calls {
             let reply = emulator
@@ -522,7 +516,8 @@ async fn an_absent_cluster_gets_one_wording_from_every_operation() {
 
 /// RULE: a connectivity update is refused — changing nothing — for a `ClusterArn`
 /// this endpoint cannot parse (`BadRequestException`), for a well-formed one its
-/// region holds no cluster for (`NotFoundException`), for a cluster that is not
+/// region holds no cluster for (the authorization refusal: nothing can grant an
+/// action on a cluster this endpoint holds no record of), for a cluster that is not
 /// `ACTIVE`, for a `CurrentVersion` that is not the one the cluster is at, and
 /// for a request that names neither thing the operation can change.
 #[tokio::test]
@@ -572,7 +567,9 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
     // empty region are cluster references identifying no cluster, which
     // authorization refuses before anything resolves; then a well-formed ARN no
     // cluster holds, and this cluster's own ARN seen from another region's
-    // endpoint.
+    // endpoint — which this surface answers with the authorization refusal too,
+    // a cluster this endpoint holds no record of carrying no document for the
+    // action to be granted by.
     let rows: Vec<(&str, String, &str, Value, u16, &str)> = vec![
         (
             "not-an-arn",
@@ -621,16 +618,16 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
             ),
             REGION,
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            404,
-            "NotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "another-region",
             arn.clone(),
             "us-east-1",
             json!({ "currentVersion": version, "connectivityInfo": connectivity }),
-            404,
-            "NotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "stale-version",
@@ -685,21 +682,31 @@ async fn update_connectivity_refuses_what_it_cannot_apply() {
         }
     }
 
-    // The resource-level refusal carries the service's own wording for a
-    // resource it does not hold.
+    // The resource-level refusal carries IAM's sentence for a request no
+    // resource-based policy allows, over the ARN exactly as submitted — and
+    // discloses nothing about what this endpoint holds under it.
+    let absent_arn = format!(
+        "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
+    );
     let absent = update_in(
         &emulator,
         REGION,
-        &format!(
-            "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/absent/11111111-2222-4333-8444-555555555555-1"
-        ),
+        &absent_arn,
         json!({ "currentVersion": version, "connectivityInfo": connectivity }),
     )
     .await;
+    let action = "kafka:UpdateConnectivity";
     assert_eq!(
         absent.body["message"].as_str(),
-        Some("The requested resource doesn\u{2019}t exist."),
-        "case absent-cluster: expected the service's not-found wording, got {}",
+        Some(
+            format!(
+                "User: {} is not authorized to perform: {action} on resource: {absent_arn} \
+                 because no resource-based policy allows the {action} action",
+                caller_principal()
+            )
+            .as_str()
+        ),
+        "case absent-cluster: expected IAM's no-resource-policy sentence, got {}",
         absent.body
     );
 

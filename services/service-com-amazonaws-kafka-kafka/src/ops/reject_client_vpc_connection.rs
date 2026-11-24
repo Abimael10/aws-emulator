@@ -26,13 +26,14 @@
 //! The CLUSTER-scoped authorization decision is taken on the `ClusterArn` as
 //! submitted, before anything the request names is resolved and before the rest
 //! of the request is read: this operation CHANGES the cluster's client
-//! connectivity, and the model gives it no channel for reporting that the
-//! cluster is absent, so a well-formed cluster ARN this endpoint holds no
-//! cluster for is refused as unauthorized — a cluster that is not there carries
-//! no resource-based policy for the action to be granted by
-//! ([`crate::state::authorization::authorize_registered_cluster`]) — rather than
-//! reported as an unusable parameter. That keeps "you may not" and "it is not
-//! there" one answer here, and discloses nothing of what the registry holds.
+//! connectivity — the surface a cluster's own resource-based policy is attached
+//! for — so a well-formed cluster ARN this endpoint holds no cluster for is
+//! refused as unauthorized: a cluster that is not there carries no
+//! resource-based policy for the action to be granted by
+//! ([`crate::state::authorization::authorize_registered_cluster`], the decision
+//! `UpdateConnectivity` takes over the same surface) rather than reported as an
+//! unusable parameter. That keeps "you may not" and "it is not there" one answer
+//! here, and discloses nothing of what the registry holds.
 //!
 //! ## Shape of an operation
 //!

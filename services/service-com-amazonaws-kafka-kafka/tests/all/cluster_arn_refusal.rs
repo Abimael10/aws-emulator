@@ -39,6 +39,13 @@
 //! value that is no ARN — over the value AS SUBMITTED, there being nothing else it
 //! stands for — which is the third suite below.
 //!
+//! Neither does the resolution BEHIND Rule 1 hold for an operation that changes how
+//! clients reach the cluster (`UpdateConnectivity`, `RejectClientVpcConnection`):
+//! that surface is what a cluster's own resource-based policy is attached for, so a
+//! well-formed ARN this endpoint holds no cluster for reaches no grant and Rule 1
+//! answers it rather than the resolution behind the gate — which
+//! `connectivity_absent_cluster_refusal.rs` drives.
+//!
 //! The rows span both dimensions the rules generalise over: which operation
 //! answers (every cluster-scoped reader, update, delete and policy call, the two
 //! cluster-operation readers, plus `GetCompatibleKafkaVersions`, which carries the
@@ -114,6 +121,17 @@ impl Operation {
     fn only_a_cluster_policy_can_grant(&self) -> bool {
         CLUSTER_POLICY_ACTIONS.contains(&self.name)
     }
+
+    /// Whether this operation CHANGES how clients reach the cluster — the
+    /// multi-VPC and public-access surface a cluster's own resource-based policy is
+    /// attached for. An action on that surface is allowed only by a document
+    /// attached to the cluster it applies to, so a well-formed ARN this endpoint
+    /// holds no cluster for reaches no grant either and Rule 1 answers it rather
+    /// than the operation's own resolution behind the gate
+    /// (`connectivity_absent_cluster_refusal.rs` drives that rule).
+    fn changes_the_client_connectivity_surface(&self) -> bool {
+        CONNECTIVITY_MUTATIONS.contains(&self.name)
+    }
     /// The request URI for `arn`, with the ARN percent-encoded wherever the
     /// model puts it.
     fn uri(&self, arn: &str) -> String {
@@ -149,6 +167,12 @@ const CLUSTER_POLICY_ACTIONS: [&str; 4] = [
     "DescribeCluster",
     "DescribeClusterV2",
 ];
+
+/// The operations that CHANGE how clients reach a cluster — the multi-VPC and
+/// public-access surface a cluster's own resource-based policy is attached for — for
+/// which a cluster this endpoint holds no record of is refused as unauthorized
+/// rather than resolved (`connectivity_absent_cluster_refusal.rs`).
+const CONNECTIVITY_MUTATIONS: [&str; 2] = ["UpdateConnectivity", "RejectClientVpcConnection"];
 
 /// Every operation of this service that resolves a cluster, or one cluster
 /// operation, by ARN — with the route the model binds it to
@@ -767,6 +791,11 @@ async fn an_arn_of_another_resource_kind_is_left_to_the_operation() {
 /// unauthorized — while a value one segment away from it never gets that far, and a
 /// value that is no ARN at all stays the parameter refusal.
 ///
+/// The exception is an operation that changes how clients REACH the cluster: there
+/// the grant could only have rested on a document attached to the cluster itself, so
+/// a well-formed ARN this endpoint holds no cluster for reaches no grant and Rule 1
+/// answers it too ([`Operation::changes_the_client_connectivity_surface`]).
+///
 /// Driven over the operations whose target IS a cluster, since the value the first
 /// leg sends has to be a resource of the kind the member carries; the two
 /// cluster-operation readers resolve their own kind of ARN, which
@@ -789,15 +818,27 @@ async fn the_gates_are_ordered_and_each_answers_its_own_values() {
         let served = emulator
             .call(operation.method, &operation.uri(&absent), operation.body())
             .await;
-        assert_ne!(
-            served.error_code(),
-            "AccessDeniedException",
-            "case \"a well-formed absent cluster\"/{}: a cluster ARN of this account must pass \
-             the gate, got {} {}",
-            operation.name,
-            served.status,
-            served.body
-        );
+        if operation.changes_the_client_connectivity_surface() {
+            assert_eq!(
+                (served.status, served.error_code()),
+                (403, "AccessDeniedException"),
+                "case \"a well-formed absent cluster\"/{}: a cluster this endpoint holds no \
+                 record of grants this action by nothing, got {} {}",
+                operation.name,
+                served.status,
+                served.body
+            );
+        } else {
+            assert_ne!(
+                served.error_code(),
+                "AccessDeniedException",
+                "case \"a well-formed absent cluster\"/{}: a cluster ARN of this account must \
+                 pass the gate, got {} {}",
+                operation.name,
+                served.status,
+                served.body
+            );
+        }
 
         let denied = emulator
             .call(
