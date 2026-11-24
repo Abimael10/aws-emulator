@@ -17,10 +17,10 @@
 //!   the broad-access check for an ALLOW of every principal, the lock-out check
 //!   for an unconditional DENY of every principal — and a document that fails
 //!   none passes with no entries;
-//! * the `SecretId` is optional, resolves by name, full ARN or partial ARN, is
-//!   `ResourceNotFoundException` when it names nothing and
-//!   `InvalidRequestException` when the secret it names is scheduled for
-//!   deletion;
+//! * the `SecretId` is optional attribution that is never resolved: the verdict
+//!   is decided by the document alone, so the same document gets the same answer
+//!   whether the id is absent, names a live secret in any of its forms, names a
+//!   secret inside its recovery window, or names no secret at all;
 //! * validating is reporting: it attaches nothing, replaces nothing and removes
 //!   nothing, so the document `GetResourcePolicy` reports is unchanged by any
 //!   number of validations.
@@ -36,8 +36,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_secretsmanager_secretsmanager::state::{
     BROAD_ACCESS_CHECK_MESSAGE, BROAD_ACCESS_CHECK_NAME, LOCKS_OUT_CALLER_CHECK_MESSAGE,
-    LOCKS_OUT_CALLER_CHECK_NAME, MARKED_FOR_DELETION_MESSAGE, SECRET_NOT_FOUND_MESSAGE,
-    VALIDATE_SYNTAX_ERROR_MESSAGE, VALIDATE_UNSUPPORTED_PRINCIPAL_MESSAGE,
+    LOCKS_OUT_CALLER_CHECK_NAME, VALIDATE_SYNTAX_ERROR_MESSAGE,
+    VALIDATE_UNSUPPORTED_PRINCIPAL_MESSAGE,
 };
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -57,6 +57,11 @@ const ANOTHER_ACCOUNT: &str = "111122223333";
 /// secret's name in its ARN, which a partial ARN leaves off
 /// (`CreateSecretRequest$Name`, this service's Smithy model).
 const ARN_SUFFIX_LEN: usize = 7;
+
+/// The longest `SecretId` the model accepts
+/// (`ValidateResourcePolicyRequest$SecretId` targets `SecretIdType`, length
+/// 1..2048, in this service's Smithy model).
+const SECRET_ID_MAX: usize = 2048;
 
 /// A fresh emulator holding only this service, over its own engine.
 fn emulator() -> MultiServiceRouter {
@@ -581,88 +586,99 @@ async fn a_principal_that_names_no_existing_identity_is_refused() {
     }
 }
 
-/// The `SecretId` is optional, resolves the same way every operation of this
-/// service resolves one, and refuses a secret it cannot use.
+/// The `SecretId` is optional attribution the operation never resolves: the
+/// verdict comes from the document alone, so every form of the id — including
+/// one no secret was ever created under — gets the same answer for the same
+/// document, and none of them is refused.
 ///
-/// The rows span the form of the `SecretId` — absent, a name, a full ARN, a
-/// partial ARN — and, for the refusals, a `SecretId` that names nothing and one
-/// whose secret is scheduled for deletion.
+/// The rows span the form of the `SecretId` (absent, a name, a full ARN, a
+/// partial ARN), whether it names a secret that exists, one inside its recovery
+/// window, one in another Region or none at all, and its size at the longest the
+/// model accepts.
 #[tokio::test]
-async fn the_secret_id_is_optional_and_resolved_like_every_other() {
+async fn the_secret_id_is_attribution_and_is_never_resolved() {
     let router = emulator();
-    let name = "resolved-validation-secret";
+    let account = this_account();
+    let name = "attributed-validation-secret";
     let arn = create(&router, name, "setup").await;
     let partial = arn[..arn.len() - ARN_SUFFIX_LEN].to_string();
-    let document = policy(
-        "Allow",
-        json!({"AWS": format!("arn:aws:iam::{}:root", this_account())}),
-    );
 
-    for (case, secret_id) in [
-        ("absent", None),
-        ("name", Some(name.to_string())),
-        ("full-arn", Some(arn.clone())),
-        ("partial-arn", Some(partial)),
-    ] {
-        let reported = validated_checks(&router, secret_id.as_deref(), &document, case).await;
-        assert!(
-            reported.is_empty(),
-            "case {case:?}: a clean document must report no checks, got {reported:?}"
-        );
-    }
-
-    for (case, secret_id) in [
-        ("missing-name", "no-such-secret".to_string()),
-        (
-            "missing-full-arn",
-            format!(
-                "arn:aws:secretsmanager:us-west-2:{}:secret:no-such-secret-aBcDeF",
-                this_account()
-            ),
-        ),
-    ] {
-        let (code, message) = err(
-            &router,
-            "ValidateResourcePolicy",
-            json!({"SecretId": secret_id, "ResourcePolicy": &document}),
-            case,
-        )
-        .await;
-        assert_eq!(
-            code, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {code} with {message:?}"
-        );
-        assert_eq!(
-            message, SECRET_NOT_FOUND_MESSAGE,
-            "case {case:?}: expected the not-found message, got {message:?}"
-        );
-    }
-
-    // A secret inside its recovery window still exists, so it is refused by its
-    // state rather than reported as missing.
+    // A secret inside its recovery window: it still exists, and validating a
+    // document attributed to it is still a report on the document.
+    let deleting = "deleting-validation-secret";
+    create(&router, deleting, "setup").await;
     ok(
         &router,
         "DeleteSecret",
-        json!({"SecretId": name, "RecoveryWindowInDays": 7}),
-        "deleted",
+        json!({"SecretId": deleting, "RecoveryWindowInDays": 7}),
+        "setup",
     )
     .await;
-    let (code, message) = err(
-        &router,
-        "ValidateResourcePolicy",
-        json!({"SecretId": name, "ResourcePolicy": &document}),
-        "scheduled-for-deletion",
-    )
-    .await;
-    assert_eq!(
-        code, "InvalidRequestException",
-        "a secret scheduled for deletion: expected InvalidRequestException, got {code} with \
-         {message:?}"
-    );
-    assert_eq!(
-        message, MARKED_FOR_DELETION_MESSAGE,
-        "a secret scheduled for deletion: expected the deletion message, got {message:?}"
-    );
+
+    let ids: Vec<(&str, Option<String>)> = vec![
+        ("absent", None),
+        ("the-name-of-a-live-secret", Some(name.to_string())),
+        ("the-full-arn-of-a-live-secret", Some(arn.clone())),
+        ("the-partial-arn-of-a-live-secret", Some(partial)),
+        (
+            "the-name-of-a-secret-inside-its-recovery-window",
+            Some(deleting.to_string()),
+        ),
+        (
+            "a-name-no-secret-was-ever-created-under",
+            Some("no-such-secret".to_string()),
+        ),
+        (
+            "a-full-arn-no-secret-holds",
+            Some(format!(
+                "arn:aws:secretsmanager:us-west-2:{account}:secret:no-such-secret-aBcDeF"
+            )),
+        ),
+        (
+            "a-partial-arn-no-secret-holds",
+            Some(format!(
+                "arn:aws:secretsmanager:us-west-2:{account}:secret:also-no-such-secret"
+            )),
+        ),
+        (
+            "an-arn-in-another-region",
+            Some(format!(
+                "arn:aws:secretsmanager:eu-central-1:{account}:secret:{name}-aBcDeF"
+            )),
+        ),
+        (
+            "an-id-at-the-longest-the-model-accepts",
+            Some("x".repeat(SECRET_ID_MAX)),
+        ),
+    ];
+
+    // Two documents, so each row shows the verdict follows the document rather
+    // than the id: one that passes every check, one that fails the broad-access
+    // check.
+    let clean = policy("Allow", json!({"AWS": format!("arn:aws:iam::{account}:root")}));
+    let broad = policy("Allow", json!("*"));
+    let documents: Vec<(&str, &String, Vec<ReportedCheck>)> = vec![
+        ("a-clean-document", &clean, vec![]),
+        (
+            "a-document-allowing-every-principal",
+            &broad,
+            vec![(
+                BROAD_ACCESS_CHECK_NAME.to_string(),
+                BROAD_ACCESS_CHECK_MESSAGE.to_string(),
+            )],
+        ),
+    ];
+
+    for (id_case, secret_id) in &ids {
+        for (document_case, document, expected) in &documents {
+            let case = format!("{document_case}/SecretId={id_case}");
+            let reported = validated_checks(&router, secret_id.as_deref(), document, &case).await;
+            assert_eq!(
+                &reported, expected,
+                "case {case:?}: expected the checks {expected:?}, got {reported:?}"
+            );
+        }
+    }
 }
 
 /// Validating reports on a document and changes nothing: whatever is validated,

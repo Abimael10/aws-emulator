@@ -5,7 +5,10 @@
 //! Validates a resource policy document and reports the outcome: a document that is
 //! not a policy document is refused with `MalformedPolicyDocumentException`, and one
 //! that fails a reported check comes back with `PolicyValidationPassed` false and an
-//! entry naming each failed check. Nothing is persisted.
+//! entry naming each failed check. Nothing is persisted and nothing but the document
+//! in the request decides the verdict: the optional `SecretId` is attribution the
+//! operation never resolves, so a document can be validated before the secret it is
+//! meant for exists.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -209,39 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The ARN or name of the secret with the resource-based policy you want
-        // to validate" (`ValidateResourcePolicyRequest$SecretId`) is optional: a
-        // request naming one has it resolved, a request naming none validates the
-        // document on its own.
-        if let Some(secret_id) = input.secret_id.as_deref() {
-            let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-            let mut store = state.lock();
-            // This operation reports on a document and persists nothing. The only
-            // write is one the clock had already made due whether or not anybody
-            // called: dropping secrets whose recovery window has elapsed.
-            let now = ::std::time::SystemTime::now();
-            store.expire_due(now);
-
-            let Some(secret) = store.get(&crate::state::request_region(ctx.parts()), secret_id)
-            else {
-                return Err(ValidateResourcePolicyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            };
-
-            // "A parameter value is not valid for the current state of the
-            // resource. Possible causes: The secret is scheduled for deletion."
-            if secret.scheduled_for_deletion() {
-                return Err(ValidateResourcePolicyErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
-        }
+        // to validate" (`ValidateResourcePolicyRequest$SecretId`) is optional, and
+        // the three checks this operation documents are all properties of the
+        // DOCUMENT. So the id is attribution only — what the call is judged and
+        // logged against — and is never resolved against the store: the verdict a
+        // caller gets for a document is the same whether the id names a live
+        // secret, a secret inside its recovery window, or no secret at all, which
+        // is what lets a policy be validated before its secret is created.
 
         // The other two checks the operation documents — broad access to the
         // secret, and locking a caller out — are REPORTED, not refused: a document
@@ -261,15 +238,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             validation_errors: Some(validation_errors),
         })
     }
-}
-
-/// The modelled server error for a request that cannot reach this service's
-/// store. `service_state` answers `None` only when the engine is not the shared
-/// in-memory one, which is a server-side fault, never a bad request.
-fn state_unavailable() -> ValidateResourcePolicyError {
-    ValidateResourcePolicyErrorModeled::InternalServiceError(InternalServiceError {
-        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
-    })
-    .into()
 }
 
