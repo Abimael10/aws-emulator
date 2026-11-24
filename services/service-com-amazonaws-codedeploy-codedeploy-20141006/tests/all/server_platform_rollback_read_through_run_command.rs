@@ -15,9 +15,14 @@
 //! against the store that owns the guest; what it adds is the path a client really has to the
 //! host — Systems Manager delivering a document's script to the agent in that guest — so the
 //! install has to be visible THERE, through a second service, and not only in the record
-//! CodeDeploy keeps. Five services are mounted on ONE engine for it: CodeDeploy, Amazon EC2,
-//! Amazon S3, Systems Manager and IAM (a node registers only as a role its instance profile
-//! carries, which is a fact IAM holds).
+//! CodeDeploy keeps. Six services are mounted on ONE engine for it: CodeDeploy, Amazon EC2,
+//! Amazon S3, Systems Manager, IAM (a node registers only as a role its instance profile
+//! carries, which is a fact IAM holds) and CloudWatch (the alarms a deployment runs under).
+//!
+//! The harness and the waits below are `pub(crate)`:
+//! `server_platform_alarm_gate_before_any_hook.rs` drives the same estate through the same
+//! front door, so one place says how the services are mounted, how a host is launched and
+//! waited on, and how a command is run in its guest.
 //!
 //! Nothing here waits a fixed time: every span is a stored due instant — the launch reaching
 //! `running`, the node registering, each deployment reaching its outcome, the invocation
@@ -36,13 +41,13 @@ use crate::server_platform_instance_deployments::{app_spec, bundle, element, for
 const REGION: &str = "us-east-1";
 
 /// The EC2 API version an `ec2Query` body carries beside its `Action`.
-const EC2_API_VERSION: &str = "2016-11-15";
+pub(crate) const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The IAM API version an `awsQuery` body carries beside its `Action`.
-const IAM_API_VERSION: &str = "2010-05-08";
+pub(crate) const IAM_API_VERSION: &str = "2010-05-08";
 
 /// The AMI the launch below runs from, in the long form EC2 issues AMI ids in.
-const AMI: &str = "ami-0123456789abcdef0";
+pub(crate) const AMI: &str = "ami-0123456789abcdef0";
 
 /// The service role the deployment group is created with; nothing resolves it here.
 const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
@@ -57,10 +62,10 @@ const PROFILE: &str = "codedeploy-host-profile";
 const ROLE: &str = "codedeploy-host-role";
 
 /// The AWS-managed policy a client attaches to that role so the agent may register its node.
-const SSM_CORE_POLICY: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
+pub(crate) const SSM_CORE_POLICY: &str = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore";
 
 /// The service principal the role's trust policy admits, so Amazon EC2 may act as it.
-const EC2_PRINCIPAL: &str = "ec2.amazonaws.com";
+pub(crate) const EC2_PRINCIPAL: &str = "ec2.amazonaws.com";
 
 /// The document Run Command delivers a shell script to a Linux node with.
 const SHELL_DOCUMENT: &str = "AWS-RunShellScript";
@@ -90,12 +95,12 @@ const POLL: Duration = Duration::from_millis(25);
 /// has to a host — that suite reads the guest through the store that owns it, this one through
 /// the agent inside it — are the very thing the two suites are there to keep apart. What does
 /// not differ is shared ([`element`], [`form_encode`], [`app_spec`], [`bundle`]).
-struct Estate {
+pub(crate) struct Estate {
     router: MultiServiceRouter,
 }
 
 impl Estate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; the SigV4 credential scope is what routes each request
@@ -117,6 +122,11 @@ impl Estate {
         ));
         router.register_service(
             service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
                 Arc::clone(&engine),
             ),
         );
@@ -159,7 +169,7 @@ impl Estate {
     }
 
     /// One CodeDeploy operation that must succeed.
-    async fn codedeploy(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn codedeploy(&self, case: &str, operation: &str, body: Value) -> Value {
         let (status, parsed) = self
             .json("codedeploy", "CodeDeploy_20141006", operation, body)
             .await;
@@ -171,7 +181,7 @@ impl Estate {
     }
 
     /// One Systems Manager operation that must succeed.
-    async fn ssm(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ssm(&self, case: &str, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.json("ssm", "AmazonSSM", operation, body).await;
         assert_eq!(
             status, 200,
@@ -181,9 +191,42 @@ impl Estate {
         parsed
     }
 
+    /// One CloudWatch operation that must succeed.
+    ///
+    /// CloudWatch's model declares `awsJson1_0` and its own target prefix
+    /// (`smithy_query(query="service_info")`), so the envelope and the prefix are that
+    /// service's rather than the two above; the SigV4 credential scope is what routes the
+    /// request to the `monitoring` signing name.
+    pub(crate) async fn cloudwatch(&self, case: &str, operation: &str, body: Value) -> Value {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("monitoring.{REGION}.amazonaws.com"))
+            .header(
+                "x-amz-target",
+                format!("GraniteServiceVersion20100801.{operation}"),
+            )
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("authorization", Self::authorization("monitoring"))
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed: Value = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CloudWatch {operation} must succeed, got {status} with {parsed:?}"
+        );
+        parsed
+    }
+
     /// One form-encoded query call (`ec2Query`, `awsQuery`) that must succeed, as its XML
     /// body.
-    async fn form(
+    pub(crate) async fn form(
         &self,
         case: &str,
         signing_name: &str,
@@ -216,11 +259,12 @@ impl Estate {
         answered
     }
 
-    /// Upload `payload` at `key` through S3's own API, creating the bucket the first time.
-    async fn upload(&self, case: &str, key: &str, payload: &[u8]) {
+    /// Upload `payload` at `key` of `bucket` through S3's own API, creating the bucket the
+    /// first time.
+    pub(crate) async fn upload(&self, case: &str, bucket: &str, key: &str, payload: &[u8]) {
         for (method, path, body) in [
-            ("PUT", format!("/{BUCKET}"), Vec::new()),
-            ("PUT", format!("/{BUCKET}/{key}"), payload.to_vec()),
+            ("PUT", format!("/{bucket}"), Vec::new()),
+            ("PUT", format!("/{bucket}/{key}"), payload.to_vec()),
         ] {
             let host = format!("s3.{REGION}.amazonaws.com");
             let request = ::http::Request::builder()
@@ -240,7 +284,7 @@ impl Estate {
 }
 
 /// A trust policy admitting `principal` and nothing else, with none of `&`, `=` or `+` in it.
-fn trust_policy(principal: &str) -> String {
+pub(crate) fn trust_policy(principal: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Principal\":{{\"Service\":\"{principal}\"}},\"Action\":\"sts:AssumeRole\"}}]}}"
@@ -272,7 +316,7 @@ fn revision(marker: &str, failing: bool) -> Vec<u8> {
 }
 
 /// Look again until Amazon EC2 reports `instance` running.
-async fn when_running(estate: &Estate, case: &str, instance: &str) {
+pub(crate) async fn when_running(estate: &Estate, case: &str, instance: &str) {
     let deadline = Instant::now() + BUDGET;
     loop {
         let described = estate
@@ -297,7 +341,7 @@ async fn when_running(estate: &Estate, case: &str, instance: &str) {
 
 /// Look again until Systems Manager reports `instance` as a managed node whose agent is
 /// responding, which is when a command can be delivered to it.
-async fn when_managed(estate: &Estate, case: &str, instance: &str) {
+pub(crate) async fn when_managed(estate: &Estate, case: &str, instance: &str) {
     let deadline = Instant::now() + BUDGET;
     loop {
         let reported = estate
@@ -325,7 +369,7 @@ async fn when_managed(estate: &Estate, case: &str, instance: &str) {
 }
 
 /// Look again until `deployment` holds a terminal status, answering its `deploymentInfo`.
-async fn when_terminal(estate: &Estate, case: &str, deployment: &str) -> Value {
+pub(crate) async fn when_terminal(estate: &Estate, case: &str, deployment: &str) -> Value {
     let deadline = Instant::now() + BUDGET;
     loop {
         let info = estate
@@ -349,7 +393,17 @@ async fn when_terminal(estate: &Estate, case: &str, deployment: &str) -> Value {
 /// Run `command` in the guest of `instance` the way a client does — `SendCommand` of the
 /// shell document, then `GetCommandInvocation` until the invocation is terminal — and answer
 /// that invocation.
-async fn run_command(estate: &Estate, case: &str, instance: &str, command: &str) -> Value {
+///
+/// The transient statuses are the ones Systems Manager's own model lists
+/// (`smithy_query(query="shape",shape="CommandInvocationStatus")`: Pending | InProgress |
+/// Delayed | Success | Cancelled | TimedOut | Failed | Cancelling), so the loop stops on
+/// whichever terminal one the node reached.
+pub(crate) async fn run_command(
+    estate: &Estate,
+    case: &str,
+    instance: &str,
+    command: &str,
+) -> Value {
     let sent = estate
         .ssm(
             case,
@@ -470,10 +524,10 @@ async fn the_installed_revision_and_the_one_a_rollback_reinstalls_are_readable_t
     // The two revisions, each under its own key: the rollback redeploys the first one's
     // object, so the second one cannot be allowed to replace it.
     estate
-        .upload(case, "revision-a.zip", &revision(MARKER_A, false))
+        .upload(case, BUCKET, "revision-a.zip", &revision(MARKER_A, false))
         .await;
     estate
-        .upload(case, "revision-b.zip", &revision(MARKER_B, true))
+        .upload(case, BUCKET, "revision-b.zip", &revision(MARKER_B, true))
         .await;
 
     // The application and a deployment group that selects the host and rolls back on a

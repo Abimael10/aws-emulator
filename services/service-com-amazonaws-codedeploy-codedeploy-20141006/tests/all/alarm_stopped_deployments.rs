@@ -472,7 +472,11 @@ async fn the_alarms_a_deployment_polls_decide_whether_it_is_stopped() {
 
 /// The fixed text the `ALARM_ACTIVE` message carries before the alarms it ends
 /// with; see [`the_alarm_active_message_delimits_each_activated_alarm_it_names`].
-const ALARM_ACTIVE_SENTENCE: &str =
+///
+/// `pub(crate)` with the alarm states above:
+/// `tests/all/server_platform_alarm_gate_before_any_hook.rs` asserts the same sentence over an
+/// EC2/on-premises deployment, so one place says what that message reads.
+pub(crate) const ALARM_ACTIVE_SENTENCE: &str =
     "One or more alarms have been activated according to the Amazon CloudWatch metrics you \
      selected, and the affected deployments have been stopped. Activated alarms: ";
 
