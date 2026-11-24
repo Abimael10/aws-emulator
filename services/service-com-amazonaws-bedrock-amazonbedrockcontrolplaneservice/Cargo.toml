@@ -55,6 +55,8 @@ service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservic
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one `mod <name>;` per `tests/all/<name>.rs`, so a new suite is a new file.
+automod = { workspace = true }
 # The suite that pins `definitionHash` recomputes the digest beside the emulator, over the
 # canonical document it spells out itself, with the same digest and hex rendering.
 sha2 = { workspace = true }

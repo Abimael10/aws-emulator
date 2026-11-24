@@ -436,6 +436,19 @@ async fn listing_changes_nothing_a_later_caller_sees() {
 // 6. Every catalog row is modelled data, and the catalog spans every filterable value.
 // ---------------------------------------------------------------------------------------
 
+/// Whether `value` is a modality value a catalog row may publish: one `ModelModality`
+/// declares (`MODEL_MODALITY_VALUES`), or the SPOKEN turn a speech-to-speech model is
+/// published with.
+///
+/// The spoken modality is RECORDED behaviour, not modelled: this model copy declares TEXT,
+/// IMAGE and EMBEDDING and no value for a spoken turn
+/// (`smithy_query(query="shape",shape="ModelModality")`), while the catalog publishes one
+/// for a model whose conversation is carried by a stream in both directions — the same split
+/// as the capability members a summary reports, which the shape declares none of.
+fn carries_modality(value: &str) -> bool {
+    carries(MODEL_MODALITY_VALUES, value) || value == "SPEECH"
+}
+
 #[test]
 fn every_catalog_row_carries_only_values_the_model_declares() {
     let mut seen_ids: Vec<&str> = Vec::new();
@@ -484,8 +497,8 @@ fn every_catalog_row_carries_only_values_the_model_declares() {
                 && model
                     .input_modalities
                     .iter()
-                    .all(|value| carries(MODEL_MODALITY_VALUES, value)),
-            "case {case:?}: inputModalities must be non-empty ModelModality values, got {:?}",
+                    .all(|value| carries_modality(value)),
+            "case {case:?}: inputModalities must be non-empty published modality values, got {:?}",
             model.input_modalities
         );
         assert!(
@@ -493,8 +506,9 @@ fn every_catalog_row_carries_only_values_the_model_declares() {
                 && model
                     .output_modalities
                     .iter()
-                    .all(|value| carries(MODEL_MODALITY_VALUES, value)),
-            "case {case:?}: outputModalities must be non-empty ModelModality values, got {:?}",
+                    .all(|value| carries_modality(value)),
+            "case {case:?}: outputModalities must be non-empty published modality values, got \
+             {:?}",
             model.output_modalities
         );
         assert!(

@@ -26,14 +26,20 @@ pub struct ListInferenceProfilesOutput {
     pub next_token: Option<String>,
 }
 
-/// `InferenceProfileSummary`. Its schema and codec come from [`bedrock_schema_and_codec!`]
+/// `InferenceProfileSummary`, plus the `toolboxArn` member a listing reports per profile.
+/// Its schema and codec come from [`bedrock_schema_and_codec!`]
 /// rather than `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt`
 /// carry `@timestampFormat("date-time")`
 /// (`smithy_query(query="shape", shape="InferenceProfileSummary")`), which the derive does
 /// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
 ///
-/// The member list below is the model's, member for member: same shape ids, same wire
-/// names, same order, same shape types.
+/// The first nine members below are the model's, member for member: same shape ids, same
+/// wire names, same order, same shape types. `toolboxArn` is RECORDED behaviour, not
+/// modelled — the shape declares no such member, while a listing STATES one per profile,
+/// carrying the toolbox the profile is bound to or nothing at all — so it is appended LAST,
+/// keeping the model's own indices intact for a later refresh, and it is `opt_stated`:
+/// stated either way, because a profile bound to no toolbox reports that it is bound to
+/// none rather than leaving the member unserved.
 #[derive(Debug, Clone, Default)]
 pub struct InferenceProfileSummary {
     pub inference_profile_name: String,
@@ -45,6 +51,7 @@ pub struct InferenceProfileSummary {
     pub inference_profile_id: String,
     pub status: String,
     pub r#type: String,
+    pub toolbox_arn: Option<String>,
 }
 
 bedrock_schema_and_codec!(
@@ -90,5 +97,13 @@ bedrock_schema_and_codec!(
     ),
     (M_STATUS, status, "status", 7, req, string),
     (M_TYPE, r#type, "type", 8, req, string),
+    (
+        M_TOOLBOX_ARN,
+        toolbox_arn,
+        "toolboxArn",
+        9,
+        opt_stated,
+        string
+    ),
 );
 

@@ -610,7 +610,9 @@ pub(super) fn region_list(regions: &[&str]) -> String {
 /// region it routes to — the base model's copy there, and only where that copy exists —
 /// names those same regions in its description, and carries the instant a resource nobody
 /// created came into being ([`cross_region_profile_published_at`]) as both `createdAt` and
-/// `updatedAt`, because nothing has updated it since.
+/// `updatedAt`, because nothing has updated it since. None of them is bound to a toolbox:
+/// Amazon Bedrock binds no toolbox to a profile it publishes itself, so each one STATES
+/// that it is bound to none.
 #[must_use]
 pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSummary> {
     let Some(geography) = inference_profile_geography(region) else {
@@ -645,6 +647,7 @@ pub fn system_defined_inference_profiles(region: &str) -> Vec<InferenceProfileSu
                 inference_profile_id: id,
                 status: INFERENCE_PROFILE_ACTIVE.to_string(),
                 r#type: INFERENCE_PROFILE_TYPE_SYSTEM_DEFINED.to_string(),
+                toolbox_arn: None,
             })
         })
         .collect();

@@ -195,6 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             inference_profile_id: profile.inference_profile_id,
             status: profile.status,
             r#type: profile.r#type,
+            toolbox_arn: profile.toolbox_arn,
         })
     }
 }

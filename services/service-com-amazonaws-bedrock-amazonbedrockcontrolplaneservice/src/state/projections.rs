@@ -1573,6 +1573,12 @@ pub(super) fn cross_region_details_of(
 /// also the shape the published profiles are built in
 /// ([`system_defined_inference_profiles`]), so a caller-created profile and a published one
 /// are reported through ONE mapping.
+///
+/// `toolboxArn` names the toolbox the profile is bound to, and is STATED whether or not
+/// there is one: no input of this service binds a toolbox to a profile
+/// (`smithy_query(query="operation", operation="CreateInferenceProfile")` takes a name, a
+/// description, the model source and tags), so a stored profile is bound to none and
+/// reports that it is bound to none.
 #[must_use]
 pub fn inference_profile_summary(profile: &InferenceProfileRecord) -> InferenceProfileSummary {
     InferenceProfileSummary {
@@ -1585,6 +1591,7 @@ pub fn inference_profile_summary(profile: &InferenceProfileRecord) -> InferenceP
         inference_profile_id: profile.id.clone(),
         status: profile.status.to_string(),
         r#type: profile.profile_type.to_string(),
+        toolbox_arn: None,
     }
 }
 

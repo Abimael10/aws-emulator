@@ -170,20 +170,25 @@ pub fn profile_model_id(profile_arn: &str) -> String {
 ///   features reported one by one beside it (`explicitPromptCaching`,
 ///   `intelligentPromptRouting`) — is reported for EVERY offered model, because every
 ///   offered model can be invoked. What describes a CONVERSATION with the model, or a job
-///   built over one — `modelFamily`, `converse`, `batchSupported` and
-///   `latencyOptimizationSupported` — is reported for a model that TAKES PART IN A
-///   CONVERSATION (one that produces TEXT) and for no other.
+///   built over one — `modelFamily`, `batchSupported` and `latencyOptimizationSupported` —
+///   is reported for a model that ANSWERS A TURN of a conversation, spoken (SPEECH) or
+///   written (TEXT), and for no other; `converse` describes a WRITTEN conversation, so it is
+///   reported for a model whose turn is TEXT alone.
 /// * `modelFamily` is the row's family.
 /// * `inferenceAPIsSupported` is the RECORD of the invocation APIs the model is reachable
-///   through, one member per API naming the calling modes that API offers for it:
-///   `invokeModel` answers for every offered model and streams where the row streams,
-///   `converse` answers and streams for a model that produces TEXT, the two
-///   OpenAI-compatible endpoints answer for a model that provider publishes, and the two
-///   long-running modes (`asyncInvoke`, `invokeModel.bidirectionalStreaming`) answer no for
-///   every row, because no modality this model copy declares is a clip or a spoken turn.
-/// * `guardrailsSupported` holds of a model that produces TEXT — a guardrail decides about
-///   text and about nothing else, and is applied beside the invocation rather than built
-///   into the model's integration, so nothing else is needed of the model.
+///   through, one member per API naming the calling modes that API offers for it. What
+///   decides every SYNC mode is whether the answer arrives in one piece: a model that
+///   answers by SPEAKING is reached through a stream and through nothing else. So
+///   `invokeModel` answers in one piece for every model that does not speak and streams
+///   where the row streams, `converse` answers in one piece for a model whose turn is TEXT
+///   and streams a turn for any model that answers a turn at all and streams it, the two
+///   OpenAI-compatible endpoints answer for a model that provider publishes,
+///   `invokeModel.bidirectionalStreaming` answers for a model whose turn is SPEECH each
+///   way, and `asyncInvoke` answers no for every row, because no modality this model copy
+///   declares is a clip.
+/// * `guardrailsSupported` holds of a model whose turn is TEXT — a guardrail decides about
+///   written text and about nothing else, and is applied beside the invocation rather than
+///   built into the model's integration, so nothing else is needed of the model.
 /// * `featuresSupported` names each Amazon Bedrock feature the row publishes support for,
 ///   beside the three that follow from what the model IS: `countTokens`, published for the
 ///   family a token count is served for, `promptOptimization`, and `provisionedThroughput`,
@@ -208,23 +213,27 @@ pub fn expected_foundation_model_projection(
     model: &bedrock::state::FoundationModel,
     region: &str,
 ) -> Value {
-    let conversational = model.output_modalities.contains(&"TEXT");
+    // A spoken turn is carried by the stream the model is driven through rather than by the
+    // written-conversation surfaces, so a model that answers by SPEAKING takes part in a
+    // conversation without taking part in a written one.
+    let speaks = model.output_modalities.contains(&"SPEECH");
+    let conversational = model.output_modalities.contains(&"TEXT") && !speaks;
+    let answers_a_turn = conversational || speaks;
     let published = |feature: &str| model.features_supported.contains(&feature);
     let takes = |modality: &str| model.input_modalities.contains(&modality);
 
     let apis = json!({
-        // A clip is what an asynchronous invocation generates and a spoken turn is what a
-        // two-way stream carries, and `ModelModality` declares neither, so no row of this
-        // catalogue is reachable either way.
+        // A clip is what an asynchronous invocation generates, and `ModelModality` declares
+        // no such modality, so no row of this catalogue is reachable that way.
         "asyncInvoke": false,
         "converse": {
-            "streaming": conversational && model.response_streaming_supported,
+            "streaming": answers_a_turn && model.response_streaming_supported,
             "sync": conversational,
         },
         "invokeModel": {
-            "bidirectionalStreaming": false,
+            "bidirectionalStreaming": takes("SPEECH") && speaks,
             "responseStreaming": model.response_streaming_supported,
-            "sync": true,
+            "sync": !speaks,
         },
         "openAiChatCompletions": model.provider_name == "OpenAI",
         "openAiResponses": model.provider_name == "OpenAI",
@@ -280,6 +289,21 @@ pub fn expected_foundation_model_projection(
     projection["intelligentPromptRouting"] =
         json!({ "isSupported": published("INTELLIGENT_PROMPT_ROUTING") });
 
+    if !answers_a_turn {
+        return projection;
+    }
+
+    // What describes a conversation with the model, or a job built over one, is reported for
+    // a model that answers a TURN of one, spoken or written.
+    projection["modelFamily"] = json!(model.model_family);
+    projection["latencyOptimizationSupported"] = json!(published("LATENCY_OPTIMIZATION"));
+    projection["batchSupported"] = json!({
+        "baseModelSupported": published("BATCH_INFERENCE"),
+        "crossRegionSupported": published("BATCH_INFERENCE"),
+        "customModelSupported":
+            published("BATCH_INFERENCE") && !model.customizations_supported.is_empty(),
+    });
+
     if !conversational {
         return projection;
     }
@@ -319,14 +343,6 @@ pub fn expected_foundation_model_projection(
         converse["maxTokensMaximum"] = json!(ceiling);
     }
 
-    projection["modelFamily"] = json!(model.model_family);
-    projection["latencyOptimizationSupported"] = json!(published("LATENCY_OPTIMIZATION"));
-    projection["batchSupported"] = json!({
-        "baseModelSupported": published("BATCH_INFERENCE"),
-        "crossRegionSupported": published("BATCH_INFERENCE"),
-        "customModelSupported":
-            published("BATCH_INFERENCE") && !model.customizations_supported.is_empty(),
-    });
     projection["converse"] = converse;
     projection
 }

@@ -101,6 +101,10 @@ pub(super) const OUT_TEXT: &[&str] = &["TEXT"];
 pub(super) const OUT_IMAGE: &[&str] = &["IMAGE"];
 /// `ModelModality` — a model that produces an embedding vector.
 pub(super) const OUT_EMBEDDING: &[&str] = &["EMBEDDING"];
+/// `ModelModality` — a model that takes a SPOKEN turn, beside the text it is prompted with.
+pub(super) const IN_SPEECH_AND_TEXT: &[&str] = &[MODALITY_SPEECH, "TEXT"];
+/// `ModelModality` — a model that answers a SPOKEN turn, and the text that turn transcribes.
+pub(super) const OUT_SPEECH_AND_TEXT: &[&str] = &[MODALITY_SPEECH, "TEXT"];
 /// `InferenceType` — a model offered on demand only.
 pub(super) const ON_DEMAND: &[&str] = &["ON_DEMAND"];
 /// `InferenceType` — a model offered both on demand and with Provisioned Throughput.
@@ -168,6 +172,35 @@ pub(super) const fn text_model(
         model_family,
         input_modalities,
         output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        features_supported,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time,
+        legacy_window: None,
+    }
+}
+
+/// A catalog row for a model that carries a SPOKEN conversation: it takes a spoken turn
+/// beside the text it is prompted with and answers with a spoken one, which is what a
+/// speech-to-speech model is published as. The conversation runs as a stream in both
+/// directions, so the model is available on demand and no customization job accepts it.
+pub(super) const fn speech_model(
+    model_id: &'static str,
+    model_name: &'static str,
+    provider_name: &'static str,
+    model_family: &'static str,
+    features_supported: &'static [&'static str],
+    start_of_life_time: &'static str,
+) -> FoundationModel {
+    FoundationModel {
+        model_id,
+        model_name,
+        provider_name,
+        model_family,
+        input_modalities: IN_SPEECH_AND_TEXT,
+        output_modalities: OUT_SPEECH_AND_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND,
@@ -312,12 +345,11 @@ pub(super) const fn customizable(
 /// the model too.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
     // Amazon Nova — the Nova 2 generation, offered on demand.
-    text_model(
+    speech_model(
         "amazon.nova-2-5-sonic",
         "Nova 2.5 Sonic",
         "Amazon",
         "Nova 2",
-        IN_TEXT,
         CACHING_ONLY,
         "2026-03-10T00:00:00Z",
     ),
@@ -330,12 +362,11 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         BATCH_AND_CACHING,
         "2025-12-03T00:00:00Z",
     ),
-    text_model(
+    speech_model(
         "amazon.nova-2-sonic-v1:0",
         "Nova 2 Sonic",
         "Amazon",
         "Nova 2",
-        IN_TEXT,
         CACHING_ONLY,
         "2025-12-03T00:00:00Z",
     ),
@@ -1937,12 +1968,14 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 // reported for every offered model, because every offered model can be invoked: a model
 // that answers with a vector or an image is invoked through `InvokeModel` like any other,
 // and a feature no table lists it in simply answers no for it. The ones that describe a
-// CONVERSATION with the model, or a job built over one — the model's family line, the
-// Converse record, the batch record and latency-optimized inference — are published for a
-// model that TAKES PART IN A CONVERSATION and for no other, so the summary of a model that
-// answers with a vector or an image reports none of those rather than one it made up.
+// CONVERSATION with the model, or a job built over one — the model's family line, the batch
+// record and latency-optimized inference — are published for a model that ANSWERS A TURN of
+// a conversation ([`model_answers_a_turn`]), spoken or written, and for no other, so the
+// summary of a model that answers with a vector or an image reports none of those rather
+// than one it made up. The Converse record is narrower still: it describes a WRITTEN
+// conversation, so a model that answers by SPEAKING ([`model_speaks`]) carries none.
 
-/// `ModelModality` — the modality a model that takes part in a conversation produces
+/// `ModelModality` — the modality a WRITTEN turn of a conversation is made of
 /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
 pub(super) const MODALITY_TEXT: &str = "TEXT";
 
@@ -1952,10 +1985,15 @@ pub(super) const MODALITY_TEXT: &str = "TEXT";
 pub(super) const OPENAI_MODEL_PROVIDER: &str = "OpenAI";
 
 /// The modality a turn of a SPOKEN conversation carries: the one a two-way stream is made
-/// of. `ModelModality` declares no such value in this model copy
-/// (`crate::ops::types::MODEL_MODALITY_VALUES`), so the catalog carries it on no row; it is
-/// named so [`model_bidirectional_streaming_supported`] states its rule as a rule rather
-/// than as a constant answer.
+/// of, which a speech-to-speech model both takes and answers with ([`speech_model`]).
+///
+/// `ModelModality` declares TEXT, IMAGE and EMBEDDING in this model copy
+/// (`crate::ops::types::MODEL_MODALITY_VALUES`) and no value for a spoken turn, while the
+/// catalog publishes one for a model that carries a spoken conversation — RECORDED
+/// behaviour, not modelled, like the capability members of a summary — so the value is
+/// stated here and reported as published. A `byOutputModality` filter still accepts the
+/// three values the enum declares and no other, because the validating walk runs on
+/// operation INPUTS.
 pub(super) const MODALITY_SPEECH: &str = "SPEECH";
 
 /// `featuresSupported` — a model invocation job may run the model over a dataset ("Supported
@@ -1971,25 +2009,53 @@ pub(super) const FEATURE_LATENCY_OPTIMIZATION: &str = "LATENCY_OPTIMIZATION";
 /// models and Regions for prompt caching").
 pub(super) const FEATURE_PROMPT_CACHING: &str = "PROMPT_CACHING";
 
-/// Whether `model` takes part in a conversation: it produces TEXT, which is the one
-/// modality a turn of a conversation is made of.
+/// Whether `model` takes part in a WRITTEN conversation: the turn it answers with is TEXT
+/// and nothing else.
 ///
-/// The precondition of every capability that acts on what a model SAYS — Converse and
-/// guardrails — so an embedding or image model, which says nothing a further turn can be
-/// built from, has neither.
+/// The precondition of every capability that acts on a WRITTEN turn — the Converse record,
+/// guardrails and prompt optimization — so an embedding or image model, which says nothing
+/// a written turn can be built from, has none of them, and neither has a model that answers
+/// by SPEAKING ([`model_speaks`]): a spoken turn is carried by the bidirectional stream the
+/// model is driven through rather than by the written-conversation surfaces, even though the
+/// model also answers the text its speech transcribes.
 #[must_use]
 pub fn model_is_conversational(model: &FoundationModel) -> bool {
-    model.output_modalities.contains(&MODALITY_TEXT)
+    model.output_modalities.contains(&MODALITY_TEXT) && !model_speaks(model)
+}
+
+/// Whether `model` answers by SPEAKING: it produces [`MODALITY_SPEECH`], the modality a
+/// SPOKEN turn of a conversation is made of.
+///
+/// A spoken answer arrives as it is spoken rather than in one piece, so it decides the
+/// calling modes an invocation API offers for the model
+/// ([`model_inference_apis_supported`]): a spoken turn is answered through a stream and
+/// through nothing else.
+#[must_use]
+pub fn model_speaks(model: &FoundationModel) -> bool {
+    model.output_modalities.contains(&MODALITY_SPEECH)
+}
+
+/// Whether `model` answers a TURN of a conversation at all, spoken or written: it produces
+/// TEXT ([`MODALITY_TEXT`]) or SPEECH ([`MODALITY_SPEECH`]).
+///
+/// What a client CONVERSES with, as against a model whose answer is an artifact — a vector
+/// or an image — that no further turn can be built from. It is what the members describing a
+/// conversation with the model or a job built over it are reported for: the family line the
+/// model belongs to, the batch record and latency-optimized inference.
+#[must_use]
+pub fn model_answers_a_turn(model: &FoundationModel) -> bool {
+    model_is_conversational(model) || model_speaks(model)
 }
 
 /// Whether a guardrail may be applied to `model`.
 ///
-/// A guardrail evaluates the text a model is given and the text it produces, so it applies
-/// to a model that produces text and to no other: there is nothing in a vector or an image
-/// for a topic, word or contextual-grounding policy to decide about. Unlike the four
-/// features of [`PUBLISHED_FEATURE_VALUES`], this needs nothing of the model beyond that —
-/// a guardrail is applied BESIDE the invocation rather than built into the model's
-/// integration — so it is decided here rather than published per model.
+/// A guardrail evaluates the WRITTEN text a model is given and the written text it produces,
+/// so it applies to a model whose turn is that text ([`model_is_conversational`]) and to no
+/// other: there is nothing in a vector, an image or a stream of speech for a topic, word or
+/// contextual-grounding policy to decide about. Unlike the four features of
+/// [`PUBLISHED_FEATURE_VALUES`], this needs nothing of the model beyond that — a guardrail
+/// is applied BESIDE the invocation rather than built into the model's integration — so it
+/// is decided here rather than published per model.
 #[must_use]
 pub fn model_guardrails_supported(model: &FoundationModel) -> bool {
     model_is_conversational(model)
@@ -2058,28 +2124,32 @@ pub fn model_batch_supported(model: &FoundationModel) -> bool {
 /// piece (`sync`), streams an answer back (`responseStreaming`) and carries a stream in both
 /// directions (`bidirectionalStreaming`).
 ///
-/// Each mode is read off the catalog row: `invokeModel` answers for every offered model,
-/// whatever it produces, and streams its answer exactly where the row streams; `converse`
-/// carries a CONVERSATION, so it reaches a conversational model
-/// ([`model_is_conversational`]) and no other, and streams under the same condition; the two
-/// OpenAI-compatible endpoints reach a model published by that provider
-/// ([`OPENAI_MODEL_PROVIDER`]), whose own API they are the shape of; and the two
-/// long-running modes are [`model_async_invoke_supported`] and
-/// [`model_bidirectional_streaming_supported`].
+/// Each mode is read off the catalog row, and what decides every SYNC mode is whether the
+/// model's answer arrives in ONE PIECE: a model that SPEAKS its answer ([`model_speaks`])
+/// is reached through a stream and through nothing else, so its sync modes are not offered
+/// however it is called. So `invokeModel` answers in one piece for every model that does not
+/// speak, whatever else it produces, and streams its answer exactly where the row streams;
+/// `converse` answers a WRITTEN turn in one piece for a conversational model
+/// ([`model_is_conversational`]) and streams a turn for any model that takes part in a
+/// conversation at all, spoken or written, and streams it; the two OpenAI-compatible
+/// endpoints reach a model published by that provider ([`OPENAI_MODEL_PROVIDER`]), whose own
+/// API they are the shape of; and the two long-running modes are
+/// [`model_async_invoke_supported`] and [`model_bidirectional_streaming_supported`].
 #[must_use]
 pub fn model_inference_apis_supported(model: &FoundationModel) -> InferenceApisSupport {
     let conversational = model_is_conversational(model);
+    let speaks = model_speaks(model);
     let openai_published = model.provider_name == OPENAI_MODEL_PROVIDER;
     InferenceApisSupport {
         async_invoke: Some(model_async_invoke_supported(model)),
         converse: Some(ConverseApiSupport {
-            streaming: Some(conversational && model.response_streaming_supported),
+            streaming: Some((conversational || speaks) && model.response_streaming_supported),
             sync: Some(conversational),
         }),
         invoke_model: Some(InvokeModelApiSupport {
             bidirectional_streaming: Some(model_bidirectional_streaming_supported(model)),
             response_streaming: Some(model.response_streaming_supported),
-            sync: Some(true),
+            sync: Some(!speaks),
         }),
         open_ai_chat_completions: Some(openai_published),
         open_ai_responses: Some(openai_published),
@@ -2103,8 +2173,8 @@ pub fn model_async_invoke_supported(model: &FoundationModel) -> bool {
 /// `InvokeModelWithBidirectionalStream` carries the conversation as a stream each way: the
 /// caller streams what it says while the model streams what it answers. That takes a model
 /// whose input and output are both the streamed modality a spoken turn is made of
-/// ([`MODALITY_SPEECH`]), and `ModelModality` declares no such value, so no row of this
-/// catalog is reachable that way.
+/// ([`MODALITY_SPEECH`]), which is what a speech-to-speech model publishes
+/// ([`speech_model`]) and what no other row of this catalog does.
 #[must_use]
 pub fn model_bidirectional_streaming_supported(model: &FoundationModel) -> bool {
     model.input_modalities.contains(&MODALITY_SPEECH)
@@ -2162,8 +2232,8 @@ pub fn model_features_supported(model: &FoundationModel) -> FeaturesSupport {
 /// An advanced prompt optimization job rewrites a prompt TEMPLATE for the models it is told
 /// to target (`modelConfigurations` of
 /// `smithy_query(query="operation",operation="CreateAdvancedPromptOptimizationJob")`), so
-/// what it needs of a model is that a prompt is what the model is given — it takes part in
-/// a conversation — and nothing else.
+/// what it needs of a model is that a WRITTEN prompt is what the model is given and a
+/// written turn what it answers ([`model_is_conversational`]) — and nothing else.
 #[must_use]
 pub fn model_prompt_optimization_supported(model: &FoundationModel) -> bool {
     model_is_conversational(model)
@@ -2185,8 +2255,10 @@ pub fn model_count_tokens_supported(model: &FoundationModel) -> bool {
 pub(super) const COUNT_TOKENS_MODEL_PROVIDER: &str = "Anthropic";
 
 /// What the Converse API supports for `model`, or `None` for a model Converse does not
-/// reach at all ([`model_is_conversational`]) — nothing it answers is a turn of a
-/// conversation, so the catalog publishes no Converse record for it.
+/// reach at all ([`model_is_conversational`]) — nothing it answers is a WRITTEN turn of a
+/// conversation, so the catalog publishes no Converse record for it: neither for a model
+/// whose answer is a vector or an image, nor for one that answers by SPEAKING
+/// ([`model_speaks`]), whose conversation is carried by a stream in both directions.
 ///
 /// Reported beside `inferenceAPIsSupported` because Converse is the API a conversational
 /// client drives the model through, and every member of the record is something that client
@@ -2422,13 +2494,15 @@ pub(super) const MODALITY_VIDEO: &str = "VIDEO";
 /// features published for it and the two features reported one by one beside the record —
 /// are reported for EVERY offered model, because every offered model can be invoked, so a
 /// client that reads one of them always gets an answer. The ones that describe a
-/// CONVERSATION with the model or a job built over it — its family line, the Converse
-/// record, the batch record and latency-optimized inference — are reported for a model that
-/// takes part in a conversation and for no other; see the capability section above.
+/// CONVERSATION with the model or a job built over it — its family line, the batch record
+/// and latency-optimized inference — are reported for a model that answers a TURN of a
+/// conversation, spoken or written ([`model_answers_a_turn`]), and for no other, while the
+/// Converse record describes a WRITTEN conversation and so is reported for a model that
+/// answers a written turn ([`model_is_conversational`]) alone; see the capability section
+/// above.
 #[must_use]
 pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
     let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
-    let conversational = model_is_conversational(model);
     FoundationModelSummary {
         model_arn: foundation_model_arn(region, model.model_id),
         model_id: model.model_id.to_string(),
@@ -2450,7 +2524,7 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
                 .and_then(|window| published_instant(window.entered_at)),
             public_extended_access_time: None,
         }),
-        model_family: conversational.then(|| model.model_family.to_string()),
+        model_family: model_answers_a_turn(model).then(|| model.model_family.to_string()),
         inference_apis_supported: Some(model_inference_apis_supported(model)),
         features_supported: Some(model_features_supported(model)),
         guardrails_supported: Some(model_guardrails_supported(model)),
@@ -2458,9 +2532,9 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
         intelligent_prompt_routing: Some(capability_support(model_intelligent_prompt_routing(
             model,
         ))),
-        latency_optimization_supported: conversational
+        latency_optimization_supported: model_answers_a_turn(model)
             .then(|| model_latency_optimization_supported(model)),
-        batch_supported: conversational.then(|| model_batch_support(model)),
+        batch_supported: model_answers_a_turn(model).then(|| model_batch_support(model)),
         converse: model_converse_support(model),
     }
 }

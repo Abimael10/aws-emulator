@@ -17,14 +17,18 @@ pub struct GetInferenceProfileInput {
     pub inference_profile_identifier: String,
 }
 
-/// `GetInferenceProfileResponse`. Its schema and codec come from
+/// `GetInferenceProfileResponse`, plus the `toolboxArn` member a read reports beside it.
+/// Its schema and codec come from
 /// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
 /// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
 /// (`smithy_query(query="operation", operation="GetInferenceProfile")`), which the derive
 /// does not put on a member schema — see `types/date_time_wire.rs` for that whole story.
 ///
-/// The member list below is the model's, member for member: same shape ids, same wire
-/// names, same order, same shape types.
+/// The first nine members below are the model's, member for member: same shape ids, same
+/// wire names, same order, same shape types. `toolboxArn` is RECORDED behaviour, not
+/// modelled, exactly as it is on [`InferenceProfileSummary`] — a read of one profile reports
+/// what a listing carries for it, member for member — so it is appended LAST and STATED
+/// either way.
 #[derive(Debug, Clone, Default)]
 pub struct GetInferenceProfileOutput {
     pub inference_profile_name: String,
@@ -36,6 +40,7 @@ pub struct GetInferenceProfileOutput {
     pub inference_profile_id: String,
     pub status: String,
     pub r#type: String,
+    pub toolbox_arn: Option<String>,
 }
 
 bedrock_schema_and_codec!(
@@ -81,5 +86,13 @@ bedrock_schema_and_codec!(
     ),
     (M_STATUS, status, "status", 7, req, string),
     (M_TYPE, r#type, "type", 8, req, string),
+    (
+        M_TOOLBOX_ARN,
+        toolbox_arn,
+        "toolboxArn",
+        9,
+        opt_stated,
+        string
+    ),
 );
 

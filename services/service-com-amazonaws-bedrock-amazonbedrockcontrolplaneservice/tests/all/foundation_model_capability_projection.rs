@@ -433,9 +433,9 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
                 Some(model.response_streaming_supported),
                 Some(false),
             ),
-            "case {name:?}: InvokeModel reaches every offered model and streams where the row \
-             streams, and no modality this catalogue declares is carried by a two-way stream, \
-             got {apis:?}"
+            "case {name:?}: InvokeModel answers in one piece for a model that does not SPEAK \
+             its answer and streams where the row streams, and none of these rows answers a \
+             spoken turn, so none is carried by a two-way stream, got {apis:?}"
         );
         assert_eq!(
             (apis.open_ai_chat_completions, apis.open_ai_responses),

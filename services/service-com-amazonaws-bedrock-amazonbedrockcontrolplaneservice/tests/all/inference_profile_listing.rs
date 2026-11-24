@@ -276,6 +276,10 @@ fn published_in(region: &str) -> Vec<Value> {
                     .collect::<Vec<Value>>(),
                 "status": "ACTIVE",
                 "type": TYPE_SYSTEM_DEFINED,
+                // Amazon Bedrock binds no toolbox to a profile it publishes itself, and the
+                // member is STATED either way, so a published profile reports it as null
+                // rather than leaving it unserved.
+                "toolboxArn": Value::Null,
             }))
         })
         .collect();
@@ -707,6 +711,64 @@ async fn the_published_cross_region_profiles_of_the_region_are_listed() {
             right.get("inferenceProfileArn"),
             "case \"two regions of one geography\": the ARN carries the region it was listed \
              in, got {left:?}"
+        );
+    }
+}
+
+/// Every profile a listing reports STATES the toolbox it is bound to, whichever of the two
+/// types it is and whichever of the two operations reports it: `toolboxArn` carries the
+/// toolbox, or JSON `null` for a profile bound to none, which is every profile this service
+/// serves — no input binds one, and Amazon Bedrock binds none to a profile it publishes
+/// itself. RECORDED behaviour: the shape declares no such member
+/// (`smithy_query(query="shape",shape="InferenceProfileSummary")`), while a listing reports
+/// one per summary.
+#[tokio::test]
+async fn every_profile_states_the_toolbox_it_is_bound_to() {
+    let emu = emulator();
+    // The rows differ along what the rule generalises over: the profile's type, and whether
+    // it was created by a caller or published by Amazon Bedrock.
+    let created = given_profile_in(
+        &emu,
+        REGION,
+        "toolbox-stated",
+        &foundation_model_source(REGION, CATALOG_MODEL),
+    )
+    .await;
+
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    for (case, query) in [
+        ("a profile a caller created", application_only()),
+        (
+            "a profile Amazon Bedrock publishes",
+            format!("type={TYPE_SYSTEM_DEFINED}"),
+        ),
+    ] {
+        let listing = list(&emu, &query).await;
+        let reported = summaries(case, &listing);
+        assert!(
+            !reported.is_empty(),
+            "case {case:?}: the listing must report at least one profile of this type, got {:?}",
+            listing.body
+        );
+        for summary in reported {
+            rows.push((case.to_string(), summary));
+        }
+    }
+    // And the read of one profile reports the member the listing carries for it.
+    let read = get(&emu, &created).await;
+    rows.push(("the read of a created profile".to_string(), read.body.clone()));
+
+    for (case, profile) in rows {
+        let id = profile
+            .get("inferenceProfileId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            profile.get("toolboxArn"),
+            Some(&Value::Null),
+            "case {case:?} ({id}): toolboxArn is stated for every profile, as null for one \
+             bound to no toolbox, got {profile:?}"
         );
     }
 }
