@@ -71,6 +71,11 @@ mod identifier_and_template_gates;
 #[path = "notify_code_configuration_lifecycle/refusal_bodies.rs"]
 mod refusal_bodies;
 
+// The FORM of the identifier this service mints for a configuration, off the same
+// harness and declared the same way.
+#[path = "notify_code_configuration_lifecycle/minted_identifier.rs"]
+mod minted_identifier;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 

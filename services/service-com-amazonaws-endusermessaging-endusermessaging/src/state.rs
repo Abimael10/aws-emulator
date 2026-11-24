@@ -62,6 +62,39 @@ const BRAND_PROFILE_ID_BODY_LENGTH: usize = 17;
 /// ARN, as `NotifyCodeConfigurationIdOrArn` documents it.
 const NOTIFY_CODE_CONFIGURATION_RESOURCE: &str = "notify-code-configuration";
 
+/// The characters a minted identifier's body is drawn from: the lowercase
+/// hexadecimal digits, which every id shape of this service admits
+/// (`^[A-Za-z0-9_-]+$`, `^[A-Za-z0-9_:/-]+$`).
+const MINTED_ID_DIGITS: &[u8] = b"0123456789abcdef";
+
+/// How many characters follow the prefix and hyphen of a minted identifier: the width
+/// this API's own examples write a bare identifier at — `bp-abc12345678901234`
+/// (`BrandProfileIdOrArn`), `job-abc12345678901234` and `ncc-abc12345678901234` (the
+/// `CreateRegistrationsFromBrandProfile` and `CreateNotifyCodeConfiguration`
+/// examples) — which is [`BRAND_PROFILE_ID_BODY_LENGTH`] for every one of them.
+pub(crate) const MINTED_ID_BODY_LENGTH: usize = BRAND_PROFILE_ID_BODY_LENGTH;
+
+/// A freshly minted identifier for a resource addressed with `prefix`: that prefix, a
+/// hyphen, and [`MINTED_ID_BODY_LENGTH`] characters each drawn uniformly at random.
+///
+/// Every identifier this service generates is minted here, so one rule covers them
+/// all: a system-generated identifier is an OPAQUE token drawn from fresh entropy,
+/// never a value a caller can predict from another identifier it has seen or from the
+/// order the resources were created in. Reached from this module's children too,
+/// which mint the ids of the resources they own.
+///
+/// Whether the candidate is free is the caller's question, since it is the caller that
+/// knows which map the id goes in.
+pub(crate) fn minted_id(prefix: &str) -> String {
+    use ::rand::Rng as _;
+
+    let mut generator = ::rand::rng();
+    let body: String = (0..MINTED_ID_BODY_LENGTH)
+        .map(|_| char::from(MINTED_ID_DIGITS[generator.random_range(0..MINTED_ID_DIGITS.len())]))
+        .collect();
+    format!("{prefix}-{body}")
+}
+
 /// A persisted brand profile: everything the brand-profile operations report.
 #[derive(Debug, Clone)]
 pub struct BrandProfile {
@@ -178,9 +211,7 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// order. Bounded by [`MAX_NOTIFY_CODE_CONFIGURATIONS`].
     pub notify_code_configurations: BTreeMap<String, NotifyCodeConfigurationRecord>,
     /// Every asynchronous job, keyed by `jobId`. A `BTreeMap` so `ListJobs` pages in
-    /// a stable, resumable order — and, since a minted id counts up within one state,
-    /// that order is also the order the jobs were started in. Bounded by
-    /// [`MAX_JOBS`].
+    /// a stable, resumable order. Bounded by [`MAX_JOBS`].
     pub jobs: BTreeMap<String, Job>,
     /// Every one-time passcode verification in flight, keyed by
     /// `verificationId`. A `BTreeMap` so a scan over the verifications of one
@@ -195,23 +226,21 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// The order [`Self::create_tokens`] was written in, so the cap evicts the
     /// oldest token rather than an arbitrary one.
     create_token_order: VecDeque<String>,
-    /// Per-state random-ish prefix for minted ids, set on the first mint.
-    id_seed: u64,
-    /// Monotonic counter making each minted id unique within this state.
-    next_id: u64,
 }
 
 impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// Mint a fresh, unused `brandProfileId`.
     ///
-    /// The shape is the one `BrandProfileIdOrArn` documents — a `bp-` prefix
-    /// followed by 17 lowercase alphanumerics — and it satisfies that shape's
-    /// `^[A-Za-z0-9_:/-]+$` pattern. The clock-derived seed keeps ids from
-    /// different runs apart; the counter keeps ids within one run unique, and
-    /// the loop re-draws rather than ever handing back an id already in use.
+    /// The form is the one `BrandProfileIdOrArn` documents — a `bp-` prefix
+    /// followed by a body of [`MINTED_ID_BODY_LENGTH`] characters of the lowercase
+    /// alphanumeric class that shape's example is written in
+    /// (`bp-abc12345678901234`), which [`MINTED_ID_DIGITS`] draws from — and it
+    /// satisfies that shape's `^[A-Za-z0-9_:/-]+$` pattern. The body is drawn from
+    /// fresh entropy ([`minted_id`]), and the loop re-draws rather than ever handing
+    /// back an id already in use.
     pub fn mint_brand_profile_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id(BRAND_PROFILE_ID_PREFIX);
+            let id = minted_id(BRAND_PROFILE_ID_PREFIX);
             if !self.brand_profiles.contains_key(&id) {
                 return id;
             }
@@ -220,37 +249,20 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
 
     /// Mint a fresh, unused `notifyCodeConfigurationId`.
     ///
-    /// `NotifyCodeConfigurationIdOrArn` documents the identifier as an opaque token
-    /// of no particular length or format, so it takes the same minted shape as every
-    /// other id this state hands out — a resource prefix plus clock-seeded and
-    /// counted hex digits — which satisfies `NotifyCodeConfigurationId`'s
-    /// `@length(1..64)` and `^[A-Za-z0-9_-]+$` pattern. The loop re-draws rather than
-    /// ever handing back an id already in use.
+    /// `NotifyCodeConfigurationId` documents the identifier as an opaque token whose
+    /// length and format a client must not assume, and the model's own example writes
+    /// one as `ncc-abc12345678901234`: the prefix of this resource
+    /// ([`NOTIFY_CODE_CONFIGURATION_ID_PREFIX`]) plus a body of
+    /// [`MINTED_ID_BODY_LENGTH`] characters drawn from fresh entropy ([`minted_id`]),
+    /// which satisfies that shape's `@length(1..64)` and `^[A-Za-z0-9_-]+$` pattern.
+    /// The loop re-draws rather than ever handing back an id already in use.
     pub fn mint_notify_code_configuration_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id(NOTIFY_CODE_CONFIGURATION_ID_PREFIX);
+            let id = minted_id(NOTIFY_CODE_CONFIGURATION_ID_PREFIX);
             if !self.notify_code_configurations.contains_key(&id) {
                 return id;
             }
         }
-    }
-
-    /// The next candidate id for a resource addressed with `prefix`.
-    ///
-    /// The clock-derived seed keeps ids from different runs apart; the counter keeps
-    /// ids within one run unique. Whether the candidate is free is the caller's
-    /// question, since it is the caller that knows which map the id goes in.
-    fn next_candidate_id(&mut self, prefix: &str) -> String {
-        if self.id_seed == 0 {
-            // 36 bits of the current nanosecond clock -> 9 hex digits.
-            self.id_seed = (nanos_since_epoch() as u64) & 0x0000_000F_FFFF_FFFF;
-        }
-        self.next_id = self.next_id.wrapping_add(1);
-        format!(
-            "{prefix}-{:09x}{:08x}",
-            self.id_seed,
-            self.next_id & 0xFFFF_FFFF
-        )
     }
 
     /// Record `token` as having minted `brand_profile_id` from `request`, evicting the
@@ -710,13 +722,6 @@ pub fn decode_page_token(marker: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let resume_after = decoded.strip_prefix(marker)?;
     (!resume_after.is_empty()).then(|| resume_after.to_string())
-}
-
-fn nanos_since_epoch() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

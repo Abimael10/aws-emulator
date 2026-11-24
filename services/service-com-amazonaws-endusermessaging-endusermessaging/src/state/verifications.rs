@@ -271,13 +271,14 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// Mint a fresh, unused `verificationId`.
     ///
     /// `VerificationId` documents an opaque service-generated token, so it takes
-    /// the same shape as every other id this state hands out — a resource prefix
-    /// plus clock-seeded and counted hex digits — which satisfies that shape's
-    /// `@length(1..64)` and `^[A-Za-z0-9_:/-]+$` pattern. The loop re-draws rather
-    /// than ever handing back an id already in use.
+    /// the form every id this state hands out takes — a resource prefix plus a body
+    /// of [`super::MINTED_ID_BODY_LENGTH`] characters drawn from fresh entropy
+    /// ([`super::minted_id`]) — which satisfies that shape's `@length(1..64)` and
+    /// `^[A-Za-z0-9_:/-]+$` pattern. The loop re-draws rather than ever handing back
+    /// an id already in use.
     pub fn mint_verification_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id("ver");
+            let id = super::minted_id("ver");
             if !self.verifications.contains_key(&id) {
                 return id;
             }
@@ -286,12 +287,14 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
 
     /// Mint a `messageId` for the message that delivers a passcode.
     ///
-    /// Unique within this state for the same reason every other minted id is: the
-    /// counter advances on every mint. `MessageId` documents an opaque
-    /// service-generated token and this shape satisfies its `@length(1..256)` and
-    /// `^[A-Za-z0-9_:/-]+$` pattern.
-    pub fn mint_message_id(&mut self) -> String {
-        self.next_candidate_id("msg")
+    /// Drawn from fresh entropy like every other minted id, so two messages never
+    /// share one. `MessageId` documents an opaque service-generated token and this
+    /// form satisfies its `@length(1..256)` and `^[A-Za-z0-9_:/-]+$` pattern. No map
+    /// is keyed by it — a message is not a resource this service holds — so, unlike
+    /// the ids above, this one asks the store nothing and only borrows it to stay
+    /// beside the mints it belongs with.
+    pub fn mint_message_id(&self) -> String {
+        super::minted_id("msg")
     }
 
     /// Drop every verification whose validity period has elapsed by `now`.

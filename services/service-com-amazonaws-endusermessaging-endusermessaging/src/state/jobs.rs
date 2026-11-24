@@ -197,14 +197,15 @@ impl Job {
 impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// Mint a fresh, unused `jobId`.
     ///
-    /// `JobId` documents an opaque service-generated identifier, so it takes the same
-    /// shape as every other id this state hands out — a resource prefix plus
-    /// clock-seeded and counted hex digits — which satisfies that shape's
-    /// `@length(1..64)` and `^[A-Za-z0-9_-]+$` pattern. The loop re-draws rather than
-    /// ever handing back an id already in use.
+    /// `JobId` documents an opaque service-generated identifier, and the model's own
+    /// example writes one as a `job-` prefix followed by a body of
+    /// [`super::MINTED_ID_BODY_LENGTH`] alphanumerics (`job-abc12345678901234`); the
+    /// body is drawn from fresh entropy ([`super::minted_id`]) and satisfies that
+    /// shape's `@length(1..64)` and `^[A-Za-z0-9_-]+$` pattern. The loop re-draws
+    /// rather than ever handing back an id already in use.
     pub fn mint_job_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id("job");
+            let id = super::minted_id("job");
             if !self.jobs.contains_key(&id) {
                 return id;
             }
