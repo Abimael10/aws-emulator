@@ -21,15 +21,19 @@
 //!   is. Once the stage chain the create owed has run out, the same call is no longer
 //!   refused that way, so the branch follows stored state.
 //! * a value outside an enumerated type's value set is refused with the boundary's
-//!   `ValidationException`, whose remediation hint lists that enum's admissible WIRE
-//!   VALUES in the order this service lists them — descending — and not in the order the
-//!   model declares them. Every other constraint class keeps the boundary's own wording.
+//!   `ValidationException`, whose remediation hint lists that type's admissible WIRE
+//!   VALUES as the SERVICE lists them and not as the model declares them: the values the
+//!   service publishes for the type — `DirectoryEdition`'s hybrid edition is published under
+//!   a name the shipped model does not carry — in the order the front door's own table is
+//!   walked, whatever value the request was refused for. Every other constraint class keeps
+//!   the boundary's own wording.
 
 use serde_json::{json, Value};
 
 use crate::certificates::certificate_pem;
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, service, PASSWORD, PAST_ONE_SPAN,
+    call, create_directory, describe_one, descriptions, minimal_create, ok, service, PASSWORD,
+    PAST_ONE_SPAN,
 };
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -238,6 +242,14 @@ fn one_enum_error(submitted: &str, member: &str, stated: &str) -> String {
     )
 }
 
+/// A well-formed `CreateMicrosoftAD` body carrying `edition`, so the only constraint the
+/// request breaks is the one on that member.
+fn microsoft_ad_with_edition(edition: &str) -> Value {
+    let mut body = minimal_microsoft_ad("edition.corp.example.com");
+    body["Edition"] = json!(edition);
+    body
+}
+
 /// The enum table. Every row names a different enum of this service's model, and the
 /// `stated` list is that enum's wire values as a refusal lists them; the DECLARED order
 /// in each comment is the model's own
@@ -245,6 +257,17 @@ fn one_enum_error(submitted: &str, member: &str, stated: &str) -> String {
 /// follow.
 fn enum_rows() -> Vec<EnumCase> {
     vec![
+        // DirectoryEdition, declared [Enterprise, Standard, Hybrid]: the one type this
+        // service publishes a value set of its OWN for, the hybrid edition carrying the
+        // name the service publishes rather than the one the shipped model declares.
+        EnumCase {
+            case: "DirectoryEdition on CreateMicrosoftAD",
+            operation: "CreateMicrosoftAD",
+            body: microsoft_ad_with_edition("standard"),
+            member: "edition",
+            submitted: "standard",
+            stated: STATED_DIRECTORY_EDITION_SET,
+        },
         // ClientAuthenticationType, declared [SmartCard, SmartCardOrPassword].
         EnumCase {
             case: "ClientAuthenticationType on DescribeClientAuthenticationSettings",
@@ -295,7 +318,9 @@ fn enum_rows() -> Vec<EnumCase> {
             submitted: "Medium",
             stated: "Small, Large",
         },
-        // TrustDirection, declared [One-Way: Outgoing, One-Way: Incoming, Two-Way].
+        // TrustDirection, declared [One-Way: Outgoing, One-Way: Incoming, Two-Way]: the one
+        // enum of this table whose two one-way values swap places under the table order the
+        // front door walks, which is neither the declaration order nor a sort of it.
         EnumCase {
             case: "TrustDirection on CreateTrust",
             operation: "CreateTrust",
@@ -307,7 +332,7 @@ fn enum_rows() -> Vec<EnumCase> {
             }),
             member: "trustDirection",
             submitted: "TwoWay",
-            stated: "Two-Way, One-Way: Outgoing, One-Way: Incoming",
+            stated: "Two-Way, One-Way: Incoming, One-Way: Outgoing",
         },
         // ShareMethod, declared [ORGANIZATIONS, HANDSHAKE].
         EnumCase {
@@ -323,7 +348,9 @@ fn enum_rows() -> Vec<EnumCase> {
             stated: "ORGANIZATIONS, HANDSHAKE",
         },
         // RadiusAuthenticationProtocol, declared [PAP, CHAP, MS-CHAPv1, MS-CHAPv2], on a
-        // member nested inside a structure, so the clause names the dotted path.
+        // member nested inside a structure, so the clause names the dotted path. Its four
+        // values happen to land in ascending bucket order under the table the front door
+        // walks.
         EnumCase {
             case: "RadiusAuthenticationProtocol on EnableRadius",
             operation: "EnableRadius",
@@ -333,7 +360,7 @@ fn enum_rows() -> Vec<EnumCase> {
             }),
             member: "radiusSettings.authenticationProtocol",
             submitted: "MSCHAPV2",
-            stated: "PAP, MS-CHAPv2, MS-CHAPv1, CHAP",
+            stated: "CHAP, MS-CHAPv1, MS-CHAPv2, PAP",
         },
         // CertificateType, declared [ClientCertAuth, ClientLDAPS].
         EnumCase {
@@ -350,6 +377,13 @@ fn enum_rows() -> Vec<EnumCase> {
         },
     ]
 }
+
+/// `DirectoryEdition`'s admissible values as a refusal of this service LISTS them: the set
+/// the service publishes, whose hybrid edition is spelled `EnterpriseHybrid` where the
+/// shipped model spells it `Hybrid` (`smithy_query(query="shape",
+/// shape="DirectoryEdition")` declares `Enterprise`, `Standard`, `Hybrid`), listed in the
+/// order the front door's table is walked rather than the model's declaration order.
+const STATED_DIRECTORY_EDITION_SET: &str = "Enterprise, EnterpriseHybrid, Standard";
 
 #[tokio::test]
 async fn an_enum_value_set_is_listed_in_the_order_this_service_lists_it() {
@@ -378,6 +412,78 @@ async fn an_enum_value_set_is_listed_in_the_order_this_service_lists_it() {
             parsed["Message"].is_null() && parsed["RequestId"].is_null(),
             "case {case:?}: expected no modelled error members on the boundary envelope, \
              got {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_value_set_is_the_target_shapes_own_whatever_value_was_refused() {
+    let router = service();
+
+    // The REJECTED value varies — in case, in spelling, in length and in whether any
+    // edition is named anything like it — and the value set the clause lists is a fact
+    // about the member's target SHAPE, so every row reads the same list.
+    let rejected = [
+        ("the recorded lower-cased edition", "standard"),
+        ("an upper-cased edition", "ENTERPRISE"),
+        ("a value no edition is spelled like", "Premium"),
+        ("the empty value", ""),
+        ("a hyphenated hybrid spelling", "enterprise-hybrid"),
+    ];
+
+    for (case, edition) in rejected {
+        let (status, parsed) = call(
+            &router,
+            "CreateMicrosoftAD",
+            microsoft_ad_with_edition(edition),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {parsed}"
+        );
+        assert_eq!(
+            parsed["__type"],
+            json!("ValidationException"),
+            "case {case:?}: expected the boundary validation envelope, got {parsed}"
+        );
+        assert_eq!(
+            message(&parsed, case),
+            one_enum_error(edition, "edition", STATED_DIRECTORY_EDITION_SET),
+            "case {case:?}: expected the value set this service publishes for the shape, got \
+             {parsed}"
+        );
+    }
+
+    // The boundary refused each of them before anything was minted, so the store holds no
+    // directory at all.
+    let after = ok(
+        &router,
+        "DescribeDirectories",
+        json!({}),
+        "the store after the refusals",
+    )
+    .await;
+    let stored = descriptions(&after, "the store after the refusals");
+    assert!(
+        stored.is_empty(),
+        "case \"the store after the refusals\": expected no directory, got {stored:?}"
+    );
+
+    // What the clause LISTS is only the remediation hint: which values the member admits
+    // is still the model's value set, so a value inside it is accepted and read back.
+    for (case, edition) in [
+        ("the standard edition", "Standard"),
+        ("the enterprise edition", "Enterprise"),
+    ] {
+        let mut body = minimal_microsoft_ad(&format!("{}.corp.example.com", edition.to_lowercase()));
+        body["Edition"] = json!(edition);
+        let directory_id = create_microsoft_ad(&router, body, case).await;
+        let described = describe_one(&router, &directory_id, case).await;
+        assert_eq!(
+            described["Edition"],
+            json!(edition),
+            "case {case:?}: expected the edition the request named, got {described}"
         );
     }
 }

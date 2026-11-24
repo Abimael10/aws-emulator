@@ -50,7 +50,7 @@
 //!
 //! A second seam is taken for the three things this service words differently from the
 //! framework when it refuses a request at its boundary: see the `override_refusal` body
-//! below, [`stated_enum_values`] (the order an enum's admissible values are listed in),
+//! below, [`stated_enum_values`] (the value set an enum clause lists, and its order),
 //! [`published_patterns`] (the expression a clause quotes for a member whose published
 //! expression is not the model's own text, per shape) and [`stated_clause_order`] (the order the
 //! clauses of one refusal are stated in). A
@@ -69,6 +69,7 @@ pub mod authorization;
 pub mod list_element_refusals;
 pub mod model_pattern_refusals;
 pub mod published_patterns;
+pub mod published_value_sets;
 pub mod request_id_header;
 pub mod stated_clause_order;
 pub mod stated_element_sets;
@@ -88,30 +89,26 @@ use std::sync::Arc;
 /// `vendor/smithy-server-runtime/src/pre_dispatch.rs` picks it for `ProtocolError::Invalid`).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// An enum's admissible wire values as a refusal of this service LISTS them: in
-/// DESCENDING order of the values themselves, which is not the model's declaration order
-/// and not ascending order either.
+/// An enum's admissible wire values as a refusal of this service LISTS them: the value set
+/// the SERVICE publishes for the member's target type, in the order the front door lists a
+/// set in.
 ///
 /// A validation clause states the value set as the remediation hint a caller is shown
-/// (`Member must satisfy enum value set: [<values>]`), and the order is the service's
-/// rather than the model's: the two recorded ds refusals whose enums have more than one
-/// value both list them highest-first — `ClientAuthenticationType`, declared
-/// `[SmartCard, SmartCardOrPassword]`, is stated as `[SmartCardOrPassword, SmartCard]`,
-/// and `UpdateType`, declared `[OS, NETWORK, SIZE]`, as `[SIZE, OS, NETWORK]`. The order
-/// is computed from the values, so it holds for every enum this service declares rather
-/// than for the two a recording happens to cover.
+/// (`Member must satisfy enum value set: [<values>]`), and both halves of that list are the
+/// service's rather than the model's — which values it holds and how each is spelled, and the
+/// order they are listed in. Both are [`published_value_sets`]', which reads them off the
+/// values themselves and off this service's own published sets, so they belong to the
+/// enumerated TYPE and not to a member, an operation or a depth: one type is listed alike
+/// wherever it is carried, and a type the model gains needs a row nowhere.
 fn stated_enum_values(allowed: &[String]) -> Vec<String> {
-    let mut values = allowed.to_vec();
-    values.sort_unstable();
-    values.reverse();
-    values
+    published_value_sets::published_value_set(allowed)
 }
 
 /// `refusal` stated the way this service states a boundary constraint refusal, or `None`
 /// to keep the framework's own wording.
 ///
 /// The only things restated are the three renderings this service's own refusals differ from
-/// the framework's in — the order of an enum's value list ([`stated_enum_values`]), the
+/// the framework's in — the value set an enum clause lists ([`stated_enum_values`]), the
 /// expression a `@pattern` clause quotes ([`published_patterns`]) and the order
 /// the clauses of one refusal are stated in ([`stated_clause_order`]); the envelope, the
 /// clause, the member path, the echoed value and every other requirement are the framework's,
@@ -142,8 +139,9 @@ fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
     })
 }
 
-/// `violation` as this service STATES it: an enum's admissible values LISTED the way this
-/// service lists them ([`stated_enum_values`]), with everything else — its member path, its
+/// `violation` as this service STATES it: an enum's admissible values LISTED as the value set
+/// this service publishes for the member's target type ([`stated_enum_values`]), with
+/// everything else — its member path, its
 /// echoed value, a `@pattern` expression, its sensitivity and every other constraint class —
 /// exactly as the framework found it.
 ///
@@ -246,8 +244,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // THREE renderings are reworded, inside the framework's own envelope, clause, member
         // path and echoed value: a value outside an enumerated type's value set has the
-        // admissible values LISTED the way this service lists them rather than the way the
-        // model declares them (see `stated_enum_values`), a clause about a value outside its
+        // admissible values LISTED as the value set this service publishes for that type,
+        // in the order its front door lists a set in (see `stated_enum_values`), a clause
+        // about a value outside its
         // member's `@pattern` quotes the expression this service PUBLISHES for that shape
         // (see `published_patterns`), and a refusal about several members
         // states its clauses in the order this service states them in (see
