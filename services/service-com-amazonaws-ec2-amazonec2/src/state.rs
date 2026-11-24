@@ -3218,6 +3218,18 @@ mod parameter_bounds;
 /// report names its nodes. Everything it declares is re-exported below, so a handler reaches
 /// it as `crate::state::topology_network_nodes` like any other primitive of this module.
 mod topology_network_nodes;
+/// What ONE flow log RECORD is: the fields it may carry, the `LogFormat` that lays them out
+/// and the line a published record is written as. Everything it declares is re-exported
+/// below, so a handler reaches it as `crate::state::DEFAULT_FLOW_LOG_FORMAT` like any other
+/// primitive of this module.
+mod flow_log_records;
+/// The DELIVERY of those records: the interfaces a flow log's scope contains, the window the
+/// clock closes, and the write into the CloudWatch Logs group the flow log names. Everything
+/// it declares is re-exported below, so a handler reaches it as
+/// `crate::state::drive_flow_log_delivery` like any other primitive of this module.
+mod flow_log_delivery;
+pub use flow_log_delivery::*;
+pub use flow_log_records::*;
 pub use bundle_tasks::*;
 pub use retired_api_actions::*;
 pub use parameter_bounds::*;
@@ -4106,178 +4118,6 @@ impl ComAmazonawsEc2Amazonec2State {
 // the error codes a refusal carries — so `CreateFlowLogs`, `DescribeFlowLogs` and
 // `DeleteFlowLogs` cannot answer differently about the same flow log. Each operation's
 // own validation stays in its `src/ops/<operation>.rs` file.
-
-/// The record format a flow log created without a `LogFormat` gets: "If you omit this
-/// parameter, the flow log is created using the default format"
-/// (`CreateFlowLogsRequest$LogFormat`), which is the default set of fields AWS documents
-/// for a flow log record, in the order it documents them (Amazon VPC User Guide, "Flow log
-/// records" — the default format's field list).
-///
-/// A CONCRETE value rather than an absent member, because a client reads `LogFormat` to
-/// learn the layout of the records it is about to parse.
-pub const DEFAULT_FLOW_LOG_FORMAT: &str = "${version} ${account-id} ${interface-id} \
-                                           ${srcaddr} ${dstaddr} ${srcport} ${dstport} \
-                                           ${protocol} ${packets} ${bytes} ${start} \
-                                           ${end} ${action} ${log-status}";
-
-/// The field ids a flow log record may name — the vocabulary a `LogFormat` draws its
-/// `${field-id}` tokens from.
-///
-/// "For more information about the available fields, see Flow log records in the Amazon VPC
-/// User Guide or Transit Gateway Flow Log records in the Amazon Web Services Transit Gateway
-/// Guide" (`CreateFlowLogsRequest$LogFormat`): the vocabulary is published PROSE, not a
-/// model shape — the member is a plain `String` — so it is written out here, as the union of
-/// the two published tables. The first block is the Amazon VPC User Guide's available
-/// fields, in the order it lists them (the first fourteen are also the default format,
-/// [`DEFAULT_FLOW_LOG_FORMAT`]); the second is the fields only a transit gateway record has,
-/// from the Transit Gateway Guide's table.
-///
-/// One catalog for both, because `LogFormat` is validated the same way whatever resource
-/// type the create monitors.
-pub const FLOW_LOG_RECORD_FIELDS: [&str; 58] = [
-    // Amazon VPC User Guide, "Flow log records" — available fields.
-    "version",
-    "account-id",
-    "interface-id",
-    "srcaddr",
-    "dstaddr",
-    "srcport",
-    "dstport",
-    "protocol",
-    "packets",
-    "bytes",
-    "start",
-    "end",
-    "action",
-    "log-status",
-    "vpc-id",
-    "subnet-id",
-    "instance-id",
-    "tcp-flags",
-    "type",
-    "pkt-srcaddr",
-    "pkt-dstaddr",
-    "region",
-    "az-id",
-    "sublocation-type",
-    "sublocation-id",
-    "pkt-src-aws-service",
-    "pkt-dst-aws-service",
-    "flow-direction",
-    "traffic-path",
-    "ecs-cluster-arn",
-    "ecs-cluster-name",
-    "ecs-container-instance-arn",
-    "ecs-container-instance-id",
-    "ecs-container-id",
-    "ecs-second-container-id",
-    "ecs-service-name",
-    "ecs-task-definition-arn",
-    "ecs-task-arn",
-    "ecs-task-id",
-    "reject-reason",
-    // Amazon Web Services Transit Gateway Guide, "Flow log records" — the fields a transit
-    // gateway record adds.
-    "resource-type",
-    "tgw-id",
-    "tgw-attachment-id",
-    "tgw-src-vpc-account-id",
-    "tgw-dst-vpc-account-id",
-    "tgw-src-vpc-id",
-    "tgw-dst-vpc-id",
-    "tgw-src-subnet-id",
-    "tgw-dst-subnet-id",
-    "tgw-src-eni",
-    "tgw-dst-eni",
-    "tgw-src-az-id",
-    "tgw-dst-az-id",
-    "tgw-pair-details",
-    "packets-lost-no-route",
-    "packets-lost-blackhole",
-    "packets-lost-mtu-exceeded",
-    "packets-lost-ttl-expired",
-];
-
-/// What separates a field id from the tag key it reads, in a record field that reports a tag
-/// of the monitored resource ("The tag configuration associated with the Flow Logs Amazon
-/// EC2 Tags feature fields in your custom log format" —
-/// `CreateFlowLogsRequest$TagFieldSpecifications`).
-///
-/// A tag field's token ends in a tag KEY the caller chose, so no published table can
-/// enumerate those tokens and [`FLOW_LOG_RECORD_FIELDS`] does not try: a token carrying this
-/// separator names a tag rather than a field of the record, and is read as one.
-const FLOW_LOG_TAG_FIELD_SEPARATOR: char = ':';
-
-/// The `${field-id}` tokens of `log_format`, in the order the format names them.
-///
-/// "Specify the fields using the `${field-id}` format, separated by spaces"
-/// (`CreateFlowLogsRequest$LogFormat`): a token is what one `${` and the next `}` enclose,
-/// and the text between two tokens is separator rather than a field. An unterminated `${`
-/// opens no token, so nothing after it is read as one.
-pub fn flow_log_format_fields(log_format: &str) -> Vec<&str> {
-    let mut fields: Vec<&str> = Vec::new();
-    let mut rest = log_format;
-    while let Some((_, opened)) = rest.split_once("${") {
-        let Some((field, tail)) = opened.split_once('}') else {
-            break;
-        };
-        fields.push(field);
-        rest = tail;
-    }
-    fields
-}
-
-/// The `${field-id}` tokens of `log_format` that name no field a flow log record has, each
-/// listed once and in the order the format names them.
-///
-/// A token is recognised when it names an entry of [`FLOW_LOG_RECORD_FIELDS`], or when it
-/// reads a tag of the monitored resource ([`FLOW_LOG_TAG_FIELD_SEPARATOR`], whose tag key is
-/// the caller's and so is not in any published table). Every other token names a field that
-/// does not exist, and the create that carries it is refused with
-/// [`unknown_flow_log_fields`].
-pub fn unknown_flow_log_format_fields(log_format: &str) -> Vec<&str> {
-    let mut unknown: Vec<&str> = Vec::new();
-    for field in flow_log_format_fields(log_format) {
-        let recognised = FLOW_LOG_RECORD_FIELDS.contains(&field)
-            || field.contains(FLOW_LOG_TAG_FIELD_SEPARATOR);
-        if !recognised && !unknown.contains(&field) {
-            unknown.push(field);
-        }
-    }
-    unknown
-}
-
-/// Refuse a `CreateFlowLogs` whose `LogFormat` names fields a flow log record does not have:
-/// HTTP 400 [`INVALID_PARAMETER`].
-///
-/// The format is a layout of PUBLISHED fields — "For more information about the available
-/// fields, see Flow log records" (`CreateFlowLogsRequest$LogFormat`) — so a token outside
-/// that vocabulary names nothing the service could write, and the whole call is refused
-/// before any flow log is stored rather than one being created that could never deliver the
-/// records it promises.
-///
-/// The message names every unrecognised token, each quoted and spelled as the request
-/// spelled it, in SORTED order rather than the order the format named them — the order a
-/// recorded refusal of this class pins, and the one that makes the sentence a function of
-/// the SET of unrecognised tokens: two formats naming the same fields in different orders
-/// are refused the same way. `unknown` is never empty, because a format whose every token is
-/// a field is not refused at all.
-pub fn unknown_flow_log_fields<E>(unknown: &[&str]) -> Scaffolded<E> {
-    let mut sorted: Vec<&str> = unknown.to_vec();
-    sorted.sort_unstable();
-    Scaffolded::service_error(
-        INVALID_PARAMETER,
-        400,
-        format!(
-            "Unknown fields provided: {fields}",
-            fields = sorted
-                .iter()
-                .map(|field| format!("'{field}'"))
-                .collect::<Vec<String>>()
-                .join(", "),
-        ),
-    )
-}
 
 /// The status a stored flow log reports: "The status of the flow log (`ACTIVE`)"
 /// (`FlowLog$FlowLogStatus`) — the one value the member documents, and the status AWS

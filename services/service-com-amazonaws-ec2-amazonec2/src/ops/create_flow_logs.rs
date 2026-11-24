@@ -692,6 +692,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A flow log that is ACTIVE is CAPTURING: "Flow log data for a monitored network
+        // interface is recorded as flow log records" (`CreateFlowLogs`), and those records are
+        // published as each aggregation window closes, with no further call from anybody. So
+        // the create starts the clock that closes those windows and delivers what they hold
+        // ([`state::drive_flow_log_delivery`]); it publishes nothing itself, the first window
+        // being owed only once its span has passed.
+        state::drive_flow_log_delivery(ctx, &self.engine, &state::request_region(ctx.parts()));
+
         Ok(CreateFlowLogsOutput {
             client_token: Some(recorded_token),
             flow_log_ids: Some(flow_log_ids),

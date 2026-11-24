@@ -2171,6 +2171,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// id it is given here before it removes anything, while `DescribeFlowLogs` treats the
     /// ids it is given as a FILTER over the same map.
     pub flow_logs: BTreeMap<String, FlowLogRecord>,
+    /// Where the DELIVERY of each of those flow logs has got to, and the one in-process clock
+    /// that advances it ([`FlowLogDeliveryPublisher`]).
+    ///
+    /// Beside the flow log store rather than on the record, for the reason
+    /// [`Self::nat_gateway_metrics`] sits beside its own: that store holds the modelled
+    /// `FlowLog` shape itself, which carries no member for the window a flow log has published
+    /// through. The records themselves are never held here — they live in the CloudWatch Logs
+    /// group the flow log names, which is their one home.
+    pub flow_log_delivery: FlowLogDeliveryPublisher,
     /// A `CreateFlowLogs` `ClientToken` and the flow log ids that request minted, so a
     /// repeat of the same request answers with those flow logs instead of turning on a
     /// second set: "Unique, case-sensitive identifier that you provide to ensure the
@@ -3994,6 +4003,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             route_table_client_tokens: HashMap::new(),
             // A fresh account monitors nothing, so it holds no flow log.
             flow_logs: BTreeMap::new(),
+            flow_log_delivery: FlowLogDeliveryPublisher::default(),
             flow_log_client_tokens: HashMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
