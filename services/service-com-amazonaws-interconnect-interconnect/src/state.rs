@@ -36,8 +36,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AttachPoint, AttachPointDescriptor, Bandwidths, Connection, ConnectionSummary,
-    CreateConnectionInput, Environment, Provider, RemoteAccountIdentifier,
+    AcceptConnectionProposalInput, AttachPoint, AttachPointDescriptor, Bandwidths, Connection,
+    ConnectionSummary, CreateConnectionInput, Environment, Provider, RemoteAccountIdentifier,
 };
 
 /// The secret a listing's page cursors are authenticated under, which is what lets a
@@ -142,7 +142,7 @@ pub struct PendingTransition {
 /// `updating`), so none of them is advanced from here.
 ///
 /// The clock stands in for the TIME each leg takes and for nothing a caller decides:
-/// it records no acceptance ([`StoredConnection::proposal_accepted`] is what records
+/// it records no acceptance ([`StoredConnection::accepted_proposal`] is what records
 /// one), so a proposal nobody has accepted stays acceptable however far along this
 /// progression its connection has been carried, and [`apply_acceptance`] — the one
 /// writer of an acceptance — re-enters the accepted state and takes the rest of the
@@ -226,8 +226,9 @@ pub struct StoredConnection {
     pub remote_account: Option<RemoteAccountIdentifier>,
     /// The transition the clock owes this connection, if any.
     pub pending_transition: Option<PendingTransition>,
-    /// Whether this connection's proposal HAS been accepted — the call that selects
-    /// the Attach Point "to which the connection should be associated". Set by
+    /// The acceptance that HAS been made on this connection's proposal — the call that
+    /// selects the Attach Point "to which the connection should be associated" — as the
+    /// request asked for it, and `None` while the proposal is still awaiting one. Set by
     /// [`apply_acceptance`], which is the only writer of an acceptance, and by
     /// nothing else.
     ///
@@ -236,8 +237,10 @@ pub struct StoredConnection {
     /// provisioning progression on its own ([`owed_progression`]), standing in for
     /// the time each leg takes and not for anyone's acceptance, so a connection that
     /// has left `requested` has not necessarily been accepted by anybody. This is
-    /// what a second acceptance of one proposal is judged against.
-    pub proposal_accepted: bool,
+    /// what a second acceptance of one proposal is judged against
+    /// ([`IdempotentAcceptance::matches`]), and what it holds is the acceptance that was
+    /// MADE rather than the shape the record has since been given.
+    pub accepted_proposal: Option<IdempotentAcceptance>,
     /// When this record leaves the store, set once it reaches `deleted`.
     pub evict_due: Option<Instant>,
 }
@@ -1741,7 +1744,7 @@ fn exists_as_resource(stored: &StoredConnection) -> bool {
 ///
 /// It is not what says whether an acceptance can still be made: the clock carries a
 /// connection out of this state by itself, so whether the proposal has been accepted
-/// is [`StoredConnection::proposal_accepted`]'s to say and which states have no
+/// is [`StoredConnection::accepted_proposal`]'s to say and which states have no
 /// acceptance left to make is [`acceptance_possible_in`]'s.
 pub const AWAITING_ACCEPTANCE_CONNECTION_STATE: &str = "requested";
 
@@ -1808,7 +1811,7 @@ pub const FAILED_CONNECTION_STATE: &str = "failed";
 /// connectivity an acceptance brings up, and one whose creation failed never had it, so
 /// on those states there is nothing left to accept. Every other modelled state is a
 /// connection that exists and that an acceptance can therefore be made on — whether it
-/// already HAS been is [`StoredConnection::proposal_accepted`]'s to say, not the
+/// already HAS been is [`StoredConnection::accepted_proposal`]'s to say, not the
 /// state's, because the clock carries a connection along the provisioning progression
 /// by itself.
 pub fn acceptance_possible_in(state: &str) -> bool {
@@ -1839,12 +1842,10 @@ pub fn acceptance_possible_in(state: &str) -> bool {
 /// whichever call comes next; nothing ever waits for it.
 pub fn apply_acceptance(
     stored: &mut StoredConnection,
-    attach_point: &AttachPoint,
-    description: Option<&String>,
-    tags: Option<&std::collections::HashMap<String, String>>,
+    input: &AcceptConnectionProposalInput,
     now: Instant,
 ) {
-    stored.connection.attach_point = attach_point.clone();
+    stored.connection.attach_point = input.attach_point.clone();
     // The bandwidth the proposal offers, read from the capture the activation key made
     // and not from the record: `Connection$bandwidth` is "the specific selected
     // bandwidth of this connection", which `UpdateConnection` reassigns while the
@@ -1856,14 +1857,18 @@ pub fn apply_acceptance(
     // `environmentId`, so the record still names the Environment the create resolved
     // the capture against.
     stored.connection.bandwidth = stored.proposal.bandwidth.clone();
-    if let Some(description) = description {
+    if let Some(description) = input.description.as_ref() {
         stored.connection.description = description.clone();
     }
     // The tags the acceptance carries are written by the one rule every writer of a
     // tag set here follows ([`merge_tags`]): merge, never replace, and "no tags" keeps
     // its single representation in the store when the request carries none.
-    merge_tags(&mut stored.connection.tags, tags);
-    stored.proposal_accepted = true;
+    merge_tags(&mut stored.connection.tags, input.tags.as_ref());
+    // What the acceptance ASKED FOR is recorded from the request itself, which is what a
+    // repeat of it is judged against: the members below are written onto a record other
+    // operations go on to change, so the request is the only place the acceptance that
+    // was made survives.
+    stored.accepted_proposal = Some(IdempotentAcceptance::of(input));
     stored.connection.state = ACCEPTED_CONNECTION_STATE.to_string();
     stored.pending_transition = owed_progression(ACCEPTED_CONNECTION_STATE, now);
 }
@@ -1939,42 +1944,71 @@ pub fn apply_deletion(stored: &mut StoredConnection, now: Instant) {
     );
 }
 
-/// Whether accepting `connection`'s proposal with `attach_point`, `description` and
-/// `tags` would leave the connection exactly as it already is.
+/// What an acceptance ASKED FOR: the caller-owned members of the
+/// `AcceptConnectionProposal` that was made on a proposal, which is what a repeat of
+/// that acceptance is judged against.
 ///
-/// What makes a repeated acceptance the SAME acceptance: the attach point it asks the
-/// connection to be associated with is the one the connection holds, and every member
-/// it supplies is already the connection's. One that asks for anything else is a
-/// different acceptance of a proposal that has already been accepted, so it is
-/// refused instead of re-associating a connection that is already provisioning.
-pub fn acceptance_already_applied(
-    connection: &Connection,
-    attach_point: &AttachPoint,
-    description: Option<&String>,
-    tags: Option<&std::collections::HashMap<String, String>>,
-) -> bool {
-    attach_point_eq(&connection.attach_point, attach_point)
-        && description.is_none_or(|supplied| *supplied == connection.description)
-        && tags.is_none_or(|supplied| {
-            supplied.iter().all(|(key, value)| {
-                connection
-                    .tags
-                    .as_ref()
-                    .and_then(|held| held.get(key))
-                    .is_some_and(|held| held == value)
-            })
-        })
+/// The request-owned members are kept here rather than read back off the stored
+/// connection, for the reason [`IdempotentCreate`] gives for the sibling judgement, and
+/// for exactly the hazard it names: `UpdateConnection` reassigns the record's
+/// description and `UntagResource` removes keys from its tag set, so an acceptance
+/// judged against the record would stop matching its own byte-for-byte repeat as soon
+/// as either of them had run — idempotency is about the request that was made, not
+/// about the resource's current shape. The record is built from the input in
+/// [`Self::of`] and compared against a repeat in [`Self::matches`], both taking the
+/// input shape itself, so the members the store holds and the members a replay is
+/// judged on cannot drift apart.
+#[derive(Debug)]
+pub struct IdempotentAcceptance {
+    /// `AcceptConnectionProposal$attachPoint` as it was sent.
+    pub attach_point: AttachPoint,
+    /// `AcceptConnectionProposal$description` as it was sent, absent included.
+    pub description: Option<String>,
+    /// The tag set `AcceptConnectionProposal$tags` asked for, in the one representation
+    /// this service holds a tag set in ([`stored_tag_set`]) — so the comparison below
+    /// judges the tag set the acceptance ASKED FOR, which a `tags` map with no entries
+    /// and no `tags` member at all are equally a request for, rather than which of the
+    /// two spellings carried it.
+    pub tags: StoredTagSet,
 }
 
-/// How the service words an acceptance of a proposal whose connection has already
-/// been accepted and asks for something that connection does not hold.
+impl IdempotentAcceptance {
+    /// What the acceptance carried, taken straight off the request that made it: the one
+    /// place a caller-owned member of an acceptance enters the store.
+    pub fn of(input: &AcceptConnectionProposalInput) -> Self {
+        Self {
+            attach_point: input.attach_point.clone(),
+            description: input.description.clone(),
+            tags: stored_tag_set(input.tags.as_ref()),
+        }
+    }
+
+    /// Whether a repeated request is the SAME acceptance that was made on this
+    /// proposal: every member of the acceptance the caller owns compared, absence
+    /// included, so a repeat of the request that succeeded is that acceptance reported
+    /// again however the record has been written since, while one differing in any
+    /// member asks for a different acceptance of a proposal that has already been
+    /// accepted.
+    pub fn matches(&self, input: &AcceptConnectionProposalInput) -> bool {
+        attach_point_eq(&self.attach_point, &input.attach_point)
+            && self.description == input.description
+            && self.tags == stored_tag_set(input.tags.as_ref())
+    }
+}
+
+/// How the service words an acceptance of a proposal that has already been accepted and
+/// asks for something other than the acceptance that was made.
 ///
 /// `ActivationKey` is `@sensitive`, so the message names the MEMBER the request
 /// carried the key in and the connection the acceptance already made, never the key.
+/// What it reports is the rule that refused the call — the acceptance was already made
+/// and is not re-made differently — rather than any one member of the request, which
+/// may be the attach point, the description or the tags.
 pub fn proposal_already_accepted_message(connection_id: &str) -> String {
     format!(
         "{REFUSAL_ENVELOPE}The connection proposal for the supplied activationKey has already \
-         been accepted as connection {connection_id}, whose attach point cannot be changed"
+         been accepted as connection {connection_id}, and the acceptance that was made cannot be \
+         changed"
     )
 }
 

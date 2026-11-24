@@ -233,8 +233,8 @@ enum StoreVerdict {
         connection_id: String,
         environment_id: String,
     },
-    /// The proposal has already been accepted and the request asks for exactly what
-    /// the connection it made already holds, so that connection is reported again
+    /// The proposal has already been accepted and the request carries what THAT
+    /// acceptance asked for, so the connection it made is reported again
     /// rather than accepted a second time. Boxed because a `Connection` is far larger
     /// than the two identifiers above.
     AlreadyAccepted(Box<Connection>),
@@ -327,22 +327,23 @@ fn judge_against_store(
     }
 
     // A proposal is accepted ONCE, and what records that it HAS been is the
-    // acceptance itself (`StoredConnection::proposal_accepted`), never the state the
+    // acceptance itself (`StoredConnection::accepted_proposal`), never the state the
     // connection reports: the clock carries a connection out of the state it was
     // created in whether or not anybody has accepted it, so judging the acceptance by
     // the state would refuse the very call the model says selects the attach point.
-    // Once the acceptance HAS been made, a request asking for exactly what that
-    // connection already holds is the SAME acceptance reported again — the operation
-    // is `@idempotent` — while one asking for anything else would re-associate a
-    // connection whose attach point that acceptance already settled, which is this
-    // service's own client fault.
-    if stored.proposal_accepted {
-        if crate::state::acceptance_already_applied(
-            connection,
-            &input.attach_point,
-            input.description.as_ref(),
-            input.tags.as_ref(),
-        ) {
+    // Once the acceptance HAS been made, a request carrying what THAT acceptance asked
+    // for is the SAME acceptance reported again — the operation is `@idempotent` —
+    // while one asking for anything else would re-associate a connection whose attach
+    // point that acceptance already settled, which is this service's own client fault.
+    // The repeat is judged against the request the acceptance was MADE with and not
+    // against the record it wrote, because the record is the sibling writers'
+    // (`UpdateConnection` reassigns its description, `UntagResource` removes keys from
+    // its tags) while the acceptance is not: idempotency is about the request that was
+    // made, not about the resource's current shape
+    // (`crate::state::IdempotentAcceptance`), the same rule the sibling replay index of
+    // this crate is held to.
+    if let Some(accepted) = &stored.accepted_proposal {
+        if accepted.matches(input) {
             return Ok(StoreVerdict::AlreadyAccepted(Box::new(connection.clone())));
         }
         return Err(
@@ -412,10 +413,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// and nothing the request carries can change them; the optional `description` and
     /// `tags` are the caller's to set on the resulting Connection.
     ///
-    /// `clientToken` needs no replay index of its own: this acceptance is idempotent
-    /// by construction, because it makes no new resource — it accepts the one proposal
-    /// the key names, and a repeat asking for what that connection already holds is
-    /// answered with that same connection.
+    /// `clientToken` needs no replay index of its own: this acceptance makes no new
+    /// resource — it accepts the one proposal the key names — so the proposal itself is
+    /// what a repeat is keyed by, and what the ACCEPTANCE asked for is recorded beside
+    /// the record it wrote (`crate::state::IdempotentAcceptance`). A repeat carrying
+    /// what that acceptance carried is answered with the connection it made, whatever
+    /// the sibling writers of those same members have done to the record since;
+    /// idempotency is about the request that was made, not about the resource's current
+    /// shape.
     ///
     /// The acceptance is this operation's to make, and no amount of elapsed time takes
     /// it away: the clock carries a new connection along the provisioning progression
@@ -522,21 +527,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The acceptance is applied by the ONE writer of everything an acceptance
         // decides (`crate::state::apply_acceptance`): the Attach Point it selected is
         // what the connection is associated with from now on, the description and tags
-        // it carries are written onto the resulting Connection, the proposal is
-        // recorded as accepted, and the connection enters the accepted state with the
+        // it carries are written onto the resulting Connection, what the acceptance
+        // asked for is recorded as the acceptance that was made, and the connection
+        // enters the accepted state with the
         // rest of the documented progression owed by the clock from this instant. The
         // Environment and the bandwidth are the PROPOSAL's, read from the capture its
         // activation key made rather than from the record, because the parameters
         // chosen on the partner's portal cannot be modified — so an `UpdateConnection`
         // made while the proposal was still awaiting acceptance does not decide what
         // this acceptance provisions.
-        crate::state::apply_acceptance(
-            stored,
-            &input.attach_point,
-            input.description.as_ref(),
-            input.tags.as_ref(),
-            now,
-        );
+        crate::state::apply_acceptance(stored, &input, now);
 
         Ok(AcceptConnectionProposalOutput {
             connection: Some(stored.connection.clone()),

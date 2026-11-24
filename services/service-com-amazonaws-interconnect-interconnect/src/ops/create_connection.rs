@@ -574,9 +574,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nobody has accepted this connection's proposal yet: the create is
                 // what MAKES the proposal, and `AcceptConnectionProposal` is the one
                 // call that accepts it. The clock's progression above moves the
-                // connection's state but records no acceptance, so this stays false
+                // connection's state but records no acceptance, so this stays absent
                 // until that call is made.
-                proposal_accepted: false,
+                accepted_proposal: None,
                 evict_due: None,
             },
         );
