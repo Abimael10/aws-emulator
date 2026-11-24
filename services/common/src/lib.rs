@@ -462,6 +462,11 @@ pub mod data_plane_addressing;
 /// route an in-process client that was handed that address, which cannot read a service off
 /// an address the way it can off an endpoint host.
 pub mod published_data_planes;
+/// The ONE reading of WHICH SERVICE the credential a presigned URL carries in its own query
+/// names — the SigV4 scope's service field, through the front door's own reader of it, and
+/// the legacy query form, which is one service's own — for everything that has to attribute
+/// such a URL to a service, since neither its host nor its path addressing names one.
+pub mod presigned_url_credential;
 /// The `address:port` pairs a WORKLOAD this emulator runs is listening for HTTP at — recorded
 /// by the service that started the server and read by whatever has to serve a request addressed
 /// there, for the hand-offs where that service already reads the reader's own store and so

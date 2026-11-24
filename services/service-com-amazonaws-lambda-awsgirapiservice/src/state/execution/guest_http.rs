@@ -18,12 +18,14 @@
 //! * The destination is ALWAYS this emulator, and always an endpoint it PUBLISHES: the URL
 //!   has to name one — a host of AWS's own naming, whose endpoint prefix names the service
 //!   ([`endpoint_prefix_of`]), this emulator's own endpoint with a data plane named in the
-//!   path under `service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`, or the
+//!   path under `service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`, the
 //!   `host:port` the core published a RESOURCE's own listener at
 //!   ([`addressed_resource_plane`]) — the address a search collection, a database or a
 //!   gateway reports in its control plane for a client to dial, which is an ADDRESS and so
 //!   names no service in its host: WHICH service answers there is what the service that
-//!   opened the listener recorded (`service_common::published_data_planes`). A URL naming
+//!   opened the listener recorded (`service_common::published_data_planes`) — or a
+//!   PRESIGNED URL on an address of THIS MACHINE, which names the service it was signed
+//!   for in its own query ([`addressed_presigned_url`]). A URL naming
 //!   none of them is REFUSED and nothing is sent. No host name is resolved and no socket is
 //!   opened on any path: the request is handed to the callback transport, so it cannot leave
 //!   this process.
@@ -31,7 +33,12 @@
 //!   credential the framework hands this emulator's handlers, exactly as the SDK seam signs
 //!   its calls ([`super::aws_api`]), and the authorization headers the guest supplied are
 //!   DROPPED rather than forwarded, so a handler cannot have a request signed as anything
-//!   else.
+//!   else. The one address no signature of this host's goes on is a PRESIGNED URL's
+//!   ([`Addressed::presigned_url`]): such a URL is authorized by the credential it was
+//!   signed with rather than by whoever fetches it, so it is sent as it states itself and is
+//!   verified and authorized by exactly what the front door applies to the same URL fetched
+//!   from outside this process. Every other address, whatever its query carries, is made as
+//!   the invocation's own identity.
 //! * Every bound is the host's: which methods may be sent, how large the request and the
 //!   answer may be, how many requests one run may make and how long one may take — the last
 //!   two shared with the SDK seam, because they bound the RUN rather than one call
@@ -44,7 +51,8 @@
 use ::std::time::Duration;
 
 use ::service_common::data_plane_addressing::{
-    first_segment, host_only, EMULATOR_PATH_NAMESPACE,
+    first_segment, host_names_the_bound_interface, host_only, names_a_service,
+    names_the_loopback_interface, EMULATOR_PATH_NAMESPACE,
 };
 use ::smithy_server_runtime::EmbeddedEmulator;
 
@@ -177,6 +185,7 @@ pub async fn sent(sending: &Sending<'_>) -> Result<Answered, Refusal> {
         .or_else(|| {
             addressed_resource_plane(sending.url, sending.published, sending.default_region)
         })
+        .or_else(|| addressed_presigned_url(sending.url, sending.default_region))
         .ok_or(Refusal::UnknownService)?;
     match ::tokio::time::timeout(
         sending.within,
@@ -197,7 +206,8 @@ pub async fn sent(sending: &Sending<'_>) -> Result<Answered, Refusal> {
 }
 
 /// WHERE one URL addresses: the service of this emulator it names, the host and the path it
-/// is sent to, and the Region its signature is scoped to.
+/// is sent to, the Region its signature is scoped to, and WHICH credential the request is
+/// made with.
 #[derive(Debug, PartialEq, Eq)]
 struct Addressed {
     /// The signing name of the service the address names, which is also the credential
@@ -209,6 +219,30 @@ struct Addressed {
     target: String,
     /// The Region the signature is scoped to.
     region: String,
+    /// Whether the ADDRESS is a presigned URL's own — the one reading that resolves a
+    /// service from the credential the URL carries ([`addressed_presigned_url`]), and so the
+    /// one request this seam makes with no credential of its own.
+    ///
+    /// Such a request is dispatched exactly as the URL states it: the credential the URL
+    /// carries is WHO the request is from — "a presigned URL is signed by whoever minted it
+    /// and carries that credential's own scope, so the later request it names is judged on
+    /// the policies in force on THAT principal", as the service serving one reads it — so
+    /// putting another credential on it would judge the fetch against the holder of the URL
+    /// instead of against its signer, and a URL handed to code that holds no credential of
+    /// its own would then authorize nothing. Every OTHER address is made as the identity the
+    /// invocation was given, whatever its query happens to carry, so a handler cannot shed
+    /// its own identity by writing credential-shaped parameters onto an address that names
+    /// its service some other way.
+    ///
+    /// What bounds the one that is: such a request is handed to the front door exactly as the
+    /// same URL fetched from OUTSIDE this process is — whether the credential it presents
+    /// verifies, and what the principal it names may do, are the front door's own two
+    /// decisions, taken over the same stores and with the same wording. While this emulator
+    /// verifies requests, a credential a handler wrote itself cannot verify and is refused
+    /// before any handler runs. While it verifies none — the default, where it hands out no
+    /// credential and checks no signature — no credential presented to it by anything is
+    /// verified either, which is the position every other client of the front door is in.
+    presigned_url: bool,
 }
 
 /// Read `url` as the address of a service of THIS emulator, or `None` for a URL that names
@@ -224,6 +258,7 @@ fn addressed(url: &str, default_region: &str) -> Option<Addressed> {
             host: authority.to_string(),
             target,
             region: region_of(host).unwrap_or_else(|| default_region.to_string()),
+            presigned_url: false,
         });
     }
     // A host the front door itself resolves to a service is NOT read here: its reader
@@ -245,6 +280,7 @@ fn addressed(url: &str, default_region: &str) -> Option<Addressed> {
         host: authority.to_string(),
         target,
         region: default_region.to_string(),
+        presigned_url: false,
     })
 }
 
@@ -303,7 +339,75 @@ fn addressed_resource_plane(
         host: authority.to_string(),
         target,
         region: default_region.to_string(),
+        presigned_url: false,
     })
+}
+
+/// WHERE a PRESIGNED URL on this emulator's own endpoint goes, or `None` for a URL that
+/// carries no presigned credential.
+///
+/// A presigned URL is handed out for a client to fetch LATER with an ordinary HTTP client,
+/// which is how object access is given to code that holds no credential of its own, and a
+/// handler is one such client. Its authorization travels in the QUERY rather than in a
+/// header, and that query is the only part of such a URL that names a service: its host is
+/// the endpoint the URL was minted against — this emulator's own, which names no service —
+/// and its path is laid out by the addressing the minting client chose, which for the object
+/// store may put the bucket in the first path segment (the path-style form) rather than in
+/// the host (the virtual-hosted form). Reading the host alone therefore attributes such a URL
+/// to nothing, for a service this emulator does serve.
+///
+/// So the service is read off the credential the URL itself carries, by the one reading of
+/// that question this emulator has (`service_common::presigned_url_credential`, which reads
+/// the SigV4 scope through the front door's own reader of it). Two things narrow which URLs
+/// are read this way, because the credential says WHICH service answers and not WHERE:
+///
+/// * the host has to be an address of THIS PROCESS ([`addresses_this_process`]): the endpoint
+///   a presigned URL of this emulator is minted against is an address this process is reached
+///   at, and an address that is not is reached by nothing here. The port cannot narrow it
+///   further — the request is carried in-process rather than dialled, and a presigned URL
+///   names no port of its own beyond the endpoint's;
+/// * a host that NAMES a service is not read here at all: the endpoint-prefix reading above
+///   has already answered for it, and such a URL is addressed by that name rather than by a
+///   credential.
+///
+/// The Region is the invocation's own, as it is for every address of this emulator: the
+/// signature a presigned URL carries is already scoped to the Region it was signed for, and
+/// this host puts no signature of its own on such a request ([`dispatch`]).
+fn addressed_presigned_url(url: &str, default_region: &str) -> Option<Addressed> {
+    let (authority, target) = authority_and_target(url)?;
+    let host = host_only(authority);
+    if names_a_service(host) || !addresses_this_process(host) {
+        return None;
+    }
+    let signing_name =
+        ::service_common::presigned_url_credential::signed_for(&target.parse().ok()?)?;
+    Some(Addressed {
+        signing_name,
+        host: authority.to_string(),
+        target,
+        region: default_region.to_string(),
+        presigned_url: true,
+    })
+}
+
+/// Whether `host` is an address of THIS PROCESS: the loopback interface
+/// (`service_common::data_plane_addressing::names_the_loopback_interface`), or the very
+/// address an operator bound this emulator's listeners on
+/// (`…::host_names_the_bound_interface`).
+///
+/// The second reading is the one every plane served on a socket of its own applies to a
+/// request's host, and it answers for ANY host on a WILDCARD bind (`0.0.0.0`, `::`), where no
+/// single address names the socket. That is right for a request that ARRIVED on that socket
+/// and wrong here, where nothing arrived: the question is whether the address the URL NAMES is
+/// one this process answers at, and on a wildcard bind an arbitrary host is not — so such a
+/// bind leaves the loopback reading alone to answer, rather than admitting every host.
+fn addresses_this_process(host: &str) -> bool {
+    if names_the_loopback_interface(host) {
+        return true;
+    }
+    let bound_to_one_address =
+        ::emulator_server::bind_address_from_env().is_ok_and(|bound| !bound.is_unspecified());
+    bound_to_one_address && host_names_the_bound_interface(host)
 }
 
 /// The ENDPOINT PREFIX an AWS-shaped host names, which is what a request to that service is
@@ -404,15 +508,20 @@ async fn dispatch(
     let mut request = builder
         .body(body.to_vec())
         .map_err(|error| Refusal::NotMade(error.to_string()))?;
-    super::aws_api::signed(
-        &mut request,
-        &addressed.signing_name,
-        &addressed.region,
-        callback,
-        identity,
-    )
-    .await
-    .map_err(Refusal::NotMade)?;
+    // A PRESIGNED URL's own address is sent as the URL states itself
+    // ([`Addressed::presigned_url`]); every other address is made as the identity the
+    // invocation was given, which is the only credential this seam ever puts on a request.
+    if !addressed.presigned_url {
+        super::aws_api::signed(
+            &mut request,
+            &addressed.signing_name,
+            &addressed.region,
+            callback,
+            identity,
+        )
+        .await
+        .map_err(Refusal::NotMade)?;
+    }
     let (parts, body) = request.into_parts();
     let request = ::http::Request::from_parts(
         parts,
@@ -1372,6 +1481,151 @@ mod tests {
             assert_eq!(
                 actual.as_deref(),
                 *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// WHICH of a handler's own requests addresses a PRESIGNED URL on this emulator's own
+    /// endpoint, over a table whose rows span what the rule generalises over: which query
+    /// form carries the credential, which service its scope names, which shape of this
+    /// machine's address the endpoint is reached by, how the addressing lays the resource out
+    /// in the path, and the URLs that carry no presigned credential, name a service in their
+    /// host instead, or address a host off this machine.
+    #[test]
+    fn a_presigned_url_is_addressed_for_the_service_its_own_query_names() {
+        /// The credential a legacy presigned URL carries, in the parameters that form uses.
+        const LEGACY: &str = "AWSAccessKeyId=AKIDEXAMPLE&Signature=ZGVhZGJlZWY%3D&\
+                              Expires=1762000000";
+        /// The credential a SigV4-presigned URL carries, with the scope separators encoded
+        /// as a client encodes them.
+        const SIGV4: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE\
+                             %2F20240101%2Feu-west-1%2Fs3%2Faws4_request&\
+                             X-Amz-Date=20240101T000000Z&X-Amz-Expires=600&\
+                             X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef";
+        let cases: &[Addressing] = &[
+            Addressing {
+                case: "a path-style legacy presigned URL on this emulator's endpoint",
+                url: "https://127.0.0.1:9297/reports/fetched.bin?AWSAccessKeyId=AKIDEXAMPLE&\
+                      Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                expected: Some((
+                    "s3",
+                    "/reports/fetched.bin?AWSAccessKeyId=AKIDEXAMPLE&Signature=ZGVhZGJlZWY%3D&\
+                     Expires=1762000000",
+                    "us-west-2",
+                )),
+            },
+            Addressing {
+                case: "a key of several segments, on the loopback name",
+                url: "https://localhost:9297/reports/nested/deep/object.json?\
+                      AWSAccessKeyId=AKIDEXAMPLE&Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                expected: Some((
+                    "s3",
+                    "/reports/nested/deep/object.json?AWSAccessKeyId=AKIDEXAMPLE&\
+                     Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                    "us-west-2",
+                )),
+            },
+            Addressing {
+                case: "the SigV4 query form, whose scope names the service",
+                url: "https://127.0.0.1:9297/reports/fetched.bin?X-Amz-Algorithm=\
+                      AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20240101%2Feu-west-1\
+                      %2Fs3%2Faws4_request&X-Amz-Date=20240101T000000Z&X-Amz-Expires=600&\
+                      X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef",
+                // The Region is the invocation's own: the signature the URL carries is
+                // already scoped to the one it was signed for, and this host adds none.
+                expected: Some((
+                    "s3",
+                    "/reports/fetched.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=\
+                     AKIDEXAMPLE%2F20240101%2Feu-west-1%2Fs3%2Faws4_request&X-Amz-Date=\
+                     20240101T000000Z&X-Amz-Expires=600&X-Amz-SignedHeaders=host&\
+                     X-Amz-Signature=deadbeef",
+                    "us-west-2",
+                )),
+            },
+            Addressing {
+                case: "the IPv6 loopback literal this emulator may be reached at",
+                url: "https://[::1]:9297/reports/fetched.bin?AWSAccessKeyId=AKIDEXAMPLE&\
+                      Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                expected: Some((
+                    "s3",
+                    "/reports/fetched.bin?AWSAccessKeyId=AKIDEXAMPLE&Signature=ZGVhZGJlZWY%3D&\
+                     Expires=1762000000",
+                    "us-west-2",
+                )),
+            },
+            Addressing {
+                case: "a URL on the same endpoint carrying no presigned credential",
+                url: "https://127.0.0.1:9297/reports/fetched.bin",
+                expected: None,
+            },
+            Addressing {
+                case: "a URL whose query is some other request's parameters",
+                url: "https://127.0.0.1:9297/reports/fetched.bin?versionId=3",
+                expected: None,
+            },
+            Addressing {
+                // An address no bind of this emulator makes its own: not loopback, and the
+                // reading that admits the operator's own address admits ONE address rather
+                // than any host, so this row holds under every bind but one naming this very
+                // literal ([`addresses_this_process`]).
+                case: "a presigned URL addressed to a host off this machine",
+                url: "https://10.1.2.3:8080/reports/fetched.bin?AWSAccessKeyId=AKIDEXAMPLE&\
+                      Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                expected: None,
+            },
+            Addressing {
+                case: "a presigned URL addressed to a name that is not this machine's",
+                url: "https://objects.example.test/reports/fetched.bin?\
+                      AWSAccessKeyId=AKIDEXAMPLE&Signature=ZGVhZGJlZWY%3D&Expires=1762000000",
+                expected: None,
+            },
+        ];
+        for row in cases {
+            let case = row.case;
+            let addressed = addressed(row.url, "us-west-2")
+                .or_else(|| addressed_presigned_url(row.url, "us-west-2"));
+            let actual = addressed.as_ref().map(|addressed| {
+                (
+                    addressed.signing_name.as_str(),
+                    addressed.target.as_str(),
+                    addressed.region.as_str(),
+                )
+            });
+            assert_eq!(
+                actual, row.expected,
+                "case {case:?}: expected {:?}, got {actual:?}",
+                row.expected
+            );
+        }
+        // A host that NAMES a service is addressed by that name, whichever credential form
+        // the URL carries: the endpoint-prefix reading answers first and the presigned
+        // reading declines such a URL outright.
+        for (case, url, expected) in [
+            (
+                "a legacy presigned URL on a service's own endpoint",
+                format!("https://s3.us-east-2.amazonaws.com/bucket/key?{LEGACY}"),
+                ("s3", "us-east-2"),
+            ),
+            (
+                "a SigV4 presigned URL on a virtual-hosted bucket host",
+                format!("https://bucket.s3.ap-southeast-4.amazonaws.com/key?{SIGV4}"),
+                ("s3", "ap-southeast-4"),
+            ),
+        ] {
+            let declined = addressed_presigned_url(&url, "us-west-2");
+            assert!(
+                declined.is_none(),
+                "case {case:?}: a host that names a service is not read as a presigned \
+                 address, got {declined:?}"
+            );
+            let addressed = addressed(&url, "us-west-2");
+            let actual = addressed
+                .as_ref()
+                .map(|addressed| (addressed.signing_name.as_str(), addressed.region.as_str()));
+            assert_eq!(
+                actual,
+                Some(expected),
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }

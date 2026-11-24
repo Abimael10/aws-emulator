@@ -9,6 +9,19 @@ Issue-Commit: dda73b1c89ff90e3a0e7799df332912882e239a1
 
 > _Note: this issue was identified against the code base at commit `dda73b1c89ff90e3a0e7799df332912882e239a1`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolved: the cause reported here — the in-function egress router attributing an outbound
+> URL to a service by host alone, so a path-style presigned URL on the emulator's own
+> endpoint reached nothing — is fixed. Such a URL is now attributed to the service its own
+> presigned credential names and is sent as the URL states itself, and a presigned URL this
+> emulator issues (the SigV4 query form its presigner mints) is served to a handler end to
+> end. One leg of the recorded scenario still fails, on a cause outside this report and
+> already filed on its own:
+> `issues/things-that-do-not-work/20261027T190000Z-s3-legacy-query-credential-presigned-get.md`
+> — no authenticator of this emulator recognises the LEGACY query credential form
+> (`AWSAccessKeyId`/`Signature`/`Expires`), which the recorded run's client minted, so such a
+> URL is refused `InvalidAccessKeyId` for every client, inside a function or outside it; that
+> report records the core change it needs._
+
 ## Operation
 GetObject
 

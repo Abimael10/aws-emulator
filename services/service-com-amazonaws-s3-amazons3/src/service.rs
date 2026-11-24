@@ -492,26 +492,19 @@ pub(crate) fn access_point_addressed_path(
     Some(path_with_bucket(&route.bucket, rest))
 }
 
-/// The query parameters a LEGACY presigned URL carries its credential in: the access key
-/// id, the signature and the expiry, all three required — "`AWSAccessKeyId`, `Signature`
-/// and `Expires`" (AWS General Reference, *Authenticating requests: using query
-/// parameters*). The signing scope of that form names no service, which is why a request
-/// carrying it resolves no routing key at all.
-const LEGACY_PRESIGNED_PARAMETERS: [&str; 3] = ["AWSAccessKeyId", "Signature", "Expires"];
-
-/// Whether `uri`'s query carries all three of [`LEGACY_PRESIGNED_PARAMETERS`] — the shape
-/// that makes a request a legacy presigned S3 URL rather than any other unroutable request.
+/// Whether `uri` carries a LEGACY presigned URL's credential: the access key id, the
+/// signature and the expiry, all three required — "`AWSAccessKeyId`, `Signature` and
+/// `Expires`" (AWS General Reference, *Authenticating requests: using query parameters*) —
+/// which is the shape that makes a request a legacy presigned S3 URL rather than any other
+/// unroutable request. The signing scope of that form names no service, which is why such a
+/// request resolves no routing key at all.
+///
+/// Asked of the one reading of a presigned URL's own credential this emulator has
+/// (`service_common::presigned_url_credential`), which the seam that carries a running
+/// function's outbound HTTP into this emulator attributes such a URL by: the form is this
+/// service's, so both have to read it the same way.
 fn carries_legacy_presigned_credential(uri: &http::Uri) -> bool {
-    let Some(query) = uri.query() else {
-        return false;
-    };
-    let names: ::std::collections::BTreeSet<&str> = query
-        .split('&')
-        .filter_map(|pair| pair.split('=').next())
-        .collect();
-    LEGACY_PRESIGNED_PARAMETERS
-        .iter()
-        .all(|parameter| names.contains(parameter))
+    ::service_common::presigned_url_credential::carries_a_legacy_credential(uri.query())
 }
 
 /// The host a request was addressed to: its `Host` header, else the authority its URI
@@ -2336,13 +2329,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 .is_some_and(|bucket| key == bucket),
             // A request whose ONLY credential is a query-string one the framework's routing
             // key does not read: the legacy presigned form, whose three parameters
-            // ([`LEGACY_PRESIGNED_PARAMETERS`]) are S3's own — "you can use query parameters
-            // to … authenticate the request" (AWS General Reference, *Authenticating
-            // requests: using query parameters*). It names no service in a scope, so the
-            // framework resolves no routing key and no service would claim it; where the
-            // credential travels is not part of addressing, so it is this service's request
-            // and is claimed as one. Whether it then VERIFIES is the framework's own
-            // judgement, exactly as for the SigV4 query form.
+            // ([`carries_legacy_presigned_credential`]) are S3's own — "you can use query
+            // parameters to … authenticate the request" (AWS General Reference,
+            // *Authenticating requests: using query parameters*). It names no service in a
+            // scope, so the framework resolves no routing key and no service would claim it;
+            // where the credential travels is not part of addressing, so it is this
+            // service's request and is claimed as one. Whether it then VERIFIES is the
+            // framework's own judgement, exactly as for the SigV4 query form.
             //
             // An ANONYMOUS (unsigned) request names no service either: it carries no
             // credential scope and no `X-Amz-Target`, and the endpoint host a client of this
