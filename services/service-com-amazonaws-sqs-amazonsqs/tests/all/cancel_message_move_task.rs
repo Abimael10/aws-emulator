@@ -9,8 +9,13 @@
 //! messages are still the source queue's own (a task takes a message out of it only when
 //! its schedule reaches that message), the moved ones stay in the destination queue, the
 //! call answers with how many had been moved, and every later reader reports that same
-//! progress under a cancelled status; a handle no recorded task answers to and a task whose
-//! status is not running are refused, and a refusal moves nothing.
+//! progress under a cancelled status; a task whose status is not running is refused, and a
+//! refusal moves nothing.
+//!
+//! The second rule under test is which refusal a handle that resolves to nothing carries: a
+//! value this service cannot read as naming a task is refused for the VALUE the parameter
+//! carried, while one that names a task no record answers to is refused as the MISSING TASK
+//! it names — the operation's modelled `ResourceNotFoundException` at HTTP 404.
 //!
 //! The delivery table spans what the rule generalises over rather than one example: the
 //! message count, the movement rate (fixed, or left to the service), both ways of
@@ -27,10 +32,35 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
 };
 
 use super::support::{
-    attribute_count as count, call, create_ok, dead_letter_queue, emulator, error_code,
-    expected_arn, message_counts, ok, receive_until, send_all,
+    account, attribute_count as count, call, create_ok, dead_letter_queue, emulator, error_code,
+    expected_arn, expected_arn_in, message_counts, ok, receive_until, send_all, OTHER_ACCOUNT,
+    REGION,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// A region this suite's emulator is NOT addressed in, so a queue ARN naming it names a
+/// queue no call served here resolves.
+const OTHER_REGION: &str = "us-west-2";
+
+/// One value encoded the way a message movement task handle is: the base64 of its payload,
+/// which is what `StartMessageMoveTask` hands a caller and what a client that decodes a
+/// handle, reads the task it names and encodes it again produces. The codec is the
+/// workspace's own (`aws_smithy_types::base64`), so a row carries the bytes a real client
+/// would send.
+fn encoded_token(payload: &str) -> String {
+    aws_smithy_types::base64::encode(payload)
+}
+
+/// The handle naming the task `document` describes: the document a task handle carries
+/// (`taskId`, `sourceArn`), encoded as one.
+fn encoded_handle(document: &Value) -> String {
+    encoded_token(&document.to_string())
+}
+
+/// An identifier of the form this service mints that no start call issued, and a second one
+/// of the same form: a handle naming either names a task no record answers to.
+const UNISSUED_TASK_ID: &str = "00000000-0000-0000-0000-000000000000";
+const ALSO_UNISSUED_TASK_ID: &str = "6f57b2cc-9f0e-4f3a-8f4b-2d1c0b9a8e77";
 
 /// The status a task reports while its cancellation is being applied, and the one it
 /// reports once it has been: "Possible values are: RUNNING, COMPLETED, CANCELLING,
@@ -41,11 +71,23 @@ const CANCELLED: &str = "CANCELLED";
 /// The status a task reports once every message it took has been delivered.
 const COMPLETED: &str = "COMPLETED";
 
-/// What the service says when a `TaskHandle` names no message movement task it can stop:
-/// the handle is a value this service minted, so one it cannot resolve is a value the
-/// parameter does not accept — stated without echoing the handle back. Spelled out here
-/// rather than imported, so a drifting constant in the service cannot make a row pass.
+/// What the service says when a `TaskHandle` is not a value it can read as naming a message
+/// movement task at all: the handle is a value this service minted, so one of another form
+/// was never issued and is a value the parameter does not accept — stated without echoing
+/// the handle back. Spelled out here rather than imported, so a drifting constant in the
+/// service cannot make a row pass.
 const UNRESOLVABLE_HANDLE_MESSAGE: &str = "Value for parameter TaskHandle is invalid.";
+
+/// What it says when a handle that DOES name a task names one this service does not hold:
+/// the task is the resource that does not exist, as fixed text carrying no part of the
+/// request.
+const MISSING_TASK_MESSAGE: &str = "Task does not exist.";
+
+/// The class that refusal carries — the modelled missing-resource error of
+/// `CancelMessageMoveTask` (`ResourceNotFoundException`, HTTP 404) — and the status it is
+/// answered under.
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+const NOT_FOUND_STATUS: u16 = 404;
 
 /// What it says when the task a handle names is not one a cancellation can act on: "a
 /// message movement can only be cancelled when the current status is RUNNING", as fixed
@@ -464,13 +506,15 @@ async fn a_cancel_naming_no_running_task_is_refused() {
     );
 
     // (case, TaskHandle, expected status, expected error code, the message the refusal must
-    // carry). A handle no record answers to is a VALUE this parameter does not accept,
-    // whatever shape it has; a task that is not running is a task a cancellation cannot act
-    // on, under the same class and the rule's own sentence; and a request carrying no handle
-    // at all supplied the required parameter no more than one leaving it out did.
+    // carry). A value this service cannot read as naming a task at all is a VALUE this
+    // parameter does not accept; a task that is not running is a task a cancellation cannot
+    // act on, under the same class and the rule's own sentence; and a request carrying no
+    // handle at all supplied the required parameter no more than one leaving it out did. A
+    // value that DOES name a task is the other test's table
+    // ([`a_cancel_naming_a_task_no_record_answers_to_reports_the_task_missing`]).
     let rows: &[(&str, String, u16, &str, &str)] = &[
         (
-            "a handle no task answers to",
+            "a value no encoding of a task handle produces",
             "6f57b2cc-0000-4000-8000-000000000000".to_string(),
             400,
             INVALID_PARAMETER_VALUE,
@@ -484,8 +528,56 @@ async fn a_cancel_naming_no_running_task_is_refused() {
             UNRESOLVABLE_HANDLE_MESSAGE,
         ),
         (
-            "a handle of the shape this service mints that names no task of this region",
+            "a bare identifier, which carries no task handle's document",
             "00000000-0000-4000-8000-000000000000".to_string(),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded payload that is no document at all",
+            encoded_token("not a task handle"),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded document naming no task at all",
+            encoded_handle(&json!({"sourceArn": cancelled_arn})),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded document whose task id is not one this service mints",
+            encoded_handle(&json!({"taskId": "7", "sourceArn": cancelled_arn})),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded document whose source queue is no queue ARN",
+            encoded_handle(&json!({"taskId": UNISSUED_TASK_ID, "sourceArn": "not-an-arn"})),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded document whose source ARN names another service's resource",
+            encoded_handle(&json!({
+                "taskId": UNISSUED_TASK_ID,
+                "sourceArn": format!("arn:aws:s3:{REGION}:{}:a-bucket", account()),
+            })),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "an encoded document whose source queue is another account's",
+            encoded_handle(&json!({
+                "taskId": UNISSUED_TASK_ID,
+                "sourceArn": format!("arn:aws:sqs:{REGION}:{OTHER_ACCOUNT}:someone-elses"),
+            })),
             400,
             INVALID_PARAMETER_VALUE,
             UNRESOLVABLE_HANDLE_MESSAGE,
@@ -729,5 +821,113 @@ async fn a_move_cannot_push_the_destination_queue_past_what_it_may_hold() {
     assert_eq!(
         settled, CANCELLED,
         "case the cancelled task: expected it to settle at {CANCELLED}"
+    );
+}
+
+/// A `TaskHandle` this service can read as NAMING a task, over a task no record answers to,
+/// is refused as the MISSING TASK it names rather than as a value the parameter does not
+/// accept: HTTP 404 with the operation's modelled `ResourceNotFoundException`.
+///
+/// The rows differ along what the rule generalises over: which part of the named task is one
+/// nothing answers to (the task id, the queue it was to move messages out of, the region
+/// that queue lives in) and how much the document carries beside the task it names. The
+/// values that name no task at all stay a parameter refusal — those rows are
+/// [`a_cancel_naming_no_running_task_is_refused`]'s — and the positive control below is the
+/// same encoding resolving a task this service really started, so no row passes because the
+/// encoding itself is unreadable.
+#[tokio::test]
+async fn a_cancel_naming_a_task_no_record_answers_to_reports_the_task_missing() {
+    let router = emulator();
+    let bodies: Vec<String> = (0..4).map(|number| format!("missing #{number}")).collect();
+    let (_, dead_letter_arn, _, handle, _) =
+        start_task(&router, "cancel-missing-task", &bodies, Some(1), false).await;
+
+    // The positive control: the handle the start call answered with resolves its own task,
+    // so each row below differs from a request that works only in the task it names.
+    let cancelled = ok(
+        &router,
+        "CancelMessageMoveTask",
+        json!({"TaskHandle": handle}),
+    )
+    .await;
+    assert!(
+        cancelled.get("ApproximateNumberOfMessagesMoved").is_some(),
+        "case the task this service started: expected a message count, got {cancelled}"
+    );
+
+    // (case, the document the handle carries). Each one names a task, and none of them names
+    // a task this store holds.
+    let rows: &[(&str, Value)] = &[
+        (
+            "an unissued task id over the queue a task really ran on",
+            json!({"taskId": UNISSUED_TASK_ID, "sourceArn": dead_letter_arn}),
+        ),
+        (
+            "another unissued task id over that same queue",
+            json!({"taskId": ALSO_UNISSUED_TASK_ID, "sourceArn": dead_letter_arn}),
+        ),
+        (
+            "an unissued task id over a queue this account does not hold",
+            json!({
+                "taskId": UNISSUED_TASK_ID,
+                "sourceArn": expected_arn("cancel-missing-no-such-queue"),
+            }),
+        ),
+        (
+            "an unissued task id over another region's queue",
+            json!({
+                "taskId": UNISSUED_TASK_ID,
+                "sourceArn": expected_arn_in(OTHER_REGION, "cancel-missing-elsewhere"),
+            }),
+        ),
+        (
+            "a handle carrying more than the task it names",
+            json!({
+                "taskId": UNISSUED_TASK_ID,
+                "sourceArn": dead_letter_arn,
+                "destinationArn": dead_letter_arn,
+            }),
+        ),
+    ];
+
+    for (case, document) in rows {
+        let (status, parsed) = call(
+            &router,
+            "CancelMessageMoveTask",
+            &json!({"TaskHandle": encoded_handle(document)}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (NOT_FOUND_STATUS, RESOURCE_NOT_FOUND),
+            "case {case}: expected HTTP {NOT_FOUND_STATUS} {RESOURCE_NOT_FOUND}, got {status} \
+             with {parsed}"
+        );
+        // awsJson1_0 carries the refusal's `message` member as the body's `message`.
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(MISSING_TASK_MESSAGE),
+            "case {case}: expected the message {MISSING_TASK_MESSAGE:?}, got {parsed}"
+        );
+        assert!(
+            parsed.get("ApproximateNumberOfMessagesMoved").is_none(),
+            "case {case}: a refusal cancels nothing, got {parsed}"
+        );
+    }
+
+    // ...and the refusals left the records exactly as they were: naming a task that does not
+    // exist neither invents a record for it nor drops the one task this suite started.
+    let listed = ok(
+        &router,
+        "ListMessageMoveTasks",
+        json!({"SourceArn": dead_letter_arn, "MaxResults": 10}),
+    )
+    .await;
+    let results = listed.get("Results").and_then(Value::as_array).map(Vec::len);
+    assert_eq!(
+        results,
+        Some(1),
+        "case the task listing after the refusals: expected the one task this suite started, \
+         got {listed}"
     );
 }

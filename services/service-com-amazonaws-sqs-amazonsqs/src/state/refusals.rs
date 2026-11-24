@@ -158,6 +158,25 @@ pub const TASK_ALREADY_RUNNING: &str =
 /// call already cancelled are refused alike, because the rule is the same for both.
 pub const ONLY_ACTIVE_TASKS_CANCELLABLE: &str = "Only active tasks can be cancelled.";
 
+/// How a refusal states that the message movement task a handle NAMES is not one this
+/// service holds: the handle reads as naming a task ([`is_message_move_task_handle`]) and no
+/// record answers to it, so what the request asked about is a resource that does not exist.
+///
+/// Fixed text, with no variable part: the task is the one resource the refusal is about, and
+/// the handle is the caller's own — echoing it back would tell the caller nothing it did not
+/// send.
+pub const MESSAGE_MOVE_TASK_DOES_NOT_EXIST: &str = "Task does not exist.";
+
+/// The modelled refusal for a handle that names a message movement task no record answers
+/// to (`ResourceNotFoundException`, "One or more specified resources don't exist"): the
+/// missing resource is the task itself, so the payload is
+/// [`MESSAGE_MOVE_TASK_DOES_NOT_EXIST`] and nothing of the request reaches it.
+pub fn message_move_task_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_MOVE_TASK_DOES_NOT_EXIST.to_string()),
+    }
+}
+
 /// How a refusal states that a message movement task was asked to move a queue's messages
 /// onto the queue they are already in.
 ///

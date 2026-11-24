@@ -3230,11 +3230,50 @@ pub const MESSAGE_MOVE_CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 pub fn message_move_task_handle(task_id: &str, source_arn: &str) -> String {
     encoded_opaque_token(
         &::serde_json::json!({
-            "taskId": task_id,
-            "sourceArn": source_arn,
+            TASK_HANDLE_TASK_ID: task_id,
+            TASK_HANDLE_SOURCE_ARN: source_arn,
         })
         .to_string(),
     )
+}
+
+/// The fields the document inside a task handle carries: the task's own identity and the
+/// source queue it moves messages out of. Named once, so what mints a handle
+/// ([`message_move_task_handle`]) and what reads one ([`is_message_move_task_handle`])
+/// cannot spell them differently.
+const TASK_HANDLE_TASK_ID: &str = "taskId";
+const TASK_HANDLE_SOURCE_ARN: &str = "sourceArn";
+
+/// Whether `task_handle` is a value of the FORM a message movement task handle has
+/// ([`message_move_task_handle`]): the encoded document naming a task — a `taskId` of the
+/// form this service mints an identifier in, and a `sourceArn` naming a queue of THIS
+/// account, which is the only kind of queue a task this service started takes messages from
+/// ([`queue_key_from_arn`], the one reading of what a queue ARN of this account is). The
+/// region that ARN names is not part of the question: a handle is read in the region the
+/// call addressed, and one naming another region's queue names a task that region holds and
+/// this one does not.
+///
+/// This is the line between a value that NAMES a task and one that is no handle at all,
+/// which is what decides which refusal a reader of a handle answers: a value this service
+/// cannot read as naming a task is a value the parameter does not accept, while one it can
+/// read names a task — and a named task no record answers to is a task that does not exist.
+/// Whether a task is RECORDED under the handle is a separate question, asked of the store
+/// ([`ComAmazonawsSqsAmazonsqsState::message_move_task`]).
+pub fn is_message_move_task_handle(task_handle: &str) -> bool {
+    let Some(decoded) = decoded_opaque_token(task_handle) else {
+        return false;
+    };
+    let Ok(named) = ::serde_json::from_str::<::serde_json::Value>(&decoded) else {
+        return false;
+    };
+    let task_id = named
+        .get(TASK_HANDLE_TASK_ID)
+        .and_then(::serde_json::Value::as_str);
+    let source_arn = named
+        .get(TASK_HANDLE_SOURCE_ARN)
+        .and_then(::serde_json::Value::as_str);
+    task_id.is_some_and(is_minted_identifier)
+        && source_arn.is_some_and(|arn| queue_key_from_arn(arn).is_some())
 }
 
 /// One message movement task `StartMessageMoveTask` started.

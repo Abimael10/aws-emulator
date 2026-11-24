@@ -329,10 +329,12 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             code: "MissingParameter",
             message: absent("TaskHandle"),
         },
-        // A handle this service minted and cannot resolve: a VALUE the parameter does not
-        // accept, stated without echoing the handle back.
+        // A value this service cannot read as naming a task at all: a VALUE the parameter
+        // does not accept, stated without echoing it back. A handle that DOES name a task
+        // and resolves to none is the missing task it names
+        // (`cancel_message_move_task.rs`), which is a different class.
         Row {
-            case: "a cancellation naming a task handle no task answers to",
+            case: "a cancellation whose TaskHandle is no task handle at all",
             operation: "CancelMessageMoveTask",
             address: Address::None,
             request: json!({"TaskHandle": "6f57b2cc-0000-4000-8000-000000000000"}),

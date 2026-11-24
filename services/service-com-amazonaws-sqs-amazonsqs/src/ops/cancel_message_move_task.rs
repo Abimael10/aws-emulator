@@ -13,11 +13,13 @@
 //! whose delivery slot is still ahead: they are taken out of the destination queue and
 //! put back in the source queue, and the cancellation instant is recorded on the task
 //! record, so every later reader projects the same status and the same progress from it.
-//! A handle no recorded task answers to, and a task whose status is not running, are
-//! refused as the VALUE the required `TaskHandle` member carried: the handle is a value
-//! this service minted, so one it cannot resolve and one naming a task a cancellation
-//! cannot act on are both values the parameter does not accept, and a request carrying no
-//! handle at all is refused as the absent parameter it is.
+//! A value that is no task handle at all, and a task whose status is not running, are
+//! refused as the VALUE the required `TaskHandle` member carried — the handle is a value
+//! this service minted, so one of another form was never issued, and a task a cancellation
+//! cannot act on is a task the parameter may not name; a request carrying no handle at all
+//! is refused as the absent parameter it is. A handle that DOES name a task and that no
+//! record answers to is refused as the missing resource it names
+//! ([`crate::state::message_move_task_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -198,12 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what is left once everything already due has been applied.
         state.materialise_due(now);
 
-        // A handle no recorded task answers to is not a resource that is missing: the
-        // handle is a value this service minted, and one it cannot resolve is a value the
-        // parameter does not accept, so the refusal is the parameter one and names the
-        // modelled member. The submitted handle is NOT echoed — it tells the caller nothing
-        // it did not send, and the parameter publishes no value set to repair it against.
+        // A handle this service cannot read as naming a task at all is a value the parameter
+        // does not accept: the handle is a value this service minted, so one of another form
+        // was never issued and the refusal is the parameter one, naming the modelled member.
+        // A handle that DOES name a task ([`sqs::is_message_move_task_handle`]) but that no
+        // record answers to names a task this service does not hold, which is a resource that
+        // does not exist — the modelled missing-resource refusal, so a client reading the
+        // code is told the task is gone rather than that its handle is malformed. Neither
+        // refusal echoes the submitted handle: it tells the caller nothing it did not send.
         let Some(task) = state.message_move_task(&region, &input.task_handle) else {
+            if sqs::is_message_move_task_handle(&input.task_handle) {
+                return Err(CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::message_move_task_not_found(),
+                )
+                .into());
+            }
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                 sqs::invalid_parameter_value_message(TASK_HANDLE_PARAMETER),
             ));
@@ -229,8 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let moved = state
             .cancel_message_move_task(&region, &input.task_handle, now)
             .ok_or_else(|| {
-                crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    sqs::invalid_parameter_value_message(TASK_HANDLE_PARAMETER),
+                CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
+                    sqs::message_move_task_not_found(),
                 )
             })?;
 
