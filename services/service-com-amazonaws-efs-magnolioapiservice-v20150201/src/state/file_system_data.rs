@@ -27,6 +27,18 @@
 //! access point, so the view a client is given is the one this service's own
 //! `DescribeAccessPoints` reports.
 //!
+//! # What a metering of a file system finds
+//!
+//! `FileSystemDescription$SizeInBytes` is "the latest known metered size (in bytes) of data
+//! stored in the file system, in its `Value` field, and the time at which that size was
+//! determined in its `Timestamp` field", so the size a file system reports is a measurement of
+//! the data it HOLDS — which is the tree above. A metering therefore sums the bytes of the
+//! files in that tree ([`MountedFileSystem::metered_bytes`]) and records what it found on the
+//! file system's own record ([`settle_metered_sizes`]), so a file system a client has written
+//! to reports those bytes and one nothing has written to reports none. Nothing is added to
+//! what the tree holds: a size this emulator did not find in it would be a size nothing
+//! stored.
+//!
 //! # Bounds
 //!
 //! The tree is in memory and bounded by [`FILE_SYSTEM_LIMITS`]: how many files and
@@ -87,6 +99,22 @@ impl MountedFileSystem {
     pub fn mounted_tree(&self, root: &str, facts: MountFacts) -> Option<MountedTree> {
         MountedTree::new(Arc::clone(&self.files), root, facts)
     }
+
+    /// The bytes of data this file system holds, as a metering of it finds them: the sum of
+    /// the bytes of every file in the tree.
+    ///
+    /// What `FileSystemDescription$SizeInBytes` reports is "the latest known metered size (in
+    /// bytes) of DATA STORED in the file system", so this counts the file contents the tree
+    /// holds and nothing else — a file system nothing has written to measures none.
+    #[must_use]
+    pub fn metered_bytes(&self) -> i64 {
+        let stored: usize = self
+            .files()
+            .stored_files()
+            .map(|(_, contents)| contents.len())
+            .sum();
+        i64::try_from(stored).unwrap_or(i64::MAX)
+    }
 }
 
 impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
@@ -111,6 +139,64 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
                 .or_insert_with(MountedFileSystem::new)
                 .clone(),
         )
+    }
+
+    /// Every file system this store holds DATA for, as `(id, handle)`: the ones a metering
+    /// measures. A file system nothing has ever mounted holds no tree, so there is nothing to
+    /// measure for it and its stored size stands.
+    pub(super) fn file_systems_to_meter(&self) -> Vec<(String, MountedFileSystem)> {
+        self.file_system_data
+            .iter()
+            .map(|(id, data)| (id.clone(), data.clone()))
+            .collect()
+    }
+
+    /// Record what a metering of `file_system_id` at `now` measured: `bytes` becomes the
+    /// latest known metered size, and `now` the time at which that size was determined.
+    ///
+    /// A measurement that finds what the record already carries determines the same size
+    /// again, so the reported `Timestamp` moves only when the data behind it did: two reads
+    /// of an unchanged file system report the same description, and the size a client reads
+    /// after writing is the size of what it wrote.
+    pub(super) fn record_metered_size(
+        &mut self,
+        file_system_id: &str,
+        bytes: i64,
+        now: SystemTime,
+    ) {
+        if let Some(file_system) = self.file_systems.get_mut(file_system_id) {
+            if file_system.size_in_bytes != bytes {
+                file_system.size_in_bytes = bytes;
+                file_system.size_measured_at = Some(now);
+            }
+        }
+    }
+}
+
+/// Meter every file system this store holds data for, as of `now`, so each reports the size of
+/// the data it holds.
+///
+/// Call it with NO guard of this store held, from the operation that is about to REPORT a file
+/// system: it takes the store's lock to collect the handles, releases it before any tree is
+/// read, and takes it again to record what was measured — so the file data's own lock is never
+/// taken under the store's.
+///
+/// Metering changes nothing a client asked for and nothing it can otherwise observe: the size
+/// is derived from the data already stored, so it is owed at the same instant whether or not
+/// anybody called, exactly as a lifecycle transition the clock has made due is.
+pub fn settle_metered_sizes<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemTime) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    // Bound to its own statement, so the store's lock is released before the trees are read.
+    let held = state.lock().file_systems_to_meter();
+    let measured: Vec<(String, i64)> = held
+        .into_iter()
+        .map(|(id, data)| (id, data.metered_bytes()))
+        .collect();
+    let mut store = state.lock();
+    for (id, bytes) in measured {
+        store.record_metered_size(&id, bytes, now);
     }
 }
 

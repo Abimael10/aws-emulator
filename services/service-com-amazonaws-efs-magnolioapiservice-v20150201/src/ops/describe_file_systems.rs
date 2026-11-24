@@ -3,7 +3,8 @@
 //! @op DescribeFileSystems
 //! IMPLEMENTED: reports the file systems [`crate::state`] holds, filtered by the
 //! `FileSystemId` and `CreationToken` query members and paginated by `MaxItems` /
-//! `Marker`. It writes only the lifecycle transitions the clock already made due.
+//! `Marker`. It writes only the lifecycle transitions the clock already made due and the
+//! metered size of the data each file system holds.
 //!
 //! ## Shape of an operation
 //!
@@ -172,6 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_server_error());
         };
         let now = ::std::time::SystemTime::now();
+
+        // The size each file system reports is a MEASUREMENT of the data it holds, taken
+        // before the description is built ([`efs::settle_metered_sizes`]) — with no guard of
+        // the store held, which is what that call needs.
+        efs::settle_metered_sizes(&*self.engine, now);
 
         let mut state = state.lock();
         state.materialize_due_transitions(now);

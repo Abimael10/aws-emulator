@@ -392,7 +392,9 @@ pub struct FileSystem {
     /// The last known metered size, in bytes, and when it was metered — `None` while no
     /// metering has happened, which is what leaves `SizeInBytes.Timestamp` ("the time at
     /// which the size of data, returned in the Value field, was determined") out of the
-    /// description. This emulator stores no file data, so nothing meters a file system.
+    /// description. A metering measures the data the file system holds
+    /// ([`settle_metered_sizes`]), so a file system a client has written to carries those
+    /// bytes and one nothing has written to carries none.
     pub size_in_bytes: i64,
     pub size_measured_at: Option<SystemTime>,
     pub tags: Vec<Tag>,

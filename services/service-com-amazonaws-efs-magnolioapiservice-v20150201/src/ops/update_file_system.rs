@@ -228,6 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // The size the answered description reports is a MEASUREMENT of the data the file
+        // system holds ([`efs::settle_metered_sizes`]), taken with no guard of the store held.
+        efs::settle_metered_sizes(&*self.engine, now);
+
         let mut state = state.lock();
         state.materialize_due_transitions(now);
 

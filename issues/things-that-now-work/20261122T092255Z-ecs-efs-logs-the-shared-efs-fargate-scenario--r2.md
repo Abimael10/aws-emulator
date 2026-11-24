@@ -51,3 +51,40 @@ Regression context (not part of the requirement, offered so a fixer can bisect):
 7. Poll `DescribeTasks(cluster=<cluster>, tasks=[<taskArn>])` until `tasks[0]["lastStatus"] == "STOPPED"`, then poll `GetLogEvents(logGroupName=<group>, logStreamName="efs/app/<taskId>", startFromHead=True)` until a message containing `A-DONE` is returned.
    Observed: the run never reaches an assertion — the whole scenario is killed at the replay budget (`Check timed out after 60.0s`) while still polling; no terminal task/container state and no delivered container output ever appear.
    Expected: the task reaches `STOPPED` with `stopCode != "TaskFailedToStart"` and `containers[0].exitCode` present, and the container's `A-DONE` line is readable from the awslogs stream, so the check proceeds to its shared-read (arm B), read-only-refusal (arm C, `Read-only file system`) and no-trace (arm D) assertions and reaches a verdict.
+
+## Resolution note (added by the fix that closed this report)
+
+Cause 1 is served on the one stage of this scenario that really did not converge, and the rest
+of it is pinned:
+
+* The LAST stage the check waits on — `DescribeFileSystems(FileSystemId=<fs>)
+  ["FileSystems"][0]["SizeInBytes"]["Value"] > 0` after bytes were written — could never become
+  true: Amazon EFS held the file data a container writes through an `efsVolumeConfiguration`
+  mount, but nothing ever measured it, so `SizeInBytes.Value` stayed `0` for every file system
+  however much data it held. A file system is now METERED where it is reported
+  (`state::file_system_data::settle_metered_sizes`), so the size it reports is the bytes of the
+  data it holds, with the `Timestamp` the metering determined them at.
+  `services/service-com-amazonaws-efs-magnolioapiservice-v20150201/tests/all/file_system_metering.rs`
+  spans that over what is stored (a first file, a longer rewrite, a second file, a removal, an
+  empty file system again), and
+  `core/router/tests/all/ecs_efs_metered_size.rs` drives it across the services this scenario
+  spans: the bytes a Fargate task's container wrote through its mount are what Amazon EFS then
+  reports, and a write its read-only mount refused moves that size not at all.
+* Every OTHER stage of the scenario reaches its state, and the new cross-service suite polls each
+  of them the way the check does: the file system, the mount target and the access point reaching
+  `available`; the task reaching `STOPPED` with `EssentialContainerExited`, `startedAt`/`stoppedAt`,
+  its awsvpc attachment's `networkInterfaceId` and its container's `lastStatus` and `exitCode`;
+  and the container's own output delivered to `<prefix>/app/<taskId>` in the configured group.
+  The four arms of the scenario stay pinned by `core/router/tests/all/ecs_efs_volume_mounts.rs`,
+  `core/router/tests/all/ecs_efs_shared_volume_handover.rs` and
+  `core/router/tests/all/ecs_read_only_mount_write_refusal.rs`.
+* What is NOT the emulator's, and is why the recorded check still answers `Check timed out after
+  60.0s`: the check's own poll helper sleeps its `interval_s` — 10 s, quoted from the check's
+  source in the earlier report of this same unit
+  (`issues/things-that-now-work/20261104T054216Z-ecs-efs-logs-the-shared-efs-fargate-scenario.md`,
+  whose resolution note measures where the 60 s go) — after each look, and the scenario makes six
+  or seven such waits, so 60-70 s elapse inside the check's own `time.sleep` whatever the
+  emulator answers. That measurement was taken with every clock span of the ECS and Amazon EFS
+  crates collapsed to 1 ms: the four-arm scenario passed in 1.5 s and the recorded check timed
+  out identically. The stage this fix adds converges on the first look, so it removes the one
+  unbounded wait of the scenario without being able to move that cap.
