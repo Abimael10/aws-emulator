@@ -46,8 +46,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The endpoint of THIS emulator the suite's calls are addressed at, which is the address
 /// a client configured with the emulator's own endpoint reaches it on — and therefore the
-/// address the pools it creates publish their token issuer on.
+/// endpoint whose zone and port the pools it creates publish their token issuer in.
 const EMULATOR_ENDPOINT: &str = "127.0.0.1:9297";
+
+/// The ISSUER AUTHORITY a pool created through [`EMULATOR_ENDPOINT`] announces: the
+/// user-pool issuer form over the zone that endpoint is reached under — an address is
+/// announced in the loopback zone — on that endpoint's own port.
+const ISSUER_AUTHORITY: &str = "cognito-idp.us-west-2.localhost:9297";
 
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
@@ -521,8 +526,8 @@ async fn a_deactivated_user_cannot_refresh_until_it_is_re_enabled() {
     let issuer = member(case, &refreshed_claims, "iss");
     assert_eq!(
         issuer,
-        format!("https://{EMULATOR_ENDPOINT}/{user_pool_id}"),
-        "case {case:?}: the refreshed token announces the pool's own issuer, the endpoint of \
-         this emulator the pool was created through, got {issuer:?}"
+        format!("https://{ISSUER_AUTHORITY}/{user_pool_id}"),
+        "case {case:?}: the refreshed token announces the pool's own issuer, in the zone of \
+         the endpoint of this emulator the pool was created through, got {issuer:?}"
     );
 }

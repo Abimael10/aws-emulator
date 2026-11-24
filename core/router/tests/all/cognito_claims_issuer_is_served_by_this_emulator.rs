@@ -14,9 +14,11 @@
 //! > A pool's token issuer is a URL its relying parties DEREFERENCE — the `iss` claim the
 //! > authorizer publishes to the integration is the discovery root a verifier reads
 //! > `<iss>/.well-known/openid-configuration` and `<iss>/.well-known/jwks.json` from — so on
-//! > an emulator that is served on a port its authority is the address that emulator is
-//! > served at, its whole path is the minting pool's id, and both documents are served
-//! > there. One authorizer over several pools therefore tells them apart by that issuer.
+//! > an emulator that is served on a port its host carries the user-pool issuer form
+//! > (`cognito-idp.<region>`) in the DNS zone that emulator's address is reached under, on
+//! > the port it is served on, its whole path is the minting pool's id, and both documents
+//! > are served there. One authorizer over several pools therefore tells them apart by that
+//! > issuer.
 //!
 //! The rows span what the rule generalises over: WHICH endpoint the pool was created through
 //! (the emulator's served address, which is the only authority a client on this machine
@@ -51,6 +53,14 @@ const SERVED_BASE: &str = "https://127.0.0.1:9297";
 
 /// The `host[:port]` of [`SERVED_BASE`].
 const SERVED_AUTHORITY: &str = "127.0.0.1:9297";
+
+/// The ISSUER AUTHORITY every pool of [`REGION`] created through this served emulator
+/// announces: the user-pool issuer host form over the zone [`SERVED_AUTHORITY`] is reached
+/// under — an ADDRESS is announced in the loopback zone, which a resolver answers with the
+/// interface the core binds on — on the port the emulator is served on.
+fn issuer_authority() -> String {
+    format!("cognito-idp.{REGION}.localhost:9297")
+}
 
 /// This service's published endpoint host in [`REGION`] — the address a client that resolves
 /// AWS's own hostnames reaches a pool at.
@@ -449,9 +459,10 @@ fn a_cognito_gate_publishes_an_issuer_this_served_emulator_answers_on() {
                     )
                     .await;
                     let result = &signed_in["AuthenticationResult"];
-                    // A served emulator has an address of its own to publish, so that is
-                    // the authority of the issuer, with the pool's id as the whole path.
-                    let expected_issuer = format!("https://{SERVED_AUTHORITY}/{}", pool.id);
+                    // A served emulator has an endpoint of its own to publish, so the
+                    // issuer is the pool's documented host form in the zone and on the port
+                    // of that endpoint, with the pool's id as the whole path.
+                    let expected_issuer = format!("https://{}/{}", issuer_authority(), pool.id);
 
                     for member in ["IdToken", "AccessToken"] {
                         let token = result[member]

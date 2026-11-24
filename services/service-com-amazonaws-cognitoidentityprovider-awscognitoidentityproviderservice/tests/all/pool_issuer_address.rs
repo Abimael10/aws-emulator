@@ -8,11 +8,13 @@
 //!
 //! > A pool's token issuer is a URL its relying parties FETCH — the `iss` claim of every
 //! > token it mints is the discovery root a verifier reads `<iss>/.well-known/jwks.json`
-//! > from — so it names the endpoint of THIS emulator the pool was created through, with
-//! > the pool's id as the whole path, and the documents it announces are served there. Only
-//! > a pool created by a client that resolves AWS's own hostnames, on an emulator that is
-//! > served on no port at all, has no address of this emulator to publish, and announces
-//! > the regional form its model documents instead.
+//! > from — so its host carries the user-pool issuer FORM (`cognito-idp.<region>`, with the
+//! > `issuer-` label in front of it for the `UPDATED` issuer type) in the DNS ZONE the
+//! > endpoint of THIS emulator the pool was created through is reached under, on that
+//! > endpoint's port, with the pool's id as the whole path, and the documents it announces
+//! > are served there. Only a pool created by a client that resolves AWS's own hostnames, on
+//! > an emulator that is served on no port at all, has no endpoint of this emulator to
+//! > publish, and announces the zone its model documents instead.
 //!
 //! The rows span what the rule generalises over: the endpoint the creating request was
 //! addressed at (an IPv4 loopback literal with a port, a loopback NAME on another port, a
@@ -76,9 +78,13 @@ struct Row {
     /// The `IssuerConfiguration.Type` the create asks for, or `None` for a pool that
     /// configures none.
     issuer_type: Option<&'static str>,
-    /// Whether the creating client resolves nothing but the endpoint it reached, which is
-    /// the address the pool then publishes.
+    /// Whether the creating client resolves nothing but the endpoint it reached, whose zone
+    /// and port the pool then publishes its issuer in.
     reaches_only_the_emulator: bool,
+    /// The authority the issuer must carry for such a client: its documented host form over
+    /// the zone that endpoint is reached under, on that endpoint's own port. Empty for a row
+    /// whose client resolves AWS's own hostnames, which is given the documented zone.
+    announced_authority: &'static str,
 }
 
 fn rows() -> Vec<Row> {
@@ -90,6 +96,7 @@ fn rows() -> Vec<Row> {
             region: "us-west-2",
             issuer_type: None,
             reaches_only_the_emulator: true,
+            announced_authority: "cognito-idp.us-west-2.localhost:45923",
         },
         Row {
             case: "the same endpoint named by its loopback NAME on another port",
@@ -97,6 +104,7 @@ fn rows() -> Vec<Row> {
             region: "eu-west-1",
             issuer_type: Some("ORIGINAL"),
             reaches_only_the_emulator: true,
+            announced_authority: "cognito-idp.eu-west-1.localhost:9297",
         },
         Row {
             case: "the same endpoint named by a bracketed IPv6 literal",
@@ -104,6 +112,7 @@ fn rows() -> Vec<Row> {
             region: "ap-southeast-2",
             issuer_type: Some("UPDATED"),
             reaches_only_the_emulator: true,
+            announced_authority: "issuer-cognito-idp.ap-southeast-2.localhost:9297",
         },
         Row {
             case: "a client that resolves AWS's own hosts: this service's regional endpoint",
@@ -111,6 +120,7 @@ fn rows() -> Vec<Row> {
             region: "us-east-1",
             issuer_type: None,
             reaches_only_the_emulator: false,
+            announced_authority: "",
         },
         Row {
             case: "a client that resolves AWS's own hosts, with the updated issuer in \
@@ -119,6 +129,7 @@ fn rows() -> Vec<Row> {
             region: "eu-north-1",
             issuer_type: Some("UPDATED"),
             reaches_only_the_emulator: false,
+            announced_authority: "",
         },
         Row {
             case: "a request naming no host at all, which addresses no endpoint to publish",
@@ -126,6 +137,7 @@ fn rows() -> Vec<Row> {
             region: "us-east-2",
             issuer_type: None,
             reaches_only_the_emulator: false,
+            announced_authority: "",
         },
     ]
 }
@@ -355,9 +367,9 @@ async fn a_pool_publishes_its_issuer_on_the_endpoint_it_was_created_through() {
         let case = row.case;
         let (user_pool_id, result) = signed_in(&router, row, index).await;
 
-        let expected = match (row.reaches_only_the_emulator, row.host) {
-            (true, Some(host)) => format!("https://{host}/{user_pool_id}"),
-            _ => documented_issuer(row.region, row.issuer_type, &user_pool_id),
+        let expected = match row.reaches_only_the_emulator {
+            true => format!("https://{}/{user_pool_id}", row.announced_authority),
+            false => documented_issuer(row.region, row.issuer_type, &user_pool_id),
         };
 
         // Both signed tokens of one sign-in announce that issuer.
@@ -423,13 +435,13 @@ async fn a_pool_publishes_its_issuer_on_the_endpoint_it_was_created_through() {
     }
 }
 
-/// A pool created through this emulator's own endpoint publishes its issuer on THAT
-/// endpoint — the one authority the creating client resolves — rather than on a host
-/// nothing on this machine resolves.
+/// A pool created through this emulator's own endpoint publishes its issuer in the ZONE
+/// that endpoint is reached under — a zone a resolver answers with the interface this
+/// emulator binds — rather than in a zone nothing on this machine resolves to it.
 ///
 /// The assertion the recorded case needs, stated on its own so a failure says WHICH part of
-/// the address is wrong: the authority is the one the create reached, the whole path is the
-/// pool's id, and no AWS endpoint zone is named.
+/// the address is wrong: the host carries the user-pool issuer form over that zone and the
+/// endpoint's own port, the whole path is the pool's id, and no AWS endpoint zone is named.
 #[tokio::test]
 async fn an_issuer_published_to_a_local_client_is_the_endpoint_it_reached() {
     let router = router();
@@ -440,7 +452,7 @@ async fn an_issuer_published_to_a_local_client_is_the_endpoint_it_reached() {
         .filter(|(_, row)| row.reaches_only_the_emulator)
     {
         let case = row.case;
-        let host = row.host.expect("a row reaching only the emulator names a host");
+        let reached = row.host.expect("a row reaching only the emulator names a host");
         let (user_pool_id, result) = signed_in(&router, row, 100 + index).await;
         let token = result["IdToken"]
             .as_str()
@@ -455,9 +467,9 @@ async fn an_issuer_published_to_a_local_client_is_the_endpoint_it_reached() {
             .split_once('/')
             .unwrap_or_else(|| panic!("case {case:?}: expected a path, got {announced:?}"));
         assert_eq!(
-            authority, host,
-            "case {case:?}: the issuer must be published on the endpoint the create \
-             reached, got {announced:?}"
+            authority, row.announced_authority,
+            "case {case:?}: the issuer must carry the user-pool issuer form in the zone the \
+             create's endpoint ({reached}) is reached under, got {announced:?}"
         );
         assert_eq!(
             path, user_pool_id,

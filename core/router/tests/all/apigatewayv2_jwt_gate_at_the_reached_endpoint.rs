@@ -14,9 +14,10 @@
 //! > A user pool announces its token issuer at the endpoint it was CREATED through, so the
 //! > issuer a relying party composes from the endpoint it dialled and the pool's id — the
 //! > documented `https://cognito-idp.{region}.amazonaws.com/{userPoolId}` for a caller that
-//! > resolves AWS's own hostnames, and this emulator's own address for a caller that
-//! > resolves only it — is the `iss` claim that pool's tokens carry, and the verification
-//! > material (the OpenID Connect discovery document and the key set) is published under
+//! > resolves AWS's own hostnames, and that same host form in the DNS zone of this
+//! > emulator's own endpoint for a caller that resolves only it — is the `iss` claim that
+//! > pool's tokens carry, and the verification material (the OpenID Connect discovery
+//! > document and the key set) is published under
 //! > it. A route whose `AuthorizationType` is `JWT` therefore admits a request to its
 //! > integration exactly when the token at the authorizer's identity source is a signed JWT
 //! > whose `iss` is that authorizer's `Issuer` (compared as a base URI, so a trailing `/`
@@ -101,6 +102,12 @@ struct Addressing {
     cognito_host: &'static str,
     /// The authority the API Gateway V2 control plane is dialled at.
     control_host: &'static str,
+    /// The AUTHORITY of the issuer a pool created at [`Addressing::cognito_host`] announces:
+    /// the user-pool issuer host form (`cognito-idp.<region>`) in the DNS zone that endpoint
+    /// is reached under, on its port — the documented `amazonaws.com` zone for a client that
+    /// resolves AWS's own hostnames, and the loopback zone for an endpoint of this emulator,
+    /// which is a name a resolver answers with the interface the core binds on.
+    issuer_authority: &'static str,
 }
 
 /// The addresses the rows run at, each named so the test that drives it says which one it
@@ -110,16 +117,19 @@ const LOOPBACK_ENDPOINT: Addressing = Addressing {
     case: "a loopback address with a port, which is how this emulator is reached",
     cognito_host: "127.0.0.1:9297",
     control_host: "127.0.0.1:9297",
+    issuer_authority: "cognito-idp.us-west-2.localhost:9297",
 };
 const NAMED_LOCAL_ENDPOINT: Addressing = Addressing {
     case: "a named local endpoint with a port",
     cognito_host: "localhost:4566",
     control_host: "localhost:4566",
+    issuer_authority: "cognito-idp.us-west-2.localhost:4566",
 };
 const PUBLISHED_REGIONAL_HOSTS: Addressing = Addressing {
     case: "each service's own published regional host",
     cognito_host: "cognito-idp.us-west-2.amazonaws.com",
     control_host: "apigateway.us-west-2.amazonaws.com",
+    issuer_authority: "cognito-idp.us-west-2.amazonaws.com",
 };
 
 /// One request dispatched through the router, and what came back.
@@ -564,18 +574,18 @@ async fn the_gate_at(addressing: &Addressing) {
         let admitted_token = access_tokens[0].clone();
         let second_client_token = access_tokens[1].clone();
 
-        // The issuer a relying party composes: the endpoint it dialled, with the pool's id
-        // as the path — which for a caller that resolves AWS's own hostnames is the
-        // documented `https://cognito-idp.{region}.amazonaws.com/{userPoolId}`
-        // (`JWTConfiguration$Issuer`), and for a client of this emulator is the address it
-        // can actually reach.
-        let issuer = format!("https://{}/{pool_id}", addressing.cognito_host);
+        // The issuer the pool announces, which is what a relying party composes from the
+        // endpoint it dialled and the pool's id: the documented
+        // `https://cognito-idp.{region}.amazonaws.com/{userPoolId}`
+        // (`JWTConfiguration$Issuer`) for a caller that resolves AWS's own hostnames, and
+        // the same host form in the zone of the endpoint a client of this emulator reached.
+        let issuer = format!("https://{}/{pool_id}", addressing.issuer_authority);
         let (header, claims) = parts_of(&admitted_token);
         assert_eq!(
             claims.get("iss").and_then(Value::as_str),
             Some(issuer.as_str()),
-            "case {case:?}: the pool's access token must name the issuer a client composes \
-             from the endpoint it created the pool through, got {claims}"
+            "case {case:?}: the pool's access token must name the issuer the pool announces \
+             for the endpoint it was created through, got {claims}"
         );
         // An ACCESS token names its client in `client_id` rather than in `aud`, which is
         // the audience a JWT authorizer of a user pool matches.

@@ -176,6 +176,11 @@ struct Addressing {
     /// Whether that client resolves nothing but the endpoint it reached, which is what decides
     /// the form of the address the minted api announces.
     reaches_only_the_emulator: bool,
+    /// The AUTHORITY of the issuer a pool created at [`Addressing::cognito_host`] announces:
+    /// the user-pool issuer host form (`cognito-idp.<region>`) in the DNS zone that endpoint
+    /// is reached under, on its port — the documented `amazonaws.com` zone for a client that
+    /// resolves AWS's own hostnames, and the loopback zone for an endpoint of this emulator.
+    issuer_authority: &'static str,
 }
 
 const LOOPBACK_ENDPOINT: Addressing = Addressing {
@@ -183,18 +188,21 @@ const LOOPBACK_ENDPOINT: Addressing = Addressing {
     cognito_host: "127.0.0.1:45923",
     control_host: "127.0.0.1:45923",
     reaches_only_the_emulator: true,
+    issuer_authority: "cognito-idp.us-east-1.localhost:45923",
 };
 const NAMED_LOCAL_ENDPOINT: Addressing = Addressing {
     case: "the same endpoint named by its loopback NAME, on another port",
     cognito_host: "localhost:9297",
     control_host: "localhost:9297",
     reaches_only_the_emulator: true,
+    issuer_authority: "cognito-idp.us-east-1.localhost:9297",
 };
 const PUBLISHED_REGIONAL_HOSTS: Addressing = Addressing {
     case: "a client that resolves AWS's own hosts: each service's own regional host",
     cognito_host: "cognito-idp.us-east-1.amazonaws.com",
     control_host: "apigateway.us-east-1.amazonaws.com",
     reaches_only_the_emulator: false,
+    issuer_authority: "cognito-idp.us-east-1.amazonaws.com",
 };
 
 /// What a dialled address answered: its status, the front door's error code, the header the
@@ -837,17 +845,18 @@ async fn the_jwt_surface_at(addressing: &Addressing) {
     let admitted_token = access_tokens[0].clone();
     let second_client_token = access_tokens[1].clone();
 
-    // The issuer a relying party composes: the endpoint it dialled, with the pool's id as the
-    // path — which for a caller that resolves AWS's own hostnames is the documented
-    // `https://cognito-idp.{region}.amazonaws.com/{userPoolId}` (`JWTConfiguration$Issuer`),
-    // and for a client of this emulator is the address it can actually reach.
-    let issuer = format!("https://{}/{pool_id}", addressing.cognito_host);
+    // The issuer the pool announces, which is what a relying party composes from the endpoint
+    // it dialled and the pool's id — the documented
+    // `https://cognito-idp.{region}.amazonaws.com/{userPoolId}` (`JWTConfiguration$Issuer`) for
+    // a caller that resolves AWS's own hostnames, and the same host form in the zone of the
+    // endpoint a client of this emulator reached.
+    let issuer = format!("https://{}/{pool_id}", addressing.issuer_authority);
     let (header, claims) = parts_of(&admitted_token);
     assert_eq!(
         claims.get("iss").and_then(Value::as_str),
         Some(issuer.as_str()),
-        "case {case:?}: the pool's access token must name the issuer a client composes from \
-         the endpoint it created the pool through, got {claims}"
+        "case {case:?}: the pool's access token must name the issuer the pool announces for \
+         the endpoint it was created through, got {claims}"
     );
     // An ACCESS token names its client in `client_id` rather than in `aud`, which is the
     // audience a JWT authorizer of a user pool matches.

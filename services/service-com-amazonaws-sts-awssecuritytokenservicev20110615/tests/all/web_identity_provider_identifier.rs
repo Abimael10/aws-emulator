@@ -16,9 +16,10 @@
 //! `iam:CreateOpenIDConnectProvider` and the role's trust policy is the document
 //! `iam:CreateRole` stored. The rows differ along what the rule generalises over — which
 //! issuer the token names, in each part the identifier is built from: the HOST (a pool
-//! created through this emulator's own address publishes an issuer on it, one created
-//! through the service's regional endpoint publishes the documented host), the PORT that
-//! address carries, and the PATH, which is the pool's own id.
+//! publishes the user-pool issuer host form of its Region, in the DNS zone of the endpoint
+//! it was created through — the documented `amazonaws.com` zone for a pool created at the
+//! service's regional endpoint, and the loopback zone for one created at this emulator's own
+//! address), the PORT that address carries, and the PATH, which is the pool's own id.
 //!
 //! The issuer that carries NO scheme to drop — `cognito-identity.amazonaws.com`, which
 //! every identity pool's own tokens name — is reported unchanged by the same derivation;
@@ -36,17 +37,25 @@ use super::web_identity_verification::{
 };
 
 /// The regional endpoint of the user-pool service, the host a client that resolves AWS's
-/// own hostnames reaches a pool at — and the host a pool created through it publishes its
-/// issuer on.
+/// own hostnames reaches a pool at — and, for a pool created through it on an emulator
+/// served on no port, the authority that pool publishes its issuer on.
 const REGIONAL_COGNITO_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 
 /// This emulator's own address, which names no service: a pool created through it publishes
-/// its token issuer there, so its issuer carries a PORT — the shape an issuer has for every
-/// client pointed at a locally served emulator.
+/// its token issuer in the zone that address is reached under, so its issuer carries a
+/// PORT — the shape an issuer has for every client pointed at a locally served emulator.
 const EMULATOR_AUTHORITY: &str = "127.0.0.1:9297";
+
+/// The authority such a pool announces for [`EMULATOR_AUTHORITY`]: the user-pool issuer host
+/// form of the pool's Region in the loopback zone, which a resolver answers with the
+/// interface this emulator binds on, on that address's own port.
+const EMULATOR_ISSUER_AUTHORITY: &str = "cognito-idp.us-east-1.localhost:9297";
 
 /// The same emulator bound on another port, so nothing is keyed to one of them.
 const OTHER_EMULATOR_AUTHORITY: &str = "127.0.0.1:18443";
+
+/// The authority a pool created through [`OTHER_EMULATOR_AUTHORITY`] announces.
+const OTHER_EMULATOR_ISSUER_AUTHORITY: &str = "cognito-idp.us-east-1.localhost:18443";
 
 /// The scheme an OpenID Connect issuer URL carries, and the one thing the provider
 /// identifier never has: "The URL must begin with https://"
@@ -81,9 +90,9 @@ struct Registered {
     provider_arn: String,
 }
 
-/// Sign in to a pool of its own, created through the endpoint `host` — which is the
-/// authority its token issuer names — register that issuer as an OpenID Connect provider of
-/// the account, and create a role admitting that provider for the token's audience.
+/// Sign in to a pool of its own, created through the endpoint `host` — whose zone and port
+/// its token issuer names — register that issuer as an OpenID Connect provider of the
+/// account, and create a role admitting that provider for the token's audience.
 async fn register(router: &MultiServiceRouter, name: &str, host: &str) -> Registered {
     let signed_in = sign_in_at(router, name, host).await;
     let provider_arn = register_provider(router, &signed_in.issuer, &signed_in.client_id).await;
@@ -111,13 +120,14 @@ async fn register(router: &MultiServiceRouter, name: &str, host: &str) -> Regist
 async fn the_exchange_reports_the_issuer_without_its_scheme() {
     let (router, _engine) = emulator_with_providers();
 
-    // One row: the case, the pool, and the endpoint the pool is created through — which is
-    // the authority its token issuer names, and so the part of the identifier before the
+    // One row: the case, the pool, the endpoint the pool is created through, and the
+    // authority its token issuer therefore names — the part of the identifier before the
     // pool's own id.
-    let rows: Vec<(&str, &str, &str)> = vec![
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
         (
             "a pool at the service's regional endpoint",
             "provider-regional",
+            REGIONAL_COGNITO_HOST,
             REGIONAL_COGNITO_HOST,
         ),
         (
@@ -126,6 +136,7 @@ async fn the_exchange_reports_the_issuer_without_its_scheme() {
             "another pool at the same endpoint",
             "provider-regional-second",
             REGIONAL_COGNITO_HOST,
+            REGIONAL_COGNITO_HOST,
         ),
         (
             // The shape a client pointed at a locally served emulator sees: the authority
@@ -133,22 +144,25 @@ async fn the_exchange_reports_the_issuer_without_its_scheme() {
             "a pool at this emulator's own address, which carries a port",
             "provider-loopback",
             EMULATOR_AUTHORITY,
+            EMULATOR_ISSUER_AUTHORITY,
         ),
         (
             "a pool at the same address on another port",
             "provider-loopback-other-port",
             OTHER_EMULATOR_AUTHORITY,
+            OTHER_EMULATOR_ISSUER_AUTHORITY,
         ),
     ];
 
-    for (case, pool_name, host) in rows {
+    for (case, pool_name, host, issuer_authority) in rows {
         let registered = register(&router, pool_name, host).await;
         let issuer = registered.signed_in.issuer.clone();
         let expected = provider_identifier(&issuer);
         assert!(
-            issuer.starts_with(ISSUER_SCHEME) && issuer.contains(host),
-            "case {case:?}: expected the pool to publish an issuer at {host:?}, got \
-             {issuer:?}"
+            issuer.starts_with(ISSUER_SCHEME)
+                && expected.starts_with(&format!("{issuer_authority}/")),
+            "case {case:?}: expected the pool created at {host:?} to publish an issuer on \
+             {issuer_authority:?}, got {issuer:?}"
         );
         let (status, body) = exchange(
             &router,

@@ -9,10 +9,12 @@
 //!
 //! > A pool's token issuer is a URL its relying parties DEREFERENCE — every token it mints
 //! > carries it as `iss`, and a verifier reads `<iss>/.well-known/openid-configuration` and
-//! > `<iss>/.well-known/jwks.json` from it — so its authority is an address THIS emulator
-//! > answers on: the endpoint the creating request reached when that endpoint is the
-//! > emulator's own, and otherwise the address this emulator is served at. Its whole path is
-//! > the pool's id, and both documents are served there.
+//! > `<iss>/.well-known/jwks.json` from it — so its host carries the user-pool issuer FORM
+//! > (`cognito-idp.<region>`, with the `issuer-` label in front of it for the `UPDATED`
+//! > issuer type) in a DNS ZONE that resolves to THIS emulator, on the port it answers on:
+//! > the zone and port of the endpoint the creating request reached when that endpoint is
+//! > the emulator's own, and otherwise of the address this emulator is served at. Its whole
+//! > path is the pool's id, and both documents are served there.
 //!
 //! The issuer is token content, which this service's model does not describe:
 //! `IssuerConfigurationType.Type`
@@ -62,6 +64,11 @@ const SERVED_BASE: &str = "https://127.0.0.1:9297";
 /// request that addressed no endpoint of this emulator publishes its issuer on.
 const SERVED_AUTHORITY: &str = "127.0.0.1:9297";
 
+/// The DNS zone an endpoint of this emulator addressed as an ADDRESS is announced in: RFC
+/// 6761 reserves it, and every name under it, for the loopback interface the core binds on
+/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`).
+const LOOPBACK_ZONE: &str = "localhost";
+
 /// One row: the host the creating request addressed, the Region it is signed for, the issuer
 /// type it configures, and the authority the pool therefore publishes its issuer on.
 struct Row {
@@ -72,8 +79,9 @@ struct Row {
     /// The `IssuerConfiguration.Type` the create asks for, or `None` for a pool that
     /// configures none.
     issuer_type: Option<&'static str>,
-    /// The authority the issuer must name: the endpoint the create reached when that is an
-    /// endpoint of this emulator, and the served address otherwise.
+    /// The authority the issuer must name: the user-pool issuer form over the zone and port
+    /// of the endpoint the create reached when that is an endpoint of this emulator, and of
+    /// the served address otherwise.
     expected_authority: &'static str,
 }
 
@@ -84,21 +92,21 @@ fn rows() -> Vec<Row> {
             host: Some(SERVED_AUTHORITY),
             region: "us-west-2",
             issuer_type: None,
-            expected_authority: SERVED_AUTHORITY,
+            expected_authority: "cognito-idp.us-west-2.localhost:9297",
         },
         Row {
             case: "a client configured with another local address of this emulator",
             host: Some("localhost:7001"),
             region: "eu-west-1",
             issuer_type: Some("ORIGINAL"),
-            expected_authority: "localhost:7001",
+            expected_authority: "cognito-idp.eu-west-1.localhost:7001",
         },
         Row {
             case: "a client configured with a bracketed IPv6 address of this emulator",
             host: Some("[::1]:9443"),
             region: "ap-southeast-2",
             issuer_type: Some("UPDATED"),
-            expected_authority: "[::1]:9443",
+            expected_authority: "issuer-cognito-idp.ap-southeast-2.localhost:9443",
         },
         Row {
             case: "the recorded case: a client that resolves AWS's own hostnames, on this \
@@ -106,14 +114,14 @@ fn rows() -> Vec<Row> {
             host: Some("cognito-idp.us-west-2.amazonaws.com"),
             region: "us-west-2",
             issuer_type: None,
-            expected_authority: SERVED_AUTHORITY,
+            expected_authority: "cognito-idp.us-west-2.localhost:9297",
         },
         Row {
             case: "the same, with the updated issuer type in another Region",
             host: Some("cognito-idp.eu-north-1.amazonaws.com"),
             region: "eu-north-1",
             issuer_type: Some("UPDATED"),
-            expected_authority: SERVED_AUTHORITY,
+            expected_authority: "issuer-cognito-idp.eu-north-1.localhost:9297",
         },
         Row {
             case: "an in-process call of another service, addressed at that service's \
@@ -121,14 +129,14 @@ fn rows() -> Vec<Row> {
             host: Some("cloudformation.us-east-1.amazonaws.com"),
             region: "us-east-1",
             issuer_type: Some("ORIGINAL"),
-            expected_authority: SERVED_AUTHORITY,
+            expected_authority: "cognito-idp.us-east-1.localhost:9297",
         },
         Row {
             case: "a request naming no host at all",
             host: None,
             region: "us-east-2",
             issuer_type: None,
-            expected_authority: SERVED_AUTHORITY,
+            expected_authority: "cognito-idp.us-east-2.localhost:9297",
         },
     ]
 }
@@ -323,11 +331,12 @@ async fn a_served_pool_publishes_an_issuer_this_emulator_answers_on() {
 
 /// No pool of a served emulator announces an issuer under a zone AWS publishes its own
 /// endpoints in: such a host answers nowhere near this process, so nothing a client of this
-/// emulator holds could ever fetch the issuer's documents.
+/// emulator holds could ever fetch the issuer's documents. What it announces instead is a
+/// name a resolver answers with the interface this emulator binds on, on a port it answers.
 ///
-/// The zone list is the workspace's own
-/// (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`), read through the
-/// predicate every announced address is judged by, rather than spelled out again here.
+/// The zone list and the loopback reading are the workspace's own
+/// (`service_common::data_plane_addressing`), read through the predicates every announced
+/// address is judged by, rather than spelled out again here.
 #[tokio::test]
 async fn a_served_pool_announces_no_aws_endpoint_host() {
     let router = router();
@@ -350,6 +359,17 @@ async fn a_served_pool_announces_no_aws_endpoint_host() {
             !service_common::data_plane_addressing::addresses_an_aws_endpoint(authority),
             "case {case:?}: a served emulator must publish an issuer on an address it answers \
              on, got {announced:?}"
+        );
+        assert!(
+            service_common::data_plane_addressing::names_the_loopback_interface(authority),
+            "case {case:?}: the issuer's host must be a name the {LOOPBACK_ZONE} zone resolves \
+             to the interface this emulator binds on, got {announced:?}"
+        );
+        assert_eq!(
+            service_common::data_plane_addressing::addressed_port(Some(authority)),
+            service_common::data_plane_addressing::addressed_port(Some(row.expected_authority)),
+            "case {case:?}: the issuer must carry the port the endpoint it publishes is \
+             served on, got {announced:?}"
         );
         assert_eq!(
             path, user_pool_id,
