@@ -209,9 +209,9 @@ async fn limit_and_position_walk_the_collection_exactly_once() {
                 None => break,
                 Some(cursor) => {
                     assert!(
-                        expected.contains(&cursor),
-                        "case {case}: the next position must name a stored validator, \
-                         got {cursor:?}"
+                        expected.iter().all(|id| !cursor.contains(id.as_str())),
+                        "case {case}: the next position is this service's own cursor and \
+                         spells no validator's id, got {cursor:?}"
                     );
                     position = Some(cursor);
                 }
@@ -280,10 +280,12 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
     let (other, other_ids) = api_with_validators(&gateway, "validator-cursor-other", 1).await;
 
     // Rows differ along the form of the cursor: one of an id's own form that no validator
-    // carries, one that is well formed but names a validator of ANOTHER API, one of a form
-    // no id takes, and one far longer than an id.
+    // carries, one that IS the id of a validator of this API (an identifier is not a cursor:
+    // the cursor is a token this service mints for the walk), one that names a validator of
+    // ANOTHER API, one of a form no id takes, and one far longer than an id.
     for (case, cursor) in [
         ("a cursor no validator carries", "zzzzzzzzzz".to_string()),
+        ("the id of a validator of this API", ids[0].clone()),
         ("a cursor from another API", other_ids[0].clone()),
         ("a cursor of a form no id takes", "NOT-AN-ID".to_string()),
         ("a cursor far longer than an id", "q".repeat(64)),
@@ -296,11 +298,24 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
         );
     }
 
-    // A cursor this API's own sequence carries is served, and resumes the page AT it.
-    for (index, id) in ids.iter().enumerate() {
-        let case = format!("GetRequestValidators(position={id})");
+    // A cursor this API's own listing handed out is served, and resumes the page AT the
+    // position it names. The cursors are read off a one-at-a-time walk, because a cursor is
+    // this service's token and not a value a caller can spell.
+    let mut index = 0usize;
+    let mut cursor = String::new();
+    loop {
+        let case = format!("GetRequestValidators(limit=1) page {index}");
+        let query = if cursor.is_empty() {
+            "limit=1".to_string()
+        } else {
+            format!("limit=1&position={cursor}")
+        };
+        let (items, next) = listed_validators(&gateway, &api, &query, &case).await;
+        index += items.len();
+        let Some(next) = next else { break };
+        let case = format!("GetRequestValidators(position=<the cursor of index {index}>)");
         let (items, _) =
-            listed_validators(&gateway, &api, &format!("position={id}&limit=500"), &case).await;
+            listed_validators(&gateway, &api, &format!("position={next}&limit=500"), &case).await;
         let listed: Vec<String> = items
             .iter()
             .map(|item| string_member(item, "id", &case))
@@ -311,7 +326,13 @@ async fn a_position_naming_nothing_in_this_apis_sequence_is_refused() {
             "case {case}: the page resumes at the cursor, expected {:?}, got {listed:?}",
             &ids[index..]
         );
+        cursor = next;
     }
+    assert_eq!(
+        index,
+        ids.len(),
+        "case GetRequestValidators(limit=1): the walk must reach every validator of {ids:?}"
+    );
 
     // The refused cursors took nothing away: the other API still reports its own record.
     let (items, _) = listed_validators(&gateway, &other, "limit=500", "the other API").await;

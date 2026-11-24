@@ -76,7 +76,7 @@
 use super::types::*;
 
 /// The ids of `api`'s authorizers in CREATION ORDER: the stable sequence a `position`
-/// cursor walks and [`crate::state::page_of`] cuts a page out of.
+/// cursor walks and [`crate::state::minted_page_of`] cuts a page out of.
 ///
 /// The rank is the `sequence` `CreateAuthorizer` stores on each record (the same rank
 /// `RestApiEntry::resources_in_creation_order` orders resources by), so a listing
@@ -173,11 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
-        // Creation order is the stable sequence a `position` cursor walks; `page_of`
-        // applies the documented default and maximum page size and refuses a cursor
-        // naming no authorizer of this API.
+        // Creation order is the stable sequence a `position` cursor walks;
+        // `minted_page_of` applies the documented default and maximum page size and refuses
+        // a cursor naming no authorizer of this API.
         let ordered = authorizer_ids_in_creation_order(api);
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[&input.rest_api_id]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetAuthorizersErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),

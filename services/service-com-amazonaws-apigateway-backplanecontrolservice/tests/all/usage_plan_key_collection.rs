@@ -281,33 +281,67 @@ async fn get_usage_plan_keys_pages_through_the_added_order_on_position_and_limit
         );
     }
 
-    // Crossed with every cursor the sequence holds: a page resumes AT the cursor it is
-    // given — the cursor a page hands back is the first id the page did NOT report — so
-    // the page is the sequence from that id on, and a cursor is handed back only while the
-    // sequence holds more.
-    for (index, cursor) in added.iter().enumerate() {
-        let case = format!("GetUsagePlanKeys(position={cursor}, limit=2)");
+    // Crossed with every cursor the collection hands out: a page resumes AT the position
+    // its cursor names — the cursor a page hands back names the first key the page did NOT
+    // report — so the page is the sequence from there on, and a cursor is handed back only
+    // while the sequence holds more. The cursors are read off a one-at-a-time walk, because
+    // a `position` is a continuation token this service mints rather than a key id a caller
+    // reads off the page.
+    let mut cursors: Vec<(usize, String)> = Vec::new();
+    let mut reported = 0usize;
+    let mut position: Option<String> = None;
+    loop {
+        let case = "GetUsagePlanKeys(the cursors of the collection)".to_string();
+        let query = match &position {
+            None => "limit=1".to_string(),
+            Some(cursor) => format!("limit=1&position={cursor}"),
+        };
+        let body = listed(&gateway, &plan, &query).await;
+        reported += listed_ids(&body, &case).len();
+        match body["position"].as_str() {
+            None => break,
+            Some(cursor) => {
+                cursors.push((reported, cursor.to_owned()));
+                position = Some(cursor.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        cursors.len(),
+        total - 1,
+        "case GetUsagePlanKeys(the cursors of the collection): expected a cursor for every \
+         index past the first of {total}, got {cursors:?}"
+    );
+    for (start, cursor) in &cursors {
+        let case = format!("GetUsagePlanKeys(position=<the cursor of index {start}>, limit=2)");
+        assert!(
+            added.iter().all(|id| !cursor.contains(id.as_str())),
+            "case {case}: a cursor spells no key's id, got {cursor:?}"
+        );
         let body = listed(&gateway, &plan, &format!("position={cursor}&limit=2")).await;
         let page = listed_ids(&body, &case);
-        let start = index;
         let end = (start + 2).min(total);
         assert_eq!(
             page,
-            added[start..end].to_vec(),
+            added[*start..end].to_vec(),
             "case {case}: expected {:?}, got {page:?}",
-            &added[start..end]
+            &added[*start..end]
         );
-        let next = added.get(end).cloned();
+        let next = cursors
+            .iter()
+            .find(|(index, _)| *index == end)
+            .map(|(_, cursor)| cursor.clone());
         assert_eq!(
             body["position"].as_str().map(str::to_owned),
             next,
-            "case {case}: expected the cursor {next:?}, got {:?}",
+            "case {case}: expected the cursor of index {end} ({next:?}), got {:?}",
             body["position"]
         );
     }
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page: one
-    // never minted, one id-shaped, and a key id of ANOTHER plan's collection.
+    // A value this service did not issue as a cursor names no position: a bad request
+    // rather than an empty page — one never minted, one id-shaped, a key id of THIS
+    // plan's own collection, and a key id of ANOTHER plan's.
     let other = bare_plan(&gateway, "key-collection-paging-other").await;
     let stranger = string_member(
         &create_key(&gateway, "a key of another plan", json!({ "name": "stranger" })).await,
@@ -315,7 +349,13 @@ async fn get_usage_plan_keys_pages_through_the_added_order_on_position_and_limit
         "a key of another plan",
     );
     meter_key(&gateway, &other, &stranger).await;
-    for cursor in ["nosuchcursor", "0000000000", stranger.as_str()] {
+    let own = added[1].clone();
+    for cursor in [
+        "nosuchcursor",
+        "0000000000",
+        own.as_str(),
+        stranger.as_str(),
+    ] {
         let answer = list_keys(&gateway, &plan, &format!("position={cursor}")).await;
         assert_failure(
             &answer,
@@ -524,10 +564,17 @@ async fn the_collection_follows_the_stored_associations_and_a_read_changes_nothi
     // Every shape of read this collection serves, none of which may change what a later
     // caller sees.
     let before = listed(&gateway, &plan, "").await;
+    let first_page = listed(&gateway, &plan, "limit=1").await;
+    let cursor = first_page["position"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case GetUsagePlanKeys(limit=1): expected a cursor, got {first_page:?}")
+        })
+        .to_string();
     let queries = [
         String::new(),
         "limit=1".to_string(),
-        format!("limit=2&position={}", expected[1]),
+        format!("limit=2&position={cursor}"),
         "name=late".to_string(),
         "name=nosuchname".to_string(),
     ];

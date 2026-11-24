@@ -34,7 +34,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
 };
 
 use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
-use crate::vpc_links::{create_vpc_link, get_vpc_link, target_arn};
+use crate::vpc_links::{create_vpc_link, get_vpc_link, settled_link, target_arn};
 
 /// The default page size API Gateway applies when a request names no `limit`, and the
 /// largest it accepts — from `GetVpcLinksRequest$limit`'s own documentation, "The maximum
@@ -277,34 +277,75 @@ async fn get_vpc_links_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // Crossed with every cursor the sequence holds: a page resumes AT the cursor it is
-    // given — the cursor a page hands back is the first id the page did NOT report — so
-    // the page is the sequence from that id on, and a cursor is handed back only while the
-    // sequence holds more.
-    for (index, cursor) in created.iter().enumerate() {
-        let case = format!("GetVpcLinks(position={cursor}, limit=2)");
+    // Crossed with every cursor the collection hands out: a page resumes AT the position
+    // its cursor names — the cursor a page hands back names the first link the page did NOT
+    // report — so the page is the sequence from there on, and a cursor is handed back only
+    // while the sequence holds more. The cursors are read off a one-at-a-time walk, because
+    // a `position` is a continuation token this service mints rather than a link id a caller
+    // reads off the page.
+    let mut cursors: Vec<(usize, String)> = Vec::new();
+    let mut reported = 0usize;
+    let mut position: Option<String> = None;
+    loop {
+        let case = "GetVpcLinks(the cursors of the collection)".to_string();
+        let query = match &position {
+            None => "limit=1".to_string(),
+            Some(cursor) => format!("limit=1&position={cursor}"),
+        };
+        let body = listed(&gateway, &query).await;
+        reported += listed_ids(&body, &case).len();
+        match body["position"].as_str() {
+            None => break,
+            Some(cursor) => {
+                cursors.push((reported, cursor.to_owned()));
+                position = Some(cursor.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        cursors.len(),
+        total - 1,
+        "case GetVpcLinks(the cursors of the collection): expected a cursor for every index \
+         past the first of {total}, got {cursors:?}"
+    );
+    for (start, cursor) in &cursors {
+        let case = format!("GetVpcLinks(position=<the cursor of index {start}>, limit=2)");
+        assert!(
+            created.iter().all(|id| !cursor.contains(id.as_str())),
+            "case {case}: a cursor spells no link's id, got {cursor:?}"
+        );
         let body = listed(&gateway, &format!("position={cursor}&limit=2")).await;
         let page = listed_ids(&body, &case);
-        let start = index;
         let end = (start + 2).min(total);
         assert_eq!(
             page,
-            created[start..end].to_vec(),
+            created[*start..end].to_vec(),
             "case {case}: expected {:?}, got {page:?}",
-            &created[start..end]
+            &created[*start..end]
         );
-        let next = created.get(end).cloned();
+        let next = cursors
+            .iter()
+            .find(|(index, _)| *index == end)
+            .map(|(_, cursor)| cursor.clone());
         assert_eq!(
             body["position"].as_str().map(str::to_owned),
             next,
-            "case {case}: expected the cursor {next:?}, got {:?}",
+            "case {case}: expected the cursor of index {end} ({next:?}), got {:?}",
             body["position"]
         );
     }
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page: an
-    // unminted id, an id of another form, and a link's NAME rather than its id.
-    for cursor in ["nosuchcursor", "0000000000", "collection-link-a"] {
+    // A value this service did not issue as a cursor names no position: a bad request
+    // rather than an empty page — an unminted id, an id of another form, a link's NAME,
+    // and a link's own id, since the cursor is the service's token rather than an
+    // identifier a caller holds.
+    let own_id = created[1].clone();
+    for cursor in [
+        "nosuchcursor",
+        "0000000000",
+        "collection-link-a",
+        own_id.as_str(),
+    ] {
         let answer = list_links(&gateway, &format!("position={cursor}")).await;
         assert_failure(
             &answer,
@@ -373,18 +414,36 @@ async fn the_collection_holds_exactly_the_links_the_account_still_has() {
 async fn listing_vpc_links_does_not_change_what_a_later_caller_sees() {
     let gateway = Gateway::new();
     let created = created_links(&gateway, &link_table()).await;
-    // Past the provisioning span the records have settled, so the only member the clock
-    // could move is already where it stays and two listings must be identical.
-    tokio::time::sleep(VPC_LINK_PROVISION_SPAN + MARGIN).await;
+    // The provisioning is a transition the CLOCK owes, so this LOOKS AGAIN until every link
+    // reports itself settled (the suite family's one poll, `settled_link`) rather than
+    // waiting a span out: once they have settled, the only member the clock could move is
+    // already where it stays and two listings must be identical.
+    for id in &created {
+        let _ = settled_link(&gateway, id, "GetVpcLinks(the links settling)").await;
+    }
 
     let before = listed(&gateway, "").await;
+    // The cursors a walk of one at a time hands out, which are the only `position` values a
+    // caller can send: the first page's and the one that resumes at the last link.
+    let first_page = listed(&gateway, "limit=1").await;
+    let after_first = first_page["position"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case GetVpcLinks(limit=1): expected a cursor, got {first_page:?}"))
+        .to_string();
+    let before_last = listed(&gateway, &format!("limit={}", created.len() - 1)).await;
+    let at_last = before_last["position"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case GetVpcLinks(all but the last): expected a cursor, got {before_last:?}")
+        })
+        .to_string();
     // Every shape of read this collection serves: the whole sequence, a page of it, a page
     // from a cursor, the last page, and a page past the published maximum size.
     let queries = [
         String::new(),
         "limit=1".to_string(),
-        format!("limit=2&position={}", created[1]),
-        format!("position={}", created[created.len() - 1]),
+        format!("limit=2&position={after_first}"),
+        format!("position={at_last}"),
         format!("limit={}", MAX_PAGE_LIMIT + 1),
     ];
     for query in &queries {

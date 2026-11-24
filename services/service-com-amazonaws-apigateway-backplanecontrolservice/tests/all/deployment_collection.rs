@@ -271,11 +271,34 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // A cursor is the id of the first deployment the previous page did NOT hand out, so a
-    // page requested at one lists the collection FROM that deployment on.
-    for (index, cursor) in created.iter().enumerate() {
-        let case = format!("position={cursor}");
-        let answer = get_deployments(&gateway, &api, &format!("?position={cursor}")).await;
+    // A cursor names the first deployment the previous page did NOT hand out, so a page
+    // requested at one lists the collection FROM that deployment on. The cursors are read
+    // off a one-at-a-time walk, because a `position` is a continuation token this service
+    // mints for the walk rather than a deployment id a caller reads off the page.
+    let mut index = 0usize;
+    let mut cursor: Option<String> = None;
+    loop {
+        let case = format!("GetDeployments(limit=1) page {index}");
+        let query = match &cursor {
+            None => "?limit=1".to_string(),
+            Some(position) => format!("?limit=1&position={position}"),
+        };
+        let answer = get_deployments(&gateway, &api, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        index += page_items(&answer.body, &case).len();
+        let Some(next) = answer.body["position"].as_str().map(str::to_owned) else {
+            break;
+        };
+        assert!(
+            created.iter().all(|id| !next.contains(id.as_str())),
+            "case {case}: a cursor spells no deployment's id, got {next:?}"
+        );
+        let case = format!("position=<the cursor of index {index}>");
+        let answer = get_deployments(&gateway, &api, &format!("?position={next}")).await;
         assert_eq!(
             answer.status, 200,
             "case {case}: expected 200, got {} with {:?}",
@@ -287,10 +310,19 @@ async fn get_deployments_pages_through_creation_order_on_position_and_limit() {
             "case {case}: expected the collection from the cursor on, got {:?}",
             answer.body
         );
+        cursor = Some(next);
     }
+    assert_eq!(
+        index,
+        created.len(),
+        "case GetDeployments(limit=1): the walk must reach every deployment of {created:?}"
+    );
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page.
-    for cursor in ["nosuchcursor", "0123456789", "ZZZZZZ"] {
+    // A value this service did not issue as a cursor names no position, so it is a bad
+    // request rather than an empty page — a deployment's own id among them, since the
+    // cursor is the service's token and not an identifier a caller holds.
+    let own_id = created[1].clone();
+    for cursor in ["nosuchcursor", "0123456789", "ZZZZZZ", own_id.as_str()] {
         assert_failure(
             &get_deployments(&gateway, &api, &format!("?position={cursor}")).await,
             400,
@@ -649,11 +681,25 @@ async fn listing_the_deployments_does_not_change_what_a_later_caller_sees() {
     )
     .await;
 
+    // The cursor the first page of one hands back, which is the only `position` a caller
+    // can send: this service mints it rather than a caller spelling it.
+    let first_page = get_deployments(&gateway, &api, "?limit=1").await;
+    let cursor = first_page.body["position"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case GetDeployments(limit=1): expected a cursor while a deployment remains, \
+                 got {:?}",
+                first_page.body
+            )
+        })
+        .to_string();
+
     let mut seen: Vec<Value> = Vec::new();
     for round in 0..3 {
         // Rows: the whole collection, one page of it, and the page after that cursor —
         // no shape of read may move the collection on.
-        for query in ["", "?limit=1", &format!("?position={second}")] {
+        for query in ["", "?limit=1", &format!("?position={cursor}")] {
             let answer = get_deployments(&gateway, &api, query).await;
             assert_eq!(
                 answer.status, 200,

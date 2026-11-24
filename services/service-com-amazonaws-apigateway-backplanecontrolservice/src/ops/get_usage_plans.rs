@@ -160,7 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(key_id) => store.usage_plan_key(id, key_id).is_some(),
             })
             .collect();
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetUsagePlansErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),

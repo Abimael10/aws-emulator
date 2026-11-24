@@ -145,7 +145,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
         let ordered = store.rest_api_ids_in_creation_order();
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetRestApisErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),

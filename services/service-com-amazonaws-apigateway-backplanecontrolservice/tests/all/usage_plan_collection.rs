@@ -257,33 +257,73 @@ async fn get_usage_plans_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // Crossed with every cursor the sequence holds: a page resumes AT the cursor it is
-    // given — the cursor a page hands back is the first id the page did NOT report — so
-    // the page is the sequence from that id on, and a cursor is handed back only while the
-    // sequence holds more.
-    for (index, cursor) in created.iter().enumerate() {
-        let case = format!("GetUsagePlans(position={cursor}, limit=2)");
+    // Crossed with every cursor the collection hands out: a page resumes AT the position
+    // its cursor names — the cursor a page hands back names the first plan the page did NOT
+    // report — so the page is the sequence from there on, and a cursor is handed back only
+    // while the sequence holds more. The cursors are read off a one-at-a-time walk, because
+    // a `position` is a continuation token this service mints rather than a plan id a caller
+    // reads off the page.
+    let mut cursors: Vec<(usize, String)> = Vec::new();
+    let mut reported = 0usize;
+    let mut position: Option<String> = None;
+    loop {
+        let case = "GetUsagePlans(the cursors of the collection)".to_string();
+        let query = match &position {
+            None => "limit=1".to_string(),
+            Some(cursor) => format!("limit=1&position={cursor}"),
+        };
+        let body = listed(&gateway, &query).await;
+        reported += listed_ids(&body, &case).len();
+        match body["position"].as_str() {
+            None => break,
+            Some(cursor) => {
+                cursors.push((reported, cursor.to_owned()));
+                position = Some(cursor.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        cursors.len(),
+        total - 1,
+        "case GetUsagePlans(the cursors of the collection): expected a cursor for every index \
+         past the first of {total}, got {cursors:?}"
+    );
+    for (start, cursor) in &cursors {
+        let case = format!("GetUsagePlans(position=<the cursor of index {start}>, limit=2)");
+        assert!(
+            created.iter().all(|id| !cursor.contains(id.as_str())),
+            "case {case}: a cursor spells no plan's id, got {cursor:?}"
+        );
         let body = listed(&gateway, &format!("position={cursor}&limit=2")).await;
         let page = listed_ids(&body, &case);
-        let start = index;
         let end = (start + 2).min(total);
         assert_eq!(
             page,
-            created[start..end].to_vec(),
+            created[*start..end].to_vec(),
             "case {case}: expected {:?}, got {page:?}",
-            &created[start..end]
+            &created[*start..end]
         );
-        let next = created.get(end).cloned();
+        let next = cursors
+            .iter()
+            .find(|(index, _)| *index == end)
+            .map(|(_, cursor)| cursor.clone());
         assert_eq!(
             body["position"].as_str().map(str::to_owned),
             next,
-            "case {case}: expected the cursor {next:?}, got {:?}",
+            "case {case}: expected the cursor of index {end} ({next:?}), got {:?}",
             body["position"]
         );
     }
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page.
-    for cursor in ["nosuchcursor", "0000000000", "collection-plan-a"] {
+    // A value this service did not issue as a cursor names no position: a bad request
+    // rather than an empty page — a plan's own id and a plan's name among them.
+    let own_id = created[1].clone();
+    for cursor in [
+        "nosuchcursor",
+        "0000000000",
+        "collection-plan-a",
+        own_id.as_str(),
+    ] {
         let answer = list_plans(&gateway, &format!("position={cursor}")).await;
         assert_failure(
             &answer,
@@ -398,12 +438,19 @@ async fn listing_usage_plans_does_not_change_what_a_later_caller_sees() {
     meter_key(&gateway, &created[1], &key).await;
 
     let before = listed(&gateway, "").await;
+    let first_page = listed(&gateway, "limit=1").await;
+    let cursor = first_page["position"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case GetUsagePlans(limit=1): expected a cursor, got {first_page:?}")
+        })
+        .to_string();
     // Every shape of read this collection serves: the whole sequence, a page of it, a
     // page from a cursor, a narrowed sequence, and one narrowed to nothing.
     let queries = [
         String::new(),
         "limit=1".to_string(),
-        format!("limit=2&position={}", created[2]),
+        format!("limit=2&position={cursor}"),
         format!("keyId={key}"),
         "keyId=nosuchkey".to_string(),
     ];

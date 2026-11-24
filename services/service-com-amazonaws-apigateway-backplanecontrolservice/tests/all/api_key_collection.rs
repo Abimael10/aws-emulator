@@ -16,8 +16,9 @@
 //!   key in it: renaming, describing, enabling or disabling a key leaves it where it was;
 //! * it reports one `position`/`limit` page of that sequence at a time, over page sizes
 //!   across the documented range (default 25, maximum 500), each published bound and one
-//!   past each, crossed with every cursor the sequence holds, and a cursor naming nothing
-//!   in the sequence is a bad request rather than an empty page;
+//!   past each, crossed with every cursor the collection hands out, and a value this
+//!   service did not issue as a cursor — a key's own id and its value among them — is a bad
+//!   request rather than an empty page;
 //! * `includeValues` decides whether the page carries each key's secret value, exactly as
 //!   `includeValue` does for a single key's read;
 //! * `nameQuery` narrows the sequence to the keys whose name begins with it and
@@ -111,6 +112,35 @@ fn key_table() -> Vec<(&'static str, Value)> {
             json!({ "name": "alpha-one", "customerId": "customer-a" }),
         ),
     ]
+}
+
+/// The cursor that resumes the collection at each index past its first key, read off a walk
+/// of the collection itself.
+///
+/// A `position` is a continuation token this service mints for the walk — not a value a
+/// caller can spell — so the only way to hold the cursor of an index is to be handed it by
+/// the page that stopped there. Answers `(index, cursor)` for every index a cursor resumes
+/// at, the whole set of cursors the collection hands out.
+async fn resume_cursors(gateway: &Gateway, query: &str) -> Vec<(usize, String)> {
+    let mut cursors: Vec<(usize, String)> = Vec::new();
+    let mut reported = 0usize;
+    let mut position: Option<String> = None;
+    loop {
+        let paged = match &position {
+            None => format!("{query}limit=1"),
+            Some(cursor) => format!("{query}limit=1&position={cursor}"),
+        };
+        let body = listed(gateway, &paged).await;
+        reported += listed_ids(&body, "GetApiKeys(the cursors of the collection)").len();
+        match body["position"].as_str() {
+            None => break,
+            Some(cursor) => {
+                cursors.push((reported, cursor.to_owned()));
+                position = Some(cursor.to_owned());
+            }
+        }
+    }
+    cursors
 }
 
 /// Create `requests` as API keys, in order, answering `(id, value)` in creation order —
@@ -354,35 +384,62 @@ async fn get_api_keys_pages_through_creation_order_on_position_and_limit() {
         );
     }
 
-    // Crossed with every cursor the sequence holds: a page resumes AT the cursor it is
-    // given — the cursor a page hands back is the first id the page did NOT report — so
-    // the page is the sequence from that id on, and a cursor is handed back only while the
-    // sequence holds more.
-    for (index, cursor) in ids.iter().enumerate() {
-        let case = format!("GetApiKeys(position={cursor}, limit=2)");
+    // Crossed with every cursor the collection hands out: a page resumes AT the position
+    // its cursor names — the cursor a page hands back names the first key the page did NOT
+    // report — so the page is the sequence from there on, a cursor is handed back only
+    // while the sequence holds more, and the cursor of one position is the same value
+    // whichever page hands it out. The cursor itself is opaque: it spells no id of the
+    // collection it walks.
+    let cursors = resume_cursors(&gateway, "").await;
+    assert_eq!(
+        cursors.len(),
+        total - 1,
+        "case GetApiKeys(the cursors of the collection): expected a cursor for every index \
+         past the first of {total}, got {cursors:?}"
+    );
+    for (start, cursor) in &cursors {
+        let case = format!("GetApiKeys(position=<the cursor of index {start}>, limit=2)");
+        for id in &ids {
+            assert!(
+                !cursor.contains(id.as_str()),
+                "case {case}: a cursor must spell no key's id, got {cursor:?}"
+            );
+        }
         let body = listed(&gateway, &format!("position={cursor}&limit=2")).await;
         let page = listed_ids(&body, &case);
-        let start = index;
         let end = (start + 2).min(total);
         assert_eq!(
             page,
-            ids[start..end].to_vec(),
+            ids[*start..end].to_vec(),
             "case {case}: expected {:?}, got {page:?}",
-            &ids[start..end]
+            &ids[*start..end]
         );
-        let next = ids.get(end).cloned();
+        let next = cursors
+            .iter()
+            .find(|(index, _)| *index == end)
+            .map(|(_, cursor)| cursor.clone());
         assert_eq!(
             body["position"].as_str().map(str::to_owned),
             next,
-            "case {case}: expected the cursor {next:?}, got {:?}",
+            "case {case}: expected the cursor of index {end} ({next:?}), got {:?}",
             body["position"]
         );
     }
 
-    // A cursor naming nothing in the sequence is a bad request, not an empty page — and
-    // a key's VALUE is not a cursor either: the sequence is a sequence of key ids.
+    // A value this service did not issue as a cursor names no position, so it is a bad
+    // request rather than an empty page: a word, a value of an id's shape, a key's own id
+    // and a key's VALUE are each refused, because a cursor is this service's own token and
+    // not something a caller reads off the records it was served.
     let value = created[0].1.clone();
-    for cursor in ["nosuchcursor", "0000000000", value.as_str()] {
+    let id = ids[2].clone();
+    let truncated = cursors[0].1[..cursors[0].1.len() - 1].to_string();
+    for cursor in [
+        "nosuchcursor",
+        "0000000000",
+        value.as_str(),
+        id.as_str(),
+        truncated.as_str(),
+    ] {
         let answer = list_keys(&gateway, &format!("position={cursor}")).await;
         assert_failure(
             &answer,
@@ -469,13 +526,14 @@ async fn listing_api_keys_does_not_change_what_a_later_caller_sees() {
     let created = created_keys(&gateway, &key_table()).await;
 
     let before = listed(&gateway, "includeValues=true").await;
+    let cursors = resume_cursors(&gateway, "").await;
     // Every shape of read this collection serves: the whole sequence, a page of it, a
     // page from a cursor, the values asked for, a narrowed sequence, and one narrowed to
     // nothing.
     let queries = [
         String::new(),
         "limit=1".to_string(),
-        format!("limit=2&position={}", created[2].0),
+        format!("limit=2&position={}", cursors[1].1),
         "includeValues=true".to_string(),
         "name=alpha".to_string(),
         "customerId=customer-c".to_string(),

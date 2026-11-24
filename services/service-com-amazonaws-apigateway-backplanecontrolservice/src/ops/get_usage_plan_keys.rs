@@ -77,8 +77,8 @@ use super::types::*;
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `GetUsagePlanKeysError` enum is never produced.
 /// The API key ids `usage_plan_id` meters, in the order the associations were ADDED: the
-/// stable sequence a `position` cursor walks and [`crate::state::page_of`] cuts a page out
-/// of.
+/// stable sequence a `position` cursor walks and [`crate::state::minted_page_of`] cuts a
+/// page out of.
 ///
 /// The rank is the `sequence` `CreateUsagePlanKey` stamps on each association (the same
 /// rank every other collection of this service is ordered by), so the listing reports the
@@ -219,9 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.usage_plan_id,
             input.name_query.as_deref(),
         );
-        // `page_of` applies the documented default and maximum page size and refuses a
-        // cursor naming no metered key of this plan.
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        // `minted_page_of` applies the documented default and maximum page size and
+        // refuses a cursor naming no metered key of this plan.
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[&input.usage_plan_id]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetUsagePlanKeysErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),

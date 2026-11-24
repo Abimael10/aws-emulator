@@ -140,18 +140,34 @@ async fn a_page_of_the_accounts_certificates_is_cut_to_the_size_the_request_aske
             "case {case}: expected the first {held} certificate(s) in generation order, got \
              {ids:?}"
         );
-        // The cursor is the certificate the page did NOT report, and a page the collection
-        // holds nothing after reports none.
-        let cursor = generated.get(held).map(String::as_str);
+        // A cursor is handed back exactly while the collection holds a certificate the page
+        // did NOT report, and it is this service's own token: it spells no certificate id,
+        // and resuming at it reports the records the page stopped before.
+        let remaining = generated.get(held).is_some();
+        let cursor = body["position"].as_str().map(str::to_owned);
         assert_eq!(
-            body["position"].as_str(),
-            cursor,
-            "case {case}: expected the cursor {cursor:?}, got {:?}",
+            cursor.is_some(),
+            remaining,
+            "case {case}: a cursor must be reported exactly while records remain, got {:?}",
             body["position"]
         );
+        if let Some(cursor) = &cursor {
+            assert!(
+                generated.iter().all(|id| !cursor.contains(id.as_str())),
+                "case {case}: a cursor spells no certificate's id, got {cursor:?}"
+            );
+            let resumed = page(&gateway, &format!("?position={cursor}&limit=500"), &case).await;
+            let rest = reported_ids(&resumed, &case);
+            assert_eq!(
+                rest,
+                generated[held..].to_vec(),
+                "case {case}: resuming at the cursor expected {:?}, got {rest:?}",
+                &generated[held..]
+            );
+        }
         // The served size travels with the cursor, and only for a request that asked for a
         // size: a default-sized page states none.
-        let echoed = requested.and(cursor).map(|_| served);
+        let echoed = requested.and(cursor.as_ref()).map(|_| served);
         assert_eq!(
             body["limit"].as_i64().map(|size| size as usize),
             echoed,

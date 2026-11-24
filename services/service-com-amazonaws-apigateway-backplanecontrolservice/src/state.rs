@@ -75,6 +75,11 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
     pub account: AccountEntry,
+    /// The secret the `position` cursor every paginated listing of this store hands back is
+    /// authenticated under, drawn from the system's randomness when the store is created
+    /// and never reported ([`position_token`], [`minted_page_of`]). Read through
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::page_token_key`].
+    pub page_tokens: PageTokenKey,
     /// The token bucket each API key that has invoked a stage is metered against, keyed
     /// by [`metering_key`]: one bucket per `(usage plan, API key)` pair, because a usage
     /// plan's throttle is the request rate it admits FOR EACH of its keys
@@ -3028,125 +3033,6 @@ pub fn stored_map<V>(
     non_empty_map(Some(patched.into_iter().collect()))
 }
 
-/// One page of an ordered cursor sequence, as a `position`/`limit` paginated collection
-/// reports it.
-#[derive(Debug, Clone)]
-pub struct Page {
-    /// The cursors on this page, in the sequence's own order.
-    pub ids: Vec<String>,
-    /// The `position` this answer reports: the cursor of the first element AFTER this
-    /// page, which is where the next page RESUMES. Absent once nothing follows the page,
-    /// and that absence is what ends a walk of the collection.
-    pub next_position: Option<String>,
-    /// The page size the service APPLIED to cut this page, for a request that asked for
-    /// one: the size it asked for, held inside the range the member publishes. Absent
-    /// when the request asked for no size at all. See [`Page::echoed_limit`].
-    applied_limit: Option<i32>,
-}
-
-impl Page {
-    /// Cut the `limit`-sized page that begins at index `start` out of `ordered`.
-    ///
-    /// `limit` defaults to [`DEFAULT_PAGE_LIMIT`] and is clamped into the documented
-    /// `1..=`[`MAX_PAGE_LIMIT`] range. `start` beyond the last element is the empty final
-    /// page, not a failure: a caller that walks a collection to its end is served the
-    /// page that holds nothing rather than a client error.
-    pub fn cut(ordered: &[String], start: usize, limit: Option<i32>) -> Self {
-        let size = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-        let window = usize::try_from(size).unwrap_or(1);
-        let start = start.min(ordered.len());
-        let end = start.saturating_add(window).min(ordered.len());
-        let ids = ordered[start..end].to_vec();
-        Self {
-            // The cursor a client sends back names where to CARRY ON, so it is the first
-            // element the page did not report and the page that follows begins AT it. A
-            // page the sequence holds nothing after reports no cursor at all, which is
-            // what tells a caller the collection has ended.
-            next_position: ordered.get(end).cloned(),
-            ids,
-            // The page was cut to `size`, so that — and not the number the request
-            // carried — is the size this page HAS, whichever end of the published range
-            // the requested one lay outside of.
-            applied_limit: limit.map(|_| size),
-        }
-    }
-
-    /// The page size this answer echoes: the size the page was CUT to, for a page the
-    /// collection carries on after — the member states the window the caller is being
-    /// paged through, which is the requested size held inside the range the member
-    /// publishes, so a request that asked for a size outside that range is told the size
-    /// it was served and a request that asked for no size is told none. The page that
-    /// ends the collection paged nothing further, and reports neither a size nor a
-    /// cursor.
-    pub fn echoed_limit(&self) -> Option<i32> {
-        self.applied_limit.filter(|_| self.next_position.is_some())
-    }
-
-    /// The page of elements as the answer's collection member REPORTS it: PRESENT, and the
-    /// empty list where the page holds no element. "The current page of elements from this
-    /// collection" is what the member carries, and a page of nothing is a page of nothing
-    /// rather than an answer that withholds the member — so a client reads "nothing is
-    /// listed" off a list it can count, and a listing of the same collection reports it the
-    /// same way whatever it holds. That holds however the page came to be empty: a collection
-    /// that holds no element at all, one a caller emptied, a filter that selects none, and the
-    /// window a caller that walked to the end asks for.
-    ///
-    /// One copy for every `position`/`limit` collection of this service, so no listing of this
-    /// service reports an empty page a second way. The base path mappings of one domain name
-    /// are the one collection this service answers otherwise
-    /// ([`Page::items_reported_only_when_held`]).
-    pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
-        Some(items)
-    }
-
-    /// The page as the ONE collection of this service that leaves its member OUT of an empty
-    /// answer reports it: present where the page holds an element, absent altogether where it
-    /// holds none, so the whole answer is the empty object.
-    ///
-    /// The base path mappings of a domain name are answered this way — a domain name that
-    /// carries no mapping is answered no `item` member at all — against
-    /// [`Page::reported_items`] for every other listing of this service.
-    pub fn items_reported_only_when_held<Element>(
-        &self,
-        items: Vec<Element>,
-    ) -> Option<Vec<Element>> {
-        (!items.is_empty()).then_some(items)
-    }
-}
-
-/// Cut the page a caller asked for out of `ordered`, a stable sequence of cursors.
-///
-/// `position` is the cursor the collection carries on AT — the first element the previous
-/// page did not report — so the page begins at it; `None` begins at the first element.
-/// The sequence's order is its own (creation order, for the collections of this service
-/// whose cursor is a minted id), so a cursor is resolved by naming an element of it.
-///
-/// `Err` carries [`INVALID_POSITION`] for an unresolvable cursor: a `position` naming no
-/// element of the sequence, which the caller must be told about rather than served an
-/// arbitrary page.
-pub fn page_of(
-    ordered: &[String],
-    position: Option<&str>,
-    limit: Option<i32>,
-) -> Result<Page, String> {
-    let start = match position {
-        None => 0,
-        Some(cursor) => ordered
-            .iter()
-            .position(|id| id == cursor)
-            .ok_or_else(|| INVALID_POSITION.to_string())?,
-    };
-    Ok(Page::cut(ordered, start, limit))
-}
-
-/// The `BadRequestException` message for a `position` this service did not issue for the
-/// collection being listed.
-///
-/// A fixed sentence naming the member that is wrong, which quotes the rejected cursor back
-/// nowhere. One copy for every `position`/`limit` collection, so an unusable cursor is
-/// refused the same way whichever listing took it.
-pub const INVALID_POSITION: &str = "Invalid position parameter";
-
 // ---------------------------------------------------------------------------
 // Patch operations
 //
@@ -4991,3 +4877,9 @@ pub use serving_emulator::*;
 /// The references other records hold on ONE stage, and their reclamation when that stage is
 /// removed; re-exported whole, so a handler still reaches each name as `crate::state::…`.
 mod stage_references;
+
+/// One `position`/`limit` PAGE of a collection of this control plane, and the cursor a page
+/// hands back for the walk to carry on at; re-exported whole, so a handler still reaches
+/// each name as `crate::state::…`.
+mod pages;
+pub use pages::*;

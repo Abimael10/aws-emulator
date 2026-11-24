@@ -216,11 +216,33 @@ async fn a_size_past_the_published_maximum_is_stated_as_the_maximum_that_was_ser
             usize::try_from(MAX_PAGE_LIMIT).unwrap_or_default(),
             "case {case}: a page holds at most the published maximum, got {held} element(s)"
         );
+        let cursor = body["position"].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {case}: a collection of {count} carries on after a page of \
+                 {MAX_PAGE_LIMIT}, got {:?}",
+                body["position"]
+            )
+        });
+        assert!(
+            keys.iter().all(|id| !cursor.contains(id.as_str())),
+            "case {case}: the cursor is this service's own token and spells no key's id, \
+             got {cursor:?}"
+        );
+        let resumed = page(
+            &gateway,
+            &format!("/apikeys?position={cursor}&limit={requested}"),
+            &case,
+        )
+        .await;
+        let rest: Vec<String> = page_items(&resumed, &case)
+            .iter()
+            .map(|item| string_member(item, "id", &case))
+            .collect();
         assert_eq!(
-            body["position"].as_str(),
-            Some(keys[count - 1].as_str()),
-            "case {case}: the page carries on at the element it did not report, got {:?}",
-            body["position"]
+            rest,
+            keys[count - 1..].to_vec(),
+            "case {case}: resuming at the cursor reports the element the page did not, \
+             got {rest:?}"
         );
         assert_eq!(
             body["limit"].as_i64(),

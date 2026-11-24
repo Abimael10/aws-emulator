@@ -216,9 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key_id| store.has_usage_data(&input.usage_plan_id, key_id, from, through))
             .collect();
         // The usage data is paged over the KEYS it is indexed by, which is what `position`
-        // and `limit` walk here; `page_of` applies the documented default and maximum page
-        // size and refuses a cursor naming no metered key of this plan.
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        // and `limit` walk here; `minted_page_of` applies the documented default and maximum
+        // page size, hands back this store's own continuation token rather than a key's id,
+        // and refuses a cursor naming no metered key of this plan.
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[&input.usage_plan_id]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetUsageErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),

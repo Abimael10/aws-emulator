@@ -14,7 +14,10 @@
 //!
 //! * a page reports the cursor the collection CARRIES ON AT — the first element the page
 //!   did not report — and the page that follows begins at that element, so a walk hands
-//!   back every element exactly once;
+//!   back every element exactly once; the cursor is the element's own ADDRESS for a
+//!   collection a caller addresses an element of by a name or a location it composed, and a
+//!   continuation token of the service's own — spelling no element of the collection — for
+//!   one walked by an identifier this service minted;
 //! * a page the collection holds nothing after reports no cursor, which is what ends a
 //!   walk, and no echoed page size either; a page it does hold something after echoes the
 //!   page size it was CUT to — the requested size held inside the published range — and
@@ -45,11 +48,17 @@ const COLLECTIONS: &[&str] = &[
     "GetDocumentationParts",
 ];
 
-/// One collection stood up with `count` elements: the listing's URI, and the cursor of
-/// each element in the order the collection reports them.
+/// One collection stood up with `count` elements: the listing's URI, the cursor of
+/// each element in the order the collection reports them, and whether the collection's
+/// cursor IS that element's own address.
 struct Listing {
     uri: String,
     cursors: Vec<String>,
+    /// `true` where a page hands back the ADDRESS of the element it carries on at — a
+    /// model's name, a documentation part's location, which a caller already holds — and
+    /// `false` where the collection is walked by an identifier THIS SERVICE minted, for
+    /// which a page hands back a continuation token of its own instead.
+    cursor_is_the_elements_address: bool,
 }
 
 impl Listing {
@@ -79,6 +88,7 @@ async fn stand_up(gateway: &Gateway, collection: &str, count: usize) -> Listing 
             Listing {
                 uri: "/restapis".to_string(),
                 cursors,
+                cursor_is_the_elements_address: false,
             }
         }
         "GetApiKeys" => {
@@ -97,6 +107,7 @@ async fn stand_up(gateway: &Gateway, collection: &str, count: usize) -> Listing 
             Listing {
                 uri: "/apikeys".to_string(),
                 cursors,
+                cursor_is_the_elements_address: false,
             }
         }
         "GetModels" => {
@@ -133,6 +144,7 @@ async fn stand_up(gateway: &Gateway, collection: &str, count: usize) -> Listing 
             Listing {
                 uri: format!("/restapis/{api}/models"),
                 cursors,
+                cursor_is_the_elements_address: true,
             }
         }
         "GetDocumentationParts" => {
@@ -163,6 +175,7 @@ async fn stand_up(gateway: &Gateway, collection: &str, count: usize) -> Listing 
             Listing {
                 uri: format!("/restapis/{api}/documentation/parts"),
                 cursors,
+                cursor_is_the_elements_address: true,
             }
         }
         other => panic!("case {other}: this suite drives no such collection"),
@@ -189,6 +202,33 @@ async fn page(gateway: &Gateway, listing: &Listing, query: &str, case: &str) -> 
         answer.status, answer.body
     );
     answer
+}
+
+/// The cursor that resumes `listing` at `index`, read off a one-at-a-time walk of it.
+///
+/// A collection walked by a minted identifier hands back a continuation token of the
+/// service's own, so the only way to hold the cursor of a position is to be handed it by the
+/// page that stopped there; a collection walked by the element's own address hands that
+/// address back, and this reads it off the same walk — so one helper serves both, and a case
+/// states the position it resumes at rather than a value it spelled itself.
+async fn cursor_at(gateway: &Gateway, listing: &Listing, index: usize, case: &str) -> String {
+    let mut reported = 0usize;
+    let mut cursor: Option<String> = None;
+    loop {
+        let query = match &cursor {
+            None => "limit=1".to_string(),
+            Some(position) => format!("limit=1&position={position}"),
+        };
+        let answer = page(gateway, listing, &query, case).await;
+        reported += page_items(&answer.body, case).len();
+        let Some(next) = answer.body["position"].as_str().map(str::to_owned) else {
+            panic!("case {case}: the collection hands out no cursor resuming at {index}")
+        };
+        cursor = Some(next.clone());
+        if reported == index {
+            return next;
+        }
+    }
 }
 
 /// The page sizes every row is crossed with: one, a few, the documented default, the
@@ -242,14 +282,36 @@ async fn a_page_reports_the_cursor_the_collection_carries_on_at_and_echoes_the_s
                 );
                 let taken = items.len();
                 walked.extend(listing.cursors[walked.len()..walked.len() + taken].to_vec());
-                // The cursor is where the collection CARRIES ON: the first element this
-                // page did not report, and nothing once the walk reached the end.
+                // A cursor is reported exactly while the collection CARRIES ON — it names
+                // the first element this page did not report, and nothing once the walk
+                // reached the end. A collection walked by the element's own address hands
+                // that address back; one walked by a minted identifier hands back a token of
+                // the service's own, which spells no element of the collection.
+                let carries_on = listing.cursors.get(walked.len());
                 assert_eq!(
-                    reported.as_deref(),
-                    listing.cursors.get(walked.len()).map(String::as_str),
-                    "case {case}: round {round} reports the cursor it carries on at, got \
-                     {reported:?}"
+                    reported.is_some(),
+                    carries_on.is_some(),
+                    "case {case}: round {round} reports a cursor exactly while the collection \
+                     carries on, got {reported:?}"
                 );
+                if let (Some(reported), Some(carries_on)) = (reported.as_deref(), carries_on) {
+                    if listing.cursor_is_the_elements_address {
+                        assert_eq!(
+                            reported, carries_on,
+                            "case {case}: round {round} reports the address it carries on at, \
+                             got {reported:?}"
+                        );
+                    } else {
+                        assert!(
+                            listing
+                                .cursors
+                                .iter()
+                                .all(|element| !reported.contains(element.as_str())),
+                            "case {case}: round {round} reports a cursor of the service's own, \
+                             which spells no element, got {reported:?}"
+                        );
+                    }
+                }
                 // The echoed page size travels with that cursor: a page the collection
                 // carries on after states the size it was cut to, and the page that ends
                 // the collection echoes nothing.
@@ -320,12 +382,8 @@ async fn a_collection_that_holds_nothing_reports_the_empty_page_member() {
         // the last page reports the last element and no cursor at all.
         let gateway = Gateway::new();
         let listing = stand_up(&gateway, collection, 3).await;
-        let last = listing
-            .cursors
-            .last()
-            .expect("the row stood up three elements")
-            .clone();
-        let case = format!("{collection}(position={last})");
+        let case = format!("{collection}(position=<the cursor of the last element>)");
+        let last = cursor_at(&gateway, &listing, 2, &case).await;
         let answer = page(&gateway, &listing, &format!("position={last}&limit=2"), &case).await;
         assert_eq!(
             page_items(&answer.body, &case).len(),

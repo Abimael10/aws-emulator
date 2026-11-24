@@ -187,7 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Creation order is the stable sequence a `position` cursor walks, and the
         // request's filters narrow that sequence BEFORE the page is cut; see
-        // `matches_filters` and `api_key_ids_in_creation_order`.
+        // `matches_filters` and `api_key_ids_in_creation_order`. The keys are addressed by
+        // the ids THIS SERVICE minted for them, so the cursor the answer carries is this
+        // store's own continuation token rather than one of those ids
+        // (`crate::state::minted_page_of`): a caller pages with it and reads no api key's
+        // identity out of it.
         let ordered: Vec<String> = store
             .api_key_ids_in_creation_order()
             .into_iter()
@@ -198,7 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_some_and(|entry| matches_filters(entry, &input))
             })
             .collect();
-        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+        let page = crate::state::minted_page_of(
+            &store.page_token_key(),
+            &crate::state::listing_scope(Self::NAME, &[]),
+            &ordered,
+            input.position.as_deref(),
+            input.limit,
+        )
             .map_err(|message| {
                 GetApiKeysErrorModeled::BadRequestException(BadRequestException {
                     message: Some(message),
