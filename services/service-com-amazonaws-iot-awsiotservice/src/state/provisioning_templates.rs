@@ -170,12 +170,16 @@ pub fn default_template_version_delete_message(version_id: i32) -> String {
     format!("Unable to delete template version {version_id}, it is the default version")
 }
 
-/// How this service refuses a template that already holds
+/// How this service refuses the create of a version on a template that already holds
 /// [`MAX_PROVISIONING_TEMPLATE_VERSIONS`] versions.
+///
+/// The refusal states what it could not DO — add a version to this template, because the
+/// template's versions are all used up — and the ONE variable part is the template the
+/// request named; the cap itself is not in the sentence.
 pub fn template_versions_limit_message(template_name: &str) -> String {
     format!(
-        "Provisioning template {template_name} already has the maximum number of versions \
-         ({MAX_PROVISIONING_TEMPLATE_VERSIONS})"
+        "Can't create a template version for the template {template_name}, the maximum number \
+         of template versions has been reached"
     )
 }
 
@@ -262,6 +266,10 @@ pub struct RegisteredProvisioningTemplate {
     /// Which version is in effect — the `defaultVersionId` a reader reports and the
     /// version whose body `DescribeProvisioningTemplate` hands back.
     pub default_version_id: i32,
+    /// The highest `versionId` this template has EVER handed out, the versions since
+    /// deleted included: the next version is one past it, so no id is ever handed out
+    /// twice.
+    pub highest_version_id: i32,
     /// Whether the template provisions at all — `CreateProvisioningTemplate$enabled`.
     pub enabled: bool,
     /// `CreateProvisioningTemplate$provisioningRoleArn` — the role provisioning
@@ -308,6 +316,7 @@ impl RegisteredProvisioningTemplate {
                 },
             )]),
             default_version_id: FIRST_TEMPLATE_VERSION_ID,
+            highest_version_id: FIRST_TEMPLATE_VERSION_ID,
             enabled,
             provisioning_role_arn,
             pre_provisioning_hook,
@@ -329,20 +338,19 @@ impl RegisteredProvisioningTemplate {
     /// Add `template_body` as a new version, making it the default when the request
     /// asked for that, and answer the id it was given.
     ///
-    /// The id is one past the highest the template has ever held, so an id is never
-    /// reused by a later version — a caller that deleted version 2 and adds another
-    /// gets 3, not 2.
+    /// The id is one past the highest the template has EVER handed out
+    /// ([`Self::highest_version_id`]), so an id is never handed out twice however the
+    /// versions in between were deleted — a caller that deleted version 2 and adds
+    /// another gets 3, and one that deleted the highest version gets the id past it
+    /// rather than that one again.
     pub fn add_version(
         &mut self,
         template_body: String,
         set_as_default: bool,
         now: SystemTime,
     ) -> i32 {
-        let version_id = self
-            .versions
-            .keys()
-            .next_back()
-            .map_or(FIRST_TEMPLATE_VERSION_ID, |highest| highest + 1);
+        let version_id = self.highest_version_id.saturating_add(1);
+        self.highest_version_id = version_id;
         self.versions.insert(
             version_id,
             ProvisioningTemplateVersion {

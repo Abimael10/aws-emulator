@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProvisioningTemplateVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProvisioningTemplateVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProvisioningTemplateVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every version a fleet provisioning template holds, oldest-first, in pages.
+//!
+//! A version hangs off the template it is a version of, so the listing is that template's
+//! own version set: a `templateName` the account holds no template under names no version
+//! set to page through and is the modelled `ResourceNotFoundException` (HTTP 404), and the
+//! listing is a pure READ — it reports what the creates and deletes of versions persisted
+//! and changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProvisioningTemplateVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProvisioningTemplateVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProvisioningTemplateVersions"))
+        // Every member this listing reports was recorded when its version was created, so
+        // the listing needs no request metadata of its own.
+        let _ = ctx;
+
+        // WHICH position the request resumes after is resolved BEFORE any store is
+        // reached: a `nextToken` this listing never issued is refused whatever the store
+        // holds.
+        let scope = token_scope(&input.template_name);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_marker(token, &scope) {
+                Some(resume_after) => Some(resume_after),
+                None => {
+                    return Err(
+                        ListProvisioningTemplateVersionsErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(UNREADABLE_NEXT_TOKEN_MESSAGE.to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `maxResults` is "The maximum number of results to return at one time", modelled
+        // `range 1..250` and refused outside it before this handler runs, so a request
+        // that names it asks for at least one version and one that does not asks for every
+        // version the template holds. The clamp is defensive rather than load-bearing.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, MAX_PAGE_SIZE) as usize);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProvisioningTemplateVersionsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        // The versions are the template's own, so a name the account holds no template
+        // under names no version set to page through: the modelled
+        // `ResourceNotFoundException` (HTTP 404), worded the way the operations that reach
+        // a template THROUGH its versions state that miss
+        // (`crate::state::provisioning_templates::missing_template_for_version_message`).
+        let Some(template) = store.provisioning_templates.get(&input.template_name) else {
+            return Err(
+                ListProvisioningTemplateVersionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::provisioning_templates::missing_template_for_version_message(
+                                &input.template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One row per version the template holds, keyed by the POSITION it occupies in the
+        // listing's order — the `versionId`, handed out ascending as versions are created,
+        // so the listing runs oldest-first. A position rather than a record is what lets a
+        // page resume where the last one ended even if the version it named has since been
+        // deleted.
+        let indexed: ::std::collections::BTreeMap<String, ProvisioningTemplateVersionSummary> =
+            template
+                .version_summaries()
+                .into_iter()
+                .filter_map(|summary| {
+                    summary
+                        .version_id
+                        .map(|version_id| (version_listing_row(version_id), summary))
+                })
+                .collect();
+        drop(store);
+
+        let rows: Vec<String> = indexed.keys().cloned().collect();
+        let (page, next_token) =
+            crate::state::page_of(rows, &scope, resume_after.as_deref(), page_size);
+
+        Ok(ListProvisioningTemplateVersionsOutput {
+            // `ProvisioningTemplateVersionListing` carries no length constraint, so a page
+            // past the last version answers with an EMPTY list rather than an absent
+            // member: "nothing further" is an answer, not a missing one.
+            versions: Some(
+                page.iter()
+                    .filter_map(|row| indexed.get(row).cloned())
+                    .collect(),
+            ),
+            // `nextToken` is "A token to retrieve the next set of results", so it is issued
+            // only while there is a next set.
+            next_token,
+        })
     }
+}
+
+/// The largest page `MaxResults` admits (`range 1..250`,
+/// `smithy_query(query="operation",operation="ListProvisioningTemplateVersions")`).
+const MAX_PAGE_SIZE: i32 = 250;
+
+/// What this listing refuses a `nextToken` it never issued with: the modelled
+/// `InvalidRequestException` (HTTP 400, "The request is not valid").
+///
+/// The sentence states that the token is not one of this listing's and echoes nothing the
+/// request sent: what is wrong is the token's provenance, not any value inside it.
+const UNREADABLE_NEXT_TOKEN_MESSAGE: &str = "nextToken is not a continuation token of this listing";
+
+/// The LISTING a continuation token belongs to: the template whose versions it pages
+/// through, which is what decides what "the next set of results" means. A token issued for
+/// one template's versions is refused by another's.
+fn token_scope(template_name: &str) -> String {
+    format!("ListProvisioningTemplateVersions/{template_name}")
+}
+
+/// The row one version occupies in this listing: its position is the `versionId`, which is
+/// handed out ascending (`crate::state::RegisteredProvisioningTemplate::add_version`), so
+/// the rows sort oldest-first.
+///
+/// The one position encoding every position-ordered listing of this service shares
+/// ([`crate::state::position_listing_row`]), so this order and the pager that walks it
+/// cannot drift. A `versionId` is a counter that starts at
+/// [`crate::state::FIRST_TEMPLATE_VERSION_ID`] and only grows, so the conversion cannot
+/// lose a value the store holds.
+fn version_listing_row(version_id: i32) -> String {
+    crate::state::position_listing_row(
+        u64::try_from(version_id).unwrap_or_default(),
+        true,
+        &version_id.to_string(),
+    )
 }
