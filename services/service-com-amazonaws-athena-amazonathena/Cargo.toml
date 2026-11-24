@@ -92,7 +92,7 @@ csv = "1.4"
 # with. Pure Rust, like the codecs it needs: `snap` reads a `SNAPPY`-compressed object and
 # `flate2` a `GZIP`-compressed one, which are the two compressions a writer of these objects
 # chooses between.
-parquet = { version = "60", default-features = false, features = [
+parquet = { version = "60.2", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }

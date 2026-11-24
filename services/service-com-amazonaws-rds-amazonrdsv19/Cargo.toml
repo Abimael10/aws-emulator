@@ -162,7 +162,7 @@ aws-sdk-sns = { version = "1", default-features = false }
 # native zlib is built. Nothing else of the crate is built — in particular no Arrow, and no
 # `thrift` (this release line reads the format's metadata with its own code, so the advisory
 # against `thrift` before 0.23 does not reach this build).
-parquet = { version = "60", default-features = false, features = ["flate2-rust_backend"] }
+parquet = { version = "60.2", default-features = false, features = ["flate2-rust_backend"] }
 # The AUTHENTICATION TOKEN an IAM-authenticated engine login presents as its password
 # (`src/state/data_plane/iam_auth_token.rs`) is a presigned request: `form_urlencoded` reads
 # its query fields, and `chrono` reads the basic ISO 8601 instant SigV4 signs it at, so

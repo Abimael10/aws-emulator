@@ -50,7 +50,7 @@ csv = "1.4"
 # Parquet format, so the object a query writes for it is written by the Apache
 # implementation of that format — the same one this workspace already writes such objects
 # with. Pure Rust, with only the codecs it needs.
-parquet = { version = "60", default-features = false, features = [
+parquet = { version = "60.2", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }

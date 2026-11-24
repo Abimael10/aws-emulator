@@ -52,7 +52,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 csv = "1.3"
 # Reads the columnar (PARQUET) bulk-load format. No compression codec beyond the
 # format's own default is enabled.
-parquet = { version = "60", default-features = false, features = ["snap"] }
+parquet = { version = "60.2", default-features = false, features = ["snap"] }
 # Parses the RDF N-Triples bulk-load format, and reads the terms (IRIs, blank nodes
 # and typed literals) a triple carries.
 oxttl = "0.2"

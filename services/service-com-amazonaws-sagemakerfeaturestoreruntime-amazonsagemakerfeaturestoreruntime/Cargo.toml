@@ -36,7 +36,7 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # The Apache implementation of the Parquet format, which writes the object one replicated
 # record lands as: the offline store holds its data as Parquet. Pure Rust; `snap` is the
 # SNAPPY compression those objects are written with.
-parquet = { version = "60", default-features = false, features = ["snap"] }
+parquet = { version = "60.2", default-features = false, features = ["snap"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

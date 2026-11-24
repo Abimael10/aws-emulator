@@ -72,7 +72,7 @@ service-com-amazonaws-glue-awsglue = { workspace = true }
 # The Apache implementation of the Parquet format, which writes the object a destination
 # with a `ParquetSerDe` serializer delivers. Pure Rust, like the codecs below: `snap` is the
 # serializer's default `SNAPPY` compression and `flate2` its `GZIP` one.
-parquet = { version = "60", default-features = false, features = [
+parquet = { version = "60.2", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }

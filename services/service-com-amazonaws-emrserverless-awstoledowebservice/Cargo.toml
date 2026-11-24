@@ -85,7 +85,7 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The Apache implementation of the Parquet format, for the TESTS only: the objects a submitted
 # Spark program wrote are read back with it, so what the suite asserts of them is that an
 # independent reader of the format parses the bytes this emulator's Spark left.
-parquet = { version = "60", default-features = false, features = ["snap"] }
+parquet = { version = "60.2", default-features = false, features = ["snap"] }
 
 [lints]
 workspace = true
