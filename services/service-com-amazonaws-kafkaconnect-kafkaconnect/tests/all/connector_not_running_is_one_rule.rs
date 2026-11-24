@@ -5,11 +5,13 @@
 //! `UpdateConnector`.
 //!
 //! RULE. A call that only a running connector can serve is refused, for a
-//! connector in ANY other `ConnectorState`, with `BadRequestException` (HTTP
-//! 400) blaming `connectorArn` and reading `Invalid parameter connectorArn: The
-//! connector is not RUNNING.` — the same status, code, blamed member and message
-//! whichever of those calls made it — and is served only while the connector is
-//! `RUNNING`.
+//! connector in ANY `ConnectorState` the operation does not accept, with
+//! `BadRequestException` (HTTP 400) blaming `connectorArn` and naming the states
+//! that WOULD be served — `Invalid parameter connectorArn: This operation is
+//! only valid for resources that are in one of the following states: [RUNNING,
+//! PAUSED]` — the same status, code, blamed member and message whichever of
+//! those calls made it, and is served only while the connector is in one of
+//! them.
 //!
 //! Every case drives the emulator the way a client does: a buffered `restJson1`
 //! request through the same router the production binary assembles, with the
@@ -17,12 +19,15 @@
 //! handler running a gate of its own would fail here.
 //!
 //! The table spans what the rule generalises over: the `ConnectorState` the
-//! connector is in when the call lands — every non-running state this service
-//! puts a connector in (`CREATING` while its workers come up, `RESTARTING`,
-//! `UPDATING` and `DELETING`) — crossed with each call the gate guards, plus the
-//! `RUNNING` row where both calls are served. `ConnectorState` also lists
-//! `FAILED` (`smithy_query query="shape" shape="ConnectorState"`), which no call
-//! of this emulator puts a connector in, so no row can reach it.
+//! connector is in when the call lands — every state this service puts a
+//! connector in that the gate does not accept (`CREATING` while its workers come
+//! up, `RESTARTING`, `UPDATING` and `DELETING`) — crossed with each call the gate
+//! guards, plus the `RUNNING` row where both calls are served. `ConnectorState`
+//! also lists `FAILED` (`smithy_query query="shape" shape="ConnectorState"`),
+//! which a connector reaches only when its bring-up found no Apache Kafka
+//! cluster — asserted, with the gate over it, in the router's
+//! `kafkaconnect_connector_bring_up` suite, where Amazon MSK is mounted to
+//! answer that question.
 //!
 //! The sibling suites' request helpers are private to their own modules, so this
 //! one carries its own copies of the few it needs.
@@ -34,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_kafkaconnect_kafkaconnect::state::{
-    CONNECTOR_CREATING, CONNECTOR_DELETING, CONNECTOR_RESTARTING, CONNECTOR_RUNNING,
-    CONNECTOR_UPDATING, TRANSITION_SPAN,
+    only_valid_in_states, CALL_ACCEPTED_CONNECTOR_STATES, CONNECTOR_CREATING, CONNECTOR_DELETING,
+    CONNECTOR_RESTARTING, CONNECTOR_RUNNING, CONNECTOR_UPDATING, TRANSITION_SPAN,
 };
 use service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService;
 
@@ -51,8 +56,11 @@ const REGION: &str = "eu-west-1";
 /// The canonical emulator account id every ARN carries.
 const ACCOUNT: &str = "000000000000";
 
-/// The whole wire message the gate answers with, pinned as a client reads it.
-const NOT_RUNNING: &str = "Invalid parameter connectorArn: The connector is not RUNNING.";
+/// The whole wire message the gate answers with, pinned as a client reads it:
+/// the member the refusal blames and the states the operation accepts, which is
+/// what tells a caller whether waiting would help.
+const NOT_RUNNING: &str = "Invalid parameter connectorArn: This operation is only valid for \
+                           resources that are in one of the following states: [RUNNING, PAUSED]";
 
 /// Long enough that one change the clock owes after a call is due. The span is
 /// the service's own constant, so this cannot drift from it.
@@ -427,4 +435,59 @@ async fn a_running_connector_serves_every_call_the_gate_guards() {
             "case {guarded:?}: expected the refusal {NOT_RUNNING:?}, got {refused}"
         );
     }
+}
+
+/// RULE (the sentence itself): the reason the gate renders is the published
+/// sentence with ONE variable part, the bracketed list of the states the
+/// operation accepts — so the message a client matches on cannot drift from the
+/// set the gate decides by.
+///
+/// The rows span what that part generalises over: the set these two operations
+/// accept (which names `PAUSED` beside `RUNNING`, though `ConnectorState` lists
+/// only the latter), a set of one state, and a set of three.
+#[test]
+fn the_reason_renders_the_states_the_operation_accepts() {
+    let rows: &[(&str, &[&str], &str)] = &[
+        (
+            "the states a call against a connector accepts",
+            CALL_ACCEPTED_CONNECTOR_STATES,
+            "This operation is only valid for resources that are in one of the following states: \
+             [RUNNING, PAUSED]",
+        ),
+        (
+            "one state",
+            &["ACTIVE"],
+            "This operation is only valid for resources that are in one of the following states: \
+             [ACTIVE]",
+        ),
+        (
+            "three states",
+            &["RUNNING", "PAUSED", "FAILED"],
+            "This operation is only valid for resources that are in one of the following states: \
+             [RUNNING, PAUSED, FAILED]",
+        ),
+    ];
+    for (case, accepted, expected) in rows {
+        let rendered = only_valid_in_states(accepted);
+        assert_eq!(
+            rendered, *expected,
+            "case {case:?}: expected the reason {expected:?}, got {rendered:?}"
+        );
+    }
+
+    // And the whole wire message the gate answers with is that reason behind the
+    // member it blames, which is what the two tables above read back.
+    let rendered = format!(
+        "Invalid parameter connectorArn: {}",
+        only_valid_in_states(CALL_ACCEPTED_CONNECTOR_STATES)
+    );
+    assert_eq!(
+        rendered, NOT_RUNNING,
+        "case \"the whole message\": expected {NOT_RUNNING:?}, got {rendered:?}"
+    );
+    assert!(
+        CALL_ACCEPTED_CONNECTOR_STATES.contains(&CONNECTOR_RUNNING),
+        "case \"the accepted set\": a running connector must be served, got \
+         {CALL_ACCEPTED_CONNECTOR_STATES:?}"
+    );
 }

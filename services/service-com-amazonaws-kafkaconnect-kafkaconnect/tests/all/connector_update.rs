@@ -984,8 +984,9 @@ async fn an_update_that_names_no_single_valid_setting_is_refused_with_nothing_st
     );
     assert_eq!(
         text(&refused, "message"),
-        "Invalid parameter connectorArn: The connector is not RUNNING.",
-        "the refusal must name the connector and why, got {refused}"
+        "Invalid parameter connectorArn: This operation is only valid for resources that are in \
+         one of the following states: [RUNNING, PAUSED]",
+        "the refusal must name the member and the states that would be served, got {refused}"
     );
 
     let (status, created) = call(

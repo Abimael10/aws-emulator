@@ -168,8 +168,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut state = store.lock();
-        state.settle_due();
+
+        // The clock first, in a scope of its own, and then the worker log events
+        // the settle it applied has written: a delivery AWAITS, so it cannot be
+        // made while this service's store is locked
+        // (`crate::state::deliver_worker_logs`).
+        store.lock().settle_due();
+        crate::state::deliver_worker_logs(&*self.engine, ctx).await;
+
+        let state = store.lock();
 
         let prefix = input.connector_name_prefix.unwrap_or_default();
         // "all the connectors in this account and Region": kafkaconnect is a
@@ -204,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(ListConnectorsOutput {
+        let output = ListConnectorsOutput {
             connectors: Some(
                 page.items
                     .into_iter()
@@ -212,6 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             next_token: page.next_token,
-        })
+        };
+        Ok(output)
     }
 }

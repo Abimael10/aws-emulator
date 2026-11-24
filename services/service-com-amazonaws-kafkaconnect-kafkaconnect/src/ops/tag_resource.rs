@@ -12,7 +12,10 @@
 //! number of characters `TagKey`'s modelled `@length` allows, no key may claim
 //! the `aws:` namespace AWS reserves for its own tags, and a key or value may
 //! carry only the published tag character set. A request naming one that does
-//! not is a `BadRequestException` (HTTP 400) with nothing written.
+//! not is a `BadRequestException` (HTTP 400) with nothing written. An ARN this
+//! service holds no resource at is a `NotFoundException` (HTTP 404) in the
+//! TAGGING API's own words (`crate::state::RESOURCE_WAS_NOT_FOUND`), which name
+//! no request member.
 //!
 //! ## Shape of an operation
 //!
@@ -231,11 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             Err(crate::state::TagWriteRefusal::NoSuchResource) => {
+                // The tagging operations report an absent resource in their own
+                // words, naming no member (`crate::state::RESOURCE_WAS_NOT_FOUND`).
                 Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::invalid_parameter_because(
-                        "resourceArn",
-                        crate::state::RESOURCE_DOES_NOT_EXIST,
-                    )),
+                    message: Some(crate::state::RESOURCE_WAS_NOT_FOUND.to_string()),
                 })
                 .into())
             }

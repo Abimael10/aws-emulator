@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_kafkaconnect_kafkaconnect::state::{
-    INVALID_ARN, RESOURCE_DOES_NOT_EXIST, TRANSITION_SPAN,
+    INVALID_ARN, RESOURCE_DOES_NOT_EXIST, RESOURCE_WAS_NOT_FOUND, TRANSITION_SPAN,
 };
 use service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService;
 
@@ -499,7 +499,9 @@ async fn the_absent_query_member_is_refused_before_the_handler_judges_the_rest()
                  11111111-2222-3333-4444-555555555555-1"
             ),
             served_status: 404,
-            served_reason: RESOURCE_DOES_NOT_EXIST,
+            // The tagging operations report an absent resource in the tagging
+            // API's own words, naming no member.
+            served_reason: RESOURCE_WAS_NOT_FOUND,
         },
         PathValue {
             case: "an ARN of another service",
@@ -540,7 +542,7 @@ async fn the_absent_query_member_is_refused_before_the_handler_judges_the_rest()
         );
         // The refusal is the BOUNDARY's, so none of the handler's own reasons for this
         // path value can be in it: the handler never ran.
-        for reason in [RESOURCE_DOES_NOT_EXIST, INVALID_ARN] {
+        for reason in [RESOURCE_DOES_NOT_EXIST, INVALID_ARN, RESOURCE_WAS_NOT_FOUND] {
             assert!(
                 !message.contains(reason),
                 "case {case:?}: the absent member is refused before the handler judges \

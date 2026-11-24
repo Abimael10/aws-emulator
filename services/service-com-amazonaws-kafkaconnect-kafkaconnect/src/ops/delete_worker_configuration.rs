@@ -201,7 +201,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let in_use = state.dependency_in_use_refusal(
             &region,
             &input.worker_configuration_arn,
-            "workerConfigurationArn",
             "worker configuration",
         );
 
@@ -224,9 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A configuration a stored connector runs with is not removed: the
         // model gives this operation no conflict channel, so the refusal is the
-        // modelled 400, blaming the member that carried the ARN. Refused before
-        // any state is touched, so nothing is marked for deletion and the
-        // configuration stays readable in the state it was in.
+        // modelled 400, naming the rule and the connector blocking the delete
+        // rather than a member of the request. Refused before any state is
+        // touched, so nothing is marked for deletion and the configuration
+        // stays readable in the state it was in.
         if let Some(message) = in_use {
             return Err(DeleteWorkerConfigurationErrorModeled::BadRequestException(
                 BadRequestException {

@@ -6,7 +6,9 @@
 //! is not a well-formed ARN of this service is a `BadRequestException`; a well-formed one
 //! no stored plugin
 //! carries is a `NotFoundException`. A plugin a stored connector runs on is kept: that
-//! delete is a `BadRequestException` too. Idempotent: a repeat while the plugin is already
+//! delete is a `BadRequestException` too, whose message names the connector blocking it
+//! (`crate::state::ComAmazonawsKafkaconnectKafkaconnectState::dependency_in_use_refusal`).
+//! Idempotent: a repeat while the plugin is already
 //! `DELETING` answers the same state without moving the due instant.
 //!
 //! ## Shape of an operation
@@ -193,7 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let in_use = state.dependency_in_use_refusal(
             &region,
             &input.custom_plugin_arn,
-            "customPluginArn",
             "custom plugin",
         );
 
@@ -212,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A plugin a stored connector runs on is not removed: the model gives
         // this operation no conflict channel, so the refusal is the modelled
-        // 400, blaming the member that carried the ARN. Refused before any
-        // state is touched, so nothing is marked for deletion and the plugin
-        // stays readable in the state it was in.
+        // 400, naming the rule and the connector blocking the delete rather than
+        // a member of the request. Refused before any state is touched, so
+        // nothing is marked for deletion and the plugin stays readable in the
+        // state it was in.
         if let Some(message) = in_use {
             return Err(DeleteCustomPluginErrorModeled::BadRequestException(
                 BadRequestException {

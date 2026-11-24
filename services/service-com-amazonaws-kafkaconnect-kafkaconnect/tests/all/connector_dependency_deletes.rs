@@ -16,8 +16,11 @@
 //! connector is only ever stored against a reference that resolves, in its own
 //! region, to an ACTIVE resource. So every ARN `DescribeConnector` echoes back
 //! resolves through that resource's own read, and the delete of a named resource
-//! is refused instead with the modelled `BadRequestException` (HTTP 400), on the
-//! member that carried the ARN.
+//! is refused instead with the modelled `BadRequestException` (HTTP 400), whose
+//! message states the rule and names a connector blocking the delete — the ARN
+//! of a connector this store holds that names the resource, which is the one
+//! variable part of that sentence and what a cleanup script has to delete before
+//! retrying.
 //!
 //! The rows vary along what that rule generalises over: the KIND of dependency
 //! (a custom plugin and a worker configuration, the two references a connector
@@ -227,15 +230,6 @@ enum Dependency {
 }
 
 impl Dependency {
-    /// The request member that carries this resource's ARN, which a refusal
-    /// blames.
-    fn member(self) -> &'static str {
-        match self {
-            Self::CustomPlugin => "customPluginArn",
-            Self::WorkerConfiguration => "workerConfigurationArn",
-        }
-    }
-
     /// The collection route this resource's delete and read sit under.
     fn route(self) -> &'static str {
         match self {
@@ -245,15 +239,20 @@ impl Dependency {
     }
 
     /// The message a delete of a resource of this kind that a connector names is
-    /// refused with.
-    fn in_use_message(self) -> String {
+    /// refused with: the RULE, and then the ARN of a connector blocking the
+    /// delete, which is what a cleanup script has to delete before retrying. It
+    /// takes none of this service's `Invalid parameter <member>: …` form and
+    /// names no request member, because the delete is refused for state the
+    /// account holds rather than for a value of the request.
+    fn in_use_message(self, connector_arn: &str) -> String {
         let resource = match self {
             Self::CustomPlugin => "custom plugin",
             Self::WorkerConfiguration => "worker configuration",
         };
         format!(
-            "Invalid parameter {}: The {resource} is in use by a connector.",
-            self.member()
+            "You can't delete a {resource} being used by one or more connectors. This {resource} \
+             is used by the connector with arn {connector_arn}, and possibly others. Please \
+             delete connectors using this {resource} and try again."
         )
     }
 
@@ -503,8 +502,10 @@ async fn a_resource_a_stored_connector_runs_on_is_not_deleted() {
             }
         }
 
-        // The delete of the resource those connectors run on is refused, on the
-        // member that carried its ARN.
+        // The delete of the resource those connectors run on is refused, naming
+        // the rule and the connector that blocks it — the first in ARN order when
+        // several name the resource, so one held state is always answered with
+        // one sentence.
         let (status, answered) = delete_dependency(&emulator, row.kind, &under_delete).await;
         assert_eq!(
             status, 400,
@@ -515,11 +516,23 @@ async fn a_resource_a_stored_connector_runs_on_is_not_deleted() {
             error_code(&answered).contains("BadRequestException"),
             "case {case:?}: expected BadRequestException, got {answered}"
         );
-        let expected = row.kind.in_use_message();
+        let blocking = connector_arns
+            .iter()
+            .min()
+            .expect("every row names at least one connector");
+        let expected = row.kind.in_use_message(blocking);
         let actual = message(&answered);
         assert_eq!(
             actual, expected,
             "case {case:?}: expected the message {expected:?}, got {actual:?}"
+        );
+        // The connector the refusal names is one this store really holds and one
+        // that really names the resource, so a client can read it back and delete
+        // it before retrying.
+        assert!(
+            connector_arns.iter().any(|arn| actual.contains(arn.as_str())),
+            "case {case:?}: the refusal must name a connector this store holds, got {actual:?} \
+             against {connector_arns:?}"
         );
 
         // The refusal wrote nothing: the resource is still readable, still

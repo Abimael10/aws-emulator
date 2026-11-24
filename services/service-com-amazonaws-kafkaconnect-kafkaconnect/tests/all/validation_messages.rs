@@ -224,6 +224,10 @@ async fn every_parameter_rejection_names_the_parameter_it_refused() {
         /// Some reason, whose sentence is this emulator's own wording, so only the part
         /// the rule fixes (the member being named) is asserted.
         Any,
+        /// The WHOLE message, naming no member at all: the form an operation that blames
+        /// no member of the request answers with (the tagging API's own not-found
+        /// sentence).
+        WholeMessage(&'static str),
     }
 
     // (case, method, path, body, expected status, expected error code, member, reason)
@@ -314,16 +318,34 @@ async fn every_parameter_rejection_names_the_parameter_it_refused() {
             ));
         }
     }
+    // The tagging route answers a well-formed ARN naming no resource this emulator holds
+    // in the tagging API's OWN words, naming no member: the form is per-operation, not
+    // per-service, which is what the by-ARN reads above read back.
     for kind in ["custom-plugin", "connector"] {
+        for (operation, method, query) in [
+            ("ListTagsForResource", "GET", ""),
+            ("UntagResource", "DELETE", "?tagKeys=env"),
+        ] {
+            rows.push((
+                format!("{operation} on an unheld {kind} ARN"),
+                method,
+                format!("/v1/tags/{}{query}", label(&unheld_arn(kind))),
+                Value::Null,
+                404,
+                "NotFoundException",
+                "resourceArn",
+                Reason::WholeMessage("Resource was not found"),
+            ));
+        }
         rows.push((
-            format!("ListTagsForResource on an unheld {kind} ARN"),
-            "GET",
+            format!("TagResource on an unheld {kind} ARN"),
+            "POST",
             format!("/v1/tags/{}", label(&unheld_arn(kind))),
-            Value::Null,
+            json!({"tags": {"env": "probe"}}),
             404,
             "NotFoundException",
             "resourceArn",
-            Reason::Recorded("The requested resource doesn\u{2019}t exist."),
+            Reason::WholeMessage("Resource was not found"),
         ));
     }
 
@@ -383,7 +405,42 @@ async fn every_parameter_rejection_names_the_parameter_it_refused() {
                 assert_names_member(&case, &answered, member, Some(reason))
             }
             Reason::Any => assert_names_member_with_a_reason(&case, &answered, member),
+            Reason::WholeMessage(expected) => {
+                let actual = message(&answered);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: expected the message {expected:?}, got {actual:?}"
+                );
+            }
         }
+    }
+}
+
+/// Look again until the resource `resource_arn` names has been DROPPED — its tag set reads
+/// back as the absent resource it names — and answer that read, or fail once a generous
+/// deadline passes. Only the clock drops a resource, so the wait is for that condition and
+/// not for a span of time.
+async fn poll_until_tags_absent(emulator: &MultiServiceRouter, resource_arn: &str) -> Value {
+    // A multiple of the service's own transition span, so this cannot drift from it, and
+    // far longer than one transition needs; nothing is asserted about how long it takes.
+    let deadline = service_com_amazonaws_kafkaconnect_kafkaconnect::state::TRANSITION_SPAN * 60;
+    let started = std::time::Instant::now();
+    loop {
+        let (status, answered) = call(
+            emulator,
+            "GET",
+            &format!("/v1/tags/{}", label(resource_arn)),
+            Value::Null,
+        )
+        .await;
+        if status == 404 {
+            return answered;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "the dropped resource must stop reporting a tag set, last read {status} {answered}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -635,13 +692,10 @@ async fn list_tags_for_resource_reports_the_tags_the_create_stored() {
     }
 
     // The same, for a connector — and the tag set read back is the one THAT create
-    // carried, not the plugin's.
+    // carried, not the plugin's. The plugin has to be ACTIVE before a connector may
+    // reference it, and only the clock moves it there, so this waits for that condition.
     let plugin = plugin_arn(&emulator, "connector-tag-plugin").await;
-    tokio::time::sleep(
-        service_com_amazonaws_kafkaconnect_kafkaconnect::state::TRANSITION_SPAN
-            + std::time::Duration::from_millis(400),
-    )
-    .await;
+    poll_until_plugin_active(&emulator, &plugin).await;
     let connector_tags: BTreeMap<String, String> = [("owner", "streams"), ("env", "staging")]
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -685,26 +739,15 @@ async fn list_tags_for_resource_reports_the_tags_the_create_stored() {
     )
     .await;
     assert_eq!(status, 200, "the delete must be accepted");
-    tokio::time::sleep(
-        service_com_amazonaws_kafkaconnect_kafkaconnect::state::TRANSITION_SPAN
-            + std::time::Duration::from_millis(400),
-    )
-    .await;
-    let (status, answered) = call(
-        &emulator,
-        "GET",
-        &format!("/v1/tags/{}", label(&connector_arn)),
-        Value::Null,
-    )
-    .await;
+    // The clock, not this call, is what drops the connector, so this looks again until the
+    // tag read reports the resource as absent.
+    let answered = poll_until_tags_absent(&emulator, &connector_arn).await;
+    // ...in the tagging API's own words, naming no member: the read path of the resource
+    // itself keeps the member-naming form, so the two are per-operation.
+    let actual = message(&answered);
     assert_eq!(
-        status, 404,
-        "a dropped connector has no tag set to report, got {status} {answered}"
-    );
-    assert_names_member(
-        "the tags of a dropped connector",
-        &answered,
-        "resourceArn",
-        Some("The requested resource doesn\u{2019}t exist."),
+        actual, "Resource was not found",
+        "case \"the tags of a dropped connector\": expected the tagging API's own not-found \
+         message, got {actual:?}"
     );
 }

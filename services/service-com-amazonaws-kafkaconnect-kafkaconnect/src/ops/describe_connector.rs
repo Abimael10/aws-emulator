@@ -4,7 +4,9 @@
 //! Reports the stored connector the ARN names, from state — never from the request. A
 //! `connectorArn` that is not a well-formed ARN of this service is a `BadRequestException`;
 //! a well-formed one no stored connector carries is a `NotFoundException`. Reporting only:
-//! the one write it makes is materialising the state change the clock already owed.
+//! the one write it makes is materialising the state change the clock already owed — and
+//! handing the worker log events that change wrote to the destination the connector's own
+//! `logDelivery` names, which was owed at the same instant.
 //!
 //! ## Shape of an operation
 //!
@@ -189,8 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut state = store.lock();
-        state.settle_due();
+
+        // The clock first, in a scope of its own, and then the worker log events
+        // the settle it applied has written: the write was owed at the instant
+        // the clock moved the connector, whether or not anybody read it, and a
+        // delivery AWAITS, so it cannot be made while this service's store is
+        // locked (`crate::state::deliver_worker_logs`).
+        store.lock().settle_due();
+        crate::state::deliver_worker_logs(&*self.engine, ctx).await;
+
+        let state = store.lock();
 
         // A value that is not a kafkaconnect ARN at all names no connector, so
         // it is incorrect input rather than a resource that is absent: the
@@ -220,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(DescribeConnectorOutput {
+        let output = DescribeConnectorOutput {
             capacity: Some(connector.capacity_description()),
             connector_arn: Some(connector.arn.clone()),
             connector_configuration: Some(connector.configuration.clone()),
@@ -242,7 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             plugins: Some(connector.plugin_descriptions()),
             service_execution_role_arn: Some(connector.service_execution_role_arn.clone()),
             worker_configuration: connector.worker_configuration_description(),
-            state_description: None,
-        })
+            // "Details about the state of a connector": what the connector's
+            // bring-up found, stored with the state it describes, so a connector
+            // that came to rest FAILED reports WHY here and a running one has
+            // nothing to explain.
+            state_description: connector.state_description.clone(),
+        };
+        Ok(output)
     }
 }

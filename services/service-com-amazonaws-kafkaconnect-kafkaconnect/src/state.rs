@@ -23,6 +23,15 @@ use sha2::Digest;
 #[allow(unused_imports)]
 use crate::ops::types::*;
 
+/// Where a connector's bring-up ends: the resting state the clock owes it and
+/// the `stateDescription` that goes with it.
+mod connector_bring_up;
+/// What a connector's workers write about it, and where those records go.
+mod worker_logs;
+
+pub use connector_bring_up::*;
+pub use worker_logs::*;
+
 /// The marker every `nextToken` this service issues carries, ahead of the
 /// discriminator of the listing that issued it ([`Listing::token_prefix`]), so a
 /// token this service did not issue — or one another of its listings issued — is
@@ -892,6 +901,16 @@ pub struct ConnectorRecord {
     pub worker_configuration: Option<WorkerConfiguration>,
     pub log_delivery: Option<LogDelivery>,
     pub state: String,
+    /// The `ConnectorState` the clock brings this connector to rest in when the
+    /// change it owes it comes due: what the bring-up its create started will
+    /// find ([`BringUp`]), decided once by that create and never re-decided, so
+    /// every read of the connector reports the same outcome.
+    pub resting_state: String,
+    /// What `DescribeConnector` reports in `stateDescription` — "details about
+    /// the state of a connector" — or `None` for a connector whose state has
+    /// nothing to explain. Stored with the resting state it describes, so the
+    /// two cannot disagree.
+    pub state_description: Option<StateDescription>,
     pub current_version: String,
     pub creation_time: SystemTime,
     pub tags: HashMap<String, String>,
@@ -925,15 +944,19 @@ impl ConnectorRecord {
     /// (a restart and an update), so neither can differ from the other on which
     /// `ConnectorState` admits such a call, on the member the refusal blames, or
     /// on how it is worded: a connector still being created, already restarting
-    /// or updating, or being deleted has no running workers for the call to act
-    /// on. Only the modelled error VARIANT stays with the handler, since the
-    /// error enum is per-operation — the same shape as
+    /// or updating, failed or being deleted has no running workers for the call
+    /// to act on. Only the modelled error VARIANT stays with the handler, since
+    /// the error enum is per-operation — the same shape as
     /// [`capacity_refusal`] and
     /// [`ComAmazonawsKafkaconnectKafkaconnectState::start_connector_operation`], the
     /// other two rules these handlers share.
     pub fn not_running_refusal(&self) -> Option<String> {
-        (self.state != CONNECTOR_RUNNING)
-            .then(|| invalid_parameter_because("connectorArn", &connector_is_not_running()))
+        (!CALL_ACCEPTED_CONNECTOR_STATES.contains(&self.state.as_str())).then(|| {
+            invalid_parameter_because(
+                "connectorArn",
+                &only_valid_in_states(CALL_ACCEPTED_CONNECTOR_STATES),
+            )
+        })
     }
 
     /// Whether this connector names the resource `arn` names among the
@@ -1589,6 +1612,9 @@ pub struct ComAmazonawsKafkaconnectKafkaconnectState {
     pub worker_configurations: HashMap<String, WorkerConfigurationRecord>,
     /// Stored connector operations, keyed by `connectorOperationArn`.
     pub connector_operations: HashMap<String, ConnectorOperationRecord>,
+    /// The log events the connectors' workers have written and that no call has
+    /// handed to their destination yet ([`deliver_worker_logs`]), oldest first.
+    pub worker_log_records: Vec<WorkerLogRecord>,
     /// How many resources this service has minted an id for. Feeds the ARN
     /// suffix, so two resources of one name (one created after the other was
     /// deleted) never share an ARN.
@@ -1618,6 +1644,7 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
 
         self.connectors
             .retain(|_, connector| !removal_due(connector.pending, now));
+        let mut written = Vec::new();
         for connector in self.connectors.values_mut() {
             if settling_due(connector.pending, now) {
                 // The settings an update made due land with the move back to
@@ -1627,10 +1654,22 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
                 if let Some(settings) = connector.pending_update.take() {
                     connector.apply_update(settings);
                 }
-                connector.state = CONNECTOR_RUNNING.to_string();
+                // The state the clock owes THIS connector: what the bring-up its
+                // create started found ([`BringUp`]), which is `RUNNING` for a
+                // connector whose workers reached their Kafka cluster and
+                // `FAILED` for one that had none to reach. A `FAILED` connector
+                // is at rest, so no further change is owed it and every call
+                // only a running connector serves is refused for it.
+                connector.state = connector.resting_state.clone();
                 connector.pending = None;
+                // And the workers write that outcome where the connector's own
+                // `logDelivery` points, for the first call that can hand it over
+                // to deliver: this runs under the state guard, and a delivery
+                // awaits.
+                written.extend(connector.worker_log_records());
             }
         }
+        self.worker_log_records.extend(written);
 
         // A worker configuration has no creating state to leave (the model gives
         // `WorkerConfigurationState` only `ACTIVE` and `DELETING`), so the only
@@ -1706,28 +1745,31 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
     ///
     /// The ONE rule both deletes of a connector's dependencies run (a custom
     /// plugin and a worker configuration), so neither can differ from the other
-    /// on when a dependency may be removed, on the member the refusal blames or
-    /// on how it is worded. A stored connector names the plugins it runs on and
-    /// the configuration it runs with by ARN, and a connector is only stored
-    /// against references that resolve, in its own region, to a resource that is
-    /// ACTIVE: removing a resource a connector still names would leave the store
-    /// holding a connector the create path refuses to store, and the reads
-    /// echoing an ARN that resolves to nothing. `member` is the request member
-    /// that carried the ARN and `resource` the service's own name for the kind
-    /// of resource it names; only the modelled error VARIANT stays with the
-    /// handler, since the error enum is per-operation — the same shape as
+    /// on when a dependency may be removed or on how the refusal is worded. A
+    /// stored connector names the plugins it runs on and the configuration it
+    /// runs with by ARN, and a connector is only stored against references that
+    /// resolve, in its own region, to a resource that is ACTIVE: removing a
+    /// resource a connector still names would leave the store holding a
+    /// connector the create path refuses to store, and the reads echoing an ARN
+    /// that resolves to nothing. `resource` is the service's own name for the
+    /// kind of resource the refused ARN names, and the refusal names ONE of the
+    /// connectors blocking the delete ([`resource_in_use_by_connector`]) — the
+    /// first in ARN order, so the same held state is always answered with the
+    /// same sentence. Only the modelled error VARIANT stays with the handler,
+    /// since the error enum is per-operation — the same shape as
     /// [`ConnectorRecord::not_running_refusal`] and [`capacity_refusal`], the
     /// other rules these handlers share.
     pub fn dependency_in_use_refusal(
         &self,
         region: &str,
         arn: &str,
-        member: &str,
         resource: &str,
     ) -> Option<String> {
         self.connectors_in(region)
-            .any(|connector| connector.names_dependency(arn))
-            .then(|| invalid_parameter_because(member, &resource_is_in_use(resource)))
+            .filter(|connector| connector.names_dependency(arn))
+            .map(|connector| connector.arn.as_str())
+            .min()
+            .map(|connector_arn| resource_in_use_by_connector(resource, connector_arn))
     }
 
     /// The worker configuration `arn` names, as an endpoint for `region` sees
@@ -2134,7 +2176,9 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 // value collides with state the account already holds (a name already taken) —
 // the request's own `name`/`connectorName` is the member that conflicted, so the
 // same member-naming form carries the modelled conflict reason. A quota refusal
-// blames no member of the request and keeps its own wording.
+// blames no member of the request and keeps its own wording, and so does a
+// refusal the TAGGING operations answer ([`RESOURCE_WAS_NOT_FOUND`]): the form
+// is per-operation, not per-service.
 // ---------------------------------------------------------------------------
 
 /// The lead-in of every kafkaconnect parameter-rejection message.
@@ -2143,6 +2187,20 @@ const INVALID_PARAMETER: &str = "Invalid parameter";
 /// The reason a parameter that names a resource this service does not hold is
 /// rejected with. The apostrophe is U+2019, as the service writes it.
 pub const RESOURCE_DOES_NOT_EXIST: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// The WHOLE message the TAGGING operations answer an ARN this service holds no
+/// resource at with.
+///
+/// `TagResource`, `UntagResource` and `ListTagsForResource` are kafkaconnect's
+/// tagging API — one route, `/v1/tags/{resourceArn}`, over every kind of resource
+/// this service holds — and they report an absent resource in their own words
+/// rather than in this service's member-naming form: the message is this one
+/// string, it interpolates nothing from the request and it names no member. It is
+/// deliberately different from the message a resource's own reader answers the
+/// same dead ARN with ([`RESOURCE_DOES_NOT_EXIST`], which keeps the
+/// member-naming form), so the two forms are per-operation rather than
+/// per-service.
+pub const RESOURCE_WAS_NOT_FOUND: &str = "Resource was not found";
 
 /// The reason a parameter that must carry an ARN, and does not, is rejected
 /// with.
@@ -2154,22 +2212,50 @@ pub const INVALID_ARN: &str = "Invalid ARN.";
 /// provisioned", as the member's own documentation puts it.
 pub const ONE_CAPACITY_FORM: &str = "Specify exactly one of autoScaling or provisionedCapacity.";
 
-/// The reason a delete of a resource a connector this account holds still runs
+/// The message a delete of a resource a connector this account holds still runs
 /// on is refused with: a connector is only stored against references that
 /// resolve to an ACTIVE resource, so the resource stays while the connector
-/// naming it does. `resource` is the service's own name for the kind of
-/// resource the refused ARN names, and nothing else is interpolated: the
-/// refusal is the same whichever connector names it and whatever ARN that
-/// connector carries.
-pub fn resource_is_in_use(resource: &str) -> String {
-    format!("The {resource} is in use by a connector.")
+/// naming it does.
+///
+/// It does NOT take this service's `Invalid parameter <member>: …` form and
+/// names no request member: the delete is refused for STATE the account holds
+/// rather than for a value of the request, so the sentence states the rule and
+/// then names the connector blocking it — which is the whole value of the
+/// refusal to a cleanup script, since that connector is what it has to delete
+/// before retrying. `resource` is the service's own name for the kind of
+/// resource the refused ARN names, and `connector_arn` is the ARN of a connector
+/// in this store that names it ("and possibly others": a second connector naming
+/// the same resource is the same refusal).
+pub fn resource_in_use_by_connector(resource: &str, connector_arn: &str) -> String {
+    format!(
+        "You can't delete a {resource} being used by one or more connectors. This {resource} is \
+         used by the connector with arn {connector_arn}, and possibly others. Please delete \
+         connectors using this {resource} and try again."
+    )
 }
 
-/// The reason a call only a RUNNING connector can serve is refused with for a
-/// connector in any other state: one still being created, already restarting,
-/// updating or being deleted has no running workers for the call to act on.
-pub fn connector_is_not_running() -> String {
-    format!("The connector is not {CONNECTOR_RUNNING}.")
+/// The `ConnectorState` values an operation that starts work on a connector
+/// accepts, as its refusal names them ([`only_valid_in_states`]).
+///
+/// `RestartConnector` and `UpdateConnector` both act on a connector's RUNNING
+/// workers, and the service names both states its workers can be acted on in:
+/// the running one, and the PAUSED one it names in this refusal even though
+/// `ConnectorState` does not list it — a connector whose workers have been
+/// paused still has workers to restart or re-configure. The set is stated once,
+/// here, so the gate and the sentence that reports it cannot disagree.
+pub const CALL_ACCEPTED_CONNECTOR_STATES: &[&str] = &[CONNECTOR_RUNNING, "PAUSED"];
+
+/// The reason a call is refused for a resource whose state the operation does not
+/// accept: it names the states that WOULD be served, which is what tells the
+/// caller whether to wait and retry.
+///
+/// Rendered from the accepted set itself, so the sentence and the gate reading it
+/// can never disagree, and in the bracketed form the service writes it in.
+pub fn only_valid_in_states(accepted: &[&str]) -> String {
+    format!(
+        "This operation is only valid for resources that are in one of the following states: [{}]",
+        accepted.join(", ")
+    )
 }
 
 /// The reason a create whose name is already taken is refused with: the

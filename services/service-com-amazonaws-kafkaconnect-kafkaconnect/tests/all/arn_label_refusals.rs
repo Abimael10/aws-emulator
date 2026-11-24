@@ -8,8 +8,10 @@
 //! it is meant to name names NO resource, so it is incorrect INPUT — the modelled
 //! `BadRequestException` (HTTP 400) blaming that member with the service's `Invalid ARN.`
 //! reason. A WELL-FORMED ARN the account holds no resource at is a different answer: the
-//! resource is absent, so that one stays the modelled `NotFoundException` (HTTP 404) with
-//! the service's `The requested resource doesn't exist.` reason — except where an earlier
+//! resource is absent, so that one stays the modelled `NotFoundException` (HTTP 404) — with
+//! the service's `The requested resource doesn't exist.` reason behind the member it blames
+//! for a resource's OWN route, and with the tagging API's own `Resource was not found` for
+//! the three TAG operations, which name no member at all — except where an earlier
 //! gate of the operation has already decided the request, which is `UpdateConnector` and
 //! its `@required` `currentVersion`. Both errors are declared for every one of these
 //! operations, and each label is an `@httpLabel __string` with no `@pattern`, so the
@@ -56,6 +58,10 @@ const INVALID_ARN: &str = "Invalid ARN.";
 /// The reason this service gives for a member naming a resource it does not hold. The
 /// apostrophe is U+2019, as the service writes it.
 const DOES_NOT_EXIST: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// The WHOLE message the three TAG operations answer an ARN this service holds no resource
+/// at with: the tagging API's own sentence, which interpolates nothing and names no member.
+const RESOURCE_WAS_NOT_FOUND: &str = "Resource was not found";
 
 /// One emulator: a single shared engine behind the production router.
 fn emulator() -> MultiServiceRouter {
@@ -139,6 +145,23 @@ impl Route {
             "TagResource" => json!({"tags": {"env": "probe"}}),
             _ => Value::Null,
         }
+    }
+
+    /// The WHOLE message this route answers a well-formed ARN the store holds nothing at
+    /// with.
+    ///
+    /// Per OPERATION, not per service: the three tagging operations — one route,
+    /// `/v1/tags/{resourceArn}`, over every kind of resource this service holds — report an
+    /// absent resource in the tagging API's own words, while a resource's own route keeps
+    /// the member-naming form.
+    fn not_found_message(&self) -> String {
+        if matches!(
+            self.operation,
+            "TagResource" | "UntagResource" | "ListTagsForResource"
+        ) {
+            return RESOURCE_WAS_NOT_FOUND.to_string();
+        }
+        format!("Invalid parameter {}: {DOES_NOT_EXIST}", self.member)
     }
 }
 
@@ -414,7 +437,7 @@ async fn a_well_formed_arn_the_store_does_not_hold_stays_the_modelled_not_found(
             error_code(&answered).contains("NotFoundException"),
             "case {case:?}: expected NotFoundException, got {answered}"
         );
-        let expected = format!("Invalid parameter {}: {DOES_NOT_EXIST}", route.member);
+        let expected = route.not_found_message();
         let actual = message(&answered);
         assert_eq!(
             actual, expected,

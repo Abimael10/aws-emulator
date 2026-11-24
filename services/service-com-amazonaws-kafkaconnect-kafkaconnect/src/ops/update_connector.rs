@@ -179,8 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+
+        // The clock first, in a scope of its own, and then the worker log events
+        // the settle it applied has written: a delivery AWAITS, so it cannot be
+        // made while this service's store is locked
+        // (`crate::state::deliver_worker_logs`).
+        store.lock().settle_due();
+        crate::state::deliver_worker_logs(&*self.engine, ctx).await;
+
         let mut state = store.lock();
-        state.settle_due();
 
         // A value that is not a kafkaconnect ARN at all names no connector, so
         // it is incorrect input rather than a resource that is absent: the

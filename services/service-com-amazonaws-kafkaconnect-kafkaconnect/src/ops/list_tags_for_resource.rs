@@ -185,11 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signed for, so another region's resource is as absent here as an ARN this
         // service never minted.
         let Some(tags) = state.tags_of(&region, &input.resource_arn) else {
+            // The tagging operations report an absent resource in their own
+            // words, naming no member (`crate::state::RESOURCE_WAS_NOT_FOUND`).
             return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "resourceArn",
-                    crate::state::RESOURCE_DOES_NOT_EXIST,
-                )),
+                message: Some(crate::state::RESOURCE_WAS_NOT_FOUND.to_string()),
             })
             .into());
         };

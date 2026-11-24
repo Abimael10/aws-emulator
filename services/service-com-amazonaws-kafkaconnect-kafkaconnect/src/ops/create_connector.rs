@@ -10,8 +10,11 @@
 //! a single element, a `capacity` naming neither or both of its two forms, an `mcuCount`
 //! outside the documented value set, or auto-scaling worker and task counts that do not
 //! bound each other the way their documentation says) is a `BadRequestException`. The
-//! connector is answered `CREATING` and becomes `RUNNING` once the clock says so
-//! (`crate::state::TRANSITION_SPAN`), which every later read materialises.
+//! connector is answered `CREATING`, and the bring-up its create starts brings it to rest
+//! once the clock says so (`crate::state::TRANSITION_SPAN`), which every later read
+//! materialises: `RUNNING` when the Apache Kafka cluster its `bootstrapServers` name is one
+//! this account holds, and `FAILED` with a `stateDescription` when the bring-up reaches no
+//! cluster there (`crate::state::bring_up_against`).
 //!
 //! ## Shape of an operation
 //!
@@ -203,8 +206,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+
+        // What the bring-up this create starts will find: the connector's
+        // workers connect to the Apache Kafka cluster its `kafkaCluster` names,
+        // and a bring-up that reaches no cluster at those addresses brings the
+        // connector to rest FAILED rather than RUNNING
+        // (`crate::state::bring_up_against`). Asked HERE, before this service's
+        // store is locked, because it awaits — it is a READ of the service that
+        // owns this account's Kafka clusters and writes nothing, so a create the
+        // gates below refuse still leaves no state behind.
+        let bring_up = crate::state::bring_up_against(
+            ctx,
+            &region,
+            &input.kafka_cluster.apache_kafka_cluster.bootstrap_servers,
+        )
+        .await;
+
+        // The clock first, in a scope of its own, and then the worker log events
+        // the settle it applied has written: a delivery AWAITS, so it cannot be
+        // made while this service's store is locked
+        // (`crate::state::deliver_worker_logs`).
+        store.lock().settle_due();
+        crate::state::deliver_worker_logs(&*self.engine, ctx).await;
+
         let mut state = store.lock();
-        state.settle_due();
 
         // The `tags` a create carries are held to the same rules as a later
         // `TagResource` write, so a create cannot store a tag the tagging path
@@ -454,6 +479,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             worker_configuration: input.worker_configuration,
             log_delivery: input.log_delivery,
             state: crate::state::CONNECTOR_CREATING.to_string(),
+            // The state the clock owes it once the bring-up is done, and what
+            // `DescribeConnector` then reports about that state: decided here,
+            // once, so every later read reports the one outcome.
+            resting_state: bring_up.resting_state,
+            state_description: bring_up.state_description,
             current_version: crate::state::FIRST_CONNECTOR_VERSION.to_string(),
             creation_time: ::std::time::SystemTime::now(),
             tags: input.tags.unwrap_or_default(),
