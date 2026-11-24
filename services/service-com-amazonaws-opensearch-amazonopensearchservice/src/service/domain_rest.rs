@@ -3335,6 +3335,28 @@ fn document_write(
     if !matches!(request.method, "POST" | "PUT") {
         return wrong_method(request, "POST, PUT");
     }
+    // The CLUSTER's own authorization decision about this write, taken through the one place
+    // every route takes it ([`guarded`]) rather than inside the write path alone: the write
+    // path takes the same decision again for a producer that reaches it from outside this
+    // plane ([`ingest::index_into`]), but a decision taken only there leaves no record of
+    // itself, and the security plugin's audit log has a record of EVERY decision the
+    // transport layer took. It is taken before anything the write would do, as every other
+    // route's is.
+    guarded(domain, request, fgac::ACTION_INDEX_DOCUMENT, |domain| {
+        authorized_document_write(domain, request, index_name, id, creates, now)
+    })
+}
+
+/// Apply one document write the cluster has authorized — the write itself, once the
+/// decisions above it have been taken.
+fn authorized_document_write(
+    domain: &mut Domain,
+    request: &Request<'_>,
+    index_name: &str,
+    id: Option<&str>,
+    creates: Creates,
+    now: SystemTime,
+) -> RtResponse {
     // A write addressed to an ALIAS lands in the index that alias is the write index of,
     // which is what makes a write alias the address a producer keeps while the index
     // behind it is rotated.

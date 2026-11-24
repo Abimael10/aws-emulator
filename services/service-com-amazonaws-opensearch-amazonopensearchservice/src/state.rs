@@ -111,6 +111,10 @@ pub mod log_probes;
 /// about a request leave a record in the log group the `AUDIT_LOGS` option names.
 pub mod audit;
 
+/// The TRANSPORT REQUEST the cluster carries one action in: the type an audit record of a
+/// transport-layer decision names the action it was taken about by.
+pub mod transport_requests;
+
 /// The `AWS/ES` metrics a provisioned domain's cluster publishes about itself: what each
 /// gauge reads, and the cadence they are observed on.
 pub mod cluster_metrics;

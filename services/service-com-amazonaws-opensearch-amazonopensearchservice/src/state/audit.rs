@@ -33,6 +33,11 @@
 //! [`CATEGORY_MISSING_PRIVILEGES`]). A record states the decision and nothing else — no
 //! response status, because the decision is taken before the request is answered — so two
 //! requests the cluster decided alike leave the same record whatever each was answered.
+//!
+//! WHICH operation a transport-layer decision was taken about is the type of the request the
+//! cluster carries that action in ([`super::transport_requests`]), which the record names
+//! beside the privilege: the privilege alone does not say, since more than one route asks for
+//! one privilege.
 
 use ::std::time::SystemTime;
 
@@ -400,10 +405,21 @@ pub fn message(domain: &Domain, event: &Event<'_>, node: &str, at: SystemTime) -
             );
         }
         // One of the transport layer is about an ACTION, so its record names the privilege
-        // that action asks for and the indexes it resolved to.
+        // that action asks for, the REQUEST the cluster carries that action in — which is
+        // what says which operation the decision was taken about, since one privilege is
+        // asked for by more than one route ([`super::transport_requests`]) — and the indexes
+        // it resolved to.
         Layer::Transport => {
             if let Some(privilege) = event.privilege {
                 record.insert("audit_request_privilege".to_string(), json!(privilege));
+                if let Some(request_type) =
+                    super::transport_requests::transport_request_type(privilege)
+                {
+                    record.insert(
+                        "audit_transport_request_type".to_string(),
+                        json!(request_type),
+                    );
+                }
             }
             if let Some(index) = event.index {
                 record.insert("audit_trace_indices".to_string(), json!([index]));
