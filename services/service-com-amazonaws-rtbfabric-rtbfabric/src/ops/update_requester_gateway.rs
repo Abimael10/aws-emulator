@@ -9,7 +9,10 @@
 //!
 //! A gateway in service takes the change while it is in service, so this call
 //! reports it as pending and the clock owes the gateway its way back to `ACTIVE`;
-//! one moving through a lifecycle of its own — coming up after its create — has no
+//! a call that states no `description` at all asks for no change, so it leaves the
+//! record exactly as it stands — its description, its status and its `updatedAt`.
+//! A gateway
+//! moving through a lifecycle of its own — coming up after its create — has no
 //! configuration in service to change, so the modelled `ConflictException` refuses
 //! it. A `clientToken` replayed with different parameters is refused with the
 //! modelled `ValidationException`, exactly as `UpdateResponderGateway` and this
@@ -243,17 +246,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A member the caller states replaces what the record holds; one it leaves out
-        // is not a request to clear the stored value.
+        // is not a request to clear the stored value. `description` is this operation's
+        // one configuration member and it is optional, so whether the call carries a
+        // change at all is read off whether it states it.
+        let mut configured = false;
         if input.description.is_some() {
             gateway.description = input.description;
+            configured = true;
         }
-        gateway.updated_at = now;
+        // The token records the call this gateway served, not the change it carried, so
+        // a retry of it is recognised either way — and the same token restating other
+        // parameters is still refused rather than applied.
         gateway.accepted_updates.accept(key, fingerprint);
-        // The gateway is in service, so the change is applied to a live gateway: this
-        // call reports the update as pending, and the clock owes the gateway its way
-        // back into service.
-        gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
-        gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        if configured {
+            gateway.updated_at = now;
+            // The gateway is in service, so the change is applied to a live gateway:
+            // this call reports the update as pending, and the clock owes the gateway
+            // its way back into service.
+            gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
+            gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        }
+        // A call that stated no configuration member asked for no change, so the
+        // record keeps the description, the status and the `updatedAt` it already had,
+        // and the status reported below is the one it stands in.
 
         Ok(UpdateRequesterGatewayOutput {
             gateway_id: gateway.gateway_id.clone(),

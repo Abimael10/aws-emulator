@@ -11,7 +11,10 @@
 //! deleting the gateway and creating a new one.
 //!
 //! A gateway that is in service takes the change while it carries traffic, so it
-//! is answered `PENDING_UPDATE` and the clock owes it `ACTIVE` again; a gateway
+//! is answered `PENDING_UPDATE` and the clock owes it `ACTIVE` again; a call that
+//! states none of the members this operation applies asks for no change, so it
+//! leaves the record exactly as it stands — its configuration, its status and its
+//! `updatedAt`. A gateway
 //! moving through a lifecycle of its own has no configuration in service to
 //! change -> `ConflictException` (409), and an id that names no stored responder
 //! gateway -> `ResourceNotFoundException` (404).
@@ -318,32 +321,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A member the caller states replaces what the record holds; one it
         // leaves out is not a request to clear the stored value. `domainName`,
         // `port` and `protocol` are not applied at all: this operation does not
-        // change them.
+        // change them, so stating one of them is no change either, and whether
+        // the call carries a change is read off the members it DOES apply.
+        let mut configured = false;
         if input.description.is_some() {
             gateway.description = input.description;
+            configured = true;
         }
         if input.listener_config.is_some() {
             // The listener configuration carries exactly the protocols list, so
             // replacing it is what updates that list.
             gateway.listener_config = input.listener_config;
+            configured = true;
         }
         if input.trust_store_configuration.is_some() {
             gateway.trust_store_configuration = input.trust_store_configuration;
+            configured = true;
         }
         if input.managed_endpoint_configuration.is_some() {
             gateway.managed_endpoint_configuration = input.managed_endpoint_configuration;
+            configured = true;
         }
         if input.client_routing_policy.is_some() {
             gateway.client_routing_policy = input.client_routing_policy;
+            configured = true;
         }
-        gateway.updated_at = now;
+        // The token records the call this gateway served, not the change it
+        // carried, so a retry of it is recognised either way — and the same
+        // token restating other parameters is still refused rather than applied.
         gateway.accepted_updates.accept(key, fingerprint);
-        // The gateway is in service, so the change is applied to a live gateway:
-        // this call reports the update as pending, and the clock owes the gateway
-        // its way back into service. A changed client routing policy is reported
-        // now and takes effect once that status is ACTIVE again.
-        gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
-        gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        if configured {
+            gateway.updated_at = now;
+            // The gateway is in service, so the change is applied to a live
+            // gateway: this call reports the update as pending, and the clock
+            // owes the gateway its way back into service. A changed client
+            // routing policy is reported now and takes effect once that status
+            // is ACTIVE again.
+            gateway.status = crate::state::GATEWAY_STATUS_PENDING_UPDATE.to_string();
+            gateway.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        }
+        // A call that stated no member this operation applies asked for no
+        // change, so the record keeps its configuration, its status and its
+        // `updatedAt`, and the status reported below is the one it stands in.
 
         Ok(UpdateResponderGatewayOutput {
             gateway_id: gateway.gateway_id.clone(),

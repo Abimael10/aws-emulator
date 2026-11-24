@@ -22,7 +22,9 @@
 //!   `managedEndpointConfiguration`, `clientRoutingPolicy`), keeps every member it
 //!   leaves out, never changes the `domainName`, `port` and `protocol` the create
 //!   fixed, and reports the gateway as `PENDING_UPDATE` with the clock owing it
-//!   `ACTIVE` again — while a gateway in any other status has no configuration in
+//!   `ACTIVE` again — while a call that states none of those members asks for no
+//!   change and leaves the record exactly as it stands, a gateway in any other
+//!   status has no configuration in
 //!   service to change, an id that names no stored responder gateway resolves to
 //!   nothing, and a replayed `clientToken` answers the record the first call
 //!   produced rather than applying the change twice.
@@ -807,6 +809,16 @@ fn update_rows() -> Vec<(String, Value)> {
     rows
 }
 
+/// Whether a patch states any member this operation APPLIES. `domainName`,
+/// `port` and `protocol` are stated by the caller and never applied, so a patch
+/// carrying only those asks for no change at all.
+fn states_a_change(patch: &Value) -> bool {
+    UPDATABLE_MEMBERS
+        .iter()
+        .chain(["managedEndpointConfiguration"].iter())
+        .any(|member| patch.get(*member).is_some())
+}
+
 #[tokio::test]
 async fn an_update_replaces_the_members_it_states_and_keeps_every_other() {
     for (case, patch) in update_rows() {
@@ -835,10 +847,19 @@ async fn an_update_replaces_the_members_it_states_and_keeps_every_other() {
             gateway_id,
             "case {case:?}: expected the update to answer for {gateway_id:?}, got {answered:?}"
         );
+        // A gateway in service takes a stated change while it carries traffic,
+        // which is what the pending status reports; a call that states none of
+        // the members this operation applies asks for no change, so the gateway
+        // stays in the status it already stood in.
+        let expected_status = if states_a_change(&patch) {
+            GATEWAY_STATUS_PENDING_UPDATE
+        } else {
+            GATEWAY_STATUS_ACTIVE
+        };
         assert_eq!(
             text(&answered, "status"),
-            GATEWAY_STATUS_PENDING_UPDATE,
-            "case {case:?}: expected a gateway in service to take the change as {GATEWAY_STATUS_PENDING_UPDATE:?}, got {answered:?}"
+            expected_status,
+            "case {case:?}: expected the gateway to answer {expected_status:?}, got {answered:?}"
         );
         let expected_policy = patch
             .get("clientRoutingPolicy")
@@ -870,6 +891,14 @@ async fn an_update_replaces_the_members_it_states_and_keeps_every_other() {
                 after[member], before[member],
                 "case {case:?}: expected {member:?} to be unchanged at {:?}, got {:?}",
                 before[member], after[member]
+            );
+        }
+        if !states_a_change(&patch) {
+            // Nothing was asked for, so the whole record is what it was before
+            // the call — `updatedAt` included.
+            assert_eq!(
+                after, before,
+                "case {case:?}: expected a call stating no applied member to leave the record alone, got {after:?} after {before:?}"
             );
         }
     }
@@ -923,6 +952,94 @@ async fn an_update_never_changes_the_domain_name_port_or_protocol_the_create_fix
                 before[member], after[member]
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn an_update_that_states_no_applied_member_leaves_the_responder_gateway_alone() {
+    // Spans the forms a call that asks for no change takes: the required members
+    // alone, restating the stored `port` and `protocol`, and each of the three
+    // members this operation never applies restated differently — on its own and
+    // all together.
+    for (case, patch) in [
+        ("the required members alone", json!({})),
+        (
+            "a different domain name",
+            json!({ "domainName": "other.example.com" }),
+        ),
+        ("a different port", json!({ "port": 8443 })),
+        ("a different protocol", json!({ "protocol": "HTTP" })),
+        (
+            "all three the create fixed, restated differently",
+            json!({ "domainName": "third.example.com", "port": 80, "protocol": "HTTP" }),
+        ),
+    ] {
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .create_responder_gateway(case, update_baseline_body("create"))
+            .await;
+        // The call lands on a gateway in service, which is the only status with a
+        // configuration in service to change at all.
+        let before = fabric
+            .poll_gateway_status(case, &gateway_id, GATEWAY_STATUS_ACTIVE)
+            .await;
+
+        let (status, answered) = fabric
+            .send(
+                "POST",
+                &update_path(&gateway_id),
+                Some(update_body("no-change", &patch)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a call stating no applied member to be served, got {status} {answered:?}"
+        );
+        assert_eq!(
+            text(&answered, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the call to answer for the gateway it addressed, got {answered:?}"
+        );
+        // Nothing was asked for, so the gateway is reported in the status it
+        // already stood in rather than as taking a change.
+        assert_eq!(
+            text(&answered, "status"),
+            GATEWAY_STATUS_ACTIVE,
+            "case {case:?}: expected the record's own status, got {answered:?}"
+        );
+        let after = fabric.read_responder_gateway(case, &gateway_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the record to be untouched, got {after:?} after {before:?}"
+        );
+
+        // The call WAS served under that token, so the token is used up: the same
+        // one restating other parameters is refused rather than applied.
+        let (status, refused) = fabric
+            .send(
+                "POST",
+                &update_path(&gateway_id),
+                Some(update_body(
+                    "no-change",
+                    &json!({ "description": "Other parameters" }),
+                )),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the used token with other parameters to be refused, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            "clientToken no-change was already used for a UpdateResponderGateway request \
+             with different parameters",
+            "case {case:?}: expected the mismatch wording, got {refused:?}"
+        );
+        let after = fabric.read_responder_gateway(case, &gateway_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused call to change nothing, got {after:?}"
+        );
     }
 }
 
@@ -1181,10 +1298,17 @@ async fn the_same_client_token_with_different_parameters_is_refused_and_changes_
             status, 200,
             "case {case:?}: expected a fresh token to carry the same change, got {status} {accepted:?}"
         );
+        // A row that states no applied member carries no change, so it is
+        // answered with the status the record already stands in.
+        let expected_status = if states_a_change(&patch) {
+            GATEWAY_STATUS_PENDING_UPDATE
+        } else {
+            GATEWAY_STATUS_ACTIVE
+        };
         assert_eq!(
             text(&accepted, "status"),
-            GATEWAY_STATUS_PENDING_UPDATE,
-            "case {case:?}: expected the fresh token's change to be taken as {GATEWAY_STATUS_PENDING_UPDATE:?}, got {accepted:?}"
+            expected_status,
+            "case {case:?}: expected the fresh token's call to answer {expected_status:?}, got {accepted:?}"
         );
     }
 }

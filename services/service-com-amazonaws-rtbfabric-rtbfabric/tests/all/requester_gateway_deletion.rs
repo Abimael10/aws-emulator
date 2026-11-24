@@ -391,7 +391,10 @@ async fn a_gateway_still_settling_can_be_released() {
 // The rule under test is about state, not about one recorded request: the update
 // applies the members the caller STATES to the stored record — one left out is not
 // a request to clear what is stored — and reports that record's OWN status, which
-// is pending while the gateway puts the change into service. A gateway that is not
+// is pending while the gateway puts the change into service. `description` is the
+// one member this operation applies and it is optional, so a call that states it
+// not at all asks for no change: the record keeps its description, its status and
+// its `updatedAt`. A gateway that is not
 // in service has no configuration in service to change, so it is refused. A retry
 // of any `clientToken` a change of the record was accepted under is answered with
 // the record rather than applied to it a second time — however many changes it has
@@ -602,12 +605,18 @@ async fn an_update_applies_what_it_states_and_reports_the_record_status() {
             gateway_id,
             "case {case:?}: expected the update to answer for the gateway it changed, got {answered:?}"
         );
-        // The gateway puts the change into service, which is what the pending status
-        // reports; the clock then owes it its way back.
+        // The gateway puts a stated change into service, which is what the pending
+        // status reports; the clock then owes it its way back. A call that stated no
+        // change leaves the gateway in the status it already stood in.
+        let expected_status = if row.stated.is_some() {
+            UPDATING_STATUS
+        } else {
+            IN_SERVICE_STATUS
+        };
         assert_eq!(
             text(&answered, "status"),
-            UPDATING_STATUS,
-            "case {case:?}: expected the update to report the record's own status, got {answered:?}"
+            expected_status,
+            "case {case:?}: expected the update to report {expected_status:?} as the record's own status, got {answered:?}"
         );
 
         // The change is in the record, and the members the update did not state are
@@ -641,6 +650,113 @@ async fn an_update_applies_what_it_states_and_reports_the_record_status() {
         assert!(
             updated_at >= created_at,
             "case {case:?}: expected updatedAt {updated_at} not to precede createdAt {created_at}"
+        );
+        if row.stated.is_none() {
+            // Nothing was asked for, so the whole record is what it was before
+            // the call — `updatedAt` included.
+            assert_eq!(
+                settled, before,
+                "case {case:?}: expected a call stating no member to leave the record alone, got {settled:?} after {before:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_update_that_states_no_description_leaves_the_requester_gateway_alone() {
+    // Spans what the rule generalises over: whether the record carries a
+    // description at all, and whether it has already taken a change of its own —
+    // so a record that was re-dated once is not re-dated again by a call that
+    // asks for nothing.
+    for (case, created, prior_change) in [
+        ("a gateway that carried no description", None, false),
+        (
+            "a gateway the create described",
+            Some("Display exchange"),
+            false,
+        ),
+        (
+            "a gateway an earlier change had already re-dated",
+            Some("Display exchange"),
+            true,
+        ),
+        (
+            "a gateway an earlier change gave its description",
+            None,
+            true,
+        ),
+    ] {
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .create_described_requester(case, created, "token-create")
+            .await;
+        fabric
+            .poll_requester_until(case, &gateway_id, IN_SERVICE_STATUS)
+            .await;
+        if prior_change {
+            let (status, answered) = fabric
+                .update_requester(
+                    &gateway_id,
+                    update_requester_body(Some("Spot bidding fabric"), "token-earlier"),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the earlier change to answer 200, got {status} {answered:?}"
+            );
+            fabric
+                .poll_requester_until(case, &gateway_id, IN_SERVICE_STATUS)
+                .await;
+        }
+        let before = fabric.read_requester(case, &gateway_id).await;
+
+        let (status, answered) = fabric
+            .update_requester(&gateway_id, update_requester_body(None, "token-no-change"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a call stating no description to be served, got {status} {answered:?}"
+        );
+        assert_eq!(
+            text(&answered, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the call to answer for the gateway it addressed, got {answered:?}"
+        );
+        // Nothing was asked for, so the gateway is reported in the status it
+        // already stood in rather than as putting a change into service.
+        assert_eq!(
+            text(&answered, "status"),
+            IN_SERVICE_STATUS,
+            "case {case:?}: expected the record's own status, got {answered:?}"
+        );
+        let after = fabric.read_requester(case, &gateway_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the record to be untouched, got {after:?} after {before:?}"
+        );
+
+        // The call WAS served under that token, so the token is used up: the same
+        // one restating other parameters is refused rather than applied.
+        let (status, refused) = fabric
+            .update_requester(
+                &gateway_id,
+                update_requester_body(Some("Other parameters"), "token-no-change"),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the used token with other parameters to be refused, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            "clientToken token-no-change was already used for a UpdateRequesterGateway request \
+             with different parameters",
+            "case {case:?}: expected the mismatch wording, got {refused:?}"
+        );
+        let after = fabric.read_requester(case, &gateway_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused call to change nothing, got {after:?}"
         );
     }
 }

@@ -20,7 +20,9 @@
 //! `UpdateLink` is covered here as well, because it is what happens next to a
 //! link an accept has brought up: it replaces the configuration members the
 //! call states, keeps every member it leaves out, and reports the status that
-//! change leaves the link in. Its table spans which of the two optional members
+//! change leaves the link in. A call that states NEITHER of its two optional
+//! members asks for no change, so it leaves the record exactly as it stands.
+//! Its table spans which of the two optional members
 //! the call states, the published bounds of the modelled timeout range, which
 //! end addresses the call, and every member of the modelled `LinkStatus` enum.
 //!
@@ -998,6 +1000,14 @@ fn update_body(row: &UpdateRow) -> Value {
     body
 }
 
+impl UpdateRow {
+    /// Whether this row asks for a change at all: both configuration members are
+    /// optional, so a row that states neither asks for nothing.
+    fn states_a_change(&self) -> bool {
+        self.error_log.is_some() || self.timeout_in_millis.is_some()
+    }
+}
+
 /// One sampling member of a link reading's `logSettings`.
 fn sampling(body: &Value, member: &str) -> f64 {
     body["logSettings"]["applicationLogs"]["sampling"][member]
@@ -1051,14 +1061,27 @@ async fn an_update_replaces_the_members_it_states_and_keeps_the_rest() {
             pair.link_id,
             updated["linkId"]
         );
-        // The link was carrying traffic, so the change is applied to a live
-        // link: the update is reported as pending, and the clock owes the link
-        // its way back up.
+        // A stated change is applied to a link that carries traffic, which is
+        // what PENDING_UPDATE reports; a call that states neither member asks
+        // for no change, so the link stays in the status it already stood in.
+        let expected_status = if row.states_a_change() {
+            LINK_STATUS_PENDING_UPDATE
+        } else {
+            LINK_STATUS_ACTIVE
+        };
         assert_eq!(
             text(&updated, "status"),
-            LINK_STATUS_PENDING_UPDATE,
-            "case {case:?}: expected the update to report PENDING_UPDATE, got {:?}",
+            expected_status,
+            "case {case:?}: expected the update to report {expected_status:?}, got {:?}",
             updated["status"]
+        );
+        // The clock owes the link its way back up only for a call that carried a
+        // change: one that carried none left nothing in flight.
+        assert_eq!(
+            fabric.settlement_owed(),
+            row.states_a_change(),
+            "case {case:?}: expected a transition to be owed only for a stated change, got {}",
+            fabric.settlement_owed()
         );
 
         // What the update left, read back from BOTH ends once the clock has
@@ -1101,12 +1124,22 @@ async fn an_update_replaces_the_members_it_states_and_keeps_the_rest() {
                     before[member], read_back[member]
                 );
             }
-            // The record did change, so it is dated at the instant it changed.
-            assert_ne!(
-                read_back["updatedAt"], before["updatedAt"],
-                "case {case:?}: expected the update to re-date the link, got {:?}",
-                read_back["updatedAt"]
-            );
+            if row.states_a_change() {
+                // The record did change, so it is dated at the instant it changed.
+                assert_ne!(
+                    read_back["updatedAt"], before["updatedAt"],
+                    "case {case:?}: expected the update to re-date the link, got {:?}",
+                    read_back["updatedAt"]
+                );
+            } else {
+                // Nothing was asked for, so nothing about the record moved: the
+                // link is still dated at the instant it last changed.
+                assert_eq!(
+                    read_back["updatedAt"], before["updatedAt"],
+                    "case {case:?}: expected a call stating no member to leave updatedAt at {:?}, got {:?}",
+                    before["updatedAt"], read_back["updatedAt"]
+                );
+            }
         }
         // ACTIVE is where the update leaves the link: nothing further is owed.
         assert!(
@@ -1306,6 +1339,147 @@ async fn an_update_states_a_timeout_inside_the_modelled_range() {
     );
 }
 
+/// The statuses a link can still be configured from: every member of the
+/// modelled `LinkStatus` enum except the three nothing moves a link out of.
+fn configurable_link_statuses() -> Vec<&'static str> {
+    LINK_STATUS_VALUES
+        .iter()
+        .copied()
+        .filter(|status| {
+            ![
+                LINK_STATUS_REJECTED,
+                LINK_STATUS_FAILED,
+                LINK_STATUS_DELETED,
+            ]
+            .contains(status)
+        })
+        .collect()
+}
+
+/// The forms a request that states neither configuration member can take on the
+/// wire: both of `UpdateLink`'s body members are optional, so an empty object and
+/// no body at all state exactly the same thing — nothing.
+fn bodies_stating_no_member() -> [(&'static str, Option<Value>); 2] {
+    [
+        ("an empty object", Some(json!({}))),
+        ("no body at all", None),
+    ]
+}
+
+#[tokio::test]
+async fn an_update_that_states_no_configuration_member_leaves_the_link_alone() {
+    // Spans what the rule generalises over: the status the link stands in (the
+    // whole modelled catalog, from `LINK_STATUS_VALUES`), which of the link's
+    // two ends addresses the call, and the form a request stating nothing takes.
+    for status_value in configurable_link_statuses() {
+        for from_peer in [false, true] {
+            for (form, body) in bodies_stating_no_member() {
+                let case = format!("{status_value} addressed from the {} end, {form}", {
+                    if from_peer {
+                        "answering"
+                    } else {
+                        "opening"
+                    }
+                });
+                let case = case.as_str();
+                let fabric = Fabric::new();
+                let pair = fabric.linked_pair("token").await;
+                fabric.force_link_status(status_value);
+                let addressed = if from_peer {
+                    &pair.responder_id
+                } else {
+                    &pair.requester_id
+                };
+                let link = format!("/gateway/{addressed}/link/{}", pair.link_id);
+                let (_, before) = fabric.send("GET", &link, None).await;
+
+                let (status, updated) = fabric.send("PATCH", &link, body).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a request stating no member to be served, got {status} {updated:?}"
+                );
+                assert_eq!(
+                    text(&updated, "linkId"),
+                    pair.link_id,
+                    "case {case:?}: expected link {:?}, got {:?}",
+                    pair.link_id,
+                    updated["linkId"]
+                );
+                // Nothing was asked for, so the link is reported in the status
+                // it already stood in rather than as taking a change.
+                assert_eq!(
+                    text(&updated, "status"),
+                    status_value,
+                    "case {case:?}: expected the link's own status {status_value:?}, got {:?}",
+                    updated["status"]
+                );
+                // And nothing is in flight: no transition was started, so the
+                // clock owes the link none.
+                assert!(
+                    !fabric.settlement_owed(),
+                    "case {case:?}: expected no transition to be owed after a call that stated nothing"
+                );
+
+                // The whole record is what it was: the configuration, the status
+                // and the `updatedAt` every later reader reports.
+                let (status, after) = fabric.send("GET", &link, None).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the link to still read back, got {status} {after:?}"
+                );
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: expected the record to be untouched, got {after:?} after {before:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_link_in_a_terminal_status_is_refused_even_by_a_request_that_states_nothing() {
+    // The refusal is about the link's status, not about what the call states, so
+    // it holds for a request that asks for no change at all.
+    for status_value in [
+        LINK_STATUS_REJECTED,
+        LINK_STATUS_FAILED,
+        LINK_STATUS_DELETED,
+    ] {
+        for (form, body) in bodies_stating_no_member() {
+            let case = format!("{status_value}, {form}");
+            let case = case.as_str();
+            let fabric = Fabric::new();
+            let pair = fabric.linked_pair("token").await;
+            fabric.force_link_status(status_value);
+            let link = format!("/gateway/{}/link/{}", pair.requester_id, pair.link_id);
+            let (_, before) = fabric.send("GET", &link, None).await;
+
+            let (status, code, refused) = fabric.send_with_code("PATCH", &link, body).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected a status nothing leaves to conflict with 409, got {status} {refused:?}"
+            );
+            assert_eq!(
+                code, "ConflictException",
+                "case {case:?}: expected ConflictException, got {code:?}"
+            );
+            assert_eq!(
+                text(&refused, "message"),
+                format!(
+                    "link {} on gateway {} is {status_value} and cannot be updated",
+                    pair.link_id, pair.requester_id
+                ),
+                "case {case:?}: expected the refusal to name the link, the gateway and the status, got {refused:?}"
+            );
+            let (_, after) = fabric.send("GET", &link, None).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: expected the refused call to change nothing, got {after:?} after {before:?}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The counters the two gateway readers DERIVE from the statuses this suite
 // drives: `GetRequesterGateway`'s `activeLinksCount`/`totalLinksCount` and
@@ -1437,9 +1611,11 @@ async fn the_derived_counters_follow_the_link_status_and_the_end_that_must_answe
 
 #[tokio::test]
 async fn a_live_link_applying_a_configuration_change_still_counts_as_active() {
-    // The update table above, so the link reaches PENDING_UPDATE through every
-    // combination of the members the call may state and either end addressing it.
-    for row in UPDATE_ROWS {
+    // The update table above, minus the row that states no member at all: that
+    // row asks for no change, so it leaves the link ACTIVE rather than applying
+    // anything. Every other combination of the members the call may state, and
+    // either end addressing it, reaches PENDING_UPDATE here.
+    for row in UPDATE_ROWS.iter().filter(|row| row.states_a_change()) {
         let case = row.name;
         let fabric = Fabric::new();
         let pair = fabric.linked_pair("token").await;

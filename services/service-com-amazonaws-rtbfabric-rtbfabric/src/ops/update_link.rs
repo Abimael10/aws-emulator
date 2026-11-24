@@ -5,7 +5,10 @@
 //! Changes the configuration of a stored link: each optional member this call
 //! states replaces what the record holds, and every member it leaves out keeps
 //! the value the link already had, so the next reader of the link reports the
-//! merged configuration. A link that is up takes the change while it carries
+//! merged configuration. Both configuration members are optional, so a call
+//! that states neither asks for no change at all and leaves the record exactly
+//! as it stands — its configuration, its status and its `updatedAt`. A link
+//! that is up takes a change while it carries
 //! traffic, so it is answered `PENDING_UPDATE` and the clock owes it `ACTIVE`
 //! again; a link still moving through its own lifecycle keeps the status that
 //! lifecycle owes it. A link in a status nothing moves it out of cannot be
@@ -192,21 +195,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A member the caller states replaces what the record holds; one it
-        // leaves out is not a request to clear the stored value.
+        // leaves out is not a request to clear the stored value. Every
+        // configuration member is optional, so whether the call carries a
+        // change at all is read off which ones it states.
+        let mut configured = false;
         if let Some(log_settings) = &input.log_settings {
             link.log_settings = log_settings.clone();
+            configured = true;
         }
         if input.timeout_in_millis.is_some() {
             link.timeout_in_millis = input.timeout_in_millis;
+            configured = true;
         }
-        link.updated_at = now;
-        if link.is_up() {
-            // The link is carrying traffic, so the change is applied to a live
-            // link: this call reports the update as pending, and the clock owes
-            // the link its way back up.
-            link.status = crate::state::LINK_STATUS_PENDING_UPDATE.to_string();
-            link.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        if configured {
+            link.updated_at = now;
+            if link.is_up() {
+                // The link is carrying traffic, so the change is applied to a
+                // live link: this call reports the update as pending, and the
+                // clock owes the link its way back up.
+                link.status = crate::state::LINK_STATUS_PENDING_UPDATE.to_string();
+                link.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+            }
         }
+        // A call that stated no configuration member asked for no change, so
+        // the record keeps the configuration, the status and the `updatedAt` it
+        // already had, and the status reported below is the one it stands in.
 
         Ok(UpdateLinkOutput {
             link_id: link.link_id.clone(),
