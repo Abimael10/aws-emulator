@@ -65,6 +65,15 @@ const LANGUAGE_VALUE: &str = "fr-CA";
 /// carries whatever the behaviour's policies name.
 const FORWARDED_FOR_HEADER: &str = "X-Forwarded-For";
 
+/// Two headers the EDGE ITSELF generates about the viewer's connection, which reach the origin
+/// only where a policy NAMES them: the viewer's country and the scheme it dialled.
+const COUNTRY_HEADER: &str = "CloudFront-Viewer-Country";
+const PROTO_HEADER: &str = "CloudFront-Forwarded-Proto";
+
+/// The scheme the policy rows' viewer dials, which is what the edge states for
+/// [`PROTO_HEADER`].
+const DIALLED_PROTO: &str = "https";
+
 /// The `User-Agent` CloudFront states on an origin request whose viewer `User-Agent` the
 /// behaviour does not forward.
 const CLOUDFRONT_USER_AGENT: &str = "Amazon CloudFront";
@@ -191,7 +200,7 @@ async fn deployed_reflecting_api(router: &MultiServiceRouter) -> String {
     )
     .await;
     let template = format!(
-        r#"{{"tenant":"$input.params('{TENANT_HEADER}')","authorization":"$input.params('{AUTHORIZATION_HEADER}')","userAgent":"$input.params('{USER_AGENT_HEADER}')","language":"$input.params('{LANGUAGE_HEADER}')","forwardedFor":"$input.params('{FORWARDED_FOR_HEADER}')"}}"#
+        r#"{{"tenant":"$input.params('{TENANT_HEADER}')","authorization":"$input.params('{AUTHORIZATION_HEADER}')","userAgent":"$input.params('{USER_AGENT_HEADER}')","language":"$input.params('{LANGUAGE_HEADER}')","forwardedFor":"$input.params('{FORWARDED_FOR_HEADER}')","country":"$input.params('{COUNTRY_HEADER}')","proto":"$input.params('{PROTO_HEADER}')"}}"#
     );
     apigw(
         router,
@@ -617,9 +626,180 @@ async fn the_origin_receives_every_header_the_behaviour_names_with_the_viewers_o
     }
 }
 
+/// `CreateCachePolicy` and `CreateOriginRequestPolicy`, each whitelisting the headers it is
+/// handed, answering the `(cache policy id, origin request policy id)` a behaviour names them
+/// by.
+///
+/// The cache policy's TTLs are all zero, so every viewer request below reaches the origin
+/// rather than an entry another row filled.
+async fn created_policies(
+    router: &MultiServiceRouter,
+    name: &str,
+    keyed: &[&str],
+    forwarded: &[&str],
+) -> (String, String) {
+    let whitelist = |names: &[&str]| {
+        let items: String = names.iter().map(|name| format!("<Name>{name}</Name>")).collect();
+        format!(
+            "<HeaderBehavior>whitelist</HeaderBehavior>\
+             <Headers><Quantity>{}</Quantity><Items>{items}</Items></Headers>",
+            names.len()
+        )
+    };
+    // The members in the order the model declares them
+    // (`smithy_query(query="shape",shape="CachePolicyConfig")`).
+    let cache = cloudfront(
+        router,
+        "POST",
+        &format!("/{API_VERSION}/cache-policy"),
+        Bytes::from(format!(
+            "<CachePolicyConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+             <Comment>what the cache key carries, and so the origin</Comment>\
+             <Name>{name}-cache</Name>\
+             <DefaultTTL>0</DefaultTTL><MaxTTL>0</MaxTTL><MinTTL>0</MinTTL>\
+             <ParametersInCacheKeyAndForwardedToOrigin>\
+             <EnableAcceptEncodingGzip>false</EnableAcceptEncodingGzip>\
+             <HeadersConfig>{}</HeadersConfig>\
+             <CookiesConfig><CookieBehavior>none</CookieBehavior></CookiesConfig>\
+             <QueryStringsConfig><QueryStringBehavior>all</QueryStringBehavior>\
+             </QueryStringsConfig>\
+             </ParametersInCacheKeyAndForwardedToOrigin></CachePolicyConfig>",
+            whitelist(keyed)
+        )),
+    )
+    .await;
+    assert_eq!(
+        cache.status,
+        201,
+        "setup: CreateCachePolicy answered {} with {:?}",
+        cache.status,
+        cache.text()
+    );
+    let origin_request = cloudfront(
+        router,
+        "POST",
+        &format!("/{API_VERSION}/origin-request-policy"),
+        Bytes::from(format!(
+            "<OriginRequestPolicyConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+             <Comment>what reaches the origin beside the cache key</Comment>\
+             <Name>{name}-origin-request</Name>\
+             <HeadersConfig>{}</HeadersConfig>\
+             <CookiesConfig><CookieBehavior>none</CookieBehavior></CookiesConfig>\
+             <QueryStringsConfig><QueryStringBehavior>none</QueryStringBehavior>\
+             </QueryStringsConfig></OriginRequestPolicyConfig>",
+            whitelist(forwarded)
+        )),
+    )
+    .await;
+    assert_eq!(
+        origin_request.status,
+        201,
+        "setup: CreateOriginRequestPolicy answered {} with {:?}",
+        origin_request.status,
+        origin_request.text()
+    );
+    (cache.element("Id"), origin_request.element("Id"))
+}
+
+/// The same rule under the POLICIES a behaviour names instead of the legacy member: a header
+/// either policy lists reaches the origin, the CloudFront-generated ones included — "all HTTP
+/// headers, cookies, and URL query strings that are specified in the cache policy or the origin
+/// request policy … can include items from the viewer request and, in the case of headers,
+/// additional ones that are added by CloudFront" (`OriginRequestPolicyConfig`) — while a header
+/// neither lists reaches none.
+///
+/// The row set spans what the rule generalises over on this path: WHICH policy names the header
+/// (the cache policy, whose values are "also included in requests that CloudFront sends to the
+/// origin", or the origin request policy), and WHAT KIND of header it is (one the viewer sent,
+/// one the EDGE generates, the viewer's credential that neither policy names).
+#[tokio::test]
+async fn the_origin_receives_every_header_either_policy_names_generated_ones_included() {
+    let router = emulator();
+    let api = deployed_reflecting_api(&router).await;
+    let origin_host = format!("{api}.execute-api.{REGION}.amazonaws.com");
+    // The cache policy keys on a viewer header and on a header the edge generates; the origin
+    // request policy adds one of each beside them. Neither names the viewer's credential.
+    let (cache_policy, origin_request_policy) = created_policies(
+        &router,
+        "forwarded-headers",
+        &[TENANT_HEADER, COUNTRY_HEADER],
+        &[LANGUAGE_HEADER, PROTO_HEADER],
+    )
+    .await;
+    let case = "a behaviour naming a cache policy and an origin request policy";
+    let (id, domain) = create_distribution(
+        &router,
+        case,
+        "forwarded-headers-policies",
+        &origin_host,
+        &format!("/{STAGE}"),
+        &format!(
+            "<CachePolicyId>{cache_policy}</CachePolicyId>\
+             <OriginRequestPolicyId>{origin_request_policy}</OriginRequestPolicyId>"
+        ),
+        &["GET", "HEAD"],
+    )
+    .await;
+    wait_until_deployed(&router, case, &id).await;
+
+    let answered = view(
+        &router,
+        DIALLED_PROTO,
+        &domain,
+        &format!("/{ECHO_PATH}?probe=policies"),
+        &[
+            (TENANT_HEADER, TENANT_VALUE),
+            (AUTHORIZATION_HEADER, AUTHORIZATION_VALUE),
+            (USER_AGENT_HEADER, USER_AGENT_VALUE),
+            (LANGUAGE_HEADER, LANGUAGE_VALUE),
+        ],
+    )
+    .await;
+    assert_eq!(
+        answered.status,
+        200,
+        "case {case:?}: expected the origin's reflected answer, got {} with {:?}",
+        answered.status,
+        answered.text()
+    );
+    let reflected = answered.json();
+    let read = |member: &str| {
+        reflected
+            .get(member)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    for (member, expected, named_by) in [
+        ("tenant", TENANT_VALUE, "the cache policy"),
+        ("language", LANGUAGE_VALUE, "the origin request policy"),
+        ("proto", DIALLED_PROTO, "the origin request policy"),
+        // The viewer's own credential reaches no origin whatever a policy names, which the
+        // table above pins for the legacy reading and the crate's own unit rows for the
+        // policy one.
+        ("authorization", "", "neither policy"),
+        // Nor the viewer's own `User-Agent`, so CloudFront states its own.
+        ("userAgent", CLOUDFRONT_USER_AGENT, "neither policy"),
+    ] {
+        let actual = read(member);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: {member} is named by {named_by}, so the origin must have received \
+             {expected:?}; got {actual:?} (reflected {reflected})"
+        );
+    }
+    // The country the edge resolved for this viewer, which the CACHE POLICY names: a two-letter
+    // code, as `GeoRestriction$Location` ("a two-letter, uppercase country code") spells one.
+    let country = read("country");
+    assert!(
+        country.len() == 2 && country.chars().all(|letter| letter.is_ascii_uppercase()),
+        "case {case:?}: {COUNTRY_HEADER} is named by the cache policy, so the origin must have \
+         received a two-letter country code; got {country:?} (reflected {reflected})"
+    );
+}
+
 /// The second half: the viewer's `Origin` reaches the origin exactly where the behaviour names
 /// it, which is what makes an S3 CORS preflight answerable through a distribution at all.
-///
 /// The rows differ along the behaviour's `Headers` list — one naming the three headers a
 /// preflight asks its question in, and one naming none — and along the way the viewer reached
 /// the edge: the address the distribution PUBLISHES, dialled, which is the only place a

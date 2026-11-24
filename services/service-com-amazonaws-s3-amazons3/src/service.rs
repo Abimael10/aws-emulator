@@ -2303,6 +2303,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // worded from that bucket's own configuration, and the seam that words it is handed
         // no request to read it from.
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
+        // And the `Referer` it states, read once here for the reason
+        // [`crate::state::stated_referer`] gives: a bucket policy may be written over that
+        // header — AWS's own guidance for a published site narrows its public read to the
+        // requests stating one — and the decision that policy is taken by is reached deep
+        // inside the store, which is handed no request to read it from.
+        crate::state::stated_referer::remember(
+            req.headers()
+                .get(crate::state::stated_referer::REFERER_HEADER),
+        );
         // And WHICH SURFACE it reached, read once here for the same reason: the framework
         // decides whether to authenticate this request before any handler runs, and the seam
         // that states how an operation is authenticated is handed no request to read it from.

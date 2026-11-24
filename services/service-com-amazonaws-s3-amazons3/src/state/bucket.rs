@@ -711,15 +711,12 @@ impl Bucket {
         principals.extend(::service_common::iam_authorization::account_principals(
             &caller,
         ));
-        let mut context = vec![(
-            SECURE_TRANSPORT_KEY.to_string(),
-            SECURE_TRANSPORT_VALUE.to_string(),
-        )];
-        // And the NETWORK the request arrived from, which is what a clause over the
-        // requester's address is decided against ([`crate::state::source_ip_conditions`]) —
-        // the same value the full authorization gate and the anonymous decision answer that
-        // key with.
-        context.extend(crate::state::source_ip_conditions());
+        // The secure transport this emulator serves every endpoint over, the NETWORK the
+        // request arrived from — which is what a clause over the requester's address is
+        // decided against — and the site it states it was REFERRED from, each the same value
+        // the full authorization gate and the anonymous decision answer that key with
+        // ([`super::refusals::request_conditions`]).
+        let mut context = super::refusals::request_conditions();
         // The bucket's own TAGS, which a clause over the resource-tag family is decided
         // against while ABAC is enabled on it ([`Bucket::resource_tag_conditions`]) — the
         // same keys the full authorization gate answers for a request addressed here.

@@ -152,6 +152,19 @@ impl NameSet {
 pub struct CacheKeyParameters {
     /// `CachePolicyHeadersConfig$HeaderBehavior`.
     pub headers: NameSet,
+    /// The headers the EDGE generates that the policy keys on, and so also sends to the origin
+    /// ([`super::generated_headers`]).
+    ///
+    /// `CachePolicyHeadersConfig$HeaderBehavior` "determines whether any HTTP headers are
+    /// included in the cache key AND in requests that CloudFront sends to the origin", and its
+    /// `whitelist` is "only the HTTP headers that are listed in the `Headers` type … in the
+    /// cache key and in requests that CloudFront sends to the origin" — so a `CloudFront-*`
+    /// header a cache policy LISTS reaches the origin on the strength of that policy alone,
+    /// whatever origin request policy the behaviour also names. A generated header is not a
+    /// header the viewer sent, so only a list that NAMES one carries it, which is the same
+    /// reading [`ForwardedParameters::generated_headers`] makes of the policy on the other
+    /// side.
+    pub generated_headers: NameSet,
     /// `CachePolicyCookiesConfig$CookieBehavior`.
     pub cookies: NameSet,
     /// `CachePolicyQueryStringsConfig$QueryStringBehavior`.
@@ -206,11 +219,20 @@ pub(super) fn cache_key_parameters(
     else {
         return CacheKeyParameters::default();
     };
+    let header_names = items(parameters.headers_config.headers.as_ref().map(|headers| &headers.items));
     CacheKeyParameters {
         headers: NameSet::of(
             &parameters.headers_config.header_behavior,
-            items(parameters.headers_config.headers.as_ref().map(|headers| &headers.items)),
+            header_names.clone(),
         ),
+        // A `CloudFront-*` header reaches the origin where the cache policy's own list NAMES
+        // it, read off the behaviour the policy states exactly as the origin request policy's
+        // side reads its own ([`forwarded_parameters`]): `CachePolicyHeaderBehavior` is `none`
+        // or `whitelist`, and only the list names a header at all.
+        generated_headers: match parameters.headers_config.header_behavior.as_str() {
+            WHITELIST => NameSet::Named(header_names),
+            _ => NameSet::None,
+        },
         cookies: NameSet::of(
             &parameters.cookies_config.cookie_behavior,
             items(parameters.cookies_config.cookies.as_ref().map(|cookies| &cookies.items)),
@@ -301,8 +323,13 @@ fn legacy_cache_key_parameters(behavior: &Behavior) -> CacheKeyParameters {
     let Some(values) = legacy(behavior) else {
         return CacheKeyParameters::default();
     };
+    let headers = legacy_headers(values);
     CacheKeyParameters {
-        headers: legacy_headers(values),
+        // The legacy whitelist is read for a generated header exactly as the forwarded side
+        // reads it ([`legacy_forwarded_parameters`]): a `CloudFront-*` header reaches the key,
+        // and the origin, where the list NAMES it.
+        generated_headers: NameSet::Named(headers.named().to_vec()),
+        headers,
         cookies: legacy_cookies(values),
         query_strings: legacy_keyed_query_strings(values),
         // The legacy member states nothing about `Accept-Encoding`, which only a cache

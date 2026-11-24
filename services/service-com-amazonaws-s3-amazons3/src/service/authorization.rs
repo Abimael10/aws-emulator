@@ -185,6 +185,14 @@ const MULTI_FACTOR_AUTH_PRESENT_KEY: &str = "aws:MultiFactorAuthPresent";
 /// undecided, which words it as if nothing had granted the action — where the request answers
 /// the key.
 const TOKEN_ISSUE_TIME_KEY: &str = "aws:TokenIssueTime";
+/// The global condition key naming the site the request states it was referred from, the ONE
+/// spelling of it this crate holds ([`crate::state::stated_referer`], whose docs carry the
+/// rule and where the value is read from).
+///
+/// It is PUBLISHED, so a request stating no `Referer` is decided as carrying no value for the
+/// key rather than leaving a clause over it unknown.
+const REFERER_KEY: &str = crate::state::stated_referer::CONDITION_KEY;
+
 /// The global condition key naming the account that OWNS the resource the request addressed
 /// ("aws:ResourceAccount", same published list).
 ///
@@ -253,6 +261,7 @@ const DATA_ACCESS_POINT_ACCOUNT_KEY: &str = "s3:DataAccessPointAccount";
 pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     SECURE_TRANSPORT_KEY,
     SOURCE_IP_KEY,
+    REFERER_KEY,
     ACL_KEY,
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
@@ -289,6 +298,7 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
 pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
     SECURE_TRANSPORT_KEY,
     SOURCE_IP_KEY,
+    REFERER_KEY,
     ACL_KEY,
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
@@ -524,12 +534,14 @@ pub struct ObjectWriteContext<'a> {
 
 impl ObjectWriteContext<'_> {
     /// The request's condition context: the secure transport every endpoint of this emulator
-    /// serves, plus one pair per member the request carried.
+    /// serves, the `Referer` the request stated where it stated one
+    /// ([`crate::state::stated_referer`]), plus one pair per member the request carried.
     pub fn conditions(&self) -> Vec<(String, String)> {
         let mut context = vec![(
             SECURE_TRANSPORT_KEY.to_string(),
             SECURE_TRANSPORT_VALUE.to_string(),
         )];
+        context.extend(crate::state::stated_referer::conditions());
         for (key, value) in [
             (ACL_KEY, self.acl),
             (STORAGE_CLASS_KEY, self.storage_class),

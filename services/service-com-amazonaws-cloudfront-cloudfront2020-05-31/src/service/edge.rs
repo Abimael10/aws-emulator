@@ -3056,11 +3056,16 @@ fn origin_request_headers(
     // The chain of addresses the request has travelled, which EVERY origin request carries
     // whatever the behaviour's policies name ([`forwarded_for`]).
     headers.push((FORWARDED_FOR.to_string(), forwarded_for(req)));
-    // The headers the edge generated for this request, where the origin request policy names
-    // them: a behaviour with no origin request policy, or one whose policy does not list a
-    // generated header, sends the origin none of them.
+    // The headers the edge generated for this request, where the behaviour's policies name
+    // them: the CACHE POLICY's own list, because "the HTTP headers that are listed in the
+    // `Headers` type are included in the cache key AND in requests that CloudFront sends to the
+    // origin" (`CachePolicyHeadersConfig$HeaderBehavior`), and the ORIGIN REQUEST POLICY's
+    // beside it. A behaviour whose policies list no generated header sends the origin none of
+    // them.
     for (name, value) in generated.headers() {
-        if forwarded.generated_headers.contains_header(&name) {
+        if keyed.generated_headers.contains_header(&name)
+            || forwarded.generated_headers.contains_header(&name)
+        {
             headers.push((name, value));
         }
     }
@@ -4168,8 +4173,10 @@ mod tests {
     fn an_origin_request_carries_no_viewer_credential_whatever_the_policy_forwards() {
         // The rows differ along the origin request policy's header behaviour — none (the
         // default), `allViewer` and `allViewerExceptHostHeader`, the AWS-managed policies
-        // whose ids `MANAGED_ORIGIN_REQUEST_POLICIES` publishes — and along the viewer
-        // header: a credential, a hop-by-hop header, and an ordinary one.
+        // whose ids `MANAGED_ORIGIN_REQUEST_POLICIES` publishes — along the viewer header
+        // asked about (the two the credential travels in, a hop-by-hop header, an ordinary
+        // one) and along the request's METHOD, because the credential this emulator relays
+        // to no origin is relayed to none on any of them.
         const ALL_VIEWER: &str = "216adef6-5c7f-47e4-b989-5492eafa07d3";
         const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
         let store = ComAmazonawsCloudfrontCloudfront20200531State::default();
@@ -4178,54 +4185,63 @@ mod tests {
             domain_name: "origin.example.com".to_string(),
             ..Origin::default()
         };
-        // (case, the policy the behaviour names, the viewer header, forwarded)
-        let cases: [(&str, Option<&str>, &str, bool); 9] = [
-            ("no policy, a credential", None, "authorization", false),
-            ("no policy, an ordinary header", None, "accept-language", false),
+        // (case, the policy the behaviour names, the viewer header, the method, forwarded)
+        type Row = (&'static str, Option<&'static str>, &'static str, &'static str, bool);
+        let cases: [Row; 10] = [
+            ("no policy, a credential on a GET", None, "authorization", "GET", false),
+            ("no policy, a credential on a HEAD", None, "authorization", "HEAD", false),
             (
-                "allViewer, a credential",
-                Some(ALL_VIEWER),
+                "no policy, a session token on a GET",
+                None,
+                "x-amz-security-token",
+                "GET",
+                false,
+            ),
+            ("no policy, an ordinary header", None, "accept-language", "GET", false),
+            (
+                "no policy, a credential on a POST",
+                None,
                 "authorization",
+                "POST",
                 false,
             ),
             (
-                "allViewer, a session token",
+                "allViewer, a credential the behaviour names",
+                Some(ALL_VIEWER),
+                "authorization",
+                "GET",
+                false,
+            ),
+            (
+                "allViewer, a session token the behaviour names",
                 Some(ALL_VIEWER),
                 "x-amz-security-token",
+                "PUT",
                 false,
             ),
             (
                 "allViewer, a hop-by-hop header",
                 Some(ALL_VIEWER),
                 "connection",
+                "GET",
                 false,
             ),
             (
-                "allViewer, an ordinary header",
-                Some(ALL_VIEWER),
-                "accept-language",
-                true,
-            ),
-            (
-                "allViewerExceptHostHeader, a credential",
-                Some(ALL_VIEWER_EXCEPT_HOST),
-                "authorization",
-                false,
-            ),
-            (
-                "allViewerExceptHostHeader, an ordinary header",
+                "allViewerExceptHostHeader, an ordinary header the behaviour names",
                 Some(ALL_VIEWER_EXCEPT_HOST),
                 "accept-language",
+                "GET",
                 true,
             ),
             (
                 "a policy this account does not hold",
                 Some("00000000-0000-0000-0000-000000000000"),
                 "accept-language",
+                "GET",
                 false,
             ),
         ];
-        for (case, policy, header, forwarded) in cases {
+        for (case, policy, header, method, forwarded) in cases {
             let behavior = Behavior {
                 path_pattern: None,
                 realtime_log_config_arn: None,
@@ -4245,8 +4261,12 @@ mod tests {
                 function_associations: None,
                 lambda_function_associations: None,
             };
-            let mut req = RtRequest::new(SdkBody::empty());
-            req.set_uri("/index.html").expect("a valid URI");
+            let built = ::http::Request::builder()
+                .method(method)
+                .uri("/index.html")
+                .body(SdkBody::empty())
+                .expect("a well-formed request");
+            let mut req = RtRequest::try_from(built).expect("a runtime-API request");
             req.headers_mut().insert(header.to_string(), "v".to_string());
             let headers =
                 origin_request_headers(&store, &behavior, &origin, &req, "cfid", VIEWER_HOST);

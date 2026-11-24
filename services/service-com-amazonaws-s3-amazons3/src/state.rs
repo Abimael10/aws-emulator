@@ -4554,6 +4554,9 @@ mod store;
 // The customer-provided key an SSE-C write supplies, and what a read of such an object must
 // present.
 pub mod sse_customer;
+// The `Referer` the request being served states, which is the one fact about a REQUEST that
+// the decision a bucket policy is taken by may be written over.
+pub mod stated_referer;
 // Who named the tag keys one request carries, which is what decides whether a key in the
 // namespace AWS keeps for its own tags may be stored.
 mod tag_key_origin;

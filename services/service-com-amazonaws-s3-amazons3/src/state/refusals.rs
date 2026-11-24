@@ -2618,18 +2618,21 @@ const VALUE_SPACE_PREFIXES: [(&str, &str); 7] = [
 /// is exactly what the anonymous caller is: only a statement whose principal element reaches
 /// EVERY principal is about its request, and one naming an account or a role is not.
 ///
-/// The request's own NETWORK is answered beside it ([`source_ip_conditions`], the keys this
-/// decision publishes): a grant to every principal conditioned on `aws:SourceIp` is the
-/// documented way to publish content to a set of addresses and to nobody else — the shape a
-/// bucket admitting a service's published checker blocks carries — so such a clause is
-/// DECIDED against the address the request was made from rather than left undecided, which
-/// would grant nothing to anybody.
+/// The request's own NETWORK and the site it states it was REFERRED from are answered beside
+/// it ([`source_ip_conditions`] and [`crate::state::stated_referer`], the keys this decision
+/// publishes): a grant to every principal conditioned on `aws:SourceIp` is the documented way
+/// to publish content to a set of addresses and to nobody else — the shape a bucket admitting
+/// a service's published checker blocks carries — and one conditioned on `aws:Referer` is the
+/// documented way to publish it to one front door, which is what a published site fronted by a
+/// distribution carries. Such a clause is therefore DECIDED against what the request states
+/// rather than left undecided, which would grant nothing to anybody.
 pub fn policy_decision_for_anonymous(
     policy: &str,
     action: &str,
     resource: &str,
 ) -> ::service_common::iam_authorization::Decision {
-    let context = source_ip_conditions();
+    let mut context = source_ip_conditions();
+    context.extend(crate::state::stated_referer::conditions());
     ::service_common::iam_authorization::resource_decision(
         policy,
         &::service_common::iam_authorization::Request::new(action, resource, &[])
@@ -2639,13 +2642,15 @@ pub fn policy_decision_for_anonymous(
 }
 
 /// The condition keys the ANONYMOUS decision ([`policy_decision_for_anonymous`]) ANSWERS, and
-/// so declares this service models for it: the address the request was made from.
+/// so declares this service models for it: the address the request was made from, and the site
+/// it states it was referred from.
 ///
 /// Absence of a published key from the context means "the request carries no value", which IAM
 /// reads under a negated operator, an `IfExists` spelling and a `Null` clause; every other key
 /// leaves its statement undecided. This decision names no principal at all, so it publishes
 /// none of the keys that describe one.
-const ANONYMOUS_PUBLISHED_CONDITION_KEYS: &[&str] = &[SOURCE_IP_KEY];
+const ANONYMOUS_PUBLISHED_CONDITION_KEYS: &[&str] =
+    &[SOURCE_IP_KEY, crate::state::stated_referer::CONDITION_KEY];
 
 /// The IAM action an object READ is authorized under: "To use `GetObject`, you must have
 /// the `READ` access to the object (or version)" (`GetObject`'s own documentation), which
@@ -2679,7 +2684,35 @@ pub(super) const SECURE_TRANSPORT_VALUE: &str = "true";
 /// The condition keys a request judged here carries a value for, and so DECLARES it models
 /// — the keys whose absence from a policy's clause is decided rather than unknown. Every
 /// other key keeps the fail-closed reading ([`Bucket::caller_is_denied`]).
-pub(super) const REQUEST_CONDITION_KEYS: &[&str] = &[SECURE_TRANSPORT_KEY, SOURCE_IP_KEY];
+///
+/// The `Referer` key is answered from the header the request stated
+/// ([`crate::state::stated_referer`]), which is the whole of what AWS answers it from, and it
+/// is published for the same reason the other two are: a request stating no `Referer` carries
+/// no value for it, and a clause written over the key decides on that absence rather than
+/// being left unknown.
+pub(super) const REQUEST_CONDITION_KEYS: &[&str] = &[
+    SECURE_TRANSPORT_KEY,
+    SOURCE_IP_KEY,
+    crate::state::stated_referer::CONDITION_KEY,
+];
+
+/// The condition context EVERY request this store judges a policy for carries: the secure
+/// transport this emulator serves every endpoint over, the address the request was made from
+/// ([`source_ip_conditions`]), and the `Referer` the request stated where it stated one
+/// ([`crate::state::stated_referer`]).
+///
+/// ONE reading, so a decision taken for a CREDENTIALED caller
+/// ([`Bucket::caller_is_denied`]) answers the same keys with the same values for the same
+/// request wherever it is taken.
+pub(super) fn request_conditions() -> Vec<(String, String)> {
+    let mut context = vec![(
+        SECURE_TRANSPORT_KEY.to_string(),
+        SECURE_TRANSPORT_VALUE.to_string(),
+    )];
+    context.extend(source_ip_conditions());
+    context.extend(crate::state::stated_referer::conditions());
+    context
+}
 
 /// The condition-key FAMILY the TAGS of the bucket a request addressed are named in, each
 /// member after the tag key it carries: `aws:ResourceTag/Team` holds the value of the bucket
@@ -2853,4 +2886,122 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsS3Amazons3State>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::service_common::iam_authorization::Decision;
+
+    /// The object a row's decision is taken about.
+    const BUCKET: &str = "published-site";
+    const OBJECT: &str = "arn:aws:s3:::published-site/index.html";
+
+    /// A public-read statement over every object of [`BUCKET`], carrying the condition
+    /// `condition` states (none for the empty one).
+    fn public_read(condition: &str) -> String {
+        format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[\
+             {{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\
+             \"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::{BUCKET}/*\"{condition}}}]}}"
+        )
+    }
+
+    /// RULE: a bucket policy's statement about an ANONYMOUS read is decided in the REQUEST's
+    /// own condition context — the keys that decision answers, the `Referer` the request stated
+    /// among them ([`ANONYMOUS_PUBLISHED_CONDITION_KEYS`]) — so a grant written over one of
+    /// those keys admits exactly the requests that satisfy it, a refusal written over one
+    /// refuses exactly the rest, and a clause over a key this service answers for nothing at
+    /// all leaves its statement undecided and grants nothing.
+    ///
+    /// The rows differ along what the rule generalises over: the OPERATOR the clause is written
+    /// with (`StringEquals`, `StringLike`, `StringNotEquals`), the EFFECT it is written on
+    /// (`Allow`, `Deny`), the KEY it names (the referer the request states, a key this service
+    /// answers for none), and what the request states for that header (the value the clause
+    /// names, another value, nothing).
+    #[test]
+    fn an_anonymous_read_is_decided_in_the_requests_own_condition_context() {
+        const SECRET: &str = "the-front-door";
+        // (case, the policy, the Referer the request states, the decision)
+        type Row = (&'static str, String, Option<&'static str>, Decision);
+        let deny_unless_referred = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[\
+             {{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+             \"Resource\":\"arn:aws:s3:::{BUCKET}/*\"}},\
+             {{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+             \"Resource\":\"arn:aws:s3:::{BUCKET}/*\",\
+             \"Condition\":{{\"StringNotEquals\":{{\"aws:Referer\":\"{SECRET}\"}}}}}}]}}"
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "an unconditioned public grant",
+                public_read(""),
+                None,
+                Decision::Allowed,
+            ),
+            (
+                "a referer-conditioned grant, the request stating the value it names",
+                public_read(&format!(
+                    ",\"Condition\":{{\"StringEquals\":{{\"aws:Referer\":\"{SECRET}\"}}}}"
+                )),
+                Some(SECRET),
+                Decision::Allowed,
+            ),
+            (
+                "the same grant, the request stating another value",
+                public_read(&format!(
+                    ",\"Condition\":{{\"StringEquals\":{{\"aws:Referer\":\"{SECRET}\"}}}}"
+                )),
+                Some("somewhere-else"),
+                Decision::NotStated,
+            ),
+            (
+                "the same grant, the request stating no referer at all",
+                public_read(&format!(
+                    ",\"Condition\":{{\"StringEquals\":{{\"aws:Referer\":\"{SECRET}\"}}}}"
+                )),
+                None,
+                Decision::NotStated,
+            ),
+            (
+                "a grant written with a pattern the stated value matches",
+                public_read(
+                    ",\"Condition\":{\"StringLike\":{\"aws:Referer\":\"the-front-*\"}}",
+                ),
+                Some(SECRET),
+                Decision::Allowed,
+            ),
+            (
+                "a refusal of every request not stating the value, by a request stating it",
+                deny_unless_referred.clone(),
+                Some(SECRET),
+                Decision::Allowed,
+            ),
+            (
+                "the same refusal, by a request stating nothing",
+                deny_unless_referred.clone(),
+                None,
+                Decision::Denied,
+            ),
+            (
+                "a grant conditioned on a key this service answers for nothing",
+                public_read(
+                    ",\"Condition\":{\"StringEquals\":{\"aws:SourceVpc\":\"vpc-0123456789abcdef0\"}}",
+                ),
+                None,
+                Decision::NotStated,
+            ),
+        ];
+        for (case, policy, stated, expected) in rows {
+            crate::state::stated_referer::remember(stated);
+            let actual = policy_decision_for_anonymous(&policy, GET_OBJECT_ACTION, OBJECT);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} (referer {stated:?}): expected {expected:?}, got {actual:?}"
+            );
+        }
+        // The note belongs to the request that recorded it: nothing is left for the next
+        // decision on this thread.
+        crate::state::stated_referer::remember(None);
+    }
 }
