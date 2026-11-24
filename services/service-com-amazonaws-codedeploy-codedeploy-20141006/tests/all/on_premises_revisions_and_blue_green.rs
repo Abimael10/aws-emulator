@@ -157,7 +157,12 @@ async fn seeded_group(
     let mut request = json!({
         "applicationName": application_name,
         "deploymentGroupName": group,
-        "serviceRoleArn": "arn:aws:iam::000000000000:role/CodeDeployRole",
+        // A role of ANOTHER account: this suite is about the on-premises registry
+        // and the termination wait, not about the service role, and a role of this
+        // account would have to be created in IAM for CodeDeploy to accept it
+        // (`CreateDeploymentGroup` resolves the role it is given against the
+        // account's own IAM records).
+        "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
         "onPremisesInstanceTagFilters": [
             {"Key": TARGET_TAG_KEY, "Value": TARGET_TAG_VALUE, "Type": "KEY_AND_VALUE"},
         ],

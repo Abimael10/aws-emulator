@@ -279,23 +279,28 @@ async fn a_service_role_is_judged_by_its_trust_policy() {
     }
 }
 
-/// RULE: a role ARN this emulator's IAM holds no role for is no evidence of a
-/// missing trust — the role may belong to another account — so the create goes
-/// ahead and the group reads back under it.
+/// RULE: a role ARN this emulator's IAM cannot answer for is no evidence of a
+/// missing trust — another account's IAM is not this emulator's to ask — so the
+/// create goes ahead and the group reads back under it.
+///
+/// A role of THIS account that IAM holds nothing under is the opposite case: the
+/// records DO answer for it, and they answer that there is no such role to assume,
+/// so that create is refused
+/// ([`crate::deployment_group_role_and_target_group_names`]).
 #[tokio::test]
-async fn a_role_the_account_does_not_hold_is_not_refused() {
+async fn a_role_this_emulator_cannot_answer_for_is_not_refused() {
     let emulator = Emulator::with_iam();
     let application = given_application(&emulator, "role-elsewhere").await;
-    // Rows differ along WHOSE role the ARN names: another account's, and one this
-    // account simply never told the emulator about.
+    // Rows differ along WHOSE role the ARN names: another account's, and another
+    // account's under a path.
     for (case, role) in [
         (
             "another account's role",
             "arn:aws:iam::210987654321:role/CodeDeployRole",
         ),
         (
-            "a role of this account IAM holds nothing for",
-            "arn:aws:iam::000000000000:role/NeverCreated",
+            "another account's role under a path",
+            "arn:aws:iam::210987654321:role/service-role/CodeDeployRole",
         ),
     ] {
         let group = format!("elsewhere-{}", case.len());

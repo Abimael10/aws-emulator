@@ -521,6 +521,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
+            // And the NAMES that configuration carries: a value outside Elastic
+            // Load Balancing's grammar for a target group name can never name
+            // one, on any compute platform, so it is refused rather than stored
+            // ([`crate::state::load_balancer_gate`]).
+            if let Some(message) =
+                crate::state::load_balancer_gate::target_group_name_refusal(
+                    input.load_balancer_info.as_ref(),
+                )
+            {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::InvalidLoadBalancerInfoException(
+                        InvalidLoadBalancerInfoException {
+                            message: Some(message),
+                        },
+                    ),
+                );
+            }
             // And the Amazon ECS services the group would target, resolved above
             // against the service that owns them: a pair that could not be loaded
             // is refused here, so nothing is stored for it.

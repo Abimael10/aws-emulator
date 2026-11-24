@@ -74,10 +74,10 @@ const INSTANCE_TYPE: &str = "t3.micro";
 /// fleet is resolved and whose instance ARNs the targets carry.
 const ACCOUNT: &str = "000000000000";
 
-/// The service role every deployment group here is created with. No IAM is mounted beside
-/// these two services, so nothing can be shown about this role and the group is stored: what
-/// these cases are about is the FLEET, not the role gate.
-const SERVICE_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/CodeDeployServiceRole";
+/// The service role every deployment group here is created with. It is a role of ANOTHER
+/// account, so this emulator's IAM has nothing to answer about it and the group is stored:
+/// what these cases are about is the FLEET, not the role gate.
+const SERVICE_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/CodeDeployServiceRole";
 
 /// The tag key the fleet carries, and the value that identifies the hosts a deployment group
 /// here selects.

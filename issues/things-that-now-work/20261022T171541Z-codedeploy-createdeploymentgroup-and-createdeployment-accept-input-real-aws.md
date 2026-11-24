@@ -75,3 +75,19 @@ Generated ids, timestamps and names above are environment-specific examples; the
 4. CreateApplication(computePlatform="ECS"), then CreateDeploymentGroup(deploymentStyle=BLUE_GREEN/WITH_TRAFFIC_CONTROL, ecsServices=[{serviceName, clusterName}]) with no loadBalancerInfo -> expect 400 InvalidLoadBalancerInfoException.
 5. CreateDeploymentGroup(..., loadBalancerInfo={targetGroupInfoList:[{name: 33+ chars}]}) -> expect 400 InvalidLoadBalancerInfoException.
 6. CreateDeploymentGroup(..., serviceRoleArn="arn:aws:iam::<acct>:role/does-not-exist") -> expect 400 InvalidRoleException, then GetDeploymentGroup on that name -> expect DeploymentGroupDoesNotExistException.
+
+## Fix note
+
+Causes 1, 2 and 3 were already closed by earlier changes; this fix closes causes 4 and 5.
+
+Cause 4, on the refusal's MESSAGE: the recording establishes the status (400) and the modelled error
+code (InvalidLoadBalancerInfoException) for an out-of-grammar target group name, but AWS's exact
+sentence for this case could NOT be established — the model puts no constraint and no wording on
+`TargetGroupName`, and the behavioural check that measured the case compares the message against a
+constant the replay verdict does not expose (it echoes only the emulator's own text). The emulator
+therefore states the documented rule in this service's own register, naming the value the request
+gave and the published 32-character bound, while the grammar it reports stays in the one place this
+tree holds it (the Elastic Load Balancing v2 crate's target-group name check). If the recorded
+sentence becomes readable, only
+`services/service-com-amazonaws-codedeploy-codedeploy-20141006/src/state/load_balancer_gate.rs::invalid_target_group_name_message`
+has to change.

@@ -74,7 +74,11 @@ const DEPLOYMENT_POLL: Duration = Duration::from_millis(50);
 
 /// A service-role ARN of the form `CreateDeploymentGroup.serviceRoleArn` takes, as a
 /// caller would hand one to a template.
-const SERVICE_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/CodeDeployServiceRole";
+///
+/// A role of ANOTHER account: this suite is about what the stack provisions, and
+/// `CreateDeploymentGroup` resolves a role of THIS account against the account's own IAM
+/// records, which this suite mounts no IAM to hold.
+const SERVICE_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/CodeDeployServiceRole";
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every

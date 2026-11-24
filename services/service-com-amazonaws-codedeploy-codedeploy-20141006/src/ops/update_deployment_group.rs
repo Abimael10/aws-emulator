@@ -567,6 +567,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
+            // And the NAMES this update would store: the same reading
+            // `CreateDeploymentGroup` applies, so a group may not be moved onto a
+            // value that is no target group name either. Only the configuration
+            // the REQUEST names is read — the one the stored group keeps was read
+            // when it was set.
+            if let Some(message) = crate::state::load_balancer_gate::target_group_name_refusal(
+                input.load_balancer_info.as_ref(),
+            ) {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::InvalidLoadBalancerInfoException(
+                        InvalidLoadBalancerInfoException {
+                            message: Some(message),
+                        },
+                    ),
+                );
+            }
             // And the Amazon ECS services the update names, resolved above against
             // the service that owns them: a pair that could not be loaded is
             // refused here, so the stored group keeps the targets it had.

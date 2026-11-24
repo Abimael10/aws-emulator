@@ -523,8 +523,10 @@ async fn an_enabled_alarm_configuration_needs_the_role_to_allow_the_poll() {
 /// and moves the alias.
 ///
 /// Rows differ along WHY there is no evidence: an ARN naming another account's
-/// role, an ARN of this account IAM holds no role for, and a role IAM does hold
-/// that carries no policy document at all.
+/// role, and a role IAM does hold that carries no policy document at all. (A role
+/// ARN of THIS account that IAM holds nothing under is not a row here: the
+/// account's records answer for it, and a deployment group naming it is refused at
+/// the create, before any deployment exists.)
 #[tokio::test]
 async fn a_role_this_emulator_knows_nothing_about_refuses_nothing() {
     let emulator = Emulator::with_lambda_cloudwatch_and_iam();
@@ -540,13 +542,6 @@ async fn a_role_this_emulator_knows_nothing_about_refuses_nothing() {
         (
             "another account's role",
             "arn:aws:iam::210987654321:role/CodeDeployRole".to_string(),
-        ),
-        (
-            "a role of this account IAM holds nothing for",
-            format!(
-                "arn:aws:iam::{}:role/NeverCreated",
-                engine::emulator_account_id()
-            ),
         ),
         ("a role carrying no policy at all", unpolicied.clone()),
     ];

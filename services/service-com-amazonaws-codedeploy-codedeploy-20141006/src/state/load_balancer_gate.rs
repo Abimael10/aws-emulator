@@ -34,6 +34,18 @@
 //! compute platform, is unaffected: the condition is about the deployment this
 //! platform's traffic control performs, not about `loadBalancerInfo` being
 //! required in general.
+//!
+//! # The second question this module answers
+//!
+//! A `loadBalancerInfo` that DOES name something names it by name, and a name
+//! outside Elastic Load Balancing's grammar for one can never name a load
+//! balancer resource. So the names a group would be stored with are read at the
+//! call that gives them — their EXISTENCE is not resolved, the group may name
+//! target groups the account creates afterwards — and a value that is no name is
+//! refused with the same `InvalidLoadBalancerInfoException`
+//! ([`target_group_name_refusal`]).
+
+use ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2;
 
 use crate::ops::types::{DeploymentStyle, LoadBalancerInfo};
 
@@ -110,6 +122,71 @@ fn names_a_load_balancer(load_balancer_info: &LoadBalancerInfo) -> bool {
             .as_deref()
             .map_or(0, <[_]>::len);
     named > 0
+}
+
+/// How THIS service names the subject of a target group NAME clause.
+///
+/// Elastic Load Balancing states the same clause with two subjects, and which one
+/// belongs to the operation that reports it: a create that TAKES a `Name` states
+/// `Target group name '<value>' …`, a call that is HANDED one states `The target
+/// group name '<value>' …` (`elbv2::state::TARGET_GROUP_NAME_SUBJECT` and
+/// `…::SELECTED_TARGET_GROUP_NAME_SUBJECT`). A deployment group is handed the name,
+/// so this service states the clause with the definite subject — the same register
+/// its own value refusals use ("The service role ARN <value> was specified in an
+/// invalid format", [`crate::state::invalid_role_message`]).
+const TARGET_GROUP_NAME_SUBJECT: &str = "The target group name";
+
+/// The refusal a deployment group earns for a TARGET GROUP NAME its
+/// `loadBalancerInfo` carries that is no target group name at all, or `None` when
+/// every name it carries is one.
+///
+/// A target group's EXISTENCE is not resolved here — a group is stored naming
+/// target groups the account may create afterwards — but the NAME is read at the
+/// call that gives it, because a value outside Elastic Load Balancing's name
+/// grammar can never name one: "This name must be unique per region and cannot be
+/// changed after creation. A maximum of 32 alphanumeric characters including
+/// hyphens are allowed, but the name must not begin or end with a hyphen"
+/// (`CreateTargetGroupInput$Name`).
+///
+/// The grammar and the CLAUSE a value broke belong to the service that owns target
+/// groups, so both are read through the ONE place this emulator states them
+/// (`elbv2::state::check_target_group_name_as`, which reports the clauses in the
+/// order AWS reports them — the length before the character set); what this service
+/// supplies is the SUBJECT the clause is stated with
+/// ([`TARGET_GROUP_NAME_SUBJECT`]), so the refusal names the value the request gave
+/// and the one rule it broke rather than reciting every rule.
+///
+/// NOTE on fidelity: the recording this refusal is owed to establishes the status
+/// and the modelled error code, and the behavioural check that measured it compares
+/// the message against a constant the replay verdict does not expose, so AWS's exact
+/// wording for THIS case could not be established from the recording or from the
+/// model. The sentence therefore states the documented clause; if the recorded one
+/// becomes readable, this is the only place it has to change.
+///
+/// Both members that carry such a name are read: `targetGroupInfoList`, the form
+/// an Application or Network Load Balancer's target groups are named in, and the
+/// `targetGroups` of each `targetGroupPairInfoList` entry, the pair an Amazon ECS
+/// deployment moves traffic between. The first value that is no name is the one
+/// answered, in the order the request names them.
+///
+/// Call it from every operation that writes a deployment group, BEFORE anything is
+/// stored: the refusal is judged from the configuration the group would HAVE,
+/// whichever members one request happened to carry.
+#[must_use]
+pub fn target_group_name_refusal(load_balancer_info: Option<&LoadBalancerInfo>) -> Option<String> {
+    let load_balancer_info = load_balancer_info?;
+    let named_directly = load_balancer_info.target_group_info_list.iter().flatten();
+    let named_in_a_pair = load_balancer_info
+        .target_group_pair_info_list
+        .iter()
+        .flatten()
+        .flat_map(|pair| pair.target_groups.iter().flatten());
+    named_directly
+        .chain(named_in_a_pair)
+        .filter_map(|target_group| target_group.name.as_deref())
+        .find_map(|name| {
+            elbv2::state::check_target_group_name_as(TARGET_GROUP_NAME_SUBJECT, name).err()
+        })
 }
 
 #[cfg(test)]
