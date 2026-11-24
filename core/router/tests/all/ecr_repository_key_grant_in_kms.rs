@@ -81,6 +81,11 @@ const ECR_SERVICE_PRINCIPAL: &str = "ecr.eu-west-1.amazonaws.com";
 /// number fails this suite.
 const GRANTS_PER_REPOSITORY: usize = 2;
 
+/// The fixed sentence Amazon ECR opens a refusal it relays from KMS with, including the colon
+/// and the space that separate it from KMS's own sentence. Spelled out here rather than
+/// imported, so a service that words it differently fails this suite.
+const RELAYED_OPENING: &str = "The Amazon ECR action failed due to a KMS exception: ";
+
 /// How long a poll keeps looking before it gives up. Generous on purpose: grant listing is
 /// eventually consistent, and this only bounds a wait that would otherwise never end, so
 /// neither a slow nor a loaded host decides the outcome.
@@ -582,13 +587,16 @@ async fn a_repository_that_names_no_key_of_the_accounts_takes_no_grant() {
 }
 
 /// RULE: a key this Region's KMS cannot grant on refuses the create with the operation's
-/// modelled `KmsException`, carrying the code KMS returned and the answer KMS gave, and no
+/// modelled `KmsException`, carrying the code KMS returned and — behind this service's own
+/// fixed opening for a failure it relays ([`RELAYED_OPENING`]) — the answer KMS gave, and no
 /// repository is created.
 ///
-/// The rows differ in WHY the key cannot be granted on — a key identifier this Region holds
-/// no key for, a key ARN of another Region (which this Region's endpoint can never hold), and
-/// a key KMS holds but that is disabled, where it is taking the grant rather than resolving
-/// the key that is refused.
+/// The rows differ in WHY the key cannot be granted on — a key this Region holds none of,
+/// named by each form `EncryptionConfiguration$kmsKey` admits (its ARN, its key id, an alias);
+/// a key ARN of another Region (which this Region's endpoint can never hold); and a key KMS
+/// holds but that is disabled, where it is taking the grant rather than resolving the key that
+/// is refused — and in the KMS encryption type the create names, since the relayed refusal is
+/// the same whichever of them asked for the key.
 #[tokio::test]
 async fn a_key_that_cannot_be_granted_on_refuses_the_create() {
     let router = emulator();
@@ -617,38 +625,59 @@ async fn a_key_that_cannot_be_granted_on_refuses_the_create() {
 
     // A well-formed key ARN of this account and Region that KMS resolves no key for: its
     // key id is this suite's own text, never one KMS minted.
-    let absent = format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/00000000-0000-4000-8000-000000000000");
+    let absent_id = "00000000-0000-4000-8000-000000000000";
+    let absent = format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/{absent_id}");
 
-    // (case, repository name, the selector the create names the key by, the KMS error code
-    //  the refusal must carry)
-    let rows: Vec<(&str, &str, String, &str)> = vec![
+    // (case, repository name, the encryption type the create names, the selector it names the
+    //  key by, the KMS error code the refusal must carry)
+    let rows: Vec<(&str, &str, &str, String, &str)> = vec![
         (
             "a key ARN of this Region that KMS resolves no key for",
             "refused-absent-key",
+            "KMS",
             absent,
+            "NotFoundException",
+        ),
+        (
+            "a key ID of this Region that KMS resolves no key for",
+            "refused-absent-key-id",
+            "KMS_DSSE",
+            absent_id.to_string(),
+            "NotFoundException",
+        ),
+        (
+            "an alias this Region's KMS holds no key under",
+            "refused-absent-alias",
+            "KMS",
+            "alias/ecr-suite-no-such-key".to_string(),
             "NotFoundException",
         ),
         (
             "a key ARN of another Region, which this Region's endpoint cannot hold",
             "refused-foreign-key",
+            "KMS",
             foreign_key,
             "NotFoundException",
         ),
         (
             "a key of this Region the owner has disabled",
             "refused-disabled-key",
+            "KMS_DSSE",
             disabled_key.clone(),
             "DisabledException",
         ),
     ];
 
-    for (case, name, selector, code) in rows {
+    for (case, name, encryption_type, selector, code) in rows {
         let (status, refused) = ecr(
             &router,
             "CreateRepository",
             &json!({
                 "repositoryName": name,
-                "encryptionConfiguration": {"encryptionType": "KMS", "kmsKey": selector},
+                "encryptionConfiguration": {
+                    "encryptionType": encryption_type,
+                    "kmsKey": selector,
+                },
             }),
         )
         .await;
@@ -663,21 +692,27 @@ async fn a_key_that_cannot_be_granted_on_refuses_the_create() {
              {status} with {refused}"
         );
 
-        // The message is the KMS answer as the SDK layer that made the call renders the
-        // exception it caught: the caught class, named by the code KMS answered, the sentence
-        // KMS itself worded, and the clause naming that answer — down to the status KMS
-        // answered with. Both the sentence and that status are read from KMS rather than
-        // written here, so no wording of this suite's own can pass for the dependency's; the
-        // request id is the answer's and is asserted only by its place.
+        // The message is this service's OWN sentence for a failure it relays from KMS,
+        // followed by KMS's answer: the sentence KMS itself worded and the clause naming that
+        // answer — down to the status KMS answered with. Both the sentence and that status are
+        // read from KMS rather than written here, so no wording of this suite's own can pass
+        // for the dependency's; the request id is the answer's and is asserted only by its
+        // place. No Java exception class stands between the two: a client strips the opening to
+        // recover KMS's own diagnostic.
         let message = member(&refused, "message");
         let (kms_status, said) = kms_said(&router, case, &selector).await;
-        let opening = format!("com.amazonaws.services.kms.model.{code}: {said} ");
+        let opening = format!("{RELAYED_OPENING}{said} ");
         let clause = format!(
             "(Service: AWSKMS; Status Code: {kms_status}; Error Code: {code}; Request ID: "
         );
         assert!(
             message.starts_with(&opening),
             "case {case:?}: expected the refusal to open {opening:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains("com.amazonaws.services.kms.model"),
+            "case {case:?}: expected no Java exception class in the relayed refusal, got \
+             {message:?}"
         );
         assert!(
             message.contains(&clause) && message.ends_with("; Proxy: null)"),

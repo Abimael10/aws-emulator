@@ -47,8 +47,9 @@
 //! DEFINITE negative — KMS answering, with a client status, about the key itself — is the
 //! modelled `KmsException` ("the operation failed due to a KMS exception", with `kmsError`
 //! "the error code returned by KMS"), and nothing is created. What the caller is told is the
-//! answer KMS gave — its own sentence and the clause naming the answer it came from
-//! ([`relayed_message`]) — because the reason the create failed is one only KMS holds.
+//! answer KMS gave, behind this service's own opening of a relayed failure — KMS's sentence
+//! and the clause naming the answer it came from ([`relayed_message`]) — because the reason
+//! the create failed is one only KMS holds.
 //! Anything else establishes nothing about the key: an emulator assembled with no KMS beside
 //! this service (the front door's own refusal, `service_common::in_process_refusal`), a
 //! fault, a refusal of the call itself. Such an answer refuses nothing and takes no grant,
@@ -358,30 +359,34 @@ where
 /// The service name a relayed KMS answer names itself by, which is KMS's own.
 const KMS_SERVICE_NAME: &str = "AWSKMS";
 
-/// The package the caught KMS exception's class is named under, which is KMS's own: an answer
-/// KMS refused a call with is reported as `com.amazonaws.services.kms.model.<ErrorCode>`, the
-/// way the SDK layer that made the call renders the exception it caught.
-const KMS_EXCEPTION_PACKAGE: &str = "com.amazonaws.services.kms.model";
+/// This service's OWN opening of a refusal it relays from KMS, without its colon.
+///
+/// Amazon ECR states the failure as its own action's — the action the client asked for is the
+/// one that failed, and the reason it failed came from KMS — and the KMS answer follows that
+/// sentence. The fixed text is recorded behavior: it is what the wire carries for a
+/// `CreateRepository` naming a key KMS refuses, and the model states nothing of the message
+/// (`KmsException` is only "the operation failed due to a KMS exception", with `kmsError`
+/// carrying "the error code returned by KMS"). The class of the exception the SDK layer caught
+/// is NOT part of it: a client strips this opening to recover KMS's own diagnostic, so nothing
+/// stands between the two.
+const RELAYED_OPENING: &str = "The Amazon ECR action failed due to a KMS exception";
 
 /// What this service answers as the `KmsException`'s `message` for an answer KMS gave about
-/// the key: the caught KMS exception's fully qualified class, KMS's OWN sentence, and the
+/// the key: this service's own opening ([`RELAYED_OPENING`]), KMS's OWN sentence, and the
 /// clause naming the answer it came from — which service answered, the status it answered
 /// with, its error code, the identifier of that answer and the proxy it came through,
 /// rendered by the workspace's one rendering of that envelope
 /// (`service_common::relayed_refusal::caught_exception_message`).
 ///
-/// EVERY part of it comes from KMS's answer: the class from the code it answered under, the
-/// sentence from the answer itself, the status from the answer's own status line and the
-/// identifier from its headers. This service states no opening of its own in front of them — a
-/// relaying service that has one states fixed text, and nothing available here (the model,
-/// which says only that `KmsException` is "the operation failed due to a KMS exception" with
-/// `kmsError` carrying "the error code returned by KMS", nor any recorded answer of this
-/// service) states what that text is for Amazon ECR, so a token worded here would be this
-/// service inventing the dependency's wording rather than relaying it.
+/// Everything after the opening comes from KMS's answer: the sentence from the answer itself,
+/// the code from the code it answered under, the status from its own status line and the
+/// identifier from its headers. No exception CLASS is named, because the rendering this
+/// service's answer carries states the failed action rather than the Java class the call's SDK
+/// layer caught.
 fn relayed_message(message: &str, code: &str, status: u16, request_id: &str) -> String {
     ::service_common::relayed_refusal::caught_exception_message(
+        RELAYED_OPENING,
         "",
-        KMS_EXCEPTION_PACKAGE,
         message,
         ::service_common::relayed_refusal::CaughtCall {
             service: KMS_SERVICE_NAME,
