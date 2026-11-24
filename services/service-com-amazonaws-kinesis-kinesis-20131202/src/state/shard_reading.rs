@@ -79,8 +79,42 @@ fn inconsistent_sequence_number_message(
     )
 }
 
+/// How a reader states that the sequence number it was handed belongs to ANOTHER shard: the
+/// shard that minted the value, then the shard the request addressed.
+///
+/// A sequence number is "the unique identifier of the record within its shard"
+/// (`Record$SequenceNumber`), minted from the shard's own numbering, so the value CARRIES the
+/// shard it belongs to — and a reader that checkpointed one shard and read another is told
+/// exactly that: which shard the value is of, and which one it was used on. Everything but
+/// the two shard ids and the member the request spelled the value in ([`PositionMembers`]) is
+/// fixed text, and the value itself says nothing those two ids do not.
+fn foreign_shard_message(members: PositionMembers, minted_by: &str, addressed: &str) -> String {
+    format!(
+        "Invalid {}. It encodes {minted_by}, while it was used in a call to a shard with \
+         {addressed}",
+        members.sequence_number
+    )
+}
+
+/// The shard of `map` that minted `sequence_number`, when one of them did.
+///
+/// Each shard mints its numbers from its own starting number
+/// ([`sequence_number_of_shard`]), so the shard a value belongs to is read back off the value
+/// against the stream's shard map — whether that shard is still open or was closed by a
+/// reshard, and `None` for a value no shard of this stream ever minted.
+fn shard_that_minted<'map>(
+    map: &'map [ShardRecord],
+    sequence_number: &str,
+) -> Option<&'map ShardRecord> {
+    map.iter()
+        .find(|shard| sequence_number_of_shard(&shard.starting_sequence_number, sequence_number))
+}
+
 /// Where in `shard` a reader that named `position_type` starts, refusing a request whose
 /// members that type does not admit.
+///
+/// `map` is the whole shard map of the stream `shard` belongs to, which is what names the
+/// shard a sequence number of another shard was minted on ([`shard_that_minted`]).
 ///
 /// Each type documents which member supplies its position — "AT_SEQUENCE_NUMBER - Start
 /// reading from the position denoted by a specific sequence number", the same for
@@ -103,6 +137,7 @@ pub fn requested_shard_position(
     sequence_number: Option<&str>,
     timestamp: Option<::aws_smithy_types::DateTime>,
     shard: &ShardRecord,
+    map: &[ShardRecord],
     trim_horizon: SystemTime,
 ) -> Result<ShardPosition, String> {
     let trim_horizon_millis = epoch_millis(trim_horizon);
@@ -147,7 +182,7 @@ pub fn requested_shard_position(
         // another shard of the stream names a position in this one no more than a value
         // outside the range the shard publishes does (`Shard$SequenceNumberRange`) — both are
         // refused here rather than answered with an iterator into another shard's records
-        // ([`sequence_number_of_shard`]).
+        // ([`sequence_number_of_shard`]), each in the sentence its own condition earns.
         let inside = sequence_number_of_shard(&shard.starting_sequence_number, sequence_number)
             && sequence_number_le(&shard.starting_sequence_number, sequence_number)
             && shard
@@ -155,10 +190,19 @@ pub fn requested_shard_position(
                 .as_deref()
                 .is_none_or(|ending| sequence_number_le(sequence_number, ending));
         if !inside {
-            return Err(format!(
-                "{} {sequence_number} is not a sequence number of shard {}",
-                members.sequence_number, shard.shard_id
-            ));
+            // Two different mistakes reach here, and they are not one sentence: a value
+            // ANOTHER shard of the stream minted names a position in that shard, which is
+            // what the refusal reports, while a value no shard of the stream minted names a
+            // position nowhere.
+            return Err(match shard_that_minted(map, sequence_number) {
+                Some(minted_by) if minted_by.shard_id != shard.shard_id => {
+                    foreign_shard_message(members, &minted_by.shard_id, &shard.shard_id)
+                }
+                _ => format!(
+                    "{} {sequence_number} is not a sequence number of shard {}",
+                    members.sequence_number, shard.shard_id
+                ),
+            });
         }
         return Ok(if position_type == SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER {
             ShardPosition::AtSequenceNumber(sequence_number.to_string())
@@ -313,7 +357,7 @@ pub fn read_shard_from<'store>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{hash_key_ranges, record_sequence_number, shard_id};
+    use crate::state::{hash_key_ranges, record_sequence_number, shard_id, starting_sequence_number};
 
     /// The members `GetShardIterator` spells a position with, which is what a refusal here
     /// names.
@@ -321,6 +365,15 @@ mod tests {
         position_type: "ShardIteratorType",
         sequence_number: "StartingSequenceNumber",
         timestamp: "Timestamp",
+    };
+
+    /// The members the OTHER reader of a shard, `SubscribeToShard`, spells the same position
+    /// with — inside its `StartingPosition` structure — because one refusal states the rule
+    /// in the member the request that tripped it actually carried.
+    const STARTING_POSITION_MEMBERS: PositionMembers = PositionMembers {
+        position_type: "StartingPosition.Type",
+        sequence_number: "StartingPosition.SequenceNumber",
+        timestamp: "StartingPosition.Timestamp",
     };
 
     /// One stream's shard map, as a create lays it down: `count` open shards of one instant.
@@ -362,6 +415,7 @@ mod tests {
                     Some(sequence_number),
                     None,
                     owner,
+                    &shards,
                     SystemTime::UNIX_EPOCH,
                 );
                 assert!(
@@ -371,34 +425,76 @@ mod tests {
                     owner.shard_id
                 );
             }
-            // Rows differ along WHOSE number it is: every other shard of the same map (one
-            // below the owner's and two above it), and a value of no shard at all.
-            let foreign: Vec<String> = shards
-                .iter()
-                .filter(|shard| shard.shard_id != owner.shard_id)
-                .map(|shard| record_sequence_number(&shard.starting_sequence_number, 0))
-                .chain(::std::iter::once("1".to_string()))
-                .collect();
-            for sequence_number in &foreign {
-                let resolved = requested_shard_position(
-                    MEMBERS,
-                    position_type,
-                    Some(sequence_number),
-                    None,
-                    owner,
-                    SystemTime::UNIX_EPOCH,
+            // Rows differ along WHOSE number it is, and along the member the reader spelled
+            // it in: every other shard of the same map (one below the owner's and two above
+            // it) is a shard the refusal has to NAME, whichever of the two readers asks.
+            for members in [MEMBERS, STARTING_POSITION_MEMBERS] {
+                for minted_by in shards.iter().filter(|shard| shard.shard_id != owner.shard_id)
+                {
+                    let starting = minted_by.starting_sequence_number.clone();
+                    for sequence_number in [
+                        starting.clone(),
+                        record_sequence_number(&starting, 0),
+                        record_sequence_number(&starting, 41),
+                    ] {
+                        let resolved = requested_shard_position(
+                            members,
+                            position_type,
+                            Some(&sequence_number),
+                            None,
+                            owner,
+                            &shards,
+                            SystemTime::UNIX_EPOCH,
+                        );
+                        let expected = format!(
+                            "Invalid {}. It encodes {}, while it was used in a call to a \
+                             shard with {}",
+                            members.sequence_number, minted_by.shard_id, owner.shard_id
+                        );
+                        assert_eq!(
+                            resolved,
+                            Err(expected.clone()),
+                            "case {position_type:?} at {sequence_number:?}, which {} minted, \
+                             in {}: expected {expected:?}, got {resolved:?}",
+                            minted_by.shard_id,
+                            owner.shard_id
+                        );
+                    }
+                }
+                // A value NO shard of the stream minted belongs to no shard to name, which
+                // is the other refusal: a value below every shard's range, and one another
+                // stream's map minted (the same shard index of a stream created at another
+                // instant).
+                let another_stream = starting_sequence_number(
+                    SystemTime::UNIX_EPOCH + ::std::time::Duration::from_millis(1_600_000_000_000),
+                    2,
                 );
-                let expected = format!(
-                    "{} {sequence_number} is not a sequence number of shard {}",
-                    MEMBERS.sequence_number, owner.shard_id
-                );
-                assert_eq!(
-                    resolved,
-                    Err(expected.clone()),
-                    "case {position_type:?} at {sequence_number:?}, which is no number of \
-                     shard {}: expected {expected:?}, got {resolved:?}",
-                    owner.shard_id
-                );
+                for sequence_number in [
+                    "0".to_string(),
+                    "1".to_string(),
+                    another_stream.clone(),
+                    record_sequence_number(&another_stream, 3),
+                ] {
+                    let resolved = requested_shard_position(
+                        members,
+                        position_type,
+                        Some(&sequence_number),
+                        None,
+                        owner,
+                        &shards,
+                        SystemTime::UNIX_EPOCH,
+                    );
+                    let expected = format!(
+                        "{} {sequence_number} is not a sequence number of shard {}",
+                        members.sequence_number, owner.shard_id
+                    );
+                    assert_eq!(
+                        resolved,
+                        Err(expected.clone()),
+                        "case {position_type:?} at {sequence_number:?}, which no shard of the \
+                         map minted: expected {expected:?}, got {resolved:?}"
+                    );
+                }
             }
         }
         // And the same number IS a position in the shard it was minted on, whichever shard of
@@ -411,6 +507,7 @@ mod tests {
                 Some(&own),
                 None,
                 shard,
+                &shards,
                 SystemTime::UNIX_EPOCH,
             );
             assert_eq!(

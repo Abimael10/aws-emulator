@@ -271,9 +271,13 @@ const POSITION_MEMBERS: crate::state::PositionMembers = crate::state::PositionMe
 /// `SubscribeToShard`, names the same five positions with the same three members inside its
 /// `StartingPosition`. What this operation adds is the modelled error the refusal travels in
 /// — "A specified parameter exceeds its restrictions, is not supported, or can't be used".
+///
+/// `map` is the stream's whole shard map, which is what names the shard a `StartingSequenceNumber`
+/// of ANOTHER shard of the same stream was minted on.
 fn requested_position(
     input: &GetShardIteratorInput,
     shard: &crate::state::ShardRecord,
+    map: &[crate::state::ShardRecord],
     trim_horizon: ::std::time::SystemTime,
 ) -> Result<crate::state::ShardPosition, GetShardIteratorError> {
     crate::state::requested_shard_position(
@@ -282,6 +286,7 @@ fn requested_position(
         input.starting_sequence_number.as_deref(),
         input.timestamp,
         shard,
+        map,
         trim_horizon,
     )
     .map_err(invalid_argument)
@@ -364,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let trim_horizon = stream.trim_horizon(now);
-        let position = requested_position(&input, shard, trim_horizon)?;
+        let position = requested_position(&input, shard, &stream.shards, trim_horizon)?;
 
         // "Checks if your request will succeed. DryRun is an optional parameter"
         // (`GetShardIteratorInput$DryRun`): the request is judged in full above and then

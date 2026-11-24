@@ -12,6 +12,11 @@
 //! nothing a later caller sees: two calls for the same position answer iterators that name
 //! the same shard and position.
 //!
+//! A sequence number belongs to the SHARD that minted it, so a request that names one on
+//! another shard of the same stream is refused with the sentence that names both shards — the
+//! one the value is of and the one the call addressed — while the same value on its own shard
+//! still names the position it denotes.
+//!
 //! The recorded flow this was derived from takes ONE iterator of the first shard of a live
 //! stream (`get_shard_iterator(StreamName=…, ShardId=…, ShardIteratorType="TRIM_HORIZON")`)
 //! and is one row of the tables below. The rows differ along what the rule generalises over:
@@ -24,7 +29,7 @@
 //! bodies and modelled errors asserted here are the ones a client sees.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -32,12 +37,16 @@ use service_com_amazonaws_kinesis_kinesis_20131202::ops::get_shard_iterator::cou
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     shard_id, shard_not_found_message, ShardIteratorToken,
     ShardPosition,
-    ACTIVATION_DELAY, SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
+    SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
     SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER, SHARD_ITERATOR_TYPE_AT_TIMESTAMP,
-    SHARD_ITERATOR_TYPE_LATEST, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+    SHARD_ITERATOR_TYPE_LATEST, SHARD_ITERATOR_TYPE_TRIM_HORIZON, STREAM_ACTIVE,
 };
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// THE ONE poll loop of this crate's suites, so a case here waits for the CONDITION the
+// emulator reaches on its own clock rather than for a duration it measures.
+use crate::stream_tags::poll_until;
 
 /// The region every case signs for.
 const REGION: &str = "us-east-1";
@@ -59,12 +68,6 @@ const SHARD_ITERATOR_TYPES: &[&str] = &[
     SHARD_ITERATOR_TYPE_LATEST,
     SHARD_ITERATOR_TYPE_TRIM_HORIZON,
 ];
-
-/// How long a case waits before treating a freshly created stream as ready: past the instant
-/// the create armed the `CREATING` -> `ACTIVE` transition for.
-fn past_activation() -> Duration {
-    ACTIVATION_DELAY + Duration::from_millis(400)
-}
 
 /// A router carrying exactly this service, over one shared engine.
 struct Emulator {
@@ -129,7 +132,7 @@ impl Emulator {
             &json!({ "StreamName": name, "ShardCount": shard_count }),
         )
         .await;
-        tokio::time::sleep(past_activation()).await;
+        self.poll_until_active(case, name).await;
         let summary = self
             .ok(case, "DescribeStreamSummary", &json!({"StreamName": name}))
             .await;
@@ -137,6 +140,24 @@ impl Emulator {
             .as_str()
             .unwrap_or_else(|| panic!("case {case}: DescribeStreamSummary reported no StreamARN"))
             .to_string()
+    }
+
+    /// Look again until `name` reports the state its create owes it, through the one poll
+    /// loop of this crate's suites.
+    async fn poll_until_active(&self, case: &str, name: &str) {
+        poll_until(
+            case,
+            &format!("the stream {name} reports {STREAM_ACTIVE}"),
+            || async {
+                let (status, response) = self
+                    .call("DescribeStreamSummary", &json!({ "StreamName": name }))
+                    .await;
+                status == 200
+                    && response["StreamDescriptionSummary"]["StreamStatus"].as_str()
+                        == Some(STREAM_ACTIVE)
+            },
+        )
+        .await;
     }
 
     /// The `SequenceNumberRange.StartingSequenceNumber` the shard map publishes for
@@ -548,7 +569,7 @@ async fn a_stream_that_is_not_active_yet_hands_out_no_iterator() {
     );
 
     // Once the transition the create armed has fallen due, the same request is served.
-    tokio::time::sleep(past_activation()).await;
+    emulator.poll_until_active("active", stream).await;
     let iterator = emulator
         .iterator(
             "active",
@@ -563,4 +584,227 @@ async fn a_stream_that_is_not_active_yet_hands_out_no_iterator() {
         ShardIteratorToken::decode(&iterator).is_some(),
         "case active: the iterator an active stream answers must decode, got {iterator}"
     );
+}
+
+/// Write one record under `partition_key`, answering the shard it landed in and the sequence
+/// number it was stored under — the two facts a producer hands a consumer to read on from.
+async fn put_record(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    payload: &str,
+    partition_key: &str,
+) -> (String, String) {
+    let stored = emulator
+        .ok(
+            case,
+            "PutRecord",
+            &json!({
+                "StreamName": stream,
+                "Data": aws_smithy_types::base64::encode(payload),
+                "PartitionKey": partition_key,
+            }),
+        )
+        .await;
+    let shard = stored["ShardId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: PutRecord answers a ShardId, got {stored}"))
+        .to_string();
+    let sequence_number = stored["SequenceNumber"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: PutRecord answers a SequenceNumber, got {stored}"))
+        .to_string();
+    (shard, sequence_number)
+}
+
+/// The record DATA one `GetRecords` page from `iterator` delivers, decoded.
+async fn read_payloads(emulator: &Emulator, case: &str, iterator: &str) -> Vec<String> {
+    let page = emulator
+        .ok(case, "GetRecords", &json!({ "ShardIterator": iterator }))
+        .await;
+    page["Records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: GetRecords must carry Records, got {page}"))
+        .iter()
+        .map(|record| {
+            let encoded = record["Data"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: a Record carries Data, got {record}"));
+            let bytes = aws_smithy_types::base64::decode(encoded)
+                .unwrap_or_else(|_| panic!("case {case}: Data is base64, got {encoded}"));
+            String::from_utf8(bytes)
+                .unwrap_or_else(|_| panic!("case {case}: this suite writes text payloads"))
+        })
+        .collect()
+}
+
+/// The sentence a `StartingSequenceNumber` of ANOTHER shard is refused with: the shard the
+/// value belongs to, then the shard the call addressed.
+///
+/// Written out here rather than borrowed from the crate, so the wording itself is what these
+/// cases pin; the two shard ids are the only variable parts, and the value does not appear.
+fn foreign_shard_message(minted_by: &str, addressed: &str) -> String {
+    format!(
+        "Invalid StartingSequenceNumber. It encodes {minted_by}, while it was used in a call \
+         to a shard with {addressed}"
+    )
+}
+
+/// A sequence number names a position only in the shard that minted it: on any other shard of
+/// the same stream the request is refused, and the refusal names the shard the value is of.
+///
+/// Rows differ along which shard of the map minted the value, how it was minted (the range the
+/// map publishes, or a write), which other shard the call addressed, and which of the two
+/// sequence-number iterator types named the position.
+#[tokio::test]
+async fn a_sequence_number_of_another_shard_names_the_shard_it_belongs_to() {
+    let emulator = Emulator::new();
+    let stream = "iterators-foreign-shard";
+    let case = "foreign shard";
+    let shard_count = 3u32;
+    emulator
+        .active_stream(case, stream, i64::from(shard_count))
+        .await;
+
+    // One number of each shard of the map, the only one a reader can hold before anything is
+    // written: the beginning of the range the shard publishes.
+    let mut minted: Vec<(String, String)> = Vec::new();
+    for index in 0..shard_count {
+        let shard = shard_id(index);
+        let published = emulator
+            .starting_sequence_number(case, stream, &shard)
+            .await;
+        minted.push((shard, published));
+    }
+    // And one minted by a WRITE, which is the number a producer hands a consumer: it belongs
+    // to the shard the record landed in, whichever shard the partition key chose.
+    let payload = "owned-by-its-own-shard";
+    let (written_in, written_number) = put_record(&emulator, case, stream, payload, "pk-a").await;
+    minted.push((written_in.clone(), written_number.clone()));
+
+    for (minted_by, sequence_number) in &minted {
+        for addressed in (0..shard_count).map(shard_id).filter(|shard| shard != minted_by) {
+            for position_type in [
+                SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+                SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
+            ] {
+                let row =
+                    format!("{sequence_number} of {minted_by} used on {addressed} as {position_type}");
+                let (code, message) = emulator
+                    .refused(
+                        &row,
+                        "GetShardIterator",
+                        &json!({
+                            "StreamName": stream,
+                            "ShardId": addressed,
+                            "ShardIteratorType": position_type,
+                            "StartingSequenceNumber": sequence_number,
+                        }),
+                    )
+                    .await;
+                assert_eq!(
+                    code, "InvalidArgumentException",
+                    "case {row}: expected InvalidArgumentException, got {code} with message \
+                     {message:?}"
+                );
+                let expected = foreign_shard_message(minted_by, &addressed);
+                assert_eq!(
+                    message, expected,
+                    "case {row}: expected {expected:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    // The control arm: on its OWN shard the very same number still names the position it
+    // denotes, and the record it names is served — the value was never malformed, it was
+    // foreign.
+    let own_shard = "its own shard";
+    let iterator = emulator
+        .iterator(
+            own_shard,
+            &json!({
+                "StreamName": stream,
+                "ShardId": written_in,
+                "ShardIteratorType": SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+                "StartingSequenceNumber": written_number,
+            }),
+        )
+        .await;
+    let payloads = read_payloads(&emulator, own_shard, &iterator).await;
+    assert_eq!(
+        payloads,
+        vec![payload.to_string()],
+        "case {own_shard}: expected the record the sequence number names, got {payloads:?}"
+    );
+
+    // A value NO shard of the stream minted belongs to no shard the refusal could name, so it
+    // is refused as a position in this shard instead — the other condition of this class, and
+    // not the sentence above.
+    for sequence_number in ["0", "1"] {
+        let row = format!("{sequence_number}, which no shard of the stream minted");
+        let addressed = shard_id(1);
+        let (code, message) = emulator
+            .refused(
+                &row,
+                "GetShardIterator",
+                &json!({
+                    "StreamName": stream,
+                    "ShardId": addressed,
+                    "ShardIteratorType": SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+                    "StartingSequenceNumber": sequence_number,
+                }),
+            )
+            .await;
+        assert_eq!(
+            code, "InvalidArgumentException",
+            "case {row}: expected InvalidArgumentException, got {code} with message {message:?}"
+        );
+        let expected = format!(
+            "StartingSequenceNumber {sequence_number} is not a sequence number of shard \
+             {addressed}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {row}: expected {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing the refusals touched changed: the map still carries the same open shards, and a
+    // position they do admit is still handed out.
+    let after = "after the refusals";
+    let listed = emulator
+        .ok(after, "ListShards", &json!({ "StreamName": stream }))
+        .await;
+    let shards = listed["Shards"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {after}: ListShards must carry Shards, got {listed}"))
+        .clone();
+    let reported: Vec<String> = shards
+        .iter()
+        .map(|shard| shard["ShardId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let expected_map: Vec<String> = (0..shard_count).map(shard_id).collect();
+    assert_eq!(
+        reported, expected_map,
+        "case {after}: expected the shard map {expected_map:?}, got {reported:?}"
+    );
+    for shard in &shards {
+        assert!(
+            shard["SequenceNumberRange"]["EndingSequenceNumber"].is_null(),
+            "case {after}: every shard must still be open, got {shard}"
+        );
+    }
+    for index in 0..shard_count {
+        emulator
+            .iterator(
+                after,
+                &json!({
+                    "StreamName": stream,
+                    "ShardId": shard_id(index),
+                    "ShardIteratorType": SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+                }),
+            )
+            .await;
+    }
 }

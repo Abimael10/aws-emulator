@@ -310,6 +310,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             input.starting_position.sequence_number.as_deref(),
             input.starting_position.timestamp,
             shard,
+            &stream.shards,
             trim_horizon,
         )
         .map_err(invalid_argument)?;
