@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `AWS::Logs::LogGroup`, `AWS::Logs::LogStream`, `AWS::Logs::MetricFilter` and
-//! `AWS::Logs::SubscriptionFilter`: the log group a stack declares, the stream inside it and
-//! the metric and subscription filters on it, created in Amazon CloudWatch Logs itself.
+//! `AWS::Logs::LogGroup`, `AWS::Logs::LogStream`, `AWS::Logs::MetricFilter`,
+//! `AWS::Logs::SubscriptionFilter` and `AWS::Logs::ResourcePolicy`: the log group a stack
+//! declares, the stream inside it, the metric and subscription filters on it, and the
+//! account-scoped resource policy that lets another service write into the account's groups,
+//! each created in Amazon CloudWatch Logs itself.
 //!
-//! This is the per-type half of provisioning for four resource types, the half
+//! This is the per-type half of provisioning for five resource types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives
 //! in its own module beside [`super::cognito_identity_pool`] for the reason that module
 //! records — the catalogue file is far past the length a change to this repository may
@@ -52,6 +54,12 @@
 //! it configures is what forwards the group's matching events to the destination the
 //! declaration names.
 //!
+//! `AWS::Logs::ResourcePolicy`'s two properties are `PutResourcePolicy`'s own members for an
+//! ACCOUNT-scoped policy — the `PolicyName` such a policy is identified by and the
+//! `PolicyDocument` it is — that call being "Creates or updates a resource policy allowing
+//! other Amazon Web Services services to put log events to this account", so it too serves
+//! this type's create and its in-place update alike ([`put_resource_policy`]).
+//!
 //! A declared property none of those calls carries is REFUSED rather than dropped
 //! ([`refuse_unapplied_properties`]): a resource reported created with less than its
 //! declaration asked for is the shallow success these arms exist to avoid.
@@ -80,6 +88,7 @@ pub(crate) const LOGS_LOG_GROUP: &str = "AWS::Logs::LogGroup";
 pub(crate) const LOGS_LOG_STREAM: &str = "AWS::Logs::LogStream";
 pub(crate) const LOGS_METRIC_FILTER: &str = "AWS::Logs::MetricFilter";
 pub(crate) const LOGS_SUBSCRIPTION_FILTER: &str = "AWS::Logs::SubscriptionFilter";
+pub(crate) const LOGS_RESOURCE_POLICY: &str = "AWS::Logs::ResourcePolicy";
 
 /// The SigV4 signing name of the service that owns them, which is what routes the in-process
 /// call to Amazon CloudWatch Logs's own handlers (that model's `sigv4Name`/`endpointPrefix`,
@@ -116,6 +125,8 @@ pub(in crate::state) enum Kind {
     MetricFilter,
     /// `AWS::Logs::SubscriptionFilter`.
     SubscriptionFilter,
+    /// `AWS::Logs::ResourcePolicy`.
+    ResourcePolicy,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -125,6 +136,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         LOGS_LOG_STREAM => Some(Kind::LogStream),
         LOGS_METRIC_FILTER => Some(Kind::MetricFilter),
         LOGS_SUBSCRIPTION_FILTER => Some(Kind::SubscriptionFilter),
+        LOGS_RESOURCE_POLICY => Some(Kind::ResourcePolicy),
         _ => None,
     }
 }
@@ -173,6 +185,20 @@ const SUBSCRIPTION_FILTER_PROPERTIES: &[&str] = &[
     "RoleArn",
 ];
 
+/// The property carrying the policy itself, which is `PutResourcePolicy`'s own
+/// `policyDocument` member — "the new policy. This is formatted as a JSON string" — while a
+/// template writes the policy as the JSON object it is ([`policy_document`]).
+const POLICY_DOCUMENT: &str = "PolicyDocument";
+
+/// The property naming the policy, which is `PutResourcePolicy`'s own `policyName` member
+/// and the whole identity of an account-scoped policy — so it is this resource's physical id
+/// (`crate::state::template::declared_name_property`) and what `Ref` returns.
+const POLICY_NAME: &str = "PolicyName";
+
+/// Every property `AWS::Logs::ResourcePolicy` publishes: the policy's name and the document
+/// it is. Both are `PutResourcePolicy`'s own members under the same names up to case.
+const RESOURCE_POLICY_PROPERTIES: &[&str] = &[POLICY_DOCUMENT, POLICY_NAME];
+
 /// Create the resource one of these types declares, in Amazon CloudWatch Logs itself — so a
 /// client that deployed the stack can pass `!Ref <group>` straight to `PutMetricFilter` or
 /// `PutLogEvents` and read the stream and the filter back with that service's own reads.
@@ -194,7 +220,56 @@ pub(super) async fn create(
         Kind::SubscriptionFilter => {
             put_subscription_filter(ctx, region, resource, &resource.properties).await
         }
+        // Nor is an account-scoped resource policy: CloudWatch Logs tags no policy.
+        Kind::ResourcePolicy => {
+            put_resource_policy(ctx, region, resource, &resource.properties).await
+        }
     }
+}
+
+/// Put the ACCOUNT-SCOPED resource policy an `AWS::Logs::ResourcePolicy` declares, in Amazon
+/// CloudWatch Logs itself.
+///
+/// `PutResourcePolicy` "creates or updates a resource policy allowing other Amazon Web
+/// Services services to put log events to this account", and a request that names no
+/// `resourceArn` is exactly the account-scoped policy this type declares — the policy is
+/// identified by its `policyName`, which is this resource's physical id, so one call serves
+/// the type's create and its in-place update alike (`declared` is the document in force,
+/// which on an update is the new declaration rather than the one the record carries).
+///
+/// Why it is really put: such a policy is what AUTHORIZES another service to write into the
+/// account's log groups, and every service that delivers logs is refused by the group whose
+/// policies grant it nothing — an Amazon OpenSearch Service domain's `LogPublishingOptions`
+/// is the case, refused unless the destination group's policies let `es.amazonaws.com` open
+/// a stream and put events. A stack that reported this resource created while nothing put the
+/// policy leaves the account granting nothing, so the very resource the template declares
+/// the grant FOR is refused and the stack rolls back.
+async fn put_resource_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(declared, &resource.resource_type, RESOURCE_POLICY_PROPERTIES)?;
+    let document = declared
+        .get(POLICY_DOCUMENT)
+        .filter(|value| !value.is_null())
+        .map(policy_document)
+        .filter(|document| !document.is_empty())
+        .ok_or_else(|| missing(resource, POLICY_DOCUMENT))?;
+    let request = serde_json::json!({
+        "policyName": resource.physical_resource_id.clone(),
+        "policyDocument": document,
+    });
+    call_logs(
+        ctx,
+        region,
+        Kind::ResourcePolicy,
+        "PutResourcePolicy",
+        &request,
+    )
+    .await?;
+    Ok(Created::attributes(BTreeMap::new()))
 }
 
 /// Create the group an `AWS::Logs::LogGroup` declares, then put the settings its owning
@@ -614,6 +689,13 @@ pub(super) async fn update(
                 .await
                 .map(Some)
         }
+        // An account-scoped policy's own NAME is its whole identity, so a declaration that
+        // states another one describes a different policy and the deployment replaces the
+        // resource itself; everything else the type states is the document, which
+        // `PutResourcePolicy` replaces on the policy that exists.
+        Kind::ResourcePolicy => put_resource_policy(ctx, region, resource, declared)
+            .await
+            .map(Some),
     }
 }
 
@@ -651,8 +733,9 @@ async fn replace_in_another_group(
         Kind::MetricFilter => put_metric_filter(ctx, region, resource, declared).await?,
         Kind::SubscriptionFilter => put_subscription_filter(ctx, region, resource, declared).await?,
         // A log group is not inside a group: it is the parent, and a renamed group is a
-        // different resource the deployment replaces for itself.
-        Kind::LogGroup => return Ok(Created::attributes(BTreeMap::new())),
+        // different resource the deployment replaces for itself. An account-scoped resource
+        // policy is in no group at all, and is replaced the same way.
+        Kind::LogGroup | Kind::ResourcePolicy => return Ok(Created::attributes(BTreeMap::new())),
     };
     let _ = delete(ctx, region, kind, resource).await;
     Ok(created)
@@ -803,6 +886,12 @@ pub(super) async fn delete(
                 "logGroupName": required_log_group(resource)?,
                 "filterName": resource.physical_resource_id.clone(),
             }),
+        ),
+        // "Deletes a resource policy from this account": the policy a stack put is taken off
+        // by the `policyName` it was put under, which is this resource's physical id.
+        Kind::ResourcePolicy => (
+            "DeleteResourcePolicy",
+            serde_json::json!({"policyName": resource.physical_resource_id.clone()}),
         ),
     };
     match call_logs(ctx, region, kind, operation, &request).await {
@@ -967,6 +1056,47 @@ pub(super) async fn actual_configuration(
             }
             Ok(Some(Value::Object(configuration)))
         }
+        // `DescribeResourcePolicies` reports the account's policies — the scope it defaults
+        // to for a request that names no resource — so the policy a stack put is the entry
+        // under its own name. The document is reported as the JSON it parses as, which is
+        // the form a template declares it in, and as the text it came in otherwise. A policy
+        // that service no longer holds reports nothing, which is a deleted one.
+        Kind::ResourcePolicy => {
+            let answer = match call_logs(
+                ctx,
+                region,
+                Kind::ResourcePolicy,
+                "DescribeResourcePolicies",
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                Ok(answer) => answer,
+                Err(refusal) if refusal.code == NOT_FOUND => return Ok(None),
+                Err(refusal) => return Err(refusal),
+            };
+            let Some(policy) = answer
+                .get("resourcePolicies")
+                .and_then(Value::as_array)
+                .and_then(|policies| {
+                    policies.iter().find(|policy| {
+                        policy.get("policyName").and_then(Value::as_str) == Some(name.as_str())
+                    })
+                })
+            else {
+                return Ok(None);
+            };
+            let mut configuration = Map::new();
+            configuration.insert(POLICY_NAME.to_string(), Value::String(name.clone()));
+            if let Some(document) = policy.get("policyDocument").and_then(Value::as_str) {
+                configuration.insert(
+                    POLICY_DOCUMENT.to_string(),
+                    serde_json::from_str::<Value>(document)
+                        .unwrap_or_else(|_| Value::String(document.to_string())),
+                );
+            }
+            Ok(Some(Value::Object(configuration)))
+        }
     }
 }
 
@@ -1067,6 +1197,7 @@ fn type_name(kind: Kind) -> &'static str {
         Kind::LogStream => LOGS_LOG_STREAM,
         Kind::MetricFilter => LOGS_METRIC_FILTER,
         Kind::SubscriptionFilter => LOGS_SUBSCRIPTION_FILTER,
+        Kind::ResourcePolicy => LOGS_RESOURCE_POLICY,
     }
 }
 
@@ -1130,15 +1261,16 @@ async fn call_logs(
 mod tests {
     use super::*;
 
-    /// The four type names this module owns are exactly the ones it claims, and nothing
+    /// The five type names this module owns are exactly the ones it claims, and nothing
     /// else: a near miss of one is another type's, which this module must not answer for.
     #[test]
-    fn the_owned_types_are_the_four_logs_types() {
+    fn the_owned_types_are_the_five_logs_types() {
         let cases: &[(&str, Option<Kind>)] = &[
             (LOGS_LOG_GROUP, Some(Kind::LogGroup)),
             (LOGS_LOG_STREAM, Some(Kind::LogStream)),
             (LOGS_METRIC_FILTER, Some(Kind::MetricFilter)),
             (LOGS_SUBSCRIPTION_FILTER, Some(Kind::SubscriptionFilter)),
+            (LOGS_RESOURCE_POLICY, Some(Kind::ResourcePolicy)),
             ("AWS::Logs::LogGroupAlias", None),
             ("AWS::SQS::Queue", None),
             ("", None),
@@ -1163,6 +1295,7 @@ mod tests {
             (Kind::LogStream, LOGS_LOG_STREAM),
             (Kind::MetricFilter, LOGS_METRIC_FILTER),
             (Kind::SubscriptionFilter, LOGS_SUBSCRIPTION_FILTER),
+            (Kind::ResourcePolicy, LOGS_RESOURCE_POLICY),
         ];
         for (kind, expected) in cases {
             let named = type_name(*kind);

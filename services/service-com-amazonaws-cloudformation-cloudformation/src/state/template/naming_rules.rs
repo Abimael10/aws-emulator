@@ -953,6 +953,13 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         crate::state::provisioner::rds_event_subscriptions::RDS_EVENT_SUBSCRIPTION => {
             Some(crate::state::provisioner::rds_event_subscriptions::SUBSCRIPTION_NAME_MEMBER)
         }
+        // The same service's `PutResourcePolicy` identifies an ACCOUNT-scoped policy by its
+        // `policyName` — "Ref returns the policy name" — so the type publishes `PolicyName`;
+        // the type's last segment is `ResourcePolicy`, so neither `ResourcePolicyName` nor
+        // `Name` finds it. That name is what the policy is PUT under and what every call on
+        // one takes, so it is the physical id: a generated `<stack>-<logical id>-<unique id>`
+        // would name no policy the declaration asked for.
+        crate::state::provisioning::logs_resources::LOGS_RESOURCE_POLICY => Some("PolicyName"),
         // AWS IoT's `CreateProvisioningTemplate` takes a `templateName` — "Ref returns the
         // provisioning template name" — so the type publishes `TemplateName`; the type's last
         // segment is `ProvisioningTemplate`, so neither `ProvisioningTemplateName` nor `Name`

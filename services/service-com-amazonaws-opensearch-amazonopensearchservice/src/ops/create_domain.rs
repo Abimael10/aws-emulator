@@ -458,6 +458,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 input.log_publishing_options.iter().flatten(),
             );
+        // Resolving those destinations is also what PROBES them: the service writes a test
+        // stream and one test event into each group it can, so a client that enabled
+        // publishing sees whether the destination really receives what the domain will
+        // publish ([`crate::state::log_probes`]). The records are built here, beside the
+        // refusal they are the other half of and before this store is locked, and delivered
+        // below once it is released — by the one lock order this handler keeps.
+        let log_probes = crate::state::log_probes::destination_probes(
+            &*self.engine,
+            &region,
+            input.log_publishing_options.iter().flatten(),
+            now,
+        );
+        // Whether the destinations were RESOLVED at all, read here for the same reason: a
+        // group CloudWatch Logs does not hold is a destination nothing resolved, so a create
+        // refused for one is refused BEFORE the step that probes them, while a refusal with
+        // every group in place is about the GRANT — the one that leaves the caller's probe
+        // behind ([`crate::state::log_destinations::destinations_exist`]).
+        let destinations_resolved = crate::state::log_destinations::destinations_exist(
+            &*self.engine,
+            input.log_publishing_options.iter().flatten(),
+        );
         let cognito_refused = crate::state::cognito_authentication::cognito_options_refusal(
             &*self.engine,
             input.cognito_options.as_ref(),
@@ -698,25 +719,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 input.log_publishing_options.iter().flatten(),
             ),
-            // And the group that ARN names has to be one CloudWatch Logs holds: a
-            // create that enables publishing to a group nobody created configures a
-            // delivery that can never happen, so it is refused and no domain is
-            // created, by the same rule the update path applies.
-            log_destination_refused,
-            crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()),
-            cognito_refused,
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The rest of the configuration is checked where it was: against the groups
+        // CloudWatch Logs holds, the off-peak window, the Cognito resources and the KMS key.
+        // WHICH of them refused decides whether this create probed its destinations: a
+        // create refused on the GRANT of a destination that is there had resolved them, and
+        // a create refused over anything else — a group nobody created among them — never
+        // reached that step ([`crate::state::log_probes`]).
+        let grant_refused = log_destination_refused.is_some() && destinations_resolved;
+        if let Some(refusal) = log_destination_refused
+            .or_else(|| crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()))
+            .or(cognito_refused)
             // A domain whose encryption at rest is enabled is provisioned THROUGH the KMS
             // key the request names, so that key is resolved before the domain is created:
             // a key the domain's own Region holds none of — a key ARN of another Region
             // among them — or one in a key state KMS performs no cryptographic operation
             // in encrypts nothing, so the create is refused and no domain exists
             // afterwards ([`crate::state::encryption_at_rest`]).
-            kms_key_refused,
-        ]
-        .into_iter()
-        .flatten()
-        .next()
+            .or(kms_key_refused)
         {
+            if grant_refused {
+                // The destinations WERE resolved, and resolving one probes it: the probe
+                // written under this service's own principal lands only where the group
+                // admits that principal, which is exactly what this refusal is about, so an
+                // ungranted destination is left holding the caller's test stream alone.
+                // Delivered with this store released, by the one lock order this handler
+                // keeps.
+                drop(store);
+                crate::state::log_publishing::deliver(&*self.engine, &log_probes);
+            }
             return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
         }
 
@@ -1108,6 +1146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.encryption_at_rest_options.clone(),
         );
         drop(store);
+        // The domain the create accepted publishes to the destinations it enabled, and
+        // resolving one of those destinations PROBES it: the test stream the caller's own
+        // write opens in every destination that exists, and the one this service's principal
+        // opens where the group's policies admit it ([`crate::state::log_probes`]), each
+        // carrying the service's one test log event. Delivered here — once every refusal has
+        // been judged, so a create that was not accepted probes nothing, and with this store
+        // released, as the grant below is.
+        crate::state::log_publishing::deliver(&*self.engine, &log_probes);
         crate::state::encryption_grant::settle_domain_grant(
             &*self.engine,
             &region,

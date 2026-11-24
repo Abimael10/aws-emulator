@@ -535,17 +535,38 @@ async fn a_cluster_that_states_no_instance_count_still_publishes_its_slow_logs()
         "case {case}: expected the search slow log to state the read, got {delivered:?}"
     );
     // The record comes from a node of the domain's cluster, which is the stream it is
-    // written to.
+    // written to — beside the two streams the create's own probe of this granted
+    // destination opened ([`crate::log_publishing_delivery::is_probe_stream`]), which no
+    // record of this read was written to. Both halves are asserted, so the group holds
+    // exactly the node's stream plus the probe's two and nothing else.
     let streams = emulator
         .logs_call("DescribeLogStreams", json!({ "logGroupName": group }))
         .await;
+    let held: Vec<String> = streams.body["logStreams"]
+        .as_array()
+        .map(|streams| {
+            streams
+                .iter()
+                .filter_map(|stream| stream["logStreamName"].as_str())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (probed, logged): (Vec<String>, Vec<String>) = held
+        .iter()
+        .cloned()
+        .partition(|stream| crate::log_publishing_delivery::is_probe_stream(stream));
     assert_eq!(
-        streams.body["logStreams"]
-            .as_array()
-            .map(|streams| streams.len()),
-        Some(1),
-        "case {case}: expected one stream, for the node that logged, got {:?}",
-        streams.body
+        logged.len(),
+        1,
+        "case {case}: expected one stream, for the node that logged, got {logged:?} out of \
+         {held:?}"
+    );
+    assert_eq!(
+        probed.len(),
+        2,
+        "case {case}: expected the create's probe of this granted group to have opened both of \
+         its streams, got {probed:?} out of {held:?}"
     );
 }
 

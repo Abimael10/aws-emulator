@@ -21,6 +21,9 @@
 //! since the cluster applies every write through one path and logs them alike.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::log_probes::{
+    CALLER_PROBE_STREAM, SERVICE_PROBE_STREAM,
+};
 
 use super::domain_lifecycle::{
     baseline_create, log_group_arn, Emulator, DEFAULT_ACCESS_KEY_ID, PREFIX, SETTLE_WAIT,
@@ -51,7 +54,14 @@ const INDEX_THRESHOLD: &str = "index.indexing.slowlog.threshold.index";
 const SEARCH_THRESHOLD: &str = "index.search.slowlog.threshold.query";
 
 /// The messages `FilterLogEvents` reports for the whole of `group`, in the order it pages
-/// them.
+/// them, LESS the two STREAMS the create-time probe of a granted destination opens.
+///
+/// Every group an enabled option names holds the service's own test log event, written when
+/// the create probed that destination
+/// ([`service_com_amazonaws_opensearch_amazonopensearchservice::state::log_probes`]); it is
+/// the CREATE's record rather than one of the work these rows do, so what the rows read is
+/// what the domain's publishing delivered. The exclusion is by STREAM rather than by message
+/// text, so a record a row's own work delivered is read however it is worded.
 ///
 /// `pub(crate)` because a sibling suite reads a published record the same way rather than
 /// growing a second copy of this.
@@ -69,6 +79,9 @@ pub(crate) async fn events(emulator: &Emulator, group: &str) -> Vec<String> {
         .map(|events| {
             events
                 .iter()
+                .filter(|event| {
+                    !is_probe_stream(event["logStreamName"].as_str().unwrap_or_default())
+                })
                 .map(|event| {
                     event["message"]
                         .as_str()
@@ -78,6 +91,15 @@ pub(crate) async fn events(emulator: &Emulator, group: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether `stream` is one of the two streams the create-time probe of a granted destination
+/// opens in it, which no row below is about.
+///
+/// `pub(crate)` for the sibling suite that counts the streams a published record was written
+/// to ([`crate::log_destination_grants`]).
+pub(crate) fn is_probe_stream(stream: &str) -> bool {
+    stream == CALLER_PROBE_STREAM || stream == SERVICE_PROBE_STREAM
 }
 
 /// The stream names `DescribeLogStreams` reports for `group`.
@@ -101,6 +123,7 @@ async fn streams(emulator: &Emulator, group: &str) -> Vec<String> {
                         .unwrap_or_default()
                         .to_string()
                 })
+                .filter(|stream| !is_probe_stream(stream))
                 .collect()
         })
         .unwrap_or_default()

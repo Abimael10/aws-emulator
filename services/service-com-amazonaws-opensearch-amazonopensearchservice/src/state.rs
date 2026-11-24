@@ -103,6 +103,10 @@ pub mod encryption_grant;
 /// the slow-log records its own data plane produces, and the cluster's application log.
 pub mod log_publishing;
 
+/// The TEST LOG EVENTS a create writes into the destination of every log type it enables —
+/// the probe that proves the wiring of a configured destination.
+pub mod log_probes;
+
 /// The security plugin's AUDIT CONFIGURATION: which of the decisions the cluster takes
 /// about a request leave a record in the log group the `AUDIT_LOGS` option names.
 pub mod audit;

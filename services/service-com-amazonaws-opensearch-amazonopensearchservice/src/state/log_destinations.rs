@@ -159,6 +159,109 @@ fn withholds_delivery(documents: &[iam::PreparedDocument], action: &str, arn: &s
     !allowed && !undecided
 }
 
+/// The destinations the ENABLED options of `options` name, in log-type order: each one the
+/// ARN of the log group it publishes to and that group's own name.
+///
+/// A DISABLED option publishes nothing, so the destination it carries is not resolved —
+/// nothing would be delivered to it. A value that is not a log group's ARN names no
+/// destination at all, which is [`super::log_publishing_refusal`]'s refusal rather than this
+/// module's, so it is passed over here.
+///
+/// The ONE reading of which groups a request's options address: the refusal below and the
+/// create-time probe of each destination ([`super::log_probes`]) resolve the same set, so
+/// what a create judges is what it probes.
+pub(crate) fn enabled_destinations<'a>(
+    options: impl IntoIterator<Item = (&'a String, &'a LogPublishingOption)>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut enabled: Vec<(&str, &str)> = options
+        .into_iter()
+        .filter(|(_, option)| option.enabled.unwrap_or(false))
+        .filter_map(|(log_type, option)| {
+            let arn = option.cloud_watch_logs_log_group_arn.as_deref()?;
+            Some((log_type.as_str(), arn))
+        })
+        .collect();
+    enabled.sort_unstable();
+    enabled
+        .iter()
+        .filter_map(|(_, arn)| named_log_group(arn))
+        .collect()
+}
+
+/// Whether the log group stored under `name` LETS THIS SERVICE deliver into it: the policies
+/// in force for it — the one attached to the group, and the account-scoped ones, which cover
+/// the log groups their own statements name — grant [`SERVICE_PRINCIPAL`] every one of
+/// [`DELIVERY_ACTIONS`] on the group `arn` names.
+///
+/// `false` for a group the store does not hold under `name`, or one whose own ARN is not
+/// `arn`: a destination in another account, another partition or another Region names a
+/// group this account does not hold here, whatever a group of that name is called locally.
+///
+/// The ONE reading of a destination's grant, so the refusal below and the create-time probe
+/// of each destination ([`super::log_probes`]) cannot disagree about which groups admit the
+/// service.
+pub(crate) fn admits_delivery(
+    logs: &cloudwatch_logs::ComAmazonawsCloudwatchlogsLogs20140328State,
+    arn: &str,
+    name: &str,
+) -> bool {
+    let Some(group) = logs
+        .log_groups
+        .get(name)
+        .filter(|group| group.log_group_arn == arn)
+    else {
+        return false;
+    };
+    // The policies in force for the group, read once each, since every action is decided
+    // against the same set.
+    let documents: Vec<iam::PreparedDocument> = group
+        .resource_policy
+        .iter()
+        .map(|policy| policy.policy_document.as_str())
+        .chain(
+            logs.account_resource_policies
+                .values()
+                .map(|policy| policy.policy_document.as_str()),
+        )
+        .map(iam::PreparedDocument::read)
+        .collect();
+    !DELIVERY_ACTIONS
+        .iter()
+        .any(|action| withholds_delivery(&documents, action, arn))
+}
+
+/// Whether every enabled option in `options` names a log group CloudWatch Logs HOLDS — the
+/// EXISTENCE half of the rule below.
+///
+/// What it is for: a refusal of these destinations is about the GRANT only once every one of
+/// them exists ([`log_publishing_destination_refusal`] answers the existence sentence first),
+/// and a destination that was never there is one nothing resolved — so this is what says the
+/// destinations of a request were resolved at all, which is the step that probes them
+/// ([`super::log_probes`]).
+///
+/// `true` for a request that enables no log type, and for one whose options name no log
+/// group at all (the other refusal's case): neither leaves a destination unresolved. `false`
+/// where the engine hands out no CloudWatch Logs store, since nothing of a store that was
+/// never readable was resolved.
+pub(crate) fn destinations_exist<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    options: impl IntoIterator<Item = (&'a String, &'a LogPublishingOption)>,
+) -> bool {
+    let destinations = enabled_destinations(options);
+    if destinations.is_empty() {
+        return true;
+    }
+    let Some(store) = cloudwatch_logs::service_state(engine) else {
+        return false;
+    };
+    let logs = store.lock();
+    destinations.iter().all(|(arn, name)| {
+        logs.log_groups
+            .get(*name)
+            .is_some_and(|group| group.log_group_arn == *arn)
+    })
+}
+
 /// Whether every enabled option in `options` publishes to a log group that EXISTS and that
 /// lets this service deliver into it, and the refusal for the first destination that does
 /// not otherwise ([`nonexistent_destination`], [`ungranted_destination`]).
@@ -181,26 +284,12 @@ pub fn log_publishing_destination_refusal<'a, Eng: Send + Sync + 'static>(
     engine: &Eng,
     options: impl IntoIterator<Item = (&'a String, &'a LogPublishingOption)>,
 ) -> Option<ValidationException> {
-    let mut enabled: Vec<(&str, &str)> = options
-        .into_iter()
-        .filter(|(_, option)| option.enabled.unwrap_or(false))
-        .filter_map(|(log_type, option)| {
-            let arn = option.cloud_watch_logs_log_group_arn.as_deref()?;
-            Some((log_type.as_str(), arn))
-        })
-        .collect();
-    if enabled.is_empty() {
+    // The destinations the enabled options name, in log-type order: each one the ARN of the
+    // group it publishes to and that group's own name.
+    let destinations = enabled_destinations(options);
+    if destinations.is_empty() {
         return None;
     }
-    enabled.sort_unstable();
-    // The destinations the enabled options name, in log-type order: each one the ARN of the
-    // group it publishes to and that group's own name. A value that is not a log group's
-    // ARN is the other refusal's ([`names_a_log_group`]), so it is passed over here rather
-    // than reported as a group that does not exist.
-    let destinations: Vec<(&str, &str)> = enabled
-        .iter()
-        .filter_map(|(_, arn)| named_log_group(arn))
-        .collect();
     let store = cloudwatch_logs::service_state(engine)?;
     let logs = store.lock();
     for (arn, name) in &destinations {
@@ -217,27 +306,7 @@ pub fn log_publishing_destination_refusal<'a, Eng: Send + Sync + 'static>(
         }
     }
     for (arn, name) in &destinations {
-        let Some(group) = logs.log_groups.get(*name) else {
-            continue;
-        };
-        // The policies in force for the group: the one attached to it, and the
-        // account-scoped ones, which cover the log groups their own statements name. Read
-        // once each, since every action is decided against the same set.
-        let documents: Vec<iam::PreparedDocument> = group
-            .resource_policy
-            .iter()
-            .map(|policy| policy.policy_document.as_str())
-            .chain(
-                logs.account_resource_policies
-                    .values()
-                    .map(|policy| policy.policy_document.as_str()),
-            )
-            .map(iam::PreparedDocument::read)
-            .collect();
-        if DELIVERY_ACTIONS
-            .iter()
-            .any(|action| withholds_delivery(&documents, action, arn))
-        {
+        if !admits_delivery(&logs, arn, name) {
             return Some(ungranted_destination(name));
         }
     }
