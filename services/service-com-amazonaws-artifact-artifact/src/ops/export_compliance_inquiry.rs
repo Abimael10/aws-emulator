@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let include_citations = input.include_citations.unwrap_or(false);
         // Rendered HERE, from the inquiry as it stands, because an export is a snapshot:
         // the document the URL below leads to is the one this call produced.
-        let document = inquiry.export_document(&covered, include_citations, &host);
+        let document = inquiry.export_document(&covered, include_citations);
         let minted = store.record_inquiry_export(
             &input.compliance_inquiry_id,
             covered,

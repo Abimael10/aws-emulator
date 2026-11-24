@@ -9,17 +9,17 @@
 //! * a query is answered out of the published report catalog this service serves: the
 //!   `response` a query reports is the passages of the catalog documents whose text carries
 //!   the query's terms, each under the source it was read out of, and the `citations`
-//!   beside it name those sources, quote those same passages and link to where this
-//!   emulator publishes them;
+//!   beside it name those sources, quote those same passages and carry the link each one
+//!   is published under;
 //! * a query the catalog holds nothing bearing on — and one naming no term at all —
 //!   reports NEITHER member: there is no passage to quote, so none is invented;
 //! * the answer is released by the CLOCK and by no read: a query whose processing is still
 //!   in progress reports neither member, every listing after the due instant reports the
 //!   same answer, and reading it twice changes nothing;
-//! * a citation's link resolves back to this emulator — it LOCATES the cited report's own
-//!   read, at the version the passage was quoted from — while the document behind that
-//!   report stays reachable only the way every other caller reaches it, by accepting the
-//!   term governing it.
+//! * a citation's `sourceLink` is the STORED link of the compliance source it names — the
+//!   one the catalog holds for that published document — so it is the same whichever
+//!   endpoint the listing is read through, and it locates the source rather than a read of
+//!   this emulator.
 //!
 //! Two further rules about the RECORD the query history serves are pinned at the end of
 //! this suite:
@@ -28,28 +28,42 @@
 //!   own order (ascending `queryIdentifier` from 1), with every member the model requires
 //!   populated — and the whole collection is enumerable whatever page size a caller walks
 //!   it at, so no page under-reports it;
-//! * a citation is ONE consistent triple: its `sourceLink` locates exactly the source its
-//!   `sourceLabel` names and its `sourceContent` quotes, and every projection of that
-//!   citation — the query listing and the exported document — reports the same triple.
+//! * a citation is ONE consistent triple: its `sourceLink` is the published link of exactly
+//!   the source its `sourceLabel` names and its `sourceContent` quotes, and every
+//!   projection of that citation — the query listing and the exported document — reports
+//!   the same triple.
 //!
 //! The rows differ along what those rules generalise over: the TERMS the query names (a
 //! series, a report name, prose from a published description, one term, several, none at
-//! all, and terms no catalog document carries) and the FORM of the submission (a text
-//! query, and an uploaded document whose section labels carry the terms), as well as how
-//! many queries one inquiry holds (one, two and three) and the page size the history is
+//! all, and terms no catalog document carries), the FORM of the submission (a text
+//! query, and an uploaded document whose section labels carry the terms), the CLASS of the
+//! catalog the answer is drawn from (a compliance programme's documents and the
+//! accessibility-conformance reports), as well as how many queries one inquiry holds (one,
+//! two and three), the endpoint the listing is read through and the page size the history is
 //! walked at.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_artifact_artifact::state::service_state;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The endpoint the test addresses the emulator on, which every URL this service announces
 /// has to name for the announced URL to resolve.
 const HOST: &str = "artifact.eu-west-1.amazonaws.com";
+
+/// The endpoints one and the same listing is read through below. A cited source's link is a
+/// property of that SOURCE, so it cannot differ between two readers: a second endpoint is
+/// what tells a stored link apart from one assembled out of the reading request.
+const READING_ENDPOINTS: &[&str] = &[
+    HOST,
+    "artifact.us-east-1.amazonaws.com",
+    "127.0.0.1:9297",
+];
 
 /// A SigV4 credential scope naming this service, which is what routes the request.
 const SIGNED: &str = "AWS4-HMAC-SHA256 \
@@ -75,13 +89,30 @@ const CITATION_CAPACITY: usize = 3;
 /// member of the answer targets.
 const LONG_STRING_MAX: usize = 2048;
 
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+/// One emulator over `engine`, so a case can read the very catalog records the handler
+/// answers out of.
+fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// One emulator: a router carrying only this service, over one shared engine.
+fn emulator() -> MultiServiceRouter {
+    emulator_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// Where the catalog publishes each report, keyed by the report NAME a citation labels its
+/// source with: the stored link a citation of that source has to carry.
+fn published_source_links(engine: &engine::InMemoryEngine) -> BTreeMap<String, String> {
+    service_state(engine)
+        .expect("the in-memory engine carries this service's store")
+        .lock()
+        .reports
+        .values()
+        .map(|report| (report.name.clone(), report.source_link.clone()))
+        .collect()
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -97,10 +128,23 @@ async fn send(
     body: Bytes,
     signed: bool,
 ) -> Answer {
+    send_to(router, method, uri, body, signed, HOST).await
+}
+
+/// One request, addressed to the emulator on `host` — the endpoint this caller reached it
+/// on, which is what a value assembled out of the request would carry.
+async fn send_to(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Bytes,
+    signed: bool,
+    host: &str,
+) -> Answer {
     let mut request = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", HOST)
+        .header("host", host)
         .header("content-type", "application/json");
     if signed {
         request = request.header("authorization", SIGNED);
@@ -139,12 +183,22 @@ async fn create(router: &MultiServiceRouter, body: &Value) -> String {
 
 /// The queries one inquiry reports.
 async fn list_queries(router: &MultiServiceRouter, inquiry_id: &str) -> Vec<Value> {
-    let answer = send(
+    list_queries_from(router, inquiry_id, HOST).await
+}
+
+/// The queries one inquiry reports to a caller that reached this emulator on `host`.
+async fn list_queries_from(
+    router: &MultiServiceRouter,
+    inquiry_id: &str,
+    host: &str,
+) -> Vec<Value> {
+    let answer = send_to(
         router,
         "GET",
         &format!("/v1/compliance-inquiry/listQueries?complianceInquiryId={inquiry_id}"),
         Bytes::new(),
         true,
+        host,
     )
     .await;
     assert_eq!(
@@ -267,7 +321,8 @@ fn fetchable(url: &str) -> String {
         .unwrap_or_else(|| panic!("an announced URL must carry a path, got {url:?}"));
     assert_eq!(
         host, HOST,
-        "a citation must link to this emulator so it resolves, got {url:?}"
+        "a document URL this service announces must name this emulator so it resolves, got \
+         {url:?}"
     );
     format!("/{path}")
 }
@@ -353,10 +408,18 @@ async fn an_answer_quotes_the_catalog_sources_the_query_matched() {
                      got {source_content:?} for {source_label:?}"
                 );
                 let report_id = report["id"].as_str().unwrap_or_default();
+                // A citation LOCATES its SOURCE: the link is a published link of the
+                // compliance document, inside the bounds of the member that carries it
+                // (`LongStringAttribute`, `@length(min: 1, max: 2048)`, `@pattern
+                // ^[^<>]*$`) — and never a locator of a read of this emulator on whichever
+                // endpoint this listing happened to be read through.
                 assert!(
-                    source_link.contains(report_id),
-                    "case {label:?}: a citation must link to the document it quoted, got \
-                     {source_link:?} for {report_id:?}"
+                    source_link.starts_with("https://")
+                        && !source_link.contains(HOST)
+                        && !source_link.contains(['<', '>'])
+                        && (1..=LONG_STRING_MAX).contains(&source_link.chars().count()),
+                    "case {label:?}: a citation must carry the published link of the source \
+                     it names, got {source_link:?} for {source_label:?} ({report_id:?})"
                 );
 
                 let at = response.find(source_content).unwrap_or_else(|| {
@@ -445,57 +508,130 @@ async fn an_answer_is_released_by_the_clock_and_then_never_changes() {
     );
 }
 
-#[tokio::test]
-async fn a_citation_links_to_the_source_its_passage_was_read_from() {
-    let router = emulator();
-    let reports = catalog(&router).await;
-    let id = create(
-        &router,
-        &text_body("Audit", "Which independent auditor assessed the AWS controls?"),
-    )
-    .await;
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
-    let queries = list_queries(&router, &id).await;
-    let citations = queries[0]["citations"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        !citations.is_empty(),
-        "the query must cite the sources it was answered out of, got {:?}",
-        queries[0]
-    );
+/// One submission the citations of which are read below.
+struct LinkCase {
+    label: &'static str,
+    body: Value,
+    /// The least sources ONE of the inquiry's queries must be answered out of, so a row
+    /// written to span several sources cannot quietly degrade to one.
+    least_sources: usize,
+}
 
-    for citation in &citations {
-        let source_label = citation["sourceLabel"].as_str().unwrap_or_default();
-        let source_link = citation["sourceLink"].as_str().unwrap_or_default();
-        let report = published(&reports, source_label);
-        // A citation LOCATES its source: following the link reads the cited report itself,
-        // at the version the passage was quoted from. The document behind that report is
-        // reached the way every other caller reaches it — by accepting its term — so the
-        // link stands in for no acceptance and leads nowhere this emulator refuses to
-        // serve.
-        let followed = send(&router, "GET", &fetchable(source_link), Bytes::new(), true).await;
-        assert_eq!(
-            followed.status, 200,
-            "case {source_label:?}: a citation's link must resolve back to this emulator, \
-             got {} with {:?}",
-            followed.status, followed.body
-        );
-        assert_eq!(
-            (
-                followed.body["reportDetails"]["id"].clone(),
-                followed.body["reportDetails"]["name"].clone(),
-                followed.body["reportDetails"]["version"].clone(),
+#[tokio::test]
+async fn a_citation_carries_the_stored_link_of_the_source_it_names() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    // Where the catalog publishes each of its reports — the link a citation of that source
+    // has to carry — read off the records the handler answers out of rather than written
+    // out here.
+    let links = published_source_links(&engine);
+
+    // The rows span the TERMS a query names, the FORM of the submission and the CLASS of
+    // the catalog the answer comes out of (a compliance programme's documents, several
+    // programmes at once, a programme publishing its documents under one page, and the
+    // accessibility-conformance reports); each is read back through every endpoint of
+    // `READING_ENDPOINTS`.
+    for case in [
+        LinkCase {
+            label: "a text query naming a report series and its standard",
+            body: text_body("Certification", "Which ISO 27001 certification applies?"),
+            least_sources: 1,
+        },
+        LinkCase {
+            label: "a text query naming prose from a published description",
+            body: text_body("Card data", "Who assessed the cardholder data environment?"),
+            least_sources: 1,
+        },
+        LinkCase {
+            label: "a text query matching several compliance programmes",
+            body: text_body(
+                "Audit",
+                "Which independent auditor assessed the SOC 2 and ISO 27001 controls?",
             ),
-            (
-                report["id"].clone(),
-                report["name"].clone(),
-                report["version"].clone(),
+            least_sources: 2,
+        },
+        LinkCase {
+            label: "an uploaded document naming two sections",
+            body: file_body(
+                "Questionnaire",
+                &["SOC 2 Type 2 controls", "ISO 27001 certification scope"],
             ),
-            "case {source_label:?}: the link must read the cited report at the version the \
-             passage came from, got {:?}",
-            followed.body
+            least_sources: 1,
+        },
+        LinkCase {
+            label: "a text query naming the accessibility-conformance class",
+            body: text_body(
+                "Accessibility",
+                "Which products carry an Accessibility Conformance Report?",
+            ),
+            least_sources: 1,
+        },
+        LinkCase {
+            label: "a text query naming a programme that publishes several documents",
+            body: text_body(
+                "SOC",
+                "Which SOC 1, SOC 2 and SOC 3 reports cover the AWS control environment?",
+            ),
+            least_sources: 2,
+        },
+    ] {
+        let label = case.label;
+        let id = create(&router, &case.body).await;
+        let settled = settled_queries(&router, label, &id).await;
+
+        let mut most_sources = 0usize;
+        for endpoint in READING_ENDPOINTS {
+            let queries = list_queries_from(&router, &id, endpoint).await;
+            assert_eq!(
+                queries.len(),
+                settled.len(),
+                "case {label:?} read through {endpoint:?}: the history must report the same \
+                 records as the one read through {HOST:?}, got {queries:?} against {settled:?}"
+            );
+            for (position, query) in queries.iter().enumerate() {
+                let citations = query["citations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                most_sources = most_sources.max(citations.len());
+                for (index, citation) in citations.iter().enumerate() {
+                    let at = format!(
+                        "{label:?} read through {endpoint:?}, query {position} citation {index}"
+                    );
+                    let source_label = citation["sourceLabel"].as_str().unwrap_or_else(|| {
+                        panic!("case {at}: a citation must label its source, got {citation:?}")
+                    });
+                    let source_link = citation["sourceLink"].as_str().unwrap_or_else(|| {
+                        panic!("case {at}: a citation must link to its source, got {citation:?}")
+                    });
+                    let expected = links.get(source_label).unwrap_or_else(|| {
+                        panic!(
+                            "case {at}: a cited source must be a report the catalog publishes, \
+                             got {source_label:?}"
+                        )
+                    });
+                    // The link is the one the catalog holds for the cited source, so it is
+                    // the same for every reader of that citation.
+                    assert_eq!(
+                        source_link, expected,
+                        "case {at}: a citation must carry the link its labelled source is \
+                         published under, expected {expected:?}, got {source_link:?}"
+                    );
+                    // And it locates that source rather than a read of this emulator: the
+                    // endpoint the reading request reached is nowhere in it.
+                    assert!(
+                        !source_link.contains(endpoint),
+                        "case {at}: a citation's link must locate the cited source and not a \
+                         read of this emulator on the reading endpoint, got {source_link:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            most_sources >= case.least_sources,
+            "case {label:?}: the submission must be answered out of at least {} sources for \
+             this row to span what it says it does, got {most_sources} on {settled:?}",
+            case.least_sources
         );
     }
 }
@@ -792,8 +928,10 @@ async fn the_history_reports_one_record_per_query_the_inquiry_holds() {
 
 #[tokio::test]
 async fn a_citation_is_one_triple_in_every_projection_of_the_query() {
-    let router = emulator();
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
     let reports = catalog(&router).await;
+    let links = published_source_links(&engine);
 
     // One submission per FORM, each carrying terms several catalog documents share, so the
     // answer cites more than one source and the triples can be told apart.
@@ -856,28 +994,17 @@ async fn a_citation_is_one_triple_in_every_projection_of_the_query() {
                     "case {label:?}: query {position} citation {index} must quote text its \
                      labelled source publishes, got {source_content:?} for {source_label:?}"
                 );
-                let followed =
-                    send(&router, "GET", &fetchable(source_link), Bytes::new(), true).await;
+                let published_link = links.get(source_label).unwrap_or_else(|| {
+                    panic!(
+                        "case {label:?}: query {position} citation {index} must name a source \
+                         the catalog publishes, got {source_label:?}"
+                    )
+                });
                 assert_eq!(
-                    followed.status, 200,
-                    "case {label:?}: query {position} citation {index} must link to a source \
-                     this emulator serves, got {} with {:?}",
-                    followed.status, followed.body
-                );
-                assert_eq!(
-                    (
-                        followed.body["reportDetails"]["id"].clone(),
-                        followed.body["reportDetails"]["name"].clone(),
-                        followed.body["reportDetails"]["version"].clone(),
-                    ),
-                    (
-                        report["id"].clone(),
-                        report["name"].clone(),
-                        report["version"].clone(),
-                    ),
-                    "case {label:?}: query {position} citation {index} must link to the source \
-                     its label names and its content quotes, got {source_link:?} reading {:?}",
-                    followed.body
+                    source_link, published_link,
+                    "case {label:?}: query {position} citation {index} must carry the link the \
+                     source its label names and its content quotes is published under, \
+                     expected {published_link:?}, got {source_link:?}"
                 );
             }
         }

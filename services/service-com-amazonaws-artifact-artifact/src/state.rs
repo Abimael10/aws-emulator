@@ -603,6 +603,15 @@ pub struct Report {
     /// Who can see this report — [`VISIBILITY_PUBLIC`] for everything AWS publishes in
     /// the catalog. Stored rather than assumed, so the projections report the record.
     pub visibility: String,
+    /// WHERE this compliance document is published — the locator of the source itself,
+    /// which is what a citation of it carries (`Citation$sourceLink`, "Link to the
+    /// compliance source").
+    ///
+    /// A property of the SOURCE, so it is held on the record beside the report's name and
+    /// its published text: a citation reports this stored value
+    /// ([`QueryCitation::source_link`]), which is therefore the same whichever endpoint a
+    /// reader reached this emulator on and the same in every projection of that citation.
+    pub source_link: String,
     /// Every published version, keyed by version number. A `BTreeMap` is what gives
     /// `ListReportVersions` the ascending total order its pagination token indexes into,
     /// and what makes "the latest version" the last entry.
@@ -1000,20 +1009,21 @@ impl InquiryQuery {
     ///
     /// `response` and `citations` are the answer this query reports, both read off the one
     /// stored [`QueryAnswer`] so the response and the sources supporting it cannot
-    /// disagree; the citation links name this emulator on the endpoint `host` — the one the
-    /// reading request reached it on.
+    /// disagree; a citation's link is the stored link of the source it names
+    /// ([`QueryCitation::source_link`]), so what a reader sees does not depend on the
+    /// endpoint it reached this emulator on.
     ///
     /// `updatedResponseVersions` is absent rather than empty: a response version records an
     /// EDIT to a response, and nothing in this emulator edits one, so there is no version
     /// history to report.
-    pub fn to_summary(&self, host: &str) -> QuerySummary {
+    pub fn to_summary(&self) -> QuerySummary {
         let answer = self.reported_answer();
         QuerySummary {
             query_identifier: self.identifier,
             query: self.query.clone(),
             response: answer.map(|answer| answer.response.clone()),
             review_type: self.review_type.clone(),
-            citations: answer.map(|answer| answer.reported_citations(host)),
+            citations: answer.map(|answer| answer.reported_citations()),
             status: self.status.clone(),
             status_message: self.status_message.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
@@ -1355,11 +1365,10 @@ impl ComplianceInquiry {
     /// Every value in it is read off this stored record — the inquiry's metadata and its
     /// queries with their statuses and answers — so the document reports what the emulator
     /// holds and nothing else. In particular a query carries the `response` it reports
-    /// ([`InquiryQuery::reported_answer`]), which is null while its processing is not over.
-    ///
-    /// `host` is the endpoint the exporting caller reached this emulator on, which is what
-    /// the cited sources' links name ([`QueryCitation::source_link`]).
-    pub fn export_document(&self, covered: &[i32], include_citations: bool, host: &str) -> Vec<u8> {
+    /// ([`InquiryQuery::reported_answer`]), which is null while its processing is not over,
+    /// and a citation carries the stored link of the source it names
+    /// ([`QueryCitation::source_link`]), so the exported triple is the listed one.
+    pub fn export_document(&self, covered: &[i32], include_citations: bool) -> Vec<u8> {
         // Which queries the export covers is asked once per query and once per feedback
         // record, so the set is INDEXED once here rather than scanned for each question.
         let covers: BTreeSet<i32> = covered.iter().copied().collect();
@@ -1391,7 +1400,7 @@ impl ComplianceInquiry {
                         .map(|answer| answer
                             .citations
                             .iter()
-                            .map(|citation| citation.to_document_entry(host))
+                            .map(|citation| citation.to_document_entry())
                             .collect::<Vec<::serde_json::Value>>())
                         .unwrap_or_default());
                 }
@@ -3357,6 +3366,15 @@ struct SeedReport {
     /// The file name of the TERM document governing this report, which is also the
     /// term's identity: a grant minted under it covers every report it governs.
     term_object: &'static str,
+    /// Where the compliance material this row publishes is PUBLISHED — the link a
+    /// citation of this source reports ([`Report::source_link`]).
+    ///
+    /// Catalog data, as `description` above is: AWS publishes each compliance programme's
+    /// material under a page of its own, and a programme that publishes several documents
+    /// publishes them under that one page, so the rows of such a programme carry one link.
+    /// The corpus discloses a published link for none of these rows, so the values below
+    /// are this catalog's, written in the same register as the descriptions beside them.
+    source_link: &'static str,
     versions: &'static [SeedVersion],
 }
 
@@ -3425,6 +3443,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "AWS-Outposts-Rack-Information-Security-FAQ.pdf",
         term_object: "AWS-Outposts-Rack-Information-Security-FAQ-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/resources/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3463,6 +3482,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-27001-2022.pdf",
         term_object: "ISO-27001-2022-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/iso-27001-faqs/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3503,6 +3523,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: ACCEPTANCE_TYPE_PASSTHROUGH,
         document_object: "UAE-TDRA-IAR.pdf",
         term_object: "UAE-TDRA-IAR-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/uae-iar/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3570,6 +3591,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "SOC2-Type2.pdf",
         term_object: "SOC2-Type2-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/soc-faqs/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3601,6 +3623,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "PCI-DSS-AOC.pdf",
         term_object: "PCI-DSS-AOC-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/pci-dss-level-1-faqs/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3633,6 +3656,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "AWS-SOC-1.pdf",
         term_object: "AWS-SOC-1-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/soc-faqs/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3664,6 +3688,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "AWS-SOC-3.pdf",
         term_object: "AWS-SOC-3-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/soc-faqs/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JUL,
@@ -3687,6 +3712,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-27017.pdf",
         term_object: "ISO-27017-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/iso-27017-faqs/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3719,6 +3745,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-27018.pdf",
         term_object: "ISO-27018-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/iso-27018-faqs/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JAN,
@@ -3742,6 +3769,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-27701.pdf",
         term_object: "ISO-27701-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/iso-27701-faqs/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JUL,
@@ -3764,6 +3792,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-9001.pdf",
         term_object: "ISO-9001-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/iso-9001-faqs/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2023JUL,
@@ -3787,6 +3816,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "FedRAMP-Moderate-Customer-Package.pdf",
         term_object: "FedRAMP-Moderate-Customer-Package-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/fedramp/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JAN,
@@ -3809,6 +3839,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "IRAP-Assessment.pdf",
         term_object: "IRAP-Assessment-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/irap/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024APR,
@@ -3832,6 +3863,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "EXPLICIT",
         document_object: "C5-Attestation.pdf",
         term_object: "C5-Attestation-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/bsi-c5/",
         versions: &[
             SeedVersion {
                 version: 1,
@@ -3863,6 +3895,7 @@ const SEED: &[SeedReport] = &[
         acceptance_type: "PASSTHROUGH",
         document_object: "CSA-CAIQ.pdf",
         term_object: "CSA-CAIQ-Term.txt",
+        source_link: "https://aws.amazon.com/compliance/csa/",
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JAN,
@@ -3897,6 +3930,11 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                 company_name: COMPANY_NAME.to_string(),
                 product_name: PRODUCT_NAME.to_string(),
                 acceptance_type: seed.acceptance_type.to_string(),
+                // The published location of this compliance document, held beside its name
+                // and its published text because it locates the SOURCE: a citation of it
+                // reports this stored value rather than a locator assembled per read
+                // ([`QueryCitation::source_link`]).
+                source_link: seed.source_link.to_string(),
                 // Every report AWS publishes in the Artifact catalog is visible to every
                 // account; a report scoped to one customer is not part of this catalog.
                 visibility: VISIBILITY_PUBLIC.to_string(),

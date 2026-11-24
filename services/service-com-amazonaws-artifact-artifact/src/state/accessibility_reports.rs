@@ -63,6 +63,12 @@ const ACCESSIBILITY_DESCRIPTION: &str =
      communications technology including: Section 508 (U.S.), EN 301 549 (EU), and \
      W3C/WAI WCAG.";
 
+/// Where the material of this class is PUBLISHED: AWS publishes the accessibility
+/// conformance of its products under one page, so every row of the class carries that one
+/// link, the same way they share one description. It is what a citation of such a report
+/// reports as its `sourceLink` ([`super::Report::source_link`]).
+const ACCESSIBILITY_SOURCE_LINK: &str = "https://aws.amazon.com/accessibility/";
+
 /// The accessibility-conformance reports the catalog publishes, one per evaluated product.
 ///
 /// The rows differ along what the report surface generalises over: the product evaluated,
@@ -87,6 +93,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-Connect.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-Connect-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
             SeedVersion {
                 version: 1,
@@ -113,6 +120,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-AWS-Transfer-Family.pdf",
         term_object: "Accessibility-Conformance-Report-AWS-Transfer-Family-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         // The window the corpus records for this report opens on 1 November 2024; its
         // close is the one this catalog publishes, which the recording does not contradict.
         versions: &[SeedVersion {
@@ -132,6 +140,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-WorkSpaces.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-WorkSpaces-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
             SeedVersion {
                 version: 1,
@@ -158,6 +167,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-QuickSight.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-QuickSight-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JAN,
@@ -175,6 +185,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-Chime-SDK.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-Chime-SDK-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
             SeedVersion {
                 version: 1,
@@ -208,6 +219,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-AWS-CloudShell.pdf",
         term_object: "Accessibility-Conformance-Report-AWS-CloudShell-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[SeedVersion {
             version: 1,
             period_start: T2024JUL,
@@ -225,6 +237,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-SageMaker-Studio.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-SageMaker-Studio-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
             SeedVersion {
                 version: 1,
@@ -251,6 +264,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
         document_object: "Accessibility-Conformance-Report-Amazon-Lex.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-Lex-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[SeedVersion {
             version: 1,
             period_start: T2025JAN,

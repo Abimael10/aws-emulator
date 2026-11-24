@@ -10,8 +10,8 @@
 //! terms are the sources, the passage of each one the terms were found in is what that
 //! source contributes, and the response is those passages, each under the source it was
 //! read out of. The text a caller reads back is therefore text this service really holds,
-//! quoted from the report it came from, and the citation beside it locates that report's own
-//! read — not prose a model wrote, which nothing in this emulator could produce.
+//! quoted from the report it came from, and the citation beside it carries that source's
+//! own published link, as the catalog holds it.
 //!
 //! The retrieval itself is the workspace's ONE free-text search over stored documents
 //! ([`::service_common::document_text_search`]), the same one the other services that
@@ -30,11 +30,6 @@ use ::service_common::document_text_search::{
 };
 
 use crate::ops::types::Citation;
-
-/// The path of the modelled read a citation locates its source by: `GetReportMetadata`'s
-/// own URI (`smithy_query(query="operation",operation="GetReportMetadata")` — GET
-/// `/v1/report/getMetadata`, with `reportId` and `reportVersion` as `@httpQuery` members).
-const REPORT_METADATA_PATH: &str = "/v1/report/getMetadata";
 
 /// The most sources one answer cites.
 ///
@@ -84,13 +79,14 @@ pub fn reportable_long_text(text: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// One source an answer cites: the passage, the document it was read out of, and which
-/// stored report that is.
+/// One source an answer cites: the passage, the document it was read out of, and where
+/// that document is published.
 ///
-/// The `Citation$sourceLink` a reader sees is NOT held here: it is built per projection
-/// ([`Self::source_link`]) against the endpoint the reading request reached this emulator
-/// on, exactly as `GetReport` builds the URL it announces, so the link resolves for whoever
-/// was handed it rather than for whoever submitted the query.
+/// All three members of the modelled `Citation` are STORED here, the link included: a
+/// citation's `sourceLink` locates the source its `sourceLabel` names and its
+/// `sourceContent` quotes, which is a property of that source and of no read of it — so
+/// the value is taken off the catalog entry the passage was quoted from when the answer is
+/// produced, and every reader and every projection of that citation reports the same one.
 #[derive(Debug, Clone)]
 pub struct QueryCitation {
     /// "Label of the compliance source" — the name of the published report the passage
@@ -99,40 +95,21 @@ pub struct QueryCitation {
     /// "Content text from the compliance source" — the window of that report's published
     /// text the query's terms were found in.
     pub source_content: String,
-    /// The report the passage was read out of, and the version of it the catalog publishes:
-    /// what [`Self::source_link`] locates, so the link always names a source this service
-    /// really holds.
+    /// "Link to the compliance source" — where the report the passage was read out of is
+    /// published, as the catalog holds it ([`super::Report::source_link`]).
+    pub source_link: String,
+    /// Which stored report the passage was read out of, which is what orders two equally
+    /// well matching sources stably ([`answer_from_catalog`]).
     pub report_id: String,
-    pub report_version: i64,
 }
 
 impl QueryCitation {
-    /// "Link to the compliance source": where the cited report is READ in this emulator —
-    /// `GetReportMetadata` for exactly that report and version — on the endpoint the
-    /// reading caller reached it on ([`super::document_url_host`]).
-    ///
-    /// The source is located rather than handed over: a citation says which published report
-    /// a passage came from, and it is not the receipt that authorises a download of that
-    /// report's document. A caller follows it to the cited report's own metadata, and
-    /// reaches the DOCUMENT the way every other caller does — by accepting the term
-    /// governing it (`GetTermForReport`) and presenting the grant to `GetReport` — so no
-    /// link here stands in for an acceptance nobody made, and none of them points at a
-    /// location this emulator would refuse to serve.
-    pub fn source_link(&self, host: &str) -> String {
-        format!(
-            "https://{host}{REPORT_METADATA_PATH}?reportId={report_id}\
-             &reportVersion={version}",
-            report_id = self.report_id,
-            version = self.report_version,
-        )
-    }
-
     /// This source as the modelled `Citation` a reader of the query reports.
-    pub fn to_citation(&self, host: &str) -> Citation {
+    pub fn to_citation(&self) -> Citation {
         Citation {
             source_label: Some(self.source_label.clone()),
             source_content: Some(self.source_content.clone()),
-            source_link: Some(self.source_link(host)),
+            source_link: Some(self.source_link.clone()),
         }
     }
 
@@ -143,8 +120,8 @@ impl QueryCitation {
     /// passage and the link that locates them are emitted in ONE place: the query listing
     /// and the exported document cannot disagree about a citation, and a link can never be
     /// paired with another source's passage.
-    pub fn to_document_entry(&self, host: &str) -> ::serde_json::Value {
-        let citation = self.to_citation(host);
+    pub fn to_document_entry(&self) -> ::serde_json::Value {
+        let citation = self.to_citation();
         ::serde_json::json!({
             "sourceLabel": citation.source_label,
             "sourceContent": citation.source_content,
@@ -169,12 +146,12 @@ pub struct QueryAnswer {
 }
 
 impl QueryAnswer {
-    /// The modelled `citations` list a reader of the query reports, against the endpoint
-    /// that reader reached ([`QueryCitation::source_link`]).
-    pub fn reported_citations(&self, host: &str) -> Vec<Citation> {
+    /// The modelled `citations` list a reader of the query reports — the stored sources,
+    /// each through the one citation projection ([`QueryCitation::to_citation`]).
+    pub fn reported_citations(&self) -> Vec<Citation> {
         self.citations
             .iter()
-            .map(|citation| citation.to_citation(host))
+            .map(|citation| citation.to_citation())
             .collect()
     }
 }
@@ -190,7 +167,8 @@ pub struct AnswerCorpus {
 }
 
 /// One searchable catalog entry: how the report is named and classified, the published text
-/// a passage is quoted from, and which published report that text belongs to.
+/// a passage is quoted from, which published report that text belongs to and where that
+/// report is published.
 #[derive(Debug, Clone)]
 struct CorpusEntry {
     label: String,
@@ -199,7 +177,9 @@ struct CorpusEntry {
     classification: String,
     text: String,
     report_id: String,
-    report_version: i64,
+    /// Where the report is published, which a citation of it carries as its link
+    /// ([`super::Report::source_link`]).
+    source_link: String,
 }
 
 impl AnswerCorpus {
@@ -207,8 +187,8 @@ impl AnswerCorpus {
     /// name, its series and category, and the published description of the version
     /// `ListReports` enumerates.
     ///
-    /// A report holding no published version has nothing to quote and no read to link to, so
-    /// it contributes no entry, exactly as it is passed over by the enumeration.
+    /// A report holding no published version has nothing to quote, so it contributes no
+    /// entry, exactly as it is passed over by the enumeration.
     pub fn from_catalog(catalog: &BTreeMap<String, Report>) -> Self {
         Self {
             entries: catalog
@@ -220,7 +200,7 @@ impl AnswerCorpus {
                         classification: format!("{} {}", report.series, report.category),
                         text: version.description.clone(),
                         report_id: report.id.clone(),
-                        report_version: version.version,
+                        source_link: report.source_link.clone(),
                     })
                 })
                 .collect(),
@@ -270,8 +250,12 @@ pub fn answer_from_catalog(query: &str, corpus: &AnswerCorpus) -> Option<QueryAn
             QueryCitation {
                 source_label: entry.label.clone(),
                 source_content,
+                // The link of the source the passage was READ OUT OF, taken off that
+                // catalog entry here, where the triple is assembled: a citation's three
+                // members all describe one source, so none of them is left to be
+                // manufactured by whoever later reports it.
+                source_link: entry.source_link.clone(),
                 report_id: entry.report_id.clone(),
-                report_version: entry.report_version,
             },
         ));
     }

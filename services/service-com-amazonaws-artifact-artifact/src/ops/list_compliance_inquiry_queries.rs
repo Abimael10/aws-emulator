@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -195,10 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter is refused whatever the state holds.
         let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
-        // The endpoint this caller reached the emulator on, which the links of the cited
-        // sources name ([`crate::state::QueryCitation::source_link`]): the URL has to
-        // resolve for whoever was handed it.
-        let host = crate::state::document_url_host(ctx.parts());
 
         let mut store = state.lock();
         // The cursor is sealed under the secret THIS store drew, so the key comes off the
@@ -239,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     position,
                 )
             },
-            |query| query.to_summary(&host),
+            |query| query.to_summary(),
         );
 
         Ok(ListComplianceInquiryQueriesOutput {
