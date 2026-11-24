@@ -43,8 +43,10 @@
 //! continuation token a truncated page hands back is an OPAQUE value the service mints and
 //! the caller hands back unread — "NextContinuationToken is obfuscated and is not a real
 //! key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated and
-//! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is base64 text in
-//! the standard alphabet, it is no rendering of the position it resumes at in any spelling a
+//! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is written in the
+//! alphabet AWS writes that listing's own tokens in — standard base64 for the object
+//! listings, lowercase hex for the account's bucket listing — it is no rendering of the
+//! position it resumes at in any spelling a
 //! caller could compute, and only a value this service minted for THIS LISTING names a
 //! page at all; while being a usable cursor, it resumes the listing exactly where the page
 //! stopped and is the same value for two identical reads of one unchanged listing. What the
@@ -643,12 +645,18 @@ async fn a_continuation_token_no_listing_issued_is_refused_by_naming_the_paramet
 }
 
 /// Whether `token` is written in the base64 alphabet (RFC 4648 §4), which is the alphabet an
-/// AWS continuation token is spelled in.
+/// object listing's continuation token is spelled in.
 fn is_base64(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '='))
+}
+
+/// Whether `token` is written in lowercase hexadecimal, which is the alphabet the account's
+/// own bucket listing spells its continuation token in.
+fn is_lowercase_hex(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f'))
 }
 
 /// Every spelling of `position` a caller could compute for itself, none of which a
@@ -696,18 +704,38 @@ fn assert_opaque(case: &str, token: &str, position: &str) {
         is_base64(token),
         "case {case:?}: a continuation token is base64 text, got {token:?}"
     );
-    for (spelling, computed) in computable_spellings(position) {
-        assert_ne!(
-            token, computed,
-            "case {case:?}: the token must not be {spelling}, got {token:?}"
-        );
-    }
+    assert_no_computable_spelling(case, token, position);
     // And the position's own text is nowhere in it — read only for a position wide enough
     // that a chance run of token characters could not be one.
     if position.len() >= 3 {
         assert!(
             !token.contains(position) && !token.contains(&hex::encode(position)),
             "case {case:?}: the token must carry no rendering of {position:?}, got {token:?}"
+        );
+    }
+}
+
+/// Assert that `token` is an opaque cursor the BUCKET listing minted: lowercase hex text, and
+/// no rendering of the position a caller could compute for itself.
+///
+/// A hex-spelled token is base16 of the authenticated cursor, so the cursor's own hex is
+/// inside it — the value is one no caller can MINT (the authenticator is what decides that,
+/// pinned by the forged-token rows), not one whose bytes are hidden: "obfuscated and is not a
+/// real bucket" is the claim the member makes, and the value is no bucket name.
+fn assert_opaque_hex(case: &str, token: &str, position: &str) {
+    assert!(
+        is_lowercase_hex(token),
+        "case {case:?}: the bucket listing's continuation token is lowercase hex, got {token:?}"
+    );
+    assert_no_computable_spelling(case, token, position);
+}
+
+/// Assert `token` is none of the values a caller could compute for `position` itself.
+fn assert_no_computable_spelling(case: &str, token: &str, position: &str) {
+    for (spelling, computed) in computable_spellings(position) {
+        assert_ne!(
+            token, computed,
+            "case {case:?}: the token must not be {spelling}, got {token:?}"
         );
     }
 }
@@ -1017,7 +1045,7 @@ async fn the_bucket_listing_hands_back_an_opaque_token_that_resumes_the_account(
         );
         match element(&answer, "ContinuationToken") {
             Some(next) if !next.is_empty() => {
-                assert_opaque(&format!("page {page}"), &next, expected);
+                assert_opaque_hex(&format!("page {page}"), &next, expected);
                 token = next;
             }
             // Only the last page owes no cursor, which is how the walk ends.

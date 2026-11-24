@@ -911,11 +911,9 @@ async fn a_create_naming_an_unroutable_address_is_refused_and_registers_nothing(
             "case {case:?}: the refusal must name the address the request carried: {body}"
         );
         assert!(
-            body["RequestId"]
-                .as_str()
-                .is_some_and(|request_id| !request_id.is_empty()),
-            "case {case:?}: a refusal states the id of the call in the RequestId member its \
-             error shape declares: {body}"
+            body.get("RequestId").is_none(),
+            "case {case:?}: a refusal document reports no RequestId — the id of the call \
+             travels in the x-amzn-RequestId header: {body}"
         );
 
         // The refused create registered nothing, so the id resolves to no data source.

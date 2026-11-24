@@ -5,10 +5,13 @@
 //! RULE under test: the token a truncated page hands back is an opaque cursor the service
 //! mints and the caller hands back unread — "NextContinuationToken is obfuscated and is not a
 //! real key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated
-//! and is not a real bucket" (`ListBucketsOutput$ContinuationToken`) — written in the base64
-//! alphabet AWS's own tokens are written in: the STANDARD one (RFC 4648 §4, `A-Za-z0-9+/`
-//! with `=` padding), so a client that reads the value as base64 reads the same character
-//! class whichever listing minted it. The value travels on the `continuation-token` query
+//! and is not a real bucket" (`ListBucketsOutput$ContinuationToken`) — written in the
+//! alphabet AWS writes THAT listing's own tokens in: the listings of what a bucket holds hand
+//! back a value in the STANDARD base64 alphabet (RFC 4648 §4, `A-Za-z0-9+/` with `=`
+//! padding), while the account's own bucket listing and the four listings of a bucket's
+//! id-addressed configurations hand back a lowercase-hex one. Either way the value is
+//! round-tripped rather than parsed, so what the alphabet decides is what a client reading
+//! the value's FORM sees. The value travels on the `continuation-token` query
 //! parameter, where a client percent-encodes the characters a query component reads otherwise
 //! ([`handed_back_in_query`]) — and a client that hands the value back verbatim, leaving its
 //! `+` to arrive as the space form decoding makes of it, resumes the same page, because a
@@ -43,6 +46,11 @@ const QUERY_VALUE: &AsciiSet = &CONTROLS.add(b'+').add(b'/').add(b'=');
 /// happened to draw.
 pub(crate) fn handed_back_in_query(token: &str) -> String {
     utf8_percent_encode(token, QUERY_VALUE).to_string()
+}
+
+/// Whether `token` is written in lowercase hexadecimal.
+fn is_lowercase_hex(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|character| matches!(character, '0'..='9' | 'a'..='f'))
 }
 
 /// Whether `token` is written in the standard base64 alphabet (RFC 4648 §4).
@@ -82,22 +90,13 @@ fn bucket_token(case: &str, answer: &Answer) -> String {
     token
 }
 
-/// Assert the token's SPELLING: the standard base64 alphabet, decodable as standard base64,
-/// and no rendering of the position it resumes at.
-fn assert_spelled_in_base64(case: &str, token: &str, position: &str) {
-    assert!(
-        is_standard_base64(token),
-        "case {case:?}: a continuation token is standard base64, got {token:?}"
-    );
-    assert!(
-        aws_smithy_types::base64::decode(token).is_ok(),
-        "case {case:?}: a continuation token decodes as standard base64, got {token:?}"
-    );
+/// Assert the token carries no plain rendering of the position it resumes at.
+fn assert_carries_no_position(case: &str, token: &str, position: &str) {
     assert_ne!(
         token, position,
         "case {case:?}: the token must not be the position it resumes at"
     );
-    // Read only for a position wide enough that a chance run of base64 characters could not
+    // Read only for a position wide enough that a chance run of token characters could not
     // be one.
     if position.len() >= 3 {
         assert!(
@@ -106,6 +105,22 @@ fn assert_spelled_in_base64(case: &str, token: &str, position: &str) {
              {token:?}"
         );
     }
+}
+
+/// Assert an object listing's token SPELLING: the standard base64 alphabet, decodable as
+/// standard base64, and no rendering of the position it resumes at.
+fn assert_spelled_in_base64(case: &str, token: &str, position: &str) {
+    assert!(
+        is_standard_base64(token),
+        "case {case:?}: a continuation token of an object listing is standard base64, got \
+         {token:?}"
+    );
+    assert!(
+        aws_smithy_types::base64::decode(token).is_ok(),
+        "case {case:?}: a continuation token of an object listing decodes as standard base64, \
+         got {token:?}"
+    );
+    assert_carries_no_position(case, token, position);
 }
 
 /// (case, the keys one bucket holds — the listing walks them in this order.)
@@ -238,10 +253,11 @@ async fn a_token_handed_back_verbatim_resumes_the_same_page() {
     }
 }
 
-/// RULE, on the other listing: the account's own bucket listing spells its token the same
-/// way and resumes the same way, so the spelling is the service's and not one listing's.
+/// RULE, on the other listing: the account's own bucket listing spells its token in the
+/// alphabet AWS spells THAT listing's tokens in — lowercase hex rather than base64 — and
+/// resumes the same way, so the spelling is read off each listing's own recorded answers.
 #[tokio::test]
-async fn the_bucket_listing_token_is_standard_base64_and_resumes_the_account() {
+async fn the_bucket_listing_token_is_lowercase_hex_and_resumes_the_account() {
     let router = router();
     let names = ["token-alphabet-a", "token-alphabet-b", "token-alphabet-c"];
     for name in names {
@@ -258,7 +274,13 @@ async fn the_bucket_listing_token_is_standard_base64_and_resumes_the_account() {
         text(&first)
     );
     let token = bucket_token(case, &first);
-    assert_spelled_in_base64(case, &token, names[1]);
+    assert!(
+        is_lowercase_hex(&token),
+        "case {case:?}: a continuation token of the bucket listing is lowercase hex, got \
+         {token:?}"
+    );
+    assert_carries_no_position(case, &token, names[1]);
+    assert_carries_no_position(case, &token, names[0]);
 
     let resumed = list_buckets(
         &router,

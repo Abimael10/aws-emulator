@@ -650,23 +650,23 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
     // The membership rule is tabled in `task_lifecycle`,
     // `task_definition_compatibility_validation` and `managed_instances_compatibility`; here
     // it is the ORDER, read back through BOTH projections. Order source: the recorded ECS
-    // responses — EXTERNAL, EC2, MANAGED_INSTANCES, FARGATE — filtered by what the revision
+    // responses — EXTERNAL, EC2, FARGATE — filtered by what the revision
     // supports.
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "bridge",
             json!({ "networkMode": "bridge" }),
-            vec!["EXTERNAL", "EC2", "MANAGED_INSTANCES"],
+            vec!["EXTERNAL", "EC2"],
         ),
         (
             "awsvpc without task size",
             json!({ "networkMode": "awsvpc" }),
-            vec!["EC2", "MANAGED_INSTANCES"],
+            vec!["EC2"],
         ),
         (
             "awsvpc with task size",
             json!({ "networkMode": "awsvpc", "cpu": "256", "memory": "512" }),
-            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            vec!["EC2", "FARGATE"],
         ),
         (
             "fargate requested",
@@ -676,11 +676,11 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE"],
             }),
-            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            vec!["EC2", "FARGATE"],
         ),
         // What the registration ASKED to be validated against does not reorder the derived
-        // list, and adds nothing to it: every launch type it names that the parameters
-        // support is already there.
+        // list, and adds nothing to it: a launch type it names that no recorded projection
+        // reports stays out of the derived list.
         (
             "fargate and managed instances requested",
             json!({
@@ -689,7 +689,7 @@ async fn compatibilities_read_back_in_the_launch_type_order_ecs_reports() {
                 "memory": "1024",
                 "requiresCompatibilities": ["FARGATE", "MANAGED_INSTANCES"],
             }),
-            vec!["EC2", "MANAGED_INSTANCES", "FARGATE"],
+            vec!["EC2", "FARGATE"],
         ),
     ];
 

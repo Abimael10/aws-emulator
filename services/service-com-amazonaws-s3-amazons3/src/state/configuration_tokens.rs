@@ -34,11 +34,17 @@
 //! cursor into another. Opaque, NOT confidential, exactly as that module
 //! puts it: what a caller cannot do is make a token of its own.
 //!
+//! WHICH ALPHABET the authenticated bytes are written in is the listing's own, because it is
+//! the one AWS writes that listing's token in ([`PagedListing::spelling`]): the bucket
+//! listing and the four listings of a bucket's id-addressed configurations hand back a
+//! lowercase-hex value, and the object listings and the directory-bucket listing hand back a
+//! standard-base64 one. A client round-trips either unread, so the alphabet is a fidelity
+//! question and not a functional one — which is exactly why it is read off the recordings
+//! rather than chosen.
+//!
 //! No page is kept on the side: the cursor is the position the next page resumes at — a
 //! configuration id, a bucket name, an object key, an annotation name — which is why every
 //! one of these listings walks what it reports in ascending order.
-
-use ::service_common::page_tokens::{page_cursor, page_token};
 
 pub use ::service_common::page_tokens::PageTokenKey;
 
@@ -86,6 +92,70 @@ impl PagedListing {
             Self::Objects => "objects",
         }
     }
+
+    /// The alphabet THIS listing's token is written in, which is the alphabet the recorded
+    /// answers of that listing write it in: a lowercase-hex value for the account's own
+    /// bucket listing and for the four listings of a bucket's id-addressed configurations, a
+    /// standard-base64 one for the listings of what a bucket or an object version holds and
+    /// for the directory-bucket listing.
+    ///
+    /// The token is round-tripped unread either way — "an opaque value that Amazon S3
+    /// understands" — so the alphabet changes nothing a client can do with the value; it is
+    /// what a client that reads the value's FORM, or a recorded-answer comparison, sees.
+    fn spelling(self) -> Spelling {
+        match self {
+            Self::Analytics
+            | Self::Buckets
+            | Self::IntelligentTiering
+            | Self::Inventory
+            | Self::Metrics => Spelling::Hex,
+            Self::DirectoryBuckets | Self::ObjectAnnotations | Self::Objects => Spelling::Base64,
+        }
+    }
+}
+
+/// The alphabet a token's authenticated bytes are written in. See
+/// [`PagedListing::spelling`] for which listing is written in which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// Lowercase hexadecimal (RFC 4648 §8's alphabet, lowercased).
+    Hex,
+    /// Base64 in the STANDARD alphabet (RFC 4648 §4, `A-Za-z0-9+/` with `=` padding).
+    Base64,
+}
+
+impl Spelling {
+    /// `bytes` as the string a response carries.
+    fn write(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Hex => ::hex::encode(bytes),
+            Self::Base64 => ::aws_smithy_types::base64::encode(bytes),
+        }
+    }
+
+    /// The bytes `token` carries, or `None` for a value that is not written in this
+    /// alphabet at all — which is one of the ways a value this store never minted names no
+    /// page.
+    ///
+    /// Each alphabet is read in ONE spelling, the one this store writes: a hex value is
+    /// lowercase, so a token whose case a caller changed is a value this store did not
+    /// hand out rather than the same bytes spelled differently.
+    fn read(self, token: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::Hex => {
+                if !token
+                    .chars()
+                    .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+                {
+                    return None;
+                }
+                ::hex::decode(token).ok()
+            }
+            // A base64 token travels on a query parameter, where a `+` a client handed back
+            // unencoded arrives as a space ([`handed_back`]).
+            Self::Base64 => ::aws_smithy_types::base64::decode(handed_back(token)).ok(),
+        }
+    }
 }
 
 /// The separator between the three parts of a cursor — the listing a token was issued for,
@@ -125,14 +195,14 @@ pub fn object_version_scope(bucket: &str, key: &str, version_id: Option<&str>) -
 }
 
 /// The `NextContinuationToken` that resumes a listing at `first_not_returned` (inclusive):
-/// the authenticated bytes of that position, rendered in base64.
+/// the authenticated bytes of that position, written in the alphabet the listing's recorded
+/// tokens are written in ([`PagedListing::spelling`]).
 ///
-/// Base64 is the spelling an AWS continuation token has, in the STANDARD alphabet (RFC 4648
-/// §4) the recorded tokens are written in — through the workspace's one rendering of an
-/// authenticated cursor ([`::service_common::page_tokens::page_token`]), so a token of this
-/// service is spelled the way every other paginated read's is, and a client hands it back on
-/// the `continuation-token` query parameter the way it hands back any other query value.
-/// The authenticator inside is what makes a token this store did not mint detectable, which
+/// The bytes are the workspace's one rendering of an authenticated cursor
+/// ([`::service_common::page_tokens::PageTokenKey::mint`]), so a token of this service names
+/// its position the way every other paginated read's does, and a client hands it back on the
+/// `continuation-token` query parameter the way it hands back any other query value. The
+/// authenticator inside is what makes a token this store did not mint detectable, which
 /// is what lets the next page refuse it instead of serving from a position the caller chose.
 ///
 /// `scope` is the resource the listing was taken OVER — the bucket a configuration listing is
@@ -144,20 +214,18 @@ pub fn encode_continuation_token(
     scope: &str,
     first_not_returned: &str,
 ) -> String {
-    page_token(
-        key,
-        &format!(
-            "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{first_not_returned}",
-            listing.label(),
-            scope_digest(scope)
-        ),
-    )
+    listing.spelling().write(&key.mint(&format!(
+        "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{first_not_returned}",
+        listing.label(),
+        scope_digest(scope)
+    )))
 }
 
 /// The position `token` resumes `listing` over `scope` at (inclusive), or `None` for any
-/// value this store did not mint for that listing and that scope: one that is not base64,
-/// one whose authenticator does not match the cursor it travels with, one issued for another
-/// listing, one issued for another BUCKET, and one carrying no cursor at all.
+/// value this store did not mint for that listing and that scope: one that is not written in
+/// the listing's own alphabet, one whose authenticator does not match the cursor it travels
+/// with, one issued for another listing, one issued for another BUCKET, and one carrying no
+/// cursor at all.
 pub fn decode_continuation_token(
     key: &PageTokenKey,
     listing: PagedListing,
@@ -183,8 +251,9 @@ pub enum ContinuationTokenReading {
     /// A token this store minted for this listing, but over another scope — another bucket's
     /// listing of the same family.
     OtherScope,
-    /// Not a token this store minted for this listing at all: not base64, authenticated
-    /// under another key, issued for another listing, or carrying no cursor.
+    /// Not a token this store minted for this listing at all: not written in the listing's
+    /// own alphabet, authenticated under another key, issued for another listing, or
+    /// carrying no cursor.
     Unknown,
 }
 
@@ -225,7 +294,10 @@ pub fn read_continuation_token(
     scope: &str,
     token: &str,
 ) -> ContinuationTokenReading {
-    let Some(cursor) = page_cursor(key, &handed_back(token)) else {
+    let Some(bytes) = listing.spelling().read(token) else {
+        return ContinuationTokenReading::Unknown;
+    };
+    let Some(cursor) = key.cursor_of(&bytes) else {
         return ContinuationTokenReading::Unknown;
     };
     let Some((label, rest)) = cursor.split_once(CURSOR_SEPARATOR) else {
@@ -245,12 +317,12 @@ pub fn read_continuation_token(
 
 /// The token a caller handed back, as the value this store MINTED.
 ///
-/// A token travels on the `continuation-token` query parameter, and this emulator's query
-/// reader is a form decoder: a `+` a client handed back without percent-encoding it arrives
-/// as a SPACE. Amazon S3 reads the parameter as the opaque value it handed out — "you can use
-/// this ContinuationToken for pagination of the list results" — so a caller that returns that
-/// value verbatim resumes its listing, and the base64 alphabet has no space, which makes a
-/// space in a token that `+` and nothing else.
+/// A base64 token travels on the `continuation-token` query parameter, and this emulator's
+/// query reader is a form decoder: a `+` a client handed back without percent-encoding it
+/// arrives as a SPACE. Amazon S3 reads the parameter as the opaque value it handed out — "you
+/// can use this ContinuationToken for pagination of the list results" — so a caller that
+/// returns that value verbatim resumes its listing, and the base64 alphabet has no space,
+/// which makes a space in a token that `+` and nothing else.
 ///
 /// Every other character of the alphabet survives a query component unchanged, so nothing
 /// else is rewritten here: a value this store did not mint still names no page
@@ -345,9 +417,11 @@ mod tests {
                     "case {listing:?}/{id:?}: must name no position in {elsewhere:?}"
                 );
             }
-            // The token is not a RENDERING of the position it resumes at: neither the id
-            // itself nor any value a caller could compute from it without the key.
-            for (spelling, computed) in [
+            // The token is written in the alphabet this listing's recorded tokens are
+            // written in ([`PagedListing::spelling`]), and is not a RENDERING of the
+            // position it resumes at: neither the id itself nor any value a caller could
+            // compute from it without the key.
+            for (rendering, computed) in [
                 ("the id itself", id.to_string()),
                 ("hex of the id", ::hex::encode(id)),
                 (
@@ -357,33 +431,53 @@ mod tests {
             ] {
                 assert_ne!(
                     token, computed,
-                    "case {listing:?}/{id:?}: the token must not be {spelling}, got {token:?}"
+                    "case {listing:?}/{id:?}: the token must not be {rendering}, got {token:?}"
                 );
             }
-            assert!(
-                token.chars().all(|character| character.is_ascii_alphanumeric()
-                    || matches!(character, '+' | '/' | '=')),
-                "case {listing:?}/{id:?}: a token is base64, got {token:?}"
-            );
+            match listing.spelling() {
+                Spelling::Hex => assert!(
+                    !token.is_empty()
+                        && token
+                            .chars()
+                            .all(|character| matches!(character, '0'..='9' | 'a'..='f')),
+                    "case {listing:?}/{id:?}: a token of this listing is lowercase hex, got \
+                     {token:?}"
+                ),
+                Spelling::Base64 => assert!(
+                    !token.is_empty()
+                        && token.chars().all(|character| character.is_ascii_alphanumeric()
+                            || matches!(character, '+' | '/' | '=')),
+                    "case {listing:?}/{id:?}: a token of this listing is standard base64, \
+                     got {token:?}"
+                ),
+            }
         }
 
         // Values a caller could write rather than round-trip, including one with the SHAPE
-        // of a minted token, which only the authenticator can refuse.
-        let shaped = ::aws_smithy_types::base64::encode(
+        // of a minted token, which only the authenticator can refuse. The rows are read
+        // against a hex-spelled listing and a base64-spelled one alike, so neither
+        // alphabet's reading serves a value this store never minted.
+        let shaped_hex =
+            ::hex::encode([0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1]);
+        let shaped_base64 = ::aws_smithy_types::base64::encode(
             [0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1],
         );
-        for (case, token) in [
-            ("an id", "kept".to_string()),
-            ("empty", String::new()),
-            ("not base64", "not a token".to_string()),
-            ("base64 but too short", "a2VwdA==".to_string()),
-            ("a minted token's shape", shaped),
-        ] {
-            assert_eq!(
-                decode_continuation_token(&key, PagedListing::Metrics, scopes[0], &token),
-                None,
-                "case {case}: expected no position for {token:?}"
-            );
+        for listing in [PagedListing::Metrics, PagedListing::Objects] {
+            for (case, token) in [
+                ("an id", "kept".to_string()),
+                ("empty", String::new()),
+                ("neither alphabet", "not a token".to_string()),
+                ("hex but too short", "6b657074".to_string()),
+                ("base64 but too short", "a2VwdA==".to_string()),
+                ("a minted token's shape, in hex", shaped_hex.clone()),
+                ("a minted token's shape, in base64", shaped_base64.clone()),
+            ] {
+                assert_eq!(
+                    decode_continuation_token(&key, listing, scopes[0], &token),
+                    None,
+                    "case {listing:?}/{case}: expected no position for {token:?}"
+                );
+            }
         }
     }
 }
