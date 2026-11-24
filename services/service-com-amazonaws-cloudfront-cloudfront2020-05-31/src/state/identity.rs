@@ -984,20 +984,15 @@ pub fn addresses_an_anycast_ip_list(value: &str) -> bool {
 /// a non-empty run of the id alphabet ([`is_token_byte`] — decimal digits and uppercase
 /// ASCII letters), carrying no separator and no lower case.
 ///
-/// The ALPHABET alone, with no namespace letter and no width: the members that carry such an
-/// identifier are plain `string` `@httpLabel`s in the model — no `@pattern`, no `@length` —
-/// so neither the letter an identifier opens with nor the width of its body is a property a
-/// route may refuse a value on. The identifiers this emulator MINTS are one form of that
-/// alphabet, never the only form CloudFront writes an identifier in, and WHICH identifier of
-/// it was ever issued is a property of the STORE: a value of this alphabet is therefore
-/// carried through to the store and reported as the resource that is ABSENT, while a value
-/// written outside it — in lower case, around a separator, as a UUID or as a word — was
-/// never an identifier at all and is the identifier a route reports it cannot READ
-/// ([`invalid_id_format`]).
-///
-/// How much of an identifier's form a route reads is each resource kind's own recorded
-/// contract (see the `path_identifiers` module): this is the half the field-level encryption
-/// records read.
+/// The ALPHABET alone, with no namespace letter and no width — so this says whether a value
+/// is WRITTEN as an identifier of this service's mint, not whether that identifier could have
+/// been issued. The members that carry one are plain `string` `@httpLabel`s in the model — no
+/// `@pattern`, no `@length` — so what each route does with the answer is that resource kind's
+/// own recorded contract (see the `path_identifiers` module): a route that refuses an
+/// identifier on its form refuses it only within this alphabet
+/// ([`id_format_refused_for`]), because a value of other characters makes no claim to be an
+/// identifier of this mint at all, while a route that refuses no form at all carries every
+/// value through to the store.
 pub fn is_entity_id_form(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_token_byte)
 }
@@ -1164,7 +1159,7 @@ pub const ENTITY_ID_PREFIX: char = 'E';
 ///
 /// A letter in this set says WHICH namespace the identifier that carries it was issued in; a
 /// letter outside it says nothing about the kind, because CloudFront's namespaces are not
-/// this emulator's mint ([`could_be_issued_for`]).
+/// this emulator's mint ([`id_format_refused_for`]).
 pub const ID_NAMESPACE_LETTERS: [char; 4] = [
     ENTITY_ID_PREFIX,
     PUBLIC_KEY_ID_PREFIX,
@@ -1179,7 +1174,7 @@ pub const ID_NAMESPACE_LETTERS: [char; 4] = [
 /// A value that identifies no namespace of this service says nothing about which kind it
 /// was issued for, so it is carried through to the STORE; one that identifies a namespace
 /// came from that namespace, and whether it could name the addressed kind is then decided by
-/// the namespace itself ([`could_be_issued_for`]) or, where several kinds share one letter,
+/// the namespace itself ([`id_format_refused_for`]) or, where several kinds share one letter,
 /// by the store.
 pub fn identifies_a_namespace(value: &str) -> bool {
     value
@@ -1188,41 +1183,50 @@ pub fn identifies_a_namespace(value: &str) -> bool {
         .is_some_and(|letter| ID_NAMESPACE_LETTERS.contains(&letter))
 }
 
-/// Whether `value` could be an identifier CloudFront issued for the resource kind whose
-/// identifiers this service mints under `prefix`, where `prefix` is that kind's OWN
-/// namespace letter — all a REQUEST alone decides about it.
+/// How many characters CloudFront writes an entity identifier in: the namespace letter the
+/// kind issues under over a body of [`ID_BODY_LEN`], the width every identifier this service
+/// mints that way carries (`allocate_field_level_encryption_config_id` and its siblings).
+pub const ISSUED_ENTITY_ID_LEN: usize = ID_BODY_LEN + 1;
+
+/// Whether a route addressed by an identifier of the kind this service mints under `prefix`
+/// refuses `value` on its FORM rather than resolving it against the store — all a REQUEST
+/// alone decides about such an identifier, and the whole of what separates the two sentences
+/// the one not-found code carries.
 ///
-/// Three questions of the value, in order:
+/// A form is refused only of a value that is WRITTEN as one of this service's identifiers:
+/// the characters CloudFront writes an identifier in ([`is_entity_id_form`] — decimal digits
+/// and uppercase ASCII letters, carrying no separator and no lower case). Such a value claims
+/// to be an identifier, so it has to be written the way identifiers are ISSUED to be one:
 ///
-/// * is it written in the characters CloudFront writes an identifier in at all
-///   ([`is_entity_id_form`])? A value in lower case, around a separator, as a UUID or as a
-///   word was never an identifier of any kind;
-/// * does it identify a NAMESPACE of this service ([`identifies_a_namespace`])? A value under
-///   any other letter identifies none — CloudFront's namespaces are not this emulator's mint
-///   — so nothing about it says it is not this kind's, and it is carried through to the STORE,
-///   which is what says whether a resource answers to it;
-/// * and if it does, is that namespace THIS kind's, written the way that namespace writes an
-///   identifier ([`is_prefixed_token`])? An identifier of another namespace was issued for
-///   the kind that namespace belongs to, and one of this namespace in no form CloudFront
-///   writes an identifier in was issued for nothing.
+/// * at the width they are issued at ([`ISSUED_ENTITY_ID_LEN`]) — a value of the alphabet at
+///   any other width is no identifier CloudFront ever issued;
+/// * and, where its leading letter identifies a namespace this service issues identifiers
+///   under ([`identifies_a_namespace`]), under THIS kind's namespace ([`is_prefixed_token`]):
+///   an identifier of another kind's namespace was issued for that kind and can therefore
+///   never name this one. A leading letter that identifies no namespace of this service says
+///   nothing about which kind issued it, so the STORE is what answers for it.
 ///
-/// So the two refusals keep the conditions they describe: a value this reports `false` for
-/// could never have been an identifier of the addressed kind and is the identifier a route
-/// reports it cannot READ ([`invalid_id_format`]), while one it reports `true` for that the
-/// store holds nothing under is the resource that is ABSENT.
+/// A value written OUTSIDE that alphabet — in lower case, around a separator, as a UUID or as
+/// a word — makes no claim to be an identifier of this mint at all, so there is no identifier
+/// in it whose form could be wrong: the recorded answers of this surface resolve it against
+/// the store and report the resource ABSENT.
+///
+/// So the two refusals keep the conditions they describe: a value this reports `true` for is
+/// the identifier a route reports it cannot READ ([`invalid_id_format`]), and every other
+/// value the store holds nothing under is the resource that is ABSENT.
 ///
 /// NOT for a kind of the family whose four members share ONE namespace letter
 /// ([`ENTITY_ID_PREFIX`]): the value cannot say which of them issued it, so those routes read
-/// the alphabet alone
+/// their own form
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
-pub fn could_be_issued_for(prefix: char, value: &str) -> bool {
+pub fn id_format_refused_for(prefix: char, value: &str) -> bool {
     if !is_entity_id_form(value) {
         return false;
     }
-    if !identifies_a_namespace(value) {
-        return true;
+    if identifies_a_namespace(value) {
+        return !is_prefixed_token(value, prefix);
     }
-    is_prefixed_token(value, prefix)
+    value.len() != ISSUED_ENTITY_ID_LEN
 }
 
 /// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every

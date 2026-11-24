@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ALPHABET a field-level encryption path identifier is written in is the OUTER bound of
-//! what any operation addressed by one accepts, end to end over HTTP.
+//! The ALPHABET a field-level encryption path identifier is written in is what decides whether
+//! its FORM is read at all, end to end over HTTP.
 //!
 //! The rule under test: an operation addressed by a field-level encryption identifier answers
 //! its one modelled not-found code (404) for every identifier it cannot resolve — the kind's
 //! own not-found error and `AccessDenied` are all these operations model
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`)
-//! — so the MESSAGE is what tells the two conditions apart, and a value carrying a character
-//! the identifier alphabet does not admit is the identifier reported UNREADABLE by every one of
-//! them, whatever else is true of it. Inside the alphabet, how much of the FORM each route
-//! reads is its own recorded contract, which
-//! `field_level_encryption_identifier_width_and_namespace.rs` states and
-//! [`unresolved_answer`] decides.
+//! — so the MESSAGE is what tells the two conditions apart. A value written in the identifier
+//! alphabet claims to be an identifier this service issued and is therefore judged on its form,
+//! which `field_level_encryption_identifier_width_and_namespace.rs` states and
+//! [`unresolved_answer`] decides; a value carrying a character that alphabet does not admit
+//! claims to be no identifier of this mint at all, so it is resolved against the store and
+//! reports the record ABSENT.
 //!
 //! The rows vary the dimensions the rule generalises over: the WIDTH (one character, the width
 //! this service issues, one short of it, one past it, and far beyond it), the LEADING LETTER
@@ -30,7 +30,7 @@
 use crate::distribution_lifecycle::emulator;
 use crate::field_level_encryption_config_lifecycle::get_config;
 use crate::field_level_encryption_identifier_width_and_namespace::{
-    address, assert_refusal, seed, unresolved_answer, Kind, Seeded, UNREADABLE_IDENTIFIER,
+    address, assert_refusal, seed, unresolved_answer, Kind, Seeded,
 };
 use crate::field_level_encryption_profile_lifecycle::get_profile;
 
@@ -155,12 +155,12 @@ fn outside_the_alphabet(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
     ]
 }
 
-/// RULE: a value written in the identifier alphabet is judged by the form its route reads — the
-/// namespace it was issued in, or the alphabet alone — so one the store holds no record for is
-/// either the record reported ABSENT or the identifier reported UNREADABLE, and never anything
-/// else, through every operation addressed by an identifier of either kind.
+/// RULE: a value written in the identifier alphabet is judged on the form the addressed kind's
+/// identifiers are ISSUED in — its namespace letter and its width — so one the store holds no
+/// record for is either the record reported ABSENT or the identifier reported UNREADABLE, and
+/// never anything else, through every operation addressed by an identifier of either kind.
 #[tokio::test]
-async fn a_value_of_the_identifier_alphabet_is_judged_by_the_form_its_route_reads() {
+async fn a_value_of_the_identifier_alphabet_is_judged_on_the_issued_form() {
     let router = emulator();
     let seeded = seed(&router).await;
 
@@ -173,7 +173,7 @@ async fn a_value_of_the_identifier_alphabet_is_judged_by_the_form_its_route_read
                     &answer,
                     &case,
                     kind.code(),
-                    unresolved_answer(operation, kind, &id, &minted),
+                    unresolved_answer(kind, &id, &minted),
                 );
             }
         }
@@ -199,11 +199,11 @@ async fn a_value_of_the_identifier_alphabet_is_judged_by_the_form_its_route_read
     }
 }
 
-/// RULE's boundary: a value carrying a character the alphabet does not admit was never an
-/// identifier this service issued, and is the identifier reported UNREADABLE by every
-/// operation addressed by one.
+/// RULE's boundary: a value carrying a character the alphabet does not admit claims to be no
+/// identifier this service issued, so no operation addressed by one refuses its form — each
+/// resolves it against the store and reports the record ABSENT.
 #[tokio::test]
-async fn a_value_carrying_a_character_outside_the_alphabet_is_reported_unreadable() {
+async fn a_value_carrying_a_character_outside_the_alphabet_is_carried_through_to_the_store() {
     let router = emulator();
     let seeded = seed(&router).await;
 
@@ -214,7 +214,7 @@ async fn a_value_carrying_a_character_outside_the_alphabet_is_reported_unreadabl
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    UNREADABLE_IDENTIFIER,
+                    kind.absent(),
                 );
             }
         }

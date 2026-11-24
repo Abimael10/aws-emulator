@@ -63,9 +63,10 @@ const CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE: &str =
     "The caller reference that you are using to create a field level encryption profile is \
      associated with another field level encryption profile in your account.";
 
-/// The sentence a read of this surface answers a value written outside the ALPHABET
-/// CloudFront writes an identifier in: the identifier the service reports it cannot read,
-/// naming the member that carried it.
+/// The sentence a read of this surface answers a value WRITTEN as an identifier of this
+/// service's mint — the alphabet CloudFront writes an identifier in — that is not of the form
+/// the addressed record's identifiers are ISSUED in: the identifier the service reports it
+/// cannot read, naming the member that carried it.
 pub(crate) const UNREADABLE_PROFILE_ID_MESSAGE: &str = "Id format is invalid";
 
 // ---------------------------------------------------------------------------
@@ -943,8 +944,9 @@ async fn a_comment_past_the_published_bound_is_refused() {
 
 /// An id no stored profile carries names no profile, whatever shape it has: both readers
 /// answer `NoSuchFieldLevelEncryptionProfile` (404), with the sentence the id's SHAPE earns —
-/// the unreadable identifier for a value outside the shape a profile id takes, the absent
-/// profile for a well-formed one — and a stored profile is still read at its own id.
+/// the unreadable identifier for a value written as an identifier of this service's mint that
+/// no profile id could be, the absent profile for every other id — and a stored profile is
+/// still read at its own id.
 #[tokio::test]
 async fn an_id_no_profile_holds_is_refused_by_both_readers() {
     let router = emulator();
@@ -966,16 +968,20 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
     // never minted, an id in another namespace and of a width no identifier of this kind is
-    // issued at, and a value of no CloudFront identifier form at all. These readers read the
-    // WHOLE form a profile id is minted in, so only a value of that form is the profile
-    // reported absent; every other value is the identifier reported unreadable.
+    // issued at, and a value of no CloudFront identifier form at all. A value WRITTEN as an
+    // identifier of this mint has to be of the whole form a profile id is issued in to be read
+    // as one, so another namespace is the identifier reported unreadable; a value that is no
+    // identifier of this mint claims no form to refuse and is the profile reported absent.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
-        ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
+        (
+            "not-a-profile-id",
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+        ),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),

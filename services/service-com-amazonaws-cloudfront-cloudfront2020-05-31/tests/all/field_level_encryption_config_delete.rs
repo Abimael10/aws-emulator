@@ -47,7 +47,8 @@ use crate::field_level_encryption_profile_lifecycle::store_profile;
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
-/// The sentence a value that is no identifier of the configuration's own namespace earns.
+/// The sentence a value written as an identifier of this service's mint that no configuration
+/// id could be earns.
 const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
 const CONFIG_IN_USE_MESSAGE: &str =
     "The field level encryption config is currently associated with a cache behavior. Please \
@@ -516,9 +517,10 @@ async fn a_configuration_a_cache_behaviour_names_cannot_be_deleted() {
 
 /// An id the store holds no field-level encryption configuration for is
 /// `NoSuchFieldLevelEncryptionConfig`, whatever shape the id takes — never a 204, which would
-/// claim something was removed — and the identifier's own NAMESPACE decides which of that
-/// code's two sentences says so: the absent configuration for an id of the configuration
-/// namespace, and the unreadable identifier for every other value.
+/// claim something was removed — and the identifier's own FORM decides which of that
+/// code's two sentences says so: the unreadable identifier for a value written as an identifier
+/// of this service's mint that no configuration id could be, and the absent configuration for
+/// every other value.
 #[tokio::test]
 async fn an_id_no_configuration_holds_is_refused() {
     let router = emulator();
@@ -533,7 +535,7 @@ async fn an_id_no_configuration_holds_is_refused() {
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let absent: [(&str, String, &str); 5] = [
+    let absent: [(&str, String, &str); 6] = [
         (
             "a configuration id never minted",
             "C0000000000000".to_string(),
@@ -547,16 +549,21 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_CONFIG_MESSAGE,
         ),
         (
             "a token that is no configuration id",
             "not-a-config-id".to_string(),
-            UNREADABLE_ID_MESSAGE,
+            NO_SUCH_CONFIG_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-config-the-only-one".to_string(),
+            NO_SUCH_CONFIG_MESSAGE,
+        ),
+        (
+            "an identifier of this mint's alphabet at no issued width",
+            "CBOGUSCONFIGID0000".to_string(),
             UNREADABLE_ID_MESSAGE,
         ),
     ];

@@ -10,13 +10,12 @@
 //! makes is that resource kind's own recorded contract:
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
-//!   the value, which is a property of the value alone. The two field-level encryption records'
-//!   `/config` routes, their deletes and the profile's own read the WHOLE form their ids are
-//!   minted in — the kind's namespace letter over an identifier body
+//!   the value, which is a property of the value alone. Every route addressed by a field-level
+//!   encryption record's `Id` reads the WHOLE form that record's ids are ISSUED in — the kind's
+//!   namespace letter over an identifier body of the issued width — of a value that is written
+//!   as an identifier of this mint at all, and reads no form of a value that is not
 //!   ([`super::unresolved_field_level_encryption_config`],
-//!   [`super::unresolved_field_level_encryption_profile`]) — while the configuration's resource
-//!   read reads the ALPHABET and nothing more
-//!   ([`super::unresolved_field_level_encryption_config_on_the_resource_read`]); the
+//!   [`super::unresolved_field_level_encryption_profile`]); the
 //!   distribution reads the whole form its ids are minted in
 //!   ([`super::is_distribution_id`]), and the origin access control reads NO form at all
 //!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]);
@@ -125,9 +124,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length`
     /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`), so what this
     /// route reads of the value is the ALPHABET an identifier is written in and nothing more
-    /// ([`is_entity_id_form`]) — the same half the field-level encryption configuration's
-    /// RESOURCE read reads
-    /// ([`super::unresolved_field_level_encryption_config_on_the_resource_read`]). A control's
+    /// ([`is_entity_id_form`]) — this route's own recorded contract, which the clusters of
+    /// `GetOriginAccessControl` own rather than the field-level encryption surface's
+    /// ([`super::unresolved_field_level_encryption_config`]). A control's
     /// identifier comes from the namespace its four kinds SHARE ([`ENTITY_ID_PREFIX`]), so
     /// neither the letter a value opens with nor the width of its body says which kind issued
     /// it, and WHICH identifier of that alphabet was ever issued is a property of the STORE: a

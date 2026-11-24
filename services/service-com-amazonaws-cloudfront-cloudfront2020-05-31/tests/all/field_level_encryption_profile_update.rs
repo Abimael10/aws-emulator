@@ -693,8 +693,9 @@ async fn an_update_whose_configuration_the_create_would_refuse_is_refused() {
 /// An id no stored profile holds is `NoSuchFieldLevelEncryptionProfile` (HTTP 404) whatever
 /// shape the id takes and whatever the `If-Match` header carries, and the refused update
 /// creates nothing under it. The MESSAGE follows the id's SHAPE, judged before the store is
-/// consulted: an id outside the shape a profile id takes is the identifier the service cannot
-/// read, a well-formed one the store holds nothing for is the absent profile.
+/// consulted: an id written as an identifier of this service's mint that no profile id could be
+/// is the identifier the service cannot read, and every other id the store holds nothing for is
+/// the absent profile.
 #[tokio::test]
 async fn an_id_no_profile_holds_is_refused() {
     let router = emulator();
@@ -715,7 +716,7 @@ async fn an_id_no_profile_holds_is_refused() {
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let candidates: [(&str, String, &str); 4] = [
+    let candidates: [(&str, String, &str); 5] = [
         (
             "an id never minted",
             "P2NEVERMINTED1".to_string(),
@@ -729,11 +730,16 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
         (
             "a token of no profile id's shape",
             "not-a-profile".to_string(),
+            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+        ),
+        (
+            "an identifier of this mint's alphabet at no issued width",
+            "PNEVERMINTEDATALL".to_string(),
             UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];

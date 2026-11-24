@@ -8,17 +8,16 @@
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart, and what decides it is how much of the identifier's FORM that
-//! route reads, which is the route's own recorded contract: the `/config` reads, the profile's
-//! reads, the updates and the deletes read which NAMESPACE the value was issued in, so a value
-//! written under a letter this service issues identifiers under that is not the addressed
-//! kind's own identifier form is the identifier the service reports it cannot READ ("Id format
-//! is invalid"), while `GetFieldLevelEncryption`, the configuration's resource read, reads the
-//! identifier ALPHABET alone (digits and uppercase letters, carrying no separator and no lower
-//! case). A value either route admits that the store holds nothing for is the ABSENT resource
-//! ("The specified field level encryption config/profile does not exist."), and a value outside
-//! the alphabet is unreadable on every route. Both sentences are fixed text: neither echoes the
-//! value submitted.
+//! the two conditions apart, and the identifier's FORM is what decides it. A value written in
+//! the identifier ALPHABET (digits and uppercase letters, carrying no separator and no lower
+//! case) claims to be an identifier this service issued, so it earns the unreadable-identifier
+//! sentence ("Id format is invalid") unless it is written the way the addressed kind's
+//! identifiers are ISSUED — the kind's own namespace letter, or a letter this service issues no
+//! identifier under, over a body of the issued width. Every other value the store holds nothing
+//! for is the ABSENT resource ("The specified field level encryption config/profile does not
+//! exist."), a value of the issued form as much as one written outside the alphabet, which
+//! claims to be no identifier of this mint at all. Both sentences are fixed text: neither
+//! echoes the value submitted.
 //!
 //! So the rows span what the rule generalises over:
 //!
@@ -29,17 +28,16 @@
 //! * the values of the kind's own minted form the store holds nothing for: one of the
 //!   kind's own namespace that was never minted and the minted id with its last character
 //!   changed — each the ABSENT resource on every route;
-//! * the values of the identifier alphabet written under a namespace letter this service
-//!   issues identifiers under that the addressed kind's own form rules out: bodies one
-//!   character short of and one character past the width the kind is issued at, the sibling
-//!   kind's own minted id, a public key id and the `E`-prefixed namespace the other CloudFront
-//!   entity ids are drawn from;
-//! * the values of the alphabet under a letter that identifies NO namespace of this service,
-//!   which say nothing about the kind that issued them and are therefore carried through to the
-//!   store: an unminted namespace letter at the issued width and over a far longer body;
+//! * the values of the identifier alphabet the addressed kind's issued form rules out: bodies
+//!   one character short of and one character past the width the kind is issued at, the sibling
+//!   kind's own minted id, a public key id, the `E`-prefixed namespace the other CloudFront
+//!   entity ids are drawn from, and an unminted namespace letter over a far longer body;
+//! * the values of the alphabet of the issued WIDTH under a letter that identifies NO namespace
+//!   of this service, which say nothing about the kind that issued them and are therefore
+//!   carried through to the store;
 //! * and the values written outside the alphabet: a minted id in lower case, a body outside the
-//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each the
-//!   identifier reported UNREADABLE on every route.
+//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each resolved
+//!   against the store on every route.
 //!
 //! Each kind's width and alphabet are read off an id this emulator really MINTED rather than
 //! written out here, so the table cannot drift from what the service issues.
@@ -67,8 +65,8 @@ use crate::field_level_encryption_profile_lifecycle::{
 const NO_SUCH_CONFIG: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE: &str = "The specified field level encryption profile does not exist.";
 
-/// The sentence these operations answer a value written outside the identifier alphabet,
-/// naming the member that carried it.
+/// The sentence these operations answer a value written as an identifier of this service's mint
+/// that the addressed kind's issued form rules out, naming the member that carried it.
 const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The caller references the two stored resources of each case are held under.
@@ -129,22 +127,6 @@ impl Op {
             Kind::Config => "NoSuchFieldLevelEncryptionConfig",
             Kind::Profile => "NoSuchFieldLevelEncryptionProfile",
         }
-    }
-
-    /// The sentence the operation answers a value written in the identifier alphabet that the
-    /// store holds no resource for.
-    fn absent(self) -> &'static str {
-        match self.kind() {
-            Kind::Config => NO_SUCH_CONFIG,
-            Kind::Profile => NO_SUCH_PROFILE,
-        }
-    }
-
-    /// Whether this operation reads which NAMESPACE the value was issued in before it resolves
-    /// it — its own recorded contract. The configuration's RESOURCE read is the one operation
-    /// of this surface that reads the alphabet alone.
-    fn reads_the_namespace(self) -> bool {
-        !matches!(self, Self::GetFieldLevelEncryption)
     }
 
     /// Send this operation at `id`, carrying the stored resource's current version token so
@@ -260,75 +242,55 @@ async fn seed(router: &MultiServiceRouter) -> Stored {
     }
 }
 
-/// One identifier a case submits where an identifier of the addressed kind belongs, and what
-/// its FORM says about it — which, together with how much of the form the route reads, decides
-/// the sentence it earns.
+/// One identifier a case submits where an identifier of the addressed kind belongs, and the
+/// sentence its FORM earns it from every operation of this surface.
 struct Shape {
     case: String,
     id: String,
-    in_the_identifier_alphabet: bool,
-    could_be_issued_for_the_kind: bool,
+    expected: &'static str,
 }
 
 impl Shape {
-    /// A value of the form the addressed kind's identifiers are MINTED in: every route of this
+    /// A value of the form the addressed kind's identifiers are ISSUED in: every route of this
     /// surface resolves it, so the store holding nothing for it is the absent resource.
-    fn own(case: impl Into<String>, id: impl Into<String>) -> Self {
+    fn own(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_identifier_alphabet: true,
-            could_be_issued_for_the_kind: true,
+            expected: absent,
         }
     }
 
-    /// A value written in the identifier alphabet under a namespace letter this service issues
-    /// identifiers under that the addressed kind's own form rules out — another width under the
-    /// kind's own letter, or another kind's namespace letter.
-    fn another_namespace(case: impl Into<String>, id: impl Into<String>) -> Self {
+    /// A value written in the identifier alphabet that the addressed kind's issued form rules
+    /// out — another width, or another kind's namespace letter: it claims to be an identifier
+    /// this service issued and could not be one of this kind, so every route reports it
+    /// unreadable.
+    fn misread(case: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_identifier_alphabet: true,
-            could_be_issued_for_the_kind: false,
+            expected: UNREADABLE_IDENTIFIER,
         }
     }
 
-    /// A value written in the identifier alphabet under a letter that identifies NO namespace of
-    /// this service: nothing about it says which kind issued it, so every route carries it
-    /// through to the store.
-    fn no_namespace(case: impl Into<String>, id: impl Into<String>) -> Self {
+    /// A value written in the identifier alphabet, at the issued width, under a letter that
+    /// identifies NO namespace of this service: nothing about it says which kind issued it, so
+    /// every route carries it through to the store.
+    fn no_namespace(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_identifier_alphabet: true,
-            could_be_issued_for_the_kind: true,
+            expected: absent,
         }
     }
 
-    /// A value written outside that alphabet, which no identifier CloudFront issues is: the
-    /// identifier the service reports it cannot read, on every route.
-    fn foreign(case: impl Into<String>, id: impl Into<String>) -> Self {
+    /// A value written OUTSIDE that alphabet, which claims to be no identifier of this mint at
+    /// all: there is no form in it to refuse, so every route resolves it against the store.
+    fn foreign(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_identifier_alphabet: false,
-            could_be_issued_for_the_kind: false,
-        }
-    }
-
-    /// The sentence this identifier earns from `op`: the absent resource where the form `op`
-    /// reads admits the value, and the unreadable identifier where it does not.
-    fn expected(&self, op: Op) -> &'static str {
-        let readable = if op.reads_the_namespace() {
-            self.could_be_issued_for_the_kind
-        } else {
-            self.in_the_identifier_alphabet
-        };
-        if readable {
-            op.absent()
-        } else {
-            UNREADABLE_IDENTIFIER
+            expected: absent,
         }
     }
 }
@@ -347,6 +309,10 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
         Kind::Config => CONFIG_REFERENCE,
         Kind::Profile => PROFILE_REFERENCE,
     };
+    let absent = match kind {
+        Kind::Config => NO_SUCH_CONFIG,
+        Kind::Profile => NO_SUCH_PROFILE,
+    };
 
     let mut changed: Vec<char> = minted.chars().collect();
     if let Some(last) = changed.last_mut() {
@@ -355,56 +321,68 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
     let changed: String = changed.into_iter().collect();
 
     vec![
-        // Values of the form this kind's identifiers are minted in, which the store holds
+        // Values of the form this kind's identifiers are issued in, which the store holds
         // nothing for.
         Shape::own(
             "an id of this kind that was never minted",
             format!("{prefix}{}", "0".repeat(body.len())),
+            absent,
         ),
-        Shape::own("the minted id with its last character changed", changed),
-        // Values of the identifier alphabet written under a namespace letter this service
-        // issues identifiers under that this kind's own form rules out.
-        Shape::another_namespace(
+        Shape::own(
+            "the minted id with its last character changed",
+            changed,
+            absent,
+        ),
+        // Values of the identifier alphabet this kind's issued form rules out.
+        Shape::misread(
             "this kind's prefix with a body one character short",
             format!("{prefix}{}", &body[..body.len() - 1]),
         ),
-        Shape::another_namespace(
+        Shape::misread(
             "this kind's prefix with a body one character too long",
             format!("{prefix}{body}A"),
         ),
-        Shape::another_namespace(
+        Shape::misread(
             "the sibling field-level encryption kind's own minted id",
             sibling,
         ),
-        Shape::another_namespace("a public key id this service minted", public_key),
-        Shape::another_namespace(
+        Shape::misread("a public key id this service minted", public_key),
+        Shape::misread(
             "the namespace every other CloudFront entity id is drawn from",
             format!("E{body}"),
         ),
-        // And the values of the alphabet under a letter that identifies no namespace of this
-        // service, which say nothing about the kind that issued them.
-        Shape::no_namespace(
-            "a namespace letter no kind of this service mints",
-            format!("W{body}"),
-        ),
-        Shape::no_namespace(
+        Shape::misread(
             "a namespace letter no kind of this service mints and a far longer body",
             format!("W{body}{body}"),
         ),
+        // And the value of the alphabet at the issued width under a letter that identifies no
+        // namespace of this service, which says nothing about the kind that issued it.
+        Shape::no_namespace(
+            "a namespace letter no kind of this service mints",
+            format!("W{body}"),
+            absent,
+        ),
         // And every value written outside that alphabet.
-        Shape::foreign("the minted id in lower case", minted.to_lowercase()),
+        Shape::foreign(
+            "the minted id in lower case",
+            minted.to_lowercase(),
+            absent,
+        ),
         Shape::foreign(
             "this kind's prefix with a body outside the id alphabet",
             format!("{prefix}{}", body.to_lowercase()),
+            absent,
         ),
         Shape::foreign(
             "a UUID, the namespace the policy kinds are keyed by",
             "00000000-0000-0000-0000-000000000000",
+            absent,
         ),
-        Shape::foreign("a bare word", "not-an-identifier"),
+        Shape::foreign("a bare word", "not-an-identifier", absent),
         Shape::foreign(
             "the resource's caller reference rather than its id",
             reference,
+            absent,
         ),
     ]
 }
@@ -434,10 +412,10 @@ fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &str) {
 // ---------------------------------------------------------------------------
 
 /// Every operation addressed by a field-level encryption identifier answers its one not-found
-/// code for an identifier it cannot resolve, and the identifier's FORM — judged by as much of
-/// it as the route reads — decides which of that code's two sentences: the absent-resource
-/// sentence where the form admits the value, and the unreadable-identifier sentence where it
-/// does not.
+/// code for an identifier it cannot resolve, and the identifier's FORM decides which of that
+/// code's two sentences: the unreadable-identifier sentence for a value written as an
+/// identifier of this service's mint that the addressed kind's issued form rules out, and the
+/// absent-resource sentence for every other value.
 #[tokio::test]
 async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_decides() {
     let router = emulator();
@@ -451,7 +429,7 @@ async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_
                 &answer,
                 &format!("{op:?} with {}", shape.case),
                 op.code(),
-                shape.expected(*op),
+                shape.expected,
             );
         }
     }

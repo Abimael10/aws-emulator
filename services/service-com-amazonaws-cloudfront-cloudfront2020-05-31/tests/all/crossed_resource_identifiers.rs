@@ -25,10 +25,11 @@
 //!   nor the width of its body says which of them issued it: those routes read the identifier
 //!   ALPHABET (digits and uppercase letters, no separator and no lower case) and nothing more;
 //! * a field-level encryption configuration's and a profile's identifiers come from namespaces
-//!   of their OWN (`C` and `P`), so a value under a namespace letter this service issues
-//!   identifiers under says which namespace it came from: those routes read it, and refuse a
-//!   value of another namespace — or of their own namespace in a form CloudFront writes no
-//!   identifier in — as unreadable.
+//!   of their OWN (`C` and `P`), so a value WRITTEN as an identifier of this service's mint — in
+//!   that same alphabet — says which namespace it came from and how wide it is: those routes
+//!   read the whole issued form, and refuse a value of another namespace, or of any namespace at
+//!   another width, as unreadable. A value outside the alphabet is no identifier of the mint at
+//!   all and claims no form for them to refuse, so they resolve it against the store.
 //!
 //! The rows are the CROSSOVER: four resource kinds are created through their own APIs, and
 //! each one's really-minted identifier is then submitted to every other kind's route, beside
@@ -92,11 +93,11 @@ impl Route {
         }
     }
 
-    /// Does this route read which NAMESPACE the value was issued in? The field-level encryption
-    /// kinds' identifiers come from namespaces of their own, so their routes do; an origin
-    /// access control's comes from a namespace four kinds share, so those read the alphabet
-    /// alone.
-    fn reads_the_namespace(self) -> bool {
+    /// Does this route read the whole form the addressed kind's identifiers are ISSUED in? The
+    /// field-level encryption kinds' identifiers come from namespaces of their own, so their
+    /// routes do — of a value written as an identifier of this mint at all; an origin access
+    /// control's comes from a namespace four kinds share, so those read the alphabet alone.
+    fn reads_the_issued_form(self) -> bool {
         !matches!(
             self,
             Self::OriginAccessControl | Self::OriginAccessControlConfig
@@ -143,20 +144,28 @@ impl Route {
 
     /// The sentence this route owes `id` when nothing of its kind answers to it.
     fn expected(self, id: &str) -> &'static str {
-        if !in_the_identifier_alphabet(id) {
-            return UNREADABLE_IDENTIFIER;
+        if !self.reads_the_issued_form() {
+            // The alphabet alone: a value of it is carried through to the store, and a value
+            // outside it is the identifier this route reports it cannot read.
+            return if in_the_identifier_alphabet(id) {
+                self.absent()
+            } else {
+                UNREADABLE_IDENTIFIER
+            };
         }
-        if !self.reads_the_namespace() {
+        if !in_the_identifier_alphabet(id) {
+            // No identifier of this service's mint at all, so there is no form to refuse.
             return self.absent();
         }
         let letter = id.chars().next();
-        let own = self.namespace();
-        if letter.is_some_and(|letter| ISSUED_NAMESPACES.contains(&letter)) {
-            // A value of a namespace this service issues identifiers under can only be this
-            // kind's as an identifier of its OWN namespace, at the width one is written at.
-            if letter != own || id.len() != MINTED_ID_WIDTH {
-                return UNREADABLE_IDENTIFIER;
-            }
+        // A value written as an identifier of this mint could be this kind's only as an
+        // identifier of its OWN namespace, or of no namespace this service issues one under, at
+        // the width one is written at.
+        let another_namespace = letter.is_some_and(|letter| {
+            ISSUED_NAMESPACES.contains(&letter) && Some(letter) != self.namespace()
+        });
+        if another_namespace || id.len() != MINTED_ID_WIDTH {
+            return UNREADABLE_IDENTIFIER;
         }
         self.absent()
     }
