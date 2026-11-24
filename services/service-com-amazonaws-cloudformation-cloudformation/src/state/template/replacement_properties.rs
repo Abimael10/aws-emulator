@@ -198,6 +198,51 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         HEALTHLAKE_DATA_TRANSFORMATION_PROFILE => {
             &["KmsKeyId", "ProfileName", "Source", "SourceFormat"]
         }
+        // An Amazon SageMaker AI MODEL keeps everything `CreateModel` made it with: that
+        // service publishes no call that changes a model — its operations on one are
+        // `DescribeModel`, `DeleteModel` and the tagging calls alone
+        // (`smithy_query(query="list_operations")` on SageMaker's model lists no `UpdateModel`)
+        // — so a declaration restating any of its properties asks for a DIFFERENT model, which
+        // CloudFormation replaces: it creates the model the new declaration asks for, publishes
+        // that name through `Ref` and the stack's outputs, and deletes the one it superseded.
+        // Re-pointing a model at a newly trained artifact (`PrimaryContainer.ModelDataUrl`) is
+        // that update. (Its `ModelName` is in this position through [`name_is_create_only`],
+        // and its `Tags` are deliberately absent: SageMaker changes a resource's tags in place
+        // through its own `AddTags`/`DeleteTags`.)
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_MODEL => &[
+            "Containers",
+            "EnableNetworkIsolation",
+            "ExecutionRoleArn",
+            "InferenceExecutionConfig",
+            "PrimaryContainer",
+            "VpcConfig",
+        ],
+        // An ENDPOINT CONFIGURATION is in exactly that position: `CreateEndpointConfig`
+        // registers the variants and the settings an endpoint is then deployed from, and
+        // SageMaker publishes no call that edits a configuration that exists (the same listing
+        // shows no `UpdateEndpointConfig`) — an endpoint is moved to ANOTHER configuration
+        // instead. So a declaration restating any of these asks for a different configuration,
+        // which CloudFormation replaces, under the same two exceptions as the model's.
+        //
+        // The model registry's GROUP (`AWS::SageMaker::ModelPackageGroup`) is the one SageMaker
+        // type these arms create that this rule covers and this catalogue deliberately leaves
+        // out: that service publishes no call that changes a group either, but the pass that
+        // gives a replacement a physical name of its own
+        // ([`crate::state::replacing_update::rename_replacements`]) does not rename this type,
+        // so the deployment would have nothing to create the replacement under and the update
+        // would report a different refusal rather than being carried out. A row here without
+        // that half would change which refusal a client reads and nothing else.
+        crate::state::provisioner::sagemaker_resources::SAGEMAKER_ENDPOINT_CONFIG => &[
+            "AsyncInferenceConfig",
+            "DataCaptureConfig",
+            "EnableNetworkIsolation",
+            "ExecutionRoleArn",
+            "ExplainerConfig",
+            "KmsKeyId",
+            "ProductionVariants",
+            "ShadowProductionVariants",
+            "VpcConfig",
+        ],
         // A VPC Lattice service network keeps the SHARING setting it was created with:
         // `UpdateServiceNetwork` takes the network's `authType` and nothing else, so a
         // declaration restating the sharing configuration asks for a different network. (Its

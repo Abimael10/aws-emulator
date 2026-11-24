@@ -4,9 +4,13 @@
 //! IMPLEMENTED: stores the notebook instance in `crate::state` as `Pending`, with every
 //! member the request left out at the default the model documents for it, and mints its
 //! ARN, its Jupyter URL and its network-interface id. The hooks of the
-//! `LifecycleConfigName` it names are RUN while the instance is still coming up and what
-//! each wrote is published to that hook's CloudWatch Logs stream (see
-//! [`crate::state::notebook_lifecycle_hook`] and [`crate::state::notebook_hook_logs`]).
+//! `LifecycleConfigName` it names are RUN while the instance is still coming up — in the
+//! workspace's bounded, session-local shell session, which starts no process and reaches no
+//! path, socket or name of the host, and whose only reach beyond itself is this emulator's
+//! own Amazon S3 over the in-process callback, as the instance's `RoleArn`
+//! ([`crate::state::notebook_hook_cli`]) — and what each wrote is published to that hook's
+//! CloudWatch Logs stream (see [`crate::state::notebook_lifecycle_hook`] and
+//! [`crate::state::notebook_hook_logs`]).
 //! This is the ONLY file to touch for this operation.
 //!
 //! The instance RUNS AS the `RoleArn` the request names: a role this account's IAM HOLDS and
@@ -409,6 +413,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // published to that hook's own log stream. This happens while the instance is still
         // `Pending`, so a client that waits for `InService` reads the output of a hook that
         // has already run (see `crate::state::notebook_lifecycle_hook`).
+        //
+        // NOTHING OF THE HOST RUNS HERE. The script is performed by the workspace's ONE
+        // bounded, session-local shell session (`::service_common::posix_shell_session`,
+        // which states why that session and not a shell): it starts no process, resolves no
+        // name, opens no socket and reaches no path of the host — it performs a fixed catalog
+        // of utilities over its own in-memory tree, and every command and every command form
+        // outside that catalog fails closed as one the session could not run. The one thing
+        // its commands reach beyond the session is THIS emulator's own Amazon S3, over the
+        // framework's in-process callback, authorized as the role the request names and inside
+        // the budgets that module states (`crate::state::notebook_hook_cli`). So the effects a
+        // bootstrap script's `aws s3` commands ask for are in this emulator's object store
+        // before the instance is reported `InService`, and the machine the emulator runs on is
+        // touched by none of it.
         if let Some(config) = lifecycle_config.filter(|_| provisioning_completes) {
             for hook in [
                 crate::state::LifecycleHook::OnCreate,
@@ -417,10 +434,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(script) = crate::state::hook_script(&config, hook) else {
                     continue;
                 };
+                // One CLI per hook, so each hook's calls have their own budget.
+                let cli = crate::state::notebook_hook_cli(ctx, &region, &input.role_arn);
                 let publication = crate::state::HookLogPublication {
                     notebook_instance_name: input.notebook_instance_name.clone(),
                     hook,
-                    lines: crate::state::hook_output(&script),
+                    lines: crate::state::hook_output_performed(&script, cli).await,
                 };
                 crate::state::publish_hook_output(ctx, &region, &publication).await;
             }

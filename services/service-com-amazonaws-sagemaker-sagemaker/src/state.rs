@@ -175,9 +175,10 @@ pub use admission::{
 pub mod s3_access;
 pub use s3_access::{
     arn_partition, first_unreadable_location, first_unreadable_location_as_role,
-    object_name_under, object_read_is_unauthorized, object_write_is_unauthorized, ordinary_name,
-    s3_client, s3_client_through, S3Location, UnreadableLocation, DEFAULT_PARTITION,
-    GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
+    object_action_is_unauthorized_through, object_name_under, object_read_is_unauthorized,
+    object_write_is_unauthorized, ordinary_name, s3_client, s3_client_through, S3Location,
+    UnreadableLocation, DEFAULT_PARTITION, DELETE_OBJECT_ACTION, GET_OBJECT_ACTION,
+    LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
 };
 
 /// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and
@@ -1305,6 +1306,11 @@ pub use notebook_instance::*;
 /// `state/notebook_lifecycle_hook.rs`.
 pub mod notebook_lifecycle_hook;
 pub use notebook_lifecycle_hook::*;
+
+/// The AWS CLI a hook's script reaches Amazon S3 through, as the instance's execution role:
+/// see `state/notebook_hook_cli.rs`.
+pub mod notebook_hook_cli;
+pub use notebook_hook_cli::*;
 
 /// Where a hook's output is published: see `state/notebook_hook_logs.rs`.
 pub mod notebook_hook_logs;

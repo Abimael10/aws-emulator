@@ -23,17 +23,26 @@
 //!
 //! `::service_common::posix_shell_session`, the workspace's ONE bounded, session-local
 //! POSIX/bash session: the grammar is `brush-parser`'s, the catalog of utilities it performs
-//! is session-local (output, status, variables), every other command and every form it does
-//! not perform fails closed, and all of its bounds are stated there — the same session
-//! CodeBuild's build environment performs a buildspec's command lines with. This module adds
-//! only what is SageMaker's about a hook: the environment the hook's own doc documents, the
+//! is session-local (output, status, variables, and the files of the tree it works over),
+//! every other command and every form it does not perform fails closed, and all of its bounds
+//! are stated there — the same session CodeBuild's build environment performs a buildspec's
+//! command lines with. This module adds only what is SageMaker's about a hook: the
+//! environment the hook's own doc documents, the ML storage volume the script writes, the
 //! ceilings on the output a hook may publish, how a script is decoded, and the group and
 //! stream it is published under.
+//!
+//! Beside that catalog the session is given the PROGRAMS the instance's environment provides
+//! — the AWS CLI a bootstrap script reaches Amazon S3 through
+//! ([`super::notebook_hook_cli`]) — so what such a command asks for is really performed, as
+//! the instance's execution role. A hook performed with none of those programs is one whose
+//! `aws` commands could not run, which is what [`hook_output`] answers for: that form is the
+//! script's own computation over its own text and reaches nothing.
 //!
 //! The one thing the session cannot report is a FAILED hook. "Lifecycle configuration
 //! scripts cannot run for longer than 5 minutes. If a script runs for longer than 5 minutes,
 //! it fails and the notebook instance is not created or started" is the only failure the
-//! model documents, and this session has no wait, no sleep and no loop — its command budget
+//! model documents, and nothing here spends that clock: the session performs every command in
+//! process, spends none of the host's clock on a wait a script STATES, and its command budget
 //! bounds a run far under that ceiling — so there is no run for it to cut short. A command
 //! the session does not provide is not a failed script either: this emulator has no host for
 //! that command to have had an effect on, so what it reports is the output of what it could
@@ -117,17 +126,30 @@ fn hook_session_config() -> ::service_common::posix_shell_session::SessionConfig
     }
 }
 
-/// Perform `script` and answer the lines it wrote, in the order it wrote them.
+/// Perform `script` and answer the lines it wrote, in the order it wrote them — with none of
+/// the PROGRAMS an instance's environment provides, so every command needing one is a command
+/// that did not run ([`hook_output_with`] is the form that provides them).
+#[must_use]
+pub fn hook_output(script: &str) -> Vec<String> {
+    hook_output_with(script, None)
+}
+
+/// Perform `script` and answer the lines it wrote, in the order it wrote them, with
+/// `programs` as the programs the instance's environment provides beside the session's own
+/// catalog.
 ///
 /// The script is read LINE BY LINE, which is how a shell reads a script file, and each line
 /// is performed by the shared session, which starts with the `$PATH` the hook's doc
 /// documents. A line the session performs nothing for contributes no output. The whole script
 /// is left unread past [`MAX_SCRIPT_BYTES`], and reading stops at the first `exit`.
 ///
-/// Pure computation over the script's own text: it starts nothing, opens nothing and reads
-/// nothing off the host.
+/// What a line of the script DOES is the session's and the environment's programs': this
+/// function starts nothing, opens nothing and reads nothing off the host.
 #[must_use]
-pub fn hook_output(script: &str) -> Vec<String> {
+pub fn hook_output_with(
+    script: &str,
+    programs: Option<Box<dyn ::service_common::posix_shell_session::EnvironmentPrograms>>,
+) -> Vec<String> {
     if script.len() > MAX_SCRIPT_BYTES {
         return Vec::new();
     }
@@ -136,7 +158,17 @@ pub fn hook_output(script: &str) -> Vec<String> {
     let mut session = ::service_common::posix_shell_session::ShellSession::new(
         environment,
         hook_session_config(),
-    );
+    )
+    // The instance HAS storage of its own — the ML storage volume "attached to the notebook
+    // instance" (`CreateNotebookInstance`'s own doc) — which is what a bootstrap script
+    // writes to and reads back, so the session performs the file utilities over its own tree:
+    // the file a line writes is there for the lines after it, and a command that formats one
+    // ([`::service_common::posix_shell_session::VOLUME_COMMANDS`]) is one this environment
+    // has. The tree is session-local memory; no host file is opened, created or removed.
+    .with_file_utilities();
+    if let Some(programs) = programs {
+        session = session.with_environment_programs(programs);
+    }
     for line in script.lines() {
         let line = line.trim();
         // A blank line and a comment are not commands, and a shebang is the interpreter the
@@ -176,14 +208,16 @@ mod tests {
         hook_output, LifecycleHook, MAX_HOOK_LOG_LINES, MAX_HOOK_LOG_LINE_BYTES, MAX_SCRIPT_BYTES,
     };
 
-    /// RULE: what a hook publishes is what its `echo` commands wrote — a command needing a
-    /// host program, a redirection or a compound form writes nothing, and a command
-    /// substitution writes whatever the command it substitutes wrote.
+    /// RULE: what a hook publishes is what the commands of its script WROTE — the session's
+    /// own utilities, the ones its working tree provides, and the grammar's control flow
+    /// around them; a command needing a host program writes nothing, a redirection writes into
+    /// the tree rather than onto the output, and a command substitution writes whatever the
+    /// command it substitutes wrote.
     #[test]
     fn only_the_catalog_writes_output() {
         // One script per shape a lifecycle script can carry, and the lines performing it
         // writes.
-        let rows: [(&str, &str, Vec<&str>); 9] = [
+        let rows: [(&str, &str, Vec<&str>); 10] = [
             ("one echo", "echo one", vec!["one"]),
             (
                 "several echoes keep their order",
@@ -196,9 +230,17 @@ mod tests {
                 vec!["after"],
             ),
             (
-                "a redirection is not performed",
+                // The redirection is performed INTO the session's own tree, which is the
+                // storage a bootstrap script writes: the line is in the file rather than in
+                // the output, and `cat` reads it back out.
+                "a redirection writes into the tree rather than onto the output",
                 "echo redirected > /tmp/out\necho plain",
                 vec!["plain"],
+            ),
+            (
+                "a file one line wrote is there for the next",
+                "printf '%s' staged > /tmp/staged\ncat /tmp/staged",
+                vec!["staged"],
             ),
             (
                 // The substitution is performed in the session; `whoami` is a command it
@@ -209,9 +251,11 @@ mod tests {
                 vec!["", "plain"],
             ),
             (
-                "a compound command is not performed",
+                // The instance has storage of its own, so the session performs the grammar's
+                // control flow over the commands inside it.
+                "a compound command is performed",
                 "if true; then echo inside; fi\necho plain",
-                vec!["plain"],
+                vec!["inside", "plain"],
             ),
             (
                 "a variable this session set expands",

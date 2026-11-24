@@ -49,6 +49,10 @@ pub const PUT_OBJECT_ACTION: &str = "s3:PutObject";
 /// on the BUCKET rather than on an object, which is what a refusal names.
 pub const LIST_BUCKET_ACTION: &str = "s3:ListBucket";
 
+/// The IAM action deleting one object is authorized under: "you must have the
+/// `s3:DeleteObject` permission" (`DeleteObject`'s own documentation).
+pub const DELETE_OBJECT_ACTION: &str = "s3:DeleteObject";
+
 /// The partition an Amazon S3 ARN carries when the execution role's own ARN names none this
 /// emulator can read.
 pub const DEFAULT_PARTITION: &str = "aws";
@@ -293,14 +297,56 @@ pub async fn object_read_is_unauthorized(
     partition: &str,
     location: &S3Location,
 ) -> bool {
-    if bucket_policy_denies_read(client, location, role_arn, partition).await {
-        return true;
-    }
-    ::service_common::iam_role::role_withholds_action(
-        ctx,
+    object_action_is_unauthorized_through(
+        ctx.callback(),
+        client,
         region,
         role_arn,
+        partition,
         GET_OBJECT_ACTION,
+        location,
+    )
+    .await
+}
+
+/// Whether the action `action` on the object `location` names, made AS `role_arn`, is one
+/// neither the bucket's own policy nor the role's identity-based policies allow.
+///
+/// The question [`object_read_is_unauthorized`] and [`object_write_is_unauthorized`] are each
+/// this one narrowed to the action their call is authorized under, asked from the emulator
+/// CALLBACK itself rather than from a request's own context — which is what work a create
+/// armed asks through, since it holds a clone of the callback and no `OperationContext` (the
+/// same split [`::service_common::iam_role::role_withholds_action_through`] makes). Both
+/// halves of the decision are the ones stated in this module's docs, in the form IAM's own
+/// rule gives them for a call inside ONE account ([`ReadAuthorization::PolicyMayNotDeny`]):
+/// the bucket's policy refuses what it EXPLICITLY DENIES, and otherwise the grant the role
+/// itself carries decides. Only what was ANSWERED withholds anything.
+pub async fn object_action_is_unauthorized_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    client: &::aws_sdk_s3::Client,
+    region: &str,
+    role_arn: &str,
+    partition: &str,
+    action: &str,
+    location: &S3Location,
+) -> bool {
+    if bucket_policy_refuses_action(
+        client,
+        location,
+        role_arn,
+        partition,
+        action,
+        ReadAuthorization::PolicyMayNotDeny,
+    )
+    .await
+    {
+        return true;
+    }
+    ::service_common::iam_role::role_withholds_action_through(
+        callback,
+        region,
+        role_arn,
+        action,
         &location.object_arn(partition),
     )
     .await
@@ -324,15 +370,14 @@ pub async fn object_write_is_unauthorized(
     partition: &str,
     location: &S3Location,
 ) -> bool {
-    if bucket_policy_denies_write(client, location, role_arn, partition).await {
-        return true;
-    }
-    ::service_common::iam_role::role_withholds_action(
-        ctx,
+    object_action_is_unauthorized_through(
+        ctx.callback(),
+        client,
         region,
         role_arn,
+        partition,
         PUT_OBJECT_ACTION,
-        &location.object_arn(partition),
+        location,
     )
     .await
 }
