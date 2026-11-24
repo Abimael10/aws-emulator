@@ -5,11 +5,12 @@
 //! RULES under test, one per test below:
 //!
 //! 1. A `LaunchConfigurationName` is resolved against the launch configurations the account
-//!    HOLDS, and a name none answers to is refused with ONE sentence, whichever operation
-//!    resolved it: HTTP 400 / `ValidationError` carrying the fixed
-//!    `Launch configuration name not found - ` text and, behind it, the statement that no
-//!    configuration of that name exists. The name the request submitted is the sentence's
-//!    only variable part.
+//!    HOLDS, and a name none answers to is refused HTTP 400 / `ValidationError` carrying the
+//!    fixed `Launch configuration name not found - ` text; the DETAIL behind that prefix is
+//!    the one the operation that resolved the name words — the operation whose own subject
+//!    is the configuration NAMES the resource it could not find, while an operation that
+//!    only launches a group from one states that no configuration of that name exists. The
+//!    name the request submitted is each sentence's only variable part.
 //! 2. `CheckpointPercentages` states thresholds "in ascending order. Each number must be
 //!    unique" (`smithy_query(query="doc",shape="RefreshPreferences",
 //!    member="CheckpointPercentages")`), and a list that is not strictly ascending is refused
@@ -46,10 +47,18 @@ const TEMPLATE: &str = "lt-1";
 /// on it replaces nothing and the suite's subject stays the refusal wording.
 const GROUP: &str = "asg-refusal-wording";
 
-/// The whole sentence a request naming a launch configuration the account holds none under is
-/// refused with, whose one variable part is the name the request submitted.
+/// The whole sentence an operation that REFERENCES a launch configuration — one that
+/// launches a group from it — is refused with when the account holds none under the name,
+/// whose one variable part is the name the request submitted.
 fn absent_launch_configuration_message(name: &str) -> String {
     format!("Launch configuration name not found - A launch configuration with the name: {name} does not exist")
+}
+
+/// The whole sentence the operation whose own SUBJECT is the launch configuration is refused
+/// with when the account holds none under the name: the same fixed prefix over a detail that
+/// names the resource, whose one variable part is the name the request submitted.
+fn launch_configuration_not_found_message(name: &str) -> String {
+    format!("Launch configuration name not found - Launch configuration {name} not found")
 }
 
 /// The whole sentence a `CheckpointPercentages` list that is not strictly ascending is
@@ -118,6 +127,16 @@ impl Resolver {
         }
     }
 
+    /// The whole sentence this operation refuses `configuration` with: the delete acts ON
+    /// the configuration, so it names the resource; the two group operations only launch
+    /// from one, so they state that no configuration of that name exists.
+    fn message(&self, configuration: &str) -> String {
+        match self {
+            Self::Delete => launch_configuration_not_found_message(configuration),
+            Self::Create | Self::Update => absent_launch_configuration_message(configuration),
+        }
+    }
+
     /// The request that names `configuration` to this operation.
     fn params(&self, configuration: &str) -> Vec<(String, String)> {
         match self {
@@ -139,9 +158,10 @@ impl Resolver {
 }
 
 /// RULE 1: every operation that resolves a `LaunchConfigurationName` refuses a name the
-/// account holds no configuration under with the same sentence, naming that name.
+/// account holds no configuration under under the same fixed prefix, with the detail that
+/// operation words, naming that name.
 #[tokio::test]
-async fn an_absent_launch_configuration_is_refused_with_one_sentence_everywhere() {
+async fn an_absent_launch_configuration_is_refused_with_its_operation_s_sentence() {
     let router = seeded().await;
 
     // `LaunchConfigurationName` is `XmlStringMaxLen255`, so the names span that length range
@@ -167,7 +187,7 @@ async fn an_absent_launch_configuration_is_refused_with_one_sentence_everywhere(
                 status,
                 &body,
                 "ValidationError",
-                &absent_launch_configuration_message(name),
+                &resolver.message(name),
             );
         }
     }

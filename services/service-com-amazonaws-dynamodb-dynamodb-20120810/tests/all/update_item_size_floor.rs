@@ -51,7 +51,8 @@ enum Surface {
     /// The single-item update.
     UpdateItem,
     /// The `Update` action of a transaction, held to the same ceiling as the single-item
-    /// update and refusing the call in the same sentence when a change crosses it.
+    /// update and cancelling the transaction with that action's reason, in that same
+    /// sentence, when a change crosses it.
     TransactWriteItems,
     /// A PartiQL `UPDATE` run on its own.
     ExecuteStatement,
@@ -349,11 +350,12 @@ fn assert_served(
     }
 }
 
-/// Assert the change one byte past the boundary was REFUSED with the update path's sentence:
-/// as the CALL's own failure on the single-item, standalone PartiQL and TRANSACTIONAL
-/// surfaces — the ceiling is the ITEM's, so an item that cannot be stored is refused in the
-/// same class and sentence however the change arrived, and a transaction carrying such a
-/// change is not cancelled — and as the slot's own error in a batch, which answers 200.
+/// Assert the change one byte past the boundary did not go through, each surface stating it as
+/// that surface does: as the CALL's own refusal with the update path's sentence on the
+/// single-item and standalone PartiQL surfaces, as the crossing ACTION's cancellation reason —
+/// carrying that same sentence — on the TRANSACTIONAL surfaces, where an item the
+/// transaction's own change grows past the ceiling is one of the circumstances a cancellation
+/// documents, and as the slot's own error in a batch, which answers 200.
 fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     let (status, body) = answered;
     if surface == Surface::BatchExecuteStatement {
@@ -372,14 +374,22 @@ fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     if surface == Surface::TransactWriteItems || surface == Surface::ExecuteTransaction {
         assert_eq!(
             (*status, error_code(body).as_str(), message(body).as_str()),
-            (400, "ValidationException", UPDATE_TOO_BIG),
-            "case {case:?}: expected the call refused with the update-path ceiling sentence, \
-             got {status} with {body}"
+            (
+                400,
+                "TransactionCanceledException",
+                "Transaction cancelled, please refer cancellation reasons for specific reasons \
+                 [ValidationError]"
+            ),
+            "case {case:?}: expected the transaction cancelled over that action, got {status} \
+             with {body}"
         );
-        assert!(
-            body.get("CancellationReasons").is_none(),
-            "case {case:?}: a refused call cancels nothing, so it reports no reason list, \
-             got {body}"
+        assert_eq!(
+            (
+                body["CancellationReasons"][0]["Code"].as_str(),
+                body["CancellationReasons"][0]["Message"].as_str(),
+            ),
+            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+            "case {case:?}: expected that action's reason to word the ceiling, got {body}"
         );
         return;
     }

@@ -17,10 +17,11 @@
 //!    would GROW the stored item past it is told the item to update is. The rows span the
 //!    surfaces that carry an item (`PutItem`, `BatchWriteItem`, a transaction's `Put`, a
 //!    PartiQL `INSERT`) and the surfaces that state a CHANGE (`UpdateItem` through `SET`,
-//!    `ADD` and `list_append`, a transaction's `Update`, a PartiQL `UPDATE`) — the
-//!    PartiQL `UPDATE`) — the transactional one refusing the CALL in that same class and
-//!    sentence, because the ceiling is the ITEM's and does not move with the surface the
-//!    change arrived through.
+//!    `ADD` and `list_append`, a transaction's `Update`, a PartiQL `UPDATE`) — and WHERE
+//!    the crossing is found decides whose failure it is: a VALUE the request carries that
+//!    no item could hold is the request's own defect on every surface, while an item that
+//!    crosses the ceiling only once the change is applied to what the table holds is, in a
+//!    transaction, the crossing ACTION's own reason.
 //! 3. A transaction is applied as one unit, so the documented 4 MB aggregate is a ceiling
 //!    on the whole CALL: a transaction whose actions add up past it is refused as the
 //!    malformed request it is, with nothing of it applied, while one whose actions add up
@@ -380,8 +381,8 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         ),
         (
             // A value the request CARRIED that no item could hold is the request's own
-            // defect, so even inside a transaction it refuses the call rather than
-            // cancelling it.
+            // defect — it is found reading the request, before any table is looked up — so
+            // inside a transaction too it refuses the call rather than cancelling it.
             "one action of a transaction carrying an oversized value",
             "TransactWriteItems",
             json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
@@ -396,12 +397,12 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
         );
     }
 
-    // The TRANSACTIONAL surface states the same sentence for a change the transaction's own
-    // update would grow past the ceiling, and refuses the CALL for it as well — the value
-    // here is inside the ceiling, so nothing the request carried is too large on its own,
-    // and it is only the item the change would LEAVE that cannot be stored. An item no table
-    // may hold cannot be stored however the rest of the transaction turns out, so the class
-    // and the sentence are the single-item update's and no action is graded.
+    // The TRANSACTIONAL surface states the same sentence as the REASON the crossing action
+    // reports where the crossing is the transaction's own doing: the value here is INSIDE the
+    // ceiling, so nothing the request carried is too large on its own and it is only the item
+    // the change would LEAVE that cannot be stored — "an item size becomes too large [...]
+    // because of changes made by the transaction", one of the circumstances a cancellation
+    // documents — so the transaction is cancelled with that action named.
     let (status, answered) = call(
         &router,
         "TransactWriteItems",
@@ -416,27 +417,38 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
             error_code(&answered).as_str(),
             message(&answered).as_str()
         ),
-        (400, "ValidationException", UPDATE_TOO_BIG),
-        "case \"a transactional change past the ceiling\": expected the call refused with the \
-         update path's sentence, got {status} with {answered}"
+        (
+            400,
+            "TransactionCanceledException",
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [ValidationError]"
+        ),
+        "case \"a transactional change past the ceiling\": expected the transaction cancelled \
+         over that action, got {status} with {answered}"
     );
-    assert!(
-        answered.get("CancellationReasons").is_none(),
-        "case \"a transactional change past the ceiling\": a refused call cancels nothing, so \
-         it reports no reason list, got {answered}"
+    assert_eq!(
+        (
+            answered["CancellationReasons"][0]["Code"].as_str(),
+            answered["CancellationReasons"][0]["Message"].as_str(),
+        ),
+        (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+        "case \"a transactional change past the ceiling\": expected that action's reason to \
+         word the ceiling, got {answered}"
     );
 
-    // The seeded item is where it was: a refused change writes nothing.
+    // The seeded item is where it was: a change that did not go through writes nothing.
     let read = ok(&router, "GetItem", json!({"TableName": TABLE, "Key": key()})).await;
     assert_eq!(
         read["Item"]["s"],
         json!({"S": "beta"}),
-        "case \"the refused changes wrote nothing\": expected the stored item, got {read}"
+        "case \"the changes that did not go through wrote nothing\": expected the stored item, \
+         got {read}"
     );
     assert_eq!(
         read["Item"].get("body"),
         None,
-        "case \"the refused changes wrote nothing\": no oversized value landed, got {read}"
+        "case \"the changes that did not go through wrote nothing\": no oversized value landed, \
+         got {read}"
     );
 }
 

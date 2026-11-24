@@ -4218,21 +4218,36 @@ pub fn absent_group_message(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup {name} not found")
 }
 
-/// The refusal every request naming a launch configuration the account holds none under is
-/// answered with, whichever operation resolved the name: the fixed
-/// `Launch configuration name not found - ` text, then the detail stating that no
-/// configuration of that name exists.
+/// The fixed text every refusal of a request naming a launch configuration the account
+/// holds none under starts with. What follows it is the DETAIL the operation reports,
+/// which is that operation's own — exactly as the absent-group prefix
+/// ([`ABSENT_GROUP_PREFIX`]) is followed by each operation's own detail.
+const ABSENT_LAUNCH_CONFIGURATION_PREFIX: &str = "Launch configuration name not found - ";
+
+/// The refusal a request that REFERENCES a launch configuration — one that launches a
+/// group from it rather than acting on the configuration itself — is answered with when
+/// the account holds none under that name: the fixed prefix above, then the detail stating
+/// that no configuration of that name exists.
 ///
 /// The name is the only part taken from the request; the rest of the sentence, the colon
-/// after `name` included, is fixed text. One function because the sentence belongs to the
-/// LOOKUP rather than to the operation that performs it — the delete of a configuration
-/// and the group operations that launch from one all resolve the same name against the
-/// same store.
+/// after `name` included, is fixed text.
 pub fn absent_launch_configuration_message(name: &str) -> String {
     format!(
-        "Launch configuration name not found - A launch configuration with the name: {name} \
+        "{ABSENT_LAUNCH_CONFIGURATION_PREFIX}A launch configuration with the name: {name} \
          does not exist"
     )
+}
+
+/// The refusal an operation whose own SUBJECT is the launch configuration states when the
+/// account holds none under the name it was asked for: the fixed prefix above, then the
+/// detail naming the resource and the name, unquoted, followed by `not found` — the form
+/// the group-scoped delete states for its own resource too
+/// ([`absent_group_message`]).
+///
+/// The name is the only part taken from the request; the rest of the sentence is fixed
+/// text.
+pub fn launch_configuration_not_found_message(name: &str) -> String {
+    format!("{ABSENT_LAUNCH_CONFIGURATION_PREFIX}Launch configuration {name} not found")
 }
 
 /// The message Amazon EC2 Auto Scaling refuses a legacy target-group detach that

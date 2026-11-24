@@ -170,8 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         if !state.launch_configurations.contains_key(&name) {
+            // This operation's own subject is the configuration, so the detail behind the
+            // fixed `Launch configuration name not found - ` prefix NAMES the resource it
+            // could not find, rather than the clause an operation that only launches a
+            // group from one states
+            // ([`crate::state::launch_configuration_not_found_message`]).
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_launch_configuration_message(&name),
+                crate::state::launch_configuration_not_found_message(&name),
             ));
         }
 

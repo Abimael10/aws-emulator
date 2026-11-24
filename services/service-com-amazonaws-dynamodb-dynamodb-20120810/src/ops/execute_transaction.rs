@@ -727,21 +727,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // carried needs no table to decide, so it stays a request-level refusal.
         let keying = |error| cancelled_by_element(at, elements, error);
         // The documented item-size ceiling is the ITEM's and does not move with the surface
-        // an update arrives through ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]):
-        // a statement whose result would not fit in an item asks for something that cannot
-        // be served however the rest of the transaction turns out, so it refuses the CALL in
-        // the class and the sentence a single-item update of it is refused with — a request
-        // to shrink rather than a transaction to retry — exactly as the `Update` action of a
-        // `TransactWriteItems` is. Every other failure applying the change finds stays that
-        // statement's own and cancels the transaction.
-        let unless_too_large = |error: crate::state::RequestError| match &error {
-            crate::state::RequestError::Validation(message)
-                if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE =>
-            {
-                lift(error)
-            }
-            _ => keying(error),
-        };
+        // an update arrives through ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]),
+        // and crossing it with a change the transaction MAKES is that change's failure —
+        // "an item size becomes too large [...] because of changes made by the
+        // transaction", one of the circumstances a cancellation documents — so it cancels
+        // the transaction with that statement's own reason, exactly as the `Update` action
+        // of a `TransactWriteItems` is. Every other failure applying the change finds stays
+        // that statement's own too ([`keying`]).
         // A table a statement names that this region does not hold — or does not hold in a
         // status that serves items — is a failure OF THAT STATEMENT, so it cancels the
         // transaction with that statement's own reason ([`cancelled_absent_table`]).
@@ -868,10 +860,9 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     // The change is APPLIED to the stored item here, so a defect found by
                     // applying it is this statement's own failure and cancels the
                     // transaction ([`cancelled_by_element`]), exactly as the same defect
-                    // does in a `TransactWriteItems` `Update` — except an item the change
-                    // grows past the documented 400 KB ceiling, which refuses the call
-                    // ([`unless_too_large`]).
-                    let touched = clauses.apply(&mut item).map_err(unless_too_large)?;
+                    // does in a `TransactWriteItems` `Update` — the documented 400 KB
+                    // ceiling included.
+                    let touched = clauses.apply(&mut item).map_err(keying)?;
                     for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
@@ -886,13 +877,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     // of it would be: the documented nesting, the 400 KB item size, and
                     // the key limits of every index it is projected into. The size
                     // refusal is the one the UPDATE path states
-                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and it refuses
-                    // the CALL ([`unless_too_large`]); every other rule the applied item
-                    // breaks is this statement's own failure.
+                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and it is this
+                    // statement's own failure like every other rule the applied item
+                    // breaks.
                     for (attribute, value) in &item {
                         crate::state::check_attribute_value(attribute, value)
                             .map_err(crate::state::stated_for_an_update)
-                            .map_err(unless_too_large)?;
+                            .map_err(keying)?;
                     }
                     // Canonicalising the applied item stays the CALL's refusal, unlike the
                     // rules above it: what is stored is already canonical (every write path
@@ -903,7 +894,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         if crate::state::update_size_exceeded(table, &item, 0) {
-                            return Err(lift(crate::state::RequestError::Validation(
+                            return Err(keying(crate::state::RequestError::Validation(
                                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
                             )));
                         }

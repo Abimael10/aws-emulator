@@ -4,26 +4,36 @@
 //! earns, across the surfaces an update arrives through.
 //!
 //! The rule under test: the ceiling is the ITEM's and does not move with the surface the
-//! change arrived through, so an update whose resulting item would cross it is refused as the
-//! request it is — HTTP 400, the validation class, and the sentence the update path words that
-//! quota with — on the TRANSACTIONAL surfaces too, which are not cancelled and report no
-//! `CancellationReasons`; and nothing of the refused call is applied.
+//! change arrived through, so the SENTENCE is the same wherever it was stated — but WHOSE
+//! failure the crossing is follows how the change was submitted. A SINGLE-ITEM update states
+//! a change on its own, so crossing the ceiling is refused as the request it is: HTTP 400,
+//! the validation class, and the sentence the update path words that quota with. Inside a
+//! TRANSACTION the crossing is a failure the transaction's own change made — "an item size
+//! becomes too large (larger than 400 KB) [...] or a similar validation error occurs because
+//! of changes made by the transaction", one of the circumstances
+//! `TransactionCanceledException` documents — so the transaction is CANCELLED: HTTP 400, the
+//! cancellation class, the top-level sentence over the per-slot codes in request order, and
+//! an ordered reason list naming the crossing action with that same sentence while every
+//! blameless action reports `None`. Nothing of a refused or a cancelled call is applied.
 //!
 //! The rows span what the rule generalises over: the surface a change is stated through
 //! (`UpdateItem` and a transaction's `Update` for an `UpdateExpression`, `ExecuteStatement`
 //! and `ExecuteTransaction` for a PartiQL `UPDATE`), HOW the ceiling is crossed (one value
 //! past it on its own, a value inside it that only crosses together with what the item
-//! already holds, two clauses that cross only together, a value the update COMPUTES), and
-//! WHERE the oversized action sits in a transaction that carries more than one.
+//! already holds, two clauses that cross only together, a value the update COMPUTES), whether
+//! the key the change addresses already HOLDS an item, and WHERE the oversized action sits in
+//! a transaction that carries more than one.
 //!
 //! The BOUNDARIES are driven beside them: a change inside the ceiling COMMITS through a
-//! transaction and reads back, an action whose own condition is not met still CANCELS the
-//! transaction with its reason list (so the class split between a request's defect and an
-//! action's failure is kept), and an item a `Put` CARRIES past the ceiling earns the sentence
-//! for an item that was carried.
+//! transaction and reads back, an action whose own condition is not met cancels with ITS
+//! reason rather than the size one, and an item a `Put` CARRIES past the ceiling is the
+//! request's own and earns the sentence for an item that was carried.
 //!
 //! Source of the ceiling: "Service, Account, and Table Quotas" in the Amazon DynamoDB
-//! Developer Guide ("The maximum item size in DynamoDB is 400 KB").
+//! Developer Guide ("The maximum item size in DynamoDB is 400 KB"). Source of the
+//! cancellation circumstance and of the reason list's ordering: the `TransactWriteItems`
+//! error `TransactionCanceledException` and its `CancellationReasons` member
+//! (`smithy_query(query="shape",shape="TransactionCanceledException")`).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -46,6 +56,22 @@ const ITEM_TOO_BIG: &str = "Item size has exceeded the maximum allowed size";
 /// The whole shape id the wire carries for the validation class, which is what a client
 /// branching on `__type` matches.
 const VALIDATION_SHAPE_ID: &str = "com.amazon.coral.validate#ValidationException";
+
+/// The `CancellationReason$Code` an action that broke a rule of the service reports.
+const VALIDATION_ERROR_CODE: &str = "ValidationError";
+
+/// The `CancellationReason$Code` an action nothing was wrong with reports.
+const NO_REASON_CODE: &str = "None";
+
+/// The whole top-level sentence a cancelled transaction carries, over the per-slot codes in
+/// request order: the sentence is fixed text and the bracketed list is the request's own
+/// shape.
+fn cancelled_message(codes: &[&str]) -> String {
+    format!(
+        "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+        codes.join(", ")
+    )
+}
 
 /// An emulator holding the table every row writes into.
 async fn seeded() -> MultiServiceRouter {
@@ -73,7 +99,7 @@ async fn seed_item(router: &MultiServiceRouter, key: &str, bytes: usize) {
 
 /// What a row's change is refused with, asserted as a client reads it: the status, the whole
 /// validation shape id, the sentence, and the absence of a reason list — a refused call grades
-/// no action, so a transaction that is refused carries no `CancellationReasons`.
+/// no action, so a request that is refused carries no `CancellationReasons`.
 fn assert_refused(case: &str, status: u16, body: &Value, sentence: &str) {
     assert_eq!(
         (status, error_type(body).as_str(), message(body).as_str()),
@@ -83,6 +109,56 @@ fn assert_refused(case: &str, status: u16, body: &Value, sentence: &str) {
     assert!(
         body.get("CancellationReasons").is_none(),
         "case {case:?}: a refused call grades no action, so it reports no reason list, got {body}"
+    );
+}
+
+/// What a cancelled transaction answers, asserted as a client reads it: the status, the
+/// cancellation class, the top-level sentence over `codes` in request order, and one reason
+/// per action — `messages` is the sentence each action reports, `None` for an action nothing
+/// was wrong with.
+fn assert_cancelled(
+    case: &str,
+    status: u16,
+    body: &Value,
+    codes: &[&str],
+    messages: &[Option<&str>],
+) {
+    assert_eq!(
+        (
+            status,
+            error_code(body).as_str(),
+            message(body).as_str()
+        ),
+        (
+            400,
+            "TransactionCanceledException",
+            cancelled_message(codes).as_str()
+        ),
+        "case {case:?}: expected the transaction cancelled over {codes:?}, got {status} with \
+         {body}"
+    );
+    let reported: Vec<(Option<&str>, Option<&str>)> = body["CancellationReasons"]
+        .as_array()
+        .map(|reasons| {
+            reasons
+                .iter()
+                .map(|reason| {
+                    (
+                        reason["Code"].as_str(),
+                        reason.get("Message").and_then(Value::as_str),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let expected: Vec<(Option<&str>, Option<&str>)> = codes
+        .iter()
+        .zip(messages)
+        .map(|(code, message)| (Some(*code), *message))
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the ordered reason list {expected:?}, got {reported:?} in {body}"
     );
 }
 
@@ -112,7 +188,8 @@ struct Crossing {
 /// The ways an `UpdateExpression` can leave the item past the ceiling. They differ in WHAT
 /// crosses it: one value on its own, a value inside the ceiling over bytes the item already
 /// holds, two clauses that only cross together, and a value the update computes from two
-/// operands neither of which crosses it.
+/// operands neither of which crosses it — and in whether the key addressed holds an item at
+/// all.
 fn crossings() -> Vec<Crossing> {
     vec![
         Crossing {
@@ -152,54 +229,84 @@ fn crossings() -> Vec<Crossing> {
     ]
 }
 
+/// The request one crossing states to `UpdateItem`.
+fn update_of(crossing: &Crossing, key: &str) -> Value {
+    json!({"TableName": TABLE, "Key": key_of(key),
+           "UpdateExpression": crossing.expression,
+           "ExpressionAttributeValues": (crossing.values)()})
+}
+
+/// RULE, the single-item half: a change stated on its own that would leave the item past the
+/// ceiling is refused as the request it is, and nothing of it is applied.
 #[tokio::test]
-async fn an_update_expression_past_the_ceiling_is_refused_whichever_surface_states_it() {
+async fn an_update_expression_past_the_ceiling_is_refused_on_its_own() {
     let router = seeded().await;
 
-    // Each row is one crossing on one surface: the single-item update and the transaction's
-    // `Update` are held to the SAME ceiling and answer in the same class and sentence, which
-    // is the rule — the transaction is not cancelled for it.
     for crossing in crossings() {
-        for (surface, transactional) in [("UpdateItem", false), ("TransactWriteItems", true)] {
-            let case = format!("{} through {surface}", crossing.case);
-            let key = format!("{}-{surface}", crossing.slot);
-            if crossing.seeded > 0 {
-                seed_item(&router, &key, crossing.seeded).await;
-            }
-            let update = json!({"TableName": TABLE, "Key": key_of(&key),
-                                "UpdateExpression": crossing.expression,
-                                "ExpressionAttributeValues": (crossing.values)()});
-            let request = if transactional {
-                json!({"TransactItems": [{"Update": update}]})
-            } else {
-                update
-            };
-            let (status, body) = call(&router, surface, request).await;
-            assert_refused(&case, status, &body, UPDATE_TOO_BIG);
-
-            // Nothing of the refused change landed: the item is exactly what it was seeded
-            // with, and a key that held no item holds none.
-            let held = held_bytes(&router, &key).await;
-            let expected = (crossing.seeded > 0).then_some(crossing.seeded);
-            assert_eq!(
-                held, expected,
-                "case {case:?}: a refused change leaves the stored item where it was, expected \
-                 {expected:?} byte(s) of filler, got {held:?}"
-            );
+        let case = format!("{} through UpdateItem", crossing.case);
+        let key = format!("{}-UpdateItem", crossing.slot);
+        if crossing.seeded > 0 {
+            seed_item(&router, &key, crossing.seeded).await;
         }
+        let (status, body) = call(&router, "UpdateItem", update_of(&crossing, &key)).await;
+        assert_refused(&case, status, &body, UPDATE_TOO_BIG);
+
+        // Nothing of the refused change landed: the item is exactly what it was seeded
+        // with, and a key that held no item holds none.
+        let held = held_bytes(&router, &key).await;
+        let expected = (crossing.seeded > 0).then_some(crossing.seeded);
+        assert_eq!(
+            held, expected,
+            "case {case:?}: a refused change leaves the stored item where it was, expected \
+             {expected:?} byte(s) of filler, got {held:?}"
+        );
     }
 }
 
+/// RULE, the transactional half: the same crossing stated as an action of a transaction is a
+/// failure that transaction's own change made, so the transaction is cancelled and the reason
+/// list names that action with the same sentence — whether or not the key already holds an
+/// item — and nothing is applied.
 #[tokio::test]
-async fn a_partiql_update_past_the_ceiling_is_refused_whichever_surface_states_it() {
+async fn an_update_past_the_ceiling_cancels_the_transaction_that_states_it() {
     let router = seeded().await;
 
-    // The same two sides of the ceiling as above — a parameter past it on its own and one
-    // inside it over bytes the item already holds — stated as a PartiQL `UPDATE`, run on its
-    // own and inside a transaction. Every row addresses an item that is already there: a
-    // PartiQL `UPDATE` states its target in a `WHERE` clause, so a key that holds no item is
-    // a predicate nothing satisfies rather than a change to size.
-    for (slot, case, seeded, bytes) in [
+    for crossing in crossings() {
+        let case = format!("{} through TransactWriteItems", crossing.case);
+        let key = format!("{}-TransactWriteItems", crossing.slot);
+        if crossing.seeded > 0 {
+            seed_item(&router, &key, crossing.seeded).await;
+        }
+        let (status, body) = call(
+            &router,
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Update": update_of(&crossing, &key)}]}),
+        )
+        .await;
+        assert_cancelled(
+            &case,
+            status,
+            &body,
+            &[VALIDATION_ERROR_CODE],
+            &[Some(UPDATE_TOO_BIG)],
+        );
+
+        let held = held_bytes(&router, &key).await;
+        let expected = (crossing.seeded > 0).then_some(crossing.seeded);
+        assert_eq!(
+            held, expected,
+            "case {case:?}: a cancelled transaction leaves the stored item where it was, \
+             expected {expected:?} byte(s) of filler, got {held:?}"
+        );
+    }
+}
+
+/// The two sides of the ceiling a PartiQL `UPDATE` can cross: a parameter past it on its own,
+/// and one inside it over bytes the item already holds. Every row addresses an item that is
+/// already there, because a PartiQL `UPDATE` states its target in a `WHERE` clause, so a key
+/// that holds no item is a predicate nothing satisfies rather than a change to size.
+fn partiql_crossings() -> [(&'static str, &'static str, usize, usize); 2] {
+    [
         (
             "p1",
             "one parameter past the ceiling on its own",
@@ -212,37 +319,73 @@ async fn a_partiql_update_past_the_ceiling_is_refused_whichever_surface_states_i
             300 * 1024,
             150 * 1024,
         ),
-    ] {
-        for (surface, transactional) in [("ExecuteStatement", false), ("ExecuteTransaction", true)]
-        {
-            let case = format!("{case} through {surface}");
-            let key = format!("{slot}-{surface}");
-            seed_item(&router, &key, seeded).await;
-            let statement = json!({
-                "Statement": format!("UPDATE \"{TABLE}\" SET big = ? WHERE pk = '{key}'"),
-                "Parameters": [{"S": "x".repeat(bytes)}],
-            });
-            let request = if transactional {
-                json!({"TransactStatements": [statement]})
-            } else {
-                statement
-            };
-            let (status, body) = call(&router, surface, request).await;
-            assert_refused(&case, status, &body, UPDATE_TOO_BIG);
+    ]
+}
 
-            let held = held_bytes(&router, &key).await;
-            assert_eq!(
-                held,
-                Some(seeded),
-                "case {case:?}: a refused statement leaves the stored item where it was, \
-                 expected {seeded} byte(s) of filler, got {held:?}"
-            );
-        }
+/// The statement one PartiQL crossing states.
+fn statement_of(key: &str, bytes: usize) -> Value {
+    json!({
+        "Statement": format!("UPDATE \"{TABLE}\" SET big = ? WHERE pk = '{key}'"),
+        "Parameters": [{"S": "x".repeat(bytes)}],
+    })
+}
+
+/// RULE: the surface the change is STATED in decides who the crossing belongs to, not the
+/// language it is stated in — a PartiQL `UPDATE` run on its own is refused, and the same
+/// statement inside a transaction cancels it.
+#[tokio::test]
+async fn a_partiql_update_past_the_ceiling_follows_the_surface_that_states_it() {
+    let router = seeded().await;
+
+    for (slot, case, seeded, bytes) in partiql_crossings() {
+        let case = format!("{case} through ExecuteStatement");
+        let key = format!("{slot}-ExecuteStatement");
+        seed_item(&router, &key, seeded).await;
+        let (status, body) = call(&router, "ExecuteStatement", statement_of(&key, bytes)).await;
+        assert_refused(&case, status, &body, UPDATE_TOO_BIG);
+
+        let held = held_bytes(&router, &key).await;
+        assert_eq!(
+            held,
+            Some(seeded),
+            "case {case:?}: a refused statement leaves the stored item where it was, \
+             expected {seeded} byte(s) of filler, got {held:?}"
+        );
+    }
+
+    for (slot, case, seeded, bytes) in partiql_crossings() {
+        let case = format!("{case} through ExecuteTransaction");
+        let key = format!("{slot}-ExecuteTransaction");
+        seed_item(&router, &key, seeded).await;
+        let (status, body) = call(
+            &router,
+            "ExecuteTransaction",
+            json!({"TransactStatements": [statement_of(&key, bytes)]}),
+        )
+        .await;
+        assert_cancelled(
+            &case,
+            status,
+            &body,
+            &[VALIDATION_ERROR_CODE],
+            &[Some(UPDATE_TOO_BIG)],
+        );
+
+        let held = held_bytes(&router, &key).await;
+        assert_eq!(
+            held,
+            Some(seeded),
+            "case {case:?}: a cancelled statement leaves the stored item where it was, \
+             expected {seeded} byte(s) of filler, got {held:?}"
+        );
     }
 }
 
+/// RULE: the reason list is "ordered according to the ordering of the TransactItems request
+/// parameter", so WHERE the oversized action sits decides where its reason sits and nothing
+/// else — every blameless action beside it reports `None`.
 #[tokio::test]
-async fn where_the_oversized_action_sits_does_not_change_the_answer() {
+async fn where_the_oversized_action_sits_is_where_its_reason_sits() {
     let router = seeded().await;
 
     let oversize = json!({":v": {"S": "x".repeat(MAX_ITEM_BYTES)}});
@@ -259,23 +402,37 @@ async fn where_the_oversized_action_sits_does_not_change_the_answer() {
 
     // The rows differ in what stands BESIDE the oversized action: nothing, an action that
     // would succeed on either side of it, and an action whose condition does not hold —
-    // which on its own would cancel the transaction. The refusal is the request's, so none of
-    // them changes it.
-    for (case, actions, written) in [
-        ("the oversized action alone", json!([update("alone")]), vec![]),
+    // each action reporting its OWN outcome in request order.
+    for (case, actions, codes, messages, written) in [
+        (
+            "the oversized action alone",
+            json!([update("alone")]),
+            vec![VALIDATION_ERROR_CODE],
+            vec![Some(UPDATE_TOO_BIG)],
+            vec![],
+        ),
         (
             "the oversized action before one that would succeed",
             json!([update("before"), put("after-the-ceiling")]),
+            vec![VALIDATION_ERROR_CODE, NO_REASON_CODE],
+            vec![Some(UPDATE_TOO_BIG), None],
             vec!["after-the-ceiling"],
         ),
         (
             "the oversized action after one that would succeed",
             json!([put("before-the-ceiling"), update("after")]),
+            vec![NO_REASON_CODE, VALIDATION_ERROR_CODE],
+            vec![None, Some(UPDATE_TOO_BIG)],
             vec!["before-the-ceiling"],
         ),
         (
             "the oversized action beside a condition that does not hold",
             json!([failing_check(), update("beside")]),
+            vec!["ConditionalCheckFailed", VALIDATION_ERROR_CODE],
+            vec![
+                Some("The conditional request failed"),
+                Some(UPDATE_TOO_BIG),
+            ],
             vec![],
         ),
     ] {
@@ -285,9 +442,9 @@ async fn where_the_oversized_action_sits_does_not_change_the_answer() {
             json!({"TransactItems": actions}),
         )
         .await;
-        assert_refused(case, status, &body, UPDATE_TOO_BIG);
+        assert_cancelled(case, status, &body, &codes, &messages);
 
-        // Nothing a refused transaction carried was applied, the sibling `Put` included.
+        // Nothing a cancelled transaction carried was applied, the sibling `Put` included.
         for key in written {
             let read = ok(
                 &router,
@@ -297,19 +454,23 @@ async fn where_the_oversized_action_sits_does_not_change_the_answer() {
             .await;
             assert!(
                 read.get("Item").is_none(),
-                "case {case:?}: the refused call wrote nothing, got {read}"
+                "case {case:?}: the cancelled call wrote nothing, got {read}"
             );
         }
     }
 }
 
+/// The CLASSES on either side of the ceiling: a change inside it commits, an action whose own
+/// condition is not met cancels with ITS reason rather than the size one, and an item a `Put`
+/// carried past the ceiling is the request's own defect.
 #[tokio::test]
-async fn the_classes_either_side_of_the_ceiling_refusal_are_kept() {
+async fn the_classes_either_side_of_the_ceiling_are_kept() {
     let router = seeded().await;
     seed_item(&router, "committed", 1024).await;
 
     // A change INSIDE the ceiling commits through the transaction and reads back, so the
-    // refusals above are the ceiling and not a blanket rejection of a transactional update.
+    // cancellations above are the ceiling and not a blanket rejection of a transactional
+    // update.
     ok(
         &router,
         "TransactWriteItems",
@@ -326,10 +487,8 @@ async fn the_classes_either_side_of_the_ceiling_refusal_are_kept() {
          {held:?} byte(s) of filler"
     );
 
-    // An action whose own CONDITION is not met is still that action's failure, so the
-    // transaction is CANCELLED and the reason list names it: the class split between a
-    // request that cannot be served and an action that failed is what the ceiling refusal
-    // sits on one side of.
+    // An action whose own CONDITION is not met reports the condition it failed, so the size
+    // reason above is the ceiling's and not what every cancelled action reports.
     let (status, body) = call(
         &router,
         "TransactWriteItems",
@@ -339,22 +498,12 @@ async fn the_classes_either_side_of_the_ceiling_refusal_are_kept() {
                "ExpressionAttributeValues": {":v": {"S": "h"}}}}]}),
     )
     .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "TransactionCanceledException"),
-        "case \"an action whose condition is not met\": expected the transaction cancelled, got \
-         {status} with {body}"
-    );
-    assert_eq!(
-        (
-            body["CancellationReasons"][0]["Code"].as_str(),
-            body["CancellationReasons"][0]["Message"].as_str(),
-        ),
-        (
-            Some("ConditionalCheckFailed"),
-            Some("The conditional request failed")
-        ),
-        "case \"an action whose condition is not met\": expected that action's reason, got {body}"
+    assert_cancelled(
+        "an action whose condition is not met",
+        status,
+        &body,
+        &["ConditionalCheckFailed"],
+        &[Some("The conditional request failed")],
     );
     let held = held_bytes(&router, "committed").await;
     assert_eq!(
@@ -364,8 +513,8 @@ async fn the_classes_either_side_of_the_ceiling_refusal_are_kept() {
          got {held:?} byte(s) of filler"
     );
 
-    // An item a `Put` CARRIES past the ceiling is too large as submitted, so it earns the
-    // carried-item sentence in the same class.
+    // An item a `Put` CARRIES past the ceiling is too large as submitted — the request states
+    // the whole item, so the defect is the request's and no action is graded for it.
     let (status, body) = call(
         &router,
         "TransactWriteItems",
