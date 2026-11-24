@@ -36,6 +36,10 @@ pub mod custom_action_lambda;
 pub mod execution_events;
 /// Whether the role a plan's `executionRole` names is one a plan execution could act as.
 pub mod execution_role;
+/// The RESOLUTION every instant this service records is reported at: the one conversion
+/// from a clock reading to a stored timestamp.
+mod reported_timestamps;
+pub use reported_timestamps::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -1353,7 +1357,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             return;
         }
         let paused = execution.is_paused();
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         match outcome {
             Ok(()) => {
                 let name = self.mark_step(key, pending.index, STEP_COMPLETED, at, true);
@@ -1414,7 +1418,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
     ///   that block drives another service's resources and nothing performed it;
     /// * no step left to reach → [`COMPLETED`].
     fn advance_execution(&mut self, key: &(String, String), due: SystemTime) {
-        let at = DateTime::from(due);
+        let at = reported_instant(due);
         let Some(execution) = self.executions.get(key) else {
             return;
         };
@@ -1618,7 +1622,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             return ApprovalOutcome::NotAwaitingApproval { status };
         }
 
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         if approved {
             let name = self.mark_step(key, index, STEP_COMPLETED, at, true);
             if let Some(execution) = self.executions.get_mut(key) {
@@ -1686,7 +1690,7 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             };
         }
         let state = execution.execution_state.clone();
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
 
         let event = match update {
             ExecutionUpdate::Pause if !execution.is_paused() => {

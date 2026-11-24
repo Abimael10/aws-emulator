@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Server-owned: the plan has been written once more, and this is when. `version`
         // is derived from the revision by `StoredPlan::as_plan`.
         record.revision += 1;
-        record.plan.updated_at = Some(::aws_smithy_types::DateTime::from(now));
+        record.plan.updated_at = Some(crate::state::reported_instant(now));
 
         // Project the response from the STORED record, so the caller sees exactly what a
         // later `GetPlan` will read back.

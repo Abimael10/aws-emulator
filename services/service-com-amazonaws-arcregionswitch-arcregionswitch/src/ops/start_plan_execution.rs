@@ -431,7 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let seed = store.next_seed();
             let execution_id = crate::state::execution_id(&input.target_region, seed);
-            let started_at = ::aws_smithy_types::DateTime::from(now);
+            let started_at = crate::state::reported_instant(now);
             let record = crate::state::StoredExecution {
                 plan_arn: input.plan_arn.clone(),
                 execution_id: execution_id.clone(),

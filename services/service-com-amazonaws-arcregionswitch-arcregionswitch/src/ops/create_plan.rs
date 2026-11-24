@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     owner: ::engine::emulator_account_id().to_string(),
                     // `version` is derived from the record's revision by `as_plan`.
                     version: None,
-                    updated_at: Some(::aws_smithy_types::DateTime::from(now)),
+                    updated_at: Some(crate::state::reported_instant(now)),
                 };
                 // The members the service materialises on every write: a plan created with
                 // no alarms, no triggers and nothing said about quota checks still carries
