@@ -15,7 +15,9 @@
 //!
 //! An ARN this account holds no taggable resource under is refused with
 //! `ResourceNotFoundException` (HTTP 404), worded by
-//! [`crate::state::tagged_resource_not_found`] like every other 404 of this service.
+//! [`crate::state::tagged_resource_not_found`] — the ARN the request sent and no
+//! resource type, because this operation is handed an arbitrary ARN and resolves no
+//! type before refusing.
 //!
 //! ## Shape of an operation
 //!

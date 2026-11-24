@@ -8,7 +8,8 @@
 //! `UntagResource` removes the keys it names from it, and `ListTagsForResource` reports
 //! exactly what is stored there — the same copy the resource's own `Get` reports — while
 //! an ARN this account holds no taggable resource under is refused with
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` and the tagging surface's own resource-type-agnostic
+//! sentence, which carries the `ResourceArn` the request sent and names no type.
 //!
 //! The suite is a table: rows differ in the resource type the ARN names (every resource
 //! of this service whose create takes `Tags`), in tag count, in key and value form and
@@ -551,56 +552,42 @@ async fn an_arn_no_taggable_resource_carries_is_reported_as_not_found() {
 
     // Rows: an ARN of each resource type this service mints one for, carrying an id
     // nothing holds; an ARN of a resource type of this service that is not taggable; an
-    // ARN of the right type in another Region and in another account; and an ARN of
-    // another vendor entirely. The expected resource word is the type the ARN claims.
+    // ARN of the right type in another Region and in another account; an ARN of another
+    // vendor entirely; an ARN whose resource field names no type at all; and a stored
+    // resource's own ARN with one character appended, which addresses nothing. The
+    // tagging operations are handed an arbitrary ARN and resolve no resource type before
+    // refusing, so every row expects the SAME sentence and differs only in the ARN it
+    // carries.
     let absent_id = "00000000-0000-4000-8000-000000000000";
-    let rows: Vec<(String, &str)> = vec![
-        (
-            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:application/{absent_id}"),
-            "Application",
+    let rows: Vec<String> = vec![
+        format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:application/{absent_id}"),
+        format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:event-integration/absent"),
+        format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration/{absent_id}"),
+        format!(
+            "arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration-association/\
+             {absent_id}/{absent_id}"
         ),
-        (
-            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:event-integration/absent"),
-            "EventIntegration",
+        format!(
+            "arn:aws:app-integrations:{REGION}:{ACCOUNT}:application-association/\
+             {absent_id}/{absent_id}"
         ),
-        (
-            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration/{absent_id}"),
-            "DataIntegration",
-        ),
-        (
-            format!(
-                "arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration-association/\
-                 {absent_id}/{absent_id}"
-            ),
-            "DataIntegrationAssociation",
-        ),
-        (
-            format!(
-                "arn:aws:app-integrations:{REGION}:{ACCOUNT}:application-association/\
-                 {absent_id}/{absent_id}"
-            ),
-            "ApplicationAssociation",
-        ),
-        (
-            // The right resource type in another Region: an ARN of this service that
-            // names nothing this store holds.
-            format!("arn:aws:app-integrations:eu-west-1:{ACCOUNT}:application/{absent_id}"),
-            "Application",
-        ),
-        (
-            // And in another account.
-            format!("arn:aws:app-integrations:{REGION}:000000000000:application/{absent_id}"),
-            "Application",
-        ),
-        (
-            // Another vendor's ARN claims no resource type of this service.
-            "arn:aws:s3:::some-bucket".to_string(),
-            "Resource",
-        ),
+        // The right resource type in another Region: an ARN of this service that names
+        // nothing this store holds.
+        format!("arn:aws:app-integrations:eu-west-1:{ACCOUNT}:application/{absent_id}"),
+        // And in another account.
+        format!("arn:aws:app-integrations:{REGION}:000000000000:application/{absent_id}"),
+        // Another vendor's ARN claims no resource type of this service.
+        "arn:aws:s3:::some-bucket".to_string(),
+        // A resource field with no type segment at all.
+        format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:{absent_id}"),
+        // A near miss: a stored resource's ARN with one more character on the end.
+        format!("{}x", stored[0].arn),
     ];
 
-    for (arn, resource_type) in rows {
-        let expected = format!("Could not find {resource_type} with ARN: {arn}.");
+    // The one sentence the tagging surface states: fixed text, then the `ResourceArn`
+    // the request sent, verbatim — no resource type, whatever type the ARN claims.
+    for arn in rows {
+        let expected = format!("Could not find resource with Arn: {arn}.");
         for (operation, reply) in [
             (
                 "ListTagsForResource",
@@ -623,13 +610,97 @@ async fn an_arn_no_taggable_resource_carries_is_reported_as_not_found() {
                 "case {case:?}: expected ResourceNotFoundException, got {:?}",
                 reply.error_type
             );
+            let stated = reply.message();
             assert_eq!(
-                reply.message().as_deref(),
+                stated.as_deref(),
                 Some(expected.as_str()),
-                "case {case:?}: expected {expected:?}, got {:?}",
-                reply.message()
+                "case {case:?}: expected {expected:?}, got {stated:?}"
             );
+            // The resource-type words this service's OWN not-found family uses (the
+            // Smithy shape names of its resources) are what the tagging surface must not
+            // assert about an ARN it resolved to nothing; an ARN's own type segment is
+            // lower-case and hyphenated, so none of them can appear by way of the echoed
+            // value.
+            for resource_type in [
+                "Application",
+                "EventIntegration",
+                "DataIntegration",
+                "DataIntegrationAssociation",
+                "ApplicationAssociation",
+            ] {
+                let stated = stated.clone().unwrap_or_default();
+                assert!(
+                    !stated.contains(resource_type),
+                    "case {case:?}: the tagging refusal must name no resource type, but \
+                     {stated:?} names {resource_type}"
+                );
+            }
         }
+    }
+
+    // A refused tagging call persists nothing: every stored neighbour still reports the
+    // empty tag set it was created with.
+    for resource in &stored {
+        let case = format!("{} after the refused tagging calls", resource.kind);
+        let listed = reported_tags(&emulator, &case, resource).await;
+        assert_eq!(
+            listed,
+            BTreeMap::new(),
+            "case {case:?}: expected a resource no refused call touched to report no \
+             tags, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_tagging_refusal_differs_from_the_resource_scoped_not_found_family() {
+    let emulator = Emulator::new();
+
+    // One resource of each type, then the ARN of a resource of that type that this
+    // account does not hold: the SAME missing resource addressed two ways. Its own
+    // reader knows which type it was asked about and names it; the tagging operations
+    // know only an ARN, so they name no type at all.
+    let absent_id = "00000000-0000-4000-8000-000000000000";
+    let rows: Vec<(&str, String, String, String)> = vec![
+        (
+            "data integration",
+            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration/{absent_id}"),
+            format!("/dataIntegrations/{}", encode_label(absent_id)),
+            format!("Could not find DataIntegration with identifier: {absent_id}."),
+        ),
+        (
+            "event integration",
+            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:event-integration/absent"),
+            format!("/eventIntegrations/{}", encode_label("absent")),
+            "Could not find EventIntegration with name: absent.".to_string(),
+        ),
+    ];
+
+    for (kind, arn, get_uri, scoped_message) in rows {
+        let case = format!("the resource-scoped reader of an absent {kind}");
+        let scoped = emulator.send("GET", &get_uri, REGION, None).await;
+        assert_eq!(
+            scoped.message().as_deref(),
+            Some(scoped_message.as_str()),
+            "case {case:?}: expected {scoped_message:?}, got {:?}",
+            scoped.message()
+        );
+
+        let case = format!("the tagging surface on the ARN of that absent {kind}");
+        let expected = format!("Could not find resource with Arn: {arn}.");
+        let tagged = tag(&emulator, &arn, json!({ "owner": "team-a" })).await;
+        assert_eq!(
+            tagged.message().as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected {expected:?}, got {:?}",
+            tagged.message()
+        );
+        assert_ne!(
+            tagged.message(),
+            scoped.message(),
+            "case {case:?}: the tagging surface must not state the resource-scoped \
+             sentence {scoped_message:?}"
+        );
     }
 }
 

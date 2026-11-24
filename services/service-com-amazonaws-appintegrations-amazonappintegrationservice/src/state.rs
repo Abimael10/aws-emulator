@@ -120,11 +120,6 @@ pub const APPLICATION_RESOURCE: &str = "Application";
 /// (`UpdateDataIntegrationAssociation`'s `DataIntegrationAssociationIdentifier` label).
 pub const DATA_INTEGRATION_ASSOCIATION_RESOURCE: &str = "DataIntegrationAssociation";
 
-/// The same, for an application association — the one resource of this service no
-/// operation of this API creates (see [`ApplicationAssociationRecord`]), named here
-/// because an ARN can still claim its type.
-pub const APPLICATION_ASSOCIATION_RESOURCE: &str = "ApplicationAssociation";
-
 /// What a resource addressed by its `Name` member is called in a not-found message.
 pub const ADDRESSED_BY_NAME: &str = "name";
 
@@ -231,16 +226,6 @@ pub fn modeled_tags(tags: &BTreeMap<String, String>) -> HashMap<String, String> 
 /// so a tag set this service stores is one it can also report.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
-/// What a resource addressed by its ARN is called in a not-found message.
-pub const ADDRESSED_BY_ARN: &str = "ARN";
-
-/// The resource-type word a not-found message uses for an ARN that names none of the
-/// resource types this service mints ARNs for: the tagging operations address "the
-/// resource" by ARN (`smithy_query(query="doc", shape="ListTagsForResourceRequest",
-/// member="resourceArn")`) without naming a type, so an ARN carrying no type of this
-/// service is reported with the generic word.
-pub const UNTYPED_RESOURCE: &str = "Resource";
-
 /// The ARN resource-type segment of an application, the part before the `/` in
 /// `arn:aws:app-integrations:<region>:<account>:application/<id>`.
 pub const APPLICATION_ARN_SEGMENT: &str = "application";
@@ -257,48 +242,19 @@ pub const DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT: &str = "data-integration-ass
 /// The ARN resource-type segment of an application association.
 pub const APPLICATION_ARN_ASSOCIATION_SEGMENT: &str = "application-association";
 
-/// The resource-type segment `arn` carries, for an ARN of THIS service: the part of its
-/// resource field before the first `/`, and `None` when the ARN is not one of this
-/// service's (a different vendor, or no ARN at all).
+/// The sentence the TAGGING operations give a `ResourceArn` this account holds no
+/// taggable resource under: fixed text, then the ARN the request sent, verbatim.
 ///
-/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so the service
-/// field has to be this one's (`ARN_NAMESPACE`) before the resource field says anything
-/// about a resource type here.
-fn arn_resource_segment(arn: &str) -> Option<&str> {
-    let mut fields = arn.splitn(6, ':');
-    if fields.next()? != "arn" {
-        return None;
-    }
-    let _partition = fields.next()?;
-    if fields.next()? != ARN_NAMESPACE {
-        return None;
-    }
-    let _region = fields.next()?;
-    let _account = fields.next()?;
-    let resource = fields.next()?;
-    Some(resource.split('/').next().unwrap_or(resource))
-}
-
-/// The resource TYPE a not-found message spells for the ARN a tagging operation named:
-/// the Smithy shape name of the resource the ARN's own type segment claims, or
-/// [`UNTYPED_RESOURCE`] when it claims none of this service's.
-pub fn arn_resource_type(arn: &str) -> &'static str {
-    match arn_resource_segment(arn) {
-        Some(APPLICATION_ARN_SEGMENT) => APPLICATION_RESOURCE,
-        Some(EVENT_INTEGRATION_ARN_SEGMENT) => EVENT_INTEGRATION_RESOURCE,
-        Some(DATA_INTEGRATION_ARN_SEGMENT) => DATA_INTEGRATION_RESOURCE,
-        Some(DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT) => DATA_INTEGRATION_ASSOCIATION_RESOURCE,
-        Some(APPLICATION_ARN_ASSOCIATION_SEGMENT) => APPLICATION_ASSOCIATION_RESOURCE,
-        _ => UNTYPED_RESOURCE,
-    }
-}
-
-/// [`not_found_message`] for the `ResourceArn` a tagging operation named and this
-/// account holds no taggable resource under — worded through the same template as every
-/// other 404 of this service, with the type the ARN claims (see [`arn_resource_type`])
-/// and the ARN the request sent.
+/// Deliberately NOT the resource-scoped [`not_found_message`] family the
+/// `Get`/`Update`/`Delete` paths word their 404s through. Those address ONE resource
+/// type by that type's own identifier, so they can name it; a tagging operation is
+/// handed an arbitrary ARN instead (`smithy_query(query="operation",
+/// operation="TagResource,UntagResource,ListTagsForResource")`: `resourceArn` targets
+/// the plain `Arn` shape, bound to no resource) and resolves no resource type before
+/// refusing — so its refusal names none either, whatever type the ARN itself claims,
+/// and a caller is told about exactly the value it sent.
 pub fn tagged_resource_not_found(arn: &str) -> String {
-    not_found_message(arn_resource_type(arn), ADDRESSED_BY_ARN, arn)
+    format!("Could not find resource with Arn: {arn}.")
 }
 
 /// The `ApplicationType` of an application whose create named none, which is a value
