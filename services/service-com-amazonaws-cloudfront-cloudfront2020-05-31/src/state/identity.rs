@@ -1147,7 +1147,7 @@ pub(super) fn is_prefixed_token(value: &str, prefix: char) -> bool {
 
 /// The namespace letter CloudFront writes the identifiers of the SHARED-form family under —
 /// a distribution, a streaming distribution, an origin access identity and an origin access
-/// control ([`EntityKind`]) — and the letter this service mints each of them with
+/// control — and the letter this service mints each of them with
 /// (`allocate_distribution_id` and its siblings).
 pub const ENTITY_ID_PREFIX: char = 'E';
 

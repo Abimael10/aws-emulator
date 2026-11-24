@@ -15,11 +15,11 @@
 //! The input's doc note — "if the ID is empty, an empty distribution configuration is
 //! returned" — is unreachable over the wire: `Id` is a required `@httpLabel` of
 //! `/2020-05-31/distribution/{Id}/config`, so an empty label matches no route and never
-//! arrives here. Every id that does arrive either names a stored distribution or is
-//! answered with `NoSuchDistribution` — under the sentence that says WHICH condition it was:
-//! an identifier that could address a distribution the account does not hold is the absent
-//! distribution, and a value that is no distribution identifier at all is the identifier
-//! reported unreadable (`crate::state::unresolved_distribution`).
+//! arrives here. Every id that does arrive either names a stored distribution or is answered
+//! with `NoSuchDistribution` and its fixed sentence: `Id` carries no `@pattern` and no
+//! `@length`, so this route reads no form of the value and resolves every one of them against
+//! the store, exactly as `GetDistribution` and every other operation addressed by a
+//! distribution identifier does (`crate::state::no_such_distribution`).
 //!
 //! ## Shape of an operation
 //!
@@ -156,14 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.id) else {
             return Err(GetDistributionConfigErrorModeled::NoSuchDistribution(
-                // The identifier is read as a distribution identifier BEFORE the absent
-                // distribution is reported: a value that is no distribution identifier at all
-                // — outside the form CloudFront issues one in, or held by this account as a
-                // resource of another kind of the same identifier family — is reported as the
-                // unreadable argument it is, naming the member it arrived in. The
-                // absent-distribution sentence is what an identifier that could address one
-                // answers.
-                store.unresolved_distribution(crate::state::ADDRESSED_BY_ID, &input.id),
+                // The STORE is what says whether an identifier was ever issued, so nothing of
+                // the value's form is read in front of it: every `Id` this account holds no
+                // distribution under is the distribution reported ABSENT, under the fixed
+                // sentence this one error class carries.
+                crate::state::no_such_distribution(),
             )
             .into());
         };

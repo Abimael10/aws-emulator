@@ -135,10 +135,6 @@ impl From<CreateInvalidationErrorModeled> for CreateInvalidationError {
     }
 }
 
-/// The model's name for the member this operation addresses its distribution by, which the
-/// identifier-format refusal names ([`crate::state::id_format_invalid_message`]).
-const DISTRIBUTION_ID_MEMBER: &str = "DistributionId";
-
 /// The `CreateInvalidation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -202,11 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
-                // The identifier is read as a distribution identifier BEFORE the absent
-                // distribution is reported, and the sentence names the member it arrived in —
-                // `DistributionId` here, which is how a caller validating its own inputs
-                // learns which one it got wrong.
-                store.unresolved_distribution(DISTRIBUTION_ID_MEMBER, &input.distribution_id),
+                // `DistributionId` carries no `@pattern` and no `@length`, so no form of the
+                // value is read in front of the store: WHICH identifier was ever issued is the
+                // store's own record, and every value it holds no distribution under is the
+                // distribution reported ABSENT, under the fixed sentence this error class
+                // carries wherever it is answered.
+                crate::state::no_such_distribution(),
             )
             .into());
         };
