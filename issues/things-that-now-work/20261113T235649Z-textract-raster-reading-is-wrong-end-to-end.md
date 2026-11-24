@@ -14,6 +14,17 @@ Issue-Commit: d1ed6d82cb6e069fe1b5dc1fba14ae1b2ea73c86
 
 # Textract raster reading is wrong end to end: glyphs misread, word breaks lost, and FORMS/TABLES/QUERIES/AnalyzeExpense extract nothing from a rendered page
 
+## Resolution
+
+Fixed in the shared raster reader (`services/service-com-amazonaws-textract-textract/src/state/ocr*`):
+
+* Cause 2 (word breaks): a line's words are separated by what the two characters either side of each gap leave when the face sets them side by side, plus the part of its space advance a space adds (`src/state/ocr/spacing.rs`); a line set in one cell per character is separated by the step between the cells its marks sit in, and a short proportional line no longer passes for a monospaced one. Pinned by `tests/all/word_breaks.rs`.
+* Cause 1 (glyphs): a page is reported at the turn its characters AGREE with their ink best rather than the turn that merely accounts for most of it (pinned by the orientation suite); a cut of a run of ink is charged for the stroke it crosses over the line's own capital height, so a cut through the middle of a letter is no cheaper on a page set large than on one set small; two characters the blurred grids cannot separate are settled on the ink as each of them draws it.
+* Causes 3, 4, 5 and 6 (FORMS, TABLES, QUERIES, AnalyzeExpense) follow from those: the KEY/VALUE pair, the TABLE with its CELL children, the QUERY's ANSWER relationship to a QUERY_RESULT and the non-empty SummaryFields are all derived from the page's recognised words again.
+
+RESIDUE, left to the open issue it belongs to: `textract.detect-document-text-from-s3-object-source` still reads six round letters of one page (capitals 52 px tall, set so tight that its 17 characters fall into 12 runs of inked columns) after the ink either side of their boundary. That is per-glyph recognition inside a run of touching characters, which is the cause
+`issues/things-that-do-not-work/20261119T223911Z-textract-ocr-still-misclassifies-glyphs-inside-recognised-words.md` owns; the four checks whose keys this issue carries for FORMS, TABLES, QUERIES and AnalyzeExpense now fail only on that same per-glyph text (and on the QUERY_RESULT leading characters of `20261114T190633Z` and the CELL text of `20261110T200812Z`).
+
 > _Note: this issue was identified against the code base at commit `d1ed6d82cb6e069fe1b5dc1fba14ae1b2ea73c86`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

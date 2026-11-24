@@ -113,7 +113,9 @@ fn the_figures_of_one_number_are_one_word() {
     ];
     for (case, words) in cases {
         let marks = line_of(&words);
-        let read = separate(&marks).words();
+        let boxes: Vec<GlyphBox> = marks.iter().map(|mark| mark.glyph).collect();
+        let line = glyphs::line_of(&boxes, 0, 19);
+        let read = separate(&marks, line).words();
         assert_eq!(
             read,
             words.iter().map(ToString::to_string).collect::<Vec<_>>(),

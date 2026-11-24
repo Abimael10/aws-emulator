@@ -12,24 +12,28 @@ use super::*;
 
 /// The characters whose faces agree most with the mark `glyph`, best first: the same
 /// measure [`recognise`] decides by, taken over every character the bank holds.
+///
+/// Best first means the measure WHOLE: the characters are ordered by the agreement of their
+/// closest face, and the one the blurred grids left undecided but the ink as drawn settles
+/// ([`settled`]) stands at the head of the list, which is the answer the comparison gives.
 pub(super) fn ranked(ink: &Ink, glyph: &GlyphBox, line: Line) -> Vec<(char, f32)> {
     let page = |x: isize, y: isize| ink.coverage(x, y);
     let mark = Mark::measure(&page, (glyph.x0, glyph.x1, glyph.y0, glyph.y1), line);
-    let mut scored: Vec<(char, f32)> = bank()
+    let mut scored: Vec<Candidate> = bank()
         .iter()
-        .map(|candidate| {
-            (
-                candidate.ch,
-                candidate
-                    .faces
-                    .iter()
-                    .map(|face| mark.agreement(face))
-                    .fold(0.0f32, f32::max),
-            )
-        })
+        .map(|candidate| scored_against(&mark, candidate))
         .collect();
-    scored.sort_by(|one, other| other.1.total_cmp(&one.1));
+    scored.sort_by(|one, other| other.score.total_cmp(&one.score));
+    if let Some(chosen) = settled(&scored) {
+        if let Some(at) = scored.iter().position(|held| held.ch == chosen.ch) {
+            let chosen = scored.remove(at);
+            scored.insert(0, chosen);
+        }
+    }
     scored
+        .into_iter()
+        .map(|candidate| (candidate.ch, candidate.score))
+        .collect()
 }
 
 /// The mark one glyph of the embedded 8x8 font draws, as a page of one character carries

@@ -118,6 +118,16 @@ pub(super) const MIN_MATCH: f32 = 0.52;
 /// filled in, or a stroke that broke, is read as another character.
 const SHAPE_APART: f32 = 0.05;
 
+/// How close two characters' agreements must stand for the BLURRED grids to have left which
+/// of them a mark is undecided, so that the ink as each of them draws it settles the answer
+/// ([`settled`]).
+///
+/// A hair: blurring a grid a cell wide spreads a stroke over its neighbours, so two
+/// characters that differ by one stroke of a letterform — a crossbar, a flat side, a
+/// counter that closes — come out within about this of each other, while two characters
+/// that differ by a whole letterform do not.
+const TIED: f32 = 0.03;
+
 /// The side of one glyph cell of the embedded 8x8 bitmap font.
 pub(super) const FONT_CELL: usize = 8;
 
@@ -272,6 +282,15 @@ fn own_ink<'a>(
 struct Mark {
     fine: [f32; FINE * FINE],
     fine_ink: f32,
+    /// The same grid before it was blurred: the ink exactly where the mark lays it down.
+    ///
+    /// What the blurred grid cannot see, because the blur is what lets a stroke that lands
+    /// half a cell off its template's still meet it: the crossbar of a `t` against the bare
+    /// stem of an `l`, the flat side of a `D` against the bowl of an `O`. Two characters
+    /// whose blurred grids a mark agrees with equally well are therefore settled on this one
+    /// ([`name_mark`]).
+    sharp: [f32; FINE * FINE],
+    sharp_ink: f32,
     /// How wide the mark's own ink is, in capital heights.
     width: f32,
     /// How tall it is, in capital heights.
@@ -312,6 +331,7 @@ impl Mark {
         let centre = (x0 + x1 + 1) as f32 / 2.0;
         let mut fine = [0f32; FINE * FINE];
         sample(&own, centre, line, FINE, &mut fine);
+        let sharp = fine;
         blur(FINE, &mut fine);
         // The proportions are measured off the PIXELS rather than off the grid: a grid cell
         // covers a tenth of a capital height, and rounding a mark's extent to whole cells
@@ -334,6 +354,8 @@ impl Mark {
         let sampled = (stride_x * stride_y) as f32;
         Self {
             fine_ink: fine.iter().sum(),
+            sharp_ink: sharp.iter().sum(),
+            sharp,
             // Saturating: a mark is the rectangle its own ink occupies, so the narrowest and
             // the shortest one there can be is a single pixel.
             width: (x1.saturating_sub(x0) + 1) as f32 / line.cap,
@@ -371,22 +393,19 @@ impl Mark {
     /// drawn as over a fraction of a pixel. Ink shifted out of the frame still counts
     /// against the match, since the denominator is both marks' whole ink.
     fn agreement(&self, other: &Self) -> f32 {
-        let mut best = 0f32;
-        for down in -1..=1 {
-            for across in -1..=1 {
-                let scored = dice_shifted(
-                    &self.fine,
-                    self.fine_ink,
-                    &other.fine,
-                    other.fine_ink,
-                    FINE,
-                    across,
-                    down,
-                );
-                best = best.max(scored);
-            }
-        }
-        best
+        best_shifted(&self.fine, self.fine_ink, &other.fine, other.fine_ink)
+    }
+
+    /// The same over the grids BEFORE they were blurred: how much of the two marks' ink is
+    /// the same ink exactly where each lays it down.
+    ///
+    /// What the blur hides, since what it is for is to let a stroke that lands half a cell
+    /// off its template's still meet it: the crossbar of a `t` beside the bare stem of an
+    /// `l`, the flat side of a `D` beside the bowl of an `O`, the one counter of a `6`
+    /// beside the two of an `8`. Two characters whose blurred grids a mark agrees with
+    /// equally are told apart on this ([`settled`]).
+    fn sharp_agreement(&self, other: &Self) -> f32 {
+        best_shifted(&self.sharp, self.sharp_ink, &other.sharp, other.sharp_ink)
     }
 
     /// The same measure without that search: what narrows the shortlist to the characters
@@ -400,6 +419,18 @@ impl Mark {
     fn shape_apart(&self, other: &Self) -> f32 {
         self.shape.apart(&other.shape)
     }
+}
+
+/// The best agreement of two grids of ink over a ONE-CELL search: see [`Mark::agreement`].
+fn best_shifted(left: &[f32], left_ink: f32, right: &[f32], right_ink: f32) -> f32 {
+    let mut best = 0f32;
+    for down in -1..=1 {
+        for across in -1..=1 {
+            let scored = dice_shifted(left, left_ink, right, right_ink, FINE, across, down);
+            best = best.max(scored);
+        }
+    }
+    best
 }
 
 /// The Sørensen-Dice coefficient of two grids of ink, the right one moved `across` cells
@@ -1018,40 +1049,95 @@ pub(super) fn recognise_region(
     name_mark(&mark)
 }
 
+/// What a mark could be: one character of the bank, how well the mark's ink agreed with the
+/// closest face of that character, and how much of it is the same ink as each lays it down.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    ch: char,
+    /// The agreement the answer is scored by, on the blurred grids and less what the two
+    /// marks' shapes stand apart.
+    score: f32,
+    /// The agreement of the same face on the grids before they were blurred.
+    sharp: f32,
+}
+
+/// How well `mark`'s ink agrees with the character `glyph`: its closest face by the measure
+/// the answer is scored by, and its closest face on the grids before they were blurred.
+///
+/// Each measure takes the character's OWN best face, because a character is held in the
+/// bank at several sizes and weights and the face whose blurred grid a mark meets best is
+/// not always the one whose strokes land exactly where the mark's do: asking one face for
+/// both would score a character on a face that is a size away from the page's, which is
+/// evidence about the bank rather than about the ink.
+fn scored_against(mark: &Mark, glyph: &Glyph) -> Candidate {
+    let mut score = 0.0f32;
+    let mut sharp = 0.0f32;
+    for face in &glyph.faces {
+        score = score.max(mark.agreement(face) - SHAPE_APART * mark.shape_apart(face));
+        sharp = sharp.max(mark.sharp_agreement(face));
+    }
+    Candidate {
+        ch: glyph.ch,
+        score,
+        sharp,
+    }
+}
+
+/// Which of `candidates` a mark is named as: the character its ink agrees with most, and
+/// where several agree with it as closely as the blurred grids can tell ([`TIED`]), the one
+/// of those whose ink the mark really shares most of.
+///
+/// The blur is what lets a stroke that lands half a cell off its template's meet it at all,
+/// and it is also what makes a `t` and an `l`, a `D` and an `O`, a `6` and an `8` the same
+/// ink: so where it cannot separate two characters, the ink as each of them lays it down
+/// does ([`Mark::sharp_agreement`]). The score reported is the agreement itself, which is
+/// what every threshold downstream of the naming is measured in.
+fn settled(candidates: &[Candidate]) -> Option<Candidate> {
+    let best = candidates
+        .iter()
+        .copied()
+        .reduce(|held, found| if found.score > held.score { found } else { held })?;
+    Some(
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.score >= best.score - TIED)
+            .reduce(|held, found| if found.sharp > held.sharp { found } else { held })
+            .unwrap_or(best),
+    )
+}
+
 /// The character `mark` is drawn with, over the bank, by the three steps of [`recognise`].
 fn name_mark(mark: &Mark) -> Option<Named> {
     if mark.fine_ink <= 0.0 {
         return None;
     }
     let named = candidates(mark);
-    let best = named
-        .iter()
-        .copied()
-        .reduce(|held, found| if found.1 > held.1 { found } else { held })?;
-    if best.1 < MIN_MATCH {
+    let best = settled(&named)?;
+    if best.score < MIN_MATCH {
         return None;
     }
     // Whether the shape left the reading OPEN: a bar is not a character of a word at all,
     // and where the mark is a stem the shape may not tell the stems apart — the best of the
     // others it could be scores as well.
-    let open = best.0 == '|'
-        || (STEMS.contains(&best.0)
+    let open = best.ch == '|'
+        || (STEMS.contains(&best.ch)
             && named
                 .iter()
-                .filter(|(ch, _)| *ch != best.0 && STEMS.contains(ch))
-                .any(|(_, scored)| best.1 - scored <= STEM_MARGIN));
+                .filter(|candidate| candidate.ch != best.ch && STEMS.contains(&candidate.ch))
+                .any(|candidate| best.score - candidate.score <= STEM_MARGIN));
     // The best LETTER OR FIGURE the same ink could be, for an open reading inside a word to
     // be settled by: a mark whose ink agrees best with a bar, or with one bare stem over
     // another, may be a character whose own ink is nearly a stem — the `t` of a face whose
     // crossbar barely reaches past it — and that character is what such a mark reads as.
     let letter = named
         .iter()
-        .filter(|(ch, scored)| ch.is_ascii_alphanumeric() && *scored >= MIN_MATCH)
-        .reduce(|held, found| if found.1 > held.1 { found } else { held })
-        .map(|(ch, _)| *ch);
+        .filter(|candidate| candidate.ch.is_ascii_alphanumeric() && candidate.score >= MIN_MATCH)
+        .reduce(|held, found| if found.score > held.score { found } else { held })
+        .map(|candidate| candidate.ch);
     Some(Named {
-        ch: best.0,
-        score: best.1,
+        ch: best.ch,
+        score: best.score,
         open,
         letter,
     })
@@ -1059,7 +1145,7 @@ fn name_mark(mark: &Mark) -> Option<Named> {
 
 /// The characters `mark` could be, each with how well its ink agreed with that character's
 /// closest face: the [`CLOSE_LOOK`] the two narrowing steps keep.
-fn candidates(mark: &Mark) -> Vec<(char, f32)> {
+fn candidates(mark: &Mark) -> Vec<Candidate> {
     let bank = bank();
     let mut shortlist = Ranking::<SHORTLIST>::new();
     for (index, candidate) in bank.iter().enumerate() {
@@ -1079,14 +1165,9 @@ fn candidates(mark: &Mark) -> Vec<(char, f32)> {
             .fold(0.0f32, f32::max);
         close.offer(scored, index);
     }
-    let mut named: Vec<(char, f32)> = Vec::with_capacity(CLOSE_LOOK);
+    let mut named: Vec<Candidate> = Vec::with_capacity(CLOSE_LOOK);
     for index in close.taken() {
-        let scored = bank[index]
-            .faces
-            .iter()
-            .map(|face| mark.agreement(face) - SHAPE_APART * mark.shape_apart(face))
-            .fold(0.0f32, f32::max);
-        named.push((bank[index].ch, scored));
+        named.push(scored_against(mark, &bank[index]));
     }
     named
 }
@@ -1252,7 +1333,7 @@ mod tests {
                      draws, got {:?}",
                     candidates(&mark)
                         .iter()
-                        .map(|(other, scored)| (*other, (scored * 100.0) as i32))
+                        .map(|other| (other.ch, (other.score * 100.0) as i32))
                         .collect::<Vec<_>>()
                 );
             }

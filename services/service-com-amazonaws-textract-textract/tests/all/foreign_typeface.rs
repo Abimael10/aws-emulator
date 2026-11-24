@@ -36,15 +36,18 @@ use crate::raster_documents::texts_of;
 /// Every raster named here is one the recogniser holds NO template at (see the module
 /// header): its templates come from this face's 16- and 32-pixel rasters, so a page drawn at
 /// the 20- or 24-pixel one is ink no template is a copy of.
+///
+/// `pub(crate)` here and on [`draw`]: `crate::zz_scratch_probe` draws its pages in this same
+/// face, so one renderer serves both suites rather than each growing its own.
 #[derive(Debug, Clone, Copy)]
-struct Face {
-    weight: FontWeight,
-    height: RasterHeight,
-    scale: usize,
+pub(crate) struct Face {
+    pub(crate) weight: FontWeight,
+    pub(crate) height: RasterHeight,
+    pub(crate) scale: usize,
 }
 
 impl Face {
-    const fn plain() -> Self {
+    pub(crate) const fn plain() -> Self {
         Self {
             weight: FontWeight::Regular,
             height: RasterHeight::Size24,
@@ -59,7 +62,7 @@ impl Face {
 /// `noto_sans_mono_bitmap` hands out one byte of ink per pixel per glyph, so the strokes
 /// are anti-aliased: the edge of every one of them lies part way between the ink and the
 /// ground, which is what a page rendered at any ordinary size carries.
-fn draw(lines: &[&str], face: Face) -> GrayImage {
+pub(crate) fn draw(lines: &[&str], face: Face) -> GrayImage {
     let cell = face.height.val();
     let pitch = cell * 3 / 2;
     let margin = 10usize;

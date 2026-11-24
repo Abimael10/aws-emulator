@@ -102,6 +102,7 @@ use super::Unreadable;
 
 mod glyphs;
 mod rules;
+mod spacing;
 
 use rules::Rule;
 
@@ -228,7 +229,10 @@ const FIGURE_SPACE_PITCH: f32 = 0.2;
 const COLUMN_GAP_PITCH: f32 = 2.0;
 
 /// How many cells a step must cover to separate two WORDS on a MONOSPACED line: a letter
-/// advances one cell, so a space's step covers two.
+/// advances one cell and a space's step covers two, so the boundary sits between them.
+/// Measured between the CELLS the two marks sit in ([`GlyphBox::cell_step_from`]), which is
+/// what makes a whole number of cells a whole number of cells whatever each glyph inks
+/// inside its own.
 const LATTICE_WORD_CELLS: f32 = 1.5;
 
 /// How many cells a step must cover to separate two COLUMNS rather than two words on a
@@ -372,10 +376,12 @@ const MIN_PIECE_HEIGHT: f32 = 0.45;
 /// letter as two.
 const CUT_VALLEY: f32 = 1.0;
 
-/// What cutting a run of ink at a column costs, per unit of STROKE the cut crosses there:
-/// see the cut cost in [`cut_apart`]. A cut through the halo between two characters crosses
-/// next to no stroke; one through the middle of a character crosses all of it.
-const CUT_COST: f32 = 1.0;
+/// What cutting a run of ink at a column costs, per unit of STROKE the cut crosses there
+/// over its line's own capital height: see the cut cost in [`cut_apart`]. A cut through the
+/// halo between two characters crosses next to no stroke and costs next to nothing; one
+/// through the middle of a character crosses all of it and costs about what naming that
+/// character is worth.
+const CUT_COST: f32 = 0.2;
 
 /// How much better the pieces of a cut run must account for its ink than the whole run
 /// does, per unit of that ink, for the cut to be taken: the mean match of the pieces must
@@ -594,15 +600,14 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         // text into a column of slivers of several: a reading like that has to be clearly
         // better, not a little better, to be the page's own.
         Some((turns, read))
-            if read.strength() >= MIN_ALTERNATIVE_READING
-                && read.strength()
-                    > upright.strength()
-                        * (1.0
-                            + if turns == 2 {
-                                MIN_ROTATION_GAIN
-                            } else {
-                                MIN_QUARTER_TURN_GAIN
-                            }) =>
+            if read.describes_better(
+                &upright,
+                if turns == 2 {
+                    MIN_ROTATION_GAIN
+                } else {
+                    MIN_QUARTER_TURN_GAIN
+                },
+            ) =>
         {
             read
         }
@@ -718,6 +723,36 @@ impl PageRead {
             return 0.0;
         }
         (self.named_ink / self.page_ink).max(0.0)
+    }
+
+    /// How well the characters this reading named agree with the ink they were named from:
+    /// the mean score over them, or zero where it named none.
+    ///
+    /// What tells a page read at the turn it was DRAWN at from the same ink read at another
+    /// turn: the marks of a page read along its own characters are the letterforms of the
+    /// face it was set in and agree with them closely, while the same ink turned agrees
+    /// middlingly with whatever its shapes happen to resemble, however much of the page
+    /// those shapes cover.
+    fn agreement(&self) -> f32 {
+        if self.score_count == 0 {
+            return 0.0;
+        }
+        self.score_total / self.score_count as f32
+    }
+
+    /// Whether this reading describes the page better than the reading `than` of the same
+    /// ink, which it has to by the margin `gain` to be reported in its place.
+    ///
+    /// Both of what a reading is judged on, because the two say different things: the share
+    /// of the page's ink the reading accounted for ([`Self::strength`]), and how well the
+    /// characters it named agree with that ink ([`Self::agreement`]). A reading that covers
+    /// more of the page while agreeing with it WORSE has not read the page at another turn —
+    /// it has named turned ink after the characters it middlingly resembles — so it does not
+    /// stand in place of the reading taken along the page's own characters.
+    fn describes_better(&self, than: &Self, gain: f32) -> bool {
+        self.strength() >= MIN_ALTERNATIVE_READING
+            && self.strength() > than.strength() * (1.0 + gain)
+            && self.agreement() >= than.agreement()
     }
 }
 
@@ -1824,6 +1859,17 @@ impl GlyphBox {
     fn glyph_step_from(&self, before: &Self) -> f32 {
         self.x0.saturating_sub(before.x0) as f32
     }
+
+    /// How far this mark's own CENTRE stands past `before`'s: the step from the cell one
+    /// mark sits in to the cell the next sits in.
+    ///
+    /// What a MONOSPACED line separates its marks by, because a cell holds a glyph's ink
+    /// wherever the glyph puts it: the step between two marks' left EDGES is a cell give or
+    /// take the bearings the two glyphs leave inside their cells, which on a line that sets
+    /// a narrow glyph beside a wide one is a good part of one.
+    fn cell_step_from(&self, before: &Self) -> f32 {
+        ((self.x0 + self.x1) as f32 - (before.x0 + before.x1) as f32) / 2.0
+    }
 }
 
 /// A line of ink on the page.
@@ -1991,13 +2037,29 @@ fn settle(
                 (matched - WEAK_MARK_MATCH)
                     .max(whole.named.map_or(0.0, |found| found.score) + CUT_PIECE_GAIN)
             },
-            letters: !wide,
+            // What a cut separates is two characters of a WORD, and a word is set with
+            // letters and figures: a run the recogniser names as one of those is a letter
+            // of the line's text, and a letter does not divide into the marks of
+            // PUNCTUATION its own strokes are shaped like — the two diagonals of an `X`,
+            // the arcs of an `S`, the bowl and tail of a `g`. A run that names punctuation
+            // itself, or names nothing at all, is ink of another kind and may be cut into
+            // whatever its pieces are: a figure set tight against a currency sign, a letter
+            // against a bracket.
+            letters: !wide || names_a_character_of_a_word(&whole),
             settles: (!wide).then_some(index),
             regions: wide || weak,
         };
         cut_apart(ink, band, whole, line, look, budget, &mut cut)?;
     }
     join(ink, band, cut, line, budget)
+}
+
+/// Whether this mark names a character a WORD is set with: a letter or a figure, or a bare
+/// stem one of them is what it would be read as ([`glyphs::Named::letter`]).
+fn names_a_character_of_a_word(mark: &Settled) -> bool {
+    mark.named.is_some_and(|found| {
+        found.ch.is_ascii_alphanumeric() || (found.open && found.letter.is_some())
+    })
 }
 
 /// Which readings of a run of ink the segmentation takes beside the run as it stands: the
@@ -2109,6 +2171,19 @@ fn cut_apart(
         for region in &found {
             regions.push(name_region(ink, region, line, budget)?);
         }
+        // A run the recogniser names as a letter or a figure is a character of the line's
+        // own text, and such a character does not divide into the marks of PUNCTUATION its
+        // own strokes are shaped like — whether it divides at a narrowing of its ink or at a
+        // break in it. So where a cut of this run would have to leave letters and figures
+        // ([`LookInside::letters`]), so must a reading by its regions: the two diagonals an
+        // `X` falls into when its crossing thins out are no two characters of a word.
+        if look.letters
+            && !regions
+                .iter()
+                .all(|region| region.named.is_some_and(|f| f.ch.is_ascii_alphanumeric()))
+        {
+            regions.clear();
+        }
     }
     let regions_value = if regions.is_empty() {
         f32::MIN
@@ -2176,10 +2251,19 @@ fn cut_apart(
                 // ink from ground; the inside of one character — the middle of an M, the
                 // waist of an S — is a stroke, which is all of it. Charging the cut for what
                 // it crosses is what keeps a letter whole where the page gives both.
+                //
+                // Over the line's own CAPITAL HEIGHT, because that is what a piece is worth
+                // measured in: a piece's value is the ink of a whole character ([`Settled::
+                // value`]), which grows with the square of the size the page is set at,
+                // while the stroke one column crosses grows with the size itself. Charging
+                // the column alone would make a cut through the middle of a character free
+                // on a page set large and dear on the same page set small, so a crossing
+                // stroke is charged as the ink it would lay down over a character's own
+                // height.
                 let crossed = if to == last {
                     0.0
                 } else {
-                    CUT_COST * ink.stroke_in_column(starts[to] - 1, band)
+                    CUT_COST * ink.stroke_in_column(starts[to] - 1, band) * line.cap
                 };
                 let value = piece.value() - crossed + best[to];
                 if value > best[from] {
@@ -2343,11 +2427,7 @@ fn joined(
     // piece of something, and the join is weighed against the better of the two, which is
     // what tells a letter whose stroke broke from a narrow character the face set tight
     // against its neighbour.
-    let character = |mark: &Settled| {
-        mark.named.is_some_and(|found| {
-            found.ch.is_ascii_alphanumeric() || (found.open && found.letter.is_some())
-        })
-    };
+    let character = names_a_character_of_a_word;
     let gain = if character(before) && character(after) {
         together.value() - (before.value() + after.value())
     } else {
@@ -2632,7 +2712,13 @@ struct Separated {
 ///
 /// The ONE place a line's word and column breaks are decided, so the text, the measured
 /// words and the reading of its bare stems cannot disagree about where its words are.
-fn separate(marks: &[Settled]) -> Separated {
+///
+/// Two marks are separated by what they stand apart PAST the gap the characters they were
+/// named as leave when a proportional face sets them side by side ([`spacing::Letterforms`]),
+/// which is what a word space measures; a pair with no letterforms to measure against, and a
+/// line set in one CELL per character, are separated by the line's own gaps and steps
+/// ([`Separators`]).
+fn separate(marks: &[Settled], line: glyphs::Line) -> Separated {
     let boxes: Vec<GlyphBox> = marks.iter().map(|mark| mark.glyph).collect();
     let median_width = median(boxes.iter().map(GlyphBox::width)).unwrap_or(1.0);
     let gaps: Vec<usize> = boxes
@@ -2648,18 +2734,31 @@ fn separate(marks: &[Settled]) -> Separated {
     // Which marks a line separates into words, and which into COLUMNS, is a property of
     // THIS line's own marks: see [`Separators`].
     let separators = Separators::of(&boxes, &gaps, &steps, median_width);
+    // What the characters this line's marks were named as leave between them, which is what
+    // its gaps are measured against where it sets each of them in its own width.
+    let letterforms = match separators {
+        Separators::Monospaced { .. } => None,
+        Separators::Proportional { .. } => spacing::Letterforms::of(marks, line),
+    };
     let mut separated: Vec<(usize, Separation)> = Vec::new();
-    let mut previous: Option<&GlyphBox> = None;
+    let mut previous: Option<(&GlyphBox, char)> = None;
     for (at, mark) in marks.iter().enumerate() {
-        if mark.named.is_none() {
+        let Some(named) = mark.named else {
             continue;
-        }
+        };
         let separation = match previous {
             None => Separation::Word,
-            Some(before) => separators.between(before, &mark.glyph),
+            Some((before, before_ch)) => match separators.between(before, &mark.glyph) {
+                // A gap of several character pitches is the boundary of two COLUMNS
+                // whatever the letterforms either side of it leave, which no space covers.
+                Separation::Column => Separation::Column,
+                measured => letterforms
+                    .and_then(|set| set.between(before, before_ch, &mark.glyph, named.ch))
+                    .unwrap_or(measured),
+            },
         };
         separated.push((at, separation));
-        previous = Some(&mark.glyph);
+        previous = Some((&mark.glyph, named.ch));
     }
     let named = settle_stems(marks, &separated);
     // A face sets its FIGURES on one advance, so the gap a narrow figure leaves inside its
@@ -2778,7 +2877,7 @@ impl InkLine {
             separators,
             marks: separated,
             named,
-        } = separate(&marks);
+        } = separate(&marks, line);
         // The character cell the line's left margin is reported in, so a line that
         // starts half way across the page is laid out half way across its text.
         let cell = separators.cell();
@@ -3030,6 +3129,12 @@ impl Separators {
     /// The marks are placed by their CENTRES, which is where a cell holds them whatever ink
     /// the glyph puts in it, and the cell is searched for around `pitch`, the step most of
     /// the line's marks are a cell apart by.
+    ///
+    /// Both the distance of each mark from the line's FIRST and the STEP from each mark to
+    /// the next have to come out a whole number of cells, because a line set in the width of
+    /// its own characters fits a cell by coincidence as often as not: the steps of a short
+    /// line of such a face — a wide letter, then a narrow one — can cancel each other out
+    /// over the line while no two neighbouring marks stand a cell apart at all.
     fn lattice_cell(glyphs: &[GlyphBox], pitch: f32) -> Option<f32> {
         if glyphs.len() < MIN_LATTICE_MARKS || pitch < 2.0 {
             return None;
@@ -3041,13 +3146,35 @@ impl Separators {
         let mut best: Option<(f32, f32)> = None;
         for offset in -LATTICE_SEARCH..=LATTICE_SEARCH {
             let cell = pitch * (1.0 + offset as f32 / 64.0);
-            let drift = Self::lattice_drift(&centres, cell);
+            let drift = Self::lattice_drift(&centres, cell)
+                .max(Self::step_drift(&centres, cell));
             if best.is_none_or(|(lowest, _)| drift < lowest) {
                 best = Some((drift, cell));
             }
         }
         best.filter(|(drift, _)| *drift <= MAX_LATTICE_DRIFT)
             .map(|(_, cell)| cell)
+    }
+
+    /// How far from a whole number of `cell`s the STEP from each of `centres` to the next
+    /// sits, in cells, on average over the line.
+    ///
+    /// What the drift from the line's first mark cannot see: a step of half a cell followed
+    /// by one of one and a half leaves both marks a whole number of cells from the first,
+    /// and no face sets its characters that way.
+    fn step_drift(centres: &[f32], cell: f32) -> f32 {
+        let steps: Vec<f32> = centres
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]) / cell)
+            .collect();
+        if steps.is_empty() {
+            return 0.0;
+        }
+        steps
+            .iter()
+            .map(|cells| (cells - cells.round()).abs())
+            .sum::<f32>()
+            / steps.len() as f32
     }
 
     /// How far from a whole number of `cell`s the marks at `centres` sit, in cells, on
@@ -3069,7 +3196,7 @@ impl Separators {
     fn between(&self, before: &GlyphBox, after: &GlyphBox) -> Separation {
         let (measured, word, column) = match *self {
             Self::Monospaced { cell } => (
-                after.glyph_step_from(before),
+                after.cell_step_from(before),
                 LATTICE_WORD_CELLS * cell,
                 LATTICE_COLUMN_CELLS * cell,
             ),

@@ -40,6 +40,7 @@ use super::*;
 /// left of the pen (`xmin` below zero) or under the baseline (`ymin` below zero), which is
 /// the ink this module is about.
 fn page(lines: &[&str], face: &'static [u8], size: f32) -> Vec<u8> {
+    let ground = 245u8;
     let font = fontdue::Font::from_bytes(face, fontdue::FontSettings::default())
         .expect("the embedded outline face parses");
     let metrics = font
@@ -47,7 +48,6 @@ fn page(lines: &[&str], face: &'static [u8], size: f32) -> Vec<u8> {
         .expect("the outline face sets its lines");
     let pitch = metrics.new_line_size.ceil() as usize;
     let margin = (size * 1.5).ceil() as usize;
-    let ground = 245u8;
     let width = margin * 2
         + lines
             .iter()
