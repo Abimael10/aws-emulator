@@ -397,8 +397,8 @@ fn constraint_refusal(refusal: &Refusal, violations: &[Violation]) -> Option<Ref
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `$table`, each
-/// wrapped in [`authorization::Authorized`] (the resource-based policy on the
-/// table bucket the request addresses decides the call) and keyed by its
+/// wrapped in [`authorization::Authorized`] (the policies in force on the caller
+/// and on the resource the request addresses decide the call) and keyed by its
 /// operation shape name — the routing key `ServerHttpProtocol::routing_key`
 /// resolves and the generated table is keyed by.
 macro_rules! gate_operations {
@@ -423,11 +423,11 @@ macro_rules! gate_operations {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The same operations the generated table holds, each wrapped in
-    /// [`authorization::Authorized`] so the resource-based policy on the table
-    /// bucket a request addresses decides the call before the handler runs.
-    /// Keyed by the routing key the protocol resolves — the key the generated
-    /// table uses — and built from the SAME shared engine, so a wrapped
-    /// operation reads and writes the one store.
+    /// [`authorization::Authorized`] so the policies in force on the caller and
+    /// on the table bucket a request addresses decide the call before the
+    /// handler runs. Keyed by the routing key the protocol resolves — the key
+    /// the generated table uses — and built from the SAME shared engine, so a
+    /// wrapped operation reads and writes the one store.
     gated: smithy_server_runtime::OperationRoutingTable,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
@@ -458,13 +458,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         let mut gated = smithy_server_runtime::OperationRoutingTable::new();
         // EVERY operation this crate serves (one per file in `src/ops/`), because
-        // the decision is the SERVICE's and not one operation's: a bucket policy
-        // governs every call that acts on that bucket or on anything inside it,
-        // and an operation whose input addresses no table bucket simply has no
-        // document to be decided against, which the gate reads off that
-        // operation's own input. An operation added later is added here as well,
-        // or it is served with its bucket's policy ignored; the test below fails
-        // when one is missing.
+        // the decision is the SERVICE's and not one operation's: every operation
+        // of this service documents the permission it takes, and a bucket policy
+        // governs every call that acts on that bucket or on anything inside it.
+        // An operation whose input addresses no resource simply has nothing to be
+        // decided against, which the gate reads off that operation's own input.
+        // An operation added later is added here as well, or it is served with
+        // the policies in force ignored; the test below fails when one is
+        // missing.
         gate_operations!(
             gated,
             engine,
@@ -608,7 +609,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }
             // Everything the model names is served out of the gated table: the
             // SAME operation the generated table holds, behind the
-            // resource-policy decision (see [`authorization`]). The key is the
+            // authorization decision (see [`authorization`]). The key is the
             // one that table's own protocol resolved, so this is no re-route —
             // and a key no handler serves resolves to `None` here exactly as it
             // does in the generated table, leaving the router's routing-error
@@ -723,8 +724,8 @@ mod tests {
     ///
     /// The names come from the MODEL rather than from a second hand list, so an
     /// operation that gains a handler and not an entry in `gate_operations!`
-    /// fails here instead of silently serving a call the addressed bucket's
-    /// policy denies — and a key spelled differently from the generated table's
+    /// fails here instead of silently serving a call the policies in force
+    /// refuse — and a key spelled differently from the generated table's
     /// fails here instead of silently never being reached by
     /// `override_operation`.
     #[test]
@@ -741,7 +742,7 @@ mod tests {
                 service.gated.get(operation).is_some(),
                 "case {operation:?}: every operation this crate serves is served behind the \
                  authorization gate; this one is missing from gate_operations!, so a request it \
-                 serves ignores the policy on the table bucket it addresses"
+                 serves is answered without the authorization decision"
             );
         }
         assert_eq!(

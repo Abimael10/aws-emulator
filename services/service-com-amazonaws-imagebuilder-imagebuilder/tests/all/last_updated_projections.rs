@@ -123,6 +123,27 @@ fn instant(case: &str, view: &Value, member: &str) -> String {
     reported.unwrap_or_default().to_string()
 }
 
+/// Whether `later` is the same instant as `earlier` or a later one.
+///
+/// The two are compared as INSTANTS and not as text: an ISO 8601 instant renders its
+/// fraction without trailing zeros, so `…:55.44Z` and `…:55.442956Z` order one way as
+/// chronology and the other way as strings. Parsed through the tree's own reading of this
+/// model's `date-time` form (`aws_smithy_types::DateTime`) rather than through a
+/// hand-rolled split.
+fn not_before(case: &str, later: &str, earlier: &str) -> bool {
+    let parse = |stamp: &str| {
+        ::aws_smithy_types::DateTime::from_str(
+            stamp,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: expected an ISO 8601 instant, got {stamp:?} ({error})")
+        })
+    };
+    let (later, earlier) = (parse(later), parse(earlier));
+    (later.secs(), later.subsec_nanos()) >= (earlier.secs(), earlier.subsec_nanos())
+}
+
 /// Merge the members of `extra` into `body`.
 fn merge(body: &mut Map<String, Value>, extra: Value) {
     if let Value::Object(extra) = extra {
@@ -508,7 +529,7 @@ async fn an_update_restamps_the_pipeline_on_every_read_path() {
             );
             let previous = stamps.last().cloned().unwrap_or_default();
             assert!(
-                updated_at >= previous,
+                not_before(case, &updated_at, &previous),
                 "case {case:?}: expected the later dateUpdated {updated_at:?} not to precede \
                  the earlier {previous:?}"
             );
@@ -598,7 +619,7 @@ async fn a_distribution_configuration_reports_the_instant_of_its_last_update() {
         );
         let updated_at = instant(case, &after, "dateUpdated");
         assert!(
-            updated_at >= created_at,
+            not_before(case, &updated_at, &created_at),
             "case {case:?}: expected dateUpdated {updated_at:?} not to precede dateCreated \
              {created_at:?}"
         );
@@ -630,7 +651,7 @@ async fn a_distribution_configuration_reports_the_instant_of_its_last_update() {
         );
         let latest_at = instant(case, &latest, "dateUpdated");
         assert!(
-            latest_at >= updated_at,
+            not_before(case, &latest_at, &updated_at),
             "case {case:?}: expected the later dateUpdated {latest_at:?} not to precede the \
              earlier {updated_at:?}"
         );

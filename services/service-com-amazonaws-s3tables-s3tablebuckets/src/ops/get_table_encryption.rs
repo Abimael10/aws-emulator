@@ -111,16 +111,6 @@ impl From<GetTableEncryptionErrorModeled> for GetTableEncryptionError {
     }
 }
 
-/// `AccessDeniedException` (HTTP 403) — the calling principal's own
-/// identity-based IAM policies do not allow this action on the table bucket the
-/// request addresses. The sentence is IAM's own, built by the gate.
-fn access_denied(message: String) -> GetTableEncryptionError {
-    GetTableEncryptionErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: Some(message),
-    })
-    .into()
-}
-
 /// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
 /// request addresses.
 fn no_such_bucket() -> GetTableEncryptionError {
@@ -184,29 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Reading a table's encryption takes the `s3tables:GetTableEncryption`
-        // permission, and the IAM resource that permission is granted on is the
-        // TABLE — addressed by its own ARN, under the bucket's, by the id it was
-        // minted with — so the ARN of the table this request names is resolved
-        // first and the decision is taken on it. A request naming a table this
-        // account does not hold has no table ARN to be judged on, so it falls to
-        // the bucket the request addressed, which is the only resource it names.
-        // No guard is held while the decision is taken.
-        let resource = {
-            let store = state.lock();
-            store
-                .table_buckets
-                .get(&input.table_bucket_arn)
-                .and_then(|bucket| bucket.namespaces.get(&input.namespace))
-                .and_then(|namespace| namespace.tables.get(&input.name))
-                .map_or_else(|| input.table_bucket_arn.clone(), |table| table.table_arn.clone())
-        };
-        // Decided BEFORE anything is answered: a caller holding no grant learns
-        // nothing about the table's encryption. See `crate::state::authorization`.
-        if let Some(message) =
-            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &resource)
-        {
-            return Err(access_denied(message));
-        }
+        // permission, which — like every other permission this service's
+        // operations document — is decided for this request before the handler
+        // runs, on the table this request addresses, by the gate every operation
+        // of this service is served behind (`crate::service::authorization`). A
+        // caller holding no grant therefore learns nothing about the table's
+        // encryption, and this handler answers only calls the policies allow.
+        let _ = ctx;
 
         // A pure read: what it answers with is reconstructed from the table's
         // own record and that of the bucket holding it, and nothing in the

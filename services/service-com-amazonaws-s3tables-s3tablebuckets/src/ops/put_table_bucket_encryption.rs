@@ -178,16 +178,6 @@ fn bad_request(message: String) -> PutTableBucketEncryptionError {
     .into()
 }
 
-/// `AccessDeniedException` (HTTP 403) — the calling principal's own
-/// identity-based IAM policies do not allow this action on the table bucket the
-/// request addresses. The sentence is IAM's own, built by the gate.
-fn access_denied(message: String) -> PutTableBucketEncryptionError {
-    PutTableBucketEncryptionErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: Some(message),
-    })
-    .into()
-}
-
 /// `ForbiddenException` (HTTP 403) — the modelled refusal for a request this
 /// service will not make on the caller's behalf: KMS answers the caller nothing
 /// about the key the configuration names, so there is no key to encrypt the
@@ -244,20 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Setting a table bucket's encryption takes the
-        // `s3tables:PutTableBucketEncryption` permission, and the IAM resource
-        // that permission is granted on is the TABLE BUCKET the request
-        // addresses — the only resource it names. Decided BEFORE anything is
-        // read or written, so a caller holding no grant changes nothing and
-        // learns nothing about the bucket. No guard is held while the decision
-        // is taken. See `crate::state::authorization`.
-        if let Some(message) = crate::state::authorization::refusal(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &input.table_bucket_arn,
-        ) {
-            return Err(access_denied(message));
-        }
+        // `s3tables:PutTableBucketEncryption` permission, which — like every
+        // other permission this service's operations document — is decided for
+        // this request before the handler runs, on the table bucket it
+        // addresses, by the gate every operation of this service is served
+        // behind (`crate::service::authorization`). A caller holding no grant
+        // therefore changes nothing and learns nothing about the bucket.
 
         // The configuration is settled BEFORE the store is reached, so a request
         // this service has no encryption for leaves the bucket's own

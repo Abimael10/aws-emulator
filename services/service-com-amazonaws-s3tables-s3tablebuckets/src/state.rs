@@ -33,10 +33,11 @@ pub use maintenance_jobs::*;
 mod replication_status;
 pub use replication_status::*;
 
-/// Whether the calling principal's own identity-based IAM policies allow the
-/// action a request asks for. Named rather than glob-imported, so a handler
-/// reads `crate::state::authorization::refusal(..)` and the gate is visible at
-/// the call site.
+/// Whether the policies in force — the calling principal's own identity-based
+/// IAM documents and the resource-based policy on what the request addresses —
+/// allow the action a request asks for. Named rather than glob-imported, so the
+/// gate that asks it reads `crate::state::authorization::refusal(..)` and is
+/// visible at the call site.
 pub mod authorization;
 
 /// Whether KMS resolves the customer managed key an encryption configuration

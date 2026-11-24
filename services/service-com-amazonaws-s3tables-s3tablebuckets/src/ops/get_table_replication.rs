@@ -113,16 +113,6 @@ impl From<GetTableReplicationErrorModeled> for GetTableReplicationError {
     }
 }
 
-/// `AccessDeniedException` (HTTP 403) — the calling principal's own
-/// identity-based IAM policies do not allow this action on the table the request
-/// addresses. The sentence is IAM's own, built by the gate.
-fn access_denied(message: String) -> GetTableReplicationError {
-    GetTableReplicationErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: Some(message),
-    })
-    .into()
-}
-
 /// `NotFoundException` (HTTP 404) — the refusal this operation models for a
 /// table the store does not hold, and for one that has no replication
 /// configuration to report, each worded with the one sentence this service
@@ -179,15 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Reading a table's replication configuration takes the
-        // `s3tables:GetTableReplication` permission, granted on the TABLE —
-        // which this request addresses by its own ARN. Decided BEFORE anything
-        // is answered, with no store guard held, so a caller holding no grant
-        // learns nothing about the table. See `crate::state::authorization`.
-        if let Some(message) =
-            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &input.table_arn)
-        {
-            return Err(access_denied(message));
-        }
+        // `s3tables:GetTableReplication` permission, which — like every other
+        // permission this service's operations document — is decided for this
+        // request before the handler runs, on the table it addresses, by the
+        // gate every operation of this service is served behind
+        // (`crate::service::authorization`). A caller holding no grant therefore
+        // learns nothing about the table.
+        let _ = ctx;
 
         // A pure read: what it answers with is reconstructed from the record a
         // put persisted, and nothing in the store is touched.

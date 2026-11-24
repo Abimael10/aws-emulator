@@ -125,16 +125,6 @@ impl From<PutTableReplicationErrorModeled> for PutTableReplicationError {
     }
 }
 
-/// `AccessDeniedException` (HTTP 403) — the calling principal's own
-/// identity-based IAM policies do not allow this action on the table the request
-/// addresses. The sentence is IAM's own, built by the gate.
-fn access_denied(message: String) -> PutTableReplicationError {
-    PutTableReplicationErrorModeled::AccessDeniedException(AccessDeniedException {
-        message: Some(message),
-    })
-    .into()
-}
-
 /// `NotFoundException` (HTTP 404) — the refusal this operation models for a
 /// table the store does not hold, and for a version precondition on a table that
 /// has no replication configuration to precondition, each worded with the one
@@ -208,16 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Setting a table's replication configuration takes the
-        // `s3tables:PutTableReplication` permission, and the IAM resource that
-        // permission is granted on is the TABLE — which this request addresses
-        // by its own ARN. Decided BEFORE anything is read or written, so a
-        // caller holding no grant learns nothing about the table and changes
-        // nothing. See `crate::state::authorization`.
-        if let Some(message) =
-            crate::state::authorization::refusal(&*self.engine, ctx, Self::NAME, &input.table_arn)
-        {
-            return Err(access_denied(message));
-        }
+        // `s3tables:PutTableReplication` permission, which — like every other
+        // permission this service's operations document — is decided for this
+        // request before the handler runs, on the table it addresses, by the
+        // gate every operation of this service is served behind
+        // (`crate::service::authorization`). A caller holding no grant therefore
+        // changes nothing and learns nothing about the table.
 
         let mut store = state.lock();
 

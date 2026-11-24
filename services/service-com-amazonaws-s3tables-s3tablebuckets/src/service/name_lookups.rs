@@ -33,7 +33,10 @@
 //! * when every constraint the request breaks is the name FORMAT of a member the
 //!   operation looks up, the operation's handler runs on the input as it stands
 //!   and resolves the name against state — which answers the modelled
-//!   `NotFoundException` for a name nothing is stored under;
+//!   `NotFoundException` for a name nothing is stored under. It runs behind the
+//!   SAME authorization gate the generated walk serves it behind
+//!   ([`super::authorization`]), so taking this exception does not serve a call
+//!   the policies in force refuse;
 //! * anything else — a create's own name, an ARN, a value outside an enumerated
 //!   set, an absent required member — is left to the framework, which refuses it
 //!   exactly as before.
@@ -172,15 +175,25 @@ macro_rules! lookup_operations {
         }
 
         /// The operations this layer serves, one per lookup operation, built
-        /// from the shared engine exactly as the generated entry builds them.
+        /// from the shared engine exactly as the generated entry builds them —
+        /// each behind the authorization gate
+        /// ([`super::authorization::Authorized`]), so serving a request the
+        /// framework would have refused for a lookup key's FORMAT still takes
+        /// the decision every operation of this service is served behind.
         pub(crate) struct NameLookups<Eng> {
-            $( $field: crate::ops::$module::$operation<Eng>, )+
+            $( $field: super::authorization::Authorized<
+                crate::ops::$module::$operation<Eng>,
+                Eng,
+            >, )+
         }
 
         impl<Eng> NameLookups<Eng> {
             pub(crate) fn new(engine: Arc<Eng>) -> Self {
                 Self {
-                    $( $field: crate::ops::$module::$operation::new(Arc::clone(&engine)), )+
+                    $( $field: super::authorization::Authorized::new(
+                        crate::ops::$module::$operation::new(Arc::clone(&engine)),
+                        Arc::clone(&engine),
+                    ), )+
                 }
             }
         }

@@ -1,24 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether IAM lets a request to this service perform the action it asks for —
-//! the decision an operation takes before it reads or writes anything.
+//! the decision taken for EVERY operation this service serves, before the
+//! handler reads or writes anything.
 //!
-//! Two questions, decided from documents collected in two places and answered by
-//! the one shared evaluator: whether the CALLER's own identity-based policies
-//! allow the action ([`refusal`]), and whether the RESOURCE's own resource-based
-//! policy refuses it ([`resource_policy_refusal`], which this service's
-//! request-time gate asks for every operation it serves).
+//! One question, decided from documents collected in two places and answered by
+//! the one shared evaluator ([`refusal`]): do the CALLER's own identity-based
+//! policies and the RESOURCE's own resource-based policy, read together in IAM's
+//! order, let this principal perform this action on this resource? This
+//! service's request-time gate ([`crate::service::authorization`]) asks it for
+//! every operation it serves, handing in the resource that operation's own input
+//! addresses and the policy in force on it.
 //!
 //! Every operation of this service documents the permission it takes ("You must
 //! have the s3tables:GetTableEncryption permission to use this operation"), and
-//! AWS decides a signed call against the calling principal's identity-based
-//! policies before the service looks at the resource: a caller holding no grant
-//! is told it is not authorized rather than told whether the resource it named
-//! exists, and a refused write changes nothing. An operation can carry that
-//! answer only when its own model declares `AccessDeniedException` ("The action
-//! cannot be performed because you do not have the required permission"), so
-//! those are the operations that ask [`refusal`] first; answering a caller an
-//! error its operation does not declare would be a divergence of its own.
+//! AWS decides a signed call against the policies in force before the service
+//! looks at the resource: a caller holding no grant is told it is not authorized
+//! rather than told whether the resource it named exists, and a refused write
+//! changes nothing. S3 Tables answers such a call `AccessDeniedException` ("The
+//! action cannot be performed because you do not have the required permission")
+//! whether or not THAT operation's own model lists the shape, which is why the
+//! refusal travels through the channel every operation of this service shares
+//! ([`crate::scaffolded::Scaffolded::AccessDenied`]) rather than through one
+//! handler's `#[operation_error]` enum.
 //!
 //! The three pieces, each held in exactly one place:
 //!
@@ -33,11 +37,13 @@
 //!    IAM service's OWN accessors (`principal_policies`,
 //!    `permissions_boundary_document`), where the collection rule itself lives —
 //!    so a document `iam:PutRolePolicy` wrote takes effect on the next request
-//!    and deleting it lifts it again;
+//!    and deleting it lifts it again; beside them, the resource-based document
+//!    the gate hands in, which is the one `PutTableBucketPolicy` wrote on the
+//!    table bucket the request addresses and `DeleteTableBucketPolicy` removed;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the one shared
-//!    evaluation of those documents against `(action, resource)`, so this
-//!    service and every other one handed the same documents answer alike; and
-//!    the SENTENCE a refusal carries, which is that module's
+//!    evaluation of those documents against `(action, resource, principal)`, so
+//!    this service and every other one handed the same documents answer alike;
+//!    and the SENTENCE a refusal carries, which is that module's
 //!    [`::service_common::iam_authorization::not_authorized_by_identity_policy`]
 //!    and the reason clauses beside it, so nothing of IAM's wording is spelled
 //!    here.
@@ -104,19 +110,29 @@ pub fn action_for(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
-/// `Some(message)` when IAM does not allow `s3tables:<operation>` on `resource`
-/// for the calling principal — the sentence the refusal carries — and `None`
-/// when it does.
+/// `Some(message)` when the policies in force do not let the calling principal
+/// perform `s3tables:<operation>` on `resource` — the sentence the refusal
+/// carries — and `None` when they do.
 ///
-/// `resource` is the ARN of what the operation acts on, as the operation
-/// resolved it for this request.
+/// `resource` is the ARN of what the operation acts on and `resource_policy` the
+/// resource-based document in force on it (the policy of the table bucket that
+/// holds it), both as the gate resolved them off the request's own input;
+/// `None` is a resource carrying no such document, which withholds nothing.
 ///
-/// IAM's order: an explicit `Deny` in a document that CAN be read refuses the
-/// request whatever else the principal carries; otherwise a grant is needed,
-/// which a caller this gate does not bound has by definition (see the module
-/// docs); and a grant is capped by the permissions boundary, since "a
-/// permissions boundary sets the maximum permissions that an identity-based
-/// policy can grant" (IAM, permissions boundaries).
+/// IAM's order, in the order it is decided here:
+///
+/// * "an explicit deny in any policy overrides any allow", so a `Deny` about the
+///   request in a document that CAN be read refuses it whatever else allows it —
+///   and the reason clause names WHICH document the deny is a fact about, since
+///   AWS distinguishes a resource-based deny from an identity-based one and both
+///   from IAM's default deny;
+/// * otherwise a grant is needed, and within one account a grant from EITHER
+///   side is enough ("the resource-based policy and the identity-based policy are
+///   evaluated together, and access is granted if either allows it"); a caller
+///   this gate does not bound has one by definition (see the module docs);
+/// * a grant is capped by the permissions boundary, since "a permissions boundary
+///   sets the maximum permissions that an identity-based policy can grant" (IAM,
+///   permissions boundaries).
 ///
 /// Asked with NO store guard held, and before the operation reads or writes
 /// anything.
@@ -126,28 +142,40 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resource: &str,
+    resource_policy: Option<&str>,
 ) -> Option<String> {
     let action = action_for(operation);
     let caller = caller(engine, ctx);
-    // An identity-based document states no `Principal` element, so the decision
-    // rests on the action and the resource the request addressed.
+    // An identity-based document states no `Principal` element, so that half of
+    // the decision rests on the action and the resource the request addressed.
     let request = iam::Request::new(&action, resource, &[]);
-    let said = iam::identity_decision(&caller.documents, &request);
-    if said == Decision::Denied {
-        return Some(iam::not_authorized_by_identity_policy(
-            &caller.arn,
-            &action,
-            resource,
-            iam::IDENTITY_POLICY_EXPLICIT_DENY,
-        ));
+    let identity_said = iam::identity_decision(&caller.documents, &request);
+    // A resource-based statement is about the request only when its `Principal`
+    // element names the calling principal. IAM reads one that ALLOWS an ACCOUNT
+    // as delegating the decision to that account's own identity-based policies
+    // rather than as a grant of its own, while one that DENIES the account
+    // refuses each of its principals — so the DENY is decided with the account's
+    // spellings beside the principal's own, and the GRANT with the principal's
+    // alone.
+    let said_about = |named: &[String]| {
+        resource_policy.map_or(Decision::NotStated, |policy| {
+            iam::resource_decision(policy, &iam::Request::new(&action, resource, named))
+        })
+    };
+    let mut denied_by_name = caller.principals.clone();
+    denied_by_name.extend(iam::account_principals(&caller.arn));
+    let resource_denied = said_about(&denied_by_name);
+    let resource_granted = said_about(&caller.principals);
+    let refused =
+        |reason: &str| iam::not_authorized_by_identity_policy(&caller.arn, &action, resource, reason);
+    if resource_denied == Decision::Denied {
+        return Some(refused(iam::RESOURCE_POLICY_EXPLICIT_DENY));
     }
-    if !(iam::is_allowed(said, Decision::NotStated) || caller.identity_is_unbounded()) {
-        return Some(iam::not_authorized_by_identity_policy(
-            &caller.arn,
-            &action,
-            resource,
-            &iam::no_identity_policy_allows(&action),
-        ));
+    if identity_said == Decision::Denied {
+        return Some(refused(iam::IDENTITY_POLICY_EXPLICIT_DENY));
+    }
+    if !(iam::is_allowed(identity_said, resource_granted) || caller.identity_is_unbounded()) {
+        return Some(refused(&iam::no_identity_policy_allows(&action)));
     }
     let boundary = caller.boundary.as_ref()?;
     let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
@@ -158,12 +186,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
         Decision::NotStated => iam::no_permissions_boundary_allows(&action),
     };
-    Some(iam::not_authorized_by_identity_policy(
-        &caller.arn,
-        &action,
-        resource,
-        &reason,
-    ))
+    Some(refused(&reason))
 }
 
 /// The ARN of the principal this request speaks for, as `sts:GetCallerIdentity`
@@ -186,62 +209,18 @@ pub fn caller_arn<Eng: Send + Sync + 'static>(
     caller(engine, ctx).arn
 }
 
-/// `Some(message)` when the resource-based policy `policy` — the document
-/// attached to the table bucket that holds the resource the request addresses —
-/// explicitly DENIES `s3tables:<operation>` on `resource` for the calling
-/// principal, and `None` when it does not.
-///
-/// Only an explicit `Deny` is answered here, and that is IAM's own order: "an
-/// explicit deny in any policy overrides any allow", so a statement of the
-/// resource's own policy that denies the action refuses the request whatever the
-/// caller's identity-based documents grant. A document that states nothing about
-/// the request, or allows it, withholds nothing — within one account a grant from
-/// either side is enough ("the resource-based policy and the identity-based
-/// policy are evaluated together, and access is granted if either allows it"), so
-/// whether a caller holding NO grant at all may act is the identity-based
-/// question [`refusal`] answers for the operations whose model declares that
-/// error.
-///
-/// `resource` is the ARN of what the operation acts on, as the operation resolved
-/// it for this request. Asked with no store guard of this service held, and
-/// before the operation reads or writes anything.
-#[must_use]
-pub fn resource_policy_refusal<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    operation: &str,
-    resource: &str,
-    policy: &str,
-) -> Option<String> {
-    let action = action_for(operation);
-    let caller = caller(engine, ctx);
-    // A resource-based statement is about the request only when its `Principal`
-    // element names the calling principal, so the decision is handed every
-    // spelling that principal is named by.
-    let request = iam::Request::new(&action, resource, &caller.principals);
-    if iam::resource_decision(policy, &request) != Decision::Denied {
-        return None;
-    }
-    // The deny is a fact about THAT document, so the clause names it rather than
-    // the principal's own policies.
-    Some(iam::not_authorized_by_identity_policy(
-        &caller.arn,
-        &action,
-        resource,
-        iam::RESOURCE_POLICY_EXPLICIT_DENY,
-    ))
-}
-
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone, Default)]
 struct Caller {
     /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a
     /// refusal names.
     arn: String,
-    /// Every spelling of the principal a resource-based policy's `Principal`
-    /// element can name it by: the ARN STS reports for the credential, the ARN of
-    /// the IAM role behind an assumed-role session, and the account the principal
-    /// belongs to — which is how such a document names a whole account.
+    /// Every spelling of the PRINCIPAL ITSELF that a resource-based policy's
+    /// `Principal` element can name it by: the ARN STS reports for the
+    /// credential, and the ARN of the IAM role behind an assumed-role session.
+    /// The account the principal belongs to is not one of them — naming the
+    /// account is not naming a principal — so [`refusal`] adds those spellings
+    /// for the DENY alone.
     principals: Vec<String>,
     /// The identity-based policy documents in force on the principal.
     documents: Vec<String>,
@@ -372,12 +351,6 @@ fn caller<Eng: Send + Sync + 'static>(
         let user_arn = caller.arn.clone();
         caller.read_policies_of(&store, &user_arn);
     }
-    // The account the principal belongs to, which is how a resource-based policy
-    // denies or delegates to a whole account rather than to one of its
-    // principals.
-    caller
-        .principals
-        .extend(iam::account_principals(&caller.arn));
     caller
 }
 
