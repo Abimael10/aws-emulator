@@ -558,11 +558,11 @@ async fn preview_portal_builds_a_preview_without_changing_what_the_portal_publis
             "case {case:?}: expected a preview URL a client on this machine can fetch, got \
              {expected_url:?}"
         );
-        assert_ne!(
+        assert_eq!(
             expected_url,
             format!("https://{default_domain}/preview"),
-            "case {case:?}: the portal's default domain name carries no port, so it is no \
-             address to announce a preview at, got {expected_url:?}"
+            "case {case:?}: expected the preview on the address the portal publishes its \
+             site at, got {expected_url:?}"
         );
         assert_eq!(
             publish_status(case, &building),

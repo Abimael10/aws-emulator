@@ -828,25 +828,26 @@ async fn an_account_holds_at_most_the_portals_its_quota_allows() {
 /// `__stringMin3Max256` (`smithy_query(query="shape", shape="EndpointConfigurationResponse")`).
 const DOMAIN_NAME_LENGTH: (usize, usize) = (3, 256);
 
-/// The zone this emulator announces a name of its own in when the request reached it at an
-/// ADDRESS rather than at a name: the zone RFC 6761 reserves for the loopback interface,
-/// which is the interface the core binds on
-/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`). Every case in this suite
-/// reaches the emulator at a loopback address, at the loopback name, or at one of AWS's own
-/// hosts — which is no zone of this emulator's to announce in — so every one of them is
-/// announced here.
-pub(crate) const ANNOUNCED_ZONE: &str = "localhost";
+/// The reserved name of the loopback interface this emulator's listeners bind, which an
+/// address it publishes may carry instead of an address literal
+/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`).
+pub(crate) const ANNOUNCED_LOOPBACK_NAME: &str = "localhost";
 
-/// Assert `value` is the default domain name this emulator GENERATES for the portal
+/// Assert `value` is the default domain name this emulator publishes for the portal
 /// `portal_id` of `region`.
 ///
 /// `PortalDefaultDomainName` is "the portal default domain name. This domain name is
-/// generated and managed by API Gateway", typed `__stringMin3Max256`, so the value is a
-/// DOMAIN NAME: dot-separated host labels, within the modelled length, with no scheme, no
-/// `:port` and no path — a client resolves it, writes it in a `Host` header and points a
-/// CNAME or a Route 53 alias record at it. AWS generates
-/// `p-{portalId}.apigw-portal.{region}.on.aws`; this emulator generates the same labels in
-/// the zone it may announce in ([`ANNOUNCED_ZONE`]), so the name leads back to this process.
+/// generated and managed by API Gateway", typed `__stringMin3Max256`. What API Gateway
+/// MANAGES about that name is that the portal's site is SERVED on it, so the value this
+/// emulator publishes is the address it serves the portal's site at: the `host:port` of the
+/// socket the portal was given, a host a client of this emulator reaches — never a name in
+/// a zone (API Gateway's own, or one under the loopback zone) that no resolver here answers
+/// and no client can therefore fetch the site at. It carries no scheme and no path, because
+/// a client writes it in a `Host` header and builds `https://<name>/` from it.
+///
+/// `portal_id` and `region` name the portal the value was read off, for the failure message:
+/// the published address is a property of the socket this emulator opened for it, not of the
+/// portal's id or of the Region the call was signed for.
 pub(crate) fn assert_published_domain_name(
     case: &str,
     value: &str,
@@ -859,28 +860,30 @@ pub(crate) fn assert_published_domain_name(
         (min..=max).contains(&length),
         "case {case:?}: expected a value of {min}..{max} characters, got {length} in {value:?}"
     );
-    // A domain name carries host labels and nothing else, so neither an authority's port
-    // separator nor a path separator belongs in it.
+    // An address a client writes in a `Host` header carries no scheme and no path.
     assert!(
-        !value.contains(':') && !value.contains('/'),
-        "case {case:?}: expected a bare domain name with no port and no path, got {value:?}"
+        !value.contains('/') && !value.contains(' '),
+        "case {case:?}: expected a bare host[:port] with no scheme and no path, got {value:?} \
+         (portal {portal_id} in {region})"
     );
-    let labels: Vec<&str> = value.split('.').collect();
+    // The host half is one this emulator is reached on: an address of the loopback
+    // interface its listeners bind, or that interface's reserved name.
+    let host = value.rsplit_once(':').map_or(value, |(host, _port)| host);
     assert!(
-        labels.len() >= 4
-            && labels.iter().all(|label| {
-                !label.is_empty()
-                    && label
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            }),
-        "case {case:?}: expected dot-separated host labels, got {value:?}"
+        host == ANNOUNCED_LOOPBACK_NAME || host.parse::<std::net::IpAddr>().is_ok(),
+        "case {case:?}: expected a host this emulator is reached on, got {value:?} (portal \
+         {portal_id} in {region})"
     );
-    assert_eq!(
-        value,
-        format!("p-{portal_id}.apigw-portal.{region}.{ANNOUNCED_ZONE}"),
-        "case {case:?}: expected the name generated for this portal in this Region, got \
-         {value:?}"
+    // And the port half is the socket the site is served on, so a client can open a
+    // connection to it.
+    let port = value
+        .rsplit_once(':')
+        .and_then(|(_host, port)| port.parse::<u16>().ok())
+        .unwrap_or_default();
+    assert!(
+        port > 0,
+        "case {case:?}: expected the port the portal's site is served on, got {value:?} \
+         (portal {portal_id} in {region})"
     );
 }
 

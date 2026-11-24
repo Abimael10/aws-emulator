@@ -337,8 +337,7 @@ async fn a_set_larger_than_the_answer_names_where_to_resume_and_the_last_answer_
 
     // One row per page size the answer is bounded by: the smallest, two that do not
     // divide the catalog, and the largest the model allows. A request that names no page
-    // size names no bound, so it is answered with the whole catalog and no token — the
-    // row below this loop.
+    // size is bounded by the service's own page — the row below this loop.
     for (case, query, bound) in [
         ("maxResults=1", "maxResults=1".to_owned(), 1_usize),
         ("maxResults=7", "maxResults=7".to_owned(), 7),
@@ -361,20 +360,22 @@ async fn a_set_larger_than_the_answer_names_where_to_resume_and_the_last_answer_
     }
 
     // `MaxResults` is `@default(0)`: a request that names no page size, or names that
-    // default, has named no bound, so the whole catalog is reported in one answer with
-    // no token at all.
+    // default, has named no bound of its own, so the SERVICE's own page bounds the answer
+    // and the answer names where to resume — the largest page the member admits, since no
+    // answer of this operation is larger than the largest page a caller could ask for.
     for (case, query) in [("no page size", ""), ("maxResults=0", "maxResults=0")] {
         let answer = offerings(&emulator, query).await;
         let reported = offering_ids(&answer, case);
         assert_eq!(
-            reported, catalog,
-            "case {case}: expected the whole catalog, got {} entries",
+            reported,
+            catalog[..100].to_vec(),
+            "case {case}: expected the service's own page of 100 entries, got {} entries",
             reported.len()
         );
         assert_eq!(
-            answer.body.get("NextToken"),
-            None,
-            "case {case}: nothing remains, so the answer carries no NextToken, got {:?}",
+            answer.body["NextToken"].as_str(),
+            Some(catalog[100].as_str()),
+            "case {case}: entries remain, so the answer names where to resume, got {:?}",
             answer.body
         );
     }

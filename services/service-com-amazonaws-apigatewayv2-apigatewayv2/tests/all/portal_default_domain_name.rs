@@ -8,22 +8,21 @@
 //! > `EndpointConfigurationResponse$PortalDefaultDomainName` is "the portal default domain
 //! > name. This domain name is generated and managed by API Gateway", typed
 //! > `__stringMin3Max256`
-//! > (`smithy_query(query="shape",shape="EndpointConfigurationResponse")`), so the value is a
-//! > DOMAIN NAME: dot-separated host labels within that length, with no scheme, no `:port`
-//! > and no path, because a client feeds it to a resolver, writes it in a `Host` header and
-//! > points a CNAME or a Route 53 alias record at it. API Gateway GENERATES it from the
-//! > portal's own id and its Region and MANAGES it, so the emulator generates the same labels
-//! > in the zone it answers in and SERVES the portal's site for that host: a request
-//! > addressed to the name is refused while the portal has nothing live and is answered the
-//! > portal's page once a publish has settled. It is minted once, by the create, and every
-//! > operation that reports the portal reports that one value.
+//! > (`smithy_query(query="shape",shape="EndpointConfigurationResponse")`). API Gateway both
+//! > generates the name and MANAGES it — the portal's site is served on it — so the value
+//! > this emulator publishes is the address it serves that site at: the `host:port` of the
+//! > socket the portal was given, which a client of this emulator reaches, rather than a
+//! > name in a zone nothing here resolves. A request addressed to it is refused while the
+//! > portal has nothing live and is answered the portal's page once a publish has settled.
+//! > It is minted once, by the create, and every operation that reports the portal reports
+//! > that one value.
 //!
 //! The rows span what the rule generalises over: the endpoint the create was addressed at
 //! (this service's own AWS host, the emulator's own endpoint as an IP literal with and
 //! without a port, a loopback name with a port) and the Region the calls are signed for,
 //! including the emulator's own default — so no row can pass on a hardcoded Region. The
-//! address a client DIALS is a different value (the `host:port` of the socket the portal was
-//! given, which its URL-typed members carry) and is `portal_published_address`'s subject.
+//! URL-typed members that send a client to the site carry the same address with the scheme
+//! and path a URL needs, and are `portal_published_address`'s subject.
 
 use serde_json::{json, Value};
 

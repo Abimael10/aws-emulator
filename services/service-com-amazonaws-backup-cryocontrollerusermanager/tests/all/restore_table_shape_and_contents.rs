@@ -425,9 +425,10 @@ async fn a_restore_reproduces_the_source_tables_indexes_and_items() {
         let source_items = scanned_items(&router, name, SOURCE_TABLE).await;
 
         let point = completed_point(&router, VAULT, &table_arn).await;
-        // The backup's reported size is the size of the data it captured, so a
-        // backup of a table holding items reports more than none and a backup of an
-        // empty table reports none.
+        // The backup's reported size is the size the table's OWN service meters for it,
+        // which it refreshes on its own schedule — so a table written to an instant ago is
+        // backed up at the size that service still reports, whatever the backup copied. What
+        // proves the data travelled is the restore below, not this figure.
         let (status, read) = call(
             &router,
             "GET",
@@ -439,15 +440,18 @@ async fn a_restore_reproduces_the_source_tables_indexes_and_items() {
             status, 200,
             "case {name:?}: DescribeRecoveryPoint must answer 200, got {status} {read:?}"
         );
+        let metered_table_size = source
+            .get("TableSizeBytes")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1);
         let captured_size = read
             .get("BackupSizeInBytes")
             .and_then(Value::as_i64)
             .unwrap_or(-1);
         assert_eq!(
-            captured_size > 0,
-            !case.items.is_empty(),
-            "case {name:?}: the backup of {} item(s) must report the size of what it \
-             captured, got {captured_size}",
+            captured_size, metered_table_size,
+            "case {name:?}: the backup of {} item(s) must report the size the table's own \
+             service meters ({metered_table_size}), got {captured_size}",
             case.items.len()
         );
 

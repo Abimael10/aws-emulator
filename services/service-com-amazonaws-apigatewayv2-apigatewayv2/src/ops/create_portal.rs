@@ -305,19 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (portal_id, store.portal_id_seed)
         };
 
-        // The portal's default domain name is the NAME this emulator announces for it — a
-        // domain name, which is what the member holds, in the zone this emulator may
-        // announce in and which its own portal data plane answers for host-style
-        // (`crate::state::announced_portal_default_domain_name`). The ADDRESS a client
-        // dials is a different value: the socket this portal's website is reached on is
-        // opened with the store's guard released, and every URL-typed member that sends a
-        // client to the site carries the `host:port` that socket answers on.
-        let portal_default_domain_name = crate::state::announced_portal_default_domain_name(
-            &portal_id,
-            &region,
-            ctx.parts(),
-            ctx.endpoint().as_str(),
-        );
         let opened = crate::service::portal_socket::open_for_portal(
             &*self.engine,
             ctx.callback().clone(),
@@ -348,6 +335,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ::std::option::Option::None,
                 )
             }
+        };
+        // The portal's default domain name is the address this emulator SERVES the portal's
+        // website at, because that is what a client reads the member to fetch the site:
+        // the `host:port` of the socket this portal was given
+        // (`crate::state::published_portal_domain_name`), which is the one address a client
+        // of this emulator can open a connection to the site on and which the portal data
+        // plane claims host-style. A portal no socket could be opened for is served behind
+        // its own path at this emulator's front door, which no host can carry, so it
+        // publishes the generated name its data plane claims instead
+        // (`crate::state::announced_portal_default_domain_name`).
+        let portal_default_domain_name = match &socket {
+            Some(_) => crate::state::published_portal_domain_name(&site_base),
+            ::std::option::Option::None => crate::state::announced_portal_default_domain_name(
+                &portal_id,
+                &region,
+                ctx.parts(),
+                ctx.endpoint().as_str(),
+            ),
         };
 
         let mut store = state.lock();

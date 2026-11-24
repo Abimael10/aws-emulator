@@ -18,10 +18,9 @@
 //!
 //! ONE reading for every artifact that DIALS it, so a definition and a generated SDK of one
 //! stage cannot hand two unrelated addresses out: the exported 2.0 document's `host` is built
-//! on it, and so is the endpoint `GetSdk` binds its client to. The ONE templated server URL
-//! of a 3.0 document is the api's own default `execute-api` endpoint instead — a 3.0 document
-//! is read by tooling that recovers the api and the Region from that URL — which
-//! [`execute_api_host`] states and `GetExport` renders.
+//! on it, so is the ONE templated server URL of an exported 3.0 document, and so is the
+//! endpoint `GetSdk` binds its client to. [`execute_api_host`] states the api's own default
+//! host, which this reading announces to a client that resolves AWS's own hosts.
 
 use super::{EMULATOR_PATH_NAMESPACE, EXECUTE_API_LABEL};
 

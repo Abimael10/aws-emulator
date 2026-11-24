@@ -275,6 +275,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::CapturedContents::default()
         };
+        // WHAT SIZE THE BACKUP REPORTS: the size the service that OWNS the resource meters
+        // for it, read at the same instant and over the same hop
+        // (`crate::state::metered_resource_size`). It is that service's own figure, refreshed
+        // on that service's own schedule, rather than a count of the bytes this capture
+        // copied — which is what bounds this emulator's store and nothing else. Asked only
+        // for a backup that will write a point at all.
+        let metered_resource_size = if withheld.is_none() {
+            crate::state::metered_resource_size(ctx.callback(), &region, &input.resource_arn)
+                .await
+        } else {
+            0
+        };
         // Starting the job holds this store's lock; neither the questions above nor
         // the publication below does, so no lock is held across an await.
         let output = self.started_job(
@@ -283,6 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             withheld,
             captured_restore_metadata,
             captured_contents,
+            metered_resource_size,
         )?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this job is owed falls due on the clock, not on the next
@@ -311,6 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
     /// the same capture; it too is stored on the recovery point, and is what a restore
     /// of that point writes back (`crate::state::captured_contents`).
     ///
+    /// `metered_resource_size` is the size that service METERS for the resource, as it
+    /// answered it at the same instant (`crate::state::metered_resource_size`): it is what
+    /// the point and the job report as the size of the backup.
+    ///
     /// Separate from `handle` so this store's lock lives for exactly this call: the
     /// publication `handle` makes afterwards awaits, and a guard must not be held
     /// across an await. `region` is the Region of the call, which every ARN this
@@ -322,6 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
         withheld: Option<crate::state::BackupFailure>,
         captured_restore_metadata: ::std::collections::BTreeMap<String, String>,
         captured_contents: crate::state::CapturedContents,
+        metered_resource_size: i64,
     ) -> Result<StartBackupJobOutput, StartBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
@@ -554,11 +572,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             creation_date: now,
             settles_at,
             completion_date: None,
-            // The size of a backup is the size of what it CAPTURED, so it is the
-            // figure the capture measured rather than a value chosen here; a backup
-            // of a resource whose contents no arm of the capture reads holds nothing
-            // and so is of no size.
-            backup_size_in_bytes: captured_contents.size_in_bytes,
+            // The size of a backup is the size of the RESOURCE it was taken of, as the
+            // service that owns it meters it: that service's figure is the one the point
+            // reports, so a resource its own service meters at nothing is backed up at
+            // nothing however many bytes this emulator copied out of it.
+            backup_size_in_bytes: metered_resource_size,
             lifecycle: input.lifecycle.clone(),
             encryption_key_arn: point_encryption_key_arn,
             is_encrypted: true,

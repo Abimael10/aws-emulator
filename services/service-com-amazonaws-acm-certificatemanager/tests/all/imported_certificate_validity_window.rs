@@ -3,15 +3,18 @@
 //! End-to-end tests for what an imported certificate's VALIDITY WINDOW decides: whether
 //! the import is admitted at all, and — once it is — the bounds the record reports.
 //!
-//! RULE under test: `ImportCertificate` admits material only while every certificate it
-//! carries is inside its own validity window at the instant the call is served ("the
-//! current time must be between the Not Before and Not After certificate fields", one of
-//! the guidelines the operation documents for a third-party certificate). A certificate
-//! whose window has closed, or has not opened yet, is refused with `ValidationException`
-//! (HTTP 400) under the fixed sentence naming which side of the window it fell on and
-//! whether the material was the certificate or its chain, and nothing is stored. An
-//! admitted certificate reports its own `Not Before`/`Not After` bounds as `NotBefore`
-//! and `NotAfter`, read out of its DER.
+//! RULE under test: `ImportCertificate` judges the MATERIAL the request carries, and never
+//! turns a call it would have admitted into a refusal because the host clock has advanced
+//! past a date inside that material. A client's certificate is fixed while the clock runs,
+//! so a refusal keyed to "the window has closed since" would make one unchanged request
+//! succeed today and fail tomorrow with nothing in the request or in the store having
+//! changed. The window is therefore READ and REPORTED — the record carries the
+//! certificate's own `Not Before`/`Not After` as `NotBefore` and `NotAfter`, which is where
+//! a caller judges expiry — and the one window refusal left is material whose window has
+//! NOT OPENED: that certificate is unusable at the instant of the call, and no earlier call
+//! could have been admitted either. Such an import is refused with `ValidationException`
+//! (HTTP 400) under the fixed sentence naming whether the material was the certificate or
+//! its chain, and nothing is stored.
 //!
 //! Every certificate here is built by `rcgen` — something other than the code under
 //! test — and every call goes through the same router the emulator serves production
@@ -27,25 +30,15 @@ use serde_json::{json, Value};
 use crate::certificate_import::{blob, generate, import, import_body, Blueprint};
 use crate::certificate_lifecycle::{call, describe, error_code, error_message, list_all_arns, router};
 
-/// The sentence ACM refuses a `Certificate` whose own window has CLOSED under, as
-/// recorded against the real service. Written out here rather than imported from the
-/// service, so no assertion is made against the template it is asserting.
-const CERTIFICATE_EXPIRED: &str =
-    "The certificate is expired. You can Import a certificate only during its validity period.";
-
-/// The sentence for a `Certificate` whose window has NOT OPENED yet — the other side of
-/// the same guideline.
+/// The sentence for a `Certificate` whose window has NOT OPENED yet — the one side of the
+/// window an import is refused on, as recorded against the real service. Written out here
+/// rather than imported from the service, so no assertion is made against the template it
+/// is asserting.
 const CERTIFICATE_NOT_YET_VALID: &str = "The certificate is not valid yet. You can Import a \
      certificate only during its validity period.";
 
-/// The sentence for a `CertificateChain` carrying a certificate whose window has CLOSED,
-/// as recorded against the real service: it names the chain, and identifies no member of
-/// it.
-const CHAIN_CERTIFICATE_EXPIRED: &str = "A certificate in the chain is expired. You can Import \
-     a certificate only during its validity period.";
-
 /// The sentence for a `CertificateChain` carrying a certificate whose window has not
-/// opened yet.
+/// opened yet: it names the chain, and identifies no member of it.
 const CHAIN_CERTIFICATE_NOT_YET_VALID: &str = "A certificate in the chain is not valid yet. You \
      can Import a certificate only during its validity period.";
 
@@ -64,10 +57,12 @@ type WindowCase<'a> = (
 /// The rows the window table runs over.
 ///
 /// The years are absolute, so each row keeps the same relation to the clock whenever the
-/// suite runs: 1998-1999, 2000-2001 and 2015-2016 are closed, 2020-2100 and 2024-2099 are
-/// open, and 2990-2999 has not opened. The closed rows differ by up to seventeen years
-/// and by curve, and the open rows by window length, so a rule that happened to admit one
-/// window length rather than another cannot pass the table.
+/// suite runs: 1998-1999, 2000-2001 and 2015-2016 have closed, 2020-2100 and 2024-2099 are
+/// open, and 2990-2999 has not opened. The closed rows differ by up to seventeen years and
+/// by curve, and the open rows by window length, so a rule that happened to admit one
+/// window length rather than another cannot pass the table — and every row whose window
+/// has closed is ADMITTED, with its own bounds reported, because the clock having moved
+/// past the material's last date is not something the service refuses on.
 fn window_cases() -> Vec<WindowCase<'static>> {
     vec![
         (
@@ -75,21 +70,21 @@ fn window_cases() -> Vec<WindowCase<'static>> {
             (2000, 2001),
             &rcgen::PKCS_ECDSA_P256_SHA256,
             "long-closed.import.example.com",
-            Some(CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a window that closed more recently, on another curve",
             (2015, 2016),
             &rcgen::PKCS_ECDSA_P384_SHA384,
             "recently-closed.import.example.com",
-            Some(CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a single-year window far in the past",
             (1998, 1999),
             &rcgen::PKCS_ECDSA_P256_SHA256,
             "oldest.import.example.com",
-            Some(CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a window that has not opened yet",
@@ -122,10 +117,10 @@ fn elliptic_curve_certificates() -> Value {
     json!({ "Includes": { "keyTypes": ["EC_prime256v1", "EC_secp384r1"] } })
 }
 
-/// RULE: a certificate is imported only while its own validity window is open, and the
-/// record of an admitted one reports that window.
+/// RULE: an import is refused only for a window that has not opened; every other window is
+/// admitted, and the record of an admitted one reports that window.
 #[tokio::test]
-async fn an_import_is_admitted_only_inside_its_own_validity_window() {
+async fn an_import_reports_its_own_window_and_is_refused_only_before_it_opens() {
     let router = router();
 
     for (case, validity, algorithm, common_name, refusal) in window_cases() {
@@ -141,8 +136,8 @@ async fn an_import_is_admitted_only_inside_its_own_validity_window() {
             let (status, response) = call(&router, "ImportCertificate", &body).await;
             assert_eq!(
                 status, 400,
-                "case {case:?}: a certificate outside its own window must be refused 400, \
-                 got {status} {response}"
+                "case {case:?}: a certificate whose window has not opened must be refused \
+                 400, got {status} {response}"
             );
             assert_eq!(
                 error_code(&response),
@@ -158,8 +153,8 @@ async fn an_import_is_admitted_only_inside_its_own_validity_window() {
             continue;
         }
 
-        // The import itself: a window open at the instant the call is served answers 200
-        // with the ARN its record is stored under.
+        // The import itself: material the service judges answers 200 with the ARN its
+        // record is stored under, whatever the clock has done to its window.
         let arn = import(&router, case, &body).await;
 
         // And the record reports the certificate's own bounds, read out of its DER —
@@ -227,11 +222,11 @@ async fn an_import_is_admitted_only_inside_its_own_validity_window() {
     );
 }
 
-/// RULE: the same guideline covers the CHAIN — every certificate the chain carries has
-/// to be inside its own window, whichever position it holds in the body — and a chain
-/// whose members are all open is stored and served back as it was sent.
+/// RULE: the same reading covers the CHAIN — a member whose window has not opened refuses
+/// the import, whichever position it holds in the body, and every other chain is stored and
+/// served back as it was sent.
 #[tokio::test]
-async fn a_chain_is_admitted_only_while_every_member_is_inside_its_window() {
+async fn a_chain_is_refused_only_for_a_member_whose_window_has_not_opened() {
     let router = router();
 
     let leaf = generate(&Blueprint {
@@ -266,17 +261,17 @@ async fn a_chain_is_admitted_only_while_every_member_is_inside_its_window() {
         (
             "one certificate whose window has closed",
             closed_root.certificate.clone(),
-            Some(CHAIN_CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a closed certificate below an open one",
             format!("{}{}", open_root.certificate, closed_root.certificate),
-            Some(CHAIN_CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a closed certificate above an open one",
             format!("{}{}", closed_root.certificate, open_root.certificate),
-            Some(CHAIN_CERTIFICATE_EXPIRED),
+            None,
         ),
         (
             "a certificate whose window has not opened yet",
@@ -302,8 +297,8 @@ async fn a_chain_is_admitted_only_while_every_member_is_inside_its_window() {
             let (status, response) = call(&router, "ImportCertificate", &body).await;
             assert_eq!(
                 status, 400,
-                "case {case:?}: a chain member outside its own window must be refused 400, \
-                 got {status} {response}"
+                "case {case:?}: a chain member whose window has not opened must be refused \
+                 400, got {status} {response}"
             );
             assert_eq!(
                 error_code(&response),
@@ -364,19 +359,21 @@ async fn a_chain_is_admitted_only_while_every_member_is_inside_its_window() {
 #[tokio::test]
 async fn a_refused_import_answers_no_certificate_arn() {
     let router = router();
-    let expired = generate(&Blueprint {
+    let not_yet_valid = generate(&Blueprint {
         common_name: Some("no-arn.import.example.com"),
-        validity: (2001, 2002),
+        validity: (2990, 2999),
         ..Blueprint::default()
     });
     let (status, response): (u16, Value) =
-        call(&router, "ImportCertificate", &import_body(&expired)).await;
+        call(&router, "ImportCertificate", &import_body(&not_yet_valid)).await;
     assert_eq!(
         status, 400,
-        "case \"an expired certificate\": expected 400, got {status} {response}"
+        "case \"a certificate whose window has not opened\": expected 400, got {status} \
+         {response}"
     );
     assert!(
         response.get("CertificateArn").is_none(),
-        "case \"an expired certificate\": a refusal mints no ARN, got {response}"
+        "case \"a certificate whose window has not opened\": a refusal mints no ARN, got \
+         {response}"
     );
 }

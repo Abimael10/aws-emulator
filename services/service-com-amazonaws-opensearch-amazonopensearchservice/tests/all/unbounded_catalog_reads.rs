@@ -8,18 +8,20 @@
 //! sees, not what a handler returns. The harness comes from [`super::domain_lifecycle`];
 //! this suite adds no second copy of it.
 //!
-//! The rule under test: `MaxResults` is the bound the REQUEST names and nothing else. It
-//! is `@default(0)`, so a request that names no page size has named no bound: the whole
-//! published listing is reported in one answer, which therefore carries no `NextToken`
-//! at all. A page size the client never asked for would hide most of a catalog from
-//! every client that does not page — for the Reserved Instance offerings, every offering
-//! of every instance type past the bound, and so the terms and payment options published
-//! only for those types.
+//! The rule under test: `MaxResults` is the bound the REQUEST names, and a catalog AWS
+//! answers COMPLETE is answered complete when the request names none. It is `@default(0)`,
+//! so a request that names no page size has named no bound: the whole published listing is
+//! reported in one answer, which therefore carries no `NextToken` at all.
 //!
-//! The rows differ along what the rule generalises over: the catalog read (the Reserved
-//! Instance offerings, the engine-version catalog and the instance-type catalog), and
-//! how the absent bound is expressed (no `maxResults` at all, and the modelled default
-//! `maxResults=0`).
+//! The Reserved Instance offering catalog is NOT one of those reads — its recorded answer
+//! bounds an unbounded request to one page and names the token to resume from, which
+//! `reserved_offerings_default_page` is the suite for. What this suite asserts of it is the
+//! other half of that rule: following the token reaches every offering, so the bound hides
+//! nothing.
+//!
+//! The rows differ along what the rule generalises over: the catalog read (the engine-version
+//! catalog and the instance-type catalog), and how the absent bound is expressed (no
+//! `maxResults` at all, and the modelled default `maxResults=0`).
 
 use std::collections::BTreeSet;
 
@@ -46,14 +48,11 @@ struct Catalog {
     member: &'static str,
 }
 
-/// Every catalog this service publishes complete, as a read and the member to read.
+/// Every catalog this service answers COMPLETE for a request that names no page size, as a
+/// read and the member to read. The offering catalog is bounded by the service's own page
+/// instead — see the module docs.
 fn catalogs() -> Vec<Catalog> {
     vec![
-        Catalog {
-            case: "reserved instance offerings",
-            path: format!("{PREFIX}/opensearch/reservedInstanceOfferings"),
-            member: "ReservedInstanceOfferings",
-        },
         Catalog {
             case: "engine versions",
             path: format!("{PREFIX}/opensearch/versions"),
@@ -95,39 +94,43 @@ fn reported(answer: &Answer, catalog: &Catalog, case: &str) -> Vec<Value> {
         .clone()
 }
 
+/// Every entry of `catalog`, walked at the largest page the model allows — so the
+/// expectation is the service's own set rather than a number written into this suite.
+async fn walked(emulator: &Emulator, catalog: &Catalog) -> Vec<Value> {
+    let mut walked: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let query = match token.as_deref() {
+            None => "maxResults=100".to_owned(),
+            Some(cursor) => format!("maxResults=100&nextToken={cursor}"),
+        };
+        let answer = read(emulator, catalog, &query).await;
+        walked.extend(reported(&answer, catalog, catalog.case));
+        match answer.body["NextToken"].as_str() {
+            None => break,
+            Some(next) => token = Some(next.to_owned()),
+        }
+        assert!(
+            walked.len() < 100_000,
+            "case {}: the walk terminates, got {} entries",
+            catalog.case,
+            walked.len()
+        );
+    }
+    assert!(
+        !walked.is_empty(),
+        "case {}: expected a published catalog, got none",
+        catalog.case
+    );
+    walked
+}
+
 #[tokio::test]
 async fn a_request_that_names_no_page_size_is_answered_with_the_whole_catalog() {
     let emulator = Emulator::new();
 
     for catalog in catalogs() {
-        // The whole set, measured by walking the catalog at the largest page the model
-        // allows — so the expectation is the service's own set rather than a number
-        // written into this suite.
-        let mut walked: Vec<Value> = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let query = match token.as_deref() {
-                None => "maxResults=100".to_owned(),
-                Some(cursor) => format!("maxResults=100&nextToken={cursor}"),
-            };
-            let answer = read(&emulator, &catalog, &query).await;
-            walked.extend(reported(&answer, &catalog, catalog.case));
-            match answer.body["NextToken"].as_str() {
-                None => break,
-                Some(next) => token = Some(next.to_owned()),
-            }
-            assert!(
-                walked.len() < 100_000,
-                "case {}: the walk terminates, got {} entries",
-                catalog.case,
-                walked.len()
-            );
-        }
-        assert!(
-            !walked.is_empty(),
-            "case {}: expected a published catalog, got none",
-            catalog.case
-        );
+        let walked = walked(&emulator, &catalog).await;
 
         for unbounded in UNBOUNDED {
             let case = format!("{} with {unbounded:?}", catalog.case);
@@ -151,90 +154,83 @@ async fn a_request_that_names_no_page_size_is_answered_with_the_whole_catalog() 
 }
 
 #[tokio::test]
-async fn the_unbounded_offerings_answer_covers_every_instance_type_term_and_payment_option() {
+async fn paging_the_offerings_reaches_every_instance_type_term_and_payment_option() {
     let emulator = Emulator::new();
 
-    // What the bound hid: the offerings a client that does not page can discover. Every
-    // instance type the service publishes, each term and each payment option has to be
-    // reachable from the one answer, or a client cannot find an offering for the
-    // instance type it would actually run.
+    // What no bound may hide: the offerings a client discovers by following the token.
+    // Every instance type the service publishes, each term and each payment option has to
+    // be reachable from the walk, or a client cannot find an offering for the instance type
+    // it would actually run.
     let catalog = Catalog {
         case: "reserved instance offerings",
         path: format!("{PREFIX}/opensearch/reservedInstanceOfferings"),
         member: "ReservedInstanceOfferings",
     };
-    for unbounded in UNBOUNDED {
-        let case = format!("unbounded {unbounded:?}");
-        let answer = read(&emulator, &catalog, unbounded).await;
-        let offerings = reported(&answer, &catalog, &case);
+    let case = "the walked offering catalog";
+    let offerings = walked(&emulator, &catalog).await;
 
-        let types: BTreeSet<&str> = offerings
-            .iter()
-            .filter_map(|offering| offering["InstanceType"].as_str())
-            .collect();
-        for instance_type in published_instance_types() {
-            assert!(
-                types.contains(instance_type),
-                "case {case}: expected an offering for {instance_type}, got offerings for \
-                 {} instance types",
-                types.len()
-            );
-        }
-
-        let durations: BTreeSet<i64> = offerings
-            .iter()
-            .filter_map(|offering| offering["Duration"].as_i64())
-            .collect();
-        for term in RESERVED_INSTANCE_TERMS {
-            assert!(
-                durations.contains(&i64::from(term)),
-                "case {case}: expected the {term}-second term among {durations:?}"
-            );
-        }
-
-        let options: BTreeSet<&str> = offerings
-            .iter()
-            .filter_map(|offering| offering["PaymentOption"].as_str())
-            .collect();
-        for option in RESERVED_INSTANCE_PAYMENT_OPTION_VALUES {
-            assert!(
-                options.contains(option),
-                "case {case}: expected the {option} payment option among {options:?}"
-            );
-        }
-
-        // Every combination of the three, so no instance type is published for fewer
-        // terms or payment options than another.
-        let expected = published_instance_types().len()
-            * RESERVED_INSTANCE_TERMS.len()
-            * RESERVED_INSTANCE_PAYMENT_OPTION_VALUES.len();
-        assert_eq!(
-            offerings.len(),
-            expected,
-            "case {case}: expected one offering per instance type, term and payment \
-             option ({expected}), got {}",
-            offerings.len()
+    let types: BTreeSet<&str> = offerings
+        .iter()
+        .filter_map(|offering| offering["InstanceType"].as_str())
+        .collect();
+    for instance_type in published_instance_types() {
+        assert!(
+            types.contains(instance_type),
+            "case {case}: expected an offering for {instance_type}, got offerings for \
+             {} instance types",
+            types.len()
         );
     }
+
+    let durations: BTreeSet<i64> = offerings
+        .iter()
+        .filter_map(|offering| offering["Duration"].as_i64())
+        .collect();
+    for term in RESERVED_INSTANCE_TERMS {
+        assert!(
+            durations.contains(&i64::from(term)),
+            "case {case}: expected the {term}-second term among {durations:?}"
+        );
+    }
+
+    let options: BTreeSet<&str> = offerings
+        .iter()
+        .filter_map(|offering| offering["PaymentOption"].as_str())
+        .collect();
+    for option in RESERVED_INSTANCE_PAYMENT_OPTION_VALUES {
+        assert!(
+            options.contains(option),
+            "case {case}: expected the {option} payment option among {options:?}"
+        );
+    }
+
+    // Every combination of the three, so no instance type is published for fewer terms or
+    // payment options than another.
+    let expected = published_instance_types().len()
+        * RESERVED_INSTANCE_TERMS.len()
+        * RESERVED_INSTANCE_PAYMENT_OPTION_VALUES.len();
+    assert_eq!(
+        offerings.len(),
+        expected,
+        "case {case}: expected one offering per instance type, term and payment option \
+         ({expected}), got {}",
+        offerings.len()
+    );
 }
 
 #[tokio::test]
 async fn a_request_that_names_a_page_size_is_still_bounded_by_it() {
     let emulator = Emulator::new();
 
-    // The rule is about the ABSENT bound: a bound the request does name still bounds the
-    // answer, and the answer names where to resume. One row per page size, including the
-    // largest the model allows.
+    // The rule is about the bound a request names: a bound it does name bounds the answer,
+    // and the answer names where to resume. One row per page size, including the largest
+    // the model allows.
     let catalog = Catalog {
         case: "reserved instance offerings",
         path: format!("{PREFIX}/opensearch/reservedInstanceOfferings"),
         member: "ReservedInstanceOfferings",
     };
-    let whole = reported(
-        &read(&emulator, &catalog, "").await,
-        &catalog,
-        "the whole catalog",
-    );
+    let whole = walked(&emulator, &catalog).await;
     for page_size in [1_usize, 3, 100] {
         let case = format!("maxResults={page_size}");
         let answer = read(&emulator, &catalog, &format!("maxResults={page_size}")).await;

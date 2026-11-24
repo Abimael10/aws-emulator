@@ -483,7 +483,8 @@ struct PublishedAddress {
     /// The base URL, `{scheme}://{host}{path}`, with no trailing slash.
     base_url: String,
     /// Whether this artifact states the address a client of IT dials — the endpoint the
-    /// reading client reached — rather than the api's own default invoke endpoint.
+    /// reading client reached — rather than a host of AWS's own that a client of this
+    /// emulator resolves nowhere.
     names_the_reached_endpoint: bool,
 }
 
@@ -513,7 +514,9 @@ async fn export(
 /// A 3.0 document carries ONE server URL whose `{basePath}` variable stands where the stage
 /// goes, and a 2.0 document the `host` a client dials beside the stage's own `basePath`
 /// ("`{host}{basePath}` is the address a client of this document calls"), so resolving each
-/// gives the same kind of value: the base URL of the deployed stage.
+/// gives the same kind of value: the base URL of the deployed stage. Both are built on the
+/// address this emulator announces for the stage, so both name the endpoint the reading
+/// client reached.
 async fn published_addresses(
     router: &MultiServiceRouter,
     endpoint: &str,
@@ -545,7 +548,7 @@ async fn published_addresses(
         PublishedAddress {
             artifact: "the oas30 export's server URL",
             base_url: templated.replace("{basePath}", &base_path),
-            names_the_reached_endpoint: false,
+            names_the_reached_endpoint: true,
         },
         PublishedAddress {
             artifact: "the swagger export's host and basePath",
@@ -660,8 +663,7 @@ async fn a_gated_stage_is_published_at_an_address_this_emulator_serves() {
             // 1. The address names an authority the reading client can dial: the endpoint it
             //    reached, where the artifact states that, and otherwise the api's own default
             //    invoke endpoint — which this data plane claims host-style.
-            let own_default = format!("{api_id}.execute-api.{REGION}.{AWS_HOST_SUFFIX}");
-            let expected_authority = if endpoint.own_endpoint && published.names_the_reached_endpoint
+            let own_default = format!("{api_id}.execute-api.{REGION}.{AWS_HOST_SUFFIX}");            let expected_authority = if endpoint.own_endpoint && published.names_the_reached_endpoint
             {
                 endpoint.host.to_string()
             } else {

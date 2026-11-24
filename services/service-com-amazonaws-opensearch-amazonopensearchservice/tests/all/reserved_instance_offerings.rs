@@ -28,8 +28,8 @@
 //! * paging is a partition: over a table of page sizes, the pages concatenate back to
 //!   the full listing in order with nothing repeated or dropped, every page is within
 //!   its size, only the last page carries no token, a request that names no page size is
-//!   answered with the whole catalog and no token, a page size outside the modelled
-//!   bound is refused at either end, and a token the operation never issued is
+//!   bounded by the service's own page and names where to resume, a page size outside the
+//!   modelled bound is refused at either end, and a token the operation never issued is
 //!   refused;
 //! * the read changes nothing a later caller sees: the same request twice answers
 //!   identically, before and after paged and filtered reads.
@@ -116,9 +116,9 @@ fn hourly_cost(offering: &Value, case: &str) -> f64 {
 
 /// The whole catalog, walked through the continuation tokens the answers hand out.
 ///
-/// A request that names no `MaxResults` names no bound, so the first answer already
-/// reports the whole catalog and carries no token; the walk is written as a walk anyway,
-/// so the helper reports the whole listing however many answers it takes.
+/// A request that names no `MaxResults` is bounded by the service's own page and names the
+/// token to resume from, so the walk takes as many answers as the catalog has pages; the
+/// helper reports the whole listing however many that is.
 pub(crate) async fn whole_catalog(emulator: &Emulator, case: &str) -> Vec<Value> {
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
@@ -605,25 +605,29 @@ async fn pages_partition_the_catalog() {
         );
     }
 
-    // `MaxResults` is `@default(0)`, so a request that names no page size — or names
-    // zero, which is that default — has named no bound at all: the whole catalog is
-    // reported in one answer, with no token, exactly as this service publishes its other
-    // catalogs.
+    // `MaxResults` is `@default(0)`, so a request may name no page size at all — or name
+    // zero, which is that default. The service then answers its OWN page and names where to
+    // resume, the way the recorded answer of an unbounded call does; the page is never
+    // larger than the largest one the member admits, and the token reaches the rest.
     for unbounded in ["", "maxResults=0"] {
         let case = format!("unbounded {unbounded:?}");
         let answer = describe(&emulator, unbounded).await;
         let page = offerings(&answer, &case);
+        let bound = usize::min(catalog.len(), 100);
         assert_eq!(
-            page, catalog,
-            "case {case}: expected the whole published catalog, got {} offerings",
+            page,
+            catalog[..bound].to_vec(),
+            "case {case}: expected the first {bound} offerings of the published catalog, got \
+             {} offerings",
             page.len()
         );
         assert_eq!(
-            answer.body.get("NextToken"),
-            None,
-            "case {case}: nothing remains to report, so the answer carries no NextToken, \
-             got {:?}",
-            answer.body
+            answer.body["NextToken"].as_str(),
+            catalog
+                .get(bound)
+                .and_then(|offering| offering["ReservedInstanceOfferingId"].as_str()),
+            "case {case}: expected the answer to name where to resume, got {:?}",
+            answer.body["NextToken"]
         );
     }
 
