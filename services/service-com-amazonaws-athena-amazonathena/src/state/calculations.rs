@@ -150,6 +150,13 @@ pub struct CalculationRecord {
     /// When the calculation was asked to stop, if it was, from which the
     /// [`CALCULATION_CANCELLATION`] span runs.
     pub stop_requested_at: Option<SystemTime>,
+    /// "The reason for the calculation state change" (`CalculationStatus$StateChangeReason`),
+    /// for a state change this service made on its own rather than at the caller's request:
+    /// the cancellation the termination of the calculation's SESSION forces
+    /// ([`CALCULATION_CANCELED_WITH_SESSION`]). `None` for every state the clock derives and
+    /// for a cancellation the caller asked for itself, neither of which Athena states a reason
+    /// for.
+    pub state_change_reason: Option<String>,
 }
 
 /// What RUNNING one calculation produced: the reading the engine took of the run
@@ -204,6 +211,7 @@ impl CalculationRecord {
             completion_due_at: due_at(now, CALCULATION_COMPLETION),
             outcome: None,
             stop_requested_at: None,
+            state_change_reason: None,
         }
     }
 
@@ -273,10 +281,11 @@ impl CalculationRecord {
     ///
     /// `SubmissionDateTime` is "the date and time the calculation was submitted for
     /// processing", which is the instant the submission persisted, and `CompletionDateTime`
-    /// the instant it stopped processing ([`Self::completed_at`]). There is no
-    /// `StateChangeReason`: AWS publishes no wording for the change a caller's own cancel
-    /// makes — the member's example is a calculation "canceled because the session was
-    /// terminated", which is not this change — and what a FAILED run reports is the error the
+    /// the instant it stopped processing ([`Self::completed_at`]). The `StateChangeReason` is
+    /// the one the record holds: AWS publishes no wording for the change a caller's own cancel
+    /// makes — the member's own example is a calculation "canceled because the session was
+    /// terminated", which is the change this service does state a reason for
+    /// ([`CALCULATION_CANCELED_WITH_SESSION`]) — and what a FAILED run reports is the error the
     /// run itself produced, which is the `stderr` object its result names.
     ///
     /// Built on the record rather than in a handler, so every read of a calculation's status
@@ -286,7 +295,7 @@ impl CalculationRecord {
             submission_date_time: Some(reported_time(self.submitted_at)),
             completion_date_time: self.completed_at(now).map(reported_time),
             state: Some(self.state_at(now).to_string()),
-            state_change_reason: None,
+            state_change_reason: self.state_change_reason.clone(),
         }
     }
 
@@ -377,6 +386,22 @@ impl CalculationRecord {
             return false;
         }
         self.stop_requested_at = Some(self.stop_requested_at.unwrap_or(now));
+        true
+    }
+
+    /// Cancel this calculation at `now` because the SESSION it runs in was terminated, and
+    /// answer whether the cancellation was taken on.
+    ///
+    /// The same cancellation a caller's own stop asks for ([`Self::stop`]) — so a calculation
+    /// already in a terminal state keeps the state it reached, and one already asked keeps the
+    /// instant it was first asked at — carrying the reason for the change this service made on
+    /// its own: "the calculation was canceled because the session was terminated"
+    /// (`CalculationStatus$StateChangeReason`).
+    pub fn cancel_with_session(&mut self, now: SystemTime) -> bool {
+        if !self.stop(now) {
+            return false;
+        }
+        self.state_change_reason = Some(CALCULATION_CANCELED_WITH_SESSION.to_string());
         true
     }
 
@@ -516,6 +541,24 @@ impl CalculationRegistry {
             .retain(|_, minted| !removed.iter().any(|id| id == minted));
         removed.len()
     }
+
+    /// Cancel every calculation of the session `session_id` that is not terminal at `now`, as
+    /// the TERMINATION of that session does, and answer with how many were cancelled.
+    ///
+    /// A calculation runs inside its session, so a session whose resources are being torn down
+    /// runs none: the work in flight is cancelled rather than left to settle on its own, which
+    /// is the change `CalculationStatus$StateChangeReason` names in its own example. One
+    /// already in a terminal state is left exactly as it is
+    /// ([`CalculationRecord::cancel_with_session`]), so a repeat of the shutdown changes
+    /// nothing.
+    pub fn cancel_session(&mut self, session_id: &str, now: SystemTime) -> usize {
+        self.calculations
+            .values_mut()
+            .filter(|record| record.session_id == session_id)
+            .filter(|record| !record.is_terminal_at(now))
+            .map(|record| usize::from(record.cancel_with_session(now)))
+            .sum()
+    }
 }
 
 /// The cursor a `ListCalculationExecutions` page hands back: the session whose calculations
@@ -653,6 +696,34 @@ pub const CALCULATION_CODE_REQUIRED: &str =
 /// for execution within a session" — and Athena refuses a request for one it will not act on
 /// in fixed text that quotes the id back no more than a session's does.
 pub const CALCULATION_NOT_FOUND: &str = SESSION_NOT_FOUND;
+
+/// The message a submission into a session this account DOES hold, but which is not in the
+/// state a calculation is taken in, is refused with.
+///
+/// The rule `SessionState` documents: "IDLE - The session is able to accept a calculation",
+/// so a session in any other state accepts none — one still acquiring its resources, one
+/// shutting down, one whose resources are gone. Athena states that as the state the session is
+/// in beside the state it would have to be in: the fixed text is everything but the state
+/// name, which is the session's CURRENT state read from this service's own state
+/// ([`SessionRecord::state_at`]), and the state required is always
+/// [`SESSION_STATE_IDLE`].
+///
+/// Distinct from [`SESSION_NOT_FOUND`] on purpose: that sentence is for an id this service
+/// will not act on at all, and says nothing about whether anything holds it, while this one
+/// names a session the caller does hold and the state it is in — the difference between
+/// "start another session" and "you may not address this one".
+pub fn session_not_accepting_calculations(state: &str) -> String {
+    format!("Session is in the {state} state; needs to be {SESSION_STATE_IDLE} to accept Calculations.")
+}
+
+/// The `StateChangeReason` a calculation cancelled by the TERMINATION of its session reports.
+///
+/// The one change `CalculationStatus$StateChangeReason` documents in its own words — "the
+/// reason for the calculation state change (for example, the calculation was canceled because
+/// the session was terminated)" — stated as the sentence that reason is, with no part of any
+/// request in it: which session it was is what the calculation's own `SessionId` reports.
+pub const CALCULATION_CANCELED_WITH_SESSION: &str =
+    "The calculation was canceled because the session was terminated.";
 
 /// The refusal a request addressing ONE calculation this service will not act on is
 /// answered with: the SAME refusal a session-addressed request takes

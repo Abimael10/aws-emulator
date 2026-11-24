@@ -14,8 +14,14 @@
 //!   calculation here exactly as it does for a submitted application there, and the way a
 //!   program is run and reported is the same in both;
 //! * what the CALCULATION reports is what that run answered: a code block that ran to its end
-//!   COMPLETED with the output it wrote, one that raised FAILED carrying its own traceback on
-//!   the error stream, and one stopped by a bound of this emulator FAILED saying which bound.
+//!   COMPLETED with the output it wrote, and one that raised FAILED carrying its own traceback
+//!   on the error stream. A run a bound of THIS EMULATOR cut short, or one nothing answered
+//!   for, is neither ([`Completion::stopped`]): nothing is known about what the code block
+//!   came to, so no outcome is claimed for it;
+//! * and the code block is a cell of the session it was submitted into, so it finds that
+//!   session's own engine already bound — `spark`, and `sc` for its context — exactly as a
+//!   cell of an interactive Spark session does
+//!   ([`::service_common::spark_runtime::SESSION_BOUND_EVENT_MEMBER`]).
 //!
 //! # Bounds
 //!
@@ -175,6 +181,15 @@ pub struct Completion {
     /// Whether the run FAILED: the code raised or exited non-zero, a bound this emulator holds
     /// a run to stopped it, or nothing answered for it at all.
     pub failed: bool,
+    /// Whether the run was CUT SHORT by this emulator rather than by anything the code did: a
+    /// bound of this emulator stopped it, or nothing answered for it at all.
+    ///
+    /// Such a run says nothing about what the code block came to — the cell is still work in
+    /// flight, which is the state a real session leaves one in until it finishes or something
+    /// cancels it — so the submission records no outcome from it
+    /// (`crate::ops::start_calculation_execution`), rather than reporting this emulator's own
+    /// stop as the cell's failure.
+    pub stopped: bool,
     /// How long the host spent running it.
     pub run_time: Duration,
 }
@@ -216,13 +231,18 @@ pub async fn run(code: String, calculation_execution_id: String) -> Completion {
     let Some(permit) = permit else {
         return not_run(NO_INTERPRETER, started.elapsed());
     };
-    let event = ::serde_json::json!({
+    let mut event = ::serde_json::json!({
         "path": CALCULATION_PATH,
         "source": code,
         "arguments": Vec::<String>::new(),
         "streamCharacters": CALCULATION_STREAM_CHARACTERS,
-    })
-    .to_string();
+    });
+    // The code block is a CELL of a session that is already running, so the session's own
+    // engine is bound for it before its first line — the environment an interactive Spark
+    // session gives a cell, rather than the empty one a standalone submit starts in.
+    event[::service_common::spark_runtime::SESSION_BOUND_EVENT_MEMBER] =
+        ::serde_json::Value::Bool(true);
+    let event = event.to_string();
     let (sender, receiver) = ::tokio::sync::oneshot::channel();
     let spawned = ::std::thread::Builder::new()
         .name("athena-calculation".to_string())
@@ -296,6 +316,8 @@ fn not_run(reason: &str, run_time: Duration) -> Completion {
         stdout: String::new(),
         stderr: format!("{reason}\n"),
         failed: true,
+        // Nothing answered for the code block, so what it came to is not known.
+        stopped: true,
         run_time,
     }
 }
@@ -310,8 +332,9 @@ fn read_run(completion: &python::Completion, run_time: Duration) -> Completion {
         // A streaming answer is one nothing here asks for, so a run that produced one is a run
         // this service can say nothing about.
         python::Completion::Streamed { .. } => not_run(NO_INTERPRETER, run_time),
-        // The entry module itself raised, which is not the code block's own failure: what ran
-        // still failed, and the engine's rendering of the exception is what says why.
+        // The entry module itself raised, which is not the code block's own failure: the
+        // engine's rendering of the exception says why, and what the code block came to is not
+        // known.
         python::Completion::Raised {
             error_type,
             error_message,
@@ -320,12 +343,17 @@ fn read_run(completion: &python::Completion, run_time: Duration) -> Completion {
             stdout: String::new(),
             stderr: format!("{error_type}: {error_message}\n"),
             failed: true,
+            stopped: true,
             run_time,
         },
+        // A BOUND of this emulator stopped the run: the code block was still going, so the
+        // bound is named on the error stream and the run is marked as the one this emulator cut
+        // short rather than as the code block's own failure.
         python::Completion::Stopped(stop) => Completion {
             stdout: String::new(),
             stderr: format!("{}\n", stop.reason()),
             failed: true,
+            stopped: true,
             run_time,
         },
         // The interpreter could not be built or driven, which says nothing about the code.
@@ -360,6 +388,8 @@ fn reported_run(answered: &str, run_time: Duration) -> Completion {
         // code": a program that exited non-zero, or that raised and so exited non-zero, is a
         // calculation that failed.
         failed: status != 0,
+        // The run ANSWERED, whatever it came to.
+        stopped: false,
         run_time,
     }
 }
@@ -405,6 +435,19 @@ mod tests {
                 "from pyspark import SparkConf\nprint(SparkConf().setAppName('a').get('spark.app.name'))",
                 "a\n",
             ),
+            (
+                // The session's own engine, bound for the cell the way an interactive Spark
+                // session binds it: the sum is COMPUTED over the span, and no part of this
+                // emulator holds it.
+                "the session bound as `spark`",
+                "print(spark.range(1, 101).groupBy().sum().collect()[0][0])",
+                "5050\n",
+            ),
+            (
+                "the session's context bound as `sc`",
+                "print(sc.parallelize(range(1, 11)).map(lambda n: n * n).sum())",
+                "385\n",
+            ),
         ];
         for (case, code, expected) in rows {
             let completion = ran(code).await;
@@ -420,7 +463,8 @@ mod tests {
     }
 
     /// RULE: a calculation whose code RAISES failed, and what it reports is the traceback the
-    /// run wrote on its error stream.
+    /// run wrote on its error stream — the code's own failure, not a run this emulator cut
+    /// short.
     #[tokio::test]
     async fn a_calculation_that_raises_reports_the_exception() {
         let rows: &[(&str, &str, &str)] = &[
@@ -436,6 +480,10 @@ mod tests {
                 "case {case:?}: the calculation must fail, got {completion:?}"
             );
             assert!(
+                !completion.stopped,
+                "case {case:?}: the code's own failure is not a run cut short, got {completion:?}"
+            );
+            assert!(
                 completion.stderr.contains(expected),
                 "case {case:?}: the failure must be on the error stream, got {completion:?}"
             );
@@ -444,7 +492,7 @@ mod tests {
 
     /// RULE: the bounds a run is held to are the host's, so a calculation that will not stop is
     /// stopped — including one that catches every exception the stop is delivered as — and what
-    /// it reports is that failure, never an outcome.
+    /// it reports is that this emulator cut the run short, never an outcome.
     #[tokio::test]
     async fn a_calculation_cannot_outlast_the_bounds_the_host_holds_it_to() {
         let rows: &[(&str, &str)] = &[
@@ -453,12 +501,17 @@ mod tests {
                 "a tight loop that catches every stop",
                 "while True:\n    try:\n        pass\n    except BaseException:\n        pass\n",
             ),
+            ("a wait past the span one run may last", "import time\ntime.sleep(600)"),
         ];
         for (case, code) in rows {
             let completion = ran(code).await;
             assert!(
                 completion.failed,
                 "case {case:?}: a stopped calculation has failed, got {completion:?}"
+            );
+            assert!(
+                completion.stopped,
+                "case {case:?}: a run this emulator cut short must say so, got {completion:?}"
             );
             assert!(
                 !completion.stdout.contains("escaped"),

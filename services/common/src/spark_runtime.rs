@@ -286,6 +286,15 @@ pub const SUBMITTED_PROGRAM_MODULE: &str = "__spark_submit_program";
 /// See [`SUBMITTED_PROGRAM_MODULE`].
 pub const SUBMITTED_PROGRAM_FUNCTION: &str = "run";
 
+/// The member a run's event carries to say the program is a CELL of a live session rather
+/// than a standalone submit: the engine of such a session is already started, so the session
+/// is bound for the program as `spark` and its context as `sc` before the first line runs.
+///
+/// Named here because the entry module below reads it: a caller that runs a program inside a
+/// session it already started sets it, and a caller that submits a standalone program leaves
+/// it out — such a program starts its own session, which is what `getOrCreate` is for.
+pub const SESSION_BOUND_EVENT_MEMBER: &str = "sessionBound";
+
 /// The handler the interpreter resolves for it: `<module>.<function>`.
 #[must_use]
 pub fn submitted_program_handler() -> String {
@@ -324,6 +333,11 @@ pub fn submitted_program_source() -> &'static str {
 /// traceback on standard error. What each keeps is bounded by the `streamCharacters` the
 /// calling service passes in the run's event, so a chatty program cannot grow the answer
 /// without limit.
+///
+/// A run whose event says it is a CELL of a live session ([`SESSION_BOUND_EVENT_MEMBER`])
+/// finds that session already bound, as an interactive engine leaves it: `spark` for the
+/// session and `sc` for its context. A standalone submit binds neither, because its program
+/// starts its own.
 ///
 /// Reporting rather than raising is how the run's outcome reaches the calling service: the
 /// engine's own bounds are unaffected, because a run whose budget was spent is reported as
@@ -381,6 +395,17 @@ def run(event, context):
         # by the arguments the submit passed it, which is what spark-submit hands it.
         sys.argv = [event["path"]] + list(event["arguments"])
         globals_of_main = {"__name__": "__main__", "__file__": event["path"]}
+        # A cell of a LIVE session finds the session's engine already started: an interactive
+        # runtime starts the session before it takes the first submission and leaves it bound
+        # as `spark`, with its context as `sc`. A standalone submit binds neither — its
+        # program starts its own session — so the two are bound only for a run that says it
+        # is a session's.
+        if event.get("sessionBound"):
+            from pyspark.sql import SparkSession
+
+            bound = SparkSession.builder.getOrCreate()
+            globals_of_main["spark"] = bound
+            globals_of_main["sc"] = bound.sparkContext
         exec(compile(event["source"], event["path"], "exec"), globals_of_main)
     except SystemExit as ended:
         # sys.exit() is how a program names the status it exits with: no argument and None are
@@ -495,6 +520,23 @@ mod tests {
                      {release:?}"
                 );
             }
+        }
+    }
+
+    /// The entry module reads the SAME event member the caller sets to say its program is a
+    /// cell of a live session, and binds both names such a cell finds bound.
+    #[test]
+    fn the_entry_module_binds_the_session_the_event_member_names() {
+        for held in [
+            format!("event.get(\"{SESSION_BOUND_EVENT_MEMBER}\")"),
+            "globals_of_main[\"spark\"]".to_string(),
+            "globals_of_main[\"sc\"]".to_string(),
+        ] {
+            assert!(
+                submitted_program_source().contains(&held),
+                "case {held:?}: the entry module must carry it, got {:?}",
+                submitted_program_source()
+            );
         }
     }
 }

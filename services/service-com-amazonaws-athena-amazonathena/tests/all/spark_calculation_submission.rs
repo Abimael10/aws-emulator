@@ -5,22 +5,22 @@
 //! assertion is about what an SDK client observes.
 //!
 //! THE RULE UNDER TEST: a calculation runs inside a session, so `StartCalculationExecution`
-//! persists the submitted code block for any session that is still running — whether that
+//! persists the submitted code block for any session that is able to accept one — whether that
 //! session was started in a notebook or for programmatic access — answering with the
 //! `CalculationExecutionId` it minted and the state the calculation was created in, which
-//! `GetCalculationExecutionCode` then answers the same code out of — while every other
-//! session-addressed submission (an id this account holds no session under, a session whose
-//! resources are no longer running) is refused HTTP 400 `InvalidRequestException` with the one
-//! sentence Athena states for the whole class, having persisted nothing and left the session
-//! exactly as it was. A submission that names neither code block, or both of them, is refused
-//! for that instead.
+//! `GetCalculationExecutionCode` then answers the same code out of — while a submission
+//! addressed to an id this account holds no session under is refused HTTP 400
+//! `InvalidRequestException` with the one sentence Athena states for a reference it will not
+//! act on, having persisted nothing and left the session exactly as it was. A submission that
+//! names neither code block, or both of them, is refused for that instead.
 //!
 //! Each rule is asserted over a TABLE rather than one request: the rows differ along the
 //! CODE BLOCK (empty, a single expression, several lines, text outside ASCII, the modelled
 //! maximum length), which member carries it (the current one, the deprecated
 //! `CalculationConfiguration`, neither, both), WHICH SESSION is addressed (notebook-bound,
-//! bound to no notebook, bound to a notebook that is gone, shutting down, shut down, an id
-//! nothing was started under in several forms) and the idempotency token a caller repeats.
+//! bound to no notebook, bound to a notebook that is gone, an id nothing was started under in
+//! several forms) and the idempotency token a caller repeats. What a session that is NOT able
+//! to accept a calculation answers is `tests/all/session_bound_calculations.rs`.
 //!
 //! Nothing here waits on the wall clock: a session that must be at a given point of its
 //! lifecycle is seeded with the instants that put it there — the same seeding
@@ -102,50 +102,30 @@ async fn given_notebook(router: &MultiServiceRouter, name: &str) -> String {
         .to_string()
 }
 
-/// Where in its lifecycle a seeded session sits.
-#[derive(Clone, Copy, Debug)]
-enum Lifecycle {
-    /// Started long enough ago to have its resources: IDLE, "able to accept a calculation".
-    Running,
-    /// Asked to shut down just now: TERMINATING, so its resources are on their way out.
-    ShuttingDown,
-    /// Asked to shut down long enough ago that the shutdown is complete: TERMINATED.
-    ShutDown,
-}
-
-/// Seed one session into `engine`'s store, bound to `notebook_id` and at the point of its
-/// lifecycle `lifecycle` names, and hand back its `SessionId`.
+/// Seed one running session into `engine`'s store, bound to `notebook_id`, and hand back its
+/// `SessionId`.
 ///
-/// Seeding is what lets a row place a session at an exact point of its lifecycle without
-/// waiting for the spans this emulator owes; the submission itself is made over the wire.
-fn given_session(
-    engine: &engine::InMemoryEngine,
-    notebook_id: Option<&str>,
-    lifecycle: Lifecycle,
-) -> String {
+/// Seeding is what lets a row address a session that is able to accept a calculation without
+/// waiting for the span its resources are due after; the submission itself is made over the
+/// wire. What a session at another point of its lifecycle answers is
+/// `tests/all/session_bound_calculations.rs`.
+fn given_session(engine: &engine::InMemoryEngine, notebook_id: Option<&str>) -> String {
     let id = state::new_session_id();
     let started_at = SystemTime::now()
         .checked_sub(WELL_PAST_ANY_RUN)
         .expect("an instant this far back exists");
-    let mut record = SessionRecord::started(
+    let record = SessionRecord::started(
         id.clone(),
         WORK_GROUP.to_string(),
         notebook_id.map(str::to_string),
         started_at,
     );
-    match lifecycle {
-        Lifecycle::Running => {}
-        Lifecycle::ShuttingDown => record.terminate(SystemTime::now()),
-        Lifecycle::ShutDown => record.terminate(started_at),
-    }
     // The seeded instants must really put the session where the row claims, so a mis-seeded
     // row cannot pass by accident.
     let seeded = record.state_at(SystemTime::now());
-    let active = matches!(lifecycle, Lifecycle::Running);
     assert_eq!(
-        record.is_active_at(SystemTime::now()),
-        active,
-        "a session seeded as {lifecycle:?} must be active={active}, got the state {seeded:?}"
+        seeded, SESSION_STATE_IDLE,
+        "a seeded session must be able to accept a calculation, got the state {seeded:?}"
     );
     let store = state::service_state(engine).expect("this service's state");
     store.lock().sessions.insert(record);
@@ -238,7 +218,7 @@ async fn a_notebook_session_keeps_the_code_each_submission_carried() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "analysis").await;
-    let session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let session = given_session(&engine, Some(&notebook));
 
     let long_block = "x".repeat(MAX_CODE_BLOCK_BYTES);
     let rows: Vec<(&str, &str)> = vec![
@@ -289,7 +269,7 @@ async fn a_submission_names_exactly_one_code_block() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "carriers").await;
-    let session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let session = given_session(&engine, Some(&notebook));
 
     // Each row is the request's code-bearing members, and the code it must then read back.
     let accepted_rows: Vec<(&str, Value, &str)> = vec![
@@ -392,7 +372,7 @@ async fn a_session_serving_no_notebook_still_takes_a_calculation() {
         ),
     ];
     for (index, (case, bound_to)) in rows.iter().enumerate() {
-        let session = given_session(&engine, bound_to.as_deref(), Lifecycle::Running);
+        let session = given_session(&engine, bound_to.as_deref());
         let before = session_state(&router, &session).await;
         assert_eq!(
             before, SESSION_STATE_IDLE,
@@ -428,16 +408,20 @@ async fn a_session_serving_no_notebook_still_takes_a_calculation() {
     }
 }
 
-/// RULE: every session-addressed submission this service will not act on is refused the same
-/// way — an id this account holds no session under, whatever its form, and a session whose
-/// resources are on their way out or gone.
+/// RULE: every submission addressed to an id this account holds NO session under is refused
+/// the same way, whatever the form of that id — the one sentence this service answers for a
+/// reference it will not act on, which names no state at all.
+///
+/// A session this account DOES hold that is not able to accept a calculation takes the
+/// sentence that names its own state instead, which is
+/// `tests/all/session_bound_calculations.rs`.
 #[tokio::test]
 async fn a_session_this_service_will_not_act_on_takes_no_calculation() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "unreachable").await;
 
-    let mut rows: Vec<(&str, String)> = vec![
+    let rows: Vec<(&str, String)> = vec![
         ("an id nothing was started under", state::new_session_id()),
         ("an id in the short Athena form", "s-0123456789abcdef".to_string()),
         ("the notebook's own id", notebook.clone()),
@@ -447,14 +431,6 @@ async fn a_session_this_service_will_not_act_on_takes_no_calculation() {
             "s".repeat(256),
         ),
     ];
-    rows.push((
-        "a session shutting down",
-        given_session(&engine, Some(&notebook), Lifecycle::ShuttingDown),
-    ));
-    rows.push((
-        "a session whose resources are gone",
-        given_session(&engine, Some(&notebook), Lifecycle::ShutDown),
-    ));
 
     for (case, session_id) in &rows {
         let (status, refused) = submit(
@@ -486,7 +462,7 @@ async fn a_repeated_idempotency_token_submits_one_calculation() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "idempotent").await;
-    let session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let session = given_session(&engine, Some(&notebook));
     let token = request_token("calculation-token");
 
     let first = accepted(
@@ -513,7 +489,7 @@ async fn a_repeated_idempotency_token_submits_one_calculation() {
     );
 
     // A parameter the token did not mint: each of the three the submission persists.
-    let other_session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let other_session = given_session(&engine, Some(&notebook));
     let changed: Vec<(&str, Value)> = vec![
         (
             "another code block under the same token",
@@ -581,7 +557,7 @@ async fn an_unminted_calculation_has_no_code_to_read() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "reads").await;
-    let session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let session = given_session(&engine, Some(&notebook));
     // One calculation exists throughout, so each refusal below is about the id the request
     // carried rather than about the account holding none.
     let minted = accepted(
@@ -628,7 +604,7 @@ async fn deleting_the_work_group_takes_its_calculations() {
     let (engine, router) = engine_and_router();
     given_spark_work_group(&router).await;
     let notebook = given_notebook(&router, "deleted").await;
-    let session = given_session(&engine, Some(&notebook), Lifecycle::Running);
+    let session = given_session(&engine, Some(&notebook));
     let id = accepted(
         &router,
         "a calculation in the workgroup",

@@ -6,6 +6,13 @@
 //! after. A session that is already inactive is left exactly as it is and reported as it
 //! stands, which is the no-op the operation documents.
 //!
+//! The work IN the session goes with it: every calculation of that session that has not
+//! reached a terminal state is cancelled — "CANCELED - The calculation is no longer running
+//! as the result of a cancel request" — carrying the reason
+//! `CalculationStatus$StateChangeReason` names for exactly this change
+//! ([`crate::state::CALCULATION_CANCELED_WITH_SESSION`]), because a session whose resources
+//! are being torn down runs nothing further.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,9 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a repeat neither restarts the teardown nor moves the instant the session ends
         // at, and the state reported below is the one the session is in.
         record.terminate(now);
+        let state = record.state_at(now).to_string();
 
-        Ok(TerminateSessionOutput {
-            state: Some(record.state_at(now).to_string()),
-        })
+        // A calculation runs INSIDE this session, so the work still in flight in it is
+        // CANCELLED with it rather than left to settle on its own: "CANCELED - The calculation
+        // is no longer running as the result of a cancel request", carrying the reason this
+        // change is made for ("the calculation was canceled because the session was
+        // terminated"). One already in a terminal state keeps the state it reached, so a
+        // repeated shutdown changes nothing here either.
+        store.calculations.cancel_session(&input.session_id, now);
+
+        Ok(TerminateSessionOutput { state: Some(state) })
     }
 }

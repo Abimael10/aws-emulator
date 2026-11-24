@@ -8,23 +8,29 @@
 //! block the request carried, and `GetCalculationExecutionCode` answers out of that same
 //! record — so the code a later read reports is the code this call persisted.
 //!
-//! A calculation runs INSIDE a session, so a session this account holds none of, and one
-//! whose resources are on their way out or gone, run none: both are refused in the one
-//! sentence every session-addressed request this service will not act on is refused with
-//! ([`crate::state::SESSION_NOT_FOUND`]). Whether that session was started in a notebook
-//! decides which notebook the calculation is a cell of and nothing else — a session started
-//! for programmatic access takes calculations exactly as a notebook's session does, which is
-//! the documented path "Submits calculations for execution within a session" names.
+//! A calculation runs INSIDE a session, so a session this account holds none of runs none: it
+//! is refused in the one sentence every session-addressed request this service will not act
+//! on is refused with ([`crate::state::SESSION_NOT_FOUND`]). A session this account DOES hold
+//! takes a calculation only while it is able to accept one — "IDLE - The session is able to
+//! accept a calculation" — and one in any other state is refused in the sentence that NAMES
+//! that state ([`crate::state::session_not_accepting_calculations`]), which is a different
+//! answer: the caller holds the session and is told to start another. Whether that session
+//! was started in a notebook decides which notebook the calculation is a cell of and nothing
+//! else — a session started for programmatic access takes calculations exactly as a
+//! notebook's session does, which is the documented path "Submits calculations for execution
+//! within a session" names.
 //!
 //! What the submission REPORTS is the state it reached: "CREATED - The calculation has been
 //! created and is ready to run". The code block is then RUN — evaluated by the Python engine
-//! this crate embeds, bounded and contained ([`crate::state::calculation_engine`]) — and what
-//! that run produced is recorded on the calculation and saved as objects under the session's
-//! working directory ([`crate::state::calculation_result_objects`]), which is what a later
-//! read reports as the calculation's result. The states between the two are owed by the clock
-//! ([`crate::state::CalculationRecord::state_at`]), so a caller reading straight back sees
-//! the calculation still running, and the session the calculation was submitted into is left
-//! in the state it was in.
+//! this crate embeds, bounded and contained ([`crate::state::calculation_engine`]), as a cell
+//! of the session, whose own Spark session it finds bound — and what that run produced is
+//! recorded on the calculation and saved as objects under the session's working directory
+//! ([`crate::state::calculation_result_objects`]), which is what a later read reports as the
+//! calculation's result. A run this emulator's own bounds cut short records nothing: the cell
+//! is still work in flight and stays RUNNING until something cancels it. The states between
+//! the two are owed by the clock ([`crate::state::CalculationRecord::state_at`]), so a caller
+//! reading straight back sees the calculation still running, and the session the calculation
+//! was submitted into is left in the state it was in.
 //!
 //! ## Shape of an operation
 //!
@@ -256,16 +262,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(session) = store.sessions.session(&input.session_id) else {
                 return Err(crate::state::session_not_authorized());
             };
-            // A session whose resources are no longer running — one shutting down, one whose
-            // resources are gone, one that ended badly — runs nothing, so there is nothing for
-            // a calculation to be submitted into. It takes the session-addressed refusal
-            // rather than the distinct wording `CreatePresignedNotebookUrl` answers for the
-            // same condition (`crate::state::NOTEBOOK_SESSION_NOT_OPEN`), which is the message
-            // RECORDED for that operation: no recording covers this one for a session that is
-            // shutting down or gone, so the refusal stays inside the class every other
-            // session-addressed request of this operation takes.
-            if !session.is_active_at(now) {
-                return Err(crate::state::session_not_authorized());
+            // A session whose resources are not UP runs nothing, so there is nothing for a
+            // calculation to be submitted into.
+            if session.state_at(now) != crate::state::SESSION_STATE_IDLE {
+                // "IDLE - The session is able to accept a calculation", so a session this
+                // account holds in any other state takes none, and the refusal NAMES the state
+                // it is in beside the state it would have to be in
+                // (`crate::state::session_not_accepting_calculations`). A different sentence
+                // from the one above on purpose: the caller HOLDS this session, so it is told
+                // to start another rather than that it may not address this one.
+                return Err(invalid_request(
+                    crate::state::session_not_accepting_calculations(session.state_at(now)),
+                ));
             }
             // The code of a calculation is the code of a cell of the notebook the session's
             // engine serves, and WHICH notebook that is was decided by the start that bound
@@ -353,23 +361,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await
         .unwrap_or_else(|_| crate::state::calculation_engine::not_answered());
-        let (objects, outcome) = crate::state::calculation_result_objects(
-            working_directory.as_deref(),
-            &session_id,
-            &calculation_execution_id,
-            &run,
-        );
-        if let Some(held) = state
-            .lock()
-            .calculations
-            .calculation_mut(&calculation_execution_id)
-        {
-            held.report(outcome, ::std::time::SystemTime::now());
+        // A run a BOUND of this emulator cut short, or one nothing answered for, says nothing
+        // about what the code block came to: the cell is work still in flight, which is the
+        // state Athena leaves one in until it finishes or something cancels it, so NO outcome
+        // is recorded for it and no object is saved under the session's working directory. The
+        // calculation stays RUNNING until a stop of its own, or the termination of its session,
+        // settles it.
+        if !run.stopped {
+            let (objects, outcome) = crate::state::calculation_result_objects(
+                working_directory.as_deref(),
+                &session_id,
+                &calculation_execution_id,
+                &run,
+            );
+            if let Some(held) = state
+                .lock()
+                .calculations
+                .calculation_mut(&calculation_execution_id)
+            {
+                held.report(outcome, ::std::time::SystemTime::now());
+            }
+            // The objects are stored under the destination bucket's own default encryption, as
+            // a write that asks for none is, which is the one rule the object store applies to
+            // every write another service makes into a bucket.
+            crate::state::query_results::write(&*self.engine, objects, &None);
         }
-        // The objects are stored under the destination bucket's own default encryption, as a
-        // write that asks for none is, which is the one rule the object store applies to every
-        // write another service makes into a bucket.
-        crate::state::query_results::write(&*self.engine, objects, &None);
 
         Ok(StartCalculationExecutionOutput {
             calculation_execution_id: Some(calculation_execution_id),
