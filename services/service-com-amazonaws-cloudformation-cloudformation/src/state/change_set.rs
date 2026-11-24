@@ -261,9 +261,8 @@ impl StoredChangeSet {
     /// to the stack on its behalf, however that application ended.
     ///
     /// A change set whose execution has begun is no longer a plan a caller may discard: it
-    /// is the record of a change made to the stack, which is why it stays addressable by
-    /// name and by ARN and why every call that would act on it again is refused on its
-    /// status rather than answered not-found.
+    /// is the record of a change made to the stack, which is why every call that would act on
+    /// it again is refused on its status rather than answered not-found.
     pub fn execution_began(&self) -> bool {
         matches!(
             self.execution_status.as_str(),
@@ -271,6 +270,36 @@ impl StoredChangeSet {
                 | execution_status::EXECUTE_COMPLETE
                 | execution_status::EXECUTE_FAILED
         )
+    }
+
+    /// Whether the execution of this change set has been CARRIED OUT — whether the plan it
+    /// describes was applied to the stack and became the revision the stack now carries, which
+    /// is what the model's `EXECUTE_COMPLETE` reports.
+    ///
+    /// Such a record is no longer a plan the stack HOLDS ([`Self::stack_holds_it`]): the plan
+    /// has been applied, so the name it was created under is free for the next one and
+    /// addresses this record no longer. The record itself stays, addressed by its own ARN,
+    /// which is what keeps the execution it carried out answerable.
+    ///
+    /// An execution that did NOT carry its change through left the stack where it was, so the
+    /// plan is still one of the stack's own records: `EXECUTE_FAILED` is not this.
+    pub fn execution_carried_out(&self) -> bool {
+        self.execution_status == execution_status::EXECUTE_COMPLETE
+    }
+
+    /// Whether this record is one of the change sets its stack HOLDS — what every read of a
+    /// stack's change sets reports and what the per-stack and per-account bounds count.
+    ///
+    /// A stack holds the plans that have still to be carried out, whatever state each is in:
+    /// one being computed, one ready to execute, one an execution superseded (`OBSOLETE`), one
+    /// whose creation failed, one whose execution is being applied right now and one whose
+    /// execution did not carry its change through. It no longer holds a record a
+    /// `DeleteChangeSet` discarded ([`Self::discarded`]), nor one whose execution was carried
+    /// out ([`Self::execution_carried_out`]) — the plan became the stack's current revision, so
+    /// the stack carries it rather than holding it as a change to make. Both stay addressable by
+    /// their own ARN.
+    pub fn stack_holds_it(&self) -> bool {
+        !self.discarded && !self.execution_carried_out()
     }
 
     /// Whether `DeleteChangeSet` may discard this record.

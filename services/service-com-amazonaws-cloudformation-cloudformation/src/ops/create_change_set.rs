@@ -1004,17 +1004,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for here: "this capacity doesn't apply to creating change sets, and specifying it
         // when creating change sets has no effect" — reviewing a macro's expansion in a
         // change set is the very thing the acknowledgement stands in for.
-        // "If the list of resource types doesn't include a resource that you're creating,
-        // the stack creation fails": the bound this request put on the operation it plans is
-        // weighed against the template that plan would deploy, before the plan is written —
-        // the same rule, in the same wording and under the same `ValidationError`, that
-        // `CreateStack` and `UpdateStack` hold their own requests to
+        // "If the list of resource types doesn't include a resource that you're UPDATING,
+        // the stack update fails" (`CreateChangeSetInput$ResourceTypes`): the bound this
+        // request put on the deployment it plans is weighed against the template that
+        // deployment would put on the stack, before the plan is written — the same rule, in
+        // the same wording and under the same `ValidationError` that `CreateStack` and
+        // `UpdateStack` hold their own requests to
         // (`crate::state::resource_type_allow_list`).
-        crate::state::validate_allowed_resource_types(
-            &template_body,
-            input.resource_types.as_deref().unwrap_or_default(),
-        )
-        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        //
+        // What a change set of a type that BRINGS ITS STACK INTO EXISTENCE plans is no update
+        // of a stack: it opens a stack that holds no revision and stays in review until an
+        // execution carries the plan out, so the types it declares are not types this call
+        // works with. Such a request is accepted, with the list it stated recorded on the
+        // change set ([`crate::state::StoredChangeSet::resource_types`]) — the bound this
+        // request put on its own plan, which is part of what a re-submission under the same
+        // name has to restate.
+        if !creates_the_stack {
+            crate::state::validate_allowed_resource_types(
+                &template_body,
+                input.resource_types.as_deref().unwrap_or_default(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
 
         let parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())

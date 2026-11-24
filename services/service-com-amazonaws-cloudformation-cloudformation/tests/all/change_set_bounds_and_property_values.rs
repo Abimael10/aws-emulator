@@ -5,10 +5,11 @@
 //!
 //! The rules every case here holds the service to:
 //!
-//! * **`ResourceTypes` bounds the resources the operation would create or change**: a plan
-//!   that adds, modifies or adopts a resource of a type the stated list does not cover is
-//!   refused before anything is written, while a resource of such a type the plan leaves as
-//!   it stands — or takes away — is nothing the operation works with.
+//! * **`ResourceTypes` bounds the UPDATE a change set plans**: a plan over a stack that
+//!   already stands is refused before anything is written when the template it would deploy
+//!   declares a type the stated list does not cover, while a change set that brings its stack
+//!   into existence — which deploys nothing until it is executed — is admitted with the list
+//!   recorded on it.
 //! * **the stack's own tags are the tags of the resources it manages**: a revision stating
 //!   them differently changes every resource a service holds tags for, under the `Tags`
 //!   attribute rather than under `Properties`, so a tags-only change set is a change set and
@@ -250,10 +251,12 @@ async fn the_allow_list_bounds_the_template_a_change_set_would_deploy() {
     // (case, whether the row CREATES its stack, the template the change set submits, the
     // list it states, the type the refusal must name — `None` for a row the list admits)
     //
-    // What the list bounds is the TEMPLATE the plan would deploy: a body declaring a type the
-    // list does not cover is refused before anything is written, and a body whose every
-    // declared type it covers is admitted — a plan over a stack that does not exist yet and
-    // one over a stack that does alike.
+    // What the list bounds is the UPDATE the plan would carry out: over a stack that already
+    // stands, a body declaring a type the list does not cover is refused before anything is
+    // written, and a body whose every declared type it covers is admitted. A change set of a
+    // type that brings its stack into existence plans no update of a stack, so it is admitted
+    // whatever its template declares — `change_set_resource_types_bound.rs` holds that side of
+    // the rule over every change-set type.
     type BoundRow<'a> = (&'a str, bool, String, Vec<&'a str>, Option<&'a str>);
     let rows: Vec<BoundRow<'_>> = vec![
         (
@@ -339,7 +342,7 @@ async fn the_allow_list_bounds_the_template_a_change_set_would_deploy() {
                 ("Param", parameter("v1")),
             ]),
             vec![UNTAGGED_TYPE],
-            Some(TAGGED_TYPE),
+            None,
         ),
         (
             "a change set that would create its stack, over covered types",

@@ -17,6 +17,14 @@
 //! sentence this module words ([`not_allowed_message`]), since it is the same bound being
 //! weighed.
 //!
+//! The bound is weighed by the call that would DEPLOY the template: a create, an update, and
+//! a change set that plans an update of a stack that already stands — "if the list of resource
+//! types doesn't include a resource that you're updating, the stack update fails"
+//! (`CreateChangeSetInput$ResourceTypes`). A change set of a type that brings its stack INTO
+//! EXISTENCE deploys nothing and updates nothing: it opens a stack that holds no revision and
+//! stays in review until an execution carries the plan out, so such a request states a bound
+//! on its own plan rather than on this call, and is admitted whatever its template declares.
+//!
 //! The syntax a list entry may take is the documented one: `AWS::*` for every resource
 //! Amazon Web Services publishes, `Custom::*` for every custom resource,
 //! `AWS::<service>::*` for every resource of one service, and a type's own name for one

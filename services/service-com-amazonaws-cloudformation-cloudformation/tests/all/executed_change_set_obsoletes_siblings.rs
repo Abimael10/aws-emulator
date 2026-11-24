@@ -14,6 +14,11 @@
 //! at all keeps the status that outcome gave it, and another stack's change sets are not this
 //! stack's plans at all.
 //!
+//! The change set the execution CARRIED OUT is not superseded either, and it is not one of the
+//! stack's plans any more: its plan became the stack's own revision, so the stack holds it no
+//! longer — `ListChangeSets` does not report it and the name it deployed under is free — while
+//! the record of that execution stays addressable by its own ARN.
+//!
 //! The table below spans the states a sibling can be in when the execution runs — a plan ready
 //! to execute (two shapes of it), a creation whose outcome left nothing to execute, a creation
 //! still in flight — and the second phase covers a stack a FIRST execution had already
@@ -228,10 +233,13 @@ async fn executing_one_change_set_supersedes_its_siblings() {
         );
     }
     // The change set this phase EXECUTES, created and settled with the siblings whose
-    // creations conclude before the execution.
+    // creations conclude before the execution. Its own ARN is kept: carrying a plan out frees
+    // the name it deployed under, so the ARN is what addresses the record afterwards.
     let (code, body) =
         create_updating_change_set(&router, stack, "executed-set", &adding("B")).await;
     assert_eq!(code, 200, "the executed change set must be created, got {code} {body}");
+    let executed_arn =
+        xml_text(&body, "Id").expect("CreateChangeSet answers the change set's ARN");
     settle_the_store(&router, &engine).await;
 
     // ...and the siblings whose creation is STILL IN FLIGHT when the execution runs: created
@@ -273,7 +281,7 @@ async fn executing_one_change_set_supersedes_its_siblings() {
         "expected the executed plan to update the stack, got {body}"
     );
     let (_, executed_execution, _) =
-        described(&router, "the executed change set", "executed-set", stack).await;
+        described(&router, "the executed change set", &executed_arn, stack).await;
     assert_eq!(
         executed_execution, execution_status::EXECUTE_COMPLETE,
         "expected the executed change set to report its execution, got \
@@ -286,18 +294,19 @@ async fn executing_one_change_set_supersedes_its_siblings() {
         assert_superseded(&router, sibling, stack).await;
     }
 
-    // Every record the stack holds is still listed, the executed one among them.
+    // Every record the stack still HOLDS is listed. The executed one is not among them: its
+    // plan became the stack's own revision, so the stack holds it no longer and the name it
+    // deployed under is free for the next plan.
     let mut names = listed(&router, stack).await;
     names.sort();
     let mut expected: Vec<String> = table
         .iter()
         .map(|sibling| sibling.name.to_string())
-        .chain(["executed-set".to_string()])
         .collect();
     expected.sort();
     assert_eq!(
         names, expected,
-        "expected every change set of the stack to stay listed, got {names:?}"
+        "expected every plan the stack still holds to stay listed, got {names:?}"
     );
 
     // A superseded plan is a record a caller may discard, and discarding it takes only that
@@ -353,9 +362,14 @@ async fn executing_one_change_set_supersedes_its_siblings() {
     // the record of that execution rather than being superseded with the plans, and the plan
     // this one supersedes — created after the first execution — goes the same way its siblings
     // did.
+    let mut second_arn = String::new();
     for (name, template) in [("second-set", adding("F")), ("spare-set", adding("G"))] {
         let (code, body) = create_updating_change_set(&router, stack, name, &template).await;
         assert_eq!(code, 200, "the change set {name} must be created, got {code} {body}");
+        if name == "second-set" {
+            second_arn =
+                xml_text(&body, "Id").expect("CreateChangeSet answers the change set's ARN");
+        }
     }
     settle_the_store(&router, &engine).await;
     let (code, body) = execute_change_set(&router, "second-set", Some(stack)).await;
@@ -375,11 +389,11 @@ async fn executing_one_change_set_supersedes_its_siblings() {
         stack,
     )
     .await;
-    for (case, name) in [
-        ("the change set the first execution carried out", "executed-set"),
-        ("the change set this execution carried out", "second-set"),
+    for (case, arn) in [
+        ("the change set the first execution carried out", &executed_arn),
+        ("the change set this execution carried out", &second_arn),
     ] {
-        let (_, reported_execution, _) = described(&router, case, name, stack).await;
+        let (_, reported_execution, _) = described(&router, case, arn, stack).await;
         assert_eq!(
             reported_execution,
             execution_status::EXECUTE_COMPLETE,

@@ -455,9 +455,9 @@ async fn a_create_change_set_materialises_its_stack_and_execute_completes_it() {
             "case {:?}: both template stages are available for a stack, got {body}",
             case.case
         );
-        // The change set itself finished executing.
-        let body =
-            settled_change_set(&router, &engine, case.change_set_name, Some(case.stack_name)).await;
+        // The change set itself finished executing, read back through the ARN that addresses
+        // the record of an execution the stack carried out.
+        let body = settled_change_set(&router, &engine, &change_set_id, None).await;
         assert_eq!(
             xml_text(&body, "ExecutionStatus").as_deref(),
             Some(execution_status::EXECUTE_COMPLETE),

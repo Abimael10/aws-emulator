@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Redeploying a stack through change sets that all carry ONE name, which is what a deployment
-//! tool does: before it plans the next deployment it discards the change set the last one
-//! deployed under, because "the name must be unique among all change sets that are associated
-//! with the specified stack".
+//! tool does: it plans every deployment under the same change-set name, because "the name must
+//! be unique among all change sets that are associated with the specified stack".
 //!
-//! RULE: a change set is a RECORD that lives until a caller discards it, and `DeleteChangeSet`
-//! discards the PLAN it describes — so a record whose plan was already applied stops being
-//! reported by every read of the stack's change sets, and the next deployment can plan under
-//! the name the last one deployed under. Every round therefore reads back as a change set of
-//! its own (its own ARN, its own plan), the stack keeps every change its executions carried
-//! out, and the name resolves to the record the LAST round created. What the store KEEPS of a
-//! discarded record is bounded, oldest reclaimed first, so deploying in a loop cannot grow it
-//! without limit.
+//! RULE: a change set is a PLAN the stack holds until it is carried out or discarded. Executing
+//! it carries it out — the plan becomes the stack's revision, so the stack holds that record no
+//! longer and the name it deployed under is free for the next deployment to plan under, with no
+//! delete in between; `DeleteChangeSet` is what frees the name of a plan nothing executed. Every
+//! round therefore reads back as a change set of its own (its own ARN, its own plan), the stack
+//! keeps every change its executions carried out, and the record of each round's execution stays
+//! addressable by its OWN ARN while the shared NAME addresses only the plan the stack still
+//! holds. What the store KEEPS of the records a stack no longer holds is bounded, oldest
+//! reclaimed first, so deploying in a loop cannot grow it without limit.
 //!
 //! The table below is the rounds: the first brings the stack into existence from a `CREATE`
 //! change set and each later one updates it from an `UPDATE` change set, so the rule is held
@@ -88,20 +88,21 @@ async fn a_redeployment_plans_under_the_name_the_last_one_deployed_under() {
 
     for round in 0..3usize {
         let case = format!("round {round}");
-        // Every round after the first discards the record the round before it deployed under
-        // — the executed change set — before it plans anything.
+        // Every round after the first plans under the name the round before it deployed under,
+        // with no delete in between: the execution carried that plan out, so the stack holds
+        // the record no longer and a delete of the name is a no-op that succeeds.
         if round > 0 {
             let (code, body) = delete_change_set(&router, DEPLOY_SET, stack).await;
             assert_eq!(
                 code, 200,
-                "case {case:?}: the record the last round deployed under must be discardable, \
-                 got {code} {body}"
+                "case {case:?}: the name of the plan the last round carried out must be \
+                 deletable, got {code} {body}"
             );
             let (code, body) = describe_change_set(&router, DEPLOY_SET, Some(stack)).await;
             assert_eq!(
                 (code, refusal(&body).0),
                 (404, "ChangeSetNotFound".to_string()),
-                "case {case:?}: the discarded record must read back as not found, got {code} \
+                "case {case:?}: the name must address no plan the stack holds, got {code} \
                  {body}"
             );
         }
@@ -171,7 +172,17 @@ async fn a_redeployment_plans_under_the_name_the_last_one_deployed_under() {
             expected_ids,
             "case {case:?}: expected the stack to carry every round's resources"
         );
+        // ...and the record of that execution is no longer a plan the stack holds: the shared
+        // NAME addresses nothing, while the record itself is still there under its own ARN,
+        // reporting the execution it carried out.
         let (code, described) = describe_change_set(&router, DEPLOY_SET, Some(stack)).await;
+        assert_eq!(
+            (code, refusal(&described).0),
+            (404, "ChangeSetNotFound".to_string()),
+            "case {case:?}: the name must address no plan once this round carried its own \
+             out, got {code} {described}"
+        );
+        let (code, described) = describe_change_set(&router, &arn, None).await;
         assert_eq!(
             (
                 code,
@@ -183,7 +194,7 @@ async fn a_redeployment_plans_under_the_name_the_last_one_deployed_under() {
                 arn.clone(),
                 execution_status::EXECUTE_COMPLETE.to_string()
             ),
-            "case {case:?}: the name must resolve to this round's executed record, got \
+            "case {case:?}: the ARN must resolve to this round's executed record, got \
              {described}"
         );
     }
@@ -199,8 +210,8 @@ async fn what_is_kept_of_the_discarded_records_is_bounded() {
     let (router, engine) = router_with_engine();
     let stack = "discarded-bound";
 
-    // One real deployment, discarded the way a redeployment discards it: the record this bound
-    // is about.
+    // One real deployment, discarded the way a caller discards the record of an execution:
+    // by the ARN that still addresses it. The record this bound is about.
     let (code, body) = create_change_set(
         &router,
         stack,
@@ -212,11 +223,12 @@ async fn what_is_kept_of_the_discarded_records_is_bounded() {
     )
     .await;
     assert_eq!(code, 200, "the change set must be created, got {code} {body}");
+    let arn = xml_text(&body, "Id").expect("CreateChangeSet answers the change set's ARN");
     settle_the_store(&router, &engine).await;
     let (code, body) = execute_change_set(&router, DEPLOY_SET, Some(stack)).await;
     assert_eq!(code, 200, "the change set must execute, got {code} {body}");
     settle_the_store(&router, &engine).await;
-    let (code, body) = delete_change_set(&router, DEPLOY_SET, stack).await;
+    let (code, body) = delete_change_set(&router, &arn, stack).await;
     assert_eq!(code, 200, "the executed record must be discardable, got {code} {body}");
 
     // ...and as many more of them as it takes to put the store past the bound, each a record of

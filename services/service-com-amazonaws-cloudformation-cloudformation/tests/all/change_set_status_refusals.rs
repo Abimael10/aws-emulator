@@ -18,6 +18,8 @@
 //!    plan is still being computed and an execution being applied to the stack are refused with
 //!    the modelled `InvalidChangeSetStatus` naming the execution status that refuses it, and
 //!    such a refusal writes nothing, so every read still resolves the change set afterwards.
+//!    A plan the stack no longer HOLDS — one whose execution was carried out — is addressed by
+//!    its own ARN rather than by the name it deployed under, which is free for the next plan.
 //! 3. **A refusal names the member whose value refuses the call.** A change set whose
 //!    creation left nothing to execute is refused on its `ChangeSetStatus`; one whose
 //!    creation completed is refused on its `ExecutionStatus`, the only member that says the
@@ -314,7 +316,8 @@ async fn execute_change_set_reports_the_status_that_refuses_it() {
             case.execution,
         );
 
-        let (code, body) = execute_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        // Addressed by its own ARN, which names a change set whatever state it is in.
+        let (code, body) = execute_change_set(&router, &change_set_id, Some(&stack_name)).await;
         assert_eq!(
             code, 400,
             "case {:?}: the execution is refused, got {code} {body}",
@@ -439,20 +442,29 @@ async fn an_executed_change_set_keeps_the_record_of_its_execution_until_it_is_di
         // Once the stack has carried the change through, the execution reports itself
         // complete...
         settle_the_store(&router, &engine).await;
-        let (_, body) = describe_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        let (_, body) = describe_change_set(&router, &change_set_id, None).await;
         assert_eq!(
             xml_text(&body, "ExecutionStatus").as_deref(),
             Some(execution_status::EXECUTE_COMPLETE),
             "case {case:?}: the execution completes with the stack, got {body}"
         );
-        // ...and what is left is the RECORD of the change the stack took: it is still read,
-        // still listed for its stack, and a call asking for it to be executed again is
-        // answered on the execution that happened.
-        let (code, body) = describe_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        // ...and what is left is the RECORD of the change the stack took, addressed by its own
+        // ARN: a call asking for it to be executed again is answered on the execution that
+        // happened. The plan is no longer one the stack HOLDS — it became the stack's own
+        // revision — so the name it deployed under addresses nothing and no read of the
+        // stack's change sets reports it.
+        let (code, body) = describe_change_set(&router, &change_set_id, None).await;
         assert_eq!(
             (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
             (200, execution_status::EXECUTE_COMPLETE.to_string()),
-            "case {case:?}: the executed change set stays readable, got {body}"
+            "case {case:?}: the executed change set stays readable by its ARN, got {body}"
+        );
+        let (code, body) = describe_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        assert_eq!(
+            (code, xml_text(&body, "Code").unwrap_or_default()),
+            (404, "ChangeSetNotFound".to_string()),
+            "case {case:?}: the name of a plan that was carried out addresses nothing, got \
+             {code} {body}"
         );
         let (code, body) = call(
             &router,
@@ -462,10 +474,10 @@ async fn an_executed_change_set_keeps_the_record_of_its_execution_until_it_is_di
         .await;
         assert_eq!(
             (code, xml_text(&body, "ChangeSetName")),
-            (200, Some(change_set_name.clone())),
-            "case {case:?}: the change set is still listed for its stack, got {body}"
+            (200, None),
+            "case {case:?}: the stack holds the plan no longer, so it is not listed, got {body}"
         );
-        let (code, body) = execute_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        let (code, body) = execute_change_set(&router, &change_set_id, None).await;
         assert_eq!(
             (
                 code,
@@ -487,13 +499,13 @@ async fn an_executed_change_set_keeps_the_record_of_its_execution_until_it_is_di
         // ...and that record is discardable: "deleting change sets ensures that no one executes
         // the wrong change set", so the delete takes the record away and a read of it is then
         // answered as a change set the stack no longer holds.
-        let (code, body) = delete_change_set(&router, &change_set_name, &stack_name).await;
+        let (code, body) = delete_change_set(&router, &change_set_id, &stack_name).await;
         assert_eq!(
             code, 200,
             "case {case:?}: the record of a concluded execution is discardable, got {code} \
              {body}"
         );
-        let (code, body) = describe_change_set(&router, &change_set_name, Some(&stack_name)).await;
+        let (code, body) = describe_change_set(&router, &change_set_id, None).await;
         assert_eq!(
             (code, xml_text(&body, "Code").unwrap_or_default()),
             (404, "ChangeSetNotFound".to_string()),

@@ -295,6 +295,9 @@ async fn every_path_that_widens_a_deployed_role_settles_and_decides_its_listings
 
         // ---- The revision, stated the way this row states it. ----
         let revised_body = body_template(stack, true);
+        // The ARN of the plan a change-set row executes: carrying a plan out frees the NAME it
+        // deployed under, so the record of that execution is addressed by its own ARN.
+        let mut executed_plan = String::new();
         match row.path {
             Path::RevisedBody => {
                 let (status, answered) = cloudformation(
@@ -325,6 +328,11 @@ async fn every_path_that_widens_a_deployed_role_settles_and_decides_its_listings
                     (settled.as_str(), execution.as_str()),
                     (CHANGE_SET_CREATE_COMPLETE, AVAILABLE),
                     "case {case:?}: the plan must be offered for execution, got {plan}"
+                );
+                executed_plan = opt_element(&plan, "ChangeSetId").unwrap_or_default();
+                assert!(
+                    !executed_plan.is_empty(),
+                    "case {case:?}: a described change set carries its ARN, got {plan}"
                 );
 
                 // A plan that was CREATED and not executed has applied nothing: the stack is the
@@ -376,7 +384,7 @@ async fn every_path_that_widens_a_deployed_role_settles_and_decides_its_listings
             let (status, plan) = cloudformation(
                 &router,
                 "DescribeChangeSet",
-                &[("StackName", stack), ("ChangeSetName", CHANGE_SET)],
+                &[("ChangeSetName", executed_plan.as_str())],
             )
             .await;
             assert_eq!(

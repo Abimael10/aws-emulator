@@ -536,8 +536,9 @@ async fn an_import_that_resolves_settles_the_change_set_the_stack_and_its_resour
 
         // The IMPORT change set, named as `cdk import` names one on a stack it already
         // deployed. The change set the deploy left is the record of what was applied, and that
-        // record is one the tool clears away before it plans again: `DeleteChangeSet` discards
-        // it, which is what frees the name it deployed under.
+        // record is one the tool clears away before it plans again: executing it carried the
+        // plan out, so the stack holds it no longer and the name it deployed under is already
+        // free, which is why that `DeleteChangeSet` finds nothing to take away and succeeds.
         let adopted: Vec<&str> = entries.iter().map(|(logical_id, _)| *logical_id).collect();
         let template = template_body(row.own_queue, &adopted);
         if row.through_a_change_set {
@@ -588,6 +589,11 @@ async fn an_import_that_resolves_settles_the_change_set_the_stack_and_its_resour
             })
             .collect();
         let plan = plan_of(&settled);
+        let import_arn = opt_element(&settled, "ChangeSetId").unwrap_or_default();
+        assert!(
+            !import_arn.is_empty(),
+            "case {case:?}: a described change set carries its ARN, got {settled}"
+        );
         assert_eq!(
             (
                 opt_element(&settled, "Status").unwrap_or_default(),
@@ -619,9 +625,16 @@ async fn an_import_that_resolves_settles_the_change_set_the_stack_and_its_resour
             imported, "IMPORT_COMPLETE",
             "case {case:?}: an executed import must complete as an import, got {imported:?}"
         );
-        let executed =
-            settled_change_set_member(&router, case, row.stack_name, "import", "ExecutionStatus")
-                .await;
+        // Executing the plan carries it out, so the stack holds that record no longer and the
+        // NAME it deployed under is free: the record of the execution is read by its own ARN.
+        let executed = settled_change_set_member(
+            &router,
+            case,
+            row.stack_name,
+            &import_arn,
+            "ExecutionStatus",
+        )
+        .await;
         assert_eq!(
             opt_element(&executed, "ExecutionStatus").as_deref(),
             Some("EXECUTE_COMPLETE"),
