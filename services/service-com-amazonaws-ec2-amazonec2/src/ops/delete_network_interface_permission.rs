@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkInterfacePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkInterfacePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkInterfacePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a permission for a network interface": this operation REMOVES one grant from
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::network_interface_permissions`], so the
+//! permission `CreateNetworkInterfacePermission` recorded is gone from the store and
+//! `DescribeNetworkInterfacePermissions` reports no such permission afterwards — which is why
+//! it answers the id it removed rather than a record ("Is true if the request succeeds and an
+//! error otherwise", `$Return`).
+//!
+//! What it decides, in the order it decides it:
+//!
+//! * a value that is not a `NetworkInterfacePermissionId` at all is refused before the store
+//!   is read (`InvalidNetworkInterfacePermissionID.Malformed`), and an id the account holds no
+//!   permission for is `InvalidNetworkInterfacePermissionID.NotFound` — the pair every id of
+//!   this crate is resolved through;
+//! * `DryRun` stops a request that would have succeeded with `DryRunOperation`, before
+//!   anything is removed — "If you have the required permissions, the error response is
+//!   DryRunOperation" (`$DryRun`);
+//! * "Specify true to remove the permission even if the network interface is attached to an
+//!   instance" (`$Force`) overrides the one condition this delete has: "by default, you cannot
+//!   delete the permission if THE ACCOUNT FOR WHICH YOU'RE REMOVING THE PERMISSION has
+//!   attached the network interface to an instance". The attachment that condition is about is
+//!   the GRANTEE's, made from the account the grant was to; this emulator serves one account
+//!   ([`::engine::emulator_account_id`]) and no operation of this API attaches an interface on
+//!   another account's behalf, so no permission it holds is over an interface the grantee has
+//!   attached and the condition never holds — which leaves `Force` with nothing to override
+//!   rather than making the owner's OWN attachment block a revoke AWS would have performed.
+//!
+//! The removal goes through the store's one removal seam
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::remove_network_interface_permission`]), the
+//! same one [`crate::state::ComAmazonawsEc2Amazonec2State::remove_network_interface`] uses for
+//! the grants over an interface it takes away, so a revoked grant gives its bytes back to the
+//! store's budget exactly as one whose interface went does.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +162,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkInterfacePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkInterfacePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkInterfacePermission"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and nothing this operation decides depends on
+        // it: the permission is named by the request's own id and the answer is whether it was
+        // removed. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // A value that is not a permission id at all is refused BEFORE the store is asked
+        // about it, the way this service orders the two: there is nothing to look up.
+        let permission_id = input.network_interface_permission_id.as_str();
+        if !state::network_interface_permission_id_is_well_formed(permission_id) {
+            return Err(state::invalid_network_interface_permission_id_malformed(
+                permission_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts, so
+        // the permission this call resolves is the one the store ACTUALLY holds.
+        store.materialize_due_transitions();
+
+        // An id the account holds no permission for is a refusal rather than a removal of
+        // nothing — the same answer `DescribeNetworkInterfacePermissions` gives for it.
+        if !store
+            .network_interface_permissions
+            .contains_key(permission_id)
+        {
+            return Err(state::invalid_network_interface_permission_id_not_found(
+                permission_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Specify true to remove the permission even if the network interface is attached to
+        // an instance" (`$Force`) — the override of a condition that cannot arise here, as this
+        // module's own documentation states: the attachment it is about is the GRANTEE's. So
+        // the grant goes either way, and the flag changes nothing about what is removed.
+        let _ = input.force;
+
+        // The removal, through the store's one removal seam, so a revoked grant gives its bytes
+        // back to the budget exactly as one whose interface went does.
+        let removed = store
+            .remove_network_interface_permission(permission_id)
+            .is_some();
+
+        Ok(DeleteNetworkInterfacePermissionOutput {
+            // "Is true if the request succeeds and an error otherwise" (`$Return`): the
+            // permission resolved above was removed by the call, so this reports what the
+            // store did rather than a constant.
+            r#return: Some(removed),
+        })
     }
 }

@@ -13,11 +13,10 @@
 //!    and cut into `MaxResults`-sized pages, in `NetworkInterfacePermissionId` order. A
 //!    fresh account holds none, so the empty set is one row of that rule rather than a fixed
 //!    answer;
-//! 2. it is a READ: no shape of request changes what a later caller sees, beyond the one
-//!    clock-owed move below;
-//! 3. a permission is recorded in the non-terminal `pending` state and the clock owes it
-//!    `granted` one transition span later, so a caller that reads straight after the write
-//!    still sees `pending` and a later one sees `granted`;
+//! 2. it is a READ: no shape of request changes what a later caller sees;
+//! 3. a permission is recorded IN FORCE and stays there: the state every read reports is
+//!    `GRANTED`, and no clock has a move to make on one, so the same read a transition span
+//!    later answers exactly the same;
 //! 4. an id the account holds no permission for is REFUSED
 //!    (`InvalidNetworkInterfacePermissionID.NotFound`) rather than answered as an absent
 //!    row, and something that is not an id of that kind at all is refused before the store
@@ -48,8 +47,7 @@ use ec2::ops::types::INTERFACE_PERMISSION_TYPE_VALUES;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INVALID_MAX_RESULTS, MAX_FILTER_VALUE_BYTES,
     MAX_FILTER_VALUES, MAX_FILTERS, MAX_RESOURCE_IDS, NETWORK_INTERFACE_PERMISSION_ID_PREFIX,
-    NETWORK_INTERFACE_PERMISSION_STATE_GRANTED, NETWORK_INTERFACE_PERMISSION_STATE_PENDING,
-    NetworkInterfacePermissionSpec,
+    NETWORK_INTERFACE_PERMISSION_STATE_GRANTED, NetworkInterfacePermissionSpec,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -343,7 +341,7 @@ async fn every_stored_permission_is_reported_with_its_members_and_a_later_write_
         ("permission", INTERFACE_PERMISSION_TYPE_VALUES[1].to_string()),
         (
             "state",
-            NETWORK_INTERFACE_PERMISSION_STATE_PENDING.to_string(),
+            NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string(),
         ),
     ] {
         let actual = element(&body, member);
@@ -494,16 +492,15 @@ async fn no_shape_of_describe_changes_the_store_or_a_later_answer() {
             "case {case:?}: expected the repeat to carry the same error code, got {second_body}"
         );
     }
-    // The clock-owed `granted` move is the one write a read may make, so what is asserted
-    // here is that no request SHAPE wrote anything of its own: once the moves every seeded
-    // permission was owed have been applied, two further reads leave the store exactly
-    // where it is.
+    // A read may write NOTHING: a permission is recorded in force, so no clock owes one a
+    // move and the store a transition span later is the store the seeding left — whatever
+    // shape of request has been read in between.
     past_the_transition().await;
     let _ = described_ids(&router, "after the transition", &[]).await;
     let settled = snapshot();
     assert!(
         settled.contains(NETWORK_INTERFACE_PERMISSION_STATE_GRANTED),
-        "the clock owed every seeded permission its granted move, got {settled}"
+        "every seeded permission is recorded in force, got {settled}"
     );
     for (case, params) in [
         ("the whole store", Vec::new()),
@@ -516,27 +513,25 @@ async fn no_shape_of_describe_changes_the_store_or_a_later_answer() {
         assert_eq!(
             settled,
             snapshot(),
-            "case {case:?}: a read after the clock's move must leave the store alone"
+            "case {case:?}: a read must leave the store alone"
         );
     }
-    assert_ne!(
+    assert_eq!(
         before, settled,
-        "the seeded permissions start out pending, so the clock's move must be visible in \
-         the store"
+        "a permission has no clock-owed move, so the store must be exactly what the seeding \
+         left"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: the clock owes a pending permission its granted move
+// Rule 3: a recorded permission is in force, and stays there
 // ---------------------------------------------------------------------------
 
-/// A permission is recorded in the non-terminal `pending` state — the
-/// `NetworkInterfacePermissionStateCode` member a grant that is not in force yet carries —
-/// and the clock owes it `granted` one transition span later, whether or not anybody calls
-/// again. So a caller reading straight after the write sees `pending`, a later one sees
-/// `granted`, and the move happens once.
+/// A permission is recorded in the `GRANTED` state — the state of a grant that is in force —
+/// and nothing moves it: the read straight after the write reports it, and so does the one a
+/// transition span later, because no clock owes a permission anything.
 #[tokio::test]
-async fn a_pending_permission_reaches_granted_when_the_clock_owes_it() {
+async fn a_recorded_permission_is_reported_in_force_and_no_clock_moves_it() {
     let (router, engine) = emulator();
     let seeded = seed(&router, &engine).await;
 
@@ -544,12 +539,12 @@ async fn a_pending_permission_reaches_granted_when_the_clock_owes_it() {
     let (status, before) = describe(&router, &[]).await;
     assert_eq!(
         status, 200,
-        "before the transition: expected HTTP 200, got {status} with body {before}"
+        "straight after the write: expected HTTP 200, got {status} with body {before}"
     );
     assert_eq!(
         states(&before),
-        vec![NETWORK_INTERFACE_PERMISSION_STATE_PENDING.to_string(); seeded.permission_ids.len()],
-        "before the transition: every permission must still be pending, got {before}"
+        vec![NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string(); seeded.permission_ids.len()],
+        "straight after the write: every permission must be in force, got {before}"
     );
 
     past_the_transition().await;
@@ -562,7 +557,7 @@ async fn a_pending_permission_reaches_granted_when_the_clock_owes_it() {
     assert_eq!(
         states(&after),
         vec![NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string(); seeded.permission_ids.len()],
-        "after the transition: the clock owed every permission its granted move, got {after}"
+        "after the transition: nothing moves a permission in force, got {after}"
     );
 
     let (status, again) = describe(&router, &[]).await;
@@ -573,7 +568,7 @@ async fn a_pending_permission_reaches_granted_when_the_clock_owes_it() {
     assert_eq!(
         states(&again),
         states(&after),
-        "the move happens once: expected {:?}, got {:?}",
+        "a read changes nothing: expected {:?}, got {:?}",
         states(&after),
         states(&again)
     );

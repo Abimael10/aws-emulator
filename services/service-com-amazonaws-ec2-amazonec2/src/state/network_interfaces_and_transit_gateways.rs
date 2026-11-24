@@ -945,7 +945,7 @@ pub(super) fn instance_network_interface_view(
 // A permission is a resource of its own — "Describes a permission for a network
 // interface" (`NetworkInterfacePermission`), minted with its own
 // `NetworkInterfacePermissionId` and reported by `DescribeNetworkInterfacePermissions`.
-// What the writer and the reporter share — the id mint, the state the clock owes, the
+// What the writer and the reporter share — the id mint, the state a grant is in, the
 // capacity ceiling and the error codes a refusal carries — lives here, so the two cannot
 // disagree about one permission.
 
@@ -955,15 +955,16 @@ pub(super) fn instance_network_interface_view(
 /// the separator [`ComAmazonawsEc2Amazonec2State::next_id`] adds.
 pub const NETWORK_INTERFACE_PERMISSION_ID_PREFIX: &str = "eni-perm";
 
-/// A permission that has been recorded but is not in force yet: the
-/// `NetworkInterfacePermissionStateCode` enum's `pending` member
-/// (`smithy_query(query="shape",shape="NetworkInterfacePermissionStateCode")`), the
-/// non-terminal state a permission sits in until [`TRANSITION_DELAY`] has passed.
-pub const NETWORK_INTERFACE_PERMISSION_STATE_PENDING: &str = "pending";
-
-/// A permission that is in force: that enum's `granted` member, the state the clock owes a
-/// `pending` permission [`TRANSITION_DELAY`] after it was recorded.
-pub const NETWORK_INTERFACE_PERMISSION_STATE_GRANTED: &str = "granted";
+/// The state a network interface permission is recorded and reported in: the
+/// `NetworkInterfacePermissionStateCode` enum's `granted` member
+/// (`smithy_query(query="shape",shape="NetworkInterfacePermissionStateCode")`), spelled the
+/// way this API answers it on the wire — in upper case, which is how a recorded grant of this
+/// class reports its state.
+///
+/// A grant is in force as soon as it is recorded: the create answers it in this state, so
+/// there is nothing non-terminal for a clock to move and a caller never has to wait for a
+/// permission it has just been given.
+pub const NETWORK_INTERFACE_PERMISSION_STATE_GRANTED: &str = "GRANTED";
 
 /// The largest number of network interface permissions this in-memory store holds.
 ///
@@ -1024,28 +1025,6 @@ pub fn invalid_network_interface_permission_id_not_found<E>(
              exist"
         ),
     )
-}
-
-/// Refuse a grant to a party the service cannot confirm as an authorized grantee: HTTP 400
-/// `OperationNotPermitted`, naming the account the request asked to grant to.
-///
-/// "Grants an Amazon Web Services-authorized account permission to attach the specified
-/// network interface to an instance in their account" (`CreateNetworkInterfacePermission`):
-/// the standing the grantee needs is given to an ACCOUNT by AWS, out of band, and no
-/// operation of this API gives it — so a grantee the service cannot confirm holds it is
-/// refused the operation and nothing is recorded, whichever interface and permission type
-/// the request named.
-///
-/// This emulator serves one account ([`::engine::emulator_account_id`]), so that account is
-/// the only grantee whose standing it can confirm, exactly as the one account bounds which
-/// peer a transit gateway peering request may name. The sentence's one variable part is the
-/// account the REQUEST named, bounded by [`echoed_resource_id`] like every other echo of a
-/// caller-chosen value.
-pub fn network_interface_permission_grantee_not_authorized<E>(aws_account_id: &str) -> Scaffolded<E> {
-    Scaffolded::operation_not_permitted(format!(
-        "You are not authorized to grant permissions to account {}",
-        echoed_resource_id(aws_account_id)
-    ))
 }
 
 /// Refuse a grant over a network interface the account does not manage: HTTP 400
@@ -1122,8 +1101,8 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The ONE writer seam, the way [`Self::insert_network_interface`] is for an interface:
     /// everything the service owns is derived here rather than taken from a caller — the id
-    /// and the `pending` state the clock then moves to `granted` one [`TRANSITION_DELAY`]
-    /// later — so two writers cannot report one permission differently. The caller-chosen
+    /// and the [`NETWORK_INTERFACE_PERMISSION_STATE_GRANTED`] state a recorded grant is in —
+    /// so two writers cannot report one permission differently. The caller-chosen
     /// bytes the record retains ([`network_interface_permission_payload_bytes`]) are charged
     /// against the store's byte budget here, so a writer cannot store them uncharged, and
     /// both ceilings are enforced here rather than trusted to the caller.
@@ -1151,19 +1130,15 @@ impl ComAmazonawsEc2Amazonec2State {
             aws_service: spec.aws_service,
             permission: Some(spec.permission),
             // "Information about the state of the permission"
-            // (`NetworkInterfacePermission$PermissionState`): a permission starts out
-            // `pending` and the clock owes it `granted`, so a caller that reads straight
-            // after the write still sees the transient state.
+            // (`NetworkInterfacePermission$PermissionState`): a grant is in force as soon as
+            // it is recorded, so the state it is stored in is the one the create answers and
+            // every later read reports.
             permission_state: Some(NetworkInterfacePermissionState {
-                state: Some(NETWORK_INTERFACE_PERMISSION_STATE_PENDING.to_string()),
+                state: Some(NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string()),
                 status_message: None,
             }),
         };
         self.add_stored_bytes(payload_bytes.saturating_add(STORED_RECORD_OVERHEAD_BYTES));
-        self.network_interface_permission_granted_at.insert(
-            network_interface_permission_id.clone(),
-            due_instant(TRANSITION_DELAY),
-        );
         self.network_interface_permissions
             .insert(network_interface_permission_id.clone(), permission);
         Some(network_interface_permission_id)
@@ -1173,8 +1148,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// reported, or `None` when the store holds no such permission.
     ///
     /// The exact reverse of [`Self::insert_network_interface_permission`]: the record's
-    /// bytes go back to the store's budget and the move the clock still owed it goes with
-    /// it, so a grant followed by its removal leaves the store exactly where it started.
+    /// bytes go back to the store's budget, so a grant followed by its removal leaves the
+    /// store exactly where it started.
     pub fn remove_network_interface_permission(
         &mut self,
         network_interface_permission_id: &str,
@@ -1189,8 +1164,6 @@ impl ComAmazonawsEc2Amazonec2State {
             )
             .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
         );
-        self.network_interface_permission_granted_at
-            .remove(network_interface_permission_id);
         Some(permission)
     }
 

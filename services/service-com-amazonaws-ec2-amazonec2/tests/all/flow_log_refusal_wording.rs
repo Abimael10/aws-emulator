@@ -92,10 +92,14 @@ async fn create_to_destination(
         param("ResourceId.1", vpc_id),
         param("TrafficType", "ALL"),
         param("LogDestination", log_destination),
-        // The role a CloudWatch Logs destination requires; harmless for the other types,
-        // whose delivery stream and bucket are in this same account.
-        param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
     ];
+    // The role a CloudWatch Logs destination requires, and the ONE destination type that takes
+    // it without the cross-account role beside it: "this parameter is required if the
+    // destination type is cloud-watch-logs" (`CreateFlowLogsRequest$DeliverLogsPermissionArn`),
+    // while under the other types it is half of a cross-account delivery pair.
+    if log_destination_type.unwrap_or("cloud-watch-logs") == "cloud-watch-logs" {
+        params.push(param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN));
+    }
     if let Some(log_destination_type) = log_destination_type {
         params.push(param("LogDestinationType", log_destination_type));
     }

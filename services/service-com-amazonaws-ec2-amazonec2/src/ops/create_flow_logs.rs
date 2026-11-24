@@ -311,6 +311,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The roles a delivery is made under: a CROSS-ACCOUNT delivery takes TWO, so a request
+        // that names one of them without the other is refused rather than served a delivery it
+        // gave only half the standing for
+        // ([`state::flow_log_cross_account_role_is_incomplete`] states which combinations those
+        // are, for the destination type in force). A fact of the REQUEST, so it is settled
+        // with the other member-compatibility rules above, before the store is reached and
+        // before anything is written — after the destination itself has been read, because a
+        // destination the type cannot publish to is the more specific fault.
+        if state::flow_log_cross_account_role_is_incomplete(
+            &log_destination_type,
+            input.deliver_logs_permission_arn.as_deref(),
+            input.deliver_cross_account_role.as_deref(),
+        ) {
+            return Err(state::flow_log_cross_account_role_pair_required());
+        }
+
         // Where the records go. For CloudWatch Logs the destination is ONE log group named
         // either way — "specify the ARN of a CloudWatch Logs log group … Alternatively, use
         // the LogGroupName parameter" (`$LogDestination`) — and each member of the created

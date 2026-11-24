@@ -1993,7 +1993,11 @@ pub(super) fn ipam_prefix_list_resolver_family_not_found<E>(
 pub const IPAM_PREFIX_LIST_RESOLVER_REFUSAL_NAME: &str = "IPAM Prefix List Resolver";
 
 /// The same for the resolver TARGET: the resolver's own name with the target's word on the end.
-const IPAM_PREFIX_LIST_RESOLVER_TARGET_REFUSAL_NAME: &str = "IPAM Prefix List Resolver Target";
+///
+/// Public for the same reason the resolver's is: the `NotFound` sentence below words itself
+/// with it, and so does the `IncorrectState` sentence `DeleteIpamPrefixListResolverTarget`
+/// refuses a target that is already going with ([`incorrect_state_of`]).
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_REFUSAL_NAME: &str = "IPAM Prefix List Resolver Target";
 
 /// Refuse a prefix list resolver id this account holds no resolver for: HTTP 400
 /// [`INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND`], worded by the template above.

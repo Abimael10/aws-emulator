@@ -23,13 +23,6 @@
 //!   `InvalidNetworkInterfaceID.NotFound`, and an interface another Amazon Web Services
 //!   service manages is not the account's to share
 //!   ([`crate::state::network_interface_cannot_be_shared`]);
-//! * the standing a grantee needs is given to an ACCOUNT by AWS out of band, and no operation
-//!   of this API gives it, so a grantee the service cannot confirm holds it is refused
-//!   `OperationNotPermitted` and nothing at all is recorded
-//!   ([`crate::state::network_interface_permission_grantee_not_authorized`]). This emulator
-//!   serves one account ([`::engine::emulator_account_id`]), so that is the only grantee
-//!   whose standing it can confirm — the same bound `CreateTransitGatewayPeeringAttachment`
-//!   puts on the peer account a request may name;
 //! * "You can grant permission to a single Amazon Web Services account only, and only one
 //!   account at a time": one grantee's grant of one permission type over one interface is ONE
 //!   record, so a repeat of a grant the account already holds answers that grant rather than
@@ -38,11 +31,10 @@
 //!   anything is written — "If you have the required permissions, the error response is
 //!   DryRunOperation" (`$DryRun`).
 //!
-//! A grant is recorded in the non-terminal `pending` state and the clock owes it `granted`
-//! one transition span later, which
-//! [`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — so
-//! a caller that reads the grant straight after this call still sees `pending`, and a later
-//! one sees `granted`. A permission is a grant over one interface, so it goes when that
+//! A grant is in force as soon as it is recorded: the account the request names holds it from
+//! this call on, so the permission is answered — and reported by every later read — in the
+//! [`crate::state::NETWORK_INTERFACE_PERMISSION_STATE_GRANTED`] state, with nothing owed on
+//! it. A permission is a grant over one interface, so it goes when that
 //! interface does ([`crate::state::ComAmazonawsEc2Amazonec2State::remove_network_interface`]).
 //!
 //! ## Shape of an operation
@@ -199,10 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
-        // The clock-owed move this call applies before it reads the grants the account already
-        // holds: a permission recorded `pending` is `granted` once its due instant has passed,
-        // whether or not anybody called, so a grant this call reports as already held is
-        // reported in the state the clock has already given it.
+        // The clock-owed moves this call applies before it reads the store, the way every other
+        // state-touching handler of this crate starts: the interface a grant is over is
+        // resolved in the state the clock has already given it rather than the one an earlier
+        // call left it in.
         store.materialize_due_transitions();
 
         // A permission is a grant over an interface the account holds, so an id it holds no
@@ -218,16 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if interface.requester_managed == Some(true) {
             return Err(state::network_interface_cannot_be_shared(
                 network_interface_id,
-            ));
-        }
-
-        // The standing the grantee needs comes from AWS rather than from this API, and the one
-        // account this emulator serves is the only grantee whose standing it can confirm —
-        // so every other account is refused the OPERATION, with nothing written and nothing
-        // said about the interface.
-        if aws_account_id != ::engine::emulator_account_id() {
-            return Err(state::network_interface_permission_grantee_not_authorized(
-                aws_account_id,
             ));
         }
 
@@ -257,8 +239,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The write: everything the service owns — the `NetworkInterfacePermissionId` and the
-        // `pending` state the clock then moves to `granted` — is derived by the store's one
-        // writer seam rather than here, so this grant and a seeded one are the same record.
+        // state a recorded grant is in — is derived by the store's one writer seam rather than
+        // here, so this grant and a seeded one are the same record.
         let Some(permission_id) =
             store.insert_network_interface_permission(state::NetworkInterfacePermissionSpec {
                 network_interface_id: network_interface_id.to_string(),

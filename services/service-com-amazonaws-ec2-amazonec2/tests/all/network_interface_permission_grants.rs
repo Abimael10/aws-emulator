@@ -12,17 +12,16 @@
 //!    the account holds and answers it as stored, so `DescribeNetworkInterfacePermissions`
 //!    reports the very record the create minted — whichever published permission type and
 //!    whichever interface the request named;
-//! 2. a recorded grant starts in the non-terminal `pending` state and the clock owes it
-//!    `granted`, so a caller reading straight after the write still sees `pending` and a
-//!    caller that polls leaves that loop at `granted` with nothing but the clock moving it;
+//! 2. a recorded grant is IN FORCE: it is answered, and read back, in the `GRANTED` state,
+//!    with no clock-owed move to wait for — a caller that reads straight after the write sees
+//!    the grant it was just given;
 //! 3. "You can grant permission to a single Amazon Web Services account only, and only one
 //!    account at a time" (`CreateNetworkInterfacePermission`): one grantee's grant of one
 //!    permission type over one interface is ONE record, so a repeat answers that grant and a
 //!    grant of the OTHER type over the same interface is a second one;
-//! 4. the grantee has to be one the service can confirm as authorized — the standing is given
-//!    to an account by AWS out of band and no operation of this API gives it — so a grant to
-//!    any other account is refused `OperationNotPermitted`, and a request that does not name
-//!    exactly one readable grantee is refused for THAT (`MissingParameter`,
+//! 4. the grantee is ANY Amazon Web Services account id — the point of the operation is to
+//!    share the interface with another account — while a request that does not name exactly
+//!    one readable grantee is refused for THAT (`MissingParameter`,
 //!    `InvalidParameterCombination`, `UnsupportedOperation`, `InvalidParameterValue`);
 //! 5. the interface has to be one the account holds and manages: something that is not an
 //!    interface id is refused before the store is read, an id the account holds no interface
@@ -38,15 +37,13 @@
 //! `DescribeNetworkInterfacePermissions`, so what is asserted is the store both operations
 //! share.
 
-use std::time::{Duration, Instant};
-
 use ec2::ops::types::INTERFACE_PERMISSION_TYPE_VALUES;
 use ec2::state::{
     AWS_ACCOUNT_ID_DIGITS, ComAmazonawsEc2Amazonec2State as Ec2State, DRY_RUN_OPERATION,
     INVALID_NETWORK_INTERFACE_ID_MALFORMED, INVALID_NETWORK_INTERFACE_ID_NOT_FOUND,
     INVALID_PARAMETER_COMBINATION, INVALID_PARAMETER_VALUE, MISSING_PARAMETER,
     NETWORK_INTERFACE_PERMISSION_ID_PREFIX, NETWORK_INTERFACE_PERMISSION_STATE_GRANTED,
-    NETWORK_INTERFACE_PERMISSION_STATE_PENDING, UNSUPPORTED_OPERATION,
+    UNSUPPORTED_OPERATION,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -62,20 +59,12 @@ const REGION: &str = "us-east-1";
 /// EC2's code for an action the resource or the caller's standing forbids.
 const OPERATION_NOT_PERMITTED: &str = "OperationNotPermitted";
 
-/// How long a poll below is given before it reports that a grant never left `pending` —
-/// generously past [`ec2::state::TRANSITION_DELAY`], so a slow machine fails nothing, while
-/// a state the loop's guard never matches still ends the test instead of hanging.
-const POLL_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long a poll waits between reads, as a client's own waiter does.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 /// One row of a table that expects a refusal: `(case, the parameters, the error code)`.
 type RefusalRow = (&'static str, Vec<Param>, &'static str);
 
-/// The one account this emulator serves, which is therefore the one grantee whose standing
-/// the service can confirm. Read from the emulator rather than written as a literal, so the
-/// test asks for what the service itself serves.
+/// The one account this emulator serves, which is therefore the account a grant to "another"
+/// account is distinguished from. Read from the emulator rather than written as a literal, so
+/// the test asks about what the service itself serves.
 fn served_account() -> &'static str {
     ::engine::emulator_account_id()
 }
@@ -84,26 +73,26 @@ fn emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
     super::ec2_query::emulator()
 }
 
-/// One grant to the served account that has to succeed, and the `NetworkInterfacePermissionId`
-/// it answered.
+/// One grant that has to succeed, and the `NetworkInterfacePermissionId` it answered.
 async fn granted_id(
     router: &MultiServiceRouter,
     interface_id: &str,
+    grantee: &str,
     permission: &str,
 ) -> String {
     let (status, body) = grant(
         router,
         &[
             param("NetworkInterfaceId", interface_id),
-            param("AwsAccountId", served_account()),
+            param("AwsAccountId", grantee),
             param("Permission", permission),
         ],
     )
     .await;
     assert_eq!(
         status, 200,
-        "a grant of {permission} over {interface_id} must succeed, got {status} with body \
-         {body}"
+        "a grant of {permission} over {interface_id} to {grantee} must succeed, got {status} \
+         with body {body}"
     );
     element(&body, "networkInterfacePermissionId").unwrap_or_default()
 }
@@ -208,45 +197,27 @@ async fn described_member(
     element(&body, name)
 }
 
-/// Poll the describe while the grant reports the non-terminal `pending` state, exactly as a
-/// client's readiness waiter does, and answer the state it finally reported.
-async fn poll_until_not_pending(
-    router: &MultiServiceRouter,
-    case: &str,
-    permission_id: &str,
-) -> String {
-    let deadline = Instant::now() + POLL_DEADLINE;
-    let mut state = described_member(router, case, permission_id, "state")
-        .await
-        .unwrap_or_default();
-    while state == NETWORK_INTERFACE_PERMISSION_STATE_PENDING && Instant::now() < deadline {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        state = described_member(router, case, permission_id, "state")
-            .await
-            .unwrap_or_default();
-    }
-    state
-}
-
 // ---------------------------------------------------------------------------
-// Rules 1 and 2: the grant is recorded, and the clock owes it `granted`
+// Rules 1 and 2: the grant is recorded, and it is in force
 // ---------------------------------------------------------------------------
 
 /// What one row of the success table grants: a published permission type over one of the two
-/// interfaces the account created.
+/// interfaces the account created, to one grantee account.
 struct GrantCase {
     case: &'static str,
     /// Which of the seeded interfaces the grant is over.
     interface: usize,
+    /// The Amazon Web Services account id the interface is shared with.
+    grantee: String,
     /// One member of the `InterfacePermissionType` enum
     /// (`INTERFACE_PERMISSION_TYPE_VALUES`, the whole published catalog).
     permission: &'static str,
 }
 
-/// Each published permission type, over more than one interface, granted to the account the
-/// service can confirm: every row mints its own permission, reports it `pending`, and is
+/// Each published permission type, over more than one interface, granted to accounts of its
+/// own: every row mints its own permission, reports it in force, and is
 /// reported back by the describe with the members it was written with. The ids are distinct,
-/// so each row is its own record, and the clock then owes every one of them `granted`.
+/// so each row is its own record.
 #[tokio::test]
 async fn every_published_permission_type_is_recorded_and_reads_back_from_the_store() {
     let (router, engine) = emulator();
@@ -256,22 +227,34 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
         create_interface(&router, &subnet_id, "also shared").await,
     ];
 
-    // The rows differ along the two things the rule generalises over: which published type is
-    // granted, and which interface it is over.
+    // The rows differ along the three things the rule generalises over: which published type
+    // is granted, which interface it is over, and which account it is granted to — an account
+    // other than the one the emulator serves (which is the whole point of the operation), the
+    // served account itself, and an account a digit away from it.
+    let neighbouring_account = {
+        let mut digits: Vec<char> = served_account().chars().collect();
+        let last = digits.len() - 1;
+        digits[last] = if digits[last] == '9' { '8' } else { '9' };
+        digits.into_iter().collect::<String>()
+    };
     let cases = [
         GrantCase {
-            case: "the first published type over the first interface",
+            case: "the first published type over the first interface, to another account",
             interface: 0,
+            grantee: "111122223333".to_string(),
             permission: INTERFACE_PERMISSION_TYPE_VALUES[0],
         },
         GrantCase {
-            case: "the second published type over the first interface",
+            case: "the second published type over the first interface, to the served account",
             interface: 0,
+            grantee: served_account().to_string(),
             permission: INTERFACE_PERMISSION_TYPE_VALUES[1],
         },
         GrantCase {
-            case: "the second published type over the second interface",
+            case: "the second published type over the second interface, to a neighbouring \
+                   account",
             interface: 1,
+            grantee: neighbouring_account,
             permission: INTERFACE_PERMISSION_TYPE_VALUES[1],
         },
     ];
@@ -283,7 +266,7 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
             &router,
             &[
                 param("NetworkInterfaceId", interface_id),
-                param("AwsAccountId", served_account()),
+                param("AwsAccountId", &case.grantee),
                 param("Permission", case.permission),
             ],
         )
@@ -308,11 +291,11 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
         // answered them.
         for (member, expected) in [
             ("networkInterfaceId", interface_id.to_string()),
-            ("awsAccountId", served_account().to_string()),
+            ("awsAccountId", case.grantee.clone()),
             ("permission", case.permission.to_string()),
             (
                 "state",
-                NETWORK_INTERFACE_PERMISSION_STATE_PENDING.to_string(),
+                NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string(),
             ),
         ] {
             let actual = element(&body, member);
@@ -332,8 +315,12 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
         for (member, expected) in [
             ("networkInterfacePermissionId", permission_id.clone()),
             ("networkInterfaceId", interface_id.to_string()),
-            ("awsAccountId", served_account().to_string()),
+            ("awsAccountId", case.grantee.clone()),
             ("permission", case.permission.to_string()),
+            (
+                "state",
+                NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string(),
+            ),
         ] {
             let actual = described_member(&router, label, &permission_id, member).await;
             assert_eq!(
@@ -353,18 +340,6 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
         expected,
         "the describe must report every grant the creates recorded"
     );
-
-    // The clock owes each `pending` grant its `granted` move, with nothing but the clock
-    // making it happen: the poll is on the published `pending` value, so it leaves the loop
-    // at whatever the grant settles in, and that has to be `granted`.
-    for permission_id in &minted {
-        let settled = poll_until_not_pending(&router, "after the clock's move", permission_id).await;
-        assert_eq!(
-            settled, NETWORK_INTERFACE_PERMISSION_STATE_GRANTED,
-            "case {permission_id:?}: expected the clock to move the grant to \
-             {NETWORK_INTERFACE_PERMISSION_STATE_GRANTED}, got {settled:?}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,29 +348,38 @@ async fn every_published_permission_type_is_recorded_and_reads_back_from_the_sto
 
 /// A repeat of a grant the account already holds answers THAT grant rather than minting a
 /// second id beside it, while a grant of the other published type over the same interface,
-/// and the same type over another interface, are records of their own. The rows differ along
-/// what makes a grant the same one: the permission type and the interface.
+/// the same type over another interface, and the same type to another GRANTEE are records of
+/// their own. The rows differ along what makes a grant the same one: the permission type, the
+/// interface and the grantee.
 #[tokio::test]
 async fn a_repeat_of_a_held_grant_answers_that_grant_and_a_different_one_mints_its_own() {
     let (router, engine) = emulator();
     let subnet_id = default_subnet(&engine);
     let first = create_interface(&router, &subnet_id, "granted twice").await;
     let second = create_interface(&router, &subnet_id, "granted once").await;
+    const GRANTEE: &str = "111122223333";
+    const OTHER_GRANTEE: &str = "444455556666";
 
-    let original = granted_id(&router, &first, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
+    let original = granted_id(&router, &first, GRANTEE, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
     for case in ["the first repeat", "the second repeat"] {
-        let repeated = granted_id(&router, &first, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
+        let repeated =
+            granted_id(&router, &first, GRANTEE, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
         assert_eq!(
             repeated, original,
             "case {case:?}: expected the grant already held ({original:?}), got {repeated:?}"
         );
     }
 
-    let other_type = granted_id(&router, &first, INTERFACE_PERMISSION_TYPE_VALUES[1]).await;
-    let other_interface = granted_id(&router, &second, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
+    let other_type =
+        granted_id(&router, &first, GRANTEE, INTERFACE_PERMISSION_TYPE_VALUES[1]).await;
+    let other_interface =
+        granted_id(&router, &second, GRANTEE, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
+    let other_grantee =
+        granted_id(&router, &first, OTHER_GRANTEE, INTERFACE_PERMISSION_TYPE_VALUES[0]).await;
     for (case, id) in [
         ("the other permission type", &other_type),
         ("the other interface", &other_interface),
+        ("the other grantee", &other_grantee),
     ] {
         assert_ne!(
             id, &original,
@@ -403,7 +387,7 @@ async fn a_repeat_of_a_held_grant_answers_that_grant_and_a_different_one_mints_i
         );
     }
 
-    let mut expected = vec![original, other_type, other_interface];
+    let mut expected = vec![original, other_type, other_interface, other_grantee];
     expected.sort();
     assert_eq!(
         described_ids(&router, "after the repeats").await,
@@ -417,12 +401,11 @@ async fn a_repeat_of_a_held_grant_answers_that_grant_and_a_different_one_mints_i
 // Rules 4, 5 and 6: who may be granted, over what, and that a refusal records nothing
 // ---------------------------------------------------------------------------
 
-/// A grantee the service cannot confirm, a request that does not name exactly one readable
-/// grantee, and an interface the request cannot name are each refused with the code that
-/// says WHICH of them it was — and none of them records anything.
+/// A request that does not name exactly one readable grantee, and an interface the request
+/// cannot name, are each refused with the code that says WHICH of them it was — and none of
+/// them records anything.
 ///
-/// The rows differ along every form the two can take: several accounts beside the one the
-/// service serves (including one a digit away from it), an account that is not an account id
+/// The rows differ along every form the two can take: an account that is not an account id
 /// in three different ways, no grantee at all, two grantees, a service grantee, an interface
 /// id of another shape and a well-formed id the account holds no interface for.
 #[tokio::test]
@@ -450,46 +433,11 @@ async fn a_grantee_or_an_interface_the_service_cannot_accept_is_refused_and_reco
         element(&body, "networkInterfacePermissionId").unwrap_or_default()
     };
 
-    // An account id a digit away from the served one: still an account id, still not an
-    // account whose standing the service can confirm.
-    let neighbouring_account = {
-        let mut digits: Vec<char> = served_account().chars().collect();
-        let last = digits.len() - 1;
-        digits[last] = if digits[last] == '9' { '8' } else { '9' };
-        digits.into_iter().collect::<String>()
-    };
     // A well-formed interface id of the long form (17 hexadecimal digits) the account holds
     // no interface for.
     const UNHELD_INTERFACE: &str = "eni-000000000000000ff";
 
     let rows: Vec<RefusalRow> = vec![
-        (
-            "an account the service cannot confirm",
-            vec![
-                param("NetworkInterfaceId", &interface_id),
-                param("AwsAccountId", "111122223333"),
-                param("Permission", INTERFACE_PERMISSION_TYPE_VALUES[0]),
-            ],
-            OPERATION_NOT_PERMITTED,
-        ),
-        (
-            "another such account, with the other permission type",
-            vec![
-                param("NetworkInterfaceId", &interface_id),
-                param("AwsAccountId", "444455556666"),
-                param("Permission", INTERFACE_PERMISSION_TYPE_VALUES[1]),
-            ],
-            OPERATION_NOT_PERMITTED,
-        ),
-        (
-            "an account one digit from the served one",
-            vec![
-                param("NetworkInterfaceId", &interface_id),
-                param("AwsAccountId", &neighbouring_account),
-                param("Permission", INTERFACE_PERMISSION_TYPE_VALUES[0]),
-            ],
-            OPERATION_NOT_PERMITTED,
-        ),
         (
             "an account id too short to be one",
             vec![
@@ -619,15 +567,26 @@ async fn a_dry_run_answers_what_the_request_would_have_done_and_records_nothing(
             DRY_RUN_OPERATION,
         ),
         (
-            "a grant to an account the service cannot confirm",
+            "a grant to another account, which would have succeeded too",
             vec![
                 param("NetworkInterfaceId", &interface_id),
                 param("AwsAccountId", "111122223333"),
                 param("Permission", INTERFACE_PERMISSION_TYPE_VALUES[0]),
                 param("DryRun", "true"),
             ],
+            412,
+            DRY_RUN_OPERATION,
+        ),
+        (
+            "a grant whose account is not an account id",
+            vec![
+                param("NetworkInterfaceId", &interface_id),
+                param("AwsAccountId", "abcdefghijkl"),
+                param("Permission", INTERFACE_PERMISSION_TYPE_VALUES[0]),
+                param("DryRun", "true"),
+            ],
             400,
-            OPERATION_NOT_PERMITTED,
+            INVALID_PARAMETER_VALUE,
         ),
         (
             "a grant over an interface the account holds none of",

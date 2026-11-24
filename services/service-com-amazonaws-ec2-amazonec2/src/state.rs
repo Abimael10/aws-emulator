@@ -558,11 +558,9 @@
 //! account has granted over those interfaces, as the modelled [`NetworkInterfacePermission`]
 //! shape itself, keyed by `NetworkInterfacePermissionId` in a [`BTreeMap`] for the same
 //! reason every other store here is: one stable order a pagination token can name a position
-//! in. A permission is recorded in the non-terminal `pending` state, so the clock owes it
-//! `granted` one [`TRANSITION_DELAY`] later; the due instant sits beside the record in
-//! [`ComAmazonawsEc2Amazonec2State::network_interface_permission_granted_at`], the way a
-//! `pending` VPC's does, and [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]
-//! applies it. A permission names an interface, so
+//! in. A permission is recorded in force — the state a grant is answered and reported in is
+//! [`NETWORK_INTERFACE_PERMISSION_STATE_GRANTED`], so nothing is owed on one and no caller
+//! has to wait for a grant it was just given. A permission names an interface, so
 //! [`ComAmazonawsEc2Amazonec2State::remove_network_interface`] drops the permissions over the
 //! interface it removes rather than leaving a grant over something the account no longer
 //! holds.

@@ -161,6 +161,55 @@ pub fn flow_log_member_unsupported_for_destination<E>(
     )
 }
 
+/// Whether the request's two delivery-role members name CROSS-ACCOUNT delivery without
+/// giving it both halves, for the destination type `log_destination_type` in force.
+///
+/// "The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts"
+/// (`CreateFlowLogsRequest$DeliverCrossAccountRole`) and "the ARN of the IAM role that allows
+/// Amazon EC2 to publish flow logs to the log destination. This parameter is required if the
+/// destination type is `cloud-watch-logs`, or if the destination type is
+/// `kinesis-data-firehose` and the delivery stream and the resources to monitor are in
+/// different accounts" (`$DeliverLogsPermissionArn`): the roles a cross-account delivery needs
+/// are a PAIR — one says which role may publish to the destination, the other which role the
+/// monitored account is reached through — so a request that names one of them alone asks for a
+/// delivery it has given only half the standing for.
+///
+/// The one destination type whose delivery takes `DeliverLogsPermissionArn` on its own is
+/// `cloud-watch-logs`, where that member is mandatory whether or not the delivery crosses
+/// accounts ([`super::flow_log_delivery_role_required`]); under every other type the member
+/// stands for cross-account delivery alone, so naming it there without the cross-account role
+/// is the same half-given request as naming the cross-account role without it.
+pub fn flow_log_cross_account_role_is_incomplete(
+    log_destination_type: &str,
+    deliver_logs_permission_arn: Option<&str>,
+    deliver_cross_account_role: Option<&str>,
+) -> bool {
+    let names_destination_role = deliver_logs_permission_arn.is_some();
+    let names_cross_account_role = deliver_cross_account_role.is_some();
+    // The destination type that takes the destination role on its own: a request naming only
+    // that member under it asks for the same-account delivery that member is required for,
+    // rather than half a cross-account one.
+    let role_stands_alone = log_destination_type == LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS;
+    match (names_destination_role, names_cross_account_role) {
+        (true, false) => !role_stands_alone,
+        (false, true) => true,
+        _ => false,
+    }
+}
+
+/// Refuse a `CreateFlowLogs` that named one of the two cross-account delivery roles without
+/// the other ([`flow_log_cross_account_role_is_incomplete`]): HTTP 400 [`INVALID_PARAMETER`],
+/// with the sentence a recorded refusal of this class pins — wholly fixed text that names both
+/// modelled members, with no part taken from the request.
+pub fn flow_log_cross_account_role_pair_required<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        "When providing a role for cross-account delivery, both the DeliverLogsPermissionArn \
+         and DeliverCrossAccountRole fields must be set.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

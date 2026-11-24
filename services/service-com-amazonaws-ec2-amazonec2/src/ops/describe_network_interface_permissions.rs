@@ -251,10 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // The clock-owed move this read is allowed to apply, the same call `DescribeSubnets`
-        // makes: a permission recorded `pending` is `granted` once its due instant has
-        // passed, whether or not anybody called, so applying it here changes nothing a
-        // later caller would not have seen anyway.
+        // The clock-owed moves this read is allowed to apply, the same call `DescribeSubnets`
+        // makes: every move the store owed was owed at its own instant whether or not anybody
+        // called, so applying them here changes nothing a later caller would not have seen
+        // anyway.
         store.materialize_due_transitions();
 
         // An id that names no permission of the account is an error, not an absent row —

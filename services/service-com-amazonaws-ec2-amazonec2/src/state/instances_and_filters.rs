@@ -721,30 +721,6 @@ impl ComAmazonawsEc2Amazonec2State {
         for prefix_list_id in deleted {
             self.remove_managed_prefix_list(&prefix_list_id);
         }
-        // A permission granted over a network interface is recorded `pending` and reaches
-        // `granted` at its due instant, whether or not anybody called — the permission
-        // counterpart of the moves above.
-        let network_interface_permissions = &mut self.network_interface_permissions;
-        self.network_interface_permission_granted_at
-            .retain(|network_interface_permission_id, due_at| {
-                if now < *due_at {
-                    return true;
-                }
-                if let Some(permission) =
-                    network_interface_permissions.get_mut(network_interface_permission_id)
-                {
-                    if let Some(state) = permission.permission_state.as_mut() {
-                        if state.state.as_deref()
-                            == Some(NETWORK_INTERFACE_PERMISSION_STATE_PENDING)
-                        {
-                            state.state =
-                                Some(NETWORK_INTERFACE_PERMISSION_STATE_GRANTED.to_string());
-                        }
-                    }
-                }
-                // The move is applied once; nothing is owed on this permission any more.
-                false
-            });
         // The two moves an IAM instance profile association owes the clock: `associating` ->
         // `associated`, and the REMOVAL of one whose disassociation has been started.
         self.settle_due_iam_instance_profile_associations(now);
@@ -1047,6 +1023,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // the same contract as its creation above, on the same clock, and it synchronizes the
         // version the modification left it configured for.
         self.materialize_due_ipam_prefix_list_resolver_target_modifications(now);
+        // A target `DeleteIpamPrefixListResolverTarget` answered as `delete-in-progress` reaches
+        // `delete-complete` once its due instant has passed, whether or not anybody called —
+        // the other end of the same target's life, owed and applied exactly as its creation and
+        // its modification are above.
+        self.materialize_due_ipam_prefix_list_resolver_target_deletions(now);
         // A resource discovery `CreateIpamResourceDiscovery` answered as `create-in-progress`
         // reaches `create-complete` once its due instant has passed, whether or not anybody
         // called — the same contract as the scope above. The DEFAULT discovery of an IPAM is

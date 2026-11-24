@@ -2447,10 +2447,9 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// of the same request answers with that interface instead of creating a second one.
     pub network_interface_client_tokens: HashMap<String, String>,
     /// The move the clock owes the ATTACHMENT of a network interface, by
-    /// `NetworkInterfaceId` — the interface counterpart of
-    /// [`Self::network_interface_permission_granted_at`], on the same monotonic clock and the
-    /// same [`TRANSITION_DELAY`], carried as the [`PendingStateMove`] every other owed move of
-    /// this store uses.
+    /// `NetworkInterfaceId` — on the same monotonic clock and the
+    /// same [`TRANSITION_DELAY`] as every other owed move of this store, carried as the
+    /// [`PendingStateMove`] they all use.
     ///
     /// `AttachNetworkInterface` answers an attachment in the non-terminal
     /// [`ATTACHMENT_STATUS_ATTACHING`] and the clock owes it [`ATTACHMENT_STATUS_ATTACHED`];
@@ -2473,13 +2472,6 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// it goes when the interface it is over goes
     /// ([`Self::remove_network_interface`]).
     pub network_interface_permissions: BTreeMap<String, NetworkInterfacePermission>,
-    /// When a `pending` network interface permission's `granted` move falls due, by
-    /// `NetworkInterfacePermissionId` — the permission counterpart of
-    /// [`Self::vpc_available_at`], on the same monotonic clock and the same
-    /// [`TRANSITION_DELAY`]: a permission is recorded `pending` and the clock owes it
-    /// `granted` whether or not anybody calls again.
-    /// [`Self::materialize_due_transitions`] applies it.
-    pub network_interface_permission_granted_at: BTreeMap<String, Instant>,
     /// Every association between one of the account's instances and an IAM instance profile,
     /// by `IamInstanceProfileAssociationId`, as the modelled
     /// [`crate::ops::types::IamInstanceProfileAssociation`] shape itself. Written only by the
@@ -2497,7 +2489,7 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub iam_instance_profile_association_by_instance: BTreeMap<String, String>,
     /// When the move the clock owes an IAM instance profile association falls due, by
     /// `IamInstanceProfileAssociationId` — the association counterpart of
-    /// [`Self::network_interface_permission_granted_at`], on the same monotonic clock and
+    /// [`Self::vpc_available_at`], on the same monotonic clock and
     /// the same [`TRANSITION_DELAY`]: an `associating` association becomes `associated`, and
     /// a `disassociating` one is removed, whether or not anybody calls again.
     /// [`Self::materialize_due_transitions`] applies it.
@@ -3478,6 +3470,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same [`TRANSITION_DELAY`] as the creation above and applied by
     /// [`Self::materialize_due_transitions`], which SYNCHRONIZES the target as it applies it.
     pub ipam_prefix_list_resolver_target_modify_complete_at: BTreeMap<String, Instant>,
+    /// When a `delete-in-progress` resolver target's move to `delete-complete` falls due, by
+    /// `IpamPrefixListResolverTargetId` — what `DeleteIpamPrefixListResolverTarget` records for
+    /// the target it deleted
+    /// ([`Self::begin_ipam_prefix_list_resolver_target_deletion`]), on the same monotonic clock
+    /// and the same [`TRANSITION_DELAY`] as the two moves above and applied by
+    /// [`Self::materialize_due_transitions`].
+    pub ipam_prefix_list_resolver_target_delete_complete_at: BTreeMap<String, Instant>,
     /// A `CreateIpamPrefixListResolverTarget` `ClientToken` and the
     /// `IpamPrefixListResolverTargetId` that call minted, so a replay of the same request
     /// answers with that target instead of creating a second one: "a unique, case-sensitive
@@ -4118,7 +4117,6 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_interface_attachment_move_at: BTreeMap::new(),
             // A fresh account has granted nothing over an interface it does not have yet.
             network_interface_permissions: BTreeMap::new(),
-            network_interface_permission_granted_at: BTreeMap::new(),
             // A fresh account runs no instance as an IAM instance profile.
             iam_instance_profile_associations: BTreeMap::new(),
             iam_instance_profile_association_by_instance: BTreeMap::new(),
@@ -4285,6 +4283,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_prefix_list_resolver_targets: BTreeMap::new(),
             ipam_prefix_list_resolver_target_create_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_target_modify_complete_at: BTreeMap::new(),
+            ipam_prefix_list_resolver_target_delete_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_target_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_internet_registry_association_client_tokens: HashMap::new(),

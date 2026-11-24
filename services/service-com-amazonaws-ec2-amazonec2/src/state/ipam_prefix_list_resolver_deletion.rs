@@ -34,6 +34,21 @@ pub const IPAM_PREFIX_LIST_RESOLVER_STATE_DELETE_IN_PROGRESS: &str = "delete-in-
 /// [`TRANSITION_DELAY`] after the call that deleted it.
 pub const IPAM_PREFIX_LIST_RESOLVER_STATE_DELETE_COMPLETE: &str = "delete-complete";
 
+/// A resolver TARGET whose deletion has been asked for and has not settled yet: the
+/// `IpamPrefixListResolverTargetState` enum's `delete-in-progress` member
+/// (`smithy_query(query="shape",shape="IpamPrefixListResolverTargetState")`), which is what
+/// `DeleteIpamPrefixListResolverTarget` answers with. That catalog spells the two delete
+/// members exactly as the resolver's own does, which is what [`is_a_delete_state`] reads both
+/// resources' states with.
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_IN_PROGRESS: &str =
+    IPAM_PREFIX_LIST_RESOLVER_STATE_DELETE_IN_PROGRESS;
+
+/// The state that catalog reaches once a target's deletion has settled: `delete-complete`,
+/// which the clock owes a [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_IN_PROGRESS`] target
+/// one [`TRANSITION_DELAY`] after the call that deleted it.
+pub const IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_COMPLETE: &str =
+    IPAM_PREFIX_LIST_RESOLVER_STATE_DELETE_COMPLETE;
+
 /// Whether `resolver` has had its deletion asked for already — either delete state counts, so
 /// no path restarts the clock on a resolver that is on its way out or already gone.
 ///
@@ -119,6 +134,83 @@ impl ComAmazonawsEc2Amazonec2State {
         self.ipam_prefix_list_resolver_delete_complete_at
             .insert(resolver_id.to_string(), Instant::now() + TRANSITION_DELAY);
         Some(view)
+    }
+
+    /// Start deleting the IPAM prefix list resolver TARGET `target_id` names, and answer it as
+    /// the store then holds it — `None` when the account holds no such target.
+    ///
+    /// "Deletes an IPAM prefix list resolver target. This removes the association between the
+    /// resolver and the managed prefix list, stopping automatic CIDR synchronization"
+    /// (`DeleteIpamPrefixListResolverTarget`): the association IS the target, so the prefix list
+    /// stops being IPAM managed as of this call — "when set, this prefix list becomes an IPAM
+    /// managed prefix list" (`ManagedPrefixList$IpamPrefixListResolverTargetId`) is what
+    /// [`Self::insert_creating_ipam_prefix_list_resolver_target`] set, and this is the one place
+    /// that is given back, so the list can be the target of another resolver afterwards.
+    ///
+    /// The record itself is left in the TRANSIENT
+    /// [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_IN_PROGRESS`] state with the clock owing
+    /// it [`IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_COMPLETE`] one [`TRANSITION_DELAY`]
+    /// later ([`Self::ipam_prefix_list_resolver_target_delete_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]) — the same arrangement, on the same clock, as the
+    /// resolver's own deletion above. Any move the clock still owed this target is superseded,
+    /// synchronization included: a target on its way out synchronizes nothing more.
+    ///
+    /// The record STAYS in the store, because a target in either delete state still has a state
+    /// to report, so its caller-chosen bytes stay charged to the store's budget exactly as a
+    /// deleted resolver's do.
+    pub fn begin_ipam_prefix_list_resolver_target_deletion(
+        &mut self,
+        target_id: &str,
+    ) -> Option<IpamPrefixListResolverTarget> {
+        let target = self.ipam_prefix_list_resolver_targets.get_mut(target_id)?;
+        target.state =
+            Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_IN_PROGRESS.to_string());
+        let view = target.clone();
+        self.ipam_prefix_list_resolver_target_create_complete_at
+            .remove(target_id);
+        self.ipam_prefix_list_resolver_target_modify_complete_at
+            .remove(target_id);
+        self.ipam_prefix_list_resolver_target_delete_complete_at
+            .insert(target_id.to_string(), Instant::now() + TRANSITION_DELAY);
+        if let Some(prefix_list_id) = view.prefix_list_id.as_deref() {
+            if let Some(record) = self.managed_prefix_lists.get_mut(prefix_list_id) {
+                if record.view.ipam_prefix_list_resolver_target_id.as_deref() == Some(target_id) {
+                    record.view.ipam_prefix_list_resolver_target_id = None;
+                    record.view.ipam_prefix_list_resolver_sync_enabled = Some(false);
+                }
+            }
+        }
+        Some(view)
+    }
+
+    /// Apply the move the clock owes a deleted resolver TARGET, as of `now`.
+    ///
+    /// A target a `DeleteIpamPrefixListResolverTarget` left `delete-in-progress` was
+    /// `delete-complete` at the instant that call recorded for it, whether or not anybody called
+    /// again — so the move is applied from [`Self::materialize_due_transitions`], its one
+    /// caller, before anything reads the store.
+    pub(super) fn materialize_due_ipam_prefix_list_resolver_target_deletions(
+        &mut self,
+        now: Instant,
+    ) {
+        let targets = &mut self.ipam_prefix_list_resolver_targets;
+        self.ipam_prefix_list_resolver_target_delete_complete_at
+            .retain(|target_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(target) = targets.get_mut(target_id) {
+                    if target.state.as_deref()
+                        == Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_IN_PROGRESS)
+                    {
+                        target.state = Some(
+                            IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_DELETE_COMPLETE.to_string(),
+                        );
+                    }
+                }
+                // The transition is applied once; nothing is owed on this target any more.
+                false
+            });
     }
 
     /// Apply the move the clock owes a deleted resolver, as of `now`.
