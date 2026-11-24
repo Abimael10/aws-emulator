@@ -182,20 +182,27 @@ async fn every_published_document_is_projected_from_the_catalogue() {
         );
         assert_eq!(
             identifier["DocumentVersion"].as_str(),
-            Some("1"),
-            "case {case}: a published document holds one version, got {identifier}"
+            Some(entry.default_published_version().to_string().as_str()),
+            "case {case}: a published document is listed by its default version, got \
+             {identifier}"
         );
-        // The date is the catalogue's own datum for that document, to the millisecond
-        // Systems Manager reports a document date at — not a reading of this store's clock.
+        // The date is the catalogue's own datum for the version being reported, to the
+        // millisecond Systems Manager reports a document date at — not a reading of this
+        // store's clock.
+        let default_millis = entry
+            .published_versions()
+            .into_iter()
+            .find(|release| release.version == entry.default_published_version())
+            .map(|release| release.created_date_millis)
+            .unwrap_or(entry.created_date_millis);
         let reported_millis = identifier["CreatedDate"]
             .as_f64()
             .map(|date| (date * 1_000.0).round() as u64);
         assert_eq!(
             reported_millis,
-            Some(entry.created_date_millis),
+            Some(default_millis),
             "case {case}: expected the publication date the catalogue carries \
-             ({}), got {identifier}",
-            entry.created_date_millis
+             ({default_millis}), got {identifier}"
         );
         assert!(
             !string_list(identifier, "PlatformTypes").is_empty(),

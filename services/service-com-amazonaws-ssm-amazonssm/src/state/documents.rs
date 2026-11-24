@@ -466,6 +466,25 @@ pub enum PublishedBody {
     FamilyStandIn,
 }
 
+/// ONE version Systems Manager has published of a catalogue document: the version number it
+/// publishes that revision as, and when it published it.
+///
+/// A published document is republished as Amazon revises it — `ListDocumentVersions` of one
+/// "lists all versions for a document", and the recorded catalogue reports several for the
+/// runbooks Amazon has revised — so the versions an entry declares are a FACT OF THE
+/// CATALOGUE carried as data, the way the publication date and the target type are. The
+/// version a read that names no selector resolves to is the NEWEST of them
+/// ([`PublishedDocument::default_published_version`]): Amazon publishes its latest revision
+/// as the default.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedVersion {
+    /// "The document version", counting from [`FIRST_DOCUMENT_VERSION`].
+    pub version: u64,
+    /// When Amazon published THIS version, in milliseconds since the Unix epoch (see
+    /// [`PublishedDocument::created_date_millis`] for why a date is data here).
+    pub created_date_millis: u64,
+}
+
 /// One document of the catalogue Systems Manager publishes: present in every account and
 /// Region without anybody creating it, and readable — never writable — by the account
 /// that reads it.
@@ -500,6 +519,16 @@ pub struct PublishedDocument {
     /// Region and run of the emulator, and unchanged by a restart. Milliseconds, because
     /// that is the precision Systems Manager reports a document date at.
     pub created_date_millis: u64,
+    /// Every version Amazon has published of this document, OLDEST FIRST, or EMPTY for an
+    /// entry whose history this crate does not hold.
+    ///
+    /// "List all versions for a document" (`ListDocumentVersions`) reports one entry per
+    /// published version, and Amazon republishes a document as it revises it, so the number
+    /// of versions a catalogue entry has and the date of each are the catalogue's own data —
+    /// held here for the entries this crate holds them for. An entry declaring NONE is the
+    /// one version its publication date dates ([`PublishedDocument::published_versions`]),
+    /// which is what a document Amazon has published once has.
+    pub versions: &'static [PublishedVersion],
 }
 
 impl PublishedDocument {
@@ -507,6 +536,30 @@ impl PublishedDocument {
     /// of it carry it ([`PublishedDocument::created_date_millis`]).
     pub fn created_date(&self) -> SystemTime {
         ::std::time::UNIX_EPOCH + ::std::time::Duration::from_millis(self.created_date_millis)
+    }
+
+    /// The versions this entry publishes, oldest first and never empty: the history the
+    /// catalogue declares, or the ONE version its publication date dates for an entry that
+    /// declares none.
+    pub fn published_versions(&self) -> Vec<PublishedVersion> {
+        if self.versions.is_empty() {
+            return vec![PublishedVersion {
+                version: FIRST_DOCUMENT_VERSION,
+                created_date_millis: self.created_date_millis,
+            }];
+        }
+        self.versions.to_vec()
+    }
+
+    /// The version a read of this document that names no selector resolves to: the NEWEST
+    /// version the catalogue publishes, since Amazon publishes its latest revision of a
+    /// document as that document's default version.
+    pub fn default_published_version(&self) -> u64 {
+        self.published_versions()
+            .iter()
+            .map(|published| published.version)
+            .max()
+            .unwrap_or(FIRST_DOCUMENT_VERSION)
     }
 }
 

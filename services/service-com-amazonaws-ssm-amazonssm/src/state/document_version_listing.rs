@@ -4,13 +4,13 @@
 //! reported by, and the page a `ListDocumentVersions` read is served.
 //!
 //! The sibling listing in [`super::document_listing`] walks the documents of a Region; this
-//! one walks the versions of one document. It walks them in ascending version order — the
-//! order the versions were minted in, which is the order the store holds them — so a page's
-//! resume cursor is total: the cursor is the VERSION NUMBER the next page starts at, not an
-//! offset into a history an update may have grown between two pages. Each version is
-//! reported by [`document_version_info`], derived from the same record a describe of that
-//! version reports, so a version's identity in a listing cannot disagree with its
-//! description.
+//! one walks the versions of one document. It walks them NEWEST VERSION FIRST — the version
+//! a client reading a history asks about first is the one in force, which is the order
+//! Systems Manager serves one in — so a page's resume cursor is still total: the cursor is
+//! the VERSION NUMBER the next page starts at, not an offset into a history an update may
+//! have grown between two pages. Each version is reported by [`document_version_info`],
+//! derived from the same record a describe of that version reports, so a version's identity
+//! in a listing cannot disagree with its description.
 
 use crate::ops::types::DocumentVersionInfo;
 
@@ -56,9 +56,9 @@ pub struct DocumentVersionPage {
 
 impl DocumentRecord {
     /// The page of this document's versions starting at the version `resume_from` numbers
-    /// and holding at most `page_size` of them, oldest first.
+    /// and holding at most `page_size` of them, NEWEST FIRST.
     ///
-    /// The walk resumes at the oldest version still held at or after `resume_from`, so a
+    /// The walk resumes at the newest version still held at or before `resume_from`, so a
     /// page keeps making forward progress across a version deletion that removed the one a
     /// token named.
     pub fn list_versions(
@@ -68,8 +68,10 @@ impl DocumentRecord {
     ) -> DocumentVersionPage {
         let mut versions = Vec::new();
         let mut next_token = None;
-        for version in &self.versions {
-            if resume_from.is_some_and(|from| version.version < from) {
+        // The store holds the versions oldest first, in the order the create and its updates
+        // minted them; a listing serves them the other way round.
+        for version in self.versions.iter().rev() {
+            if resume_from.is_some_and(|from| version.version > from) {
                 continue;
             }
             if versions.len() == page_size {

@@ -6,10 +6,11 @@
 //!
 //! RULE: an association is identified for its whole life by the `AssociationId` its create
 //! minted, so every later call addresses it by that id — an update applies a new version of
-//! THAT association, built from what the call supplied and nothing else ("when you update an
-//! association, the system removes all optional parameters from the request and overwrites the
-//! association with null values for those parameters"), and a delete removes it, after which
-//! no read reports it.
+//! THAT association, carrying the association's whole configuration as of that version ("the
+//! targets specified for the association when the association version was created",
+//! `AssociationVersionInfo$Targets`): the members the call supplies written over the
+//! configuration in force, and the members it leaves out kept as they were. A delete removes
+//! the association, after which no read reports it.
 //!
 //! Every case goes through the front door a client uses, over the dispatch
 //! [`crate::state_manager_associations`] publishes, so the two suites share one calling
@@ -59,8 +60,8 @@ struct UpdateRow {
     update_with: Value,
     /// `(member, value)` pairs the updated association reports.
     reported: Vec<(&'static str, Value)>,
-    /// The members the updated association reports nothing for, because this update did not
-    /// supply them — whether or not the create did.
+    /// The members the updated association reports nothing for, because neither this update
+    /// nor the configuration it was applied over carries them.
     unset: Vec<&'static str>,
 }
 
@@ -85,8 +86,8 @@ fn update_rows() -> Vec<UpdateRow> {
             unset: vec!["AssociationName"],
         },
         UpdateRow {
-            case: "an optional member the create set and the update does not restate is \
-                   reported by neither",
+            case: "an optional member the create set and the update does not restate is kept, \
+                   because the version the update appends is the whole configuration",
             created_with: json!({
                 "AssociationName": "the-name",
                 "ComplianceSeverity": "HIGH",
@@ -97,13 +98,13 @@ fn update_rows() -> Vec<UpdateRow> {
             reported: vec![
                 ("Parameters", json!({"commands": ["echo first"]})),
                 ("AssociationVersion", json!("2")),
+                ("AssociationName", json!("the-name")),
+                ("ComplianceSeverity", json!("HIGH")),
+                ("MaxConcurrency", json!("2")),
             ],
-            unset: vec![
-                "AssociationName",
-                "ComplianceSeverity",
-                "MaxConcurrency",
-                "ScheduleExpression",
-            ],
+            // Nothing ever set a schedule or an error ceiling on this association, so no
+            // version of it carries either.
+            unset: vec!["ScheduleExpression", "MaxErrors"],
         },
         UpdateRow {
             case: "a restated name, severity and cron schedule, every member carried by the \
@@ -128,6 +129,18 @@ fn update_rows() -> Vec<UpdateRow> {
             unset: vec!["MaxErrors"],
         },
         UpdateRow {
+            case: "a parameter set carried EMPTY, which clears the parameters rather than \
+                   keeping them",
+            created_with: json!({"Parameters": {"commands": ["echo first"]}, "MaxErrors": "2"}),
+            update_with: json!({"Name": AGENT, "Parameters": {}}),
+            reported: vec![
+                ("Name", json!(AGENT)),
+                ("MaxErrors", json!("2")),
+                ("AssociationVersion", json!("2")),
+            ],
+            unset: vec!["Parameters"],
+        },
+        UpdateRow {
             case: "another document, which the association applies from then on",
             created_with: json!({"Parameters": {"commands": ["echo first"]}}),
             update_with: json!({"Name": AGENT, "DocumentVersion": "$DEFAULT"}),
@@ -143,7 +156,7 @@ fn update_rows() -> Vec<UpdateRow> {
 
 /// RULE: an update applies a new version to the association its id names — the id and the node
 /// it was created for are unchanged, the version number counts up, and the configuration it
-/// reports is exactly what the update supplied.
+/// reports is what the update supplied over the configuration in force.
 #[tokio::test]
 async fn an_update_applies_a_new_version_of_the_association_its_id_names() {
     for row in update_rows() {

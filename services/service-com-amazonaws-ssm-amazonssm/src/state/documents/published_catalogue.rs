@@ -88,16 +88,24 @@ macro_rules! authored {
             body: PublishedBody::Authored,
             created_date_millis: $millis,
             target_type: $target,
+            versions: &[],
         }
     };
 }
 
 /// An Automation runbook of the catalogue, carried with the family stand-in body.
+///
+/// A runbook whose publication HISTORY the catalogue holds names its versions and the date
+/// of the first of them; one that declares neither carries the catalogue's stand-in date and
+/// the one version that date dates ([`PublishedDocument::published_versions`]).
 macro_rules! runbook {
     ($name:literal) => {
         runbook!($name, None)
     };
     ($name:literal, $target:expr) => {
+        runbook!($name, $target, CATALOGUE_PUBLISHED_MILLIS, &[])
+    };
+    ($name:literal, $target:expr, $millis:expr, $versions:expr) => {
         PublishedDocument {
             name: $name,
             document_type: AUTOMATION,
@@ -112,11 +120,39 @@ macro_rules! runbook {
                  }\n  }\n}"
             ),
             body: PublishedBody::FamilyStandIn,
-            created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
+            created_date_millis: $millis,
             target_type: $target,
+            versions: $versions,
         }
     };
 }
+
+/// The versions Amazon publishes of the SSH troubleshooting runbook, oldest first: the
+/// revisions of it the recorded catalogue reports, each with the date Amazon published that
+/// revision. The newest is the document's default version
+/// ([`PublishedDocument::default_published_version`]).
+const TROUBLESHOOT_SSH_VERSIONS: &[PublishedVersion] = &[
+    PublishedVersion {
+        version: 1,
+        created_date_millis: 1_535_478_878_887,
+    },
+    PublishedVersion {
+        version: 2,
+        created_date_millis: 1_537_580_033_794,
+    },
+    PublishedVersion {
+        version: 3,
+        created_date_millis: 1_701_351_959_610,
+    },
+    PublishedVersion {
+        version: 4,
+        created_date_millis: 1_709_719_148_098,
+    },
+    PublishedVersion {
+        version: 5,
+        created_date_millis: 1_728_550_923_741,
+    },
+];
 
 /// A command document of the catalogue, carried with the family stand-in body.
 macro_rules! command {
@@ -135,6 +171,7 @@ macro_rules! command {
             body: PublishedBody::FamilyStandIn,
             created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
             target_type: $target,
+            versions: &[],
         }
     };
 }
@@ -154,6 +191,7 @@ macro_rules! package {
             body: PublishedBody::FamilyStandIn,
             created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
             target_type: None,
+            versions: &[],
         }
     };
 }
@@ -173,6 +211,7 @@ macro_rules! session {
             body: PublishedBody::FamilyStandIn,
             created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
             target_type: None,
+            versions: &[],
         }
     };
 }
@@ -193,6 +232,7 @@ macro_rules! change_template {
             body: PublishedBody::FamilyStandIn,
             created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
             target_type: None,
+            versions: &[],
         }
     };
 }
@@ -214,6 +254,7 @@ macro_rules! template {
             body: PublishedBody::FamilyStandIn,
             created_date_millis: CATALOGUE_PUBLISHED_MILLIS,
             target_type: None,
+            versions: &[],
         }
     };
 }
@@ -1636,7 +1677,12 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
     runbook!("AWSSupport-TroubleshootS3EventNotifications", S3_BUCKET),
     runbook!("AWSSupport-TroubleshootS3PublicRead", S3_BUCKET),
     runbook!("AWSSupport-TroubleshootSAMLIssues"),
-    runbook!("AWSSupport-TroubleshootSSH", EC2_INSTANCE),
+    runbook!(
+        "AWSSupport-TroubleshootSSH",
+        EC2_INSTANCE,
+        1_535_478_878_887,
+        TROUBLESHOOT_SSH_VERSIONS
+    ),
     runbook!("AWSSupport-TroubleshootSUSERegistration", EC2_INSTANCE),
     runbook!("AWSSupport-TroubleshootSessionManager", EC2_INSTANCE),
     runbook!("AWSSupport-TroubleshootVPN"),

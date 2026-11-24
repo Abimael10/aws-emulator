@@ -2845,13 +2845,15 @@ impl ComAmazonawsSsmAmazonssmState {
     /// `region`'s endpoint, or `None` when the catalogue holds none of that name.
     ///
     /// Built from the catalogue's own body, so everything the read reports beyond the
-    /// name, the type and the publication date — the schema version, the description, the
+    /// name, the type and the publication dates — the schema version, the description, the
     /// parameters, the platform types, the hash — is derived by the one content reader
     /// that reads a created document's content. A published document is already
-    /// registered, so it is `Active` with no transition owed, it is owned by Amazon rather
-    /// than by the account reading it, and it is dated by the catalogue's own publication
-    /// date ([`PublishedDocument::created_date`]) rather than by this store's beginning:
-    /// nobody here created it.
+    /// registered, so every version of it is `Active` with no transition owed, it is owned
+    /// by Amazon rather than by the account reading it, and each version is dated by the
+    /// catalogue's own publication date for THAT version
+    /// ([`PublishedDocument::published_versions`]) rather than by this store's beginning:
+    /// nobody here created it. The default version is the newest the catalogue publishes
+    /// ([`PublishedDocument::default_published_version`]).
     pub fn published_document_record(&self, region: &str, name: &str) -> Option<DocumentRecord> {
         let (published, parsed, hash) = published_document_projection(name)?;
         Some(DocumentRecord {
@@ -2867,26 +2869,31 @@ impl ComAmazonawsSsmAmazonssmState {
             document_type: published.document_type.to_string(),
             tags: BTreeMap::new(),
             owner: PUBLISHED_DOCUMENT_OWNER.to_string(),
-            versions: vec![DocumentVersionRecord {
-                version: FIRST_DOCUMENT_VERSION,
-                display_name: None,
-                version_name: None,
-                document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
-                // The target type is the catalogue's own
-                // ([`PublishedDocument::target_type`]): Amazon declares what kinds of
-                // resource a document it publishes runs on, so a read reports it and the
-                // listing's `TargetType` filter selects on it.
-                target_type: published.target_type.map(str::to_string),
-                content: published.content.to_string(),
-                hash: hash.to_string(),
-                parsed: parsed.clone(),
-                requires: None,
-                attachment_names: Vec::new(),
-                created_date: published.created_date(),
-                status: DOCUMENT_STATUS_ACTIVE.to_string(),
-                active_due: None,
-            }],
-            default_version: FIRST_DOCUMENT_VERSION,
+            versions: published
+                .published_versions()
+                .into_iter()
+                .map(|release| DocumentVersionRecord {
+                    version: release.version,
+                    display_name: None,
+                    version_name: None,
+                    document_format: DEFAULT_DOCUMENT_FORMAT.to_string(),
+                    // The target type is the catalogue's own
+                    // ([`PublishedDocument::target_type`]): Amazon declares what kinds of
+                    // resource a document it publishes runs on, so a read reports it and the
+                    // listing's `TargetType` filter selects on it.
+                    target_type: published.target_type.map(str::to_string),
+                    content: published.content.to_string(),
+                    hash: hash.to_string(),
+                    parsed: parsed.clone(),
+                    requires: None,
+                    attachment_names: Vec::new(),
+                    created_date: ::std::time::UNIX_EPOCH
+                        + ::std::time::Duration::from_millis(release.created_date_millis),
+                    status: DOCUMENT_STATUS_ACTIVE.to_string(),
+                    active_due: None,
+                })
+                .collect(),
+            default_version: published.default_published_version(),
             // A document Systems Manager publishes is Amazon's to share and already
             // reaches every account, so the account reading it has recorded no share of
             // its own on it.

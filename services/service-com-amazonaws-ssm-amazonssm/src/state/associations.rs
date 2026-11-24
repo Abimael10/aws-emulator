@@ -418,6 +418,28 @@ pub struct AssociationVersionRecord {
     pub association_dispatch_assume_role: Option<String>,
 }
 
+impl AssociationVersionRecord {
+    /// This version as the STARTING POINT of the next one: the whole configuration in force,
+    /// numbered `version` and dated `created_at`, for the call appending it to overwrite the
+    /// members it supplies.
+    ///
+    /// A version of an association is the configuration the association ran with AS OF that
+    /// version — "the targets specified for the association when the association version was
+    /// created", "the cron or rate schedule specified for the association when the
+    /// association version was created" (`AssociationVersionInfo$Targets`,
+    /// `$ScheduleExpression`) — so the member an update does not supply is the member the
+    /// association keeps applying, and the version that update appends carries it as much as
+    /// the one before did. Carrying it forward here is what makes every version a complete
+    /// snapshot rather than a diff a reader would have to replay from the first version.
+    pub fn carried_forward(&self, version: u64, created_at: SystemTime) -> Self {
+        Self {
+            version,
+            created_at,
+            ..self.clone()
+        }
+    }
+}
+
 /// One association, as `CreateAssociation` persisted it and `DescribeAssociation` reports
 /// it.
 #[derive(Debug, Clone)]
@@ -681,6 +703,10 @@ impl AssociationRecord {
     /// association applies is taken from it: an update that names another document moves the
     /// association onto it, and one that names none keeps the document the version it was
     /// built from already carried.
+    ///
+    /// The version appended is a WHOLE configuration rather than the members one call
+    /// changed ([`AssociationVersionRecord::carried_forward`]), so the association applies
+    /// what it applied before beside what that call changed.
     pub fn push_version(&mut self, version: AssociationVersionRecord) {
         self.name = version.document_name.clone();
         self.versions.push(version);

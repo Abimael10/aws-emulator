@@ -628,8 +628,8 @@ async fn a_listing_reports_every_document_the_region_holds() {
         );
     }
 
-    // The catalogue is reported by the owner it belongs to and at the only version it
-    // holds, whatever the account created.
+    // The catalogue is reported by the owner it belongs to and at the default version it
+    // publishes, whatever the account created.
     for entry in CATALOGUE {
         let identifier = identifier("a published document", &response, entry.name);
         assert_eq!(
@@ -646,8 +646,9 @@ async fn a_listing_reports_every_document_the_region_holds() {
         );
         assert_eq!(
             identifier["DocumentVersion"].as_str(),
-            Some("1"),
-            "case a published document: {} holds one version, got {identifier}",
+            Some(entry.default_published_version().to_string().as_str()),
+            "case a published document: {} is listed at the version the catalogue publishes \
+             as its default, got {identifier}",
             entry.name
         );
     }

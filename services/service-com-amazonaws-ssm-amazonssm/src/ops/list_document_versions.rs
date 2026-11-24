@@ -10,8 +10,9 @@
 //! name the account holds no document for — through the endpoint the request was signed
 //! for — is `InvalidDocument` rather than an empty answer, and a document Systems Manager
 //! publishes resolves without any create. Each version is reported from the store in
-//! [`crate::state`] ([`crate::state::document_version_listing::document_version_info`]), oldest
-//! first, with the flag that says which of them is the document's DEFAULT version.
+//! [`crate::state`] ([`crate::state::document_version_listing::document_version_info`]),
+//! NEWEST version first, with the flag that says which of them is the document's DEFAULT
+//! version.
 //!
 //! A version's `Status` moves with the clock, so this report materialises the move that
 //! was already due whether or not anybody called, and writes nothing else: what it reports

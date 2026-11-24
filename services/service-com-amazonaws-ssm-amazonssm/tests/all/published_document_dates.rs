@@ -36,23 +36,46 @@ async fn list_versions(router: &MultiServiceRouter, name: &str) -> (u16, Value) 
     call(router, "ListDocumentVersions", &json!({ "Name": name })).await
 }
 
-/// The one `DocumentVersionInfo` a published document lists, asserting the read succeeded
-/// and reported exactly one version.
-async fn the_one_version(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
-    let (status, response) = list_versions(router, name).await;
+/// The DEFAULT `DocumentVersionInfo` a published document lists, asserting the read
+/// succeeded and reported one entry per version the catalogue publishes, newest first.
+async fn the_default_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    entry: &service_com_amazonaws_ssm_amazonssm::state::PublishedDocument,
+) -> Value {
+    let (status, response) = list_versions(router, entry.name).await;
     assert_eq!(
         status, 200,
-        "case {case}: ListDocumentVersions {name} must resolve a document AWS publishes, \
-         got {status} {response}"
+        "case {case}: ListDocumentVersions {} must resolve a document AWS publishes, \
+         got {status} {response}",
+        entry.name
     );
     let versions = response["DocumentVersions"]
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let published = entry.published_versions();
     assert_eq!(
         versions.len(),
-        1,
-        "case {case}: {name} publishes one version, got {response}"
+        published.len(),
+        "case {case}: {} publishes {} version(s), got {response}",
+        entry.name,
+        published.len()
+    );
+    // Newest first, so the first entry is the version a read naming no selector resolves to.
+    let reported: Vec<&str> = versions
+        .iter()
+        .map(|version| version["DocumentVersion"].as_str().unwrap_or("<unset>"))
+        .collect();
+    let newest_first: Vec<String> = published
+        .iter()
+        .rev()
+        .map(|release| release.version.to_string())
+        .collect();
+    assert_eq!(
+        reported,
+        newest_first.iter().map(String::as_str).collect::<Vec<_>>(),
+        "case {case}: the versions are served newest first, got {response}"
     );
     versions[0].clone()
 }
@@ -66,8 +89,9 @@ fn created_date(case: &str, reported: &Value) -> f64 {
 }
 
 /// Every document of the published catalogue resolves on a FRESH emulator, with no create
-/// of any kind, and reports one `Active` default version dated by its own publication
-/// date — the date `DescribeDocument` and `ListDocuments` report for it too.
+/// of any kind, and reports its versions `Active` and dated by their own publication dates,
+/// the newest being the default version — the date `DescribeDocument` and `ListDocuments`
+/// report for it too.
 #[tokio::test]
 async fn every_published_document_lists_an_active_version_dated_by_its_publication() {
     let router = router();
@@ -75,7 +99,7 @@ async fn every_published_document_lists_an_active_version_dated_by_its_publicati
 
     for entry in CATALOGUE {
         let case = entry.name;
-        let version = the_one_version(&router, case, entry.name).await;
+        let version = the_default_version(&router, case, entry).await;
         assert_eq!(
             (
                 version["Name"].clone(),
@@ -86,12 +110,12 @@ async fn every_published_document_lists_an_active_version_dated_by_its_publicati
             ),
             (
                 json!(entry.name),
-                json!("1"),
+                json!(entry.default_published_version().to_string()),
                 json!(true),
                 json!("Active"),
                 json!("JSON"),
             ),
-            "case {case}: a published document lists one Active, default JSON version, \
+            "case {case}: a published document lists its Active, default JSON version, \
              got {version}"
         );
 
@@ -141,7 +165,7 @@ async fn a_publication_date_is_catalogue_data_and_not_the_stores_own_clock() {
     let mut by_name: BTreeMap<&str, f64> = BTreeMap::new();
     for entry in CATALOGUE {
         let case = entry.name;
-        let version = the_one_version(&router, case, entry.name).await;
+        let version = the_default_version(&router, case, entry).await;
         let date = created_date(case, &version);
         assert!(
             date > 0.0,
@@ -191,14 +215,14 @@ async fn a_publication_date_is_the_same_in_every_region_and_in_a_second_emulator
 
     for entry in CATALOGUE {
         let case = entry.name;
-        let date = created_date(case, &the_one_version(&first, case, entry.name).await);
-        let again = created_date(case, &the_one_version(&first, case, entry.name).await);
+        let date = created_date(case, &the_default_version(&first, case, entry).await);
+        let again = created_date(case, &the_default_version(&first, case, entry).await);
         assert_eq!(
             again, date,
             "case {case}: a read must not move the publication date, got {again} \
              against {date}"
         );
-        let restarted = created_date(case, &the_one_version(&second, case, entry.name).await);
+        let restarted = created_date(case, &the_default_version(&second, case, entry).await);
         assert_eq!(
             restarted, date,
             "case {case}: a second emulator publishes the same catalogue, so the date is \
@@ -256,6 +280,9 @@ const RECORDED_PUBLICATION_DATES_MILLIS: &[(&str, i64)] = &[
     ("AWS-StopEC2Instance", 1_531_242_313_476),
     ("AWS-UpdateLinuxAmi", 1_775_747_623_945),
     ("AWS-UpdateSSMAgent", 1_622_567_950_979),
+    // The newest version of a runbook the catalogue publishes several revisions of, which is
+    // the version a read naming no selector resolves to.
+    ("AWSSupport-TroubleshootSSH", 1_728_550_923_741),
 ];
 
 /// The `CreatedDate` of a reported version or document in epoch MILLISECONDS, which is the
@@ -270,11 +297,16 @@ fn millis_of(case: &str, reported: &Value) -> i64 {
 async fn the_known_publication_dates_are_served_as_the_catalogue_carries_them() {
     let router = router();
     for (name, expected_millis) in RECORDED_PUBLICATION_DATES_MILLIS {
-        assert!(
-            CATALOGUE.iter().any(|entry| entry.name == *name),
-            "case {name}: the catalogue must publish a document the corpus pins a date for"
-        );
-        let version = the_one_version(&router, name, name).await;
+        let entry = CATALOGUE
+            .iter()
+            .find(|entry| entry.name == *name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {name}: the catalogue must publish a document the corpus pins a date \
+                     for"
+                )
+            });
+        let version = the_default_version(&router, name, entry).await;
         let millis = millis_of(name, &version);
         assert_eq!(
             millis, *expected_millis,

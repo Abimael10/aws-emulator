@@ -5,9 +5,11 @@
 //! Reports the versions of ONE State Manager association: "retrieves all versions of an
 //! association for a specific association ID", so the association the request's id names is
 //! resolved through the endpoint the call was signed for and every version a create and its
-//! updates wrote ([`crate::state::associations::AssociationVersionRecord`]) is reported, in
-//! the order they were minted in and a page at a time
-//! ([`crate::state::association_version_listing`]).
+//! updates wrote ([`crate::state::associations::AssociationVersionRecord`]) is reported,
+//! NEWEST version first and a page at a time
+//! ([`crate::state::association_version_listing`]). Each entry is the association's whole
+//! configuration as of that version, so the first entry is what the association is doing
+//! now.
 //!
 //! An id that names no association of that endpoint is `AssociationDoesNotExist`, worded the
 //! way every read of an association by its id words it, and a `NextToken` this listing could

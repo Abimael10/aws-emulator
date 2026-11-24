@@ -4,16 +4,23 @@
 //!
 //! Applies a new configuration to a State Manager association this service already holds:
 //! the association keeps the id it was created under and takes a NEW VERSION
-//! ([`crate::state::associations::AssociationVersionRecord`]) carrying what this call
-//! supplied, which is what `DescribeAssociation` then reports and what
+//! ([`crate::state::associations::AssociationVersionRecord`]) carrying the configuration it
+//! runs with from now on, which is what `DescribeAssociation` then reports and what
 //! `ListAssociationVersions` reports beside the versions before it.
 //!
-//! The whole configuration comes from the REQUEST: "when you update an association, the
-//! system removes all optional parameters from the request and overwrites the association with
-//! null values for those parameters... In order to keep the association options, you must
-//! specify all optional parameters in the request". So the new version is built from this
-//! call alone rather than from the version before it; the only member carried over is the
-//! document, for a call that names none, since an association always applies one.
+//! A version is the WHOLE configuration as of itself rather than the members one call
+//! changed: "the targets specified for the association when the association version was
+//! created", "the cron or rate schedule specified for the association when the association
+//! version was created" (`AssociationVersionInfo$Targets`, `$ScheduleExpression`). So the
+//! version this call appends is built from the version in FORCE and each member this call
+//! supplies is written over it — a member the call leaves out is one the association keeps
+//! applying, and Systems Manager reports it on the appended version as well, which is what
+//! the recorded responses of an update that changes only the schedule show. A member the
+//! call DOES carry is written as carried, so a list carried empty clears what it names. Two
+//! members cannot be carried over: the parameters of a call that moves the association onto
+//! ANOTHER document, since the parameters a document takes are its own, and
+//! `ApplyOnlyAtCronInterval`, which is modelled with a default of `false` and so has no
+//! unset reading to carry.
 //!
 //! The association also RUNS on this call: "when you update an association, the association
 //! immediately runs against the specified targets. You can add the ApplyOnlyAtCronInterval
@@ -355,20 +362,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        // The association this call changes, and the two things about it that decide whether
-        // the call can be applied at all: the document it applies now (what a call naming none
-        // keeps) and the version it holds last (what its concurrency control is measured
-        // against). Read as VALUES, so the store is free for the document resolve below.
-        let (held_document, latest_version, next_version) = {
+        // The association this call changes: the CONFIGURATION in force (what the version
+        // this call appends is built from, and what the document it applies is read from
+        // where the call names none) and the number of the version holding it (what its
+        // concurrency control is measured against). Read as VALUES, so the store is free for
+        // the document resolve below.
+        let (in_force, held_document, latest_version, next_version) = {
             let held = store
                 .association(&region, &input.association_id)
                 .ok_or_else(does_not_exist)?;
             (
+                held.latest().cloned(),
                 held.name.clone(),
                 held.latest_version(),
                 held.next_version(),
             )
         };
+        // Every association holds at least the version its create minted, so a record with
+        // none is one no create could have written.
+        let in_force = in_force.ok_or_else(does_not_exist)?;
         // "You must specify the latest association version in the service. If you want to
         // ensure that this request succeeds, either specify $LATEST, or omit this parameter":
         // a call naming any other version was written against a configuration that is no
@@ -442,18 +454,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // "The parameters you want to update for the association": the set this call CARRIES
+        // — even an empty one, which is a call that runs the document with no parameter at all
+        // — or, for a call carrying the member not at all, the parameters the association is
+        // already running that document with, since the version this call appends is the whole
+        // configuration in force rather than the members it changed. A call that moves the
+        // association onto ANOTHER document carries nothing over to it: the parameters a
+        // document takes are its own, so only the ones this call supplies can be meant for the
+        // new one.
+        let keeps_the_document = document.name == in_force.document_name;
+        let parameters: ::std::collections::BTreeMap<String, Vec<String>> =
+            match input.parameters.clone() {
+                Some(supplied) => supplied.into_iter().collect(),
+                None if keeps_the_document => in_force.parameters.clone(),
+                None => ::std::collections::BTreeMap::new(),
+            };
         // "You must specify values for all required parameters in the Amazon Web Services
         // Systems Manager document (SSM document). You can only supply values to parameters
         // defined in the SSM document" (`InvalidParameters`) — the one reading of a document's
-        // parameters this service has, which is what the create is held to as well.
-        let parameters: ::std::collections::BTreeMap<String, Vec<String>> = input
-            .parameters
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        if crate::state::commands::parameters_are_rejected(&version.parsed, &parameters)
-        {
+        // parameters this service has, which is what the create is held to as well. What is
+        // held to it is the configuration the appended version will carry, so a parameter is
+        // checked against the document that version applies whether this call supplied it or
+        // the version in force did.
+        if crate::state::commands::parameters_are_rejected(&version.parsed, &parameters) {
             return Err(
                 UpdateAssociationErrorModeled::InvalidParameters(InvalidParameters {
                     message: Some(crate::state::commands::INVALID_PARAMETERS.to_string()),
@@ -477,9 +500,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let targets: Vec<Target> = input.targets.clone().unwrap_or_default();
-        let target_maps = input.target_maps.clone().unwrap_or_default();
-        if !targets.is_empty() && !target_maps.is_empty() {
+        let supplied_targets: Vec<Target> = input.targets.clone().unwrap_or_default();
+        let supplied_target_maps = input.target_maps.clone().unwrap_or_default();
+        if !supplied_targets.is_empty() && !supplied_target_maps.is_empty() {
             return Err(UpdateAssociationErrorModeled::InvalidTargetMaps(
                 InvalidTargetMaps {
                     message: Some(
@@ -489,39 +512,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `Targets` and `TargetMaps` are two spellings of ONE thing — which resources the
+        // association runs on, and "both Targets and TargetMaps can't be specified together"
+        // — so a call CARRYING either replaces the targeting, with an empty list clearing it,
+        // and a call carrying neither member keeps the targeting the association already runs
+        // on.
+        let (targets, target_maps) =
+            if input.targets.is_some() || input.target_maps.is_some() {
+                (supplied_targets, supplied_target_maps)
+            } else {
+                (in_force.targets.clone(), in_force.target_maps.clone())
+            };
 
-        let applied = crate::state::associations::AssociationVersionRecord {
-            version: next_version,
-            created_at: now,
-            // `AssociationDescription$Name` is "the name of the SSM document", so the name
-            // the document is held under is the one this version applies, whichever
-            // spelling named it — and a call that named none applies the document the
-            // association already applied.
-            document_name: document.name.clone(),
-            // The version the association is pinned to is the one this call RESOLVED against
-            // that document — the default version where the request named none, the way a
-            // create resolves it — so a read reports which version the association tracks
-            // rather than the absence of a selector.
-            document_version: Some(requested_version.to_string()),
-            parameters,
-            targets,
-            schedule_expression: input.schedule_expression.clone(),
-            output_location: input.output_location.clone(),
-            association_name: input.association_name.clone(),
-            automation_target_parameter_name: input.automation_target_parameter_name.clone(),
-            max_errors: input.max_errors.clone(),
-            max_concurrency: input.max_concurrency.clone(),
-            compliance_severity: input.compliance_severity.clone(),
-            sync_compliance: input.sync_compliance.clone(),
-            apply_only_at_cron_interval: input.apply_only_at_cron_interval,
-            calendar_names: input.calendar_names.clone().unwrap_or_default(),
-            target_locations: input.target_locations.clone().unwrap_or_default(),
-            schedule_offset: input.schedule_offset,
-            duration: input.duration,
-            target_maps,
-            alarm_configuration: input.alarm_configuration.clone(),
-            association_dispatch_assume_role: input.association_dispatch_assume_role.clone(),
-        };
+        // The version this call appends is the association's WHOLE configuration as of it —
+        // "the targets specified for the association when the association version was
+        // created", "the cron or rate schedule specified for the association when the
+        // association version was created" (`AssociationVersionInfo$Targets`,
+        // `$ScheduleExpression`) — so it is built from the configuration in force and each
+        // member this call supplies is written over it. A member the call leaves out is the
+        // member the association keeps applying, which is why it appears in this version too
+        // ([`crate::state::associations::AssociationVersionRecord::carried_forward`]).
+        let mut applied = in_force.carried_forward(next_version, now);
+        // `AssociationDescription$Name` is "the name of the SSM document", so the name the
+        // document is held under is the one this version applies, whichever spelling named
+        // it — and a call that named none applies the document the association already
+        // applied.
+        applied.document_name = document.name.clone();
+        // The version the association is pinned to is the one this call RESOLVED against that
+        // document — the default version where the request named none, the way a create
+        // resolves it — so a read reports which version the association tracks rather than
+        // the absence of a selector.
+        applied.document_version = Some(requested_version.to_string());
+        applied.parameters = parameters;
+        applied.targets = targets;
+        applied.target_maps = target_maps;
+        applied.schedule_expression = non_empty(input.schedule_expression.as_deref())
+            .map(str::to_string)
+            .or(applied.schedule_expression);
+        applied.output_location = input.output_location.clone().or(applied.output_location);
+        applied.association_name = non_empty(input.association_name.as_deref())
+            .map(str::to_string)
+            .or(applied.association_name);
+        applied.automation_target_parameter_name =
+            non_empty(input.automation_target_parameter_name.as_deref())
+                .map(str::to_string)
+                .or(applied.automation_target_parameter_name);
+        applied.max_errors = non_empty(input.max_errors.as_deref())
+            .map(str::to_string)
+            .or(applied.max_errors);
+        applied.max_concurrency = non_empty(input.max_concurrency.as_deref())
+            .map(str::to_string)
+            .or(applied.max_concurrency);
+        applied.compliance_severity = non_empty(input.compliance_severity.as_deref())
+            .map(str::to_string)
+            .or(applied.compliance_severity);
+        applied.sync_compliance = non_empty(input.sync_compliance.as_deref())
+            .map(str::to_string)
+            .or(applied.sync_compliance);
+        // `ApplyOnlyAtCronInterval` is modelled with a DEFAULT of `false`, so a call that
+        // names none is a call that names `false`: there is no "unset" for this member to
+        // carry anything forward from.
+        applied.apply_only_at_cron_interval = input.apply_only_at_cron_interval;
+        if let Some(named) = input.calendar_names.clone() {
+            applied.calendar_names = named;
+        }
+        if let Some(named) = input.target_locations.clone() {
+            applied.target_locations = named;
+        }
+        applied.schedule_offset = input.schedule_offset.or(applied.schedule_offset);
+        applied.duration = input.duration.or(applied.duration);
+        applied.alarm_configuration = input
+            .alarm_configuration
+            .clone()
+            .or(applied.alarm_configuration);
+        applied.association_dispatch_assume_role =
+            non_empty(input.association_dispatch_assume_role.as_deref())
+                .map(str::to_string)
+                .or(applied.association_dispatch_assume_role);
         {
             let record = store
                 .association_mut(&region, &input.association_id)

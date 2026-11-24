@@ -688,7 +688,7 @@ async fn a_published_document_reports_the_published_content() {
             ("Name", json!(published.name)),
             ("DocumentType", json!(published.document_type)),
             ("DocumentFormat", json!("JSON")),
-            ("DocumentVersion", json!("1")),
+            ("DocumentVersion", json!(published.default_published_version().to_string())),
             // A published document is already registered, so it is never `Creating`.
             ("Status", json!("Active")),
         ] {

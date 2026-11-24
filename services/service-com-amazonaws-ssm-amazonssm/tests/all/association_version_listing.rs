@@ -4,12 +4,13 @@
 //! `ListAssociationVersions` reporting the version `CreateAssociation` minted and every
 //! version `UpdateAssociation` appended to it.
 //!
-//! RULE: a version listing reports every version the association its id names holds, oldest
-//! first, each carrying the configuration the call that wrote it supplied and the id and
-//! document name of the association that holds it; it serves them in pages of at most
-//! `MaxResults`, where the `NextToken` is the version number the next page starts at, and an
-//! id naming no association of the Region the request was signed for is
-//! `AssociationDoesNotExist`.
+//! RULE: a version listing reports every version the association its id names holds, NEWEST
+//! VERSION FIRST, each entry being the association's whole configuration as of that version
+//! ("the targets specified for the association when the association version was created",
+//! `AssociationVersionInfo$Targets`) beside the id and document name of the association that
+//! holds it; it serves them in pages of at most `MaxResults`, where the `NextToken` is the
+//! version number the next page starts at, and an id naming no association of the Region the
+//! request was signed for is `AssociationDoesNotExist`.
 //!
 //! Every case goes through the front door a client uses, over the dispatch
 //! [`crate::state_manager_associations`] publishes, so this suite shares one calling
@@ -63,6 +64,11 @@ fn version_numbers(response: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The version numbers of a whole history as a listing must report them: newest first.
+fn newest_first(held: usize) -> Vec<String> {
+    (1..=held).rev().map(|n| n.to_string()).collect()
+}
+
 /// The refusal message of a failure body.
 fn error_message(body: &Value) -> String {
     body["message"]
@@ -82,7 +88,8 @@ async fn update(router: &MultiServiceRouter, case: &str, body: &Value) {
 }
 
 /// What one version of an association must report: the members it carries, and the members it
-/// carries nothing for because the call that wrote it supplied none.
+/// carries nothing for because neither the call that wrote it nor the configuration it was
+/// applied over carries them.
 struct ExpectedVersion {
     reported: Vec<(&'static str, Value)>,
     unset: Vec<&'static str>,
@@ -186,10 +193,12 @@ fn history_rows() -> Vec<HistoryRow> {
                         ("ComplianceSeverity", json!("LOW")),
                         ("MaxErrors", json!("2")),
                         ("MaxConcurrency", json!("50%")),
+                        // A version is the whole configuration as of itself, so the targets
+                        // the create named are carried by every later version that does not
+                        // name its own.
+                        ("Targets", json!([{"Key": "InstanceIds", "Values": [NODE]}])),
                     ],
-                    // An update carries the whole configuration, so the targets the create
-                    // named are reported by the version that named them and by no later one.
-                    unset: vec!["Targets", "ScheduleExpression"],
+                    unset: vec!["ScheduleExpression"],
                 },
                 ExpectedVersion {
                     reported: vec![
@@ -198,8 +207,13 @@ fn history_rows() -> Vec<HistoryRow> {
                         ("ScheduleExpression", json!("cron(0 2 ? * SUN *)")),
                         ("ApplyOnlyAtCronInterval", json!(true)),
                         ("ScheduleOffset", json!(3)),
+                        ("MaxErrors", json!("2")),
+                        ("ComplianceSeverity", json!("LOW")),
+                        ("Targets", json!([{"Key": "InstanceIds", "Values": [NODE]}])),
                     ],
-                    unset: vec!["Parameters", "MaxErrors", "ComplianceSeverity"],
+                    // The parameters are the document's own, so moving the association onto
+                    // another document carries none of them over.
+                    unset: vec!["Parameters"],
                 },
                 ExpectedVersion {
                     reported: vec![
@@ -208,8 +222,51 @@ fn history_rows() -> Vec<HistoryRow> {
                         ("AssociationName", json!("the-third-name")),
                         ("SyncCompliance", json!("MANUAL")),
                         ("ApplyOnlyAtCronInterval", json!(false)),
+                        ("ScheduleExpression", json!("cron(0 2 ? * SUN *)")),
+                        ("ScheduleOffset", json!(3)),
                     ],
-                    unset: vec!["ScheduleExpression", "ScheduleOffset"],
+                    unset: vec!["Parameters"],
+                },
+            ],
+        },
+        HistoryRow {
+            case: "a create and two updates, the second carrying an empty target list and an \
+                   empty change-calendar list, which clear what they name",
+            created_with: json!({
+                "Targets": [{"Key": "InstanceIds", "Values": [NODE]}],
+                "CalendarNames": ["AWS-ChangeCalendar"]
+            }),
+            updates: vec![
+                json!({"Name": AGENT, "MaxConcurrency": "10%"}),
+                json!({"Name": AGENT, "Targets": [], "CalendarNames": []}),
+            ],
+            expected: vec![
+                ExpectedVersion {
+                    reported: vec![
+                        ("AssociationVersion", json!("1")),
+                        ("Targets", json!([{"Key": "InstanceIds", "Values": [NODE]}])),
+                        ("CalendarNames", json!(["AWS-ChangeCalendar"])),
+                    ],
+                    unset: vec!["MaxConcurrency"],
+                },
+                ExpectedVersion {
+                    reported: vec![
+                        ("AssociationVersion", json!("2")),
+                        ("MaxConcurrency", json!("10%")),
+                        ("Targets", json!([{"Key": "InstanceIds", "Values": [NODE]}])),
+                        ("CalendarNames", json!(["AWS-ChangeCalendar"])),
+                    ],
+                    unset: vec!["ScheduleExpression"],
+                },
+                ExpectedVersion {
+                    reported: vec![
+                        ("AssociationVersion", json!("3")),
+                        ("MaxConcurrency", json!("10%")),
+                        // Carried empty, so the member is reported as the empty list it was
+                        // carried as rather than kept.
+                        ("CalendarNames", json!([])),
+                    ],
+                    unset: vec!["Targets"],
                 },
             ],
         },
@@ -239,8 +296,9 @@ async fn with_history(router: &MultiServiceRouter, row: &HistoryRow) -> String {
     association_id
 }
 
-/// RULE: a version listing reports every version the association holds, oldest first, each
-/// carrying what the call that wrote it supplied beside the association's own id and name.
+/// RULE: a version listing reports every version the association holds, newest first, each
+/// carrying the association's whole configuration as of that version beside its own id and
+/// name.
 #[tokio::test]
 async fn a_version_listing_reports_every_version_the_association_holds() {
     for row in history_rows() {
@@ -269,14 +327,16 @@ async fn a_version_listing_reports_every_version_the_association_holds() {
             response["NextToken"].is_null(),
             "case {case:?}: expected a whole history to be served in one page, got {response:?}"
         );
-        // Oldest first, counting up from the version the create minted with no gaps.
-        let numbered: Vec<String> = (1..=row.expected.len()).map(|n| n.to_string()).collect();
+        // Newest first, counting DOWN from the version in force to the one the create minted,
+        // with no gaps: a client reading element 0 reads what the association is doing now.
         assert_eq!(
             version_numbers(&response),
-            numbered,
-            "case {case:?}: expected the versions oldest first, got {versions:?}"
+            newest_first(row.expected.len()),
+            "case {case:?}: expected the versions newest first, got {versions:?}"
         );
-        for (version, expected) in versions.iter().zip(&row.expected) {
+        // The table reads oldest first, the way the history was built; the listing reports it
+        // the other way round.
+        for (version, expected) in versions.iter().rev().zip(&row.expected) {
             assert_eq!(
                 version["AssociationId"].as_str(),
                 Some(association_id.as_str()),
@@ -285,6 +345,14 @@ async fn a_version_listing_reports_every_version_the_association_holds() {
             assert!(
                 version["CreatedDate"].is_number() || version["CreatedDate"].is_string(),
                 "case {case:?}: expected the version to report when it was created, got \
+                 {version:?}"
+            );
+            // "The names or Amazon Resource Names (ARNs) of the Change Calendar type documents
+            // your associations are gated under": a version no change calendar gates is gated
+            // under NONE of them, which is an empty list rather than no list at all.
+            assert!(
+                version["CalendarNames"].is_array(),
+                "case {case:?}: expected CalendarNames to be a list on every version, got \
                  {version:?}"
             );
             for (member, value) in &expected.reported {
@@ -320,7 +388,7 @@ async fn a_version_listing_reports_every_version_the_association_holds() {
 
 /// RULE: a listing serves at most `MaxResults` versions per page, and the `NextToken` is the
 /// version the next page starts at — so walking the pages reports every version exactly once,
-/// oldest first.
+/// newest first.
 #[tokio::test]
 async fn paging_a_version_listing_reports_every_version_exactly_once() {
     let (router, _engine) = service();
@@ -328,11 +396,11 @@ async fn paging_a_version_listing_reports_every_version_exactly_once() {
     // page size below it.
     let row = history_rows()
         .into_iter()
-        .next_back()
+        .max_by_key(|row| row.expected.len())
         .expect("the table holds a row");
     let held = row.expected.len();
     let association_id = with_history(&router, &row).await;
-    let whole: Vec<String> = (1..=held).map(|n| n.to_string()).collect();
+    let whole: Vec<String> = newest_first(held);
 
     // The page sizes span the modelled range (`ListAssociationVersionsRequest$MaxResults`,
     // 1..50): the minimum, a size that does not divide the held count, the count itself, the
@@ -380,7 +448,7 @@ async fn paging_a_version_listing_reports_every_version_exactly_once() {
         }
         assert_eq!(
             walked, whole,
-            "case {case:?}: expected the walk to report every version once, oldest first, got \
+            "case {case:?}: expected the walk to report every version once, newest first, got \
              {walked:?}"
         );
         let expected_pages = held.div_ceil(size.unwrap_or(held));
@@ -453,7 +521,7 @@ async fn a_token_this_listing_never_issued_is_refused() {
     let (router, _engine) = service();
     let row = history_rows()
         .into_iter()
-        .next_back()
+        .max_by_key(|row| row.expected.len())
         .expect("the table holds a row");
     let held = row.expected.len();
     let association_id = with_history(&router, &row).await;
@@ -494,7 +562,8 @@ async fn a_token_this_listing_never_issued_is_refused() {
     }
 
     // Every version this association holds is a position its history can be resumed from, so
-    // a listing resumed at one reports that version and the ones after it.
+    // a listing resumed at one reports that version and the ones BEFORE it: the walk runs from
+    // the newest version down.
     for version in 1..=held {
         let case = format!("resumed at version {version}");
         let response = listed(
@@ -503,11 +572,11 @@ async fn a_token_this_listing_never_issued_is_refused() {
             &json!({"AssociationId": association_id, "NextToken": version.to_string()}),
         )
         .await;
-        let expected: Vec<String> = (version..=held).map(|n| n.to_string()).collect();
+        let expected: Vec<String> = (1..=version).rev().map(|n| n.to_string()).collect();
         assert_eq!(
             version_numbers(&response),
             expected,
-            "case {case:?}: expected the versions at or after {version}, got {response:?}"
+            "case {case:?}: expected the versions at or before {version}, got {response:?}"
         );
     }
 

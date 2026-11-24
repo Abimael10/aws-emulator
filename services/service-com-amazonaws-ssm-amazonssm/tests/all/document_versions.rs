@@ -449,6 +449,7 @@ async fn content_a_version_already_holds_is_refused() {
             .map(|entry| entry["DocumentVersion"].as_str().unwrap_or_default())
             .collect();
         let held: Vec<String> = (1..=contents.len())
+            .rev()
             .map(|version| version.to_string())
             .collect();
         assert_eq!(
@@ -990,14 +991,14 @@ async fn seed_versions(router: &MultiServiceRouter, row: &VersionsListed<'_>) {
 }
 
 /// "List all versions for a document": the listing reports EVERY version the document
-/// holds, oldest first, flagging the one that is the default — whatever the document's
+/// holds, NEWEST FIRST, flagging the one that is the default — whatever the document's
 /// type and format, however many versions it holds, and whether the default is still the
 /// created version or was moved to another one.
 ///
 /// Each version is reported with the members the same version's `DescribeDocument`
 /// reports, so a listing cannot disagree with a describe.
 #[tokio::test]
-async fn every_version_is_listed_oldest_first_with_the_default_flagged() {
+async fn every_version_is_listed_newest_first_with_the_default_flagged() {
     let router = router();
     let rows = vec![
         VersionsListed {
@@ -1065,17 +1066,20 @@ async fn every_version_is_listed_oldest_first_with_the_default_flagged() {
         );
 
         let default_version = row.default_version.unwrap_or(1);
+        let held = row.contents.len();
         for (index, entry) in listed.iter().enumerate() {
-            let version = (index + 1).to_string();
+            // The newest version is served first, so entry 0 is the last version minted.
+            let number = held - index;
+            let version = number.to_string();
             assert_eq!(
                 entry["DocumentVersion"],
                 json!(version),
-                "case {case}: the listing is oldest first, so entry {index} is version \
+                "case {case}: the listing is newest first, so entry {index} is version \
                  {version}, got {entry}"
             );
             assert_eq!(
                 entry["IsDefaultVersion"],
-                json!(index + 1 == default_version),
+                json!(number == default_version),
                 "case {case}: version {version} is the default exactly when it is version \
                  {default_version}, got {entry}"
             );
@@ -1110,7 +1114,7 @@ async fn every_version_is_listed_oldest_first_with_the_default_flagged() {
             }
             assert_eq!(
                 entry["VersionName"],
-                row.version_names[index].map_or(Value::Null, |name| json!(name)),
+                row.version_names[number - 1].map_or(Value::Null, |name| json!(name)),
                 "case {case}: version {version} reports the VersionName it was given, \
                  got {entry}"
             );
@@ -1118,20 +1122,22 @@ async fn every_version_is_listed_oldest_first_with_the_default_flagged() {
     }
 }
 
-/// A document Systems Manager publishes holds exactly the one version it publishes, which
-/// is its default — the catalogue resolves without anybody creating it, so its versions
-/// list without any create too.
+/// A document Systems Manager publishes lists the versions the catalogue publishes of it,
+/// newest first, the newest being its default — the catalogue resolves without anybody
+/// creating it, so its versions list without any create too.
 #[tokio::test]
-async fn a_published_document_lists_the_one_version_it_holds() {
+async fn a_published_document_lists_the_versions_the_catalogue_publishes() {
     let router = router();
     for entry in CATALOGUE {
         let case = entry.name;
         let response = list_versions_ok(&router, case, &json!({ "Name": entry.name })).await;
         let listed = reported(case, &response);
+        let published = entry.published_versions();
         assert_eq!(
             listed.len(),
-            1,
-            "case {case}: a published document holds one version, got {response}"
+            published.len(),
+            "case {case}: a published document lists one entry per version the catalogue \
+             publishes, got {response}"
         );
         assert_eq!(
             (
@@ -1139,8 +1145,13 @@ async fn a_published_document_lists_the_one_version_it_holds() {
                 listed[0]["DocumentVersion"].clone(),
                 listed[0]["IsDefaultVersion"].clone()
             ),
-            (json!(entry.name), json!("1"), json!(true)),
-            "case {case}: the published version is version 1 and the default, got {response}"
+            (
+                json!(entry.name),
+                json!(entry.default_published_version().to_string()),
+                json!(true)
+            ),
+            "case {case}: the version served first is the newest, which is the default, got \
+             {response}"
         );
     }
 }
@@ -1167,7 +1178,7 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_its_token() {
         )
         .await;
     }
-    let every_version: Vec<String> = (1..=held).map(|version| version.to_string()).collect();
+    let every_version: Vec<String> = (1..=held).rev().map(|version| version.to_string()).collect();
 
     // The modelled `MaxResults` range is 1..50 (`ListDocumentVersionsRequest$MaxResults`),
     // so both of its bounds are asked for beside the sizes in between.
@@ -1207,7 +1218,7 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_its_token() {
         }
         assert_eq!(
             walked, every_version,
-            "case {case}: the pages partition the versions oldest first, got {walked:?}"
+            "case {case}: the pages partition the versions newest first, got {walked:?}"
         );
     }
 
@@ -1297,7 +1308,7 @@ async fn a_token_this_listing_did_not_issue_is_refused() {
     .await;
     assert_eq!(
         reported("the resumed page", &second)[0]["DocumentVersion"],
-        json!("2"),
+        json!("1"),
         "the issued token resumes at the version it names, got {second}"
     );
 }

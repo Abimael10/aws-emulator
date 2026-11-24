@@ -21,9 +21,10 @@
 //! of this service registers one.
 //!
 //! The suites are tables. Each row is one input along the axis the rule generalises over —
-//! which targeting form the applied version uses, how many nodes it selects, whether it names
-//! the node the deprecated way, and whether it leaves the next run to the schedule — rather
-//! than the single update a recording happened to make.
+//! which targeting form the applied version uses, how many nodes it selects, whether the
+//! update restates the targeting or carries it empty, whether it names the node the deprecated
+//! way, and whether it leaves the next run to the schedule — rather than the single update a
+//! recording happened to make.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -173,9 +174,17 @@ fn rows() -> Vec<Row> {
             reaches: vec![OTHER_NODE],
         },
         Row {
-            case: "an update restating no target at all, which selects no node",
+            case: "an update restating no target at all, which keeps the targeting the \
+                   association already runs on",
             created_with: json!({"Targets": [{"Key": "InstanceIds", "Values": [NODE]}]}),
             update_with: json!({"ScheduleExpression": "rate(2 hours)"}),
+            reaches: vec![NODE],
+        },
+        Row {
+            case: "an update carrying an EMPTY target list, which clears the targeting so the \
+                   run selects no node",
+            created_with: json!({"Targets": [{"Key": "InstanceIds", "Values": [NODE]}]}),
+            update_with: json!({"Targets": [], "ScheduleExpression": "rate(2 hours)"}),
             reaches: vec![],
         },
         Row {
