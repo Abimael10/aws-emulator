@@ -8,7 +8,8 @@
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart, and the identifier's FORM is what decides it. A value written in
+//! the two conditions apart, and the identifier's FORM is what decides it — for the routes that
+//! READ one. A value written in
 //! the identifier ALPHABET (digits and uppercase letters, carrying no separator and no lower
 //! case) claims to be an identifier this service issued, so it earns the unreadable-identifier
 //! sentence ("Id format is invalid") unless it is written the way the addressed kind's
@@ -16,8 +17,10 @@
 //! identifier under, over a body of the issued width. Every other value the store holds nothing
 //! for is the ABSENT resource ("The specified field level encryption config/profile does not
 //! exist."), a value of the issued form as much as one written outside the alphabet, which
-//! claims to be no identifier of this mint at all. Both sentences are fixed text: neither
-//! echoes the value submitted.
+//! claims to be no identifier of this mint at all. `GetFieldLevelEncryption`, the
+//! configuration's RESOURCE read, reads NO form of the value at all — its own recorded contract
+//! — so there every value is carried through to the store and the absent resource is the only
+//! sentence. Both sentences are fixed text: neither echoes the value submitted.
 //!
 //! So the rows span what the rule generalises over:
 //!
@@ -127,6 +130,17 @@ impl Op {
             Kind::Config => "NoSuchFieldLevelEncryptionConfig",
             Kind::Profile => "NoSuchFieldLevelEncryptionProfile",
         }
+    }
+
+    /// Whether this operation reads the identifier's FORM at all before it resolves it — its
+    /// own recorded contract, read from the one place this surface states it
+    /// ([`crate::field_level_encryption_identifier_width_and_namespace::reads_the_form`]), so
+    /// the split cannot drift between the suites. Each variant is named for the operation it
+    /// drives, which is the name that helper takes.
+    fn reads_the_form(self) -> bool {
+        crate::field_level_encryption_identifier_width_and_namespace::reads_the_form(&format!(
+            "{self:?}"
+        ))
     }
 
     /// Send this operation at `id`, carrying the stored resource's current version token so
@@ -243,11 +257,13 @@ async fn seed(router: &MultiServiceRouter) -> Stored {
 }
 
 /// One identifier a case submits where an identifier of the addressed kind belongs, and the
-/// sentence its FORM earns it from every operation of this surface.
+/// sentence its FORM earns it: `expected` from an operation that READS the identifier's form,
+/// `absent` from the one that reads none of it.
 struct Shape {
     case: String,
     id: String,
     expected: &'static str,
+    absent: &'static str,
 }
 
 impl Shape {
@@ -258,18 +274,20 @@ impl Shape {
             case: case.into(),
             id: id.into(),
             expected: absent,
+            absent,
         }
     }
 
     /// A value written in the identifier alphabet that the addressed kind's issued form rules
     /// out — another width, or another kind's namespace letter: it claims to be an identifier
-    /// this service issued and could not be one of this kind, so every route reports it
-    /// unreadable.
-    fn misread(case: impl Into<String>, id: impl Into<String>) -> Self {
+    /// this service issued and could not be one of this kind, so every route that reads the
+    /// form reports it unreadable.
+    fn misread(case: impl Into<String>, id: impl Into<String>, absent: &'static str) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
             expected: UNREADABLE_IDENTIFIER,
+            absent,
         }
     }
 
@@ -281,6 +299,7 @@ impl Shape {
             case: case.into(),
             id: id.into(),
             expected: absent,
+            absent,
         }
     }
 
@@ -291,6 +310,17 @@ impl Shape {
             case: case.into(),
             id: id.into(),
             expected: absent,
+            absent,
+        }
+    }
+
+    /// The sentence this identifier earns from `op`: what its form earns it where `op` reads
+    /// one, and the absent resource where `op` reads no form at all ([`Op::reads_the_form`]).
+    fn expected_from(&self, op: Op) -> &'static str {
+        if op.reads_the_form() {
+            self.expected
+        } else {
+            self.absent
         }
     }
 }
@@ -337,23 +367,32 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
         Shape::misread(
             "this kind's prefix with a body one character short",
             format!("{prefix}{}", &body[..body.len() - 1]),
+            absent,
         ),
         Shape::misread(
             "this kind's prefix with a body one character too long",
             format!("{prefix}{body}A"),
+            absent,
         ),
         Shape::misread(
             "the sibling field-level encryption kind's own minted id",
             sibling,
+            absent,
         ),
-        Shape::misread("a public key id this service minted", public_key),
+        Shape::misread(
+            "a public key id this service minted",
+            public_key,
+            absent,
+        ),
         Shape::misread(
             "the namespace every other CloudFront entity id is drawn from",
             format!("E{body}"),
+            absent,
         ),
         Shape::misread(
             "a namespace letter no kind of this service mints and a far longer body",
             format!("W{body}{body}"),
+            absent,
         ),
         // And the value of the alphabet at the issued width under a letter that identifies no
         // namespace of this service, which says nothing about the kind that issued it.
@@ -413,9 +452,10 @@ fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &str) {
 
 /// Every operation addressed by a field-level encryption identifier answers its one not-found
 /// code for an identifier it cannot resolve, and the identifier's FORM decides which of that
-/// code's two sentences: the unreadable-identifier sentence for a value written as an
-/// identifier of this service's mint that the addressed kind's issued form rules out, and the
-/// absent-resource sentence for every other value.
+/// code's two sentences on every route that READS one: the unreadable-identifier sentence for a
+/// value written as an identifier of this service's mint that the addressed kind's issued form
+/// rules out, and the absent-resource sentence for every other value — while the configuration's
+/// RESOURCE read, which reads no form, answers the absent-resource sentence for every value.
 #[tokio::test]
 async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_decides() {
     let router = emulator();
@@ -429,7 +469,7 @@ async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_
                 &answer,
                 &format!("{op:?} with {}", shape.case),
                 op.code(),
-                shape.expected,
+                shape.expected_from(*op),
             );
         }
     }

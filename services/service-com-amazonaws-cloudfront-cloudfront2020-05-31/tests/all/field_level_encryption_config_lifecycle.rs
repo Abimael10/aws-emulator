@@ -67,10 +67,10 @@ const URL_ENCODED: &str = "URLEncoded";
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
 
-/// The sentence a read of this surface answers a value WRITTEN as an identifier of this
-/// service's mint — the alphabet CloudFront writes an identifier in — that is not of the form
-/// the addressed record's identifiers are ISSUED in: the identifier the service reports it
-/// cannot read, naming the member that carried it.
+/// The sentence a read of this surface that reads its identifier's FORM answers a value
+/// WRITTEN as an identifier of this service's mint — the alphabet CloudFront writes an
+/// identifier in — that is not of the form the addressed record's identifiers are ISSUED in:
+/// the identifier the service reports it cannot read, naming the member that carried it.
 pub(crate) const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 const QUERY_ARG_PROFILE_EMPTY: &str =
@@ -1288,11 +1288,9 @@ async fn a_mapping_list_past_its_bound_is_refused() {
 }
 
 /// An id no stored configuration carries names no configuration: the reader answers
-/// `NoSuchFieldLevelEncryptionConfig` (404) whatever shape the id has, and the MESSAGE says
-/// which condition it was — a value WRITTEN as an identifier of this service's mint that is not
-/// of the form CloudFront issues a configuration id in is the identifier the service cannot
-/// read, and every other id the store holds nothing for is the absent configuration — and a
-/// stored configuration is still read at its own id.
+/// `NoSuchFieldLevelEncryptionConfig` (404) with the absent-configuration sentence whatever
+/// shape the id has — this read reads no form of its `Id` — and a stored configuration is
+/// still read at its own id.
 #[tokio::test]
 async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
     let router = emulator();
@@ -1314,15 +1312,14 @@ async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
     // The rows span the ways an id can name no configuration: a well-shaped configuration id
     // that was never minted, an id in another namespace and of a width no identifier of this
     // kind is issued at, a minted id of another kind — the profile's, a different resource
-    // under the same surface — and a value of no CloudFront identifier form at all. A value
-    // written in the identifier ALPHABET has to be of the form a configuration id is issued in
-    // to be read as one, so another namespace is the id this read reports it cannot read; a
-    // value outside that alphabet claims no form to refuse and is the configuration reported
-    // absent.
+    // under the same surface — and a value of no CloudFront identifier form at all. This read
+    // reads no form of the value at all: `Id` is a plain `string` `@httpLabel` with no
+    // `@pattern` and no `@length`, so every one of them is carried through to the store and is
+    // the configuration reported absent.
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
-        (profile.as_str(), UNREADABLE_ID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config(&router, case).await;

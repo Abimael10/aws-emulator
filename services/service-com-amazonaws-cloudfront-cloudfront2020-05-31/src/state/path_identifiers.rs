@@ -11,13 +11,17 @@
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
 //!   the value, which is a property of the value alone. Every route addressed by a field-level
-//!   encryption record's `Id` reads the WHOLE form that record's ids are ISSUED in — the kind's
-//!   namespace letter over an identifier body of the issued width — of a value that is written
-//!   as an identifier of this mint at all, and reads no form of a value that is not
+//!   encryption record's `Id` that reads or writes the record's CONFIGURATION DOCUMENT reads the
+//!   WHOLE form that record's ids are ISSUED in — the kind's namespace letter over an identifier
+//!   body of the issued width — of a value that is written as an identifier of this mint at
+//!   all, and reads no form of a value that is not
 //!   ([`super::unresolved_field_level_encryption_config`],
-//!   [`super::unresolved_field_level_encryption_profile`]); the
+//!   [`super::unresolved_field_level_encryption_profile`]) — while the configuration's resource
+//!   read reads NO form at all and reports every id it cannot resolve as the configuration that
+//!   is absent ([`super::no_such_field_level_encryption_config`]); the
 //!   distribution reads the whole form its ids are minted in
-//!   ([`super::is_distribution_id`]), and the origin access control reads NO form at all
+//!   ([`super::is_distribution_id`]), and the origin access control reads the ALPHABET and
+//!   nothing more
 //!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
@@ -40,7 +44,9 @@
 //! [`super::unresolved_field_level_encryption_profile`]). Those need no store, which is the one
 //! reason the ones below are methods. A kind whose recorded contract makes NO such split reads
 //! nothing of the value at all and reports the absent resource for every identifier it cannot
-//! resolve, which is what the public key reads do ([`super::no_such_public_key`]).
+//! resolve, which is what the public key reads and the field-level encryption configuration's
+//! RESOURCE read do ([`super::no_such_public_key`],
+//! [`super::no_such_field_level_encryption_config`]).
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 

@@ -20,7 +20,10 @@
 //!   value of the kind's issued form (which identifier of that form was ever issued is a
 //!   property of the store) and a value that claims to be no identifier of this mint at all —
 //!   lower-cased, hyphenated, underscored, mixed-case — in which there is no identifier whose
-//!   form could be wrong.
+//!   form could be wrong;
+//! * and `GetFieldLevelEncryption`, the configuration's RESOURCE read, reads NO form at all —
+//!   its own recorded contract — so there every value is carried through to the store and earns
+//!   the absent-record sentence, which is what the shared oracle answers for it.
 //!
 //! The rows are therefore PAIRS that isolate each half of that discriminator, one dimension at a
 //! time, across both resource kinds and every operation addressed by one of their identifiers:
@@ -99,7 +102,7 @@ async fn the_case_a_value_is_written_in_decides_whether_its_form_is_read() {
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    unresolved_answer(kind, &id, &minted),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }
@@ -170,7 +173,7 @@ async fn the_leading_letter_decides_within_the_identifier_alphabet() {
                     &answer,
                     &format!("{operation} with {case} at the issued width ({id:?})"),
                     kind.code(),
-                    unresolved_answer(kind, &id, &minted),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }

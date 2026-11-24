@@ -3791,9 +3791,12 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// [`no_such_field_level_encryption_profile`] keeps for the other field-level encryption
 /// resource: these operations model this one not-found code and no argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
-/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and every route addressed by a
-/// configuration id reports each id the account holds no configuration under as the
-/// configuration that is absent ([`unresolved_field_level_encryption_config`]).
+/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and each route addressed by a
+/// configuration id reports every id of the form IT reads that the account holds no
+/// configuration under as the configuration that is absent
+/// ([`unresolved_field_level_encryption_config`]) — the configuration's own RESOURCE read
+/// (`GetFieldLevelEncryption`) reading no form at all, so it answers this sentence for every id
+/// it cannot resolve.
 ///
 /// The sentence states a property of the store rather than of the request — the id names no
 /// configuration — so nothing from the request belongs in the text and every refusal of this
@@ -3813,14 +3816,19 @@ pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchField
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
     "The specified field level encryption config does not exist.";
 
-/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) every operation addressed by a
-/// field-level encryption configuration `Id` answers an `Id` it cannot resolve — the split
-/// [`unresolved_field_level_encryption_profile`] makes for the other field-level encryption
-/// record, over the configuration's own namespace letter ([`id_format_refused_for`]).
+/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) the operations addressed by a
+/// field-level encryption configuration `Id` that read or write the CONFIGURATION DOCUMENT —
+/// its `/config` read, its update and its delete — answer an `Id` they cannot resolve: the
+/// split [`unresolved_field_level_encryption_profile`] makes for the other field-level
+/// encryption record, over the configuration's own namespace letter
+/// ([`id_format_refused_for`]).
 ///
-/// ONE answer for the whole kind: the configuration's RESOURCE read (`GetFieldLevelEncryption`,
-/// `GET /2020-05-31/field-level-encryption/{Id}`), its `/config` read, its update and its
-/// delete all judge the value the same way, as their recorded answers report.
+/// The RESOURCE read of the same kind (`GetFieldLevelEncryption`, `GET
+/// /2020-05-31/field-level-encryption/{Id}`) reads NO form of the value at all, as its own
+/// recorded answers report: it carries every `Id` through to the store and answers
+/// [`no_such_field_level_encryption_config`] for the one it cannot resolve. How much of an
+/// identifier's form a route reads is each route's recorded contract, so do not fold the two
+/// into one.
 pub fn unresolved_field_level_encryption_config(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {

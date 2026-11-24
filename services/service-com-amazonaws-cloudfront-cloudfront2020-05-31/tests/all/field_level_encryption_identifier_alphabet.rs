@@ -8,9 +8,11 @@
 //! own not-found error and `AccessDenied` are all these operations model
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`)
 //! — so the MESSAGE is what tells the two conditions apart. A value written in the identifier
-//! alphabet claims to be an identifier this service issued and is therefore judged on its form,
-//! which `field_level_encryption_identifier_width_and_namespace.rs` states and
-//! [`unresolved_answer`] decides; a value carrying a character that alphabet does not admit
+//! alphabet claims to be an identifier this service issued and is therefore judged on its form
+//! by every route that reads one, which
+//! `field_level_encryption_identifier_width_and_namespace.rs` states and [`unresolved_answer`]
+//! decides — the configuration's RESOURCE read reads no form at all, so there every value is
+//! carried through to the store; a value carrying a character that alphabet does not admit
 //! claims to be no identifier of this mint at all, so it is resolved against the store and
 //! reports the record ABSENT.
 //!
@@ -23,8 +25,8 @@
 //! the suite's contrast rows.
 //!
 //! The harness is the one `field_level_encryption_identifier_width_and_namespace.rs` publishes
-//! ([`Kind`], [`seed`], [`address`], [`assert_refusal`], [`unresolved_answer`],
-//! [`UNREADABLE_IDENTIFIER`]), reused rather than copied; the width this service issues is read
+//! ([`Kind`], [`seed`], [`address`], [`assert_refusal`], [`unresolved_answer`]), reused rather
+//! than copied; the width this service issues is read
 //! off an identifier it really minted, so no width here is written out by hand.
 
 use crate::distribution_lifecycle::emulator;
@@ -36,7 +38,11 @@ use crate::field_level_encryption_profile_lifecycle::get_profile;
 
 /// A body of `width` characters of the identifier alphabet, cycling its digits and uppercase
 /// letters so no width is a value this emulator ever minted.
-fn body(width: usize) -> String {
+///
+/// Published for the sibling suites that submit a body of the identifier alphabet
+/// (`field_level_encryption_resource_read_reads_no_identifier_form.rs`), so the alphabet lives
+/// in one place.
+pub(crate) fn body(width: usize) -> String {
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         .chars()
         .cycle()
@@ -173,7 +179,7 @@ async fn a_value_of_the_identifier_alphabet_is_judged_on_the_issued_form() {
                     &answer,
                     &case,
                     kind.code(),
-                    unresolved_answer(kind, &id, &minted),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }

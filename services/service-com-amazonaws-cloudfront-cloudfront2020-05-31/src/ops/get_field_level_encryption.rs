@@ -150,18 +150,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no status and no propagation deadline, so the clock owes one nothing and this read
         // reports the stored record as it stands.
         //
-        // "Request the ID for the field-level encryption configuration information": whether
-        // the value is written as an identifier this service could have ISSUED for a
-        // configuration is decided before the configuration is resolved — a value written in
-        // the alphabet CloudFront writes an identifier in that is not of the configuration's
-        // issued form is the identifier this route reports it cannot read, and every other
-        // value the store holds no configuration under is the configuration that is absent,
-        // which is what this route's recorded answers report
-        // ([`crate::state::unresolved_field_level_encryption_config`]).
+        // "Request the ID for the field-level encryption configuration information": the `Id`
+        // is resolved against the STORE and nothing else. The model constrains that member no
+        // further than `string` — a required `@httpLabel` with no `@pattern` and no `@length`
+        // (`smithy_query(query="operation",operation="GetFieldLevelEncryption")`) — and this
+        // operation models no argument error either, so the form of the value decides nothing
+        // here: every `Id` the account holds no configuration under is the configuration that
+        // is ABSENT ([`crate::state::no_such_field_level_encryption_config`]), which is what
+        // this route's recorded answers report. The CONFIGURATION DOCUMENT read of the same
+        // record reads the form the value was issued in, as its own recorded answers report
+        // ([`crate::state::unresolved_field_level_encryption_config`]): how much of an
+        // identifier's form a route reads is each route's own recorded contract.
         let Some(stored) = store.field_level_encryption_config(&input.id) else {
             return Err(
                 GetFieldLevelEncryptionErrorModeled::NoSuchFieldLevelEncryptionConfig(
-                    crate::state::unresolved_field_level_encryption_config(&input.id),
+                    crate::state::no_such_field_level_encryption_config(),
                 )
                 .into(),
             );
