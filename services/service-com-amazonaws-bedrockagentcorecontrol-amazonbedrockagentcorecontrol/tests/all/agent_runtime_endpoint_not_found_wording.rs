@@ -17,7 +17,8 @@
 //! the resource family.
 //!
 //! Sources: `smithy_query(query="operation",operation="GetAgentRuntimeEndpoint,\
-//! UpdateAgentRuntimeEndpoint,CreateAgentRuntimeEndpoint,CreateAgentRuntime")` for the
+//! UpdateAgentRuntimeEndpoint,DeleteAgentRuntimeEndpoint,CreateAgentRuntimeEndpoint,\
+//! CreateAgentRuntime")` for the
 //! routes, the `@httpLabel` members, the success statuses and the modelled errors with
 //! their HTTP statuses, and the `AgentRuntimeId` / `EndpointName` patterns quoted below for
 //! the identifier forms the rows span.
@@ -163,12 +164,13 @@ fn agent_not_found(runtime_id: &str) -> String {
 }
 
 /// The operations whose route addresses ONE endpoint, with the HTTP method each is bound to
-/// and the body it carries: both must answer the identical sentence, so neither the verb nor
-/// the body can appear in it. `DeleteAgentRuntimeEndpoint` is bound at the same route and is
-/// not implemented yet, so it is not driven here.
-const ENDPOINT_OPERATIONS: [(&str, &str, bool); 2] = [
+/// and the body it carries: every one of them must answer the identical sentence, so neither
+/// the verb nor the body can appear in it. A read, a change and a removal of the same unknown
+/// endpoint are all driven here.
+const ENDPOINT_OPERATIONS: [(&str, &str, bool); 3] = [
     ("GetAgentRuntimeEndpoint", "GET", false),
     ("UpdateAgentRuntimeEndpoint", "PUT", true),
+    ("DeleteAgentRuntimeEndpoint", "DELETE", false),
 ];
 
 /// Drive every operation that addresses one endpoint at `runtime_id`/`endpoint_name` and
