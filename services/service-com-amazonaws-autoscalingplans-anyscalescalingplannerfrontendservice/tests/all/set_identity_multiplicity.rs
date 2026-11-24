@@ -319,9 +319,10 @@ async fn stored_target_values(emulator: &Emulator, name: &str) -> Vec<f64> {
 async fn a_respelled_dimension_set_names_the_metric_whose_policy_is_in_force() {
     // A re-sent configuration naming the SAME dimension set with a repeated entry is
     // that same metric, so the policy derived from it is the policy already in force,
-    // under the name it already had and tracking the value it already tracked; a set that
-    // names ANOTHER metric is minted another policy, and that one takes the update's
-    // value ([`crate::update_keeps_an_applied_policys_target_value`]).
+    // under the name it already had; a set that names ANOTHER metric is minted another
+    // policy. Either way the configuration in force is the one the update sent, so what
+    // tells the two apart is the policy NAME
+    // ([`crate::update_keeps_an_applied_policys_target_value`]).
     const IN_FORCE_TARGET: f64 = 40.0;
     const REQUESTED_TARGET: f64 = 70.0;
     const NEW_METRIC_TARGET: f64 = 80.0;
@@ -369,19 +370,11 @@ async fn a_respelled_dimension_set_names_the_metric_whose_policy_is_in_force() {
         emulator.make_all_due();
 
         let targets = stored_target_values(&emulator, OWNER).await;
-        let expected_first = if same_metric {
-            // The re-spelled set is the metric whose policy is applied, which the update
-            // cannot re-point.
-            IN_FORCE_TARGET
-        } else {
-            REQUESTED_TARGET
-        };
         assert_eq!(
             targets,
-            vec![expected_first, NEW_METRIC_TARGET],
-            "case {case:?}: a configuration naming the metric whose policy is applied \
-             keeps that policy's target value ({IN_FORCE_TARGET}) and every other one \
-             takes the update's, got {targets:?}"
+            vec![REQUESTED_TARGET, NEW_METRIC_TARGET],
+            "case {case:?}: every configuration the update carries is in force with the \
+             target value it sent, got {targets:?}"
         );
 
         let after = policy_names(&emulator, OWNER).await;

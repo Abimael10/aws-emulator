@@ -442,62 +442,6 @@ impl ScalingPlanRecord {
             .collect()
     }
 
-    /// The instruction set in force after an update that carried `requested`.
-    ///
-    /// `UpdateScalingPlan` takes the plan's whole `ScalingInstructions` list, so the list
-    /// the request carries is the configuration in force afterwards — with ONE exception,
-    /// which is what this method applies: an update does not re-point a target tracking
-    /// policy the plan has ALREADY APPLIED. For a configuration whose scaling metric a
-    /// policy applied to that resource already tracks, the target value in force is kept,
-    /// because that value is what the applied policy tracks to; every other member of the
-    /// configuration, every configuration no applied policy tracks (a resource whose
-    /// instruction turned dynamic scaling off, a metric the resource did not track
-    /// before), and every instruction for a resource the plan did not cover, is the
-    /// update's to set.
-    ///
-    /// "Already applied" is read from [`Self::applied_policies`] — the one answer this
-    /// crate gives to "which policies has this plan put on that resource?" — so the
-    /// exception cannot apply to a policy that does not exist, and the values kept are the
-    /// ones those very policies report tracking.
-    ///
-    /// A resource is matched by its own identity (`(ServiceNamespace, ResourceId,
-    /// ScalableDimension)`, "Each scaling instruction applies to one resource") and a
-    /// metric by [`target_metric_identity`], never by a position in a list: an update
-    /// rewrites the instruction list in the order the request carries it.
-    pub fn applied_update(&self, requested: Vec<ScalingInstruction>) -> Vec<ScalingInstruction> {
-        requested
-            .into_iter()
-            .map(|mut instruction| {
-                let Some(in_force) = self.scaling_instructions.iter().find(|applied| {
-                    resource_identity(applied) == resource_identity(&instruction)
-                }) else {
-                    return instruction;
-                };
-                // The metric each policy APPLIED to that resource tracks, with the target
-                // value it tracks to.
-                let tracked: BTreeMap<String, f64> = self
-                    .applied_policies(in_force)
-                    .into_iter()
-                    .filter_map(|policy| {
-                        let configuration = policy.target_tracking_configuration?;
-                        Some((
-                            target_metric_identity(&configuration)?,
-                            configuration.target_value,
-                        ))
-                    })
-                    .collect();
-                for configuration in &mut instruction.target_tracking_configurations {
-                    if let Some(in_force) = target_metric_identity(configuration)
-                        .and_then(|metric| tracked.get(&metric))
-                    {
-                        configuration.target_value = *in_force;
-                    }
-                }
-                instruction
-            })
-            .collect()
-    }
-
     /// What this plan has APPLIED to the resources it covers, under the instruction set
     /// `instructions`: per resource, the capacity band the plan registered for it and the
     /// target tracking scaling policies it put on it.

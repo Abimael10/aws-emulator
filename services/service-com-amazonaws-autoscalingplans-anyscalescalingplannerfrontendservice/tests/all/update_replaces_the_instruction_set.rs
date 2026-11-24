@@ -11,10 +11,10 @@
 //!   configuration in force afterwards, entry for entry and member for member — a
 //!   resource it no longer names is dropped, one it adds is covered, and the target
 //!   tracking policies the plan derives track exactly the configurations it asked for.
-//!   The ONE member an update does not re-point is the target value of a metric an
-//!   applied policy already tracks, whose rule
-//!   [`crate::update_keeps_an_applied_policys_target_value`] spans and whose expectation
-//!   every row here is read through. The operation answers an EMPTY body and moves
+//!   No member is held back, the target value of a metric the plan already tracks
+//!   included, which is the rule
+//!   [`crate::update_keeps_an_applied_policys_target_value`] spans and which every row
+//!   here is read through. The operation answers an EMPTY body and moves
 //!   neither `ScalingPlanVersion` ("This value is always 1") nor `CreationTime`, so the
 //!   applied plan's `StatusMessage` — "A simple message about the current status of the
 //!   scaling plan" — is what reports that the update took: a created-and-applied plan and
@@ -46,7 +46,6 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 use crate::applied_policies_and_status_narratives::{applied_plan, described, resources};
 use crate::documented_entry_count_wording::entry_count_refusal;
 use crate::scaling_plan_lifecycle::{error_code, error_message, stack_source, Emulator};
-use crate::update_keeps_an_applied_policys_target_value::in_force_after_update;
 
 /// The narrative a plan reports once its creation has been applied.
 const CREATED_MESSAGE: &str = "Scaling plan has been created and applied to all resources.";
@@ -122,8 +121,7 @@ fn service_instruction(target: f64) -> Value {
 }
 
 /// One row of the replacement table: the instructions in force and the instructions the
-/// update carries. What the plan must report afterwards is the second list read through
-/// the one exception, [`in_force_after_update`].
+/// update carries. What the plan must report afterwards is the second list, verbatim.
 struct Case {
     label: &'static str,
     in_force: Vec<Value>,
@@ -320,7 +318,7 @@ async fn an_update_puts_the_instruction_set_it_carries_in_force() {
             "case {label:?}: UpdateScalingPlan answers an empty body, got {body:?}"
         );
 
-        let expected = in_force_after_update(&case.in_force, &case.requested);
+        let expected = case.requested.clone();
         let plan = described(&emulator, "my-plan").await;
         assert_eq!(
             plan.get("ScalingInstructions"),

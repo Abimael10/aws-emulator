@@ -15,11 +15,11 @@
 //! What an update moves and what it leaves alone is the plan's own rule, pinned over
 //! tables in
 //! `services/service-com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice/tests/all/update_keeps_an_applied_policys_target_value.rs`:
-//! the update's instruction set is the one in force, except that the target value of a
-//! metric the plan has ALREADY APPLIED a policy for is kept, because that value is what
-//! that policy tracks to. So the update below moves the capacity window the plan registers
-//! — a change it does apply — and re-sends the target value, and what this suite reaches
-//! is that both halves land where the policy and the scalable target really live.
+//! the update's instruction set is the one in force, member for member, the target value
+//! of a metric the plan already tracks included. So the update below moves both the
+//! capacity window the plan registers and the value its policy tracks to, and what this
+//! suite reaches is that both halves land where the policy and the scalable target really
+//! live.
 //!
 //! Three services have to agree for that to hold: AWS Auto Scaling writes the policy,
 //! Application Auto Scaling holds it and reports it, and DynamoDB holds the table whose
@@ -34,7 +34,8 @@
 //!
 //! The rows differ along what the rule generalises over: which half of a table's
 //! provisioned capacity the instruction scales, the metric it tracks, the target value the
-//! create states, and the capacity window the update moves it to.
+//! create states, the value the update re-points it to, and the capacity window the update
+//! moves it to.
 
 use std::time::{Duration, Instant};
 
@@ -343,23 +344,25 @@ async fn held_until(
 #[tokio::test]
 async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
     // (case, the dimension the instruction scales, the metric it tracks, the target value
-    //  the create states)
-    let rows: &[(&str, &str, &str, f64)] = &[
+    //  the create states, the target value the update re-points the policy to)
+    let rows: &[(&str, &str, &str, f64, f64)] = &[
         (
             "the read half of a table's provisioned capacity",
             "dynamodb:table:ReadCapacityUnits",
             "DynamoDBReadCapacityUtilization",
             50.0,
+            75.0,
         ),
         (
-            "the write half, tracked to another value",
+            "the write half, tracked to another value and lowered by the update",
             "dynamodb:table:WriteCapacityUnits",
             "DynamoDBWriteCapacityUtilization",
             40.0,
+            12.5,
         ),
     ];
 
-    for (case, dimension, metric, created_target) in rows {
+    for (case, dimension, metric, created_target, updated_target) in rows {
         let router = router();
         let table = "plan-scaled-table";
         let plan = "router-scaling-plan";
@@ -450,10 +453,10 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
              states, got {targets}"
         );
 
-        // An update that moves what the plan applies to the resource — here the capacity
-        // window its scalable target is registered with — moves the very same records: the
-        // policy keeps its name and the value it tracks (an update does not re-point a
-        // policy the plan has already applied), and the scalable target reports the new
+        // An update that moves what the plan applies to the resource — here both the
+        // value its policy tracks to and the capacity window its scalable target is
+        // registered with — moves the very same records: the policy keeps its name and
+        // reports the value the update sent, and the scalable target reports the new
         // window.
         plans(
             &router,
@@ -466,7 +469,7 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
                     table,
                     dimension,
                     metric,
-                    *created_target,
+                    *updated_target,
                     UPDATED_MIN_CAPACITY,
                     UPDATED_MAX_CAPACITY,
                 )],
@@ -484,9 +487,28 @@ async fn a_plans_target_tracking_policy_is_held_by_application_auto_scaling() {
         let configuration = &held[0]["TargetTrackingScalingPolicyConfiguration"];
         assert_eq!(
             (held[0]["PolicyName"].clone(), configuration["TargetValue"].as_f64()),
-            (json!(policy_name), Some(*created_target)),
-            "case {case:?}: the update must move the policy it installed, not replace it, \
-             got {held:?}"
+            (json!(policy_name), Some(*updated_target)),
+            "case {case:?}: the update must re-point the policy it installed, not replace \
+             it, got {held:?}"
+        );
+        // The plan's own read-backs report the same value the policy holds: the plan's
+        // instruction and the policy it derives for the resource cannot disagree.
+        assert_eq!(
+            updated["ScalingInstructions"][0]["TargetTrackingConfigurations"][0]["TargetValue"]
+                .as_f64(),
+            Some(*updated_target),
+            "case {case:?}: the updated plan must report the target value it was sent, \
+             got {updated}"
+        );
+        let reported = reported_policies(&router, case, plan).await;
+        assert_eq!(
+            (
+                reported[0]["PolicyName"].clone(),
+                reported[0]["TargetTrackingConfiguration"]["TargetValue"].as_f64()
+            ),
+            (json!(policy_name), Some(*updated_target)),
+            "case {case:?}: the plan's resource must report the re-pointed policy under \
+             the name it had, got {reported:?}"
         );
         let targets = application_auto_scaling(
             &router,

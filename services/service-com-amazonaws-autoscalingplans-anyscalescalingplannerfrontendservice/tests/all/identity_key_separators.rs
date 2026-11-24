@@ -413,8 +413,8 @@ async fn two_metrics_that_only_look_alike_are_two_metrics() {
 async fn a_metric_that_only_looks_like_the_one_in_force_is_another_metric() {
     // The metric a configuration tracks is what the policy derived from it is named
     // for, so a metric that merely LOOKS like the one in force is minted a policy of
-    // its own, while the one actually in force keeps the policy — and the name, and the
-    // target value that policy tracks — it had.
+    // its own, while the one actually in force keeps the policy — and the name — it had,
+    // re-pointed at the value the update sends.
     let emulator = Emulator::new();
     let in_force = customized_metric("a/b", "c", &[], 40.0);
     let look_alike = customized_metric("a", "b/c", &[], 80.0);
@@ -470,15 +470,16 @@ async fn a_metric_that_only_looks_like_the_one_in_force_is_another_metric() {
     assert_eq!(
         targets,
         vec![
-            // The metric in force is the one its applied policy tracks, so the update
-            // could not re-point its target value; the look-alike is another metric, so
-            // it takes the value the update asked for
-            // ([`crate::update_keeps_an_applied_policys_target_value`]).
-            ("a/b".to_string(), "c".to_string(), 40.0),
+            // Both configurations are stored as the update words them: an update puts the
+            // instruction set it carries in force, member for member
+            // ([`crate::update_keeps_an_applied_policys_target_value`]). What the
+            // separator decides is the metric's IDENTITY, which the policy names below
+            // report.
+            ("a/b".to_string(), "c".to_string(), 70.0),
             ("a".to_string(), "b/c".to_string(), 80.0),
         ],
-        "case {:?}: both configurations must be stored as the update words them, with the \
-         applied policy's target value kept, got {targets:?}",
+        "case {:?}: both configurations must be stored as the update words them, got \
+         {targets:?}",
         "a separator inside the namespace vs inside the metric name"
     );
 

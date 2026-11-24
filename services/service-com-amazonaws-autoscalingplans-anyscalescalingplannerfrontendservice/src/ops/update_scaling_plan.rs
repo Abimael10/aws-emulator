@@ -7,11 +7,11 @@
 //! `ScalingInstructions` the request carries REPLACE the ones in force, entry for entry:
 //! "Updates the specified scaling plan", and the member is the plan's whole instruction
 //! set, so a resource the request no longer names is dropped, one it adds is covered, and
-//! every member of an instruction it re-sends is what the plan reports and what the target
-//! tracking policies derived from it track afterwards — except that an update does not
-//! re-point a policy the plan has already APPLIED: the target value in force for a metric
-//! such a policy tracks is kept
-//! (`crate::state::ScalingPlanRecord::applied_update`).
+//! every member of an instruction it re-sends — the target value of a target tracking
+//! configuration included — is what the plan reports and what the target tracking policies
+//! derived from it track afterwards. `ScalingPolicyUpdateBehavior` is the one documented
+//! policy-retention control, and it governs only "a resource's externally created scaling
+//! policies", so no member of the request is held back from the configuration in force.
 //!
 //! Neither `ScalingPlanVersion` ("This value is always 1") nor `CreationTime` moves on an
 //! update, so the plan's status narrative is what tells a caller the update was applied:
@@ -249,9 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Replace only what the request carries; everything else stays as stored. The
             // instruction set it carries is the plan's whole instruction set, so it is
-            // written over the one in force — save for the target values the policies the
-            // plan has already applied track to, which an update does not re-point
-            // (`crate::state::ScalingPlanRecord::applied_update`).
+            // written over the one in force verbatim, member for member.
             let mut applied_change = false;
             if let Some(source) = input.application_source {
                 applied_change |= source != plan.application_source;
@@ -260,8 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let replaced = plan.scaling_instructions.clone();
             let applied_before = plan.applied_footprint(&replaced);
             if let Some(instructions) = input.scaling_instructions {
-                let in_force = plan.applied_update(instructions);
-                plan.scaling_instructions = in_force;
+                plan.scaling_instructions = instructions;
             }
             applied_change |= plan.applied_footprint(&plan.scaling_instructions) != applied_before;
             // The plan goes back to the applied status, whose narrative reports an UPDATE

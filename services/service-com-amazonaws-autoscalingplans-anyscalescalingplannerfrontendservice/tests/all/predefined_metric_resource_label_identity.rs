@@ -283,11 +283,11 @@ async fn two_predefined_configurations_are_one_metric_only_when_their_labels_mat
 #[tokio::test]
 async fn an_update_puts_the_target_value_of_every_configuration_it_carries_in_force() {
     // An update puts the instruction set it carries in force, so every configuration it
-    // sends reports the target value it asked for — unless the metric it names is the one
-    // whose policy the plan has already applied, whose value that policy tracks and an
-    // update does not re-point
+    // sends reports the target value it asked for, whether or not the metric it names is
+    // the one whose policy the plan has already applied
     // ([`crate::update_keeps_an_applied_policys_target_value`]). What the label decides is
-    // the metric's IDENTITY, which is what makes the two cases differ here.
+    // the metric's IDENTITY, and so which policy the configuration belongs to — which the
+    // policy-name test below reads.
     const IN_FORCE_TARGET: f64 = 1_000.0;
     const REQUESTED_TARGET: f64 = 500.0;
     const UNTRACKED_TARGET: f64 = 12.5;
@@ -321,17 +321,11 @@ async fn an_update_puts_the_target_value_of_every_configuration_it_carries_in_fo
         emulator.make_all_due();
 
         let stored = stored_metrics(&emulator).await;
-        let expected_target = if pair.same_metric {
-            IN_FORCE_TARGET
-        } else {
-            REQUESTED_TARGET
-        };
         assert_eq!(
             stored,
-            vec![(pair.second.resource_label.clone(), expected_target)],
-            "case {case:?}: the stored configuration must carry the requested label, and \
-             the target value {expected_target} — the applied policy's where the update \
-             names its metric, the request's otherwise, got {stored:?}"
+            vec![(pair.second.resource_label.clone(), REQUESTED_TARGET)],
+            "case {case:?}: the stored configuration must carry the requested label and \
+             the target value {REQUESTED_TARGET} the update sent, got {stored:?}"
         );
     }
 }

@@ -435,9 +435,8 @@ struct ReplacementCase {
 /// value vs the cooldowns and the scale-in flag), whether the instruction asks for the
 /// resource's policies to be replaced, the FORM of the metric (predefined vs
 /// customized), and whether the resource is one the plan already covers. Whatever the
-/// row, what the plan reports afterwards is the instruction set the update carried — save
-/// for the target value of a metric an applied policy already tracks, which an update
-/// does not re-point ([`crate::update_keeps_an_applied_policys_target_value`] spans that
+/// row, what the plan reports afterwards is the instruction set the update carried,
+/// member for member ([`crate::update_keeps_an_applied_policys_target_value`] spans that
 /// rule).
 fn replacement_cases() -> Vec<ReplacementCase> {
     let tracked = table_instruction("DynamoDBReadCapacityUtilization", 50.0);
@@ -455,8 +454,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 "DynamoDBReadCapacityUtilization",
                 75.0,
             )],
-            // The bounds are the update's; the target value is the one the policy the
-            // plan already applied for that metric tracks to.
+            // The bounds and the target value are both the update's.
             expected: vec![instruction(
                 "dynamodb",
                 "table/my-table",
@@ -464,7 +462,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 4,
                 400,
                 "DynamoDBReadCapacityUtilization",
-                50.0,
+                75.0,
             )],
         },
         ReplacementCase {
@@ -485,8 +483,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                 "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies"
             })],
             // `ReplaceExternalPolicies` deletes the policies that are EXTERNAL to AWS
-            // Auto Scaling; the policy this plan applied itself keeps the target value it
-            // tracks to, like it does without that behaviour.
+            // Auto Scaling; the policy this plan applied itself is re-pointed at the
+            // value the request sends, like it is without that behaviour.
             expected: vec![json!({
                 "ServiceNamespace": "dynamodb",
                 "ResourceId": "table/my-table",
@@ -497,7 +495,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                     "PredefinedScalingMetricSpecification": {
                         "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                     },
-                    "TargetValue": 50.0
+                    "TargetValue": 75.0
                 }],
                 "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies"
             })],
@@ -505,8 +503,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
         ReplacementCase {
             label: "cooldowns and the scale-in flag on a metric already tracked",
             in_force: vec![tracked.clone()],
-            // Every member of the configuration is the update's to set, except the target
-            // value an applied policy of that metric already tracks.
+            // Every member of the configuration is the update's to set, the target value
+            // of the metric its applied policy already tracks included.
             requested: vec![json!({
                 "ServiceNamespace": "dynamodb",
                 "ResourceId": "table/my-table",
@@ -533,7 +531,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                     "PredefinedScalingMetricSpecification": {
                         "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                     },
-                    "TargetValue": 50.0,
+                    "TargetValue": 75.0,
                     "DisableScaleIn": true,
                     "ScaleOutCooldown": 90,
                     "ScaleInCooldown": 600
@@ -577,8 +575,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                         "PredefinedScalingMetricSpecification": {
                             "PredefinedScalingMetricType": "DynamoDBReadCapacityUtilization"
                         },
-                        // The metric whose policy is applied keeps the value it tracks.
-                        "TargetValue": 50.0
+                        // The metric whose policy is applied takes the update's value.
+                        "TargetValue": 75.0
                     },
                     {
                         "CustomizedScalingMetricSpecification": {
@@ -586,7 +584,7 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                             "Namespace": "MyApp",
                             "Statistic": "Sum"
                         },
-                        // No policy tracks this metric yet, so the update's value takes.
+                        // No policy tracks this metric yet, and it takes it just the same.
                         "TargetValue": 30.0
                     }
                 ]
@@ -661,8 +659,8 @@ fn replacement_cases() -> Vec<ReplacementCase> {
                         "Statistic": "Sum",
                         "Dimensions": [{ "Name": "Queue", "Value": "orders" }]
                     },
-                    // The applied policy of this metric keeps the value it tracks.
-                    "TargetValue": 25.0
+                    // The applied policy of this metric is re-pointed at the new value.
+                    "TargetValue": 60.0
                 }]
             })],
         },

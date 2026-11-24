@@ -3,30 +3,33 @@
 //! What an `UpdateScalingPlan` does to the target value of a metric whose policy the plan
 //! has already APPLIED — and when the applied status re-narrates itself as an update.
 //!
-//! Two rules are pinned here, and they are one rule read twice: a plan reports what it has
-//! APPLIED to its resources.
+//! Two rules are pinned here, and they are one rule read twice: a plan applies the
+//! instruction set the last request put in force, and reports what it applied.
 //!
 //! * `UpdateScalingPlan` "Updates the specified scaling plan"
 //!   (`smithy_query(query="operation",operation="UpdateScalingPlan")`) and takes the
 //!   plan's whole `ScalingInstructions` list, so the list the request carries is the
-//!   configuration in force afterwards — EXCEPT that an update does not re-point a target
-//!   tracking policy the plan has already applied: for a configuration whose scaling
-//!   metric such a policy already tracks, the target value in force is kept, because that
-//!   value is what the applied policy tracks to. Every other member of the configuration,
-//!   every configuration no applied policy tracks (a resource whose instruction turned
-//!   dynamic scaling off — `DisableDynamicScaling` "When dynamic scaling is enabled, AWS
-//!   Auto Scaling creates target tracking scaling policies based on the specified target
-//!   tracking configurations", `smithy_query(query="shape",shape="ScalingInstruction")` —
-//!   a metric the resource did not track before), and every instruction for a resource the
-//!   plan did not cover, is the update's to set. RECORDED behaviour: the model constrains
-//!   neither which members an update applies nor the narrative below.
+//!   configuration in force afterwards, member for member — the `TargetValue` of a target
+//!   tracking configuration included, whether or not a policy the plan has already
+//!   applied tracks that metric. `TargetTrackingConfiguration$TargetValue` is "The target
+//!   value for the metric" with no update-time exception
+//!   (`smithy_query(query="shape",shape="TargetTrackingConfiguration")`), and the one
+//!   documented control over what happens to a resource's pre-existing policies,
+//!   `ScalingInstruction$ScalingPolicyUpdateBehavior`, is scoped to policies the service
+//!   did not create: "Controls whether a resource's externally created scaling policies
+//!   are kept or replaced" (`smithy_query(query="shape",shape="ScalingInstruction")`). So
+//!   nothing the request sends is held back, and the policy the plan derives for a metric
+//!   it still tracks is re-pointed at the new value under the name it already had: the
+//!   name is a function of the plan, the resource and the metric, not of the value.
 //! * `ScalingPlan$StatusMessage` is "A simple message about the current status of the
 //!   scaling plan" (`smithy_query(query="shape",shape="ScalingPlan")`), and the applied
 //!   status is reached by APPLYING a configuration to the plan's resources, so the
 //!   narrative of an applied plan reports the mutation that last changed what is applied:
 //!   an update that leaves the plan's resources with the same capacity bands and the same
 //!   target tracking policies applied nothing, and the narrative of the application in
-//!   force stands.
+//!   force stands. Since neither `ScalingPlanVersion` ("This value is always 1") nor
+//!   `CreationTime` moves on an update, that narrative is what tells a caller the update
+//!   took.
 //!
 //! The rows of each table differ along what the rules generalise over: whether the metric
 //! in force had an applied policy at all, the FORM of the metric (predefined, predefined
@@ -43,7 +46,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::applied_policies_and_status_narratives::{applied_plan, described, resources};
-use crate::scaling_plan_lifecycle::{resource_identity, stack_source, Emulator};
+use crate::scaling_plan_lifecycle::{stack_source, Emulator};
 
 /// The plan every case writes to.
 const PLAN: &str = "my-plan";
@@ -98,49 +101,6 @@ pub(crate) fn metric_identity(configuration: &Value) -> String {
 /// configures: it has, unless the instruction turned dynamic scaling off.
 fn applies_policies(instruction: &Value) -> bool {
     instruction["DisableDynamicScaling"] != json!(true)
-}
-
-/// The instruction set in force after an update carrying `requested` against the applied
-/// set `in_force` — the rule, written out: the update's list, with the target value kept
-/// for every configuration whose metric an applied policy of that resource already tracks.
-///
-/// `pub(crate)` so every suite that updates an applied plan states the expected result
-/// through the one rule rather than restating it per row.
-pub(crate) fn in_force_after_update(in_force: &[Value], requested: &[Value]) -> Vec<Value> {
-    requested
-        .iter()
-        .map(|requested| {
-            let mut instruction = requested.clone();
-            let applied = in_force
-                .iter()
-                .find(|applied| resource_identity(applied) == resource_identity(&instruction));
-            let Some(applied) = applied.filter(|applied| applies_policies(applied)) else {
-                return instruction;
-            };
-            let tracked: BTreeMap<String, Value> = applied["TargetTrackingConfigurations"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|configuration| {
-                    (
-                        metric_identity(configuration),
-                        configuration["TargetValue"].clone(),
-                    )
-                })
-                .collect();
-            for configuration in instruction["TargetTrackingConfigurations"]
-                .as_array_mut()
-                .into_iter()
-                .flatten()
-            {
-                if let Some(kept) = tracked.get(&metric_identity(configuration)) {
-                    configuration["TargetValue"] = kept.clone();
-                }
-            }
-            instruction
-        })
-        .collect()
 }
 
 /// One target tracking configuration over a predefined metric.
@@ -209,9 +169,9 @@ fn asg(configurations: Vec<Value>) -> Value {
 /// target value every configuration in force afterwards must report, in the order the
 /// update's instructions and their configurations are written.
 ///
-/// The target values are stated LITERALLY per row, beside the whole instruction set
-/// [`in_force_after_update`] derives: a row says which value it expects to survive, so a
-/// misreading shared by the rule and its expectation cannot pass unnoticed.
+/// The target values are stated LITERALLY per row, beside the whole instruction set the
+/// update sent: a row says which value it expects to be in force, so a misreading shared
+/// by the rule and its expectation cannot pass unnoticed.
 struct Case {
     label: &'static str,
     in_force: Vec<Value>,
@@ -219,11 +179,11 @@ struct Case {
     targets: &'static [f64],
 }
 
-/// The table the merge rule spans.
+/// The table the replacement rule spans.
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            label: "a policied predefined metric keeps the value its policy tracks",
+            label: "a policied predefined metric takes the value the update sends",
             in_force: vec![table(
                 vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
                 json!({}),
@@ -232,7 +192,7 @@ fn cases() -> Vec<Case> {
                 vec![predefined("DynamoDBReadCapacityUtilization", 75.0)],
                 json!({}),
             )],
-            targets: &[50.0],
+            targets: &[75.0],
         },
         Case {
             label: "the same, with the requested value below the one in force",
@@ -244,10 +204,22 @@ fn cases() -> Vec<Case> {
                 vec![predefined("DynamoDBReadCapacityUtilization", 12.5)],
                 json!({}),
             )],
+            targets: &[12.5],
+        },
+        Case {
+            label: "the value in force re-sent unchanged stays in force",
+            in_force: vec![table(
+                vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
+                json!({}),
+            )],
+            requested: vec![table(
+                vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
+                json!({}),
+            )],
             targets: &[50.0],
         },
         Case {
-            label: "a policied metric keeps its value while the capacity bounds move",
+            label: "the value moves while the capacity bounds move too",
             in_force: vec![table(
                 vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
                 json!({}),
@@ -256,10 +228,10 @@ fn cases() -> Vec<Case> {
                 vec![predefined("DynamoDBReadCapacityUtilization", 75.0)],
                 json!({ "MinCapacity": 4, "MaxCapacity": 400 }),
             )],
-            targets: &[50.0],
+            targets: &[75.0],
         },
         Case {
-            label: "every other member of a policied configuration is the update's to set",
+            label: "every other member of a policied configuration moves with it",
             in_force: vec![table(
                 vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
                 json!({}),
@@ -276,7 +248,19 @@ fn cases() -> Vec<Case> {
                 })],
                 json!({}),
             )],
-            targets: &[50.0],
+            targets: &[75.0],
+        },
+        Case {
+            label: "the value moves while the instruction asks for a policy replacement",
+            in_force: vec![table(
+                vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
+                json!({}),
+            )],
+            requested: vec![table(
+                vec![predefined("DynamoDBReadCapacityUtilization", 75.0)],
+                json!({ "ScalingPolicyUpdateBehavior": "ReplaceExternalPolicies" }),
+            )],
+            targets: &[75.0],
         },
         Case {
             label: "a resource with no applied policy takes the update's value",
@@ -303,7 +287,7 @@ fn cases() -> Vec<Case> {
             targets: &[70.0],
         },
         Case {
-            label: "a policied metric keeps its value as the update turns scaling off",
+            label: "a policied metric takes the update's value as it turns scaling off",
             in_force: vec![table(
                 vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
                 json!({}),
@@ -312,10 +296,10 @@ fn cases() -> Vec<Case> {
                 vec![predefined("DynamoDBReadCapacityUtilization", 75.0)],
                 json!({ "DisableDynamicScaling": true }),
             )],
-            targets: &[50.0],
+            targets: &[75.0],
         },
         Case {
-            label: "a metric the resource did not track takes the update's value",
+            label: "a metric the resource did not track takes the update's value beside it",
             in_force: vec![table(
                 vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
                 json!({}),
@@ -327,16 +311,16 @@ fn cases() -> Vec<Case> {
                 ],
                 json!({}),
             )],
-            targets: &[50.0, 30.0],
+            targets: &[75.0, 30.0],
         },
         Case {
-            label: "a policied customized metric keeps its value too",
+            label: "a policied customized metric takes the update's value too",
             in_force: vec![table(vec![customized("queue-depth", 25.0)], json!({}))],
             requested: vec![table(vec![customized("queue-depth", 60.0)], json!({}))],
-            targets: &[25.0],
+            targets: &[60.0],
         },
         Case {
-            label: "a configuration dropped from a resource leaves the survivor's value alone",
+            label: "a configuration dropped from a resource leaves the survivor's value sent",
             in_force: vec![table(
                 vec![
                     predefined("DynamoDBReadCapacityUtilization", 50.0),
@@ -345,10 +329,10 @@ fn cases() -> Vec<Case> {
                 json!({}),
             )],
             requested: vec![table(vec![customized("queue-depth", 60.0)], json!({}))],
-            targets: &[30.0],
+            targets: &[60.0],
         },
         Case {
-            label: "the configurations of one resource are reordered",
+            label: "the configurations of one resource are reordered and re-pointed",
             in_force: vec![table(
                 vec![
                     predefined("DynamoDBReadCapacityUtilization", 50.0),
@@ -363,19 +347,19 @@ fn cases() -> Vec<Case> {
                 ],
                 json!({}),
             )],
-            targets: &[30.0, 50.0],
+            targets: &[60.0, 75.0],
         },
         Case {
-            label: "a metric re-pointed at another target group is another metric",
+            label: "a metric re-pointed at another target group takes the update's value",
             in_force: vec![asg(vec![alb("tg-a", 1_000.0)])],
             requested: vec![asg(vec![alb("tg-b", 500.0)])],
             targets: &[500.0],
         },
         Case {
-            label: "a metric re-sent on the same target group keeps its value",
+            label: "a metric re-sent on the same target group takes it as well",
             in_force: vec![asg(vec![alb("tg-a", 1_000.0)])],
             requested: vec![asg(vec![alb("tg-a", 500.0)])],
-            targets: &[1_000.0],
+            targets: &[500.0],
         },
         Case {
             label: "a resource the plan did not cover takes the update's values",
@@ -390,7 +374,7 @@ fn cases() -> Vec<Case> {
                 ),
                 asg(vec![predefined("ASGAverageCPUUtilization", 40.0)]),
             ],
-            targets: &[50.0, 40.0],
+            targets: &[75.0, 40.0],
         },
         Case {
             label: "the one resource in force is swapped for another",
@@ -456,7 +440,7 @@ fn by_metric(configurations: &[Value]) -> BTreeMap<String, Value> {
 }
 
 #[tokio::test]
-async fn an_update_does_not_re_point_a_policy_the_plan_has_already_applied() {
+async fn an_update_puts_the_target_value_it_sends_in_force() {
     for case in cases() {
         let emulator = Emulator::new();
         let label = case.label;
@@ -464,7 +448,7 @@ async fn an_update_does_not_re_point_a_policy_the_plan_has_already_applied() {
 
         update_plan(&emulator, &case.requested).await;
 
-        let expected = in_force_after_update(&case.in_force, &case.requested);
+        let expected = case.requested.clone();
         let plan = described(&emulator, PLAN).await;
         assert_eq!(
             plan.get("ScalingInstructions"),
@@ -472,9 +456,9 @@ async fn an_update_does_not_re_point_a_policy_the_plan_has_already_applied() {
             "case {label:?}: wrong instruction set in force after the update, got {plan}"
         );
 
-        // The row's own literal expectation of which target value survived, beside the
-        // whole set above: the value in force where an applied policy tracks the metric,
-        // the update's where none does.
+        // The row's own literal expectation of which target value is in force, beside the
+        // whole set above: the value the update sent, whether or not an applied policy
+        // tracked that metric before.
         let reported: Vec<f64> = expected
             .iter()
             .flat_map(|instruction| {
@@ -517,10 +501,10 @@ async fn an_update_does_not_re_point_a_policy_the_plan_has_already_applied() {
 }
 
 #[tokio::test]
-async fn a_policy_whose_value_is_kept_keeps_the_policy_it_had() {
-    // Why the value is kept: it is what the applied policy tracks to. So the policy is
-    // still the same policy after the update — same name, same value — and a client
-    // following that name is not handed a re-pointed one.
+async fn a_re_pointed_policy_keeps_the_name_it_had() {
+    // A policy's name is a function of the plan, the resource and the metric, so an update
+    // that only moves what the policy tracks TO re-points the policy a client is already
+    // following rather than minting another: same name, new target value.
     let emulator = Emulator::new();
     let in_force = vec![table(
         vec![predefined("DynamoDBReadCapacityUtilization", 50.0)],
@@ -543,11 +527,23 @@ async fn a_policy_whose_value_is_kept_keeps_the_policy_it_had() {
     let after = resources(&emulator, PLAN).await;
     let policy_after = after[0]["ScalingPolicies"][0].clone();
     assert_eq!(
-        policy_after, policy_before,
-        "the policy of a metric whose value the update could not re-point is the policy \
-         that was already applied, got {policy_after} after {policy_before}"
+        (
+            policy_after["PolicyName"].clone(),
+            policy_after["PolicyType"].clone()
+        ),
+        (
+            policy_before["PolicyName"].clone(),
+            policy_before["PolicyType"].clone()
+        ),
+        "the policy of a metric the plan still tracks keeps the name and type it had, got \
+         {policy_after} after {policy_before}"
     );
-    // The members the update DID move are in force beside it.
+    assert_eq!(
+        policy_after["TargetTrackingConfiguration"]["TargetValue"].as_f64(),
+        Some(75.0),
+        "the re-pointed policy must track the value the update sent, got {policy_after}"
+    );
+    // The members the update moved beside the value are in force too.
     let plan = described(&emulator, PLAN).await;
     let instruction = &plan["ScalingInstructions"][0];
     assert_eq!(
@@ -595,7 +591,7 @@ fn narrative_cases() -> Vec<NarrativeCase> {
                     json!({}),
                 )],
             }),
-            applied_change: false,
+            applied_change: true,
         },
         NarrativeCase {
             label: "a wider capacity band for the resource",
