@@ -312,9 +312,9 @@ async fn a_handler_mints_an_authentication_token_for_the_login_it_names() {
             signature.len() == 64 && signature.chars().all(|c| c.is_ascii_hexdigit()),
             "case {case:?}: expected a SigV4 signature, got {signature:?}"
         );
-        // The token carries no secret: a presigned request's signing values are the key
-        // id, the scope and the signature over the one request — so there is no session
-        // token and nothing a holder could sign another request with.
+        // This function's execution role is one this emulator holds no IAM record of, so the
+        // run was given no session of its own: the token carries no session token, because
+        // the credential behind it is not a temporary one.
         assert_eq!(
             field(&token, "X-Amz-Security-Token"),
             None,

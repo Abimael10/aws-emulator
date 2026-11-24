@@ -11,7 +11,8 @@
 //! an HTTP request the handler signs itself — reaches that service AS THE FUNCTION'S OWN
 //! EXECUTION ROLE and answers with that service's own answer: the operation's output members
 //! for a success, and the service's own error code and message for a refusal. The credential
-//! the request is signed with is never the handler's to read.
+//! the request is signed with is the one the runtime exported for the run, which is what the
+//! SDK's own default credential chain inside the handler resolves.
 //!
 //! The rows differ along what the rule generalises over: WHICH standard-library module is
 //! imported (one row per module that a runtime missing `os.stat_result` or `os.O_RDONLY`
@@ -235,12 +236,16 @@ def lambda_handler(event, context):
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=120
     )
 
-    # What the handler holds of the credential its calls are signed with: nothing.
+    # What the SDK's DEFAULT credential chain resolves for this invocation: the credentials
+    # the runtime exported for it, which are the session of the function's execution role.
     credentials = boto3.Session().get_credentials()
     steps["credentials"] = {
-        "access_key": credentials.access_key,
-        "secret_key": credentials.secret_key,
-        "token": credentials.token,
+        "matches_environment": (
+            credentials.access_key == os.environ.get("AWS_ACCESS_KEY_ID")
+            and credentials.secret_key == os.environ.get("AWS_SECRET_ACCESS_KEY")
+            and credentials.token == os.environ.get("AWS_SESSION_TOKEN")
+        ),
+        "has_session_token": bool(credentials.token),
     }
 
     # An HTTP request the handler SIGNS AND SENDS ITSELF, which is how a data plane
@@ -449,13 +454,15 @@ async fn a_handler_reads_and_writes_objects_with_what_the_runtime_presents() {
         );
     }
 
-    // The credential the calls are signed with is the runtime's, and the handler holds none
-    // of it.
-    for member in ["access_key", "secret_key", "token"] {
+    // The credential the calls are signed with is the one the runtime exported for the run —
+    // the TEMPORARY credentials of the session of the function's execution role — which is
+    // what the SDK's default credential chain inside the handler resolves.
+    for member in ["matches_environment", "has_session_token"] {
         assert_eq!(
             steps["credentials"][member],
-            Value::Null,
-            "case {member:?}: expected the handler to hold no credential, got {}",
+            json!(true),
+            "case {member:?}: expected the default chain to resolve the run's own temporary \
+             credentials, got {}",
             steps["credentials"]
         );
     }

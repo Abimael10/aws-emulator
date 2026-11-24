@@ -2336,7 +2336,9 @@ impl AwsAccess {
     /// Not a call: the SDKs build this token in the client
     /// ([`super::db_auth_token`]), so nothing is dispatched and no service answers. It is
     /// here beside [`call`](Self::call) because the credential it is signed with is the one
-    /// this seam holds, and because the guest reaches both the same way.
+    /// this seam holds — the identity a call of this seam is signed as, so the token's
+    /// credential scope names the very key the run was given — and because the guest reaches
+    /// both the same way.
     ///
     /// `region` is the Region the SDK client the guest built names, honoured when it is a
     /// Region name at all and otherwise replaced by the invocation's own — the same reading
@@ -2357,6 +2359,7 @@ impl AwsAccess {
         self.runtime
             .block_on(super::db_auth_token::db_auth_token(
                 &self.callback,
+                self.identity.as_ref(),
                 host,
                 port,
                 user,

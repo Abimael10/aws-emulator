@@ -88,6 +88,13 @@
 //!   as the SDK refuses it (`PartialCredentialsError`). The signature itself is still host
 //!   code's ([`super::aws_api`]): what the guest hands over is the key it holds, never the
 //!   invocation's own.
+//! * `session.get_credentials()` resolves the SDK's DEFAULT credential chain for a session
+//!   built with no credentials of its own, which in a Lambda execution environment is the
+//!   three reserved credential variables the runtime exported — the TEMPORARY credentials of
+//!   the session of the function's execution role, session token included
+//!   ([`BOTOCORE_CREDENTIALS_SOURCE`]). That is the credential the SDK signs with, so what a
+//!   handler reads back is the identity its own calls speak for; an environment holding none
+//!   resolves to no credential at all, which is what the SDK's own chain answers then.
 //! * A member of an ANSWER that carries an object's own bytes — `GetObject`'s `Body` — is
 //!   handed over as `botocore.response.StreamingBody`, the stream the SDK's own client
 //!   answers with, so a handler reads it with `read()`; which members those are is named by
@@ -592,33 +599,73 @@ class StreamingBody:
         return False
 "#;
 
-/// `botocore.credentials`: the handle on the invocation's credentials.
+/// `botocore.credentials`: the credentials the SDK's DEFAULT chain resolves inside a run.
 ///
-/// A handler that signs a request of its own asks the session for its credentials and hands
-/// them to [`BOTOCORE_AUTH_SOURCE`]'s signer. What it gets is a HANDLE and not a credential:
-/// the signature is put on by host code with a credential this runtime never hands the
-/// guest, so there is nothing secret here to read — and nothing is invented either, so a
-/// handler that reads `access_key` finds no key rather than one that signs nothing.
+/// An SDK's default credential chain reads the credentials of the environment it runs in, and
+/// in a Lambda execution environment those are the three reserved variables the runtime
+/// exported for the session of the function's execution role ([`super::runtime_environment`]).
+/// So a handler that asks the session for its credentials — to read its own identity, or to
+/// hand them to [`BOTOCORE_AUTH_SOURCE`]'s signer — is answered with exactly those three
+/// values, and an environment holding none resolves to no credential at all rather than to an
+/// empty one.
+///
+/// The signature of a CALL is still put on by host code ([`super::aws_api`]): what the chain
+/// answers here is the credential the run was given, not a second one minted for the guest.
 const BOTOCORE_CREDENTIALS_SOURCE: &str = r#"
-"""The invocation's credentials, which the handler holds no copy of."""
+"""The credentials the SDK's default chain resolves for this invocation."""
+
+# The provider name a credential resolved from the environment carries, and the one a
+# credential handed to the client itself carries.
+_ENVIRONMENT_METHOD = "env"
+_EXPLICIT_METHOD = "explicit"
+
+# The three reserved variables a managed runtime exports the invocation's own credentials in
+# (the Lambda Developer Guide's reserved runtime environment variables), which is where the
+# default chain reads them.
+_ACCESS_KEY_VARIABLE = "AWS_ACCESS_KEY_ID"
+_SECRET_KEY_VARIABLE = "AWS_SECRET_ACCESS_KEY"
+_SESSION_TOKEN_VARIABLE = "AWS_SESSION_TOKEN"
 
 
 class Credentials:
-    """A handle on the credentials this invocation's calls are signed with.
+    """One credential the SDK signs with: an access key, its secret and a session token.
 
-    The host signs those calls (see `botocore.auth`), so no access key, secret or session
-    token of the invocation is readable here.
+    A credential resolved from the environment is the TEMPORARY credential of the session of
+    the function's execution role, so it carries a session token; one a handler built itself
+    carries whatever it was given. The secret is never used to sign in this runtime — the host
+    signs every call (see `botocore.auth`) — so what is held here is only what the run was
+    already given in its own environment.
     """
 
-    method = "lambda-runtime"
-
-    def __init__(self, access_key=None, secret_key=None, token=None):
+    def __init__(self, access_key=None, secret_key=None, token=None, method=None):
         self.access_key = access_key
         self.secret_key = secret_key
         self.token = token
+        self.method = _EXPLICIT_METHOD if method is None else method
 
     def get_frozen_credentials(self):
         return self
+
+
+def resolve_environment_credentials():
+    """What the DEFAULT credential chain resolves in this execution environment.
+
+    The run's own environment, which is all a handler has: the three reserved variables the
+    runtime exported. `None` where it holds no credential — a key without its secret is not
+    one — which is what the chain answers when nothing resolves.
+    """
+    import os
+
+    access_key = os.environ.get(_ACCESS_KEY_VARIABLE)
+    secret_key = os.environ.get(_SECRET_KEY_VARIABLE)
+    if not access_key or not secret_key:
+        return None
+    return Credentials(
+        access_key=access_key,
+        secret_key=secret_key,
+        token=os.environ.get(_SESSION_TOKEN_VARIABLE) or None,
+        method=_ENVIRONMENT_METHOD,
+    )
 "#;
 
 /// `botocore.awsrequest`: the request a handler builds to sign and send itself.
@@ -714,14 +761,22 @@ class SigV4QueryAuth(SigV4Auth):
 const BOTOCORE_SESSION_SOURCE: &str = r#"
 """The botocore session a handler asks for its credentials or a client."""
 
-from botocore.credentials import Credentials
+from botocore.credentials import resolve_environment_credentials
 
 
 class Session:
     def __init__(self, **_ignored):
-        self._credentials = Credentials()
+        self._credentials = None
 
     def get_credentials(self):
+        """The credentials this session resolves, as the SDK's default chain resolves them.
+
+        A session built by a handler names none of its own, so what it answers is what the
+        execution environment holds: the session of the function's execution role. `None`
+        where nothing resolves, which is what the SDK's own chain answers then.
+        """
+        if self._credentials is None:
+            self._credentials = resolve_environment_credentials()
         return self._credentials
 
     def get_scoped_config(self):
@@ -1606,13 +1661,21 @@ class Session:
         return dict(kwargs, **self._credentials)
 
     def get_credentials(self):
-        """The handle on the credentials this session's clients are built with.
+        """The credentials this session's clients sign with, as the SDK resolves them.
 
-        A handler asks for these to sign a request of its own
-        (`botocore.auth.SigV4Auth`); the signature of a client's call is the runtime's, so
-        the handle carries only what the session itself was built with — nothing of the
-        invocation's own credential, which the runtime holds.
+        A session built with credentials of its own answers those; a session built with none
+        resolves the DEFAULT credential chain, which in a Lambda execution environment is the
+        three reserved variables the runtime exported — the temporary credentials of the
+        session of the function's execution role, session token included. `None` where
+        nothing resolves at all, which is what the SDK's own chain answers then.
         """
+        from botocore.credentials import resolve_environment_credentials
+
+        if (
+            self._credentials["aws_access_key_id"] is None
+            and self._credentials["aws_secret_access_key"] is None
+        ):
+            return resolve_environment_credentials()
         return Credentials(
             access_key=self._credentials["aws_access_key_id"],
             secret_key=self._credentials["aws_secret_access_key"],
