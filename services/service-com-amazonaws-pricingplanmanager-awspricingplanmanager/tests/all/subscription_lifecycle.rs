@@ -849,7 +849,14 @@ async fn a_cancelled_subscription_disappears_without_another_call() {
 /// Waits for the CONDITION, not for a time: how long a cancellation takes to be processed
 /// is the service's business, so this looks again until the answer is a 404 or a deadline
 /// far past it passes.
-async fn poll_until_absent(router: &MultiServiceRouter, arn: &str, case: &str) -> Answer {
+///
+/// The ONE such wait of this crate's integration tests — the suite that pins a cancel
+/// accepted after a refused one drives it too, so the loop is written once.
+pub(crate) async fn poll_until_absent(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Answer {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let fetched = call(router, "GetSubscription", json!({"arn": arn}), None).await;
