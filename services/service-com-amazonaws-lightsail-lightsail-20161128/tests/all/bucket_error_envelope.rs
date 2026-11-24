@@ -8,9 +8,9 @@
 //! for instances, applied to the bucket surface: when Lightsail cannot find what
 //! a request names it answers **HTTP 400** with the wire error
 //! `NotFoundException`, the body member `code` set to `DoesNotExist` and a
-//! `message` built from the request — `The specified resource <name> does not
-//! exist within types [<ResourceType>]. Please provide a valid resource name.`
-//! for a resource of the account. The model declares `@httpError(404)`
+//! `message` built from the request — `The <ResourceType> does not exist: <name>`
+//! for a resource of the account the request named by its own kind. The model
+//! declares `@httpError(404)`
 //! on `NotFoundException`, but a Lightsail SDK client maps the failure from the
 //! body's `code`, and the recorded endpoint answers 400 — so 400 is the wire
 //! status, and it is the same envelope on every path, reporting or mutating, for

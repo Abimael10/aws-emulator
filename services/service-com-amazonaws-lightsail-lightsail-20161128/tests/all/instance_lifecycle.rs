@@ -213,25 +213,33 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// The message Lightsail refuses a request naming a resource the account does
-/// not hold with: fixed text around the identifier the request carried and the
-/// bracketed list of resource types the operation looked for it among.
+/// The message Lightsail refuses a request that named a resource by BOTH its own
+/// identifier and its kind with: fixed text naming the resource type, then the
+/// identifier the request carried.
 ///
-/// SOURCE: the recorded refusal of a `DeleteAlarm` naming an alarm that had
-/// already been deleted — "The specified resource <alarmName> does not exist
-/// within types [Alarm]. Please provide a valid resource name." Nothing in it is
-/// per-run: the fixed text is the service's, and the two variable parts are the
-/// request's own identifier and the operation's type list.
+/// SOURCE: the recorded refusals of a `DeleteKeyPair` and a `GetKeyPair` naming a
+/// key pair the account does not hold ("The KeyPair does not exist: <keyPairName>")
+/// and of a `DeleteDisk` re-deleting a disk that was already gone ("The Disk does
+/// not exist: <diskName>"). Nothing in it is per-run: the fixed text is the
+/// service's, and the two variable parts are the modelled `ResourceType` the
+/// refusing operation addresses and the request's own identifier.
 ///
 /// `pub(crate)` so every suite in this test target states the one template once
 /// rather than carrying a copy of it each.
 pub(crate) fn does_not_exist_message(resource_type: &str, name: &str) -> String {
-    does_not_exist_within_message(&[resource_type], name)
+    format!("The {resource_type} does not exist: {name}")
 }
 
-/// [`does_not_exist_message`] for an operation that looks for the identifier
-/// among SEVERAL resource types, which the message lists in the order the
+/// The OTHER not-found wording: the one a refusal that had to SEARCH for an
+/// identifier among resource types carries, listing them in the order the
 /// operation resolves them in.
+///
+/// SOURCE: the recorded refusal of a `PutAlarm` naming a resource the account does
+/// not hold, whose `monitoredResourceName` states no kind at all, and of a
+/// `DeleteAlarm` naming an alarm that had already been deleted — "The specified
+/// resource <name> does not exist within types [<types>]. Please provide a valid
+/// resource name." It is NOT the wording of a resource-addressed lookup, which is
+/// [`does_not_exist_message`].
 pub(crate) fn does_not_exist_within_message(resource_types: &[&str], name: &str) -> String {
     format!(
         "The specified resource {name} does not exist within types [{}]. Please provide a valid \

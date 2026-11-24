@@ -18,9 +18,13 @@
 //! * an input-validation refusal reports `InvalidParams`, whichever operation
 //!   answers it.
 //!
-//! Every one of them words the not-found message the same way — `The specified
-//! resource <name> does not exist within types [<ResourceType>, ...]. Please
-//! provide a valid resource name.` — and the invalid-instance-type refusal of
+//! The not-found message is a per-operation choice too: an operation handed both
+//! the identifier and the kind of resource it addresses words it `The
+//! <ResourceType> does not exist: <name>`, while one that had to SEARCH for the
+//! identifier among resource types — `PutAlarm`'s monitored resource — and the
+//! alarm operations addressing an alarm word it `The specified resource <name>
+//! does not exist within types [<ResourceType>, ...]. Please provide a valid
+//! resource name.` The invalid-instance-type refusal of
 //! `CreateCloudFormationStack` is AWS's own sentence around the rejected value.
 //!
 //! So every case here is a TABLE: one row per operation that refuses, crossed

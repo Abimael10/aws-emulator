@@ -60,9 +60,19 @@
 //! built through [`Scaffolded::resource_does_not_exist`] /
 //! [`Scaffolded::does_not_exist`] for the resource operations and through
 //! [`Scaffolded::alarm_resource_not_found`] /
-//! [`Scaffolded::alarm_resource_not_found_within`] for the alarm operations. Every one
-//! of them words the message with [`resource_not_found_message`], the service's ONE
-//! not-found wording.
+//! [`Scaffolded::alarm_resource_not_found_within`] for the alarm operations.
+//!
+//! The WORDING is a per-operation choice too, and there are two of them:
+//!
+//! * an operation handed both the identifier and the kind of resource it addresses —
+//!   every resource reader, updater and deleter, whose input member names one kind and
+//!   one only — words the refusal with [`resource_does_not_exist_message`], "The
+//!   &lt;ResourceType&gt; does not exist: &lt;name&gt;";
+//! * an operation that had to SEARCH for an identifier among resource types words it
+//!   with [`resource_not_found_within_types_message`], which names the types it looked
+//!   among — `PutAlarm`'s monitored resource — and so do the alarm operations that
+//!   address an alarm (`DeleteAlarm`, `TestAlarm`), whose recorded refusals carry that
+//!   sentence with the single-entry list.
 //!
 //! An input-validation refusal carries its own discriminator, [`INVALID_PARAMS_CODE`],
 //! which the modelled `InvalidInputException`'s `Default` puts in `code` — so every
@@ -230,14 +240,29 @@ pub const NOT_FOUND_EXCEPTION_CODE: &str = "NotFoundException";
 /// form every handler in this crate refuses a request with — is served with it.
 pub const INVALID_PARAMS_CODE: &str = "InvalidParams";
 
-/// The message Lightsail refuses a request naming a resource it cannot find with: the
-/// service's fixed text around the identifier the request carried and the bracketed
-/// list of resource types the operation looked for it among.
+/// The message Lightsail refuses a request that named a resource by BOTH its own
+/// identifier and its kind with: fixed text naming the resource type, then the
+/// identifier the request carried.
 ///
-/// The crate's ONE not-found wording, whichever discriminator the refusing operation
-/// reports in `code`: the fixed text is AWS's, and the variable parts are the request's
-/// own identifier and that type list.
-pub fn resource_not_found_message(resource_types: &[&str], name: &str) -> String {
+/// The fixed text is AWS's — "The ", " does not exist: " — and the variable parts are
+/// the modelled `ResourceType` the refusing operation addresses (one of the
+/// `crate::state::RESOURCE_TYPE_*` constants) and the identifier copied verbatim from
+/// the request.
+pub fn resource_does_not_exist_message(resource_type: &str, name: &str) -> String {
+    format!("The {resource_type} does not exist: {name}")
+}
+
+/// The message Lightsail refuses a request whose identifier it had to SEARCH for among
+/// resource types with: the service's fixed text around the identifier the request
+/// carried and the bracketed list of the types that were searched.
+///
+/// Not the wording of a resource-addressed lookup — that one is
+/// [`resource_does_not_exist_message`]. This one belongs to a refusal that had to
+/// resolve an identifier whose kind the request did not state, and to the alarm
+/// operations, whose recorded refusals word it this way even for a single-entry list.
+/// The fixed text is AWS's, and the variable parts are the request's own identifier and
+/// that type list.
+pub fn resource_not_found_within_types_message(resource_types: &[&str], name: &str) -> String {
     format!(
         "The specified resource {name} does not exist within types [{}]. Please provide a \
          valid resource name.",
@@ -298,28 +323,32 @@ impl<E> Scaffolded<E> {
     ///
     /// `resource_type` is a value of the modelled `ResourceType` enum, i.e. one of the
     /// `crate::state::RESOURCE_TYPE_*` constants, so the message names the resource the
-    /// way every other Lightsail response does. An operation that addresses a resource
-    /// WITHOUT being told which kind it is names every kind it looks among, through
+    /// way every other Lightsail response does. The request named that kind itself — the
+    /// input member it carried the identifier in admits one kind and one only — so the
+    /// message is the resource-addressed wording
+    /// [`resource_does_not_exist_message`]. An operation that addresses a resource
+    /// WITHOUT being told which kind it is names every kind it looked among, through
     /// [`Scaffolded::resource_does_not_exist_within`].
     pub fn resource_does_not_exist(resource_type: &str, name: &str) -> Self {
-        Self::resource_does_not_exist_within(&[resource_type], name)
+        Self::does_not_exist(resource_does_not_exist_message(resource_type, name))
     }
 
-    /// The same rejection for an operation that looks for `name` among SEVERAL
+    /// The same rejection for an operation that had to look for `name` among SEVERAL
     /// resource types, which the message then lists in the order the operation
     /// resolves them in.
     ///
-    /// The template is the service's own and is the crate's ONE not-found wording:
-    /// the fixed text is AWS's, and the variable parts are the identifier the
-    /// request carried and that bracketed type list.
+    /// The wording is [`resource_not_found_within_types_message`], and it is the one a
+    /// SEARCH answers with: the kind of the resource is not something the request
+    /// stated, so the refusal reports what was searched instead of naming one type.
     pub fn resource_does_not_exist_within(resource_types: &[&str], name: &str) -> Self {
-        Self::does_not_exist(resource_not_found_message(resource_types, name))
+        Self::does_not_exist(resource_not_found_within_types_message(resource_types, name))
     }
 
     /// The not-found rejection of an ALARM operation: the same HTTP 400, the same wire
-    /// error `NotFoundException` and the same message, with the discriminator those
-    /// operations report in `code` — [`NOT_FOUND_EXCEPTION_CODE`] rather than
-    /// [`DOES_NOT_EXIST_CODE`].
+    /// error `NotFoundException` and the searched-types message
+    /// ([`resource_not_found_within_types_message`]) their recorded refusals carry, with
+    /// the discriminator those operations report in `code` —
+    /// [`NOT_FOUND_EXCEPTION_CODE`] rather than [`DOES_NOT_EXIST_CODE`].
     pub fn alarm_resource_not_found(resource_type: &str, name: &str) -> Self {
         Self::alarm_resource_not_found_within(&[resource_type], name)
     }
@@ -330,7 +359,7 @@ impl<E> Scaffolded<E> {
     pub fn alarm_resource_not_found_within(resource_types: &[&str], name: &str) -> Self {
         Self::NotFound(crate::ops::types::NotFoundException {
             code: Some(NOT_FOUND_EXCEPTION_CODE.to_string()),
-            message: Some(resource_not_found_message(resource_types, name)),
+            message: Some(resource_not_found_within_types_message(resource_types, name)),
             ..Default::default()
         })
     }

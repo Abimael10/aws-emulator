@@ -6,10 +6,9 @@
 //! The rule under test: when Lightsail cannot find what a request names — a
 //! resource of the account, or an entry of a published catalog — it answers
 //! **HTTP 400** with the wire error `NotFoundException`, the body member `code`
-//! set to `DoesNotExist`, and a `message` built from the request: the identifier
-//! the request carried and the `ResourceType` list it was looked for among (`The
-//! specified resource <name> does not exist within types [<ResourceType>].
-//! Please provide a valid resource name.`) for an account resource, and the
+//! set to `DoesNotExist`, and a `message` built from the request: the kind of
+//! resource the operation addresses and the identifier the request carried (`The
+//! <ResourceType> does not exist: <name>`) for an account resource, and the
 //! rejected id for a blueprint the catalog does not hold. The model declares `@httpError(404)` on
 //! `NotFoundException`, but a Lightsail SDK client maps the failure from the
 //! body's `code`, and the recorded endpoint answers 400 — so 400 is the wire

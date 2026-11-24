@@ -721,10 +721,7 @@ async fn a_restore_the_account_cannot_serve_is_refused_and_stores_nothing() {
             "us-east-1a",
             16,
             json!({"sourceDiskName": "absent-disk", "useLatestRestorableAutoSnapshot": true}),
-            Refusal::DoesNotExist(
-                "The specified resource absent-disk does not exist within types [Disk]. Please \
-                 provide a valid resource name.",
-            ),
+            Refusal::DoesNotExist("The Disk does not exist: absent-disk"),
         ),
         (
             "one GB below the volume the copy was taken of",
