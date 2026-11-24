@@ -14,14 +14,22 @@
 //! collapse into one — answering the second request as a replay, so the resource
 //! it asked for was never created.
 //!
+//! The same token also decides WHEN that comparison happens: the replay is
+//! settled before any refusal of the request's own payload that is not needed to
+//! render the parameters being compared, so a token already recorded against
+//! different parameters is the 409 however badly the rest of the request is
+//! formed
+//! ([`a_client_token_replay_outranks_a_refusal_of_the_requests_own_payload`]).
+//!
 //! Every assertion goes over the wire through the shared [`super::harness`], so a
 //! resource is only visible if the create really reached state.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::cedar::MAX_STATEMENT_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, error_code, ok, router, store_with_validation_off as store, user_pool_arn,
+    call, error_code, field_list, ok, router, store_with_validation_off as store, user_pool_arn,
     SIGNING_REGION,
 };
 
@@ -519,6 +527,296 @@ async fn two_different_requests_under_one_client_token_conflict_in_every_create(
             body["resources"][0]["resourceId"],
             json!(created_id),
             "case {case:?}: expected the conflict to name {created_id}, got {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHEN the replay is decided: before the request's own payload is judged
+// ---------------------------------------------------------------------------
+
+/// The published *Tags per resource* quota, which the model states twice: in
+/// `TagResource`'s documentation ("You can associate as many as 50 tags with a
+/// resource") and in `TooManyTagsException`'s ("the limit (50)").
+///
+/// Written out here rather than imported on purpose: the rows pin the PUBLISHED
+/// quota, so a change to the implementation constant has to fail this test
+/// instead of moving with it.
+const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `TagMap`'s modelled length maximum, from `smithy_query(query="operation",
+/// operation="CreatePolicyStore")`: `tags` is a `TagMap` of length ..200. It
+/// bounds ONE request's map, so a map this large is legal input that the
+/// per-resource quota still refuses.
+const MAX_TAGS_PER_REQUEST: usize = 200;
+
+/// A tag map of `count` distinct keys.
+fn tag_map(count: usize) -> Value {
+    Value::Object(
+        (0..count)
+            .map(|index| (format!("key{index:03}"), json!("v")))
+            .collect(),
+    )
+}
+
+/// A statement whose text is longer than [`MAX_STATEMENT_BYTES`], reached by
+/// padding a string literal inside a condition, so the only thing wrong with it
+/// is its size.
+fn over_long_statement() -> String {
+    format!(
+        "permit(principal, action, resource) when {{ context.tag == \"{}\" }};",
+        "x".repeat(MAX_STATEMENT_BYTES + 1)
+    )
+}
+
+/// One create that carries an `@idempotencyToken`, paired with a request this
+/// service refuses on its OWN payload checks.
+struct PayloadFault {
+    case: &'static str,
+    operation: &'static str,
+    /// The member of the create's response that names the resource it made.
+    id_member: &'static str,
+    /// The `resourceType` the `ConflictException` reports for that resource.
+    resource_type: &'static str,
+    /// A request this operation serves, against the supplied `policyStoreId`.
+    accepted: fn(&str) -> Value,
+    /// A request whose payload this operation refuses, against the same store.
+    refused: fn(&str) -> Value,
+    /// The member `ValidationException$fieldList` names for `refused`.
+    field: &'static str,
+    /// The list operation that counts the resources this create produces, its
+    /// request body and the output member carrying the list.
+    list: (&'static str, fn(&str) -> Value, &'static str),
+}
+
+/// Every create in this crate that carries an `@idempotencyToken` and also has a
+/// payload refusal of its own to run.
+///
+/// The rows span the three such operations and, within each, the KIND of payload
+/// fault — a map larger than one resource may hold, Cedar text the parser cannot
+/// read, a placeholder Cedar admits nowhere, and text past the size bound — so
+/// what they share is only that the request's own payload is unservable.
+///
+/// `CreateIdentitySource` is deliberately absent: both of its payload refusals
+/// (the provider reference it resolves and the `principalEntityType` it must
+/// settle) produce members of the very parameters string the replay compares, so
+/// its replay cannot be decided before them, and it has no other payload check.
+const PAYLOAD_FAULTS: &[PayloadFault] = &[
+    PayloadFault {
+        case: "a create-time tag map one past the per-resource quota",
+        operation: "CreatePolicyStore",
+        id_member: "policyStoreId",
+        resource_type: "POLICY_STORE",
+        accepted: |_| json!({ "validationSettings": { "mode": "OFF" }, "tags": { "k": "v" } }),
+        refused: |_| {
+            json!({
+                "validationSettings": { "mode": "OFF" },
+                "tags": tag_map(MAX_TAGS_PER_RESOURCE + 1),
+            })
+        },
+        field: "/tags",
+        list: ("ListPolicyStores", |_| json!({}), "policyStores"),
+    },
+    PayloadFault {
+        case: "a create-time tag map at the modelled per-request maximum",
+        operation: "CreatePolicyStore",
+        id_member: "policyStoreId",
+        resource_type: "POLICY_STORE",
+        accepted: |_| json!({ "validationSettings": { "mode": "OFF" } }),
+        refused: |_| {
+            json!({
+                "validationSettings": { "mode": "OFF" },
+                "tags": tag_map(MAX_TAGS_PER_REQUEST),
+            })
+        },
+        field: "/tags",
+        list: ("ListPolicyStores", |_| json!({}), "policyStores"),
+    },
+    PayloadFault {
+        case: "a static policy whose statement is not Cedar at all",
+        operation: "CreatePolicy",
+        id_member: "policyId",
+        resource_type: "POLICY",
+        accepted: |store| {
+            json!({
+                "policyStoreId": store,
+                "definition": { "static": { "statement": STATEMENT } },
+            })
+        },
+        refused: |store| {
+            json!({
+                "policyStoreId": store,
+                "definition": { "static": { "statement": "this is not cedar" } },
+            })
+        },
+        field: "/definition/static/statement",
+        list: (
+            "ListPolicies",
+            |store| json!({ "policyStoreId": store }),
+            "policies",
+        ),
+    },
+    PayloadFault {
+        case: "a static policy whose statement is past the size bound",
+        operation: "CreatePolicy",
+        id_member: "policyId",
+        resource_type: "POLICY",
+        accepted: |store| {
+            json!({
+                "policyStoreId": store,
+                "definition": { "static": { "statement": STATEMENT } },
+            })
+        },
+        refused: |store| {
+            json!({
+                "policyStoreId": store,
+                "definition": { "static": { "statement": over_long_statement() } },
+            })
+        },
+        field: "/definition/static/statement",
+        list: (
+            "ListPolicies",
+            |store| json!({ "policyStoreId": store }),
+            "policies",
+        ),
+    },
+    PayloadFault {
+        case: "a policy template whose statement is not Cedar at all",
+        operation: "CreatePolicyTemplate",
+        id_member: "policyTemplateId",
+        resource_type: "POLICY_TEMPLATE",
+        accepted: |store| json!({ "policyStoreId": store, "statement": TEMPLATE_STATEMENT }),
+        refused: |store| json!({ "policyStoreId": store, "statement": "this is not cedar" }),
+        field: "/template/statement",
+        list: (
+            "ListPolicyTemplates",
+            |store| json!({ "policyStoreId": store }),
+            "policyTemplates",
+        ),
+    },
+    PayloadFault {
+        case: "a policy template with a placeholder Cedar admits nowhere",
+        operation: "CreatePolicyTemplate",
+        id_member: "policyTemplateId",
+        resource_type: "POLICY_TEMPLATE",
+        accepted: |store| json!({ "policyStoreId": store, "statement": TEMPLATE_STATEMENT }),
+        refused: |store| {
+            json!({
+                "policyStoreId": store,
+                "statement": "permit(principal, action == ?action, resource);",
+            })
+        },
+        field: "/template/statement",
+        list: (
+            "ListPolicyTemplates",
+            |store| json!({ "policyStoreId": store }),
+            "policyTemplates",
+        ),
+    },
+];
+
+/// How many resources a row's list operation reports.
+async fn listed_count(router: &MultiServiceRouter, row: &PayloadFault, store_id: &str) -> usize {
+    let (operation, body, member) = row.list;
+    let listed = ok(router, operation, &body(store_id)).await;
+    listed[member].as_array().map_or(0, Vec::len)
+}
+
+/// RULE: every create in this crate that carries an `@idempotencyToken` settles
+/// the token replay BEFORE it judges the request's own payload, so a token
+/// already recorded against different parameters answers the modelled 409
+/// `ConflictException` naming the resource that token created — whatever the
+/// request's payload would otherwise be refused for — and the refused payload
+/// still earns its 400 `ValidationException`, naming the member at fault, under
+/// a token the service has never seen.
+#[tokio::test]
+async fn a_client_token_replay_outranks_a_refusal_of_the_requests_own_payload() {
+    for row in PAYLOAD_FAULTS {
+        let case = row.case;
+        // One engine per row, so the counts below are of what this row created.
+        let router = router();
+        let store_id = store(&router).await;
+        let token = "a1b2c3d4";
+
+        // The control: under a token the service has never seen, this payload is
+        // refused on its own merits, 400 naming the member at fault. What the
+        // rows pin is therefore the PRECEDENCE, not a blanket 409.
+        let (status, body) = call(&router, row.operation, &(row.refused)(&store_id)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 under an unseen token, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException under an unseen token, got {body}"
+        );
+        let paths: Vec<String> = field_list(&body).into_iter().map(|(path, _)| path).collect();
+        assert!(
+            paths.iter().any(|path| path == row.field),
+            "case {case:?}: expected fieldList to name {}, got {paths:?} in {body}",
+            row.field
+        );
+
+        // The token is now recorded against a request the service served.
+        let created = ok(
+            &router,
+            row.operation,
+            &{
+                let mut request = (row.accepted)(&store_id);
+                request["clientToken"] = json!(token);
+                request
+            },
+        )
+        .await;
+        let created_id = created[row.id_member]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !created_id.is_empty(),
+            "case {case:?}: expected {} to report a {}, got {created}",
+            row.operation,
+            row.id_member
+        );
+        let after_create = listed_count(&router, row, &store_id).await;
+
+        // That same token, replayed with the unservable payload: the replay is
+        // decided first, so the answer is the conflict naming the resource the
+        // token already created — not the payload's 400.
+        let mut replay = (row.refused)(&store_id);
+        replay["clientToken"] = json!(token);
+        let (status, body) = call(&router, row.operation, &replay).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409 for the reused token, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ConflictException",
+            "case {case:?}: expected a ConflictException for the reused token, got {body}"
+        );
+        assert_eq!(
+            body["resources"],
+            json!([{ "resourceId": created_id, "resourceType": row.resource_type }]),
+            "case {case:?}: expected the conflict to name {created_id} as a {}, got {body}",
+            row.resource_type
+        );
+
+        // Neither answer may have reached state: the token still replays the
+        // resource it was recorded against, and nothing else was created.
+        let mut again = (row.accepted)(&store_id);
+        again["clientToken"] = json!(token);
+        let replayed = ok(&router, row.operation, &again).await;
+        assert_eq!(
+            replayed, created,
+            "case {case:?}: the token must still replay {created}, got {replayed}"
+        );
+        let after_conflict = listed_count(&router, row, &store_id).await;
+        assert_eq!(
+            after_conflict, after_create,
+            "case {case:?}: expected {after_create} resources after the conflict, got \
+             {after_conflict}"
         );
     }
 }

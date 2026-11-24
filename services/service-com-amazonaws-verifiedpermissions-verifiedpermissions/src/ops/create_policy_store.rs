@@ -35,7 +35,10 @@
 //! ## Errors
 //!
 //! * `ConflictException` (HTTP 409) — the same `clientToken` was replayed with
-//!   different parameters.
+//!   different parameters. Decided BEFORE every refusal of the request's own
+//!   payload, as it is in every `@idempotencyToken` create in this crate: a
+//!   token reused with different parameters is this conflict however badly the
+//!   rest of the request is formed.
 //! * `ServiceQuotaExceededException` (HTTP 402).
 //! * `ValidationException` (HTTP 400) — a request member does not satisfy its
 //!   constraint requirements, with `fieldList` naming the member. This operation
@@ -164,23 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The request's `tags` map is the tag set the new store would start out
-        // holding, so it is admitted only if a resource may hold it: the limit is
-        // on what a resource ENDS UP holding, and this request decides that set
-        // outright. Refused before anything is read or minted, so a request that
-        // cannot be served leaves no store behind — one that the tagging path
-        // would then treat as permanently over the limit.
-        if let Some(tags) = input.tags.as_ref() {
-            if crate::ops::tags_over_the_per_resource_limit(tags.len()) {
-                return Err(CreatePolicyStoreErrorModeled::ValidationException(
-                    crate::ops::validation_exception([crate::ops::too_many_tags_in_request(
-                        crate::ops::paths::TAGS,
-                    )]),
-                )
-                .into());
-            }
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::Modeled(
                 CreatePolicyStoreErrorModeled::InternalServerException(InternalServerException {
@@ -217,6 +203,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         last_updated_date: store.last_updated_date,
                     });
                 }
+            }
+        }
+
+        // The request's `tags` map is the tag set the new store would start out
+        // holding, so it is admitted only if a resource may hold it: the limit is
+        // on what a resource ENDS UP holding, and this request decides that set
+        // outright. It reads the request's PAYLOAD, so it runs here: AFTER the
+        // `clientToken` replay above — a token reused with different parameters
+        // is the documented conflict however badly the rest of the request is
+        // formed, exactly as in `CreatePolicy` and `CreatePolicyTemplate` — and
+        // BEFORE the quota check and anything minted, so a request that cannot be
+        // served leaves no store behind that the tagging path would then treat as
+        // permanently over the limit. The replay mints nothing either, so moving
+        // this below it keeps that second guarantee intact.
+        if let Some(tags) = input.tags.as_ref() {
+            if crate::ops::tags_over_the_per_resource_limit(tags.len()) {
+                return Err(CreatePolicyStoreErrorModeled::ValidationException(
+                    crate::ops::validation_exception([crate::ops::too_many_tags_in_request(
+                        crate::ops::paths::TAGS,
+                    )]),
+                )
+                .into());
             }
         }
 
