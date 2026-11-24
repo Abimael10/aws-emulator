@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRunGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRunGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a run group: the record is REMOVED from [`crate::state`], so a following
+//! `GetRunGroup` answers the modelled `ResourceNotFoundException` (HTTP 404),
+//! `ListRunGroups` no longer enumerates it and its ARN names no taggable resource. An id
+//! no stored run group carries answers that same 404, however the modelled `^[0-9]+$` id
+//! is spelled.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRunGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A run group holds nothing but the caps it enforces — the model gives it no status — so
+//! there is no state in which the record cannot be reclaimed, and a successful delete
+//! answers the modelled 202 with no body.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +175,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRunGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRunGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRunGroup"))
+        // Every branch below records the call through `crate::state::audit`: a delete
+        // leaves no trace in the store, so the log is the only place its effect is
+        // attributable afterwards.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            DeleteRunGroupErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run group registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // The id is matched on its NUMERIC value, the same normalisation every other
+        // lookup in this crate uses, so a delete and a read that spell the id differently
+        // (the modelled `^[0-9]+$` admits leading zeros) still name the same group.
+        let Some(key) = crate::state::numeric_id(&input.id)
+            .filter(|key| registry.run_groups.contains_key(key))
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(DeleteRunGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::run_group_not_found_message(&input.id),
+                },
+            )
+            .into());
+        };
+
+        registry.run_groups.remove(&key);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::RunGroupDeleted,
+            Some(&input.id),
+        );
+
+        Ok(DeleteRunGroupOutput)
     }
 }

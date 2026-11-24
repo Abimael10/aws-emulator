@@ -269,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&input.id),
             );
             GetRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no run with id {} exists in this region", input.id),
+                message: crate::state::run_not_found_message(&input.id),
             })
         })?;
         crate::state::audit(

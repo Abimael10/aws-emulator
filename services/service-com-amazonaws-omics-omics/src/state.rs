@@ -7,7 +7,7 @@
 //! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`), the
 //! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`), the
 //! **run group** that caps the compute those runs may use (`CreateRunGroup` /
-//! `GetRunGroup` / `ListRunGroups`), the **run cache** a run reads task outputs from (`CreateRunCache` /
+//! `GetRunGroup` / `ListRunGroups` / `DeleteRunGroup`), the **run cache** a run reads task outputs from (`CreateRunCache` /
 //! `GetRunCache`) and the **sequence store** that holds read sets
 //! (`CreateSequenceStore` / `GetSequenceStore` / `DeleteSequenceStore`), together with the **multipart read set
 //! upload** a caller initiates against that store
@@ -241,6 +241,30 @@ pub fn is_deletable_run_status(status: &str) -> bool {
 /// that resolves a `workflowId`.
 pub fn workflow_not_found_message(workflow_id: &str) -> String {
     format!("Workflow {workflow_id} not found")
+}
+
+/// What an operation that resolves a modelled `RunGroupId` answers when no run group this
+/// emulator holds carries it.
+///
+/// The variable part is the run group id the REQUEST carried; the sentence names the kind
+/// of resource and nothing else of the request, the same fixed form
+/// [`workflow_not_found_message`] states for the other numeric-id resource of this API, so
+/// one wording serves every operation that resolves a `runGroupId` (`GetRunGroup`,
+/// `UpdateRunGroup`, `DeleteRunGroup`, and the run operations that place a run in a group).
+pub fn run_group_not_found_message(run_group_id: &str) -> String {
+    format!("Run group {run_group_id} not found")
+}
+
+/// The same fixed form, for the modelled `RunId` every run operation resolves (`GetRun`,
+/// `DeleteRun`, and the `StartRun` that duplicates a run).
+pub fn run_not_found_message(run_id: &str) -> String {
+    format!("Run {run_id} not found")
+}
+
+/// The same fixed form again, for the modelled `RunCacheId` a run cache operation resolves
+/// (`GetRunCache`, and the `StartRun` that binds a run to a cache).
+pub fn run_cache_not_found_message(run_cache_id: &str) -> String {
+    format!("Run cache {run_cache_id} not found")
 }
 
 /// What `GetWorkflowVersion` answers when the workflow version the request names is
@@ -2368,6 +2392,8 @@ pub enum AuditOutcome {
     RunGroupCreated,
     /// A stored run group's settings were changed in place.
     RunGroupUpdated,
+    /// A stored run group was deleted: the registry no longer holds the record.
+    RunGroupDeleted,
     /// A cross-account resource share was minted and stored.
     ShareCreated,
     /// A stored share was asked to go away, and carries the status that move leaves it in.
@@ -2415,6 +2441,7 @@ impl AuditOutcome {
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::RunGroupUpdated => "run-group-updated",
+            Self::RunGroupDeleted => "run-group-deleted",
             Self::ShareCreated => "share-created",
             Self::ShareDeleted => "share-deleted",
             Self::ResourceTagged => "resource-tagged",

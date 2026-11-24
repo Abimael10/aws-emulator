@@ -25,7 +25,11 @@
 //!   `nextToken` that resumes exactly there; `name` narrows the listing to the groups
 //!   carrying exactly that name; and a token this listing never issued is refused;
 //! * a run may join a group this emulator holds: the run records the group's canonical id,
-//!   `ListRuns` narrows on it, and an id no group holds is the modelled 404 there too.
+//!   `ListRuns` narrows on it, and an id no group holds is the modelled 404 there too;
+//! * `DeleteRunGroup` reclaims exactly the one record its path id names: the delete answers
+//!   the modelled 202 with no body, every later reader of that group — `GetRunGroup`,
+//!   `ListRunGroups`, the tag readers and a second delete — answers as it does for an id
+//!   this registry never held, and no other group or run is touched.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_omics_omics::state::{FIRST_RESOURCE_ID, MAX_TAGS};
@@ -893,5 +897,364 @@ async fn list_run_groups_honours_its_name_filter() {
             .map(|(_, id)| id.clone())
             .collect::<Vec<String>>(),
         "an unfiltered listing must report every group in creation order, got {body:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DeleteRunGroup
+// ---------------------------------------------------------------------------
+
+/// The status a successful `DeleteRunGroup` answers, with no body: its output shape models
+/// no member and the operation declares `@http(code: 202)`.
+/// Source: `smithy_query(query="operation",operation="DeleteRunGroup")`.
+const DELETE_STATUS: u16 = 202;
+
+/// `DELETE /runGroup/{id}`.
+async fn delete_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+    call(router, "DELETE", &format!("/runGroup/{id}"), None).await
+}
+
+/// `GET /tags/{resourceArn}` — `ListTagsForResource`, the reader a run group's tags are
+/// read through. The ARN is one non-greedy `@httpLabel`, so its `:` and `/` arrive
+/// percent-encoded the way an AWS SDK encodes a label.
+async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let encoded = utf8_percent_encode(resource_arn, NON_ALPHANUMERIC).to_string();
+    call(router, "GET", &format!("/tags/{encoded}"), None).await
+}
+
+/// The sentence this service states when the run group a request names is not one it
+/// holds. Fixed form, with the id the REQUEST carried as its only variable part, the same
+/// form this service words a missing workflow with.
+fn run_group_not_found_sentence(id: &str) -> String {
+    format!("Run group {id} not found")
+}
+
+/// The sentence this service states when a caller-supplied resource ARN names no resource
+/// it holds, which is what a deleted group's ARN becomes: fixed form, with the ARN the
+/// request carried as its only variable part.
+fn resource_not_found_sentence(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} not found")
+}
+
+/// Assert `id` names no run group any reader of this service holds: the read, a further
+/// delete and the tag reader of its ARN all answer the modelled 404 with the sentence that
+/// condition is worded with, so the record is gone rather than merely hidden from one
+/// reader.
+async fn assert_gone(router: &MultiServiceRouter, case: &str, id: &str, arn: &str) {
+    for (reader, expected, (status, body)) in [
+        (
+            "GetRunGroup",
+            run_group_not_found_sentence(id),
+            get_group(router, id).await,
+        ),
+        (
+            "DeleteRunGroup",
+            run_group_not_found_sentence(id),
+            delete_group(router, id).await,
+        ),
+        (
+            "ListTagsForResource",
+            resource_not_found_sentence(arn),
+            list_tags(router, arn).await,
+        ),
+    ] {
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 from {reader} for a deleted group, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException from {reader}, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {case:?}: expected {reader} to answer {expected:?}, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_run_group_is_gone_from_every_reader() {
+    let router = emulator();
+    // The same table the create/read-back case uses, so the delete is asserted over the
+    // whole class of stored groups — unnamed, named, capped on each member at each
+    // published bound, tagged — rather than over one shape of record.
+    let cases = group_cases();
+    let mut created = Vec::new();
+    for group in &cases {
+        let (status, body) = create_group(&router, &request_for(group)).await;
+        let id = created_group_id(&group.case, status, &body);
+        let arn = body
+            .get("arn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let (status, stored) = get_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200 from GetRunGroup before the deletes, got {stored:?}",
+            group.case
+        );
+        created.push((group.case.clone(), id, arn, stored));
+    }
+
+    // Rows differing along which record the delete has to reach: the first in the registry,
+    // two in the middle, one in the middle of the whole table and the last one. Every other
+    // row is named by a NON-canonical spelling of its own `^[0-9]+$` id, so the delete is
+    // asserted to resolve an id the way every other reader of this service does.
+    let last = created.len() - 1;
+    let mut indices = vec![0, 3, 4, last / 2, last];
+    indices.sort_unstable();
+    indices.dedup();
+    let targets: Vec<(usize, String)> = indices
+        .iter()
+        .enumerate()
+        .map(|(n, at)| {
+            let id = created[*at].1.clone();
+            (*at, if n % 2 == 0 { id } else { format!("0{id}") })
+        })
+        .collect();
+
+    for (at, spelling) in &targets {
+        let case = &created[*at].0;
+        let (status, body) = delete_group(&router, spelling).await;
+        assert_eq!(
+            status, DELETE_STATUS,
+            "case {case:?}: expected {DELETE_STATUS} from DeleteRunGroup for id {spelling:?}, \
+             got {body:?}"
+        );
+        assert_eq!(
+            body,
+            Value::Null,
+            "case {case:?}: expected no response body from DeleteRunGroup, got {body:?}"
+        );
+    }
+
+    let deleted: std::collections::BTreeSet<usize> =
+        targets.iter().map(|(at, _)| *at).collect();
+    for (at, (case, id, arn, stored)) in created.iter().enumerate() {
+        if deleted.contains(&at) {
+            assert_gone(&router, case, id, arn).await;
+        } else {
+            // A delete reaches exactly the one record its path id names: every group it did
+            // not name reads back byte for byte as it stood.
+            let (status, body) = get_group(&router, id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 from GetRunGroup after other groups were \
+                 deleted, got {body:?}"
+            );
+            assert_eq!(
+                &body, stored,
+                "case {case:?}: a delete of another group must leave this one as it stood, \
+                 got {body:?}"
+            );
+        }
+    }
+
+    // The listing reports exactly the survivors, still in creation order, at every page
+    // size: the deleted records are gone from the collection, not skipped inside a page.
+    let survivors: Vec<String> = created
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !deleted.contains(at))
+        .map(|(_, (_, id, _, _))| id.clone())
+        .collect();
+    for page_size in [1usize, 2, 3, survivors.len(), 100] {
+        let case = format!("page size {page_size} after the deletes");
+        let seen = walk_listing(&router, &case, "", page_size, created.len()).await;
+        assert_eq!(
+            seen, survivors,
+            "case {case:?}: expected exactly the groups that were not deleted, got {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_an_id_no_run_group_holds_is_not_found_and_changes_nothing() {
+    let router = emulator();
+    // One real group exists, so the 404s below are about the id, not about an empty
+    // registry.
+    let (status, body) = create_group(
+        &router,
+        &json!({
+            "requestId": "the only group",
+            "name": "lonely cohort",
+            "maxCpus": 3,
+            "tags": tag_map(1),
+        }),
+    )
+    .await;
+    let existing = created_group_id("the only group", status, &body);
+    let (status, before) = get_group(&router, &existing).await;
+    assert_eq!(
+        status, 200,
+        "the only group: expected 200 from GetRunGroup, got {before:?}"
+    );
+    let minted: u64 = existing.parse().expect("a decimal run group id");
+
+    // Every id below is admissible for the modelled `RunGroupId` (`^[0-9]+$`, len 1..18)
+    // and names no stored group: each published length bound, one the counter has not
+    // reached, and the id another of this service's stores could mint.
+    let (min, max) = RUN_GROUP_ID_WIDTH;
+    for id in [
+        "0".repeat(min),
+        "9".repeat(min),
+        "9".repeat(max),
+        (minted + 1).to_string(),
+        (minted + 1_000_000).to_string(),
+    ] {
+        assert_ne!(
+            id, existing,
+            "the fixture must not collide with the real id"
+        );
+        let (status, body) = delete_group(&router, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {id:?}: expected 404 from DeleteRunGroup, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {id:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        // The refusal names the id the REQUEST carried, in the sentence this service
+        // words a missing run group with.
+        let expected = run_group_not_found_sentence(&id);
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {id:?}: expected {expected:?}, got {body:?}"
+        );
+        // Every reader of a run group words that condition the same way.
+        let (_, read) = get_group(&router, &id).await;
+        assert_eq!(
+            read.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {id:?}: expected GetRunGroup to answer {expected:?}, got {read:?}"
+        );
+    }
+
+    // An id one character past the published length bound is outside the modelled
+    // constraint, so the walk refuses it before any record is looked up.
+    let too_long = "1".repeat(max + 1);
+    let (status, body) = delete_group(&router, &too_long).await;
+    assert_eq!(
+        status, 400,
+        "case {too_long:?}: expected 400 from DeleteRunGroup, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case {too_long:?}: expected ValidationException, got {body:?}"
+    );
+
+    // A refused delete deleted nothing: the one stored group reads back exactly as it was
+    // and the registry still holds it alone.
+    let (status, after) = get_group(&router, &existing).await;
+    assert_eq!(
+        status, 200,
+        "the only group: expected 200 from GetRunGroup after the refusals, got {after:?}"
+    );
+    assert_eq!(
+        after, before,
+        "the only group: a refused delete must leave the group as it stood, got {after:?}"
+    );
+    let (status, body) = list_groups(&router, "").await;
+    let page = items("after the refusals", status, &body);
+    assert_eq!(
+        listed_ids(&page),
+        vec![existing],
+        "after the refusals: expected exactly the one created group, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_run_group_leaves_the_runs_that_joined_it_as_they_stood() {
+    let router = emulator();
+    let workflow_id = workflow_for_runs(&router, "group-deleted").await;
+
+    let mut groups = Vec::new();
+    for (case, body) in [
+        (
+            "the deleted group",
+            json!({ "requestId": "doomed", "name": "doomed cohort", "maxCpus": 8 }),
+        ),
+        (
+            "the kept group",
+            json!({ "requestId": "kept", "name": "kept cohort", "maxRuns": 2 }),
+        ),
+    ] {
+        let (status, response) = create_group(&router, &body).await;
+        groups.push((case, created_group_id(case, status, &response)));
+    }
+
+    let mut runs = Vec::new();
+    for (case, group) in &groups {
+        let body = start_run_body(
+            &workflow_id,
+            &format!("run-in-{case}"),
+            &json!({ "runGroupId": group }),
+        );
+        let (status, response) = start_run(&router, &body).await;
+        runs.push((*case, created_id(case, status, &response), group.clone()));
+    }
+
+    let (deleted_case, deleted) = groups[0].clone();
+    let (status, body) = delete_group(&router, &deleted).await;
+    assert_eq!(
+        status, DELETE_STATUS,
+        "case {deleted_case:?}: expected {DELETE_STATUS} from DeleteRunGroup, got {body:?}"
+    );
+
+    // A run is a record of its own: the delete reclaimed the group, not the runs that
+    // named it, so each run still reports the group id it recorded when it started.
+    for (case, run_id, group) in &runs {
+        let (status, run) = get_run(&router, run_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetRun after the delete, got {run:?}"
+        );
+        assert_eq!(
+            run.get("runGroupId").and_then(Value::as_str),
+            Some(group.as_str()),
+            "case {case:?}: expected the run to still report runGroupId {group:?}, got {run:?}"
+        );
+    }
+
+    // The group the delete did not name is untouched, and still narrows a run listing;
+    // the deleted id is held for no reader, so the listing that narrows on it answers the
+    // same 404 every other reader of it does.
+    let (_, kept) = groups[1].clone();
+    let (status, body) = get_group(&router, &kept).await;
+    assert_eq!(
+        status, 200,
+        "the kept group: expected 200 from GetRunGroup, got {body:?}"
+    );
+    let (status, body) = list_runs(&router, &format!("?runGroupId={kept}")).await;
+    let page = items("the kept group", status, &body);
+    assert_eq!(
+        page.len(),
+        1,
+        "the kept group: expected exactly the run that joined it, got {body:?}"
+    );
+    let (status, body) = list_runs(&router, &format!("?runGroupId={deleted}")).await;
+    assert_eq!(
+        status, 404,
+        "the deleted group: expected 404 from ListRuns, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "the deleted group: expected ResourceNotFoundException from ListRuns, got {body:?}"
+    );
+    let expected = run_group_not_found_sentence(&deleted);
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(expected.as_str()),
+        "the deleted group: expected ListRuns to answer {expected:?}, got {body:?}"
     );
 }

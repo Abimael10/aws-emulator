@@ -364,7 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(run_id),
                 );
                 StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("no run with id {run_id} exists in this region"),
+                    message: crate::state::run_not_found_message(run_id),
                 })
             })?),
             None => None,
@@ -451,7 +451,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(cache_id),
                 );
                 StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("no run cache with id {cache_id} exists in this region"),
+                    message: crate::state::run_cache_not_found_message(cache_id),
                 })
             })?),
             None => None,
@@ -476,9 +476,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         );
                         StartRunErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: format!(
-                                    "no run group with id {requested} exists in this region"
-                                ),
+                                message: crate::state::run_group_not_found_message(requested),
                             },
                         )
                     })?,

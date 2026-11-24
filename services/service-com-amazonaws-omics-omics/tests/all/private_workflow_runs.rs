@@ -2911,6 +2911,49 @@ async fn every_call_emits_a_structured_audit_record() {
         &version_arn,
     );
 
+    // The run group the table above updated is reclaimed here, so a destructive call that
+    // leaves no trace in the store still leaves one in the log — and the id it names is
+    // the one the request carried.
+    let case = "a run group deleted";
+    let (status, body, record) = audited_call(
+        captured,
+        &router,
+        case,
+        "DELETE",
+        &format!("/runGroup/{group}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 202, "case {case:?}: expected 202, got {body:?}");
+    assert_audit_record(
+        case,
+        &record,
+        "DeleteRunGroup",
+        &format!("DELETE /runGroup/{group}"),
+        "run-group-deleted",
+        &group,
+    );
+
+    let case = "a run group delete naming an id nothing holds";
+    let (status, body, record) = audited_call(
+        captured,
+        &router,
+        case,
+        "DELETE",
+        &format!("/runGroup/{absent}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "case {case:?}: expected 404, got {body:?}");
+    assert_audit_record(
+        case,
+        &record,
+        "DeleteRunGroup",
+        &format!("DELETE /runGroup/{absent}"),
+        "not-found",
+        absent,
+    );
+
     // The two deletes. Which outcome each is owed depends on which side of the clock the
     // call lands on — a run that has not finished cannot be deleted and its workflow is
     // still in use — so the record is asserted against the answer the call actually gave,
@@ -2981,6 +3024,114 @@ async fn every_call_emits_a_structured_audit_record() {
             &format!("DELETE /workflow/{workflow}"),
             "workflow-deleted",
             &workflow,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// How this service words "the id you named is not one I hold"
+// ---------------------------------------------------------------------------
+
+/// The fixed form this service words a missing resource of this API with: the kind of
+/// resource, the id the REQUEST carried, and nothing else of the request.
+/// Source: the `Workflow <id> not found` sentence every workflow reader answers, and the
+/// recorded `Run group <id> not found` a run group reader answers.
+fn not_found_sentence(kind: &str, id: &str) -> String {
+    format!("{kind} {id} not found")
+}
+
+#[tokio::test]
+async fn a_numeric_id_this_service_does_not_hold_is_not_found_by_its_resource_kind() {
+    let router = emulator();
+    // One resource of each kind exists, so each refusal below is about the id the request
+    // named and not about an empty store.
+    let workflow = workflow_for_runs(&router, "not-found-sentences").await;
+    let (status, body) = call(
+        &router,
+        "POST",
+        "/runGroup",
+        Some(&json!({ "requestId": "not-found-sentences" })),
+    )
+    .await;
+    let group = created_id("a run group to keep", status, &body);
+    let (status, body) = call(
+        &router,
+        "POST",
+        "/runCache",
+        Some(&json!({
+            "requestId": "not-found-sentences",
+            "cacheS3Location": "s3://omics-emulator-cache/kept/",
+        })),
+    )
+    .await;
+    let cache = created_id("a run cache to keep", status, &body);
+
+    // Rows spanning every resource of this API a `^[0-9]+$` id names and every reader that
+    // resolves one: the kind the sentence states is the resource the ROUTE addresses, never
+    // the kind another row asked for.
+    let readers: Vec<(&str, &str, &str, Option<Value>)> = vec![
+        ("Run", "GET", "/run/{id}", None),
+        ("Run", "DELETE", "/run/{id}", None),
+        ("Run cache", "GET", "/runCache/{id}", None),
+        ("Run group", "GET", "/runGroup/{id}", None),
+        ("Run group", "DELETE", "/runGroup/{id}", None),
+        (
+            "Run group",
+            "POST",
+            "/runGroup/{id}",
+            Some(json!({ "maxCpus": 8 })),
+        ),
+        ("Workflow", "GET", "/workflow/{id}", None),
+        ("Workflow", "DELETE", "/workflow/{id}", None),
+    ];
+
+    // Ids differing along width and value across the published 1..18 of every one of these
+    // id shapes, each naming nothing: the sentence varies only in the id it echoes.
+    let ids = [
+        "0".to_string(),
+        "9".to_string(),
+        "1234567".to_string(),
+        "9".repeat(18),
+    ];
+    for (kind, method, template, body) in &readers {
+        for id in &ids {
+            for held in [&workflow, &group, &cache] {
+                assert_ne!(
+                    id, held,
+                    "the fixture must not collide with a resource this store holds"
+                );
+            }
+            let case = format!("{method} {template} for id {id}");
+            let uri = template.replace("{id}", id);
+            let (status, answered) = call(&router, method, &uri, body.as_ref()).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404, got {answered:?}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {answered:?}"
+            );
+            let expected = not_found_sentence(kind, id);
+            assert_eq!(
+                answered.get("message").and_then(Value::as_str),
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    // The resources that DO exist were not touched by any of those refusals.
+    for (reader, uri) in [
+        ("GetWorkflow", format!("/workflow/{workflow}")),
+        ("GetRunGroup", format!("/runGroup/{group}")),
+        ("GetRunCache", format!("/runCache/{cache}")),
+    ] {
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {reader:?}: expected 200 after the refusals, got {body:?}"
         );
     }
 }

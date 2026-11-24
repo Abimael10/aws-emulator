@@ -267,9 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         );
                         ListRunsErrorModeled::ResourceNotFoundException(
                             ResourceNotFoundException {
-                                message: format!(
-                                    "no run group with id {requested} exists in this region"
-                                ),
+                                message: crate::state::run_group_not_found_message(requested),
                             },
                         )
                     })?,

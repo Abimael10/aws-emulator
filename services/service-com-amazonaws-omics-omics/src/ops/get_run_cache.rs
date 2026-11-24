@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(&input.id),
             );
             GetRunCacheErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("no run cache with id {} exists in this region", input.id),
+                message: crate::state::run_cache_not_found_message(&input.id),
             })
         })?;
         crate::state::audit(
