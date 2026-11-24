@@ -617,18 +617,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`PrivateDnsEnabled`). Two things have to hold for that zone to resolve anything,
         // and each is asked here rather than left to fail silently:
         //
+        // * the VPC has to have both DNS attributes on, which is what makes a private hosted
+        //   zone resolve inside it at all;
         // * the SERVICE has to publish a default public DNS name, since the record set for
         //   that name is the whole content of the zone
         //   ([`crate::state::endpoint_service_private_dns_name`], read off the one catalogue
         //   `DescribeVpcEndpointServices` reports from) — a service with none has no zone to
-        //   associate;
-        // * the VPC has to have both DNS attributes on, which is what makes a private hosted
-        //   zone resolve inside it at all.
+        //   associate.
         //
-        // BOTH are asked BELOW, after the dry-run probe: each reads a resource the request
-        // NAMED — the endpoint service's own published name, the VPC's own attributes —
-        // against what the request asked for, rather than reading the request, so they are
-        // part of carrying the create out.
+        // BOTH are asked BELOW, after the dry-run probe, and in THAT order: each reads a
+        // resource the request NAMED — the VPC's own attributes, the endpoint service's own
+        // published name — against what the request asked for, rather than reading the request,
+        // so they are part of carrying the create out; and the VPC is the resource that admits
+        // a zone of any service at all, so a VPC that resolves no private names is refused for
+        // its attributes whatever the named service publishes.
         //
         // The model publishes no DEFAULT for the member (`smithy_query(query="doc",
         // shape="CreateVpcEndpointRequest",member="PrivateDnsEnabled")` states the rule above
@@ -960,33 +962,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // "The private hosted zone contains a record set for the default public DNS name for
-        // the service for the Region" (`PrivateDnsEnabled`): that record set is the whole
-        // content of the zone, so a service publishing no such name has no zone to associate
-        // — through the one wording this crate refuses that with. Asked AFTER the probe
-        // above, with the VPC's attributes below: it reads the named service's own published
-        // name against what the request asked for.
-        if private_dns_has_no_domain {
-            return Err(state::private_dns_unsupported_service(service_name));
-        }
         // "To use a private hosted zone, you must set the following VPC attributes to true:
         // enableDnsHostnames and enableDnsSupport" (`PrivateDnsEnabled`): the zone this
         // endpoint would associate resolves nothing inside a VPC that resolves no private
         // names at all, so the association is refused rather than recorded as one no name
         // would answer.
         //
+        // The FIRST of the two questions private DNS is held to, asked for every request that
+        // asks for the association rather than only for one naming a service that publishes a
+        // name of its own: a VPC that resolves no private names could hold no service's zone,
+        // so that is what the caller has to change before an endpoint of ANY service in it
+        // could carry private DNS — which is the refusal a recorded create against such a VPC
+        // is answered with whatever the named service publishes. Only a VPC with both
+        // attributes on reaches the question of what the service publishes, below.
+        //
         // Asked AFTER the dry-run probe above, for the reason the policy-support refusal
         // below is: this reads the VPC's attributes against what the request asked for —
         // two resources against each other — rather than reading the request, so it is part
         // of carrying the create out. A recorded `DryRun` probe over a VPC whose attributes
         // are off is answered `DryRunOperation`, and the real call is answered this.
-        if private_dns_domain.is_some() {
+        if private_dns_enabled {
             let attributes = store
                 .vpc_attributes_of(&input.vpc_id)
                 .ok_or_else(|| state::invalid_vpc_id_not_found(&input.vpc_id))?;
             if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
                 return Err(state::private_dns_unsupported_vpc(&input.vpc_id));
             }
+        }
+        // "The private hosted zone contains a record set for the default public DNS name for
+        // the service for the Region" (`PrivateDnsEnabled`): that record set is the whole
+        // content of the zone, so a service publishing no such name has no zone to associate
+        // — through the one wording this crate refuses that with. Asked AFTER the probe
+        // above and after the VPC's own attributes: it reads the named service's own published
+        // name against what the request asked for.
+        if private_dns_has_no_domain {
+            return Err(state::private_dns_unsupported_service(service_name));
         }
 
         // "Indicates whether the service supports endpoint policies"

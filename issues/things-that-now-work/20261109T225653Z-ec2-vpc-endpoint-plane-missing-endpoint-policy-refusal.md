@@ -74,3 +74,23 @@ Model evidence: smithy_query operation=CreateVpcEndpoint -> input {VpcId require
 3. Cause 1: replay ec2-vpce-traj-iot-data-endpoint-create-refusals step task#4 — CreateVpcEndpoint for com.amazonaws.<region>.iot.data with a PolicyDocument that is not the full-access policy. Observe HTTP 200 plus dnsEntrySet names under *.vpce.amazonaws.com instead of HTTP 400 / InvalidParameter 'Service <serviceName> only supports the full-access endpoint policy.'
 4. Cause 2: replay ec2-vpc-endpoints-filters-ids-empty-list-and-paginated-continuation step task#5 (and task#6) — DescribeVpcEndpoints over two Gateway endpoints. Observe each vpcEndpointSet item missing dnsEntrySet, dnsOptions, groupSet, ipAddressType, networkInterfaceIdSet, privateDnsEnabled and subnetIdSet, and policyDocument serialized without its Version key.
 5. Cause 3: replay ec2-gateway-vpc-endpoint-lifecycle step task#3 — DescribeVpcEndpointServices filtered to the s3 gateway service. Observe serviceType listing both Gateway and Interface, supportedIpAddressTypeSet missing 'ipv6', and privateDnsName/privateDnsNameSet set to 's3.<region>.amazonaws.com'.
+
+## Resolution
+
+Causes 2 and 3 needed no further change: the code base had drifted since this report was
+filed, and the `VpcEndpoint` projection now emits every modelled member with its empty list
+members as empty elements and keeps the default policy's `Version` key, while the
+endpoint-service catalogue derives `serviceType`, `supportedIpAddressTypeSet` and the DNS-name
+members per service and publishes only names this emulator answers on. Both fixtures replay
+clean.
+
+Cause 1's refusal — `InvalidParameter`, `Service <serviceName> only supports the full-access
+endpoint policy.` — was in place too, and the endpoint's own DNS entries no longer name hosts
+the emulator does not serve; what was left was the ORDER of the two prerequisites of private
+DNS. A request asking to enable private DNS is now held to the VPC's own DNS attributes FIRST,
+before the named service's published default public DNS name: a VPC with either attribute off
+earns the sentence naming both attributes and that VPC whatever the service publishes, and only
+a VPC with both on reaches the question of what the service publishes. `CreateVpcEndpoint` and
+`ModifyVpcEndpoint` ask the two questions in that one order, and
+`tests/all/vpc_endpoint_private_dns_prerequisites.rs` pins it over both kinds of service against
+each attribute state a VPC can be in.

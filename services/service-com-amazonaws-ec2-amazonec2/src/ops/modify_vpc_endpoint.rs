@@ -784,18 +784,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // private hosted zone's record set holds.
         let service_private_dns_name = state::endpoint_service_private_dns_name(&store, &service_name);
         if private_dns_enabled && !private_dns_held {
-            // The zone's whole content is the record set for the name the SERVICE publishes, so
-            // a service that publishes none has no zone to associate — the same question, in
-            // the same wording, the create asks before honouring the member.
-            let Some(private_dns_domain) = service_private_dns_name.as_deref() else {
-                return Err(state::private_dns_unsupported_service(&service_name));
-            };
+            // The VPC has to resolve private names at all before any zone could be associated
+            // in it, so its attributes are read FIRST — the same order the create asks these
+            // two questions in, and the one refusal a VPC that resolves none earns whatever
+            // the named service publishes.
             let attributes = store
                 .vpc_attributes_of(&vpc_id)
                 .ok_or_else(|| state::invalid_vpc_id_not_found(&vpc_id))?;
             if !(attributes.enable_dns_support && attributes.enable_dns_hostnames) {
                 return Err(state::private_dns_unsupported_vpc(&vpc_id));
             }
+            // The zone's whole content is the record set for the name the SERVICE publishes, so
+            // a service that publishes none has no zone to associate — the same question, in
+            // the same wording, the create asks before honouring the member.
+            let Some(private_dns_domain) = service_private_dns_name.as_deref() else {
+                return Err(state::private_dns_unsupported_service(&service_name));
+            };
             // And the zone answers ONE domain inside the VPC: it belongs to at most one
             // endpoint per VPC per service, so turning it on for a second one is refused
             // ([`crate::state::vpc_has_private_dns_endpoint_for_service`], asked excluding the
