@@ -138,14 +138,16 @@
 //!   of the tracks in the first fragment for a playback session. The codec ID for track 1
 //!   should be V_MPEG/ISO/AVC and, optionally, the codec ID for track 2 should be A_AAC.
 
-use ::std::io::Cursor;
-
-use ::service_common::h264_mp4::{self, Sample, TimedSample, VideoTrack};
-use ::webm_iterable::matroska_spec::{Master, MatroskaSpec};
-use ::webm_iterable::WebmIterator;
+use ::service_common::h264_mp4::{self, TimedSample, VideoTrack};
 
 #[allow(unused_imports)]
 use super::types::*;
+// Reading the Matroska document one archived fragment IS, and the sample
+// description its codec private data states, is the one read this plane shares
+// with the playback plane of a streaming session — so it lives beside neither.
+use crate::service::archived_container::{
+    avcc_sample, read_codec_private, read_fragment, video_track, ContainerFault,
+};
 use crate::state::{
     date_time_millis, epoch_millis, service_state, ArchivedStream, StoredFragment,
     StreamLookupError, TimestampOrigin, NO_DATA_RETENTION_MESSAGE, TIMESTAMP_RANGE_ORDER_MESSAGE,
@@ -174,38 +176,11 @@ const NO_FRAGMENTS_MESSAGE: &str = "No fragments found in the stream for the cli
 /// payload this service assembles, named once there.
 const MAX_CLIP_BYTES: usize = crate::state::MAX_PAYLOAD_BYTES;
 
-/// The Matroska codec ids that name the H.264 video this operation clips.
-///
-/// `V_MPEG4/ISO/AVC` is the id the Matroska codec registry assigns to H.264 and
-/// the one the Kinesis Video Streams producers write; `V_MPEG/ISO/AVC` is how
-/// this operation's own documentation prints it ("the codec ID of track 1 should
-/// be V_MPEG/ISO/AVC (for h.264)"), so both spellings name the same codec here.
-const AVC_CODEC_IDS: &[&str] = &["V_MPEG4/ISO/AVC", "V_MPEG/ISO/AVC"];
-
-/// How many nanoseconds one Matroska timecode tick is worth when a fragment's
-/// container declares no `TimestampScale`: the Matroska default of one
-/// millisecond.
-const DEFAULT_TIMECODE_SCALE_NANOS: u64 = 1_000_000;
-
-/// Nanoseconds in one millisecond, the unit this service records fragment
-/// timestamps and durations in.
-const NANOS_PER_MILLI: i128 = 1_000_000;
-
-/// How many units of time one second of the clip holds: the millisecond, which is
-/// the precision the archive stamps its fragments and their durations at, so a
-/// sample's time needs no rounding to be written.
-const CLIP_TIMESCALE: u32 = 1_000;
-
 /// How long the LAST sample of the clip lasts when the fragment carrying it
-/// declares no duration past that sample's own instant: one tick of
-/// [`CLIP_TIMESCALE`], the shortest span a sample can be shown for.
+/// declares no duration past that sample's own instant: one tick of the written
+/// timescale ([`crate::service::archived_container::MEDIA_TIMESCALE`]), the
+/// shortest span a sample can be shown for.
 const MINIMUM_SAMPLE_TICKS: u32 = 1;
-
-/// The most EBML elements one archived fragment is read for: the step budget of
-/// that read, so the work a clip can ask for is bounded whatever shape the stored
-/// tree has. One fragment is a header and one Cluster of frames, so no media an
-/// ingest plane wrote reaches it.
-const MAX_ELEMENTS_PER_FRAGMENT: usize = 100_000;
 
 /// The most samples one clip carries.
 ///
@@ -226,11 +201,6 @@ const UNSUPPORTED_MEDIA_MESSAGE: &str =
 /// specified codec".
 const INVALID_MEDIA_FRAME_MESSAGE: &str =
     "One or more frames in the requested clip could not be parsed based on the specified codec.";
-
-/// How many bytes of a sequence parameter set a sample description reads: the
-/// set's own unit header, then the profile, the profile compatibility and the
-/// level the coded video declares (ISO/IEC 14496-10).
-const SEQUENCE_PARAMETER_SET_HEADER: usize = 4;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -472,58 +442,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What a clip could not be built from, as the modelled refusals name it.
-#[derive(Debug)]
-enum ClipFault {
-    /// The archived bytes do not read as a Matroska document, so the frames of
-    /// the clip cannot be found in them.
-    Unreadable,
-    /// No track of a selected fragment declares the H.264 video this operation
-    /// clips.
-    UnsupportedMedia,
-    /// The video track of a selected fragment declares no codec private data, so
-    /// the clip has no sample description to carry. The track number is the
-    /// offending track's.
-    MissingCodecPrivateData(u64),
-    /// Its codec private data is not an AVC decoder configuration record the
-    /// sample description can be written from.
-    InvalidCodecPrivateData(u64),
-    /// The selected fragments carry no frame to put in the clip.
-    NoFrames,
-    /// The writer refused the container, carrying what it refused.
-    Unwritable(String),
-}
-
 /// The modelled refusal `fault` is reported as.
-fn refused_clip(fault: ClipFault) -> GetClipError {
+fn refused_clip(fault: ContainerFault) -> GetClipError {
     match fault {
-        ClipFault::MissingCodecPrivateData(track) => {
+        ContainerFault::MissingCodecPrivateData(track) => {
             GetClipErrorModeled::MissingCodecPrivateDataException(MissingCodecPrivateDataException {
                 message: Some(format!(
                     "Missing codec private data in fragment for track {track}."
                 )),
             })
         }
-        ClipFault::InvalidCodecPrivateData(track) => {
+        ContainerFault::InvalidCodecPrivateData(track) => {
             GetClipErrorModeled::InvalidCodecPrivateDataException(InvalidCodecPrivateDataException {
                 message: Some(format!(
                     "Invalid codec private data in fragment for track {track}."
                 )),
             })
         }
-        ClipFault::UnsupportedMedia => {
+        ContainerFault::UnsupportedMedia => {
             GetClipErrorModeled::UnsupportedStreamMediaTypeException(
                 UnsupportedStreamMediaTypeException {
                     message: Some(UNSUPPORTED_MEDIA_MESSAGE.to_string()),
                 },
             )
         }
-        ClipFault::Unreadable | ClipFault::NoFrames => {
+        ContainerFault::Unreadable | ContainerFault::NoFrames => {
             GetClipErrorModeled::InvalidMediaFrameException(InvalidMediaFrameException {
                 message: Some(INVALID_MEDIA_FRAME_MESSAGE.to_string()),
             })
         }
-        ClipFault::Unwritable(reason) => {
+        ContainerFault::Unwritable(reason) => {
             ::tracing::error!(reason = %reason, "the clip could not be written");
             GetClipErrorModeled::InvalidMediaFrameException(InvalidMediaFrameException {
                 message: Some(INVALID_MEDIA_FRAME_MESSAGE.to_string()),
@@ -557,56 +505,12 @@ impl ClipSource {
     }
 }
 
-/// One track as a fragment's `Tracks` declares it.
-#[derive(Debug, Default)]
-struct TrackDeclaration {
-    /// Its `TrackNumber` — the number a frame's block header names, and the one
-    /// a codec-private-data refusal reports.
-    number: u64,
-    /// Its `CodecID`.
-    codec_id: String,
-    /// Its `CodecPrivate`, when the producer declared one.
-    codec_private: Option<Vec<u8>>,
-    /// Its `PixelWidth`, when the container declares the track's geometry.
-    pixel_width: Option<u64>,
-    /// Its `PixelHeight`.
-    pixel_height: Option<u64>,
-}
-
-impl TrackDeclaration {
-    /// Whether this track's codec id names the H.264 video a clip is muxed from.
-    fn is_avc(&self) -> bool {
-        AVC_CODEC_IDS.contains(&self.codec_id.as_str())
-    }
-}
-
-/// One frame a fragment carries on its video track.
-#[derive(Debug)]
-struct ArchivedFrame {
-    /// When the frame is shown, in milliseconds from the start of its own
-    /// fragment.
-    offset_millis: i64,
-    /// The frame's own bytes, as the block carried them.
-    bytes: Vec<u8>,
-    /// Whether a player may start decoding at this frame, as the block's header
-    /// says.
-    sync: bool,
-}
-
-/// What one archived fragment carries for the mux: the video track it declares
-/// and that track's frames.
-#[derive(Debug)]
-struct ArchivedFragment {
-    track: TrackDeclaration,
-    frames: Vec<ArchivedFrame>,
-}
-
 /// The MP4 clip of `sources`: one AVC video track whose sample description is the
 /// first fragment's codec private data and whose samples are the frames every
 /// selected fragment carries on that track, in archive order.
-fn muxed_clip(sources: &[ClipSource]) -> Result<Vec<u8>, ClipFault> {
+fn muxed_clip(sources: &[ClipSource]) -> Result<Vec<u8>, ContainerFault> {
     // (when the sample is shown, in milliseconds since the epoch; the sample)
-    let mut placed: Vec<(i64, Sample)> = Vec::new();
+    let mut placed: Vec<(i64, ::service_common::h264_mp4::Sample)> = Vec::new();
     let mut track: Option<VideoTrack> = None;
     // Where the clip's media ends: the end of the last fragment that put a sample
     // in it, which is what the final sample's duration is measured against.
@@ -636,9 +540,9 @@ fn muxed_clip(sources: &[ClipSource]) -> Result<Vec<u8>, ClipFault> {
         }
     }
 
-    let track = track.ok_or(ClipFault::NoFrames)?;
+    let track = track.ok_or(ContainerFault::NoFrames)?;
     if placed.is_empty() {
-        return Err(ClipFault::NoFrames);
+        return Err(ContainerFault::NoFrames);
     }
     // Each sample lasts until the next one is shown, and the last one until the
     // media of the fragment carrying it ends — never less than one tick, so no
@@ -654,273 +558,5 @@ fn muxed_clip(sources: &[ClipSource]) -> Result<Vec<u8>, ClipFault> {
             duration: ticks.max(MINIMUM_SAMPLE_TICKS),
         });
     }
-    h264_mp4::mux_avc(&track, &samples).map_err(ClipFault::Unwritable)
-}
-
-/// The video track the clip declares, from the track a fragment declared and the
-/// record it carries.
-///
-/// The geometry is the coded video's own, read from the sequence parameter set of
-/// that record; a record whose parameter set does not read falls back to the
-/// geometry the CONTAINER declares for the track (`PixelWidth`/`PixelHeight`),
-/// and codec private data that states neither is not data this clip can be muxed
-/// from.
-fn video_track(
-    declared: &TrackDeclaration,
-    record: &AvcRecord,
-) -> Result<VideoTrack, ClipFault> {
-    let declared_dimensions = match (declared.pixel_width, declared.pixel_height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
-        _ => None,
-    };
-    let dimensions = coded_dimensions(&record.seq_param_set).or(declared_dimensions);
-    let Some((width, height)) = dimensions else {
-        return Err(ClipFault::InvalidCodecPrivateData(declared.number));
-    };
-    Ok(VideoTrack {
-        width: u16::try_from(width).unwrap_or(u16::MAX),
-        height: u16::try_from(height).unwrap_or(u16::MAX),
-        timescale: CLIP_TIMESCALE,
-        seq_param_set: record.seq_param_set.clone(),
-        pic_param_set: record.pic_param_set.clone(),
-    })
-}
-
-/// The coded geometry a sequence parameter set states, read by the maintained
-/// H.264 bitstream reader, or `None` when those bytes are not one.
-fn coded_dimensions(seq_param_set: &[u8]) -> Option<(u64, u64)> {
-    use ::h264_reader::nal::{sps::SeqParameterSet, Nal, RefNal};
-
-    let nal = RefNal::new(seq_param_set, &[], true);
-    let sps = SeqParameterSet::from_bits(nal.rbsp_bits()).ok()?;
-    let (width, height) = sps.pixel_dimensions().ok()?;
-    (width > 0 && height > 0).then_some((u64::from(width), u64::from(height)))
-}
-
-/// The AVC decoder configuration record a track's codec private data is, or the
-/// fault that stands in its way.
-fn read_codec_private(declared: &TrackDeclaration) -> Result<AvcRecord, ClipFault> {
-    // "The video track of each fragment must contain codec private data in the
-    // Advanced Video Coding (AVC) for H.264 format": a track that declares none
-    // is the modelled missing-record refusal, naming the track it is missing for.
-    let private = declared
-        .codec_private
-        .as_deref()
-        .filter(|bytes| !bytes.is_empty())
-        .ok_or(ClipFault::MissingCodecPrivateData(declared.number))?;
-    AvcRecord::read(private).ok_or(ClipFault::InvalidCodecPrivateData(declared.number))
-}
-
-/// The AVC decoder configuration record (ISO/IEC 14496-15) a clip's sample
-/// description is written from.
-#[derive(Debug)]
-struct AvcRecord {
-    /// The record's first sequence parameter set.
-    seq_param_set: Vec<u8>,
-    /// Its first picture parameter set.
-    pic_param_set: Vec<u8>,
-    /// How wide the length field framing one unit of a sample is, in bytes:
-    /// `lengthSizeMinusOne` plus one.
-    length_size: usize,
-}
-
-impl AvcRecord {
-    /// `bytes` read as the record, or `None` when they are not one.
-    ///
-    /// The record is read by the maintained H.264 reader, which owns the layout
-    /// ISO/IEC 14496-15 fixes — the configuration version, the profile, the
-    /// length framing of a sample's units and the length-prefixed parameter sets.
-    /// Codec private data it cannot read, or that carries neither kind of
-    /// parameter set, is not data a sample description can be written from.
-    fn read(bytes: &[u8]) -> Option<Self> {
-        use ::h264_reader::avcc::AvcDecoderConfigurationRecord;
-
-        let record = AvcDecoderConfigurationRecord::try_from(bytes).ok()?;
-        let seq_param_set = parameter_set_bytes(record.sequence_parameter_sets().next()?.ok()?)?;
-        let pic_param_set = parameter_set_bytes(record.picture_parameter_sets().next()?.ok()?)?;
-        Some(Self {
-            seq_param_set,
-            pic_param_set,
-            length_size: usize::from(record.length_size_minus_one()) + 1,
-        })
-    }
-}
-
-/// One parameter set of the record as the bytes a sample description carries, or
-/// `None` when it states no profile for the clip to declare.
-///
-/// A sequence parameter set shorter than [`SEQUENCE_PARAMETER_SET_HEADER`] is not
-/// one a sample description can be written from: the description states the
-/// profile, the profile compatibility and the level of the coded video, and those
-/// are the three bytes that follow the set's own unit header (ISO/IEC 14496-10).
-fn parameter_set_bytes(set: &[u8]) -> Option<Vec<u8>> {
-    (set.len() >= SEQUENCE_PARAMETER_SET_HEADER).then(|| set.to_vec())
-}
-
-/// One archived frame in the framing an MP4 track carries its samples in.
-///
-/// The frames a Kinesis Video Streams producer writes are already the
-/// length-prefixed units of the track's record, so they are carried through as
-/// they are. A producer that wrote its units DELIMITED instead (the Annex B byte
-/// stream, which is what the NAL adaptation flags adapt) is re-framed, and so is
-/// one whose record states a length field of another width, so that what the clip
-/// declares and what its samples carry agree.
-fn avcc_sample(frame: &ArchivedFrame, length_size: usize) -> Sample {
-    let delimited = frame.bytes.starts_with(&[0, 0, 1]) || frame.bytes.starts_with(&[0, 0, 0, 1]);
-    let mut stream = Vec::new();
-    let reframed = if delimited {
-        stream.extend_from_slice(&frame.bytes);
-        true
-    } else if length_size == 4 {
-        false
-    } else {
-        h264_mp4::annex_b_from_avcc(&frame.bytes, length_size, &mut stream)
-    };
-    if !reframed {
-        return Sample {
-            bytes: frame.bytes.clone(),
-            sync: frame.sync,
-        };
-    }
-    let units = h264_mp4::annex_b_units(&stream);
-    let framed = h264_mp4::avcc_samples(&units);
-    if framed.is_empty() {
-        return Sample {
-            bytes: frame.bytes.clone(),
-            sync: frame.sync,
-        };
-    }
-    // One block carries one coded picture, so what the re-framing read out of it
-    // stays one sample of the clip.
-    Sample {
-        sync: frame.sync || framed.iter().any(|sample| sample.sync),
-        bytes: framed
-            .into_iter()
-            .flat_map(|sample| sample.bytes)
-            .collect::<Vec<u8>>(),
-    }
-}
-
-/// The video track and frames one archived fragment carries.
-///
-/// The container is read by the maintained Matroska reader: the element tree, its
-/// variable-size integers and a block's own header are that crate's business. What
-/// this reads out of the tree is the Kinesis Video Streams shape of a fragment —
-/// the track declarations of its header and the frames of its Cluster.
-fn read_fragment(media: &[u8]) -> Result<ArchivedFragment, ClipFault> {
-    let mut scale_nanos = DEFAULT_TIMECODE_SCALE_NANOS;
-    let mut declared: Vec<TrackDeclaration> = Vec::new();
-    let mut open: Option<TrackDeclaration> = None;
-    let mut cluster_millis = 0i64;
-    // (the track the block is on, when it is shown in milliseconds from the start
-    // of the fragment, its bytes, whether it is a sync frame)
-    let mut blocks: Vec<(u64, i64, Vec<u8>, bool)> = Vec::new();
-    let mut elements = 0usize;
-
-    for read in WebmIterator::new(Cursor::new(media), &[]) {
-        elements = elements.saturating_add(1);
-        if elements > MAX_ELEMENTS_PER_FRAGMENT {
-            break;
-        }
-        let tag = read.map_err(|_| ClipFault::Unreadable)?;
-        match &tag {
-            MatroskaSpec::TimestampScale(nanos) => scale_nanos = (*nanos).max(1),
-            MatroskaSpec::TrackEntry(Master::Start) => open = Some(TrackDeclaration::default()),
-            MatroskaSpec::TrackEntry(Master::End) => {
-                if let Some(track) = open.take() {
-                    declared.push(track);
-                }
-            }
-            MatroskaSpec::TrackNumber(number) => {
-                if let Some(track) = open.as_mut() {
-                    track.number = *number;
-                }
-            }
-            MatroskaSpec::CodecID(codec_id) => {
-                if let Some(track) = open.as_mut() {
-                    track.codec_id = codec_id.clone();
-                }
-            }
-            MatroskaSpec::CodecPrivate(private) => {
-                if let Some(track) = open.as_mut() {
-                    track.codec_private = Some(private.clone());
-                }
-            }
-            MatroskaSpec::PixelWidth(width) => {
-                if let Some(track) = open.as_mut() {
-                    track.pixel_width = Some(*width);
-                }
-            }
-            MatroskaSpec::PixelHeight(height) => {
-                if let Some(track) = open.as_mut() {
-                    track.pixel_height = Some(*height);
-                }
-            }
-            MatroskaSpec::Timestamp(ticks) => {
-                cluster_millis = ticks_as_millis(i128::from(*ticks), scale_nanos);
-            }
-            MatroskaSpec::SimpleBlock(_) => {
-                let block = ::webm_iterable::matroska_spec::SimpleBlock::try_from(&tag)
-                    .map_err(|_| ClipFault::Unreadable)?;
-                blocks.push((
-                    block.track,
-                    cluster_millis
-                        .saturating_add(ticks_as_millis(i128::from(block.timestamp), scale_nanos)),
-                    block.raw_frame_data().to_vec(),
-                    block.keyframe,
-                ));
-            }
-            MatroskaSpec::Block(_) => {
-                let block = ::webm_iterable::matroska_spec::Block::try_from(&tag)
-                    .map_err(|_| ClipFault::Unreadable)?;
-                blocks.push((
-                    block.track,
-                    cluster_millis
-                        .saturating_add(ticks_as_millis(i128::from(block.timestamp), scale_nanos)),
-                    block.raw_frame_data().to_vec(),
-                    false,
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    // "the codec ID of track 1 should be V_MPEG/ISO/AVC (for h.264)": the clip is
-    // muxed from the track whose codec id names that codec, and media whose
-    // declarations name no such track is media whose type this operation cannot
-    // determine.
-    let track = declared
-        .into_iter()
-        .find(TrackDeclaration::is_avc)
-        .ok_or(ClipFault::UnsupportedMedia)?;
-    // A fragment's frames are shown from the fragment's own start, so the offsets
-    // are measured from its first frame rather than from the producer's clock
-    // origin — two fragments ingested from one session then sit on the clip's
-    // timeline where the archive's own timestamps put them.
-    let first_millis = blocks
-        .iter()
-        .filter(|(on, _, _, _)| *on == track.number)
-        .map(|(_, at, _, _)| *at)
-        .min()
-        .unwrap_or(0);
-    let frames = blocks
-        .into_iter()
-        .filter(|(on, _, _, _)| *on == track.number)
-        .map(|(_, at, bytes, sync)| ArchivedFrame {
-            offset_millis: at.saturating_sub(first_millis),
-            bytes,
-            sync,
-        })
-        .collect();
-    Ok(ArchivedFragment { track, frames })
-}
-
-/// `ticks` of a container's timecode scale, in milliseconds.
-///
-/// `TimestampScale` is "the number of nanoseconds per tick" (Matroska), so a tick
-/// is worth `scale_nanos` nanoseconds and the conversion is exact at the
-/// millisecond precision this service records.
-fn ticks_as_millis(ticks: i128, scale_nanos: u64) -> i64 {
-    let nanos = ticks.saturating_mul(i128::from(scale_nanos));
-    i64::try_from(nanos / NANOS_PER_MILLI).unwrap_or(i64::MAX)
+    h264_mp4::mux_avc(&track, &samples).map_err(ContainerFault::Unwritable)
 }

@@ -6949,6 +6949,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpeg2ts"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83c1d679004305ea6e44eb53526da5816934a05b4b5b3b9a470e708a41d70a18"
+
+[[package]]
 name = "mpeg4-audio-const"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16637,6 +16643,7 @@ dependencies = [
  "http",
  "image",
  "mp4",
+ "mpeg2ts",
  "openh264",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

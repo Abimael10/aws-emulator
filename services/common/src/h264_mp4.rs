@@ -13,7 +13,9 @@
 //!
 //! * [`annex_b_units`] and [`parameter_set`] read an encoder's byte stream;
 //! * [`avcc_samples`] frames its coded pictures the way a track carries them;
-//! * [`mux_avc`] writes the file, through the maintained MP4 writer;
+//! * [`mux_avc`] writes the file, through the maintained MP4 writer, and
+//!   [`mux_avc_init`] writes the INITIALIZATION of the same track on its own — the
+//!   `ftyp` and `moov` atoms a player loads before any media;
 //! * [`annex_b_from_avcc`] turns a track's sample back into the stream a decoder reads.
 //!
 //! Nothing here decodes or encodes pictures: the codec is the maintained encoder each
@@ -175,6 +177,24 @@ pub fn mux_avc(track: &VideoTrack, samples: &[TimedSample]) -> Result<Vec<u8>, S
     if samples.is_empty() {
         return Err("the encoded stream carries no coded picture".to_string());
     }
+    written_mp4(track, samples)
+}
+
+/// Write the INITIALIZATION of `track`: the same file [`mux_avc`] writes, carrying the
+/// track's declaration and NO media.
+///
+/// What an HLS or MPEG-DASH player loads before the first media fragment — the atoms that
+/// state the geometry and the parameter sets its decoder is set up from, and nothing a
+/// fragment carries. `Err` carries what the writer refused, as [`mux_avc`] does.
+pub fn mux_avc_init(track: &VideoTrack) -> Result<Vec<u8>, String> {
+    written_mp4(track, &[])
+}
+
+/// The MP4 file carrying `track` and `samples`, written by the maintained writer.
+///
+/// The one write both entry points share, so an initialization and the media fragments
+/// beside it declare the same track.
+fn written_mp4(track: &VideoTrack, samples: &[TimedSample]) -> Result<Vec<u8>, String> {
     let config = ::mp4::Mp4Config {
         major_brand: ::mp4::FourCC::from(*b"isom"),
         minor_version: 512,

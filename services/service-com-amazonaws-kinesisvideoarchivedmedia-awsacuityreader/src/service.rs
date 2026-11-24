@@ -45,6 +45,29 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Reading the Matroska container one archived fragment IS: the track it
+/// declares, the codec private data a sample description comes from, and the
+/// frames of its Cluster.
+///
+/// It lives beside the operations rather than inside one of them because TWO
+/// readers of this plane look inside a fragment — the clip `GetClip` muxes and
+/// the media a streaming session's playback plane serves — and two readers of
+/// one container are two chances to disagree about what a producer ingested.
+pub mod archived_container;
+/// The MEDIA a streaming session's playback plane serves, written from the
+/// archived container: the MP4 initialization fragment, the MP4 media fragment of
+/// one archived fragment, and the MPEG TS fragment an `MPEG_TS` session serves
+/// instead of those two.
+pub mod playback_media;
+/// The playlists and the manifest a streaming session's playback plane serves: the
+/// HLS master and media playlists and the MPEG-DASH manifest, rendered from the
+/// session that was minted and the fragments the archive still holds.
+pub mod playback_manifest;
+/// The playback plane of a streaming session: the resources the URL
+/// `GetHLSStreamingSessionURL` and `GetDASHStreamingSessionURL` hand out are
+/// fetched at, claimed by their path and served from the recorded session.
+pub mod playback_session;
+
 /// Whether the CALLER may perform the action a request asks for, decided against the
 /// identity-based IAM policies in force on the principal its credentials name.
 ///
@@ -119,6 +142,10 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, held beside the entry so the seams below can read this
+    /// service's own store — which is where the streaming sessions the playback
+    /// plane serves live ([`playback_session`]).
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -127,7 +154,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -141,13 +169,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Delegated to the framework's own predicate — see [`can_handle_parts`]: this
-        // service's signing name (`kinesisvideo`) is shared with the Kinesis Video
-        // control plane, Media, Signaling Channels and WebRTC Storage, so the claim is
-        // the routing key AND the model-derived first URI path segment. Matching on
-        // the signing name alone would have five services claim every `kinesisvideo`
-        // request, which the router answers with 500 `AmbiguousService` instead of
-        // serving any of them.
+        // A request that FOLLOWED the streaming-session URL this service reported is
+        // claimed by its PATH: a media player holds no credentials and signs nothing,
+        // so such a request names no service at all and nothing else would claim it —
+        // the router would answer `404 UnknownService` for an address this emulator
+        // itself published. The two playback path spaces (`/hls/…`, `/dash/…`) are
+        // modelled by none of the five services that share this signing name, so this
+        // claim diverts nothing from any of them.
+        if playback_session::claims_playback_path(parts) {
+            return true;
+        }
+        // Otherwise delegated to the framework's own predicate — see
+        // [`can_handle_parts`]: this service's signing name (`kinesisvideo`) is shared
+        // with the Kinesis Video control plane, Media, Signaling Channels and WebRTC
+        // Storage, so the claim is the routing key AND the model-derived first URI path
+        // segment. Matching on the signing name alone would have five services claim
+        // every `kinesisvideo` request, which the router answers with 500
+        // `AmbiguousService` instead of serving any of them.
         can_handle_parts(parts)
     }
 
@@ -195,13 +233,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. The framework's `rest` default is `501
-        // NotImplemented`, which no endpoint of the Kinesis Video Streams family
-        // answers: a request whose method and URI name no operation this endpoint hosts
-        // is rejected by the front door ahead of any handler, in the one envelope that
-        // family states an unroutable request in — the control plane's
-        // `service::unknown_operation`, which owns that wording for the whole family.
-        let _ = req;
+        // routing table resolved it.
+        //
+        // A request that followed the streaming-session URL this service reported is
+        // exactly that case by construction: the model binds no operation to a
+        // playback path — the resources a player fetches are what a session URL points
+        // at rather than API calls — so the playlist, the manifest and the media are
+        // served here, from the session the minting call recorded
+        // ([`playback_session`]).
+        if let Some(served) = playback_session::serve_playback_path(&*self.engine, req) {
+            return Some(served);
+        }
+        // Every other unroutable request keeps this family's own wording. The
+        // framework's `rest` default is `501 NotImplemented`, which no endpoint of the
+        // Kinesis Video Streams family answers: a request whose method and URI name no
+        // operation this endpoint hosts is rejected by the front door ahead of any
+        // handler, in the one envelope that family states an unroutable request in —
+        // the control plane's `service::unknown_operation`, which owns that wording for
+        // the whole family.
         Some(
             ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::service::unknown_operation
                 ::unknown_operation_response(),

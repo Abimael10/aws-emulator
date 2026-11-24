@@ -52,6 +52,11 @@ webm-iterable = "0.7"
 # Reads the sequence parameter set of a track's AVC decoder configuration record, which is
 # what states the coded geometry the clip's video track declares.
 h264-reader = "0.9"
+# Writes the MPEG-2 transport stream one `getTSFragment.ts` of an `MPEG_TS` streaming
+# session is served as: the packet headers, the program tables and the PES packets of
+# ISO/IEC 13818-1, so the fragment a player fetches is a transport stream a maintained
+# writer produced rather than bytes shaped to look like one.
+mpeg2ts = "0.6"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -504,6 +504,68 @@ pub const NO_FRAGMENTS_MESSAGE: &str =
 /// served by this emulator.
 pub const LOOPBACK_HOST: &str = "127.0.0.1";
 
+/// The path segment that follows a playback protocol's own prefix in every
+/// session resource's path.
+pub const SESSION_PATH_VERSION: &str = "v1";
+
+/// The query field a session resource is addressed with: the session token
+/// `GetHLSStreamingSessionURL` / `GetDASHStreamingSessionURL` put in the URL
+/// they handed out ("an authenticated URL (that includes an encrypted session
+/// token)").
+pub const SESSION_TOKEN_FIELD: &str = "SessionToken";
+
+/// The query field naming WHICH track of the session a playlist or
+/// initialization fragment is asked for: "There is a distinct HLS media
+/// playlist for the video track and the audio track (if applicable)".
+pub const TRACK_NUMBER_FIELD: &str = "TrackNumber";
+
+/// The query field naming WHICH archived fragment a media fragment is asked
+/// for, by the fragment number the archive holds it under.
+pub const FRAGMENT_NUMBER_FIELD: &str = "FragmentNumber";
+
+/// The HLS master playlist: the "root resource needed for streaming with HLS",
+/// which `GetHLSStreamingSessionURL` reports the URL of.
+pub const HLS_MASTER_PLAYLIST_RESOURCE: &str = "getHLSMasterPlaylist.m3u8";
+
+/// The HLS media playlist of one track, which the master playlist names: it
+/// "contains a URL to access the MP4 initialization fragment ... and URLs to
+/// access the MP4 media fragments".
+pub const HLS_MEDIA_PLAYLIST_RESOURCE: &str = "getHLSMediaPlaylist.m3u8";
+
+/// The MP4 initialization fragment, which "contains only the codec private data
+/// for the stream and respective track, which the media player needs to decode
+/// the media frames".
+pub const MP4_INIT_FRAGMENT_RESOURCE: &str = "getMP4InitFragment.mp4";
+
+/// One MP4 media fragment: the "encoded fragment's media frames and their
+/// timestamps".
+pub const MP4_MEDIA_FRAGMENT_RESOURCE: &str = "getMP4MediaFragment.mp4";
+
+/// One MPEG TS fragment, "containing both initialization and media data for all
+/// tracks in the stream" — the resource a session whose `ContainerFormat` is
+/// `MPEG_TS` serves media as, "instead of GetMP4InitFragment and
+/// GetMP4MediaFragment".
+pub const TS_FRAGMENT_RESOURCE: &str = "getTSFragment.ts";
+
+/// The MPEG-DASH manifest: the root resource of an MPEG-DASH session, which
+/// `GetDASHStreamingSessionURL` reports the URL of.
+pub const DASH_MANIFEST_RESOURCE: &str = "getMPDManifest.mpd";
+
+/// The path, on this emulator, one resource of a streaming session is served
+/// at: `/<protocol>/v1/<resource>?SessionToken=<token>`.
+///
+/// The ONE place that layout is written, so the URL an operation reports and
+/// the plane that serves it ([`crate::service::playback_session`]) address the
+/// same resources — and so a playlist can name a sibling resource by a path
+/// relative to its own.
+#[must_use]
+pub fn session_resource_path(protocol: SessionProtocol, resource: &str, token: &str) -> String {
+    format!(
+        "/{}/{SESSION_PATH_VERSION}/{resource}?{SESSION_TOKEN_FIELD}={token}",
+        protocol.url_prefix()
+    )
+}
+
 /// The URL a minted streaming session is reported in: the manifest or playlist
 /// resource of `protocol`, carrying `token`, on the endpoint the CALLER reached
 /// this emulator on.
@@ -511,8 +573,9 @@ pub const LOOPBACK_HOST: &str = "127.0.0.1";
 /// The host is read from the request itself — its `Host` header, else the
 /// authority of the URI it addressed, else [`LOOPBACK_HOST`] — exactly as the
 /// real service answers on its own data endpoint, and deliberately names no
-/// real AWS host: this emulator serves the playback session, so a player or
-/// test that follows the URL must come back here. The one rule both
+/// real AWS host: this emulator serves the playback session
+/// ([`crate::service::playback_session`]), so a player or test that follows the
+/// URL comes back here and is answered by that playlist. The one rule both
 /// streaming-session operations use, so they cannot drift on which endpoint a
 /// session URL names.
 #[must_use]
@@ -529,9 +592,8 @@ pub fn session_url(
         .or_else(|| ctx.parts().uri.host())
         .unwrap_or(LOOPBACK_HOST);
     format!(
-        "https://{host}/{}/v1/{}?SessionToken={token}",
-        protocol.url_prefix(),
-        protocol.manifest_resource()
+        "https://{host}{}",
+        session_resource_path(protocol, protocol.manifest_resource(), token)
     )
 }
 
@@ -573,6 +635,18 @@ impl SessionProtocol {
         }
     }
 
+    /// The protocol a playback path's FIRST segment names, or `None` when the
+    /// segment names neither playback plane.
+    ///
+    /// The inverse of [`Self::url_prefix`], written against it rather than
+    /// against a second copy of the two segments.
+    #[must_use]
+    pub fn of_url_prefix(prefix: &str) -> Option<Self> {
+        [Self::Hls, Self::Dash]
+            .into_iter()
+            .find(|protocol| protocol.url_prefix() == prefix)
+    }
+
     /// The resource a media player fetches first for this protocol: the HLS
     /// master playlist (`GetHLSMasterPlaylist`) or the MPEG-DASH manifest
     /// (`GetDASHManifest`), the "root resource needed for streaming" each
@@ -580,8 +654,8 @@ impl SessionProtocol {
     #[must_use]
     pub fn manifest_resource(self) -> &'static str {
         match self {
-            Self::Hls => "getHLSMasterPlaylist.m3u8",
-            Self::Dash => "getMPDManifest.mpd",
+            Self::Hls => HLS_MASTER_PLAYLIST_RESOURCE,
+            Self::Dash => DASH_MANIFEST_RESOURCE,
         }
     }
 }
@@ -597,6 +671,13 @@ pub struct StreamingSession {
     pub protocol: SessionProtocol,
     /// The session's `PlaybackMode`.
     pub playback_mode: String,
+    /// Which of a fragment's two timestamps the session's fragment selector
+    /// reads, which is also the timestamp a playlist or manifest REPORTS for a
+    /// fragment: "When HLSFragmentSelector is SERVER_TIMESTAMP, the timestamps
+    /// will be the server start timestamps. Similarly, when HLSFragmentSelector
+    /// is PRODUCER_TIMESTAMP, the timestamps will be the producer start
+    /// timestamps."
+    pub origin: TimestampOrigin,
     /// The session's `ContainerFormat`. An MPEG-DASH session carries no such
     /// parameter: its manifest serves the MP4 initialization and media
     /// fragments `GetMP4InitFragment`/`GetMP4MediaFragment` answer, so it is
@@ -625,6 +706,15 @@ impl StreamingSession {
     #[must_use]
     pub fn expires_at(&self) -> SystemTime {
         self.created_at + Duration::from_secs(u64::from(self.expires_in_secs))
+    }
+
+    /// Whether the session is still one its playback resources may be served
+    /// for at `now`: "When a session expires, no new calls to
+    /// GetHLSMasterPlaylist, GetHLSMediaPlaylist, GetMP4InitFragment,
+    /// GetMP4MediaFragment, or GetTSFragment can be made for that session."
+    #[must_use]
+    pub fn is_live_at(&self, now: SystemTime) -> bool {
+        self.expires_at() > now
     }
 }
 
@@ -987,7 +1077,7 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     /// records it through this one method, so the bound covers them all.
     pub fn record_session(&mut self, session: StreamingSession) {
         let now = session.created_at;
-        self.sessions.retain(|_, held| held.expires_at() > now);
+        self.sessions.retain(|_, held| held.is_live_at(now));
         while self.sessions.len() >= MAX_STREAMING_SESSIONS {
             let oldest = self
                 .sessions
@@ -1002,6 +1092,23 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             }
         }
         self.sessions.insert(session.token.clone(), session);
+    }
+
+    /// The session `token` names, while its `Expires` window is still open at
+    /// `now`.
+    ///
+    /// The one rule for which session a playback request may be served for: an
+    /// expired session is answered exactly as a token no session was ever
+    /// minted for, because "when a session expires, no new calls to
+    /// GetHLSMasterPlaylist ... can be made for that session". Nothing is
+    /// written here — the record stays until the next mint drops it
+    /// ([`Self::record_session`]), which is what keeps a playback read from
+    /// changing what a later caller sees.
+    #[must_use]
+    pub fn live_session(&self, token: &str, now: SystemTime) -> Option<&StreamingSession> {
+        self.sessions
+            .get(token)
+            .filter(|held| held.is_live_at(now))
     }
 }
 

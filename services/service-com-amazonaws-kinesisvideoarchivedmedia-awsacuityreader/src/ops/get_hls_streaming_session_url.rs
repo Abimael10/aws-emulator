@@ -24,7 +24,11 @@
 //!   carry a `TimestampRange`; a `TimestampRange` on a LIVE session is refused.
 //!   `EndTimestamp` is required for ON_DEMAND and optional for LIVE_REPLAY.
 //! * The session is RECORDED in state with the playlist snapshot it serves, so
-//!   two calls mint two distinct sessions. A session with no fragments to serve
+//!   two calls mint two distinct sessions, and the URL reported for it is served
+//!   by this emulator: the master playlist, the media playlist, the
+//!   initialization and the media fragments a player fetches from it are answered
+//!   by [`crate::service::playback_session`] from that record. A session with no
+//!   fragments to serve
 //!   — none in the requested range for ON_DEMAND / LIVE_REPLAY, none in the
 //!   last 30 seconds for LIVE — is `ResourceNotFoundException`, exactly as the
 //!   error's own documentation states.
@@ -503,6 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream_name,
             protocol: SessionProtocol::Hls,
             playback_mode,
+            origin,
             container_format,
             discontinuity_mode: Some(discontinuity_mode),
             display_fragment_timestamp,

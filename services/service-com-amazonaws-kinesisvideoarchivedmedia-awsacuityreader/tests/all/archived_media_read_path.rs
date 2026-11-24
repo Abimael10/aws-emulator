@@ -529,6 +529,27 @@ impl Harness {
             .expect("a valid request");
         self.router.dispatch(request).await
     }
+
+    /// Fetch `url` the way a MEDIA PLAYER does: an unsigned `GET` carrying no
+    /// credentials at all, which is how a player follows the streaming-session URL
+    /// a session call reported.
+    ///
+    /// The URL is sent as the service reported it, so what this exercises is the
+    /// address the emulator published rather than a path a suite composed.
+    pub(crate) async fn fetch(&self, url: &str) -> http::Response<Bytes> {
+        self.fetch_with("GET", url).await
+    }
+
+    /// [`Self::fetch`] with the method the case names, for the one rule that is
+    /// about which methods a playback address answers.
+    pub(crate) async fn fetch_with(&self, method: &str, url: &str) -> http::Response<Bytes> {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(url)
+            .body(Bytes::new())
+            .expect("a valid request");
+        self.router.dispatch(request).await
+    }
 }
 
 /// The JSON body of a response.
@@ -1682,6 +1703,7 @@ async fn minting_a_session_bounds_the_session_store() {
         stream_name: STREAM.to_string(),
         protocol: SessionProtocol::Hls,
         playback_mode: "ON_DEMAND".to_string(),
+        origin: archived_media::state::TimestampOrigin::Producer,
         container_format: "FRAGMENTED_MP4".to_string(),
         discontinuity_mode: Some("NEVER".to_string()),
         display_fragment_timestamp: "NEVER".to_string(),
@@ -2488,3 +2510,898 @@ async fn no_operation_of_this_service_answers_not_implemented() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The playback plane: what the streaming-session URL resolves to.
+// ---------------------------------------------------------------------------
+
+/// The media type an HLS playlist is served as.
+const HLS_PLAYLIST_TYPE: &str = "application/vnd.apple.mpegurl";
+/// The media type an MPEG-DASH manifest is served as.
+const DASH_MANIFEST_TYPE: &str = "application/dash+xml";
+/// The media type an MP4 initialization or media fragment is served as.
+const MP4_FRAGMENT_TYPE: &str = "video/mp4";
+/// The media type an MPEG TS fragment is served as.
+const TS_FRAGMENT_TYPE: &str = "video/MP2T";
+/// How many bytes one MPEG-2 transport packet is (ISO/IEC 13818-1).
+const TS_PACKET_BYTES: usize = 188;
+
+/// A session over the whole seeded archive of [`STREAM`], by producer timestamps.
+fn on_demand_body(extra: &serde_json::Value, selector_member: &str) -> serde_json::Value {
+    with_members(
+        &serde_json::json!({
+            "StreamName": STREAM,
+            "PlaybackMode": "ON_DEMAND",
+            selector_member: {
+                "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+                "TimestampRange": { "StartTimestamp": T0_SECS, "EndTimestamp": T0_SECS + 1000 },
+            },
+        }),
+        extra,
+    )
+}
+
+/// Mint a session through `path` and answer the URL it reported.
+async fn minted_session_url(
+    harness: &Harness,
+    case: &str,
+    path: &str,
+    member: &str,
+    body: &serde_json::Value,
+) -> String {
+    let response = harness.post(path, body).await;
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "case {case}: expected HTTP 200 from {path}, got {} with body {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    let url = body_json(&response)[member]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !url.is_empty(),
+        "case {case}: {path} must report a {member}, got {:?}",
+        String::from_utf8_lossy(response.body())
+    );
+    url
+}
+
+/// The body of a response as text.
+fn text_body(response: &http::Response<Bytes>) -> String {
+    String::from_utf8_lossy(response.body()).into_owned()
+}
+
+/// The `content-type` of a response.
+fn served_type(response: &http::Response<Bytes>) -> String {
+    content_type(response)
+}
+
+/// The URL of `relative`, resolved against the playback URL `base` the way a
+/// media player resolves a reference inside a playlist or a manifest.
+fn sibling_url(base: &str, relative: &str) -> String {
+    let (prefix, _) = base
+        .rsplit_once('/')
+        .unwrap_or_else(|| panic!("the playback URL {base:?} carries a path"));
+    format!("{prefix}/{relative}")
+}
+
+/// Every resource a playlist or a manifest REFERENCES: the segment lines and
+/// `EXT-X-MAP` of an HLS playlist, the `sourceURL` and `media` attributes of an
+/// MPEG-DASH manifest, each with its XML entities resolved.
+fn referenced_resources(document: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in document.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
+            if let Some(uri) = rest.split('"').next() {
+                found.push(uri.to_string());
+            }
+            continue;
+        }
+        if line.starts_with('#') || line.starts_with('<') {
+            for attribute in ["sourceURL=\"", "media=\""] {
+                if let Some((_, rest)) = line.split_once(attribute) {
+                    if let Some(uri) = rest.split('"').next() {
+                        found.push(uri.replace("&amp;", "&"));
+                    }
+                }
+            }
+            continue;
+        }
+        found.push(line.to_string());
+    }
+    found
+}
+
+/// The instant the `index`-th seeded fragment's PRODUCER timestamp names, in the
+/// form a playlist's wall-clock tag and a manifest's timestamp attribute carry.
+fn reported_producer_instant(index: u64) -> String {
+    archived_media::state::to_date_time(from_epoch_millis(producer_secs(index) * 1000))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("the instant renders")
+}
+
+/// One row of the playback walk: a session to mint, and the root resource its URL
+/// must resolve to.
+struct WalkRow {
+    case: &'static str,
+    path: &'static str,
+    member: &'static str,
+    body: serde_json::Value,
+    root_type: &'static str,
+    /// The media type every LEAF the session's documents name is served as.
+    leaf_type: &'static str,
+}
+
+/// RULE: a URL an operation reports for the caller to FETCH is served by this
+/// emulator at the address it reported, and so is every resource the document at
+/// that address names — down to the media bytes.
+///
+/// The rows differ along what the rule generalises over: the playback protocol
+/// (HLS, MPEG-DASH), the container the media is packaged in (`FRAGMENTED_MP4`,
+/// `MPEG_TS`), the playback mode (`ON_DEMAND`, `LIVE`) and the stream whose
+/// archive is played.
+#[tokio::test]
+async fn a_streaming_session_url_is_served_down_to_its_media() {
+    let rows: Vec<WalkRow> = vec![
+        WalkRow {
+            case: "an HLS session of MP4 fragments",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: on_demand_body(&serde_json::json!({}), "HLSFragmentSelector"),
+            root_type: HLS_PLAYLIST_TYPE,
+            leaf_type: MP4_FRAGMENT_TYPE,
+        },
+        WalkRow {
+            case: "an HLS session of MPEG TS fragments",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: on_demand_body(
+                &serde_json::json!({ "ContainerFormat": "MPEG_TS" }),
+                "HLSFragmentSelector",
+            ),
+            root_type: HLS_PLAYLIST_TYPE,
+            leaf_type: TS_FRAGMENT_TYPE,
+        },
+        WalkRow {
+            case: "a LIVE HLS session over the stream ingested just now",
+            path: "/getHLSStreamingSessionURL",
+            member: "HLSStreamingSessionURL",
+            body: serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+            root_type: HLS_PLAYLIST_TYPE,
+            leaf_type: MP4_FRAGMENT_TYPE,
+        },
+        WalkRow {
+            case: "an MPEG-DASH session",
+            path: "/getDASHStreamingSessionURL",
+            member: "DASHStreamingSessionURL",
+            body: on_demand_body(&serde_json::json!({}), "DASHFragmentSelector"),
+            root_type: DASH_MANIFEST_TYPE,
+            leaf_type: MP4_FRAGMENT_TYPE,
+        },
+    ];
+
+    let harness = seeded();
+    for row in rows {
+        let case = row.case;
+        let url =
+            minted_session_url(&harness, case, row.path, row.member, &row.body).await;
+        assert!(
+            url.starts_with(&format!("https://{EMULATOR_ENDPOINT}/")),
+            "case {case}: the session URL must address this emulator, got {url:?}"
+        );
+
+        let root = harness.fetch(&url).await;
+        assert_eq!(
+            root.status().as_u16(),
+            200,
+            "case {case}: the reported URL {url:?} must be served, got {} {:?}",
+            root.status(),
+            text_body(&root)
+        );
+        let actual_type = served_type(&root);
+        assert_eq!(
+            actual_type, row.root_type,
+            "case {case}: expected the root resource as {:?}, got {actual_type:?}",
+            row.root_type
+        );
+
+        let root_document = text_body(&root);
+        let children = referenced_resources(&root_document);
+        assert!(
+            !children.is_empty(),
+            "case {case}: the root resource must name the resources below it, got \
+             {root_document:?}"
+        );
+        // A document that names resources is walked one level further, so the walk
+        // reaches the MEDIA of the session rather than stopping at a playlist that
+        // names it.
+        let mut leaves = 0usize;
+        for child in children {
+            let child_url = sibling_url(&url, &child);
+            let response = harness.fetch(&child_url).await;
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "case {case}: the resource {child:?} the session names must be served, got {} {:?}",
+                response.status(),
+                text_body(&response)
+            );
+            assert!(
+                !response.body().is_empty(),
+                "case {case}: the resource {child:?} must carry a body"
+            );
+            let child_type = served_type(&response);
+            if child_type == HLS_PLAYLIST_TYPE || child_type == DASH_MANIFEST_TYPE {
+                let document = text_body(&response);
+                let grandchildren = referenced_resources(&document);
+                assert!(
+                    !grandchildren.is_empty(),
+                    "case {case}: the playlist {child:?} must name its media, got {document:?}"
+                );
+                for grandchild in grandchildren {
+                    let leaf_url = sibling_url(&url, &grandchild);
+                    let leaf = harness.fetch(&leaf_url).await;
+                    assert_eq!(
+                        leaf.status().as_u16(),
+                        200,
+                        "case {case}: the media {grandchild:?} must be served, got {} {:?}",
+                        leaf.status(),
+                        text_body(&leaf)
+                    );
+                    assert!(
+                        !leaf.body().is_empty(),
+                        "case {case}: the media {grandchild:?} must carry bytes"
+                    );
+                    let leaf_type = served_type(&leaf);
+                    let expected = match grandchild.contains("InitFragment") {
+                        true => MP4_FRAGMENT_TYPE,
+                        false => row.leaf_type,
+                    };
+                    assert_eq!(
+                        leaf_type, expected,
+                        "case {case}: expected {grandchild:?} as {expected:?}, got {leaf_type:?}"
+                    );
+                    leaves += 1;
+                }
+            } else {
+                leaves += 1;
+            }
+        }
+        assert!(
+            leaves > 0,
+            "case {case}: the walk must reach the session's media"
+        );
+    }
+}
+
+/// One row of the HLS playlist table: a session parameter, and what the media
+/// playlist it is minted with must state.
+struct PlaylistRow {
+    case: &'static str,
+    /// The members added to the minting request.
+    extra: serde_json::Value,
+    /// The stream and mode the session plays, when they are not the seeded
+    /// on-demand pair.
+    live: bool,
+    /// How many discontinuity markers the playlist carries.
+    discontinuities: usize,
+    /// How many wall-clock tags it carries.
+    timestamps: usize,
+    /// The resource its segments are fetched at.
+    segment: &'static str,
+    /// Whether it names an initialization fragment of its own.
+    init: bool,
+    /// How many segments it lists.
+    segments: usize,
+}
+
+/// RULE: the media playlist of a session states the parameters that session was
+/// minted with — the container its segments are packaged in, where
+/// discontinuities are marked, whether fragment start timestamps are shown, and
+/// how many fragments the playlist carries.
+///
+/// The rows differ along what the rule generalises over: each of the three
+/// `DiscontinuityMode` values, both `DisplayFragmentTimestamp` values, both
+/// `ContainerFormat` values, a capped and an uncapped playlist, and an archive
+/// whose fragments are contiguous beside one whose fragments have gaps — which is
+/// what separates `ON_DISCONTINUITY` from `ALWAYS`.
+#[tokio::test]
+async fn an_hls_session_playlist_states_the_parameters_it_was_minted_with() {
+    // The seeded on-demand archive holds 5 fragments 10 seconds apart, each 2
+    // seconds long: every boundary is a gap of 8 seconds. The live archive holds 7
+    // fragments one second apart, each one second long: its boundaries are
+    // contiguous, and a LIVE session serves the newest 5 of them.
+    let rows: Vec<PlaylistRow> = vec![
+        PlaylistRow {
+            case: "the defaults over producer timestamps",
+            extra: serde_json::json!({}),
+            live: false,
+            discontinuities: 0,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "discontinuity markers between every fragment",
+            extra: serde_json::json!({ "DiscontinuityMode": "ALWAYS" }),
+            live: false,
+            discontinuities: 4,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "markers only where the timeline breaks, over an archive with gaps",
+            extra: serde_json::json!({ "DiscontinuityMode": "ON_DISCONTINUITY" }),
+            live: false,
+            discontinuities: 4,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "markers only where the timeline breaks, over a contiguous archive",
+            extra: serde_json::json!({ "DiscontinuityMode": "ON_DISCONTINUITY" }),
+            live: true,
+            discontinuities: 0,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "markers between every fragment of a contiguous archive",
+            extra: serde_json::json!({ "DiscontinuityMode": "ALWAYS" }),
+            live: true,
+            discontinuities: 4,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "fragment start timestamps shown",
+            extra: serde_json::json!({ "DisplayFragmentTimestamp": "ALWAYS" }),
+            live: false,
+            discontinuities: 0,
+            timestamps: 5,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "fragment start timestamps not shown",
+            extra: serde_json::json!({ "DisplayFragmentTimestamp": "NEVER" }),
+            live: false,
+            discontinuities: 0,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "media packaged as MPEG TS",
+            extra: serde_json::json!({ "ContainerFormat": "MPEG_TS" }),
+            live: false,
+            discontinuities: 0,
+            timestamps: 0,
+            segment: "getTSFragment.ts",
+            init: false,
+            segments: 5,
+        },
+        PlaylistRow {
+            case: "a playlist capped at two fragments",
+            extra: serde_json::json!({ "MaxMediaPlaylistFragmentResults": 2 }),
+            live: false,
+            discontinuities: 0,
+            timestamps: 0,
+            segment: "getMP4MediaFragment.mp4",
+            init: true,
+            segments: 2,
+        },
+    ];
+
+    let harness = seeded();
+    for row in rows {
+        let case = row.case;
+        let body = match row.live {
+            true => with_members(
+                &serde_json::json!({ "StreamName": LIVE_STREAM, "PlaybackMode": "LIVE" }),
+                &row.extra,
+            ),
+            false => on_demand_body(&row.extra, "HLSFragmentSelector"),
+        };
+        let url = minted_session_url(
+            &harness,
+            case,
+            "/getHLSStreamingSessionURL",
+            "HLSStreamingSessionURL",
+            &body,
+        )
+        .await;
+
+        let master = harness.fetch(&url).await;
+        let master_document = text_body(&master);
+        let variant = referenced_resources(&master_document)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                panic!("case {case}: the master playlist must name a media playlist")
+            });
+        let media = harness.fetch(&sibling_url(&url, &variant)).await;
+        assert_eq!(
+            media.status().as_u16(),
+            200,
+            "case {case}: the media playlist must be served, got {}",
+            media.status()
+        );
+        let playlist = text_body(&media);
+
+        let discontinuities = playlist
+            .lines()
+            .filter(|line| line.trim() == "#EXT-X-DISCONTINUITY")
+            .count();
+        assert_eq!(
+            discontinuities, row.discontinuities,
+            "case {case}: expected {} discontinuity markers, got {discontinuities} in \
+             {playlist:?}",
+            row.discontinuities
+        );
+
+        let timestamps = playlist
+            .lines()
+            .filter(|line| line.trim().starts_with("#EXT-X-PROGRAM-DATE-TIME:"))
+            .count();
+        assert_eq!(
+            timestamps, row.timestamps,
+            "case {case}: expected {} wall-clock tags, got {timestamps} in {playlist:?}",
+            row.timestamps
+        );
+
+        let segments: Vec<String> = playlist
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            segments.len(),
+            row.segments,
+            "case {case}: expected {} segments, got {segments:?}",
+            row.segments
+        );
+        for segment in &segments {
+            assert!(
+                segment.starts_with(row.segment),
+                "case {case}: expected segments at {:?}, got {segment:?}",
+                row.segment
+            );
+        }
+        let names_init = playlist.contains("#EXT-X-MAP:URI=");
+        assert_eq!(
+            names_init, row.init,
+            "case {case}: expected an initialization fragment named: {}, got {playlist:?}",
+            row.init
+        );
+    }
+}
+
+/// RULE (the other half of the wall-clock tag): the timestamp a playlist reports
+/// for a fragment is the one the session's own fragment selector reads — "when
+/// HLSFragmentSelector is PRODUCER_TIMESTAMP, the timestamps will be the producer
+/// start timestamps" — and it is the archive's value for that fragment, not the
+/// instant the playlist was fetched.
+#[tokio::test]
+async fn a_shown_fragment_timestamp_is_the_archives_own() {
+    let harness = seeded();
+    let url = minted_session_url(
+        &harness,
+        "producer timestamps shown",
+        "/getHLSStreamingSessionURL",
+        "HLSStreamingSessionURL",
+        &on_demand_body(
+            &serde_json::json!({ "DisplayFragmentTimestamp": "ALWAYS" }),
+            "HLSFragmentSelector",
+        ),
+    )
+    .await;
+    let master = harness.fetch(&url).await;
+    let variant = referenced_resources(&text_body(&master))
+        .into_iter()
+        .next()
+        .expect("the master playlist names a media playlist");
+    let playlist = text_body(&harness.fetch(&sibling_url(&url, &variant)).await);
+
+    let shown: Vec<String> = playlist
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-PROGRAM-DATE-TIME:"))
+        .map(str::to_string)
+        .collect();
+    let expected: Vec<String> = (0..SEEDED_FRAGMENTS).map(reported_producer_instant).collect();
+    assert_eq!(
+        shown, expected,
+        "case the seeded archive: expected the producer timestamps {expected:?}, got {shown:?}"
+    );
+}
+
+/// One row of the MPEG-DASH manifest table.
+struct ManifestRow {
+    case: &'static str,
+    extra: serde_json::Value,
+    /// Whether every `S` element carries the fragment's own number.
+    fragment_numbers: bool,
+    /// Whether every `S` element carries its accurate timestamp.
+    timestamps: bool,
+    /// The presentation the manifest declares.
+    presentation: &'static str,
+}
+
+/// RULE: the MPEG-DASH manifest of a session states the parameters that session
+/// was minted with — "if DisplayFragmentNumber is set to ALWAYS, the Kinesis Video
+/// Streams fragment number is added to each S element in the manifest file with
+/// the attribute name kvs:fn", and the same for the accurate timestamp under
+/// `kvs:ts`.
+///
+/// The rows differ along what the rule generalises over: both values of each of
+/// the two members, their combination, and a complete presentation beside one a
+/// player re-reads.
+#[tokio::test]
+async fn a_dash_session_manifest_states_the_parameters_it_was_minted_with() {
+    let rows: Vec<ManifestRow> = vec![
+        ManifestRow {
+            case: "the defaults",
+            extra: serde_json::json!({}),
+            fragment_numbers: false,
+            timestamps: false,
+            presentation: "static",
+        },
+        ManifestRow {
+            case: "fragment numbers on every S element",
+            extra: serde_json::json!({ "DisplayFragmentNumber": "ALWAYS" }),
+            fragment_numbers: true,
+            timestamps: false,
+            presentation: "static",
+        },
+        ManifestRow {
+            case: "accurate timestamps on every S element",
+            extra: serde_json::json!({ "DisplayFragmentTimestamp": "ALWAYS" }),
+            fragment_numbers: false,
+            timestamps: true,
+            presentation: "static",
+        },
+        ManifestRow {
+            case: "both on every S element",
+            extra: serde_json::json!({
+                "DisplayFragmentNumber": "ALWAYS",
+                "DisplayFragmentTimestamp": "ALWAYS",
+            }),
+            fragment_numbers: true,
+            timestamps: true,
+            presentation: "static",
+        },
+    ];
+
+    let harness = seeded();
+    for row in rows {
+        let case = row.case;
+        let url = minted_session_url(
+            &harness,
+            case,
+            "/getDASHStreamingSessionURL",
+            "DASHStreamingSessionURL",
+            &on_demand_body(&row.extra, "DASHFragmentSelector"),
+        )
+        .await;
+        let manifest = text_body(&harness.fetch(&url).await);
+
+        let elements: Vec<&str> = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("<S "))
+            .collect();
+        assert_eq!(
+            elements.len(),
+            SEEDED_FRAGMENTS as usize,
+            "case {case}: expected one S element per fragment, got {elements:?}"
+        );
+        for (index, element) in elements.iter().enumerate() {
+            let number = fragment_number(index as u64);
+            let carries_number = element.contains(&format!("kvs:fn=\"{number}\""));
+            assert_eq!(
+                carries_number, row.fragment_numbers,
+                "case {case}: expected kvs:fn on {element:?}: {}",
+                row.fragment_numbers
+            );
+            let carries_timestamp =
+                element.contains(&format!("kvs:ts=\"{}\"", reported_producer_instant(index as u64)));
+            assert_eq!(
+                carries_timestamp, row.timestamps,
+                "case {case}: expected kvs:ts on {element:?}: {}",
+                row.timestamps
+            );
+        }
+        assert!(
+            manifest.contains(&format!("type=\"{}\"", row.presentation)),
+            "case {case}: expected a {:?} presentation, got {manifest:?}",
+            row.presentation
+        );
+    }
+}
+
+/// RULE: a session's media fragment carries the frames the archive holds for that
+/// fragment and nothing else, in the container the session's `ContainerFormat`
+/// asks for; its initialization carries the track's own declaration and no media.
+#[tokio::test]
+async fn a_session_media_fragment_carries_the_frames_the_archive_holds() {
+    let coded = coded_video();
+    let harness = seeded();
+
+    // The MP4 pair: the initialization declares the archived track and carries no
+    // sample; each media fragment carries exactly that fragment's access units.
+    let url = minted_session_url(
+        &harness,
+        "MP4 fragments",
+        "/getHLSStreamingSessionURL",
+        "HLSStreamingSessionURL",
+        &on_demand_body(&serde_json::json!({}), "HLSFragmentSelector"),
+    )
+    .await;
+    let variant = referenced_resources(&text_body(&harness.fetch(&url).await))
+        .into_iter()
+        .next()
+        .expect("the master playlist names a media playlist");
+    let playlist = text_body(&harness.fetch(&sibling_url(&url, &variant)).await);
+
+    let init_uri = playlist
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("#EXT-X-MAP:URI=\""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("the media playlist names an initialization fragment")
+        .to_string();
+    let init = harness.fetch(&sibling_url(&url, &init_uri)).await;
+    let init_bytes = init.body().to_vec();
+    assert_is_mp4("the initialization fragment", &init_bytes);
+    let declared = clip_track("the initialization fragment", &init_bytes);
+    assert!(
+        declared.samples.is_empty(),
+        "case the initialization fragment: it carries only the codec private data, got {} \
+         samples",
+        declared.samples.len()
+    );
+    assert_eq!(
+        (declared.width, declared.height),
+        (
+            u16::try_from(CODED_WIDTH).expect("a short side"),
+            u16::try_from(CODED_HEIGHT).expect("a short side")
+        ),
+        "case the initialization fragment: it declares the archived track's geometry"
+    );
+    assert_eq!(
+        (declared.seq_param_set, declared.pic_param_set),
+        (coded.seq_param_set.clone(), coded.pic_param_set.clone()),
+        "case the initialization fragment: it carries the archived track's parameter sets"
+    );
+
+    let segments: Vec<String> = playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let case = format!("the MP4 media fragment of seeded fragment {index}");
+        assert!(
+            segment.contains(&format!("FragmentNumber={}", fragment_number(index as u64))),
+            "case {case}: the segment must address that fragment, got {segment:?}"
+        );
+        let served = harness.fetch(&sibling_url(&url, segment)).await;
+        let bytes = served.body().to_vec();
+        assert_is_mp4(&case, &bytes);
+        let track = clip_track(&case, &bytes);
+        assert_eq!(
+            track.samples,
+            media_units(index as u64),
+            "case {case}: expected the archived fragment's access units"
+        );
+    }
+
+    // The MPEG TS fragment: whole transport packets of the same frames.
+    let ts_url = minted_session_url(
+        &harness,
+        "MPEG TS fragments",
+        "/getHLSStreamingSessionURL",
+        "HLSStreamingSessionURL",
+        &on_demand_body(
+            &serde_json::json!({ "ContainerFormat": "MPEG_TS" }),
+            "HLSFragmentSelector",
+        ),
+    )
+    .await;
+    let ts_variant = referenced_resources(&text_body(&harness.fetch(&ts_url).await))
+        .into_iter()
+        .next()
+        .expect("the master playlist names a media playlist");
+    let ts_playlist = text_body(&harness.fetch(&sibling_url(&ts_url, &ts_variant)).await);
+    let ts_segments: Vec<String> = ts_playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        ts_segments.len(),
+        SEEDED_FRAGMENTS as usize,
+        "case the MPEG TS playlist: expected one segment per fragment, got {ts_segments:?}"
+    );
+    for (index, segment) in ts_segments.iter().enumerate() {
+        let case = format!("the MPEG TS fragment of seeded fragment {index}");
+        let served = harness.fetch(&sibling_url(&ts_url, segment)).await;
+        let bytes = served.body().to_vec();
+        assert_eq!(
+            served_type(&served),
+            TS_FRAGMENT_TYPE,
+            "case {case}: an MPEG TS fragment is served as one"
+        );
+        assert!(
+            !bytes.is_empty() && bytes.len() % TS_PACKET_BYTES == 0,
+            "case {case}: a transport stream is whole 188-byte packets, got {} bytes",
+            bytes.len()
+        );
+        assert!(
+            bytes
+                .chunks(TS_PACKET_BYTES)
+                .all(|packet| packet.first() == Some(&0x47)),
+            "case {case}: every transport packet starts with the sync byte"
+        );
+    }
+}
+
+/// One row of the refusal table: a playback address, and why nothing is served at
+/// it.
+struct PlaybackRefusalRow {
+    case: &'static str,
+    method: &'static str,
+    /// The path and query, with `{token}` standing for the live session's token.
+    target: &'static str,
+    status: u16,
+}
+
+/// RULE: a playback address serves the session its token names, while that
+/// session's own `Expires` window is open, and nothing otherwise — "when a session
+/// expires, no new calls to GetHLSMasterPlaylist, GetHLSMediaPlaylist,
+/// GetMP4InitFragment, GetMP4MediaFragment, or GetTSFragment can be made for that
+/// session".
+///
+/// The rows differ along what the rule generalises over: a token no session
+/// answers to, a token whose session has expired, a token for the other playback
+/// protocol, no token at all, a resource of the other protocol's plane, a track
+/// and a fragment the session does not serve, and a method a player does not read
+/// with.
+#[tokio::test]
+async fn a_playback_address_serves_nothing_it_cannot_resolve() {
+    let rows: &[PlaybackRefusalRow] = &[
+        PlaybackRefusalRow {
+            case: "a token no session answers to",
+            method: "GET",
+            target: "/hls/v1/getHLSMasterPlaylist.m3u8?SessionToken=00000000",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "a session whose Expires window has closed",
+            method: "GET",
+            target: "/hls/v1/getHLSMasterPlaylist.m3u8?SessionToken=expired",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "no token at all",
+            method: "GET",
+            target: "/hls/v1/getHLSMasterPlaylist.m3u8",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "an HLS token on the MPEG-DASH manifest",
+            method: "GET",
+            target: "/dash/v1/getMPDManifest.mpd?SessionToken={token}",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "the MPEG TS fragment of a session packaged as MP4",
+            method: "GET",
+            target: "/hls/v1/getTSFragment.ts?SessionToken={token}&FragmentNumber=9134385233318143200",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "a track the session does not serve",
+            method: "GET",
+            target: "/hls/v1/getHLSMediaPlaylist.m3u8?SessionToken={token}&TrackNumber=9",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "a fragment number the session does not serve",
+            method: "GET",
+            target: "/hls/v1/getMP4MediaFragment.mp4?SessionToken={token}&FragmentNumber=1",
+            status: 404,
+        },
+        PlaybackRefusalRow {
+            case: "a method a media player does not read with",
+            method: "POST",
+            target: "/hls/v1/getHLSMasterPlaylist.m3u8?SessionToken={token}",
+            status: 405,
+        },
+    ];
+
+    let harness = seeded();
+    // A live session, whose token the rows address, and one whose window the clock
+    // has already closed.
+    let url = minted_session_url(
+        &harness,
+        "the live session",
+        "/getHLSStreamingSessionURL",
+        "HLSStreamingSessionURL",
+        &on_demand_body(&serde_json::json!({}), "HLSFragmentSelector"),
+    )
+    .await;
+    let token = url
+        .rsplit_once("SessionToken=")
+        .map(|(_, token)| token.to_string())
+        .expect("the session URL carries a token");
+    {
+        use archived_media::state::{SessionProtocol, StreamingSession, TimestampOrigin};
+
+        let state = service_state(&*harness.engine).expect("the service store");
+        let mut state = state.lock();
+        let created_at = SystemTime::now() - Duration::from_secs(3600);
+        state.record_session(StreamingSession {
+            token: "expired".to_string(),
+            stream_name: STREAM.to_string(),
+            protocol: SessionProtocol::Hls,
+            playback_mode: "ON_DEMAND".to_string(),
+            origin: TimestampOrigin::Producer,
+            container_format: "FRAGMENTED_MP4".to_string(),
+            discontinuity_mode: Some("NEVER".to_string()),
+            display_fragment_timestamp: "NEVER".to_string(),
+            display_fragment_number: None,
+            fragment_numbers: vec![fragment_number(0)],
+            created_at,
+            expires_in_secs: 300,
+        });
+    }
+
+    for row in rows {
+        let target = row.target.replace("{token}", &token);
+        let response = harness
+            .fetch_with(row.method, &format!("https://{EMULATOR_ENDPOINT}{target}"))
+            .await;
+        assert_eq!(
+            response.status().as_u16(),
+            row.status,
+            "case {}: expected HTTP {} for {} {target}, got {} {:?}",
+            row.case,
+            row.status,
+            row.method,
+            response.status(),
+            text_body(&response)
+        );
+    }
+
+    // And the live session is served, so the rows above fail for the reason each
+    // names rather than because nothing is served at all.
+    let served = harness.fetch(&url).await;
+    assert_eq!(
+        served.status().as_u16(),
+        200,
+        "case the live session: its master playlist must be served, got {}",
+        served.status()
+    );
+}
+
