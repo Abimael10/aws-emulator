@@ -176,7 +176,14 @@ fn startup_line(row: &Row) -> String {
 
 /// One emulator carrying the five services this suite exercises over ONE shared engine, exactly
 /// as the production router builds them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` — with the helpers marked so below it — because this suite OWNS the fixture for
+/// "an ALB-fronted `awsvpc` Amazon ECS service whose container logs through the `awslogs`
+/// driver": the five services, the task execution role the driver is initialised as, and the
+/// reading of what a stream carries. A sibling suite measuring another rule of that same topology
+/// calls these rather than keeping a second copy of them, exactly as this suite calls the ALB
+/// fixture's own helpers.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -240,7 +247,9 @@ async fn iam(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 
 /// Create the task execution role in IAM itself, grant it AWS's own managed policy for the
 /// purpose, and answer the ARN IAM minted for it.
-async fn execution_role(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] gives.
+pub(crate) async fn execution_role(router: &MultiServiceRouter) -> String {
     let (status, created) = iam(
         router,
         "CreateRole",
@@ -289,7 +298,14 @@ async fn logs(router: &MultiServiceRouter, operation: &str, request: &Value) -> 
 }
 
 /// Call one CloudWatch Logs operation that must succeed, and answer its payload.
-async fn logs_ok(router: &MultiServiceRouter, case: &str, operation: &str, request: &Value) -> Value {
+///
+/// `pub(crate)` for the reason [`emulator`] gives.
+pub(crate) async fn logs_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: &Value,
+) -> Value {
     let (status, payload) = logs(router, operation, request).await;
     assert_eq!(
         status, OK,
@@ -350,7 +366,11 @@ async fn register_logging_revision(
 }
 
 /// The last segment of an ARN, which is the id of the thing it names.
-fn id_of(arn: &str) -> &str {
+///
+/// `pub(crate)` for the reason [`emulator`] gives: a stream the driver names after a task is
+/// named after that task's id, so a sibling suite reading such a stream reads the id through
+/// this one rule.
+pub(crate) fn id_of(arn: &str) -> &str {
     arn.rsplit('/').next().unwrap_or(arn)
 }
 
@@ -480,7 +500,9 @@ async fn stream_messages(router: &MultiServiceRouter, group: &str, stream: &str)
 ///
 /// Polls the CONDITION — the driver's initialisation and the delivery of a line the container
 /// wrote are both clock-owed — rather than waiting a fixed time.
-async fn delivered_lines(
+///
+/// `pub(crate)` for the reason [`emulator`] gives.
+pub(crate) async fn delivered_lines(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
