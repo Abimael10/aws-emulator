@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectInstanceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectInstanceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the Campaigns configuration of one Amazon Connect instance, which is the
+//! onboarding record this service holds for it — the record `GetConnectInstanceConfig`
+//! projects the modelled `InstanceConfig` from — so an instance whose configuration is
+//! deleted reports none afterwards and can be onboarded again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectInstanceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two refusals, both decided by the store
+//! (`crate::state::ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::delete_connect_instance_config`)
+//! and neither writing anything:
+//!
+//! * an instance that still owns at least one campaign — in ANY run state — keeps its
+//!   configuration: the modelled `InvalidStateException` (HTTP 409) carrying
+//!   `crate::state::INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE`, because the configuration is
+//!   what those campaigns run on;
+//! * an instance that has no configuration at all — nothing onboarded it, or its
+//!   onboarding job has not finished — has none to delete: the modelled
+//!   `ResourceNotFoundException` (HTTP 404) carrying the sentence every operation whose
+//!   own resource IS that configuration answers
+//!   (`crate::state::instance_config_absent_message`).
+//!
+//! The accepted delete answers the modelled `Unit` output — no body — and leaves an audit
+//! record naming the instance, as its sibling instance mutators do.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +181,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectInstanceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectInstanceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectInstanceConfig"))
+        // Every exit of this call leaves an audit record naming the instance and how the
+        // call ended — each refusal as well as the accepted delete, the same record the
+        // other instance mutators leave.
+        let audit = |outcome: &str| {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                outcome,
+            );
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            audit("InternalServerException");
+            return Err(
+                DeleteConnectInstanceConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the instance onboarding store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Whether the instance has a configuration is read at this instant, the same way
+        // every other reader of one reads it, so the clock alone decides nothing
+        // differently here; the store applies the rule and this handler only words it.
+        let now = ::std::time::SystemTime::now();
+        let outcome = state
+            .lock()
+            .delete_connect_instance_config(&input.connect_instance_id, now);
+
+        match outcome {
+            crate::state::DeleteInstanceConfigOutcome::Deleted => {
+                audit("accepted");
+                Ok(DeleteConnectInstanceConfigOutput)
+            }
+            crate::state::DeleteInstanceConfigOutcome::NoSuchConfig => {
+                audit("ResourceNotFoundException");
+                Err(
+                    DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::instance_config_absent_message(
+                                &input.connect_instance_id,
+                            ),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+            // The instance still owns campaigns, so its configuration stays: the refusal
+            // is the state conflict the model declares for exactly this, and nothing of
+            // the record was written — only the audit record of the attempt and how it
+            // ended.
+            crate::state::DeleteInstanceConfigOutcome::StillHasCampaigns => {
+                audit("InvalidStateException");
+                Err(
+                    DeleteConnectInstanceConfigErrorModeled::InvalidStateException(
+                        InvalidStateException {
+                            message: crate::state::INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE
+                                .to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
     }
 }

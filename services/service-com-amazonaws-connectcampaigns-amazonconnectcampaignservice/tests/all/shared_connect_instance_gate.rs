@@ -12,11 +12,13 @@
 //!
 //! What each operation DOES with that answer stays its own: `CreateCampaign` answers the
 //! absent instance with the modelled `ValidationException` (HTTP 400) and the fixed
-//! sentence of that class, while `StartInstanceOnboardingJob` — whose own resource is the
-//! instance's onboarding record — answers the SAME outcome with the modelled
-//! `ResourceNotFoundException` (HTTP 404) naming the instance the request asked about. One
-//! read, two refusals, so the pair cannot disagree about whether the account holds an
-//! instance while still answering in the words recorded for each operation.
+//! sentence of that class, `ListCampaigns` — asked to list the campaigns OF that instance
+//! — answers the same outcome with that error and its own fixed sentence, while
+//! `StartInstanceOnboardingJob` — whose own resource is the instance's onboarding record —
+//! answers the SAME outcome with the modelled `ResourceNotFoundException` (HTTP 404)
+//! naming the instance the request asked about. One read, three refusals, so they cannot
+//! disagree about whether the account holds an instance while still answering in the words
+//! recorded for each operation.
 //!
 //! Asserted over a TABLE whose rows differ along what the gate generalises over — the form
 //! of the `InstanceId` (len 0..256, pattern `^[a-zA-Z0-9_\-.]*$`, from
@@ -38,6 +40,11 @@ const NOT_USABLE_WORDING: &str =
 /// onboarding record, answers the same registry outcome with: fixed text around the id the
 /// request carried, where `{id}` goes. Written out for the same reason.
 const ONBOARDING_NOT_FOUND_WORDING: &str = "ConnectInstanceId not found {id}.";
+
+/// The sentence `ListCampaigns` answers the same registry outcome with when the listing is
+/// filtered by that instance. Written out for the same reason; it carries nothing from the
+/// request, so there is no place to fill.
+const NOT_ONBOARDED_WORDING: &str = "Instance is not onboarded";
 
 /// One row of the table: the instance id the account is given and the region the request
 /// that follows is signed for.
@@ -122,6 +129,18 @@ async fn start_onboarding(harness: &Harness, case: &Case) -> Answer {
         "PUT",
         &format!("/connect-instance/{}/onboarding", case.instance),
         &json!({"encryptionConfig": {"enabled": false}}),
+    )
+    .await
+}
+
+/// `ListCampaigns` filtered by this case's instance: `POST /campaigns-summary`.
+async fn list_filtered_by_instance(harness: &Harness, case: &Case) -> Answer {
+    call(
+        harness,
+        case.region,
+        "POST",
+        "/campaigns-summary",
+        &json!({"filters": {"instanceIdFilter": {"value": case.instance, "operator": "Eq"}}}),
     )
     .await
 }
@@ -274,6 +293,107 @@ async fn the_same_read_gates_instance_onboarding_in_this_service_s_own_words() {
             "case {:?}: the started job reports a status, got {}",
             case.name,
             started.body
+        );
+    }
+}
+
+/// The SAME read gates a LISTING filtered by an instance: an id the account's registry
+/// does not hold is refused in this operation's own words instead of being answered with
+/// an empty page, and nothing about the request changes to have it served once the account
+/// holds the instance.
+///
+/// An empty page and a refusal are the two answers a client cannot tell apart otherwise:
+/// a listing is a question about the instance it is filtered by, so an instance that can
+/// hold no campaign is refused rather than reported as holding none.
+#[tokio::test]
+async fn the_same_read_gates_the_campaign_listing_in_this_service_s_own_words() {
+    for case in cases() {
+        for ever_held in [false, true] {
+            let harness = router();
+            if ever_held {
+                harness.register_connect_instance(case.registered_in, &case.instance);
+                assert!(
+                    harness.deregister_connect_instance(&case.instance),
+                    "case {:?}: expected the registered instance to be removable",
+                    case.name
+                );
+            }
+
+            let refused = list_filtered_by_instance(&harness, &case).await;
+            assert_eq!(
+                refused.status, 400,
+                "case {:?} (ever held: {ever_held}): expected HTTP 400 for a listing \
+                 filtered by an instance the account does not hold, got {} {}",
+                case.name, refused.status, refused.body
+            );
+            assert!(
+                refused.error_code.ends_with("ValidationException"),
+                "case {:?} (ever held: {ever_held}): expected ValidationException, got {:?}",
+                case.name,
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message(),
+                NOT_ONBOARDED_WORDING,
+                "case {:?} (ever held: {ever_held}): expected this operation's own fixed \
+                 sentence, got {}",
+                case.name,
+                refused.body
+            );
+            assert!(
+                refused.body.get("campaignSummaryList").is_none(),
+                "case {:?} (ever held: {ever_held}): a refused listing reports no page, \
+                 got {}",
+                case.name,
+                refused.body
+            );
+        }
+
+        // The one registration is all it takes for the same request to be served: the
+        // gate is the registry's contents and nothing else about the call changed. The
+        // instance holds no campaign yet, so the page it is served is empty — which is
+        // what an empty page MEANS.
+        let harness = router();
+        harness.register_connect_instance(case.registered_in, &case.instance);
+        let empty = list_filtered_by_instance(&harness, &case).await;
+        assert_eq!(
+            (
+                empty.status,
+                empty
+                    .body
+                    .get("campaignSummaryList")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            ),
+            (200, Some(0)),
+            "case {:?}: expected an empty page for an instance the account holds, got {} {}",
+            case.name,
+            empty.status,
+            empty.body
+        );
+
+        // And the campaigns of that instance are what the served listing reports.
+        let created = create(&harness, &case, "listed-campaign").await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: expected the create to be served, got {} {}",
+            case.name, created.status, created.body
+        );
+        let listed = list_filtered_by_instance(&harness, &case).await;
+        assert_eq!(
+            (
+                listed.status,
+                listed
+                    .body
+                    .pointer("/campaignSummaryList/0/id")
+                    .and_then(Value::as_str)
+            ),
+            (200, created.body["id"].as_str()),
+            "case {:?}: expected the listing to report the campaign of that instance, \
+             got {} {}",
+            case.name,
+            listed.status,
+            listed.body
         );
     }
 }

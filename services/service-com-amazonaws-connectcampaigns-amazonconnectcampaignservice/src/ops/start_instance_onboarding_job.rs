@@ -276,7 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 audit("ConflictException");
                 return Err(StartInstanceOnboardingJobErrorModeled::ConflictException(
                     ConflictException {
-                        message: crate::state::INSTANCE_ALREADY_ONBOARDED_MESSAGE.to_string(),
+                        message: crate::state::instance_already_onboarded_message(
+                            &input.connect_instance_id,
+                        ),
                         x_amz_error_type: None,
                     },
                 )

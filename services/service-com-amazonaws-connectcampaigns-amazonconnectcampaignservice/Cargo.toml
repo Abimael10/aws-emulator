@@ -8,8 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# The response media type this service announces, and the seam wrapper that reaches the
-# framework's own refusals with it: the tree's one statement of that rule.
+# The shared AWS constraint-refusal renderer this service words its boundary refusals
+# with, and the shared Amazon Connect instance gate its operations are gated on.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

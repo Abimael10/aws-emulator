@@ -230,6 +230,69 @@ pub fn tags_over_cap_message(count: usize) -> String {
     ::aws_smithy_schema_server::envelope(&[violation]).unwrap_or_default()
 }
 
+/// The tag-key namespace reserved for the tags AWS generates itself, which a caller may
+/// not write into.
+///
+/// Source: the `@length`/`@pattern` of `TagKey`, the shape every tag map's key and every
+/// tag-key list's member targets — `^(?!aws:)[a-zA-Z+-=._:/]+$`
+/// (`smithy_query(query="shape", shape="TagKey")`) — whose leading negative lookahead
+/// excludes exactly this prefix, so the model itself states the namespace is not the
+/// caller's.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies inside the namespace [`RESERVED_TAG_KEY_PREFIX`] keeps, matched
+/// WITHOUT regard to ASCII case — the way the refusal of this class states the rule, so
+/// `AWS:`, `Aws:` and `aws:` are one namespace and not three.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys`, in the order given, that [`is_reserved_tag_key`] — or `None`
+/// when none of them does.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// What this service answers when a request names a tag key inside
+/// [`RESERVED_TAG_KEY_PREFIX`]: a FIXED sentence, naming neither the key nor the member
+/// it arrived under, so every refusal of this class reads the same.
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// Refuse the request when any of `keys` is a key the caller may not supply, and write
+/// nothing: the one tag-key check of this crate, so every operation whose request names a
+/// tag key — a map's keys on a create or a tag call, a key list on an untag — judges one
+/// rule and answers one sentence.
+///
+/// The key is judged from the REQUEST's own content, so a caller reaches this refusal
+/// before any resource is looked up. It is answered on the wire under
+/// [`TAG_BAD_REQUEST_CODE`], at the status that code carries, because that is the code the
+/// tagging tier in front of this service answers a key it refuses with, and a client
+/// branches on the code it is sent; no shape of this model carries that name, which is
+/// what [`crate::scaffolded::Scaffolded::wire_coded`] exists for.
+///
+/// A map KEY never reaches the framework's constraint walk (it is captured as the path
+/// segment of the entry's value rather than validated as a leaf of its own), and the
+/// engine behind `@pattern` has no look-around to apply the expression's leading negative
+/// lookahead with, so this rule reaches no request unless it is applied here.
+pub fn reject_reserved_tag_keys<'a, E, I>(keys: I) -> Result<(), crate::scaffolded::Scaffolded<E>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    match first_reserved_tag_key(keys) {
+        None => Ok(()),
+        Some(_) => Err(crate::scaffolded::Scaffolded::wire_coded(
+            TAG_BAD_REQUEST_CODE,
+            TAG_BAD_REQUEST_STATUS,
+            RESERVED_TAG_KEY_MESSAGE,
+        )),
+    }
+}
+
 /// One dial request a campaign's buffer holds: the id this service minted for it, and
 /// what the request asked to dial exactly as it was submitted.
 ///
@@ -491,6 +554,39 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         }
         self.instance_onboarding.remove(connect_instance_id);
         DeleteOnboardingOutcome::Deleted
+    }
+
+    /// Delete the Campaigns configuration this service holds for `connect_instance_id`,
+    /// and report what became of the request (see [`DeleteInstanceConfigOutcome`]).
+    ///
+    /// The one place that configuration is dropped, and the one place the rule that
+    /// governs the drop lives: an instance that still owns at least one campaign keeps its
+    /// configuration, in WHATEVER state those campaigns are
+    /// ([`DeleteInstanceConfigOutcome::StillHasCampaigns`]), because the configuration is
+    /// what its campaigns run on; an instance that has no configuration at all has none to
+    /// delete ([`DeleteInstanceConfigOutcome::NoSuchConfig`]). Nothing is written on either
+    /// refusal, so a refused delete leaves the configuration exactly as readable as it was.
+    ///
+    /// What is dropped is the onboarding record itself, because that record IS the
+    /// instance's configuration here: [`Self::onboarded_instance`] is what projects the
+    /// modelled `InstanceConfig` from it, so an instance whose record is gone reports no
+    /// configuration and can be onboarded again. The configuration's existence is read at
+    /// `now` through that same projection, so this call and every reader of a
+    /// configuration agree about which instances have one.
+    pub fn delete_connect_instance_config(
+        &mut self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> DeleteInstanceConfigOutcome {
+        if self.onboarded_instance(connect_instance_id, now).is_none() {
+            return DeleteInstanceConfigOutcome::NoSuchConfig;
+        }
+        let campaigns = self.campaigns_for_instance(connect_instance_id);
+        if campaigns > 0 {
+            return DeleteInstanceConfigOutcome::StillHasCampaigns;
+        }
+        self.instance_onboarding.remove(connect_instance_id);
+        DeleteInstanceConfigOutcome::Deleted
     }
 
     /// The onboarding record this service holds for `connect_instance_id`, or `None`
@@ -1051,16 +1147,46 @@ pub enum DeleteOnboardingOutcome {
     NotFailed,
 }
 
+/// What became of a request to delete one instance's Campaigns configuration, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::delete_connect_instance_config`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteInstanceConfigOutcome {
+    /// The configuration is gone, so the instance has none any more and no campaign of it
+    /// was left behind.
+    Deleted,
+    /// This service holds no configuration for that instance — nothing onboarded it, or
+    /// its onboarding job has not finished — so there is none to delete: the modelled
+    /// `ResourceNotFoundException` (HTTP 404) carrying [`instance_config_absent_message`].
+    NoSuchConfig,
+    /// The instance still owns at least one campaign, so its configuration stays: the
+    /// modelled `InvalidStateException` (HTTP 409) carrying
+    /// [`INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE`].
+    StillHasCampaigns,
+}
+
+/// What this service answers when the Campaigns configuration a request asks it to delete
+/// belongs to an instance that still owns campaigns.
+///
+/// A FIXED service string stating the rule it enforces: it names neither the instance nor
+/// how many campaigns it holds, so every refusal of this class reads the same.
+pub const INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE: &str = "This instance still has campaigns";
+
 /// What this service answers when the Amazon Connect instance a request names is
 /// already onboarded to Campaigns, so its onboarding job cannot be started again.
 ///
-/// The sentence the model documents for `ConflictException` — "The request could not be
-/// processed because of conflict in the current state of the resource" — which is what
-/// this refusal is: the state of the instance, and not the request, is what stops the
-/// call. A FIXED service string carrying nothing from the request, so every refusal of
-/// this class reads the same.
-pub const INSTANCE_ALREADY_ONBOARDED_MESSAGE: &str =
-    "The request could not be processed because of conflict in the current state of the resource.";
+/// Composed from the request and the caller's account: the onboarding record is scoped to
+/// an account, so the sentence names the instance the request asked to onboard and the
+/// account that already holds its record — the same two values
+/// [`onboarding_record_absent_message`] names, which is how this service words the state
+/// of an instance's onboarding record. The one text the onboarding handlers share, so
+/// they cannot disagree about a request they both refuse.
+pub fn instance_already_onboarded_message(connect_instance_id: &str) -> String {
+    format!(
+        "Instance {connect_instance_id} under account {} is already onboarded.",
+        ::emulator_server::emulator_account_id()
+    )
+}
 
 /// What this service answers when the Amazon Connect instance a request asks it to
 /// onboard is not one the account holds: the id names no instance to onboard.
@@ -1342,6 +1468,11 @@ pub const TAG_ARN_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// model's corresponding shape (`ValidationException`).
 pub const TAG_BAD_REQUEST_CODE: &str = "BadRequestException";
 
+/// The HTTP status every refusal carrying [`TAG_BAD_REQUEST_CODE`] answers at: that code
+/// states something about the REQUEST, which is a client error. Named once, so the code
+/// and the status it travels with cannot drift apart.
+pub const TAG_BAD_REQUEST_STATUS: u16 = 400;
+
 /// What a tag operation answers alongside [`TAG_BAD_REQUEST_CODE`]: also a fixed
 /// sentence, so an ARN of another vendor is refused without being echoed back.
 pub const TAG_ARN_BAD_REQUEST_MESSAGE: &str = "Invalid input resource arn";
@@ -1353,7 +1484,7 @@ pub const TAG_ARN_BAD_REQUEST_MESSAGE: &str = "Invalid input resource arn";
 fn tag_arn_bad_request<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::wire_coded(
         TAG_BAD_REQUEST_CODE,
-        400,
+        TAG_BAD_REQUEST_STATUS,
         TAG_ARN_BAD_REQUEST_MESSAGE,
     )
 }
@@ -1491,6 +1622,16 @@ pub use ::service_common::connect_instance_registry::ConnectInstanceRefusal;
 /// `ValidationException` (HTTP 400) is what carries it.
 pub const INSTANCE_NOT_USABLE_MESSAGE: &str =
     ::service_common::connect_instance_registry::INSTANCE_NOT_USABLE_MESSAGE;
+
+/// What this service answers when the Amazon Connect instance a LISTING is filtered by is
+/// not one Campaigns can be used with: the same gate outcome
+/// ([`INSTANCE_NOT_USABLE_MESSAGE`]) as a create, worded as the listing words it.
+///
+/// A FIXED service string — it names no instance and carries nothing from the request —
+/// so every refusal of this class reads the same. Each operation answers the one gate
+/// outcome in the words recorded for THAT operation, which is why the listing's sentence
+/// is its own rather than the create's.
+pub const INSTANCE_NOT_ONBOARDED_MESSAGE: &str = "Instance is not onboarded";
 
 /// What this service answers when the Amazon Connect instance registry — another
 /// service's store, reached through the shared engine — cannot be read at all, so the

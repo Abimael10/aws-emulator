@@ -9,6 +9,11 @@
 //! and the keys the request does not name are left alone. The removal lands in the one
 //! campaign record `ListTagsForResource` and `DescribeCampaign` read back.
 //!
+//! A `tagKeys` entry in the namespace AWS reserves for its own tags is refused ahead of
+//! the ARN, by the crate's one tag-key check
+//! (`crate::state::reject_reserved_tag_keys`): the key shape is the same `TagKey` a tag
+//! MAP is keyed by, so a key a caller may not supply is one it may not name here either.
+//!
 //! The ARN's resource path is parsed before anything is looked up, so an ARN this service
 //! mints no resource under is a bad request rather than a missing resource; a campaign
 //! ARN the store holds nothing under is a not-found. Both refusals live with the
@@ -180,6 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // A tag key the caller may not supply is a bad request about the request's own
+        // content, so it is judged before the ARN is resolved and before anything is
+        // removed: the crate's one tag-key check, shared with every other operation whose
+        // request names a tag key.
+        crate::state::reject_reserved_tag_keys(input.tag_keys.iter().map(String::as_str))?;
 
         let (campaign_id, removed) = {
             let mut guard = state.lock();

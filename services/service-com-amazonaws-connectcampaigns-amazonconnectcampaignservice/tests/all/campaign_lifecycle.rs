@@ -725,11 +725,14 @@ async fn list_campaigns_filters_by_instance_and_pages_in_creation_order() {
         );
     }
 
-    // `instanceIdFilter` keeps exactly the campaigns of the named instance.
+    // `instanceIdFilter` keeps exactly the campaigns of the named instance — including
+    // none at all for an instance the account holds that no campaign was created for. (An
+    // instance the account does NOT hold is refused rather than reported as empty;
+    // `shared_connect_instance_gate.rs` owns that rule.)
     let filter_rows: &[(&str, &[String])] = &[
         ("inst-a", &on_instance_a),
         ("inst-b", &on_instance_b),
-        ("inst-none", &[]),
+        ("inst-spare", &[]),
     ];
     for (instance, expected) in filter_rows {
         let ids = list_ids(&router, Some(instance), Some(2), None).await;

@@ -31,10 +31,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::ops::types::INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES;
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::{
-    connect_instance_not_found_message, onboarding_record_absent_message,
-    ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState,
-    INSTANCE_ALREADY_ONBOARDED_MESSAGE, ONBOARDING_JOB_DURATION, ONBOARDING_STATUS_IN_PROGRESS,
-    ONBOARDING_STATUS_SUCCEEDED,
+    connect_instance_not_found_message, instance_already_onboarded_message,
+    onboarding_record_absent_message,
+    ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState, ONBOARDING_JOB_DURATION,
+    ONBOARDING_STATUS_IN_PROGRESS, ONBOARDING_STATUS_SUCCEEDED,
 };
 
 use super::common::{
@@ -67,11 +67,12 @@ const NOT_FOUND_WORDING: &str = "ConnectInstanceId not found {id}.";
 const RECORD_ABSENT_WORDING: &str =
     "Instance onboarding record does not exist for aws account id {account} and instance id {id}";
 
-/// The sentence an instance that is already onboarded is refused with — the one the
-/// model documents for `ConflictException`. It carries nothing from the request, so
-/// there is no `{id}` to fill.
+/// The sentence an instance that is already onboarded is refused with: fixed text around
+/// the instance the request named and the account whose record already holds it — the
+/// onboarding record is account-scoped, so both are named. `{id}` and `{account}` are
+/// where those go.
 const ALREADY_ONBOARDED_WORDING: &str =
-    "The request could not be processed because of conflict in the current state of the resource.";
+    "Instance {id} under account {account} is already onboarded.";
 
 /// `wording` with the request's instance `id` — and the caller's account id, which the
 /// emulator presents as its own canonical one — in the places it names.
@@ -583,26 +584,34 @@ async fn a_repeat_start_while_the_job_runs_reports_that_job() {
 #[tokio::test]
 async fn an_instance_whose_onboarding_has_finished_is_not_onboarded_again() {
     // Once the job has FINISHED there is no onboarding left to do, so the repeat is a
-    // genuine conflict. One row per way such a second call can differ from the first:
-    // the config it carries and how many times it is re-sent — none of them starts a
-    // second job, and none of them overwrites the first.
-    let rows: Vec<(&str, Value, usize)> = vec![
-        ("the same config", service_key_config(), 1),
+    // genuine conflict. One row per way such a second call can differ from the first: the
+    // instance id it names (the variable part of the refusal's sentence, spanning the
+    // `InstanceId` forms), the config it carries and how many times it is re-sent — none of
+    // them starts a second job, and none of them overwrites the first.
+    let rows: Vec<(&str, String, Value, usize)> = vec![
         (
-            "a different config",
+            "the same config",
+            "twice-onboarded-instance".to_string(),
+            service_key_config(),
+            1,
+        ),
+        (
+            "a different config, under the uuid form of an instance id",
+            "3a7c91d5-48e2-4b06-9c13-5fd802ae6714".to_string(),
             json!({"enabled": true, "encryptionType": "KMS", "keyArn": KEY_ARN}),
             1,
         ),
         (
-            "a key with no type, re-sent twice",
+            "a key with no type, re-sent twice, under a 256-character instance id",
+            "i".repeat(256),
             json!({"enabled": true, "keyArn": KEY_ARN}),
             2,
         ),
     ];
 
-    for (case, second_config, repeats) in rows {
+    for (case, instance, second_config, repeats) in rows {
         let harness = router();
-        let instance = "twice-onboarded-instance";
+        let instance = instance.as_str();
         harness.register_connect_instance(REGION, instance);
 
         let first_config = service_key_config();
@@ -629,8 +638,9 @@ async fn an_instance_whose_onboarding_has_finished_is_not_onboarded_again() {
             );
             assert_eq!(
                 refused.message(),
-                ALREADY_ONBOARDED_WORDING,
-                "case {case:?} repeat {repeat}: expected the conflict wording, got {}",
+                worded(ALREADY_ONBOARDED_WORDING, instance),
+                "case {case:?} repeat {repeat}: expected the conflict wording around the \
+                 instance and the account, got {}",
                 refused.body
             );
             assert!(
@@ -779,9 +789,18 @@ fn the_shared_refusal_wordings_are_the_ones_this_suite_pins() {
          got {:?}",
         onboarding_record_absent_message("an-instance")
     );
-    assert_eq!(
-        INSTANCE_ALREADY_ONBOARDED_MESSAGE, ALREADY_ONBOARDED_WORDING,
-        "case \"the conflict wording\": expected {ALREADY_ONBOARDED_WORDING:?}, got \
-         {INSTANCE_ALREADY_ONBOARDED_MESSAGE:?}"
-    );
+    for (case, instance) in [
+        ("the uuid form", "8c1e5a07-6b23-4d19-9f85-2a07c4e31b60".to_string()),
+        ("one character", "a".to_string()),
+        ("every admitted punctuation", "a.b_c-D9".to_string()),
+        ("256 characters (the length maximum)", "i".repeat(256)),
+    ] {
+        assert_eq!(
+            instance_already_onboarded_message(&instance),
+            worded(ALREADY_ONBOARDED_WORDING, &instance),
+            "case {case:?}: expected {:?}, got {:?}",
+            worded(ALREADY_ONBOARDED_WORDING, &instance),
+            instance_already_onboarded_message(&instance)
+        );
+    }
 }

@@ -14,20 +14,23 @@
 //! siblings under one Connect instance or campaigns of different instances — hold
 //! separate maps even when they carry the same key.
 //!
-//! A second rule is asserted here because this plane is where it shows: the `content-type`
-//! of a reply is the media type the LAYER that answered it announces. The refusals of these
-//! three operations come from the tag tier in front of this service's modelled front door —
-//! recognisable by the wire codes they carry, which name no shape this model declares — and
-//! are announced under the protocol's own `application/json`, while everything this
-//! service's front door answers, these operations' successes included, announces that front
-//! door's own media type.
+//! A tag key inside the namespace AWS reserves for the tags it generates itself is
+//! refused wherever a request names one — a map's key on a create or a tag call, a key
+//! list on an untag — ahead of any lookup, and nothing is written.
+//!
+//! A second rule is asserted here because this plane is where it shows: every reply of
+//! this service announces the media type its `restJson1` protocol trait implies
+//! (`application/json`), whichever layer answered it — a success, a refusal its handlers
+//! raise, a refusal the framework renders inside the request walk, and the tag plane's own
+//! refusals, which carry wire codes naming no shape this model declares.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::{
-    tags_over_cap_message, MAX_TAGS_PER_RESOURCE, TAG_ARN_BAD_REQUEST_MESSAGE,
-    TAG_ARN_NOT_FOUND_MESSAGE, TAG_BAD_REQUEST_CODE, TAG_NOT_FOUND_CODE,
+    is_reserved_tag_key, tags_over_cap_message, MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_MESSAGE,
+    TAG_ARN_BAD_REQUEST_MESSAGE, TAG_ARN_NOT_FOUND_MESSAGE, TAG_BAD_REQUEST_CODE,
+    TAG_NOT_FOUND_CODE,
 };
 
 use super::common::{call, router, Answer, Harness};
@@ -910,14 +913,10 @@ async fn a_tag_write_lands_on_exactly_the_resource_its_arn_names() {
     }
 }
 
-/// The media type this service's own front door announces on the replies it produces: the
-/// awsJson 1.1 value its recorded wire carries, which is NOT the `application/json` its
-/// `restJson1` protocol trait implies.
-const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
-
-/// The media type the TAG tier's own refusals are announced under: the protocol's own,
-/// which is the value their producer stamped.
-const TAG_TIER_MEDIA_TYPE: &str = "application/json";
+/// The media type every reply of this service announces: the one its `restJson1` protocol
+/// trait implies, which its recorded wire carries on a body and on a refusal envelope
+/// alike — the tag plane's own refusals included.
+const RESPONSE_MEDIA_TYPE: &str = "application/json";
 
 /// What one row of the media-type table asks for.
 enum Announced {
@@ -932,8 +931,8 @@ enum Announced {
 }
 
 /// One row of the media-type table: what to ask, the status and wire error code the reply
-/// must carry (an empty code for a reply that carries none), and the media type the layer
-/// that answered it announces.
+/// must carry (an empty code for a reply that carries none), and the media type it
+/// announces.
 struct AnnouncedRow {
     case: &'static str,
     asked: Announced,
@@ -943,7 +942,7 @@ struct AnnouncedRow {
 }
 
 #[tokio::test]
-async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
+async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
     let router = router();
     let arn = a_stored_campaign(&router, "announced", Some(tag_map([("env", "dev")]))).await;
 
@@ -954,31 +953,32 @@ async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
     let another_vendor = "arn:aws:connect:us-east-1:000000000000:instance/abcdef".to_string();
     let absent = arn.replace(id_of(&arn), "2f9c7b416d054e389a210b7c5d4e3f20");
 
-    // Rows differ along the layer that answers (this service's front door, the tag tier),
-    // the status class of the reply (200 with a body, 200 with none, 400, 404), the
-    // operation it came from (all three tag operations, plus the campaign plane) and, for
-    // the tag tier, the class of ARN that reaches it.
+    // Rows differ along the layer that answers (this service's handlers, the framework's
+    // own refusal tail, the tag plane's refusals), the status class of the reply (200 with
+    // a body, 200 with none, 400, 404), the operation it came from (all three tag
+    // operations, plus the campaign plane) and the class of ARN that reaches it — and every
+    // one of them announces the same value.
     let rows: Vec<AnnouncedRow> = vec![
         AnnouncedRow {
             case: "the tag listing of a stored campaign (200, a body)",
             asked: Announced::ListTags(arn.clone()),
             status: 200,
             code: "",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on a stored campaign (200, no body)",
             asked: Announced::Tag(arn.clone()),
             status: 200,
             code: "",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of a stored campaign (200, no body)",
             asked: Announced::Untag(arn.clone()),
             status: 200,
             code: "",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a campaign read (200, a body)",
@@ -989,7 +989,7 @@ async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
             ),
             status: 200,
             code: "",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a campaign id that resolves to nothing (404, a handler's modelled shape)",
@@ -1000,7 +1000,7 @@ async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
             ),
             status: 404,
             code: "ResourceNotFoundException",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a value outside a modelled bound (400, the walk's own refusal)",
@@ -1011,56 +1011,72 @@ async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
             ),
             status: 400,
             code: "ValidationException",
-            announced: FRONT_DOOR_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "the tag listing of an ARN of another resource (400, the tag tier)",
             asked: Announced::ListTags(not_a_campaign.clone()),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on an ARN of another vendor (400, the tag tier)",
             asked: Announced::Tag(another_vendor.clone()),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of an ARN of another resource (400, the tag tier)",
             asked: Announced::Untag(not_a_campaign),
             status: 400,
             code: TAG_BAD_REQUEST_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "the tag listing of an absent campaign (404, the tag tier)",
             asked: Announced::ListTags(absent.clone()),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "a tag merge on an absent campaign (404, the tag tier)",
             asked: Announced::Tag(absent.clone()),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
         AnnouncedRow {
             case: "an untag of an absent campaign (404, the tag tier)",
             asked: Announced::Untag(absent),
             status: 404,
             code: TAG_NOT_FOUND_CODE,
-            announced: TAG_TIER_MEDIA_TYPE,
+            announced: RESPONSE_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a tag key the caller may not supply (400, the tag-key rule)",
+            asked: Announced::Tag(arn.clone()),
+            status: 400,
+            code: TAG_BAD_REQUEST_CODE,
+            announced: RESPONSE_MEDIA_TYPE,
         },
     ];
 
     for row in rows {
         let answer = match &row.asked {
             Announced::ListTags(arn) => list_tags(&router, arn).await,
-            Announced::Tag(arn) => tag(&router, arn, &tag_map([("owner", "announced")])).await,
+            Announced::Tag(arn) => {
+                // The one row about a refused tag KEY carries a reserved key; every other
+                // tag row carries a key a caller may supply.
+                let tags = if row.code == TAG_BAD_REQUEST_CODE && arn.contains("campaign/") {
+                    tag_map([("aws:owner", "announced")])
+                } else {
+                    tag_map([("owner", "announced")])
+                };
+                tag(&router, arn, &tags).await
+            }
             Announced::Untag(arn) => untag(&router, arn, &["owner"]).await,
             Announced::Elsewhere(method, path, body) => {
                 call(&router, REGION, method, path, body).await
@@ -1089,9 +1105,240 @@ async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
         }
         assert_eq!(
             answer.media_type, row.announced,
-            "case {:?}: expected the media type {:?} of the layer that answered it, got {:?} \
-             on HTTP {} {}",
+            "case {:?}: expected the media type {:?} this service's protocol implies, got \
+             {:?} on HTTP {} {}",
             row.case, row.announced, answer.media_type, answer.status, answer.body
+        );
+    }
+}
+
+/// The sentence a request naming a tag key in the reserved namespace is refused with:
+/// fixed text, naming neither the key nor the member it arrived under. Written out here
+/// rather than read back out of the implementation, so this suite pins the wording itself.
+const RESERVED_KEY_WORDING: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
+/// Tag keys inside the namespace AWS reserves for its own tags, spanning what that rule
+/// generalises over: the prefix alone, what a generated key looks like under it, and the
+/// case spellings the rule's own sentence says it ignores. Every one of them is within
+/// `TagKey`'s `@length` (min 1, max 128, from
+/// `smithy_query(query="shape", shape="TagKey")`), so a refusal of one is the namespace
+/// rule and not a bound.
+fn reserved_keys() -> Vec<(&'static str, String)> {
+    vec![
+        ("the reserved prefix alone", "aws:".to_string()),
+        (
+            "a key under the reserved prefix",
+            "aws:cloudformation:stack-name".to_string(),
+        ),
+        ("the prefix in upper case", "AWS:region".to_string()),
+        ("the prefix in mixed case", "Aws:CreatedBy".to_string()),
+        (
+            "the longest key the length maximum admits",
+            format!("aws:{}", "k".repeat(124)),
+        ),
+    ]
+}
+
+/// Tag keys OUTSIDE that namespace which the prefix test must not catch: the prefix
+/// without its colon, a key that merely starts with those letters, and one carrying the
+/// prefix somewhere other than at the start.
+fn allowed_keys() -> Vec<(&'static str, String)> {
+    vec![
+        ("the prefix without its colon", "aws".to_string()),
+        ("a key beginning with those letters", "awsome".to_string()),
+        ("the prefix not at the start", "my-aws:thing".to_string()),
+        ("a key with no relation to it", "owner".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn a_create_naming_a_reserved_tag_key_is_refused_and_creates_nothing() {
+    for (case, key) in reserved_keys() {
+        let router = router();
+        router.register_connect_instance(REGION, INSTANCE);
+
+        let refused = call(
+            &router,
+            REGION,
+            "PUT",
+            "/campaigns",
+            &create_body(INSTANCE, "reserved-key", Some(tag_map([(key.as_str(), "nope")]))),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for a tag key the caller may not supply, \
+             got {} {}",
+            refused.status, refused.body
+        );
+        assert!(
+            refused.error_code.ends_with(TAG_BAD_REQUEST_CODE),
+            "case {case:?}: expected the wire code {TAG_BAD_REQUEST_CODE:?}, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            RESERVED_KEY_WORDING,
+            "case {case:?}: expected the reserved-key sentence, got {}",
+            refused.body
+        );
+        assert!(
+            refused.body.get("id").is_none() && refused.body.get("arn").is_none(),
+            "case {case:?}: a refused create mints nothing, got {}",
+            refused.body
+        );
+
+        // Nothing was stored: the listing reports no campaign at all, so the refused
+        // request did not leave one behind under the key it named.
+        let listed = call(
+            &router,
+            REGION,
+            "POST",
+            "/campaigns-summary",
+            &json!({"maxResults": 50}),
+        )
+        .await;
+        assert_eq!(
+            (
+                listed.status,
+                listed
+                    .body
+                    .get("campaignSummaryList")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            ),
+            (200, Some(0)),
+            "case {case:?}: a refused create stores nothing, got {} {}",
+            listed.status,
+            listed.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tag_or_untag_naming_a_reserved_tag_key_is_refused_and_changes_nothing() {
+    let router = router();
+    let arn = a_stored_campaign(&router, "reserved-key-target", Some(tag_map([("env", "dev")]))).await;
+    let kept: Vec<(String, String)> = vec![("env".to_string(), "dev".to_string())];
+
+    for (case, key) in reserved_keys() {
+        // The ARN is well formed and the campaign exists, so neither refusal below is the
+        // tag plane's ARN refusal: the key alone is what is wrong with the request.
+        let tagged = tag(&router, &arn, &tag_map([(key.as_str(), "nope")])).await;
+        assert_eq!(
+            (tagged.status, tagged.message().to_string()),
+            (400, RESERVED_KEY_WORDING.to_string()),
+            "case {case:?}: expected the tag call to be refused with the reserved-key \
+             sentence, got {} {}",
+            tagged.status,
+            tagged.body
+        );
+        assert!(
+            tagged.error_code.ends_with(TAG_BAD_REQUEST_CODE),
+            "case {case:?}: expected the wire code {TAG_BAD_REQUEST_CODE:?} from the tag \
+             call, got {:?}",
+            tagged.error_code
+        );
+
+        let untagged = untag(&router, &arn, &[key.as_str()]).await;
+        assert_eq!(
+            (untagged.status, untagged.message().to_string()),
+            (400, RESERVED_KEY_WORDING.to_string()),
+            "case {case:?}: expected the untag call to be refused with the reserved-key \
+             sentence, got {} {}",
+            untagged.status,
+            untagged.body
+        );
+        assert!(
+            untagged.error_code.ends_with(TAG_BAD_REQUEST_CODE),
+            "case {case:?}: expected the wire code {TAG_BAD_REQUEST_CODE:?} from the untag \
+             call, got {:?}",
+            untagged.error_code
+        );
+
+        // Both refusals wrote nothing: the campaign still carries exactly the map it was
+        // created with, through both readers of it.
+        assert_eq!(
+            listed_tags(&router, &arn, case).await,
+            kept.iter().cloned().collect(),
+            "case {case:?}: expected the stored map to be untouched by the refusals"
+        );
+        assert_eq!(
+            described_tags(&router, &arn, case).await,
+            kept.iter().cloned().collect(),
+            "case {case:?}: expected the describe to report the same untouched map"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tag_key_outside_the_reserved_namespace_is_taken_wherever_it_arrives() {
+    for (case, key) in allowed_keys() {
+        let router = router();
+
+        // On a create: the key is kept and read back through both readers.
+        let arn = a_stored_campaign(
+            &router,
+            "allowed-key",
+            Some(tag_map([(key.as_str(), "kept")])),
+        )
+        .await;
+        let expected: std::collections::BTreeMap<String, String> =
+            [(key.clone(), "kept".to_string())].into_iter().collect();
+        assert_eq!(
+            listed_tags(&router, &arn, case).await,
+            expected,
+            "case {case:?}: expected the created campaign to carry the key it was given"
+        );
+
+        // On a tag call: the same key re-valued, and on an untag: removed.
+        let tagged = tag(&router, &arn, &tag_map([(key.as_str(), "merged")])).await;
+        assert_eq!(
+            tagged.status, 200,
+            "case {case:?}: expected the tag call to be served, got {} {}",
+            tagged.status, tagged.body
+        );
+        assert_eq!(
+            listed_tags(&router, &arn, case).await,
+            [(key.clone(), "merged".to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, String>>(),
+            "case {case:?}: expected the merge to re-value the key"
+        );
+        let untagged = untag(&router, &arn, &[key.as_str()]).await;
+        assert_eq!(
+            untagged.status, 200,
+            "case {case:?}: expected the untag call to be served, got {} {}",
+            untagged.status, untagged.body
+        );
+        assert!(
+            listed_tags(&router, &arn, case).await.is_empty(),
+            "case {case:?}: expected the untag to leave the campaign without the key"
+        );
+    }
+}
+
+#[test]
+fn the_reserved_namespace_is_judged_as_this_suite_pins_it() {
+    // The handlers judge a key and compose the refusal through the crate's own helpers,
+    // so the rule and the sentence pinned above are checked against those helpers too — a
+    // change to either side has to change both.
+    assert_eq!(
+        RESERVED_TAG_KEY_MESSAGE, RESERVED_KEY_WORDING,
+        "case \"the reserved-key wording\": expected {RESERVED_KEY_WORDING:?}, got \
+         {RESERVED_TAG_KEY_MESSAGE:?}"
+    );
+    for (case, key) in reserved_keys() {
+        assert!(
+            is_reserved_tag_key(&key),
+            "case {case:?}: expected {key:?} to be judged reserved"
+        );
+    }
+    for (case, key) in allowed_keys() {
+        assert!(
+            !is_reserved_tag_key(&key),
+            "case {case:?}: expected {key:?} to be judged a key a caller may supply"
         );
     }
 }

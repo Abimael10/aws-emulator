@@ -16,13 +16,18 @@
 //!   `ResourceNotFoundException` naming the configuration and the instance the request
 //!   asked about;
 //! * reading the configuration only REPORTS: it neither starts a job nor finishes one,
-//!   and repeated reads at the same point of the job agree.
+//!   and repeated reads at the same point of the job agree;
+//! * DELETING the configuration is what ends an instance's onboarding: it is refused
+//!   while the instance still owns campaigns, in whatever state those campaigns are, and
+//!   once none is left the configuration is gone — so the instance reports no
+//!   configuration and can be onboarded again.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::{
     instance_config_absent_message, service_linked_role_arn,
     ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState,
-    ONBOARDING_STATUS_IN_PROGRESS, ONBOARDING_STATUS_SUCCEEDED,
+    INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE, ONBOARDING_STATUS_IN_PROGRESS,
+    ONBOARDING_STATUS_SUCCEEDED,
 };
 
 use super::common::{call, job_status, reach_the_due_instant, router, Answer, Harness, KEY_ARN};
@@ -36,6 +41,11 @@ const REGION: &str = "us-east-1";
 /// rather than read back out of the implementation, so this suite pins the wording
 /// itself; `{id}` is where the request's instance id goes.
 const CONFIG_ABSENT_WORDING: &str = "ConnectInstanceConfig not found {id}.";
+
+/// The sentence a request asking to delete the configuration of an instance that still
+/// owns campaigns is refused with. Written out here for the same reason as the one above;
+/// it names neither the instance nor the campaigns, so there is no place to fill.
+const STILL_HAS_CAMPAIGNS_WORDING: &str = "This instance still has campaigns";
 
 /// IAM files a service-linked role under the reserved
 /// `role/aws-service-role/<service principal>/` path, and the Campaigns role of an
@@ -86,6 +96,81 @@ async fn config(harness: &Harness, instance: &str) -> Answer {
         &Value::Null,
     )
     .await
+}
+
+/// `DeleteConnectInstanceConfig` for `instance`.
+async fn delete_config(harness: &Harness, instance: &str) -> Answer {
+    call(
+        harness,
+        REGION,
+        "DELETE",
+        &format!("/connect-instance/{instance}/config"),
+        &Value::Null,
+    )
+    .await
+}
+
+/// `CreateCampaign` for `instance`, handing back the campaign id it minted.
+async fn a_campaign_of(harness: &Harness, instance: &str, name: &str) -> String {
+    let created = call(
+        harness,
+        REGION,
+        "PUT",
+        "/campaigns",
+        &json!({
+            "name": name,
+            "connectInstanceId": instance,
+            "dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 0.5}},
+            "outboundCallConfig": {"connectContactFlowId": "flow-1"},
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"create {name} for {instance}\": expected HTTP 200, got {} {}",
+        created.status, created.body
+    );
+    created.body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"create {name}\": no id in {}", created.body))
+        .to_string()
+}
+
+/// Move the campaign `id` into the run state the suffixes of `transitions` lead to — the
+/// run-state plane of `/campaigns/{id}/<suffix>` — asserting each step was served.
+async fn move_campaign(harness: &Harness, id: &str, transitions: &[&str], case: &str) {
+    for suffix in transitions {
+        let moved = call(
+            harness,
+            REGION,
+            "POST",
+            &format!("/campaigns/{id}/{suffix}"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            moved.status, 200,
+            "case {case:?}: expected the {suffix} of campaign {id} to be served, got {} {}",
+            moved.status, moved.body
+        );
+    }
+}
+
+/// `DeleteCampaign` for `id`, asserting it was served.
+async fn delete_campaign(harness: &Harness, id: &str, case: &str) {
+    let deleted = call(
+        harness,
+        REGION,
+        "DELETE",
+        &format!("/campaigns/{id}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: expected the delete of campaign {id} to be served, got {} {}",
+        deleted.status, deleted.body
+    );
 }
 
 /// The `connectInstanceConfig` member of a served answer, as the three members the
@@ -450,5 +535,275 @@ fn the_config_wordings_are_the_ones_this_suite_pins() {
         "case \"the service-linked role ARN\": expected {:?}, got {:?}",
         worded(SERVICE_LINKED_ROLE_WORDING, ""),
         service_linked_role_arn()
+    );
+    assert_eq!(
+        INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE, STILL_HAS_CAMPAIGNS_WORDING,
+        "case \"the in-use wording\": expected {STILL_HAS_CAMPAIGNS_WORDING:?}, got \
+         {INSTANCE_STILL_HAS_CAMPAIGNS_MESSAGE:?}"
+    );
+}
+
+/// An instance that still owns campaigns keeps its configuration, whatever state those
+/// campaigns are in and however many there are; once every one of them is deleted the
+/// configuration is deleted too, and the instance then reports none.
+///
+/// The rows differ along what the rule generalises over: the run state the campaigns are
+/// in — a campaign the create left `Initialized`, and the states the run-state plane moves
+/// one into — and how many campaigns the instance owns.
+#[tokio::test]
+async fn an_instance_that_still_owns_campaigns_keeps_its_config() {
+    // `(case, how many campaigns, the run-state path suffixes each is moved through)`.
+    let rows: Vec<(&str, usize, Vec<&str>)> = vec![
+        ("one campaign the create left Initialized", 1, vec![]),
+        ("one Running campaign", 1, vec!["start"]),
+        ("one Paused campaign", 1, vec!["start", "pause"]),
+        ("one Stopped campaign", 1, vec!["start", "stop"]),
+        ("three campaigns in the initial state", 3, vec![]),
+        ("two Running campaigns", 2, vec!["start"]),
+    ];
+
+    for (case, count, transitions) in rows {
+        let harness = router();
+        let instance = "instance-with-campaigns";
+        harness.register_connect_instance(REGION, instance);
+        let started = start(&harness, instance, &service_key_config()).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected the onboarding to be served, got {} {}",
+            started.status, started.body
+        );
+        reach_the_due_instant(&harness, instance);
+
+        let mut campaigns = Vec::new();
+        for index in 0..count {
+            let id = a_campaign_of(&harness, instance, &format!("campaign-{index}")).await;
+            move_campaign(&harness, &id, &transitions, case).await;
+            campaigns.push(id);
+        }
+
+        // Every campaign but the last one is deleted one at a time: while ANY campaign of
+        // the instance is left, the configuration stays and the refusal is the same.
+        for (index, id) in campaigns.iter().enumerate() {
+            let refused = delete_config(&harness, instance).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case:?} ({} campaigns left): expected HTTP 409 while the instance \
+                 still owns campaigns, got {} {}",
+                campaigns.len() - index,
+                refused.status,
+                refused.body
+            );
+            assert!(
+                refused.error_code.ends_with("InvalidStateException"),
+                "case {case:?} ({} campaigns left): expected InvalidStateException, got {:?}",
+                campaigns.len() - index,
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message(),
+                STILL_HAS_CAMPAIGNS_WORDING,
+                "case {case:?} ({} campaigns left): expected the in-use sentence, got {}",
+                campaigns.len() - index,
+                refused.body
+            );
+
+            // The refusal wrote nothing: the configuration is still readable, and the
+            // onboarding job it was projected from is still the finished one.
+            let still_there = config(&harness, instance).await;
+            assert_eq!(
+                (still_there.status, reported_config(&still_there)),
+                (
+                    200,
+                    Some(expected_config(instance, &service_key_config()))
+                ),
+                "case {case:?} ({} campaigns left): a refused delete leaves the config \
+                 readable, got {} {}",
+                campaigns.len() - index,
+                still_there.status,
+                still_there.body
+            );
+            let polled = status(&harness, instance).await;
+            assert_eq!(
+                (polled.status, job_status(&polled)),
+                (200, ONBOARDING_STATUS_SUCCEEDED),
+                "case {case:?} ({} campaigns left): a refused delete leaves the job as it \
+                 was, got {} {}",
+                campaigns.len() - index,
+                polled.status,
+                polled.body
+            );
+
+            delete_campaign(&harness, id, case).await;
+        }
+
+        // With no campaign left, the delete is served: a Unit output, so no body at all.
+        let deleted = delete_config(&harness, instance).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected HTTP 200 once no campaign is left, got {} {}",
+            deleted.status, deleted.body
+        );
+        assert_eq!(
+            deleted.body,
+            Value::Null,
+            "case {case:?}: expected the delete to answer no body, got {}",
+            deleted.body
+        );
+
+        // The configuration is gone — read back through the operation that reports it —
+        // and so is the onboarding record it was projected from.
+        let read_back = config(&harness, instance).await;
+        assert_eq!(
+            (read_back.status, read_back.message().to_string()),
+            (404, worded(CONFIG_ABSENT_WORDING, instance)),
+            "case {case:?}: expected the deleted config to be a 404 afterwards, got {} {}",
+            read_back.status,
+            read_back.body
+        );
+        assert!(
+            read_back.error_code.ends_with("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            read_back.error_code
+        );
+
+        // The onboarding lifecycle has an exit AND a way back in: the instance can be
+        // onboarded again, and the new job's own config is what it then reports.
+        let again_config = json!({"enabled": true, "encryptionType": "KMS", "keyArn": KEY_ARN});
+        let restarted = start(&harness, instance, &again_config).await;
+        assert_eq!(
+            (restarted.status, job_status(&restarted)),
+            (200, ONBOARDING_STATUS_IN_PROGRESS),
+            "case {case:?}: expected a fresh onboarding job after the delete, got {} {}",
+            restarted.status,
+            restarted.body
+        );
+        reach_the_due_instant(&harness, instance);
+        let reonboarded = config(&harness, instance).await;
+        assert_eq!(
+            (reonboarded.status, reported_config(&reonboarded)),
+            (200, Some(expected_config(instance, &again_config))),
+            "case {case:?}: expected the re-onboarded config, got {} {}",
+            reonboarded.status,
+            reonboarded.body
+        );
+    }
+}
+
+/// An instance with no configuration has none to delete: the delete answers the same
+/// not-found class, and the same sentence, that the read of a configuration answers.
+#[tokio::test]
+async fn an_instance_with_no_config_has_none_to_delete() {
+    let harness = router();
+
+    // An instance whose job has only just started has no configuration yet, so neither
+    // the read nor the delete finds one.
+    let in_progress = "job-in-progress";
+    harness.register_connect_instance(REGION, in_progress);
+    let started = start(&harness, in_progress, &service_key_config()).await;
+    assert_eq!(
+        (started.status, job_status(&started)),
+        (200, ONBOARDING_STATUS_IN_PROGRESS),
+        "case \"start a job\": expected a job that has only just started, got {} {}",
+        started.status,
+        started.body
+    );
+
+    // One instance IS onboarded, so the misses below are misses of their own instance and
+    // not of an empty store.
+    let onboarded = "onboarded-instance";
+    harness.register_connect_instance(REGION, onboarded);
+    let onboarding = start(&harness, onboarded, &service_key_config()).await;
+    assert_eq!(
+        onboarding.status, 200,
+        "case \"onboard one instance\": expected HTTP 200, got {} {}",
+        onboarding.status, onboarding.body
+    );
+    reach_the_due_instant(&harness, onboarded);
+
+    let held_not_onboarded = "held-but-not-onboarded";
+    harness.register_connect_instance(REGION, held_not_onboarded);
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "an instance the account holds but nobody onboarded",
+            held_not_onboarded.to_string(),
+        ),
+        (
+            "an instance whose onboarding job has not finished",
+            in_progress.to_string(),
+        ),
+        (
+            "an id the account does not hold",
+            "never-registered".to_string(),
+        ),
+        ("the onboarded id with a suffix", format!("{onboarded}-2")),
+        (
+            "the uuid form",
+            "4e1b7a92-5c38-4f0d-8a16-93cd70e2b418".to_string(),
+        ),
+        ("one character", "q".to_string()),
+        ("every admitted punctuation", "x.y_z-W8".to_string()),
+        ("256 characters (the length maximum)", "z".repeat(256)),
+    ];
+
+    for (case, instance) in rows {
+        let refused = delete_config(&harness, &instance).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404 for an instance with no config, got {} {}",
+            refused.status, refused.body
+        );
+        assert!(
+            refused.error_code.ends_with("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            worded(CONFIG_ABSENT_WORDING, &instance),
+            "case {case:?}: expected the config-absent wording around the id the request \
+             carried, got {}",
+            refused.body
+        );
+    }
+
+    // None of those refusals touched the instance that IS onboarded, nor the job that is
+    // still running.
+    let served = config(&harness, onboarded).await;
+    assert_eq!(
+        (served.status, reported_config(&served)),
+        (
+            200,
+            Some(expected_config(onboarded, &service_key_config()))
+        ),
+        "case \"the onboarded instance afterwards\": expected its config to be unchanged, \
+         got {} {}",
+        served.status,
+        served.body
+    );
+    let polled = status(&harness, in_progress).await;
+    assert_eq!(
+        (polled.status, job_status(&polled)),
+        (200, ONBOARDING_STATUS_IN_PROGRESS),
+        "case \"the unfinished job afterwards\": expected it to be running still, got {} {}",
+        polled.status,
+        polled.body
+    );
+
+    // The delete that found no configuration is repeatable, and so is one that followed a
+    // served delete: the instance has none either way.
+    reach_the_due_instant(&harness, in_progress);
+    let now_deletable = delete_config(&harness, in_progress).await;
+    assert_eq!(
+        now_deletable.status, 200,
+        "case \"the job has since finished\": expected the delete to be served, got {} {}",
+        now_deletable.status, now_deletable.body
+    );
+    let again = delete_config(&harness, in_progress).await;
+    assert_eq!(
+        (again.status, again.message().to_string()),
+        (404, worded(CONFIG_ABSENT_WORDING, in_progress)),
+        "case \"delete the same config twice\": expected the second to be a 404, got {} {}",
+        again.status,
+        again.body
     );
 }

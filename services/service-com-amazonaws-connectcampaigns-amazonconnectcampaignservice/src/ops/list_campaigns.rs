@@ -5,6 +5,13 @@
 //! honouring `filters.instanceIdFilter`, capping each page at `maxResults`, and emitting
 //! and consuming `nextToken` so a caller walks every campaign exactly once.
 //!
+//! A listing filtered by an instance is GATED on that instance being one Campaigns can be
+//! used with — one the account's Connect registry holds
+//! (`crate::state::connect_instance_refusal` reads it, the same gate `CreateCampaign`
+//! consults) — and answers the modelled `ValidationException` (HTTP 400) in this
+//! operation's own words when it is not, rather than reporting an empty page for an
+//! instance that can hold no campaign.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +181,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
+            }
+
+            // A listing filtered by an instance is a question about that instance, so the
+            // instance has to be one Campaigns can be used with before the campaign store
+            // is read at all: an id the account's Connect registry does not hold names
+            // nothing to list campaigns of, and answering it with an empty page would
+            // report "no campaigns" for an instance that cannot have any. The gate is the
+            // one this service's operations share
+            // (`crate::state::connect_instance_refusal`), asked BEFORE this service's
+            // store is locked — the lock order that cross-service read requires — and
+            // this operation answers its outcome in its own recorded words, as every
+            // operation of that gate does.
+            match crate::state::connect_instance_refusal(&*self.engine, &filter.value) {
+                None => {}
+                Some(crate::state::ConnectInstanceRefusal::NoSuchInstance) => {
+                    return Err(ListCampaignsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::INSTANCE_NOT_ONBOARDED_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into())
+                }
+                Some(crate::state::ConnectInstanceRefusal::RegistryUnavailable) => {
+                    return Err(ListCampaignsErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE
+                                .to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into())
+                }
             }
         }
         let wanted_instance = instance_filter.map(|filter| filter.value.as_str());

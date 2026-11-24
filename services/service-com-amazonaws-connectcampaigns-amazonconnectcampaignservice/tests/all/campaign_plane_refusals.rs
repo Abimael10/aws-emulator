@@ -621,15 +621,15 @@ async fn the_next_token_this_service_hands_out_is_base64_and_resumes_the_walk() 
 }
 
 #[tokio::test]
-async fn every_reply_announces_the_media_type_this_services_front_end_labels_json_with() {
+async fn every_reply_announces_the_media_type_this_services_protocol_implies() {
     let router = router();
     let stored = a_stored_campaign(&router, "control").await;
 
-    // One row per kind of producer a reply of this service's FRONT DOOR can come from: a
-    // handler's success, a handler's refusal, the refusal the framework renders INSIDE the
-    // request walk from a modelled bound, a stub's 501, and a request this service claims
-    // but no modelled route serves. The refusals of the tag tier in front of that front
-    // door keep their own producer's media type, and `resource_tags.rs` asserts that.
+    // One row per kind of producer a reply of this service can come from: a handler's
+    // success, a handler's refusal, the refusal the framework renders INSIDE the request
+    // walk from a modelled bound, a stub's 501, and a request this service claims but no
+    // modelled route serves. The tag plane's own refusals announce the same value, and
+    // `resource_tags.rs` asserts that.
     let rows: Vec<(&str, &str, String, Value)> = vec![
         (
             "a handler's success",
@@ -678,9 +678,9 @@ async fn every_reply_announces_the_media_type_this_services_front_end_labels_jso
     for (case, method, path, body) in rows {
         let answer = call(&router, REGION, method, &path, &body).await;
         assert_eq!(
-            answer.media_type, "application/x-amz-json-1.1",
-            "case {case:?}: expected every reply of this service's front door to announce \
-             its media type, got {:?} on HTTP {} {}",
+            answer.media_type, "application/json",
+            "case {case:?}: expected every reply of this service to announce the media \
+             type its restJson1 protocol implies, got {:?} on HTTP {} {}",
             answer.media_type, answer.status, answer.body
         );
     }

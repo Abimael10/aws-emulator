@@ -10,6 +10,11 @@
 //! (`crate::state::connect_instance_refusal` reads it) — and answers the modelled
 //! `ValidationException` (HTTP 400) when it is not, before anything is stored.
 //!
+//! A `tags` map naming a key in the namespace AWS reserves for its own tags is refused
+//! ahead of that gate, by the crate's one tag-key check
+//! (`crate::state::reject_reserved_tag_keys`), under the wire code and sentence the
+//! tagging tier answers such a key with.
+//!
 //! ## Idempotency
 //!
 //! The model marks this operation `@idempotent` and its documentation says "This API is
@@ -180,6 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // A tag key the caller may not supply is a bad request about the request's own
+        // content, so it is judged first — before the instance registry is read and
+        // before anything is stored. The rule and its sentence are the crate's one
+        // tag-key check, shared with the tag plane.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::reject_reserved_tag_keys(tags.keys().map(String::as_str))?;
+        }
 
         // A campaign belongs to an Amazon Connect instance that Campaigns can be used
         // with, and the account's Connect registry is the one record of which instances

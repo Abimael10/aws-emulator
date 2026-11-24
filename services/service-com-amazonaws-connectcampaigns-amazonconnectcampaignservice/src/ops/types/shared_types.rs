@@ -20,14 +20,30 @@ pub enum DialerConfig {
     agentlessDialerConfig(AgentlessDialerConfig),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcampaigns#ProgressiveDialerConfig")]
+// `skip_validation = ["bandwidthAllocation"]` on both dialer configs that carry one: the
+// real service does NOT apply `BandwidthAllocation`'s modelled `@range` (double, min 0,
+// max 1, from `smithy_query(query="shape", shape="BandwidthAllocation")`) to a request. A
+// create carrying a value above that maximum is ACCEPTED and the value is stored and
+// reported back exactly as sent, so the bound is a defect of the model's documentation for
+// this shape rather than a requirement a request has to satisfy — the same situation the
+// crate records for `GetCampaignStateBatch`'s campaign-id count. `skip_validation` drops
+// only that member's constraint traits; `@required` and every other member's bounds —
+// `dialingCapacity`'s own `@range` included — are untouched, so the boundary still refuses
+// a config that omits the member or breaks a bound the service does enforce.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connectcampaigns#ProgressiveDialerConfig",
+    skip_validation = ["bandwidthAllocation"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ProgressiveDialerConfig {
     pub bandwidth_allocation: f64,
     pub dialing_capacity: Option<f64>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcampaigns#PredictiveDialerConfig")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connectcampaigns#PredictiveDialerConfig",
+    skip_validation = ["bandwidthAllocation"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct PredictiveDialerConfig {
     pub bandwidth_allocation: f64,

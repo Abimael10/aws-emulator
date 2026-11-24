@@ -16,6 +16,11 @@
 //!   to it is processed, one answer per requested id, and only a batch past it is refused —
 //!   with the list the caller submitted stated as the value of the member that broke the
 //!   cap.
+//! * A bound the real service does NOT apply is not applied here either: a dialer config's
+//!   `bandwidthAllocation` is accepted whatever value it carries — above the modelled
+//!   maximum included — and the value is stored and reported back as sent, while every
+//!   other bound of the same request, `dialingCapacity`'s own range among them, is still
+//!   refused.
 //!
 //! The rows are built from the constrained members of this service's own model
 //! (`smithy_query(query="operation", operation="CreateCampaign,ListCampaigns,\
@@ -67,6 +72,11 @@ const MAX_CAMPAIGN_ID: usize = 256;
 
 /// `MaxResults`' published range (`@range(min 1, max 50)`).
 const MAX_RESULTS_RANGE: (i64, i64) = (1, 50);
+
+/// `DialingCapacity`'s published range (`@range(min 0.01, max 1)`, from
+/// `smithy_query(query="shape", shape="DialingCapacity")`) — a bound this service DOES
+/// apply, which is why it is the nested double the rows below break.
+const DIALING_CAPACITY_RANGE: (f64, f64) = (0.01, 1.0);
 
 /// The expression `InstanceId` has to satisfy, as a clause quotes it: the model's
 /// `@pattern` without the `^`/`$` a whole-value pattern is written with.
@@ -255,12 +265,18 @@ async fn a_constraint_clause_states_the_member_and_the_requirement_and_echoes_no
             body: json!({
                 "name": "fine",
                 "connectInstanceId": INSTANCE,
-                "dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 2.5}},
+                "dialerConfig": {"progressiveDialerConfig": {
+                    "bandwidthAllocation": 0.5,
+                    "dialingCapacity": 2.5,
+                }},
                 "outboundCallConfig": {"connectContactFlowId": "flow-1"},
             }),
             expected: one_error(
-                "Value at 'dialerConfig.progressiveDialerConfig.bandwidthAllocation'",
-                "Member must have value less than or equal to 1",
+                "Value at 'dialerConfig.progressiveDialerConfig.dialingCapacity'",
+                &format!(
+                    "Member must have value less than or equal to {}",
+                    DIALING_CAPACITY_RANGE.1
+                ),
             ),
             submitted: "2.5".to_string(),
         },
@@ -537,4 +553,88 @@ async fn a_batch_up_to_the_services_cap_is_processed_and_only_one_past_it_is_ref
         after.status,
         after.body
     );
+}
+
+/// A `bandwidthAllocation` is taken whatever value it carries, and the value is stored and
+/// reported back exactly as sent: the bound the model declares for it is not one the
+/// service applies to a request.
+///
+/// The rows differ along where the value sits relative to that modelled range — inside it,
+/// on each published bound, and past the maximum, at a value a caller might plausibly send
+/// and at a far larger one — and along which dialer config carries it, because the member
+/// is the same `BandwidthAllocation` shape in both.
+#[tokio::test]
+async fn a_bandwidth_allocation_outside_the_modelled_range_is_taken_and_echoed() {
+    let router = router();
+    router.register_connect_instance(REGION, INSTANCE);
+
+    // `BandwidthAllocation`'s published range is (min 0, max 1), from
+    // `smithy_query(query="shape", shape="BandwidthAllocation")`: the rows cover both
+    // bounds and the far side of the maximum.
+    let allocations: &[(&str, f64)] = &[
+        ("the range minimum", 0.0),
+        ("inside the range", 0.5),
+        ("the range maximum", 1.0),
+        ("just past the range maximum", 1.5),
+        ("far past the range maximum", 42.0),
+    ];
+
+    for (variant, variant_case) in [
+        ("progressiveDialerConfig", "a progressive dialer"),
+        ("predictiveDialerConfig", "a predictive dialer"),
+    ] {
+        for (allocation_case, allocation) in allocations {
+            let case = format!("{variant_case}, {allocation_case}");
+            let sent = json!({variant: {"bandwidthAllocation": allocation}});
+            let created = call(
+                &router,
+                REGION,
+                "PUT",
+                "/campaigns",
+                &json!({
+                    "name": format!("allocation-{variant}-{allocation}"),
+                    "connectInstanceId": INSTANCE,
+                    "dialerConfig": sent,
+                    "outboundCallConfig": {"connectContactFlowId": "flow-1"},
+                }),
+            )
+            .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: expected the create to be served, got {} {}",
+                created.status, created.body
+            );
+            let id = created.body["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no minted id in {}", created.body))
+                .to_string();
+
+            // Stored verbatim: the describe reports the value the request carried, neither
+            // clamped to the modelled maximum nor rounded.
+            let described = call(
+                &router,
+                REGION,
+                "GET",
+                &format!("/campaigns/{id}"),
+                &Value::Null,
+            )
+            .await;
+            assert_eq!(
+                (
+                    described.status,
+                    described
+                        .body
+                        .pointer(&format!(
+                            "/campaign/dialerConfig/{variant}/bandwidthAllocation"
+                        ))
+                        .and_then(Value::as_f64)
+                ),
+                (200, Some(*allocation)),
+                "case {case:?}: expected the stored allocation to be reported as sent, \
+                 got {} {}",
+                described.status,
+                described.body
+            );
+        }
+    }
 }

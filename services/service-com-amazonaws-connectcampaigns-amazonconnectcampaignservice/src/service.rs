@@ -46,37 +46,16 @@
 //!
 //! ## The media type this service announces
 //!
-//! The model declares the `restJson1` protocol trait, whose generic default response
-//! media type is `application/json`, while the recorded responses of this service's own
-//! front door — success and refusal alike — announce `application/x-amz-json-1.1`: that
-//! front end labels its JSON bodies with that media type whatever the modelled protocol
-//! is, and the media type a client reads is what it keys its parsing and content
-//! negotiation off. The rule, the one function that applies it and the operation-seam
-//! wrapper that reaches the refusal tail with it all live in
-//! [`service_common::response_media_type`]; [`RESPONSE_MEDIA_TYPE`] is this service's
-//! own pair, and the seams it is applied at are `override_operation` (every routed
-//! request, including the refusal the framework renders inside the request walk),
-//! `override_routing_error` and `override_framework_error`.
-//!
-//! This service's wire shows a SECOND announcer in front of that front door, and then which
-//! layer answered decides the value: the refusals of its TAG operations are recorded under
-//! the protocol's own `application/json`, and they are recognisable on the wire by the error
-//! CODE they carry — `BadRequestException` and `NotFoundException`
-//! ([`crate::state::TAG_BAD_REQUEST_CODE`], [`crate::state::TAG_NOT_FOUND_CODE`]), neither
-//! of which is the name of any shape this service's model declares, where every answer of
-//! the modelled front door carries a modelled shape's name. So those refusals keep the media
-//! type their own producer stamped and everything else is re-announced
-//! ([`announced_by_the_modelled_front_door`]). The sibling ConnectCampaignsV2 API is served
-//! by the same front door and the same tag tier, and splits its wire at the same place.
-//!
-//! One response is announced by the framework alone, because no author seam reaches it:
-//! the authentication refusal, which the router renders through
-//! `definition().refusal_response(..)` before this service is asked anything.
+//! Its PROTOCOL's own, on every reply: the model's only protocol trait is `restJson1`,
+//! whose responses carry `application/json`, and the recorded responses of this service
+//! carry that value too — a JSON body and a refusal envelope alike. So no seam here
+//! re-announces anything and the framework's renderers, which stamp the media type the
+//! protocol trait implies, are left to it. The sibling ConnectCampaignsV2 API, whose own
+//! recorded wire carries the awsJson 1.1 media type instead, states that for itself in its
+//! own crate: the value is a fact of each service's wire, and the two share only a signing
+//! name.
 
-use service_common::response_media_type::{ResponseMediaType, ResponseMediaTypeOperation};
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
-};
+use smithy_server_runtime::{http, Refusal, Refused, Service, Violation, ViolationKind};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -149,43 +128,11 @@ fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
     )
 }
 
-/// The media type the `restJson1` protocol trait this service's model declares implies,
-/// which the framework's renderers stamp on every response — the one value
-/// [`RESPONSE_MEDIA_TYPE`] replaces.
-const REST_JSON_MEDIA_TYPE: &str = "application/json";
-
-/// The pair this service's responses are re-announced across: the media type its
-/// model's protocol trait implies, and the one its recorded wire announces (see the
-/// module header). Named once, so every seam that re-announces reads the same two
-/// values.
-pub const RESPONSE_MEDIA_TYPE: ResponseMediaType = ResponseMediaType::new(
-    REST_JSON_MEDIA_TYPE,
-    service_common::response_media_type::AWS_JSON_1_1,
-);
-
-/// The wire error codes this service's TAG tier answers with, neither of which is the name
-/// of a shape this service's model declares ([`crate::state::TAG_BAD_REQUEST_CODE`] and
-/// [`crate::state::TAG_NOT_FOUND_CODE`]) — which is what tells that tier's refusals apart
-/// from every answer of the modelled front door on the wire a client reads.
-const TAG_TIER_ERROR_CODES: [&str; 2] = [
-    crate::state::TAG_BAD_REQUEST_CODE,
-    crate::state::TAG_NOT_FOUND_CODE,
-];
-
-/// Whether `resp` is one of the responses THIS service's front door produced — the
-/// [`service_common::response_media_type::AnnouncedResponses`] predicate the media type pair
-/// above belongs to.
-///
-/// Everything but a refusal the TAG tier answered is the front door's: its successes, the
-/// refusals its handlers raise in the model's own shapes, and the refusals the framework
-/// renders inside the walk, all of which the recorded wire announces under the awsJson 1.1
-/// media type. The tag tier's own refusals — the client errors carrying one of
-/// [`TAG_TIER_ERROR_CODES`], read off the response a client receives by the shared
-/// [`service_common::response_media_type::client_error_naming_one_of`] — are recorded under
-/// the protocol-implied value, so they are handed back exactly as their producer wrote them.
-fn announced_by_the_modelled_front_door(resp: &aws_smithy_runtime_api::http::Response) -> bool {
-    !service_common::response_media_type::client_error_naming_one_of(resp, &TAG_TIER_ERROR_CODES)
-}
+/// The media type this service announces on every reply: the one its `restJson1` protocol
+/// trait implies, which is also the one its recorded wire carries (see the module header).
+/// Named here because the suites pin it, and stamped by the framework's own renderers
+/// rather than by any seam of this file.
+pub const RESPONSE_MEDIA_TYPE: &str = "application/json";
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -227,11 +174,6 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The wrapper every routable request is served through, so a refusal raised
-    /// inside the request walk announces this service's media type too. Held in a
-    /// field, built once, because [`Service::override_operation`] hands back a borrow
-    /// of it.
-    media_type: ResponseMediaTypeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -241,10 +183,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            media_type: ResponseMediaTypeOperation::announcing(
-                RESPONSE_MEDIA_TYPE,
-                announced_by_the_modelled_front_door,
-            ),
         }
     }
 }
@@ -268,24 +206,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         can_handle_parts(parts)
     }
 
-    fn override_operation(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<&dyn ErasedOperation> {
-        // Every request the generated routing table can serve is served through the
-        // shared media-type wrapper, which delegates to that same table entry and then
-        // re-announces the media type of what it answered — reaching the refusal the
-        // framework renders inside the request walk — for the responses this service's own
-        // front door produced ([`announced_by_the_modelled_front_door`]); a refusal of the
-        // TAG tier keeps the media type its own producer stamped (see the module header).
-        // The routing stays the model's: a request whose routing key names no modelled
-        // operation is declined here, so the framework answers it as the unroutable
-        // request it is — through `override_routing_error` below, which re-announces
-        // that answer too.
-        service_common::response_media_type::routes(&self.entry, req)
-            .then_some(&self.media_type as _)
-    }
-
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) so this service can
@@ -300,36 +220,5 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // caller submitted. A refusal that is not a constraint violation — an
         // unauthenticated caller — keeps the framework's code and wording.
         stated_refusal(refusal)
-    }
-
-    fn override_routing_error(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated routing
-        // table resolved it. The framework's protocol-correct default for this
-        // service's envelope is kept word for word, status, code and body alike; only
-        // the media type is re-announced, so an unroutable request is answered under
-        // the same media type as a routed one (see the module header).
-        Some(RESPONSE_MEDIA_TYPE.announce(self.entry.routing_error_response(req)))
-    }
-
-    fn override_framework_error(
-        &self,
-        error: &aws_smithy_schema_server::ProtocolError,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this on a transport-level failure it detects up front —
-        // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. The entry's protocol-correct rendering is kept word for
-        // word; only the media type is re-announced (see the module header). The whole
-        // body is the shared rule's: that seam is handed the error ALONE, with no
-        // request to resolve an envelope from, and the rebuild-and-render that answer
-        // takes lives once in
-        // [`service_common::response_media_type::reannounced_framework_error`].
-        service_common::response_media_type::reannounced_framework_error(
-            RESPONSE_MEDIA_TYPE,
-            error,
-        )
     }
 }
