@@ -17,8 +17,9 @@
 //! behind admits all ICMP, all TCP and all UDP from the cluster's node groups, a named
 //! service-access group is admitted to the nodes on the service's port and admits the primary
 //! group on the nodes' port, and the groups a launch did NOT hand over are not written to at
-//! all. When the cluster shuts down Amazon EMR takes exactly those rules off again, leaving
-//! the caller's own, and while they are there the groups they reference cannot be deleted.
+//! all. The groups are the CALLER's, so the rules stay on them when the cluster shuts down,
+//! and while they are there the groups they reference cannot be deleted — removing them is
+//! the owner's own revoke, which `all/managed_security_group_teardown.rs` covers.
 //!
 //! Amazon EC2 is mounted BESIDE Amazon EMR on one engine, exactly as the assembled router
 //! mounts them.
@@ -460,10 +461,10 @@ async fn emr_authorizes_its_managed_ingress_onto_the_groups_a_launch_hands_it() 
     }
 }
 
-/// A cluster that is shut down by a call has exactly the rules Amazon EMR added taken off
-/// again, and the caller's own are left where they are.
+/// A cluster that is shut down by a call leaves every rule Amazon EMR wrote where it is: the
+/// groups belong to the caller, so nothing but the caller's own revoke takes them off.
 #[tokio::test]
-async fn emr_revokes_only_its_own_ingress_when_the_cluster_is_terminated() {
+async fn emr_leaves_its_ingress_in_place_when_the_cluster_is_terminated() {
     let emulator = emulator();
     let (vpc_id, subnet_id) = network(&emulator).await;
     let primary = security_group(&emulator, &vpc_id, "emr-primary").await;
@@ -503,18 +504,22 @@ async fn emr_revokes_only_its_own_ingress_when_the_cluster_is_terminated() {
     .await;
     let after = inbound_atoms(&emulator, &groups).await;
     assert_eq!(
-        after, declared,
-        "after the shutdown only the caller's own rules may remain; unexpected {:?}, missing \
-         {:?}",
-        after.difference(&declared).collect::<Vec<_>>(),
-        declared.difference(&after).collect::<Vec<_>>(),
+        after, while_running,
+        "the shutdown must leave the groups' rules exactly as they were; unexpected {:?}, \
+         missing {:?}",
+        after.difference(&while_running).collect::<Vec<_>>(),
+        while_running.difference(&after).collect::<Vec<_>>(),
+    );
+    assert!(
+        declared.is_subset(&after),
+        "and the caller's own rules are among them, got {after:?}"
     );
 }
 
 /// And a cluster that shuts ITSELF down — the clock's own shutdown, which no call asked for —
-/// has them taken off just the same.
+/// leaves them just the same.
 #[tokio::test]
-async fn emr_revokes_its_ingress_when_the_cluster_terminates_itself() {
+async fn emr_leaves_its_ingress_in_place_when_the_cluster_terminates_itself() {
     let emulator = emulator();
     let (vpc_id, subnet_id) = network(&emulator).await;
     let primary = security_group(&emulator, &vpc_id, "emr-primary").await;
@@ -533,29 +538,21 @@ async fn emr_revokes_its_ingress_when_the_cluster_terminates_itself() {
     )
     .await;
     let groups = vec![primary.clone(), core.clone()];
-    // Read the state and the rules TOGETHER: this cluster's shutdown is owed by the clock, so
-    // on a host slow enough it can already be under way by the time this reads, and a cluster
-    // that has begun shutting down is one whose rules have been taken off — the very rule this
-    // case is about. The rules of a cluster that is still up are asserted here and, with no
-    // shutdown owed at all, by the cases above.
-    let state = cluster_state(&emulator, &cluster_id).await;
+    // The rules are written as the cluster comes up, so they are there from the launch on,
+    // whatever the clock has done with the cluster since.
     let while_up = inbound_atoms(&emulator, &groups).await;
-    if !state.starts_with("TERMINAT") {
-        assert!(
-            !while_up.is_empty(),
-            "a cluster that is {state:?} must carry the rules Amazon EMR authorized onto its \
-             managed groups"
-        );
-    }
+    assert!(
+        !while_up.is_empty(),
+        "the launch must have carried Amazon EMR's rules onto its managed groups"
+    );
 
     // Looked for until the deadline passes rather than waited out: the shutdown is the
-    // clock's, and the rules go with it.
+    // clock's. The rules do NOT go with it.
     let deadline = Instant::now() + WAIT_DEADLINE;
-    let (state, remaining) = loop {
+    let state = loop {
         let state = cluster_state(&emulator, &cluster_id).await;
-        let remaining = inbound_atoms(&emulator, &groups).await;
-        if (state == "TERMINATED" && remaining.is_empty()) || Instant::now() >= deadline {
-            break (state, remaining);
+        if state == "TERMINATED" || Instant::now() >= deadline {
+            break state;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
@@ -563,15 +560,19 @@ async fn emr_revokes_its_ingress_when_the_cluster_terminates_itself() {
         state, "TERMINATED",
         "the transient cluster must shut itself down, got {state:?}"
     );
-    assert!(
-        remaining.is_empty(),
-        "a cluster that shut itself down must leave no rule of its own behind, got \
-         {remaining:?}"
+    let remaining = inbound_atoms(&emulator, &groups).await;
+    assert_eq!(
+        remaining, while_up,
+        "a cluster that shut itself down must leave the groups' rules exactly as they were; \
+         unexpected {:?}, missing {:?}",
+        remaining.difference(&while_up).collect::<Vec<_>>(),
+        while_up.difference(&remaining).collect::<Vec<_>>(),
     );
 }
 
 /// The rules Amazon EMR adds are a live dependency of the groups they reference: a group is
-/// undeletable while they are there, and deletable once the cluster has shut down.
+/// undeletable while they are there, and they are still there once the cluster has shut down,
+/// so the delete stays refused until their owner revokes them.
 #[tokio::test]
 async fn the_managed_groups_cannot_be_deleted_while_emrs_rules_reference_them() {
     let emulator = emulator();
@@ -615,17 +616,26 @@ async fn the_managed_groups_cannot_be_deleted_while_emrs_rules_reference_them() 
         json!({ "JobFlowIds": [cluster_id] }),
     )
     .await;
+    // The shutdown took nothing off the groups, so the dependency is still there: the delete
+    // is refused the same way until the groups' OWNER revokes the rules, which is what
+    // `all/managed_security_group_teardown.rs` drives end to end.
     for group_id in [&primary, &core] {
-        let deleted = emulator
+        let refused = emulator
             .ec2
             .delete_security_group()
             .group_id(group_id)
             .send()
-            .await;
-        assert!(
-            deleted.is_ok(),
-            "case {group_id:?}: once Amazon EMR's rules are revoked the group must delete, \
-             got {deleted:?}"
+            .await
+            .expect_err("a shut-down cluster's rules still hold the groups they reference");
+        let code = refused
+            .as_service_error()
+            .and_then(::aws_sdk_ec2::error::ProvideErrorMetadata::code)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            code, "DependencyViolation",
+            "case {group_id:?}: the delete must still be refused after the shutdown, got \
+             {code:?}"
         );
     }
 }

@@ -444,9 +444,9 @@ pub fn drive_cluster_clock<Eng: Send + Sync + 'static>(
             ::tokio::time::sleep(wait).await;
             state.lock().advance_all(SystemTime::now());
             publish_pending(&callback, &*engine, &region).await;
-            // A transition the clock just materialised can also be one the groups Amazon EMR
-            // manages for the cluster are owed a change for — the shutdown of a cluster that
-            // terminates itself is owed to nobody's call — so what is then due is made in
+            // A transition the clock just materialised can also be the first state of a
+            // cluster nobody's call launched into — the groups its launch handed Amazon EMR
+            // are owed their ingress from that state on — so what is then due is written in
             // Amazon EC2 from here too, with no guard held.
             settle_managed_security_groups(&callback, &*engine, &region).await;
         }

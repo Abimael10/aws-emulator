@@ -906,8 +906,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The groups the launch handed Amazon EMR to MANAGE are provisioned first, so the
         // rules the cluster's nodes need are on those groups before the nodes come up: the
         // ingress Amazon EMR authorizes onto them is written in the service that owns security
-        // group rules ([`crate::state::settle_managed_security_groups`]), and taken off again
-        // when this cluster shuts down.
+        // group rules ([`crate::state::settle_managed_security_groups`]), where it then stays:
+        // the groups are the caller's, so removing those rules is the caller's own revoke.
         crate::state::settle_managed_security_groups(ctx.callback(), &*self.engine, &region).await;
         let launched = match &planned {
             Some((launches, placement)) => {

@@ -266,12 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         crate::state::terminate_cluster_instances(ctx, &region, &released_instances).await;
         crate::state::release_cluster_placement_groups(ctx, &region, &released_groups).await;
-        // And the ingress Amazon EMR authorized onto the security groups it manages for those
-        // clusters: a cluster that is shutting down no longer needs the paths between its
-        // nodes, so the rules Amazon EMR added are taken back off the groups it was handed —
-        // leaving whatever the caller declared on them untouched
+        // The ingress Amazon EMR authorized onto the security groups it was handed is NOT
+        // among what a shutdown releases: those groups are the caller's, so the rules stay on
+        // them and revoking them is the caller's own call
         // ([`crate::state::settle_managed_security_groups`]).
-        crate::state::settle_managed_security_groups(ctx.callback(), &*self.engine, &region).await;
 
         // A cluster this call did not move — one already shutting down or already gone,
         // which keeps the repeated request a success — changed nothing, so there is

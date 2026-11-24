@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ingress Amazon EMR AUTHORIZES onto the security groups it manages for a cluster, and
-//! revokes again when that cluster shuts down.
+//! The ingress Amazon EMR AUTHORIZES onto the security groups it manages for a cluster.
 //!
 //! One concern of this service's state. A launch hands Amazon EMR the groups it is to manage
 //! — "the identifier of the Amazon EC2 security group for the master node", "for the core and
@@ -17,9 +16,9 @@
 //! the service-access group).
 //!
 //! Those rules are not this service's resource: a security group rule belongs to Amazon EC2
-//! and is written THERE, over the in-process callback
-//! ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
-//! service's crate — the same grounding [`super::studio_network`] and
+//! and to the account that owns the group, and it is written THERE, over the in-process
+//! callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no
+//! other service's crate — the same grounding [`super::studio_network`] and
 //! [`super::cluster_instances`] follow. What a caller then reads back with
 //! `ec2:DescribeSecurityGroups` are rules Amazon EC2 itself holds, which is also what makes
 //! them a live dependency of the groups: a group another group's rule references cannot be
@@ -30,15 +29,18 @@
 //! 1. **which groups** — the ones the cluster's own record names
 //!    ([`ManagedSecurityGroups::of`]); a cluster whose launch named none has no managed group
 //!    for this service to write to, and nothing is written anywhere.
-//! 2. **which rules** — one catalogue ([`managed_ingress`]), so the authorize and the revoke
-//!    cannot disagree about what Amazon EMR adds.
+//! 2. **which rules** — one catalogue ([`managed_ingress`]), so what Amazon EMR adds is
+//!    stated in exactly one place.
 //! 3. **when** — the cluster's own lifecycle
-//!    ([`ComAmazonawsEmrElasticmapreduceState::record_cluster_managed_group_changes`]): a
-//!    cluster being provisioned has its rules authorized, and a cluster that has begun
-//!    shutting down has them revoked, whoever moved it there.
-//! 4. **what was really written** — the grants Amazon EC2 ACCEPTED, kept per cluster
-//!    ([`ComAmazonawsEmrElasticmapreduceState::managed_group_rules`]), so the shutdown
-//!    revokes exactly the rules Amazon EMR itself added and never one the caller declared.
+//!    ([`ComAmazonawsEmrElasticmapreduceState::record_cluster_managed_group_changes`]): the
+//!    rules are authorized ONCE, as the cluster is provisioned, whoever moved it there.
+//!    Nothing takes them off again: the groups belong to the CALLER, so a rule written onto
+//!    one of them stays there once the cluster that occasioned it has gone, and removing it
+//!    is the caller's own `ec2:RevokeSecurityGroupIngress` — which is why the documented
+//!    teardown of a cluster's managed groups is to revoke those rules and only then delete
+//!    the groups (Amazon EMR Management Guide, "Control network traffic with security
+//!    groups"). A caller that revokes them while the cluster is still up is not overruled
+//!    either: the authorization is owed once per cluster and is not written again.
 
 use super::*;
 
@@ -71,10 +73,9 @@ const SERVICE_ACCESS_TO_NODES_PORT: i32 = 8_443;
 /// group).
 const NODES_TO_SERVICE_ACCESS_PORT: i32 = 9_443;
 
-/// How many authorizations and revocations may wait to be made in Amazon EC2 before the
-/// oldest is dropped: a backstop on this process's memory. One cluster is owed one
-/// authorization and one revocation ever, and the cluster map is bounded
-/// ([`MAX_CLUSTERS`]), so this is far above what can really queue.
+/// How many authorizations may wait to be made in Amazon EC2 before the oldest is dropped: a
+/// backstop on this process's memory. One cluster is owed one authorization ever, and the
+/// cluster map is bounded ([`MAX_CLUSTERS`]), so this is far above what can really queue.
 const MAX_PENDING_MANAGED_GROUP_ACTIONS: usize = 2 * MAX_CLUSTERS;
 
 /// The security groups Amazon EMR manages for one cluster, as that cluster's record names
@@ -205,92 +206,67 @@ pub fn managed_ingress(groups: &ManagedSecurityGroups) -> Vec<ManagedGroupGrant>
     grants
 }
 
-/// What this service has done to the groups it manages for one cluster, which is what decides
-/// whether there is anything to do next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedGroupPhase {
-    /// Amazon EMR has written its rules onto the cluster's managed groups.
-    Authorized,
-    /// It has taken them off again, because the cluster is shutting down or gone.
-    Revoked,
-}
-
-/// One authorization or revocation waiting to be made in Amazon EC2.
+/// One authorization waiting to be made in Amazon EC2.
 #[derive(Debug, Clone)]
 pub struct ManagedGroupAction {
-    /// The cluster whose groups it is about, which is what the result is recorded under.
+    /// The cluster whose groups it is about, which is what a refused write is reported
+    /// against.
     pub cluster_id: String,
-    /// Which way the rules go.
-    pub phase: ManagedGroupPhase,
-    /// The grants to write, or the ones really written that are now to be removed.
+    /// The grants to write.
     pub grants: Vec<ManagedGroupGrant>,
 }
 
-/// The phase the groups of a cluster in `cluster_state` are owed, or `None` when that state
-/// owes them nothing.
+/// Whether a cluster in `cluster_state` is one whose managed groups Amazon EMR writes its
+/// rules onto.
 ///
 /// A cluster is being PROVISIONED from the moment it is launched — its nodes come up behind
-/// these groups — so the rules are owed from its first state on; a cluster that has begun
-/// shutting down has released its capacity, so they are owed removal from the first state of
-/// its shutdown on.
-fn owed_phase(cluster_state: &str) -> Option<ManagedGroupPhase> {
-    match cluster_state {
+/// these groups — so the rules are owed from its first state on. A cluster that has begun
+/// shutting down owes nothing: the rules it was launched with are already there, and they are
+/// not taken off again (this module's docs).
+fn owes_authorization(cluster_state: &str) -> bool {
+    matches!(
+        cluster_state,
         cluster_state::STARTING
-        | cluster_state::BOOTSTRAPPING
-        | cluster_state::RUNNING
-        | cluster_state::WAITING => Some(ManagedGroupPhase::Authorized),
-        cluster_state::TERMINATING
-        | cluster_state::TERMINATED
-        | cluster_state::TERMINATED_WITH_ERRORS => Some(ManagedGroupPhase::Revoked),
-        _ => None,
-    }
+            | cluster_state::BOOTSTRAPPING
+            | cluster_state::RUNNING
+            | cluster_state::WAITING
+    )
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
-    /// Queue the authorization or revocation every cluster whose managed groups are not in
-    /// the phase its state owes them is owed, as of the states the store now holds.
+    /// Queue the authorization every cluster whose managed groups have not had Amazon EMR's
+    /// rules written onto them yet is owed, as of the states the store now holds.
     ///
     /// The comparison is against what was really DONE rather than against who moved the
-    /// cluster, so a shutdown the clock materialised on a read is followed by the same revoke
-    /// a `TerminateJobFlows` is, and nothing is authorized or revoked twice. A cluster this
-    /// store no longer holds cannot move again, so its entries go with it.
+    /// cluster, so a cluster the clock moved into its first state is provisioned exactly like
+    /// one a `RunJobFlow` did, and nothing is authorized twice — not when the cluster moves
+    /// on, and not when the caller revokes a rule of its own accord. A cluster this store no
+    /// longer holds cannot move again, so its entry goes with it.
     ///
-    /// A cluster that reached its shutdown without anything having been authorized for it has
-    /// nothing to revoke: the phase is recorded and NO revocation is queued, which is what
-    /// keeps this service from removing a rule its caller declared.
+    /// Nothing is ever queued the other way: the rules sit on the CALLER's groups, so they
+    /// stay there when the cluster shuts down and revoking them is the caller's own call
+    /// (this module's docs).
     pub fn record_cluster_managed_group_changes(&mut self) {
         let clusters = &self.clusters;
-        self.managed_group_phases
-            .retain(|cluster_id, _| clusters.contains_key(cluster_id));
-        self.managed_group_rules
-            .retain(|cluster_id, _| clusters.contains_key(cluster_id));
-        let mut observed: Vec<(String, ManagedGroupPhase, Vec<ManagedGroupGrant>)> = Vec::new();
+        self.managed_groups_authorized
+            .retain(|cluster_id| clusters.contains_key(cluster_id));
+        let mut observed: Vec<(String, Vec<ManagedGroupGrant>)> = Vec::new();
         for cluster in self.clusters.values() {
-            let Some(phase) = owed_phase(&cluster.status.state) else {
-                continue;
-            };
-            if self.managed_group_phases.get(&cluster.id) == Some(&phase) {
+            if !owes_authorization(&cluster.status.state)
+                || self.managed_groups_authorized.contains(&cluster.id)
+            {
                 continue;
             }
-            let grants = match phase {
-                ManagedGroupPhase::Authorized => {
-                    managed_ingress(&ManagedSecurityGroups::of(cluster))
-                }
-                // Exactly what Amazon EC2 accepted for this cluster, so a shutdown removes
-                // the rules Amazon EMR added and nothing else.
-                ManagedGroupPhase::Revoked => self
-                    .managed_group_rules
-                    .get(&cluster.id)
-                    .cloned()
-                    .unwrap_or_default(),
-            };
-            observed.push((cluster.id.clone(), phase, grants));
+            observed.push((
+                cluster.id.clone(),
+                managed_ingress(&ManagedSecurityGroups::of(cluster)),
+            ));
         }
-        for (cluster_id, phase, grants) in observed {
-            self.managed_group_phases.insert(cluster_id.clone(), phase);
+        for (cluster_id, grants) in observed {
+            self.managed_groups_authorized.insert(cluster_id.clone());
             if grants.is_empty() {
-                // Nothing to write and nothing that was written: the phase is reached
-                // already, so no call is queued for it.
+                // A cluster whose launch handed Amazon EMR no group to manage: there is
+                // nothing to write, so no call is queued for it.
                 continue;
             }
             if self.pending_managed_group_actions.len() >= MAX_PENDING_MANAGED_GROUP_ACTIONS {
@@ -305,7 +281,6 @@ impl ComAmazonawsEmrElasticmapreduceState {
             }
             self.pending_managed_group_actions.push(ManagedGroupAction {
                 cluster_id,
-                phase,
                 grants,
             });
         }
@@ -317,22 +292,6 @@ impl ComAmazonawsEmrElasticmapreduceState {
     /// change twice.
     fn take_managed_group_actions(&mut self) -> Vec<ManagedGroupAction> {
         ::std::mem::take(&mut self.pending_managed_group_actions)
-    }
-
-    /// Record the grants Amazon EC2 accepted for `cluster_id`, which is what its shutdown
-    /// will revoke.
-    fn record_managed_group_rules(&mut self, cluster_id: &str, written: Vec<ManagedGroupGrant>) {
-        if written.is_empty() {
-            self.managed_group_rules.remove(cluster_id);
-            return;
-        }
-        self.managed_group_rules
-            .insert(cluster_id.to_string(), written);
-    }
-
-    /// Forget the grants of `cluster_id`, because they have been revoked.
-    fn forget_managed_group_rules(&mut self, cluster_id: &str) {
-        self.managed_group_rules.remove(cluster_id);
     }
 }
 
@@ -355,19 +314,17 @@ fn ip_permission(grant: &ManagedGroupGrant) -> ::aws_sdk_ec2::types::IpPermissio
         .build()
 }
 
-/// Write one grant to Amazon EC2, answering the grant as it was really accepted — or `None`
-/// when none of it was.
+/// Write one grant to Amazon EC2.
 ///
 /// A rule the group ALREADY holds is refused by Amazon EC2 for the whole call
 /// (`InvalidPermission.Duplicate` names the request, not one of its sources), so a grant that
 /// was refused as a whole is retried one source at a time: a group that already admits one of
-/// the cluster's node groups still gains the others, and what is answered is the set of
-/// sources this call is responsible for. A rule that was already there is NOT one Amazon EMR
-/// added, so it is not part of the answer and the shutdown leaves it alone.
+/// the cluster's node groups still gains the others.
 async fn authorize_grant(
     client: &::aws_sdk_ec2::Client,
+    cluster_id: &str,
     grant: &ManagedGroupGrant,
-) -> Option<ManagedGroupGrant> {
+) {
     let whole = client
         .authorize_security_group_ingress()
         .group_id(&grant.group_id)
@@ -375,17 +332,17 @@ async fn authorize_grant(
         .send()
         .await;
     match whole {
-        Ok(_) => return Some(grant.clone()),
+        Ok(_) => return,
         Err(error) => ::tracing::debug!(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            cluster_id = %cluster_id,
             group_id = %grant.group_id,
             "Amazon EC2 did not authorize this cluster's managed ingress as one rule"
         ),
     }
     if grant.source_group_ids.len() < 2 {
-        return None;
+        return;
     }
-    let mut accepted: Vec<String> = Vec::new();
     for source_group_id in &grant.source_group_ids {
         let single = ManagedGroupGrant {
             source_group_ids: vec![source_group_id.clone()],
@@ -397,46 +354,25 @@ async fn authorize_grant(
             .ip_permissions(ip_permission(&single))
             .send()
             .await;
-        match answer {
-            Ok(_) => accepted.push(source_group_id.clone()),
-            Err(error) => ::tracing::debug!(
+        if let Err(error) = answer {
+            ::tracing::debug!(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                cluster_id = %cluster_id,
                 group_id = %grant.group_id,
                 "Amazon EC2 did not authorize this one source of a managed ingress rule"
-            ),
+            );
         }
     }
-    (!accepted.is_empty()).then(|| ManagedGroupGrant {
-        source_group_ids: accepted,
-        ..grant.clone()
-    })
 }
 
-/// Take one grant back off the group it was written to.
-async fn revoke_grant(client: &::aws_sdk_ec2::Client, grant: &ManagedGroupGrant) {
-    let answer = client
-        .revoke_security_group_ingress()
-        .group_id(&grant.group_id)
-        .ip_permissions(ip_permission(grant))
-        .send()
-        .await;
-    if let Err(error) = answer {
-        ::tracing::debug!(
-            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-            group_id = %grant.group_id,
-            "Amazon EC2 did not revoke this cluster's managed ingress"
-        );
-    }
-}
-
-/// Make every change this store's clusters have made due to the groups Amazon EMR manages for
-/// them, and leave the queue empty.
+/// Make every authorization this store's clusters have made due onto the groups Amazon EMR
+/// manages for them, and leave the queue empty.
 ///
 /// Called with NO guard held: the queue is recorded and taken out in one critical section, so
 /// nothing is written twice, and the Amazon EC2 calls run with the guard released — a call
 /// into another service is never made while this service's store is locked.
 ///
-/// A call Amazon EC2 refused, and one that reached no Amazon EC2 at all, is recorded and
+/// A call Amazon EC2 refused, and one that reached no Amazon EC2 at all, is logged and
 /// otherwise left alone: the cluster's own lifecycle is this service's to move and does not
 /// depend on the answer.
 ///
@@ -461,24 +397,8 @@ pub async fn settle_managed_security_groups<Eng: Send + Sync + 'static>(
     }
     let client = studio_network::ec2_client_over(callback, region);
     for action in actions {
-        match action.phase {
-            ManagedGroupPhase::Authorized => {
-                let mut written: Vec<ManagedGroupGrant> = Vec::new();
-                for grant in &action.grants {
-                    if let Some(accepted) = authorize_grant(&client, grant).await {
-                        written.push(accepted);
-                    }
-                }
-                state
-                    .lock()
-                    .record_managed_group_rules(&action.cluster_id, written);
-            }
-            ManagedGroupPhase::Revoked => {
-                for grant in &action.grants {
-                    revoke_grant(&client, grant).await;
-                }
-                state.lock().forget_managed_group_rules(&action.cluster_id);
-            }
+        for grant in &action.grants {
+            authorize_grant(&client, &action.cluster_id, grant).await;
         }
     }
 }
