@@ -22,9 +22,10 @@
 //!   refusal states;
 //! * an absent workload or pattern is a 404 whose message echoes nothing of the request;
 //! * every version BOTH views report carries the capability block — one entry per
-//!   optional deployment capability with that capability's status, plus the versions an
-//!   update can reach the version from — and the targets it names are exactly the ones
-//!   the `updateFromVersion` filter selects by.
+//!   optional deployment capability with that capability's status, plus the update path
+//!   the version publishes — and that path follows the modify capability the version
+//!   publishes: empty where a deployment of it is not modified after it was created, and
+//!   otherwise the versions the `updateFromVersion` filter selects for it.
 
 use std::collections::BTreeSet;
 
@@ -785,66 +786,66 @@ async fn both_version_views_report_the_capability_block_of_every_published_versi
 }
 
 #[tokio::test]
-async fn the_update_targets_a_version_reports_are_the_ones_the_filter_selects_by() {
+async fn the_update_path_a_version_publishes_follows_the_capability_it_publishes() {
     let harness = Harness::new();
-    let whole = published();
     for (workload, pattern) in every_pattern(&harness).await {
         let base = list_body(&workload, &pattern);
         for version in CATALOGUE_PATTERN_VERSIONS {
             let case = format!("{workload}/{pattern}@{version}");
             let read = get_version(&harness, &case, &workload, &pattern, version).await;
-            let targets = update_targets(&case, &capability_block(&case, &read));
+            let flags = capability_block(&case, &read);
+            let path = update_targets(&case, &flags);
 
-            // An update moves a deployment onto a published version it is not already on,
-            // so the versions this one can be reached FROM are every other published
-            // version of the pattern — the rule `UpdateDeployment` applies.
-            let expected: BTreeSet<String> = whole
-                .iter()
-                .filter(|published| published.as_str() != *version)
-                .cloned()
-                .collect();
+            // The versions an update can move a deployment that deploys THIS version
+            // onto: the page the filter that asks exactly that question selects.
+            let selected: BTreeSet<String> = names(
+                &case,
+                &listed(&harness, &case, with(&base, "filters", update_from(&[version]))).await,
+            )
+            .into_iter()
+            .collect();
+            // The update path a version publishes follows the capability it publishes:
+            // a version a deployment of which is not modified after it was created
+            // publishes no path at all, and one that is publishes the versions an update
+            // moves a deployment on it onto.
+            let modifiable = flags["modifyDeployments"]["status"] == json!(CAPABILITY_ENABLED);
+            let expected = if modifiable {
+                selected.clone()
+            } else {
+                BTreeSet::new()
+            };
             assert_eq!(
-                targets, expected,
-                "case {case:?}: expected the versions an update can reach this one from \
-                 {expected:?}, got {targets:?}"
+                path, expected,
+                "case {case:?}: a version whose modify capability is {modifiable} must \
+                 publish the update path {expected:?}, got {path:?}"
             );
 
-            // Each target is a version this pattern publishes, and the filter that
-            // selects by the SAME rule answers this version for it — the block and the
-            // filter are two reports of one rule, so neither names a move the other
-            // refuses.
-            for from in &targets {
-                let case = format!("{case} from {from}");
-                get_version(&harness, &case, &workload, &pattern, from).await;
-                let selected: BTreeSet<String> = names(
-                    &case,
-                    &listed(&harness, &case, with(&base, "filters", update_from(&[from]))).await,
-                )
-                .into_iter()
-                .collect();
-                assert!(
-                    selected.contains(*version),
-                    "case {case:?}: the filter must select this version for a version it \
-                     names as a target, got {selected:?}"
+            // Whatever the path names is a version this pattern really publishes, and
+            // never the version itself: a published path cannot name a move that resolves
+            // to nothing or that moves no version at all.
+            for named in &path {
+                let case = format!("{case} onto {named}");
+                get_version(&harness, &case, &workload, &pattern, named).await;
+                assert_ne!(
+                    named.as_str(),
+                    *version,
+                    "case {case:?}: the published path must not name the version itself"
                 );
             }
 
-            // And a starting version the block does NOT name — the version itself, and
-            // one the pattern does not publish — selects this version for nobody.
-            for from in [(*version).to_string(), "9.9.9".to_string()] {
-                let case = format!("{case} from the unnamed {from}");
-                let selected: BTreeSet<String> = names(
-                    &case,
-                    &listed(&harness, &case, with(&base, "filters", update_from(&[&from]))).await,
-                )
-                .into_iter()
-                .collect();
-                assert!(
-                    !selected.contains(*version),
-                    "case {case:?}: a starting version the block does not name must not \
-                     select this version, got {selected:?}"
-                );
-            }
+            // A starting version the pattern does not publish names no deployment of it,
+            // so it selects nothing rather than widening the page.
+            let unknown: BTreeSet<String> = names(
+                &case,
+                &listed(&harness, &case, with(&base, "filters", update_from(&["9.9.9"]))).await,
+            )
+            .into_iter()
+            .collect();
+            assert!(
+                unknown.is_empty(),
+                "case {case:?}: an unpublished starting version must select nothing, got \
+                 {unknown:?}"
+            );
         }
     }
 }

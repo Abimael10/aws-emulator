@@ -227,7 +227,8 @@ impl ::aws_smithy_schema_server::DeserializableStruct for DeploymentPatternVersi
 }
 
 /// The optional deployment capabilities ONE deployment pattern version supports: one
-/// entry per capability, plus the versions an update can reach this version from.
+/// entry per capability, plus the versions an update can move a deployment onto from
+/// this version.
 ///
 /// A structure the wire carries on a version summary and the on-disk model does not
 /// declare at all, so its schema and codec are written out here (see this module's note).
@@ -243,8 +244,9 @@ pub struct DeploymentPatternVersionFeatureFlags {
     /// Whether a deployment of this version runs steps after the deployment itself
     /// finished.
     pub post_deployment_steps: DeploymentPatternVersionCapability,
-    /// The versions an update can move a deployment onto this version FROM, newest
-    /// first; empty when no version of the pattern can be updated to this one.
+    /// The versions an update can move a deployment onto FROM this version, newest
+    /// first; empty when an update can move a deployment on from this version onto
+    /// nothing.
     pub update_from_version: Vec<String>,
 }
 

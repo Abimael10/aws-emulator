@@ -37,6 +37,9 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one `mod <name>;` per `tests/all/<name>.rs`, so the single integration-test
+# target picks a new suite up from its file.
+automod = { workspace = true }
 # Tests forge a pagination token with the same encoding `state::encode_token` issues
 # one with, rather than hand-rolling hex beside it.
 hex = { workspace = true }

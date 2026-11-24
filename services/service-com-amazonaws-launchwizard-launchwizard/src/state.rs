@@ -375,6 +375,11 @@ pub struct PatternVersion {
     pub version_name: String,
     /// `DeploymentPatternVersionDataSummary$description`.
     pub description: String,
+    /// Which OPTIONAL deployment capabilities a deployment of THIS version has, as the
+    /// catalogue publishes them for it — carried on the version's own record so one
+    /// version can publish a capability another does not, and reported as it stands by
+    /// both version views (see [`pattern_version_capabilities`]).
+    pub capabilities: pattern_version_capabilities::VersionCapabilities,
 }
 
 /// A deployment pattern of a workload, in the seeded, read-only catalogue.
@@ -478,10 +483,11 @@ impl DeploymentPattern {
     /// version (it is what `WorkloadData$documentationUrl` reports), so the member is
     /// left out rather than filled with the document of another resource.
     ///
-    /// `featureFlags` states which optional deployment capabilities the version supports,
-    /// projected from what this emulator serves for a deployment of it
-    /// ([`pattern_version_capabilities::feature_flags`]) rather than stored beside the
-    /// version, so the block cannot claim a capability nothing here serves.
+    /// `featureFlags` states which optional deployment capabilities the version supports:
+    /// the statuses the version's own catalogue record publishes, plus the versions an
+    /// update can move a deployment onto from it, which is the service's own update-target
+    /// rule rather than a second list beside it
+    /// ([`pattern_version_capabilities::feature_flags`]).
     fn summary_of(&self, version: &PatternVersion) -> DeploymentPatternVersionDataSummary {
         DeploymentPatternVersionDataSummary {
             deployment_pattern_version_name: Some(version.version_name.clone()),
@@ -489,10 +495,7 @@ impl DeploymentPattern {
             documentation_url: None,
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
-            feature_flags: Some(pattern_version_capabilities::feature_flags(
-                self,
-                &version.version_name,
-            )),
+            feature_flags: Some(pattern_version_capabilities::feature_flags(self, version)),
         }
     }
 
@@ -504,9 +507,9 @@ impl DeploymentPattern {
     /// published version is one a deployment can be moved onto — except the one it
     /// already deploys, which moves no version at all. `UpdateDeployment` answers each
     /// variant with the error the model gives that kind of failure, and
-    /// [`DeploymentPattern::is_update_target`] — what the read that reports a
-    /// deployment's update targets answers from — selects exactly the versions this
-    /// returns `None` for, so the two cannot disagree about one version.
+    /// [`DeploymentPattern::is_update_target`] — what the `updateFromVersion` filter of
+    /// the version listing selects by — selects exactly the versions this returns `None`
+    /// for, so the two cannot disagree about one version.
     pub fn update_target_refusal(
         &self,
         from_version: &str,
@@ -531,6 +534,23 @@ impl DeploymentPattern {
     pub fn is_update_target(&self, from_version: &str, version: &str) -> bool {
         self.version(from_version).is_some()
             && self.update_target_refusal(from_version, version).is_none()
+    }
+
+    /// The versions an update can move a deployment that currently deploys
+    /// `from_version` onto, in catalogue order (newest first).
+    ///
+    /// The ONE answer to "what can a deployment on this version be updated to": the page
+    /// the `updateFromVersion` filter of the version listing selects for a starting
+    /// version, and the update path a version's capability block publishes where the
+    /// version publishes the capability to be modified at all
+    /// ([`pattern_version_capabilities::feature_flags`]), both come from here, so neither
+    /// names a move [`DeploymentPattern::update_target_refusal`] refuses.
+    pub fn update_targets_from(&self, from_version: &str) -> Vec<String> {
+        self.versions
+            .iter()
+            .filter(|candidate| self.is_update_target(from_version, &candidate.version_name))
+            .map(|candidate| candidate.version_name.clone())
+            .collect()
     }
 
     /// This pattern as the `WorkloadDeploymentPatternDataSummary`
@@ -2212,6 +2232,10 @@ fn seeded_pattern_versions(pattern_description: &str) -> Vec<PatternVersion> {
             description: format!(
                 "Version {version_name} of this deployment pattern. {pattern_description}"
             ),
+            // What the catalogue publishes about the version's OPTIONAL capabilities,
+            // carried on the version itself (see
+            // [`pattern_version_capabilities::published_capabilities`]).
+            capabilities: pattern_version_capabilities::published_capabilities(),
         })
         .collect()
 }
