@@ -433,10 +433,24 @@ async fn the_unrouted_ingest_path_is_refused_by_the_address_alone_and_ingests_no
                     faults[0]
                 );
             }
-            None => assert!(
+            // A session the plane SERVED: an in-band fault is an acknowledgement inside
+            // the session's own 200, so a served session that carries none must show no
+            // ERROR acknowledgement at all.
+            None if served_status == 200 => assert!(
                 !acknowledged.iter().any(|event| event == "ERROR"),
                 "case {case:?} at the announced write origin: expected no in-band fault, \
                  got {acknowledged:?}"
+            ),
+            // A session REFUSED at the request level is answered out of band, as the HTTP
+            // error it is: the one error acknowledgement in that body IS the refusal, which
+            // states its class in the error-type field asserted above, so the body carries
+            // that and nothing else.
+            None => assert_eq!(
+                acknowledged,
+                vec!["ERROR".to_string()],
+                "case {case:?} at the announced write origin: expected the refusal's own \
+                 error acknowledgement and nothing else, got {acknowledged:?} {}",
+                text(&response)
             ),
         }
 

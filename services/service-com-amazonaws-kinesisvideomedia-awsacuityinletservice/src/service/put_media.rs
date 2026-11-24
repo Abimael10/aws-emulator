@@ -53,11 +53,13 @@
 //!   not buffer the stream it is handed and so has no body to hash: a request that
 //!   declares none carries a signature over a payload nothing can check, which is
 //!   refused as the signature failure it is;
-//! - the stream the request names has to be the stream the ADDRESS it arrived on was
-//!   announced for ([`serves_the_addressed_stream`]): `GetDataEndpoint` resolves an
-//!   endpoint for the stream the discovery call named, so an ingest address is that one
-//!   stream's and a request naming any other used the wrong endpoint, refused with the
-//!   class this family declares for exactly that ([`crate::service::wrong_endpoint`]).
+//! - the stream the request names has to RESOLVE on the address it arrived on
+//!   ([`serves_the_addressed_stream`]): `GetDataEndpoint` resolves an endpoint for the
+//!   stream the discovery call named, so an ingest address is that one stream's and the
+//!   only identifier that names a stream there is that stream's own — a session naming
+//!   another stream of the account, or an identifier the registry holds nothing for,
+//!   resolves to no stream this host serves and is refused as the unresolvable stream it
+//!   is ([`stream_not_found`]), with nothing taken from its container.
 //!
 //! Every accepted Cluster is persisted through
 //! [`crate::state::ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::ingest_fragment`],
@@ -126,8 +128,9 @@ const ERROR_TYPE_FIELD: &str = "x-amzn-errortype";
 const INVALID_ARGUMENT: &str = "InvalidArgumentException";
 
 /// `ResourceNotFoundException` — "The stream with the given name does not exist" (HTTP
-/// 404), the refusal of an ingest into a stream the control-plane registry does not
-/// hold.
+/// 404), the refusal of an ingest whose stream identifier names no stream this address
+/// serves: one the control-plane registry does not hold, and one that names a stream this
+/// address was not announced for.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// `AccessDeniedException` — the code AWS refuses a call IAM does not permit with (HTTP
@@ -230,8 +233,15 @@ struct Refusal {
 impl Refusal {
     /// This refusal on the wire, in the envelope a Kinesis Video Streams media API
     /// states an error in: the status, the error type field, and a `Message` member.
+    ///
+    /// What a producer reads off this plane is acknowledgements, so a refusal is stated as
+    /// the error acknowledgement it is — the same `EventType` an in-band fault carries —
+    /// while the class itself is stated in the error type field, where a Kinesis Video
+    /// Streams media API states "a more specific error type in addition to what the HTTP
+    /// status code provides".
     fn response(&self) -> RtResponse {
-        let body = ::serde_json::json!({ "Message": self.message }).to_string();
+        let body =
+            ::serde_json::json!({ "EventType": EVENT_ERROR, "Message": self.message }).to_string();
         let mut response = answer(self.status, body);
         response.headers_mut().insert(ERROR_TYPE_FIELD, self.code);
         response
@@ -328,8 +338,8 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             return access_denied(refusal).response();
         }
 
-        // The stream is resolved BEFORE the container is read: a stream nothing
-        // registered is a fault in the request, which is answered as an HTTP error, and
+        // The stream is resolved BEFORE the container is read: a stream this address does
+        // not serve is a fault in the request, which is answered as an HTTP error, and
         // nothing about the submitted media changes that answer. The guard is taken for
         // that resolution alone and released again, so the container is read while no
         // other caller of this service is held up.
@@ -337,15 +347,15 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             .lock()
             .resolve_stream(&*self.engine, name, arn)
             .map(|stream| stream.arn);
-        let Some(stream_arn) = addressed else {
-            return stream_not_found(&session).response();
-        };
-        // And it has to be the stream this ADDRESS serves: an announced ingest endpoint
-        // belongs to the stream it was discovered for, so a session naming another stream
-        // that DID resolve used the wrong endpoint, and is refused the class whose remedy
-        // is to discover that stream's own endpoint and produce there.
-        if !serves_the_addressed_stream(&*self.engine, req, &stream_arn) {
-            return wrong_endpoint().response();
+        // Resolution is scoped to THIS address: an announced ingest endpoint belongs to
+        // the one stream it was discovered for, so that stream's identifiers are the only
+        // ones that name a stream here — another stream of the account and an identifier
+        // the registry holds nothing for alike resolve to no stream this host serves, and
+        // both are the one unresolvable-stream fault.
+        let served_here = addressed
+            .is_some_and(|stream_arn| serves_the_addressed_stream(&*self.engine, req, &stream_arn));
+        if !served_here {
+            return stream_not_found().response();
         }
 
         // Reading the container — up to one request's ceiling of media, re-framed Cluster
@@ -440,7 +450,7 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
             ) else {
                 // The stream resolved a moment ago and no longer does: the control plane
                 // removed it mid-session, which is the same request-level fault.
-                return stream_not_found(&session).response();
+                return stream_not_found().response();
             };
             for event in [EVENT_BUFFERING, EVENT_RECEIVED] {
                 acknowledgements.push(fragment_acknowledgement(
@@ -647,27 +657,19 @@ fn access_denied(message: String) -> Refusal {
     }
 }
 
-/// `ResourceNotFoundException` for the stream this session named.
-fn stream_not_found(_session: &SubmittedSession) -> Refusal {
+/// `ResourceNotFoundException` for a session whose stream identifier names no stream this
+/// ingest address serves: one the registry holds nothing for, and one that names another
+/// stream of the account, are the same unresolvable-stream fault here.
+fn stream_not_found() -> Refusal {
     Refusal {
         status: 404,
         code: RESOURCE_NOT_FOUND,
         // The one sentence this family states for a stream that is not there to serve,
         // held by the archive read plane and stated by the control plane too — fixed text
-        // carrying nothing from the request, as the recorded refusal carries nothing.
+        // carrying nothing from the request, as the recorded refusal carries nothing: the
+        // identifier the session named appears in its own request header and never in the
+        // answer.
         message: archive::STREAM_NOT_FOUND_MESSAGE.to_string(),
-    }
-}
-
-/// `InvalidEndpointException` for a session that resolved its stream at an address
-/// announced for a DIFFERENT one: this plane's envelope carrying the status, the code and
-/// the sentence the class is declared with ([`crate::service::wrong_endpoint`]), which the
-/// modelled read route refuses the same condition with.
-fn wrong_endpoint() -> Refusal {
-    Refusal {
-        status: crate::service::wrong_endpoint::STATUS,
-        code: crate::service::wrong_endpoint::ERROR_CODE,
-        message: crate::service::wrong_endpoint::MESSAGE.to_string(),
     }
 }
 
@@ -711,8 +713,8 @@ const SIGNATURE_NOT_VERIFIED: &str = "The request signature we calculated does n
 ///
 /// A `DataEndpoint` is resolved per stream — `GetDataEndpoint` takes `StreamName`/
 /// `StreamARN` so that "an endpoint for a specified stream" is what it hands back — so the
-/// ingest address a producer was given serves that one stream, and a session naming
-/// another stream on it used the wrong endpoint ([`crate::service::wrong_endpoint`]).
+/// ingest address a producer was given serves that one stream, and a stream it was not
+/// announced for is a stream that does not resolve there ([`stream_not_found`]).
 /// Which stream an address was announced for comes from the control plane that announced
 /// it ([`control_plane::endpoint_serves_stream`]), so an address this emulator published
 /// nothing at carries no stream to check against and nothing here narrows it.

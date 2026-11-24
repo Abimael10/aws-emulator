@@ -8,14 +8,12 @@
 //!
 //! 1. the address belongs to the STREAM it was discovered for — "Gets an endpoint for a
 //!    specified stream for either reading or writing", with the stream named in the
-//!    discovery call's own input — so a session naming another stream of the account used
-//!    the wrong endpoint: refused HTTP 400 `InvalidEndpointException`, the class Kinesis
-//!    Video Media declares for a "caller used wrong endpoint" and whose remedy is to
-//!    re-run `GetDataEndpoint` and produce at the endpoint it reports. A session naming an
-//!    identifier the registry does not hold is the OTHER class, HTTP 404
-//!    `ResourceNotFoundException` with the sentence this family states for a stream that
-//!    is not there to serve: the registry's answer is settled before the address is read
-//!    against it. Either way nothing is persisted to either stream;
+//!    discovery call's own input — so the only identifiers that name a stream there are
+//!    that stream's own: a session naming another stream of the account, and one naming an
+//!    identifier the registry does not hold, alike resolve to no stream this host serves
+//!    and are refused HTTP 404 `ResourceNotFoundException` with the sentence this family
+//!    states for a stream that is not there to serve. Either way nothing is persisted to
+//!    either stream;
 //! 2. the payload hash the producer's signature covers has to be DECLARED in
 //!    `x-amz-content-sha256`, because the ingest front end is handed a stream and never
 //!    buffers a body to hash: a session that declares none carries a signature over
@@ -24,12 +22,14 @@
 //!
 //! Each table spans what its rule generalises over: rule 1 over which stream the session
 //! names and in which identifier form (the host's own by name and by ARN, another active
-//! stream by name and by ARN, a name and an ARN that name nothing); rule 2 over what the
+//! stream by name and by ARN, a name that exists nowhere, a name derived from the host's
+//! own that exists nowhere, and an ARN that names nothing — the last four all one class);
+//! rule 2 over what the
 //! request declares as its payload hash (the unsigned-payload marker, a hex digest of the
 //! body, no header at all, an empty one) and over whether the refusal comes before the
 //! stream is resolved at all.
 
-use crate::ingest_plane_addressing::{event_types, status, text, Harness};
+use crate::ingest_plane_addressing::{error_type, event_types, member, status, text, Harness};
 use crate::put_media_ingest::{cluster, ingest_headers, Container, IngestHeaders};
 
 /// The address the discovery calls in this suite are made at: a client on the machine this
@@ -44,15 +44,18 @@ const CONTENT_SHA256: &str = "x-amz-content-sha256";
 /// found or not active" is the fixed text of the refusal.
 const STREAM_NOT_FOUND: &str = "The requested stream is not found or not active.";
 
-/// The sentence Kinesis Video Media states for a caller that used the wrong endpoint,
-/// written out as the wire carries it rather than read off the code under test: the
-/// documented text of `InvalidEndpointException`
-/// (`smithy_query(query="doc", shape="InvalidEndpointException")`), whose remedy clause is
-/// what a client re-discovers its endpoint on.
-const WRONG_ENDPOINT: &str = "Caller used wrong endpoint to write data to a stream. On \
-                              receiving such an exception, the user must call \
-                              GetDataEndpoint with AccessMode set to \"READ\" and use the \
-                              endpoint Kinesis Video returns in the next GetMedia call.";
+/// The `EventType` an acknowledgement reporting a fault carries, written out as the wire
+/// carries it: what a producer reads off this plane is acknowledgements, so a refusal is
+/// stated as one.
+const ERROR_EVENT_TYPE: &str = "ERROR";
+
+/// The class that states a caller used the WRONG ENDPOINT for the API it called, and the
+/// opening clause of the sentence it is documented with
+/// (`smithy_query(query="doc", shape="InvalidEndpointException")`). No row of rule 1 may
+/// earn it: a producer told to re-discover an endpoint it is already using retries forever
+/// for a stream that will never resolve there.
+const WRONG_ENDPOINT_CLASS: &str = "InvalidEndpointException";
+const WRONG_ENDPOINT_CLAUSE: &str = "Caller used wrong endpoint";
 
 /// The producer clock every session in this suite is stamped from: a whole second, well
 /// behind this machine's clock, so no row is refused for a timestamp that has not happened.
@@ -63,28 +66,6 @@ fn producer_start() -> std::time::SystemTime {
 /// One two-Cluster container, as a producer submits one session's media.
 fn container(marker: u8) -> Vec<u8> {
     Container::of(vec![cluster(0, 2, 20, marker), cluster(1000, 2, 20, marker ^ 0x11)]).bytes()
-}
-
-/// The error code a refusal states, from the field a Kinesis Video media API states one in.
-fn error_code(response: &http::Response<bytes::Bytes>) -> String {
-    response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The `Message` member a refusal carries, or the empty string when it carries none.
-fn message(response: &http::Response<bytes::Bytes>) -> String {
-    serde_json::from_slice::<serde_json::Value>(response.body())
-        .ok()
-        .and_then(|body| {
-            body.get("Message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
 }
 
 /// `headers` with the declared payload hash replaced by `declared`, or removed when it is
@@ -114,6 +95,9 @@ enum Named {
     OtherStreamByArn,
     /// A `StreamName` no stream of this account answers to.
     AbsentName,
+    /// A `StreamName` derived from the endpoint's own, which nothing created — the form a
+    /// producer sends when it builds the name itself.
+    AbsentNeighbourName,
     /// A well-formed `StreamARN` no stream of this account answers to.
     AbsentArn,
 }
@@ -123,10 +107,7 @@ enum Named {
 enum Answer {
     /// The session is admitted and its media taken.
     Served,
-    /// The stream resolved, but at an address announced for another one: the
-    /// wrong-endpoint class.
-    WrongEndpoint,
-    /// The registry holds no such stream at all: the not-found class.
+    /// The identifier names no stream this host serves: the not-found class.
     NotFound,
 }
 
@@ -135,7 +116,6 @@ impl Answer {
     fn refusal(self) -> Option<(u16, &'static str, &'static str)> {
         match self {
             Self::Served => None,
-            Self::WrongEndpoint => Some((400, "InvalidEndpointException", WRONG_ENDPOINT)),
             Self::NotFound => Some((404, "ResourceNotFoundException", STREAM_NOT_FOUND)),
         }
     }
@@ -164,16 +144,21 @@ const ROWS: &[Row] = &[
     Row {
         case: "another active stream of the account, by name",
         named: Named::OtherStreamByName,
-        answer: Answer::WrongEndpoint,
+        answer: Answer::NotFound,
     },
     Row {
         case: "another active stream of the account, by ARN",
         named: Named::OtherStreamByArn,
-        answer: Answer::WrongEndpoint,
+        answer: Answer::NotFound,
     },
     Row {
         case: "a stream name that exists nowhere",
         named: Named::AbsentName,
+        answer: Answer::NotFound,
+    },
+    Row {
+        case: "a name derived from the endpoint's own that exists nowhere",
+        named: Named::AbsentNeighbourName,
         answer: Answer::NotFound,
     },
     Row {
@@ -183,12 +168,12 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// RULE: an announced ingest endpoint serves the ONE stream it was discovered for — a
-/// session naming another stream of the account is refused 400 `InvalidEndpointException`
-/// with the sentence that class carries, a session naming an identifier the registry does
-/// not hold is refused 404 `ResourceNotFoundException` with the sentence this family
-/// states for a stream that is not there to serve, both persist nothing to either stream,
-/// and the endpoint keeps serving its own stream in either identifier form.
+/// RULE: an announced ingest endpoint serves the ONE stream it was discovered for, so a
+/// session naming another stream of the account and a session naming an identifier the
+/// registry does not hold are the one refusal — 404 `ResourceNotFoundException` with the
+/// sentence this family states for a stream that is not there to serve — both persist
+/// nothing to either stream, and the endpoint keeps serving its own stream in either
+/// identifier form.
 #[tokio::test]
 async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
     let harness = Harness::new();
@@ -215,6 +200,7 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
             Named::OtherStreamByName => ("x-amzn-stream-name", other.to_string()),
             Named::OtherStreamByArn => ("x-amzn-stream-arn", other_arn.clone()),
             Named::AbsentName => ("x-amzn-stream-name", "scoped-never-created".to_string()),
+            Named::AbsentNeighbourName => ("x-amzn-stream-name", format!("{own}-absent")),
             Named::AbsentArn => ("x-amzn-stream-arn", absent_arn.clone()),
         };
         // The identical session, differing only in the stream it names.
@@ -260,17 +246,39 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
                 text(&response)
             );
             assert_eq!(
-                error_code(&response),
+                error_type(&response),
                 expected_code,
                 "case {case:?}: expected {expected_code}, got {:?} {}",
-                error_code(&response),
+                error_type(&response),
                 text(&response)
             );
             assert_eq!(
-                message(&response),
+                member(&response, "Message"),
                 expected_message,
                 "case {case:?}: expected that class's own sentence, got {:?}",
-                message(&response)
+                member(&response, "Message")
+            );
+            assert_eq!(
+                member(&response, "EventType"),
+                ERROR_EVENT_TYPE,
+                "case {case:?}: expected the acknowledgement stream's error kind, got {:?} {}",
+                member(&response, "EventType"),
+                text(&response)
+            );
+            // The wrong-endpoint class is for a caller that addressed an endpoint which
+            // serves the API it called not at all: a session whose identifier names no
+            // stream here is not that, and must carry neither that class nor its sentence.
+            assert!(
+                error_type(&response) != WRONG_ENDPOINT_CLASS
+                    && !text(&response).contains(WRONG_ENDPOINT_CLAUSE),
+                "case {case:?}: the refusal must not be the wrong-endpoint class, got {:?} {}",
+                error_type(&response),
+                text(&response)
+            );
+            assert!(
+                !event_types(&response).iter().any(|event| event == "PERSISTED"),
+                "case {case:?}: a refused session acknowledges no fragment, got {}",
+                text(&response)
             );
             assert!(
                 !text(&response).contains(other) && !text(&response).contains("scoped-never"),
@@ -412,10 +420,10 @@ async fn an_ingest_session_declaring_no_payload_hash_is_refused_and_persists_not
                 text(&response)
             );
             assert_eq!(
-                error_code(&response),
+                error_type(&response),
                 "InvalidSignatureException",
                 "case {case:?}: expected the signature-failure class, got {:?} {}",
-                error_code(&response),
+                error_type(&response),
                 text(&response)
             );
             assert!(
@@ -471,10 +479,10 @@ async fn the_signature_is_settled_before_the_stream_the_session_names_is_resolve
             text(&response)
         );
         assert_eq!(
-            error_code(&response),
+            error_type(&response),
             "InvalidSignatureException",
             "case {case:?}: expected the signature-failure class, got {:?} {}",
-            error_code(&response),
+            error_type(&response),
             text(&response)
         );
     }

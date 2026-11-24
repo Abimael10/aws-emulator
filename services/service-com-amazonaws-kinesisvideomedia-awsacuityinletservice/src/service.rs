@@ -85,10 +85,13 @@
 //! an unroutable request instead of the operation — nothing is resolved and nothing is
 //! read.
 //!
-//! An announced address serves ONE stream, too, and both data routes hold a call to that:
-//! a call that resolved its stream at an address announced for a different one used the
-//! wrong endpoint, which is the condition this service's `InvalidEndpointException` is
-//! declared for and which [`wrong_endpoint`] states once for both routes.
+//! An announced address serves ONE stream, too, and both data routes hold a call to that,
+//! each in the vocabulary it answers in: the modelled read refuses a read that resolved
+//! its stream at an address announced for a different one with the class declared for a
+//! caller that used the wrong endpoint ([`wrong_endpoint`]), while the recorded ingest
+//! front end resolves only the identifiers of the stream its own address was announced
+//! for, so a session naming any other stream is refused as the unresolvable stream it is,
+//! exactly as one naming an identifier the registry holds nothing for ([`put_media`]).
 
 pub mod authorization;
 pub mod matroska;

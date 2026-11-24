@@ -87,6 +87,22 @@ impl Emulator {
         reply.expect_ok(case, "CreateThingGroup");
     }
 
+    /// `UpdateIndexingConfiguration`: `POST /indexing/config`, the call that brings the
+    /// fleet index a dynamic thing group's query runs against into existence — a dynamic
+    /// group cannot be created for an account whose thing index is off.
+    async fn enable_thing_indexing(&self, case: &str) {
+        let reply = self
+            .dispatch(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" }
+                })),
+            )
+            .await;
+        reply.expect_ok(case, "UpdateIndexingConfiguration");
+    }
+
     /// `CreateDynamicThingGroup`: `POST /dynamic-thing-groups/{thingGroupName}`.
     ///
     /// A dynamic group is a view of the fleet index, so the index it queries has to exist
@@ -455,6 +471,9 @@ async fn thing_group_targets_are_expanded_into_their_member_devices() {
 #[tokio::test]
 async fn a_group_target_whose_devices_are_unknown_is_refused() {
     let emulator = Emulator::new();
+    // A dynamic group's members are the things its query selects, so the account's thing
+    // index has to be on before one can be created at all.
+    emulator.enable_thing_indexing("setup").await;
     emulator.create_dynamic_thing_group("setup", "derived").await;
 
     let gateway = thing_arn("gateway-0");

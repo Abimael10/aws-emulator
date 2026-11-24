@@ -253,6 +253,32 @@ fn json(response: &http::Response<Bytes>) -> serde_json::Value {
     serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null)
 }
 
+/// The error class a refusal of this plane states, from the field a Kinesis Video Streams
+/// media API states "a more specific error type in addition to what the HTTP status code
+/// provides" in, or the empty string when it states none.
+///
+/// Here rather than in one suite because every suite that drives this plane's refusals
+/// reads the same field, and one reader is what keeps them agreeing on where the class
+/// lives.
+pub(crate) fn error_type(response: &http::Response<Bytes>) -> String {
+    response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One member of the single acknowledgement a refusal of this plane answers with, as a
+/// string, or the empty string when the answer carries no such member.
+pub(crate) fn member(response: &http::Response<Bytes>, name: &str) -> String {
+    json(response)
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The `EventType` values an ingest answer's acknowledgement stream carries, in order:
 /// one JSON object per line, which is what a producer reads off this wire.
 pub(crate) fn event_types(response: &http::Response<Bytes>) -> Vec<String> {

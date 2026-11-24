@@ -63,11 +63,12 @@ pub fn read_plane_served_at<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRe
 /// An endpoint is discovered PER STREAM — `GetDataEndpoint` takes `StreamName`/`StreamARN`
 /// so that "an endpoint for a specified stream" is what it reports — so the address a
 /// reader was handed serves that one stream, and a read there naming another stream used
-/// the wrong endpoint, which both data routes refuse with the class declared for that
-/// condition ([`super::wrong_endpoint`]). The sibling [`super::put_media`] scopes the
-/// ingest route by the same reading, against the same record of which stream an address
-/// was announced for, so the two routes of this one endpoint cannot drift on whose media
-/// they serve.
+/// the wrong endpoint, which this modelled route refuses with the class declared for that
+/// condition ([`super::wrong_endpoint`]). The sibling [`super::put_media`] reads WHICH
+/// stream an address was announced for the same way, against the same record, so the two
+/// routes of this one endpoint cannot drift on whose media they serve; what each answers
+/// differs, the recorded ingest front end refusing a stream its address does not serve as
+/// the unresolvable stream it is.
 pub fn serves_the_addressed_stream<Eng: Send + Sync + 'static>(
     engine: &Eng,
     parts: &::http::request::Parts,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this endpoint refuses a media call that reached the data endpoint of ANOTHER
-//! stream.
+//! How the MODELLED read route refuses a media call that reached a data endpoint which
+//! does not serve the stream it named.
 //!
 //! An endpoint is discovered PER STREAM — `GetDataEndpoint` takes `StreamName`/`StreamARN`
 //! so that "an endpoint for a specified stream" is what it reports — so the address a
@@ -21,20 +21,13 @@
 //! not-found class, whichever address asked for it — and this class is for a stream that
 //! DID resolve at an address announced for a different one.
 //!
-//! Both of this endpoint's data routes refuse it the same way: the modelled
-//! [`crate::ops::get_media`] read, and the recorded `POST /putMedia` ingest beside it
-//! ([`super::put_media`]), which states this service's modelled error vocabulary in its
-//! own envelope. The facts of the refusal live here once so the two routes of one endpoint
-//! cannot drift on how it is stated.
-
-/// The error code both of this endpoint's data routes state a wrong-endpoint refusal
-/// under: the modelled shape's own name, which is what a client's re-discovery path
-/// branches on.
-pub const ERROR_CODE: &str = "InvalidEndpointException";
-
-/// The status the model gives that shape (`httpError` 400), stated here for the ingest
-/// route, whose answers are built by hand because no model binds it.
-pub const STATUS: u16 = 400;
+//! The MODELLED [`crate::ops::get_media`] read is the route that states it: `GetMedia`
+//! declares the class, and the condition is the one its documented remedy addresses. The
+//! recorded `POST /putMedia` ingest front end beside it ([`super::put_media`]) is bound by
+//! no model, and its recorded behaviour is that an ingest address resolves ONE stream's
+//! identifiers and no others — a session naming another stream of the account is answered
+//! the same unresolvable-stream refusal as one naming an identifier the registry holds
+//! nothing for, so that route states its refusal from its own table and not from here.
 
 /// The sentence the refusal states: the one Kinesis Video Media documents for this error
 /// class, stating the condition and then the remedy — re-run `GetDataEndpoint` and retry
