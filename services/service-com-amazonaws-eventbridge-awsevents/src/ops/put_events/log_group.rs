@@ -464,24 +464,22 @@ pub(super) const LOGS_ACCESS_DENIED_STATUS: u16 = 400;
 /// What the delivery SEES is CloudWatch Logs' own refusal of the
 /// `logs:PutLogEvents`: the authorization sentence naming the principal the call
 /// was made as, the action and the resource, followed by the metadata block an
-/// AWS error carries. The condition names the PERMISSION
+/// AWS error carries. The condition is the class that answer's own code belongs to
+/// ([`super::answered_refusal`]), which names the PERMISSION
 /// ([`crate::state::NO_PERMISSIONS`]) because that is what the answer is about,
 /// as a topic's and a function's do.
 ///
-/// The request id is MINTED here, for the reason
+/// The request id is MINTED there, for the reason
 /// [`crate::state::queue_access_refusal`] gives.
 pub(super) fn log_group_write_refusal(stream_arn: &str, action: &str) -> (String, String) {
-    let request_id = ::service_common::query_error_envelope::new_request_id();
-    (
-        crate::state::NO_PERMISSIONS.to_string(),
-        format!(
-            "{} (Service: {LOGS_SERVICE_NAME}; Status Code: {LOGS_ACCESS_DENIED_STATUS}; \
-             Error Code: {LOGS_ACCESS_DENIED_CODE}; Request ID: {request_id}; Proxy: null)",
-            ::service_common::iam_authorization::not_authorized_by_resource_policy(
-                crate::state::SERVICE_PRINCIPAL,
-                action,
-                stream_arn,
-            )
+    super::answered_refusal(
+        &::service_common::iam_authorization::not_authorized_by_resource_policy(
+            crate::state::SERVICE_PRINCIPAL,
+            action,
+            stream_arn,
         ),
+        LOGS_SERVICE_NAME,
+        LOGS_ACCESS_DENIED_STATUS,
+        LOGS_ACCESS_DENIED_CODE,
     )
 }

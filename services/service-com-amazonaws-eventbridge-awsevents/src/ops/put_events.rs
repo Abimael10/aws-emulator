@@ -3783,6 +3783,44 @@ fn delivery_condition(code: &str) -> &'static str {
     crate::state::UNKNOWN_CONDITION
 }
 
+/// What a dead letter reports for a delivery the target's own service ANSWERED, as
+/// the two message attributes that carry it: the sentence that service worded for
+/// the refusal, inside the metadata block its answer carries, and the CLASS this
+/// service puts that answer in.
+///
+/// Both halves are built from the ONE answer, and its error `code` is read exactly
+/// once: the message states it through the tree's single rendering of a caught
+/// service exception
+/// (`::service_common::relayed_refusal::caught_exception_message`) and the class
+/// comes from that same value through the one classifier ([`delivery_condition`]).
+/// So a dead letter's `ERROR_CODE` and `ERROR_MESSAGE` cannot name two different
+/// failures — no site may word one of them while naming the class of the other —
+/// whichever service answered and whatever it answered. A refusal THIS service
+/// decides instead of reading off an answer (a role's documents, an event bus's
+/// policy, an HTTP endpoint's status) carries no such block and names its own
+/// condition.
+///
+/// The request id is MINTED here, for the reason
+/// [`crate::state::queue_access_refusal`] gives: it identifies the ONE refused
+/// call, so it is drawn fresh rather than derived from the event or the target.
+fn answered_refusal(reason: &str, service: &str, status: u16, code: &str) -> (String, String) {
+    let request_id = ::service_common::query_error_envelope::new_request_id();
+    (
+        delivery_condition(code).to_string(),
+        ::service_common::relayed_refusal::caught_exception_message(
+            "",
+            "",
+            reason,
+            ::service_common::relayed_refusal::CaughtCall {
+                service,
+                status,
+                code,
+                request_id: &request_id,
+            },
+        ),
+    )
+}
+
 /// Every error code a target's service answers for a RESOURCE THAT IS NOT THERE,
 /// as each of those services publishes one: the `awsQueryError` code or the error
 /// shape's own name, for the services a target of this service can live in.
@@ -4009,22 +4047,35 @@ const SQS_KMS_ACCESS_DENIED_STATUS: u16 = 400;
 /// can report nothing about the resource
 /// (`service_com_amazonaws_kms_trentservice::state::unauthorized_resource_message`),
 /// so the two services cannot word the same denial differently, and the condition
-/// names the PERMISSION ([`crate::state::NO_PERMISSIONS`]), as every refusal a
-/// target's own documents decide does. It is the same nesting a topic target's
-/// refusal carries ([`topic_key_publish_refusal`]), with that target service's own
-/// block in place of this one's.
+/// is the class that answer's own code belongs to ([`answered_refusal`]), which for
+/// an authorization code is the PERMISSION one ([`crate::state::NO_PERMISSIONS`]),
+/// as every refusal a target's own documents decide is. It is the same nesting a
+/// topic target's refusal carries ([`topic_key_publish_refusal`]), with that target
+/// service's own block in place of this one's.
 ///
 /// Each request id is MINTED here, for the reason
 /// [`crate::state::queue_access_refusal`] gives: it identifies ONE refused call —
 /// there are two nested calls, so there are two ids.
 fn queue_key_send_refusal() -> (String, String) {
+    target_key_refusal(
+        crate::state::SQS_SERVICE_NAME,
+        SQS_KMS_ACCESS_DENIED_STATUS,
+        SQS_KMS_ACCESS_DENIED_CODE,
+    )
+}
+
+/// The two attributes a dead letter carries for a delivery the KEY the target's
+/// service encrypts with withheld: the nesting of the two refusals the call
+/// produced ([`target_key_refusal_message`]), under the class the relaying
+/// service's own code belongs to ([`answered_refusal`]).
+///
+/// One function for every target kind whose service encrypts what it is handed, so
+/// the class of such a refusal is settled in one place and from the same code the
+/// message states.
+fn target_key_refusal(service: &str, status: u16, code: &str) -> (String, String) {
     (
-        crate::state::NO_PERMISSIONS.to_string(),
-        target_key_refusal_message(
-            crate::state::SQS_SERVICE_NAME,
-            SQS_KMS_ACCESS_DENIED_STATUS,
-            SQS_KMS_ACCESS_DENIED_CODE,
-        ),
+        delivery_condition(code).to_string(),
+        target_key_refusal_message(service, status, code),
     )
 }
 
@@ -4047,15 +4098,30 @@ fn queue_key_send_refusal() -> (String, String) {
 fn target_key_refusal_message(service: &str, status: u16, code: &str) -> String {
     let kms_request_id = ::service_common::query_error_envelope::new_request_id();
     let relaying_request_id = ::service_common::query_error_envelope::new_request_id();
-    format!(
-        "{} (Service: {KMS_SERVICE_NAME}; Status Code: {KMS_ACCESS_DENIED_STATUS}; \
-         Error Code: {KMS_ACCESS_DENIED_CODE}; Request ID: {kms_request_id}; Proxy: null) \
-         (Service: {service}; Status Code: {status}; Error Code: {code}; Request ID: \
-         {relaying_request_id}; Proxy: null)",
-        ::service_com_amazonaws_kms_trentservice::state::unauthorized_resource_message(
+    let refused_data_key = ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        &::service_com_amazonaws_kms_trentservice::state::unauthorized_resource_message(
             crate::state::SERVICE_PRINCIPAL,
             KMS_GENERATE_DATA_KEY_OPERATION,
-        )
+        ),
+        ::service_common::relayed_refusal::CaughtCall {
+            service: KMS_SERVICE_NAME,
+            status: KMS_ACCESS_DENIED_STATUS,
+            code: KMS_ACCESS_DENIED_CODE,
+            request_id: &kms_request_id,
+        },
+    );
+    ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        &refused_data_key,
+        ::service_common::relayed_refusal::CaughtCall {
+            service,
+            status,
+            code,
+            request_id: &relaying_request_id,
+        },
     )
 }
 
@@ -4259,30 +4325,23 @@ const SNS_AUTHORIZATION_ERROR_STATUS: u16 = 403;
 /// document grants nothing is Amazon SNS's own refusal of the `sns:Publish`: the
 /// authorization sentence naming the principal the call was made as, the action
 /// and the topic, followed by the metadata block an AWS error carries — the
-/// service, the status, the error code and the id of the refused request. So the
-/// condition names the PERMISSION ([`crate::state::NO_PERMISSIONS`]) rather than
-/// the resource, the same one a queue's refusal carries
-/// ([`crate::state::queue_access_refusal`]): a target whose own document withheld
-/// the grant is one that IS there, whichever service it lives in.
-///
-/// The request id is MINTED here and nowhere else, for the reason
-/// [`crate::state::queue_access_refusal`] gives: it identifies the ONE refused
-/// call, so it is drawn fresh from the tree's one mint of an AWS request id
-/// rather than derived from the event or the target.
+/// service, the status, the error code and the id of the refused request. That
+/// answer's code is an AUTHORIZATION one, so the class read off it
+/// ([`answered_refusal`]) names the PERMISSION
+/// ([`crate::state::NO_PERMISSIONS`]) rather than the resource — unlike a queue's
+/// refusal, which that service answers under its own not-found code
+/// ([`crate::state::queue_access_refusal`]), each dead letter carrying the class of
+/// the answer beside it.
 fn topic_publish_refusal(topic_arn: &str) -> (String, String) {
-    let request_id = ::service_common::query_error_envelope::new_request_id();
-    (
-        crate::state::NO_PERMISSIONS.to_string(),
-        format!(
-            "{} (Service: {SNS_SERVICE_NAME}; Status Code: \
-             {SNS_AUTHORIZATION_ERROR_STATUS}; Error Code: {SNS_AUTHORIZATION_ERROR_CODE}; \
-             Request ID: {request_id}; Proxy: null)",
-            ::service_common::iam_authorization::not_authorized_by_resource_policy(
-                crate::state::SERVICE_PRINCIPAL,
-                SNS_PUBLISH_ACTION_NAME,
-                topic_arn,
-            )
+    answered_refusal(
+        &::service_common::iam_authorization::not_authorized_by_resource_policy(
+            crate::state::SERVICE_PRINCIPAL,
+            SNS_PUBLISH_ACTION_NAME,
+            topic_arn,
         ),
+        SNS_SERVICE_NAME,
+        SNS_AUTHORIZATION_ERROR_STATUS,
+        SNS_AUTHORIZATION_ERROR_CODE,
     )
 }
 
@@ -4358,17 +4417,15 @@ const SNS_KMS_ACCESS_DENIED_STATUS: u16 = 400;
 /// What the delivery SEES is Amazon SNS's refusal of the `sns:Publish` wrapping
 /// KMS's refusal of the `kms:GenerateDataKey` — the one nesting every encrypted
 /// target's refusal carries ([`target_key_refusal_message`]), with this service's
-/// own block. The condition names the PERMISSION
+/// own block. The condition is the class that answer's code belongs to
+/// ([`target_key_refusal`]), which for an authorization code is the PERMISSION one
 /// ([`crate::state::NO_PERMISSIONS`]), as every refusal a target's own documents
-/// decide does.
+/// decide is.
 fn topic_key_publish_refusal() -> (String, String) {
-    (
-        crate::state::NO_PERMISSIONS.to_string(),
-        target_key_refusal_message(
-            SNS_SERVICE_NAME,
-            SNS_KMS_ACCESS_DENIED_STATUS,
-            SNS_KMS_ACCESS_DENIED_CODE,
-        ),
+    target_key_refusal(
+        SNS_SERVICE_NAME,
+        SNS_KMS_ACCESS_DENIED_STATUS,
+        SNS_KMS_ACCESS_DENIED_CODE,
     )
 }
 
@@ -4510,27 +4567,19 @@ const LAMBDA_ACCESS_DENIED_STATUS: u16 = 403;
 /// authorization sentence naming the principal the call was made as, the action
 /// and the function, followed by the metadata block an AWS error carries — the
 /// service, the status, the error code and the id of the refused request. The
-/// condition names the PERMISSION rather than the resource, because that is what
+/// condition is the class that answer's code belongs to ([`answered_refusal`]),
+/// which names the PERMISSION rather than the resource because that is what
 /// Lambda's answer is about.
-///
-/// The request id is MINTED here, for the reason
-/// [`crate::state::queue_access_refusal`] gives: it identifies the ONE refused
-/// call, so it is drawn fresh from the tree's one mint of an AWS request id
-/// rather than derived from the event or the target.
 fn function_invoke_refusal(function_arn: &str, action: &str) -> (String, String) {
-    let request_id = ::service_common::query_error_envelope::new_request_id();
-    (
-        crate::state::NO_PERMISSIONS.to_string(),
-        format!(
-            "{} (Service: {LAMBDA_SERVICE_NAME}; Status Code: \
-             {LAMBDA_ACCESS_DENIED_STATUS}; Error Code: {LAMBDA_ACCESS_DENIED_CODE}; \
-             Request ID: {request_id}; Proxy: null)",
-            ::service_common::iam_authorization::not_authorized_by_resource_policy(
-                crate::state::SERVICE_PRINCIPAL,
-                action,
-                function_arn,
-            )
+    answered_refusal(
+        &::service_common::iam_authorization::not_authorized_by_resource_policy(
+            crate::state::SERVICE_PRINCIPAL,
+            action,
+            function_arn,
         ),
+        LAMBDA_SERVICE_NAME,
+        LAMBDA_ACCESS_DENIED_STATUS,
+        LAMBDA_ACCESS_DENIED_CODE,
     )
 }
 
