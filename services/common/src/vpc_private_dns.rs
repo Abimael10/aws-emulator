@@ -153,6 +153,21 @@ pub struct PrivateZoneAnswer {
     pub records: Vec<PrivateZoneRecord>,
 }
 
+/// What the RESOLVER RULES reaching a VPC do with one query whose name a rule of theirs sends
+/// away from the VPC's own resolver.
+///
+/// Such a query is not answered out of the VPC's zones at all: it leaves for the resolvers the
+/// rule names, so what comes back is whatever answered there — and nothing, where nothing
+/// answers DNS at any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardedQuery {
+    /// The query was sent to the rule's targets and no resolver answered at any of them, so the
+    /// client is left without an answer for it.
+    Unanswered,
+    /// A resolver at one of the targets answered, with what it holds for the name.
+    Answered(PrivateZoneAnswer),
+}
+
 /// ONE record of the answer section a query was answered with, as a query LOG states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedAnswer {
@@ -229,6 +244,18 @@ pub trait VpcPrivateDns: Send + Sync + 'static {
         name: &str,
         record_type: &str,
     ) -> Option<PrivateZoneAnswer>;
+
+    /// What the Resolver rules associated with `vpc_id` do with a query for `name` of
+    /// `record_type`, and `None` for a query no rule of theirs sends away — one no rule's domain
+    /// covers, and one the matching rule leaves to the VPC's own resolver.
+    ///
+    /// Asked BEFORE the zones, because a query a rule sends away is never answered out of them.
+    fn forwarded(
+        &self,
+        vpc_id: &str,
+        name: &str,
+        record_type: &str,
+    ) -> Option<ForwardedQuery>;
 
     /// Whether the AUTODEFINED rules for reverse DNS lookups are in force in `vpc_id`, which is
     /// what answers a reverse question about an address of that VPC.
@@ -324,6 +351,21 @@ impl VpcPrivateDnsPlane {
     ) -> Option<PrivateZoneAnswer> {
         let plane = self.0.lock().plane.clone()?;
         plane.zone_answer(vpc_id, name, record_type)
+    }
+
+    /// [`VpcPrivateDns::forwarded`] of the registered plane, and `None` where none is registered
+    /// — then no Resolver rule reaches any VPC, so nothing is sent away.
+    ///
+    /// The plane is cloned out of the record first, for the reason [`Self::admission`]'s is.
+    #[must_use]
+    pub fn forwarded(
+        &self,
+        vpc_id: &str,
+        name: &str,
+        record_type: &str,
+    ) -> Option<ForwardedQuery> {
+        let plane = self.0.lock().plane.clone()?;
+        plane.forwarded(vpc_id, name, record_type)
     }
 
     /// [`VpcPrivateDns::answers_autodefined_reverse`] of the registered plane, and `true` where
@@ -439,6 +481,17 @@ mod tests {
                     value: "192.0.2.10".to_string(),
                 }],
             })
+        }
+
+        /// This plane sends no query away: what the rows below pin is the reading it answers out
+        /// of its own zone, and a plane with no rule reaching its VPC leaves every query to it.
+        fn forwarded(
+            &self,
+            _vpc_id: &str,
+            _name: &str,
+            _record_type: &str,
+        ) -> Option<ForwardedQuery> {
+            None
         }
 
         fn answers_autodefined_reverse(&self, vpc_id: &str) -> bool {

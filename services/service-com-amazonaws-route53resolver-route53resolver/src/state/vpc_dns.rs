@@ -34,7 +34,12 @@
 //!
 //! # What the answer is
 //!
-//! The record sets of the PRIVATE hosted zones associated with that VPC, read through Route
+//! The RESOLVER RULES in force in the VPC decide first whether the VPC's own resolver answers the
+//! query at all: a query whose name the most specific rule reaching the VPC sends away goes to
+//! the resolvers that rule names instead of to any zone here ([`super::vpc_dns_forwarding`]).
+//!
+//! Everything else is answered out of the record sets of the PRIVATE hosted zones associated with
+//! that VPC, read through Route
 //! 53's own store: a query is answered out of the zone whose name is the longest suffix of
 //! the name asked for ("Route 53 … uses the most specific zone"), authoritatively, since the
 //! Resolver is the authority for a private zone. A name that zone holds nothing at is
@@ -81,6 +86,7 @@ use ::service_common::vpc_private_dns::{
 };
 
 use super::dns_firewall::{qtype_number, FirewallView};
+use super::vpc_dns_forwarding::{forwarded_answer, ViewResolverRule};
 use super::{ec2, ENDPOINT_STATUS_OPERATIONAL, IP_STATUS_ATTACHED};
 
 /// The link-local address every VPC's own Resolver answers at: "the Route 53 Resolver …
@@ -241,12 +247,17 @@ pub struct VpcDnsView {
     /// The DNS Firewall filtering this VPC's queries, which decides a query BEFORE any zone
     /// is read for it ([`super::dns_firewall`]).
     firewall: FirewallView,
+    /// The Resolver rules in force in this VPC, which decide WHETHER the query is answered out
+    /// of those zones at all: a query a `FORWARD` rule covers is sent to the resolvers that rule
+    /// names instead ([`super::vpc_dns_forwarding`]).
+    rules: Vec<ViewResolverRule>,
     /// The security groups the client is a member of, by id — carried so a query answered out of
     /// this view is RECORDED against the same client every other reading of it is made for.
     groups: Vec<String>,
-    /// Where a query this view answers is recorded ([`super::query_log_delivery`]), and `None`
+    /// Where a query this view answers is recorded ([`super::query_log_delivery`]), and where a
+    /// query a Resolver rule sends away is carried to ([`super::vpc_dns_forwarding`]) — `None`
     /// for a view built for a test of the answer paths alone.
-    recorder: Option<StoredVpcDns>,
+    stores: Option<StoredVpcDns>,
     /// The Amazon EC2 instance the client runs on, where the view was taken for one — which is
     /// how a record of its queries names their source.
     instance_id: Option<String>,
@@ -328,7 +339,7 @@ impl VpcDnsView {
     /// A query that reached no resolver, and one no security group admitted, is not a query the
     /// Resolver answered, so neither is recorded.
     fn recorded(&self, name: &str, record_type: &str, protocol: &str, answer: &Answer) {
-        let Some(recorder) = self.recorder.as_ref() else {
+        let Some(recorder) = self.stores.as_ref() else {
             return;
         };
         let answers: Vec<LoggedAnswer> = answer
@@ -415,6 +426,14 @@ impl VpcDnsView {
         // answered the rule's way whether or not any zone of this VPC holds it.
         if let Some(blocked) = self.blocked(&asked, &record_type) {
             return blocked;
+        }
+        // The Resolver rules in force in this VPC decide the query next: a query a forwarding
+        // rule covers leaves for the resolvers that rule names, so no zone of this VPC answers
+        // it ([`super::vpc_dns_forwarding`]).
+        if let Some(diverted) =
+            forwarded_answer(&self.rules, self.stores.as_ref(), &asked, &record_type)
+        {
+            return diverted.answer();
         }
         self.zone_answer(&asked, &record_type)
             .or_else(|| standard_public_answer(&asked, &record_type))
@@ -737,7 +756,7 @@ pub struct StoredVpcDns {
         ::engine::ServiceState<super::ComAmazonawsRoute53resolverRoute53resolverState>,
     /// Amazon EC2's store, or `None` for an engine that vends none — then there is no VPC, no
     /// subnet and no security group to read.
-    ec2: Option<::engine::ServiceState<ec2::ComAmazonawsEc2Amazonec2State>>,
+    pub(crate) ec2: Option<::engine::ServiceState<ec2::ComAmazonawsEc2Amazonec2State>>,
     /// Route 53's store, or `None` for an engine that vends none — then no hosted zone answers.
     route53: Option<::engine::ServiceState<route53::ComAmazonawsRoute53Awsdnsv20130401State>>,
     /// The DNS Firewall filtering a VPC's queries, read off this service's own stores.
@@ -876,14 +895,16 @@ impl StoredVpcDns {
             nameserver,
             servers,
             zones: self.zones_of_vpc(&client.vpc_id),
+            rules: self.rules_of_vpc(&client.vpc_id),
             firewall: self
                 .firewall
                 .as_ref()
                 .map(|firewall| firewall.view_for_vpc(&client.vpc_id))
                 .unwrap_or_default(),
             groups: client.groups.clone(),
-            // The same stores this view was read off are where a query it answers is recorded.
-            recorder: Some(self.clone()),
+            // The same stores this view was read off are where a query it answers is recorded,
+            // and where a query a Resolver rule sends away is carried to.
+            stores: Some(self.clone()),
             instance_id: None,
         }
     }
@@ -1199,10 +1220,13 @@ mod tests {
             // The rows below are about the zones; a view whose VPC no rule group reaches
             // filters nothing, which is every row here.
             firewall: FirewallView::default(),
+            // The rows below are about the zones too: a view whose VPC no Resolver rule reaches
+            // sends no query away.
+            rules: Vec::new(),
             groups: Vec::new(),
             // The rows below are about what is ANSWERED; a view built over no store records
             // nothing, which is what a reading taken for a test alone does.
-            recorder: None,
+            stores: None,
             instance_id: None,
         }
     }

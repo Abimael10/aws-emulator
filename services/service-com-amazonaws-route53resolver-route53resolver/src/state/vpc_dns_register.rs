@@ -27,11 +27,12 @@ use ::std::net::Ipv4Addr;
 use ::std::sync::Arc;
 
 use ::service_common::vpc_private_dns::{
-    InVpcQuerySource, LoggedQuery, PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord,
-    QueryAdmission, VpcPrivateDns, VpcPrivateDnsPlane,
+    ForwardedQuery, InVpcQuerySource, LoggedQuery, PrivateZoneAnswer, PrivateZoneCode,
+    PrivateZoneRecord, QueryAdmission, VpcPrivateDns, VpcPrivateDnsPlane,
 };
 
-use super::vpc_dns::{ResponseCode, StoredVpcDns, DNS_PORT};
+use super::vpc_dns::{Answer, ResponseCode, StoredVpcDns, DNS_PORT};
+use super::vpc_dns_forwarding::ForwardedTo;
 
 impl VpcPrivateDns for StoredVpcDns {
     fn admission(
@@ -67,24 +68,26 @@ impl VpcPrivateDns for StoredVpcDns {
         // and the addresses that answer are read by `admission` above, so nothing of them is
         // read for a question.
         let answered = self.private_zone_answer(vpc_id, name, record_type)?;
-        Some(PrivateZoneAnswer {
-            code: match answered.code {
-                ResponseCode::NxDomain => PrivateZoneCode::NxDomain,
-                // A zone of the VPC holds the name, so the answer is its records or none of
-                // that type; a zone answers no server failure — that is what a name under NO
-                // zone of the VPC comes to, which is the `None` above.
-                ResponseCode::NoError | ResponseCode::ServFail => PrivateZoneCode::NoError,
-            },
-            records: answered
-                .records
-                .into_iter()
-                .map(|record| PrivateZoneRecord {
-                    name: record.name,
-                    ttl: record.ttl,
-                    record_type: record.record_type,
-                    value: record.value,
-                })
-                .collect(),
+        Some(zone_answer_of(answered))
+    }
+
+    fn forwarded(
+        &self,
+        vpc_id: &str,
+        name: &str,
+        record_type: &str,
+    ) -> Option<ForwardedQuery> {
+        // WHICH rules reach the VPC, which of them decides this query and what answers at the
+        // addresses it names are this service's own records ([`super::vpc_dns_forwarding`]), so
+        // the component carrying the query reads the outcome rather than the rules.
+        let diverted = self.forwarded_query_answer(vpc_id, name, record_type)?;
+        Some(match diverted {
+            // Nothing answered at any address the rule names: the query left the VPC and no
+            // reply came back for it.
+            ForwardedTo::Nothing => ForwardedQuery::Unanswered,
+            ForwardedTo::Resolver(answered) => {
+                ForwardedQuery::Answered(zone_answer_of(answered))
+            }
         })
     }
 
@@ -98,6 +101,30 @@ impl VpcPrivateDns for StoredVpcDns {
         // The configurations recording this VPC's queries, their destinations and the form of a
         // record are this service's own ([`super::query_log_delivery`]).
         self.record_query(source, query);
+    }
+}
+
+/// One answer of this plane's own as the register carries it.
+///
+/// A zone of the VPC that holds the name answers with its records, or with none of the type asked
+/// about; a zone answers no server failure — that is what a name under NO zone comes to, which
+/// the readings above report as no answer of theirs at all.
+fn zone_answer_of(answered: Answer) -> PrivateZoneAnswer {
+    PrivateZoneAnswer {
+        code: match answered.code {
+            ResponseCode::NxDomain => PrivateZoneCode::NxDomain,
+            ResponseCode::NoError | ResponseCode::ServFail => PrivateZoneCode::NoError,
+        },
+        records: answered
+            .records
+            .into_iter()
+            .map(|record| PrivateZoneRecord {
+                name: record.name,
+                ttl: record.ttl,
+                record_type: record.record_type,
+                value: record.value,
+            })
+            .collect(),
     }
 }
 

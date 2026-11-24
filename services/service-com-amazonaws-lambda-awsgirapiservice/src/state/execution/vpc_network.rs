@@ -52,6 +52,13 @@
 //! name a matched `BLOCK` rule covers is answered that rule's `BlockResponse` way instead of
 //! out of the zone; an engine no such service is mounted on filters nothing.
 //!
+//! Past the firewall, the RESOLVER RULES in force in the VPC decide whether this resolver answers
+//! the query at all: a query whose name the most specific rule reaching the VPC sends away is
+//! forwarded to the resolvers that rule names, so what the client reads is what answered there
+//! and not what any zone holds — nothing at all, where nothing answers at the addresses the rule
+//! names. Those rules and their targets are the records of the service that owns Resolver rules,
+//! so the outcome is read out of the same register ([`::service_common::vpc_private_dns`]).
+//!
 //! A query the resolver answers is also RECORDED where the account asked for it: the Resolver
 //! query logging configurations associated with the VPC are the records of the service that owns
 //! them, so the record of the query is handed to that service through the same register
@@ -71,9 +78,9 @@ use ::service_common::vpc_dns_firewall::{
     FirewallDecision, VpcQueryFilters, OVERRIDE_DNS_TYPE_CNAME,
 };
 use ::service_common::vpc_private_dns::{
-    established_not_to_exist, InVpcQuerySource, LoggedAnswer, LoggedQuery, PrivateZoneAnswer,
-    PrivateZoneCode, PrivateZoneRecord, QueryAdmission, VpcPrivateDnsPlane, CLASS_INTERNET,
-    PROTOCOL_UDP, SOURCE_ID_INSTANCE,
+    established_not_to_exist, ForwardedQuery, InVpcQuerySource, LoggedAnswer, LoggedQuery,
+    PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord, QueryAdmission, VpcPrivateDnsPlane,
+    CLASS_INTERNET, PROTOCOL_UDP, SOURCE_ID_INSTANCE,
 };
 use ::simple_dns::rdata::{RData, A, AAAA, CNAME, MX, NS, PTR, TXT};
 use ::simple_dns::{
@@ -414,6 +421,30 @@ impl VpcAttachment {
             }
             None => {}
         }
+        // The RESOLVER RULES in force in this VPC decide the query before any zone is read for
+        // it: a query whose name the most specific rule reaching the VPC sends away goes to the
+        // resolvers that rule names, so nothing here answers it out of a zone. Which rules those
+        // are, which one decides the query and what answered at its targets are Route 53
+        // Resolver's own records, read out of the register that owns them
+        // ([`::service_common::vpc_private_dns`]).
+        match self.forwarded(question) {
+            // The query left the VPC and nothing answered: a resolver whose forwarders leave a
+            // query unanswered has no answer of its own for it, and the answer is not this
+            // resolver's authority's.
+            Some(ForwardedQuery::Unanswered) => {
+                return Answered::of(Vec::new(), RESPONSE_SERVER_FAILURE, false)
+            }
+            Some(ForwardedQuery::Answered(answered)) => {
+                let code = if answered.code == PrivateZoneCode::NxDomain {
+                    RESPONSE_NAME_ERROR
+                } else {
+                    RESPONSE_NO_ERROR
+                };
+                // Another resolver's answer, relayed: this one holds no authority for it.
+                return Answered::of(private_zone_records(&answered), code, false);
+            }
+            None => {}
+        }
         // The PRIVATE HOSTED ZONES associated with this VPC answer ahead of the VPC's own
         // internal zone: a query asked inside a VPC is answered out of the private zones
         // associated with it, authoritatively, and only a name NO such zone holds is left to
@@ -587,6 +618,15 @@ impl VpcAttachment {
                 _other => None,
             })
             .collect()
+    }
+
+    /// What the Resolver rules in force in this VPC do with one question, and `None` for a
+    /// question no rule of them sends away — as well as for a question whose TYPE this resolver
+    /// cannot name, which is one it answers nothing for either way.
+    fn forwarded(&self, question: &Question<'_>) -> Option<ForwardedQuery> {
+        let plane = self.plane.as_ref()?;
+        let record_type = type_keyword(question.qtype)?;
+        plane.forwarded(&self.vpc_id, &question.qname.to_string(), record_type)
     }
 
     /// What the PRIVATE HOSTED ZONES associated with this VPC hold for one question, and `None`
