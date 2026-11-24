@@ -2,13 +2,12 @@
 
 //! WHERE a client opens a session on a DB cluster whose engine wire this emulator serves.
 //!
-//! The rule under test: the endpoint member a client DIALS carries the NAME the cluster mints
-//! from its own identifier (`<identifier>.cluster-<label>`), announced in the zone a resolver
-//! answers with the interface the core opened that cluster's listener on, beside that
-//! listener's port in the one `DBCluster$Port` ("the port that the database engine is
-//! listening on") — so the pair the client composes RESOLVES to the plane that serves it. One
-//! name per cluster, and one per role: the `cluster-` label names the write path and
-//! `cluster-ro-` the read path, which is what a client that splits its traffic reads.
+//! The rule under test: the endpoint member a client DIALS carries the ADDRESS the listener
+//! the core opened for that cluster is answered at, beside that listener's port in the one
+//! `DBCluster$Port` ("the port that the database engine is listening on") — so the pair the
+//! client composes reaches the plane that serves it, which a name this emulator resolves for
+//! nobody would not. The `cluster-ro-` name the cluster mints beside it is the read path, which
+//! is what a client that splits its traffic reads.
 //!
 //! A cluster this emulator serves NO data plane for keeps the same form under the published
 //! AWS domain — there is no local plane for such a cluster to lead a client to — which is the

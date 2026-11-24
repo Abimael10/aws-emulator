@@ -312,23 +312,25 @@ pub(crate) async fn describe_one(
 /// The query parameters of one call, owned so a table row can hold them.
 type Params = Vec<(&'static str, String)>;
 
-/// The DNS suffix the endpoint names of a cluster whose engine WIRE this emulator serves sit
-/// in: the service label of the control plane that owns the engine, in the loopback zone RFC
-/// 6761 reserves for the interface the core binds its listeners on.
+/// The DNS suffix the minted READER name of a cluster whose engine WIRE this emulator serves
+/// sits in: the service label of the control plane that owns the engine, in the loopback zone
+/// RFC 6761 reserves for the interface the core binds its listeners on.
 ///
-/// A cluster this emulator serves no data plane for keeps the published AWS form instead, so
-/// a row for such a cluster passes its own control plane's endpoint domain.
+/// Such a cluster's WRITER member is not a name at all but the address its own listener is
+/// answered at ([`assert_served_endpoint_pair`]); a cluster this emulator serves no data plane
+/// for keeps the published AWS form for both, so a row for such a cluster passes its own
+/// control plane's endpoint domain.
 pub(crate) const SERVED_SUFFIX: &str = "rds.localhost";
 
-/// RULE: the two endpoint names a DB cluster publishes are minted by the CLUSTER from its own
-/// identifier — the writer under `cluster-`, the reader under `cluster-ro-` — with one
-/// server-assigned label and ONE shared suffix behind them, and neither carries a port. They
-/// are therefore non-empty and distinct whatever the cluster's membership is.
+/// RULE: the two endpoint names a DB cluster this emulator serves NO data plane for publishes
+/// are minted by the CLUSTER from its own identifier — the writer under `cluster-`, the reader
+/// under `cluster-ro-` — with one server-assigned label and ONE shared suffix behind them, and
+/// neither carries a port. They are therefore non-empty and distinct whatever the cluster's
+/// membership is.
 ///
-/// The `suffix` is the only thing that depends on where the cluster's data plane is served:
-/// a cluster whose engine wire this emulator serves publishes the same pair under
-/// [`SERVED_SUFFIX`] ([`assert_served_endpoint_pair`]), and one it serves no plane for under
-/// its control plane's own endpoint domain.
+/// A cluster whose engine wire this emulator SERVES publishes the address that plane is
+/// answered at as its writer member instead ([`assert_served_endpoint_pair`]), because that is
+/// the member a client composes its connection from.
 ///
 /// `pub(crate)` so every suite that reads a cluster's endpoints asserts the one rule rather
 /// than a copy of it.
@@ -352,15 +354,7 @@ pub(crate) fn assert_endpoint_name_pair(
         ("writer", writer, &writer_label),
         ("reader", reader, &reader_label),
     ] {
-        assert!(
-            name.starts_with(label.as_str()) && name.ends_with(&tail),
-            "case {case:?}: expected a {which} endpoint of the form {label}<label>{tail}, got \
-             {name:?}"
-        );
-        assert!(
-            !name.contains(':'),
-            "case {case:?}: an endpoint member carries no port of its own, got {name:?}"
-        );
+        assert_minted_endpoint_name(case, which, label, &tail, name);
     }
     // The server-assigned label and the suffix are the CLUSTER's: both names carry the same
     // ones, so the role label is the only thing that differs between them.
@@ -373,10 +367,11 @@ pub(crate) fn assert_endpoint_name_pair(
     );
 }
 
-/// RULE: a cluster whose engine wire this emulator SERVES publishes the same pair of minted
-/// names as any other cluster — the writer under `cluster-`, the reader under `cluster-ro-` —
-/// in the zone the interface its listeners are bound on names ([`SERVED_SUFFIX`]), so the
-/// pair of a published name and the published `Port` is an address a session opens on.
+/// RULE: a cluster whose engine wire this emulator SERVES publishes, as the member a client
+/// COMPOSES ITS CONNECTION FROM, the host its own engine listener is answered at — an address
+/// of the interface the core bound, because this emulator resolves no name for its clients —
+/// and keeps the minted `cluster-ro-` name, in the zone that interface names
+/// ([`SERVED_SUFFIX`]), as the reader member the model gives no port of its own.
 ///
 /// `pub(crate)` so every suite that reads a served cluster's endpoints asserts the one rule
 /// rather than a copy of it.
@@ -387,7 +382,47 @@ pub(crate) fn assert_served_endpoint_pair(
     writer: &str,
     reader: &str,
 ) {
-    assert_endpoint_name_pair(case, identifier, region, SERVED_SUFFIX, writer, reader);
+    assert!(
+        writer.parse::<std::net::IpAddr>().is_ok(),
+        "case {case:?}: expected the writer endpoint to be the address this emulator answers \
+         the cluster's engine wire at, got {writer:?}"
+    );
+    assert!(
+        service_common::data_plane_addressing::names_the_loopback_interface(writer),
+        "case {case:?}: expected the writer endpoint to name the interface the core bound, got \
+         {writer:?}"
+    );
+    assert!(
+        !writer.contains(':') || writer.contains("::"),
+        "case {case:?}: an endpoint member carries no port of its own, got {writer:?}"
+    );
+    assert_ne!(
+        writer, reader,
+        "case {case:?}: a cluster's reader endpoint must be distinct from its writer \
+         endpoint, got {writer:?} for both"
+    );
+    assert_minted_endpoint_name(
+        case,
+        "reader",
+        &format!("{identifier}.cluster-ro-"),
+        &format!(".{region}.{SERVED_SUFFIX}"),
+        reader,
+    );
+}
+
+/// RULE: a name the CLUSTER mints for one of its endpoints carries the cluster's identifier
+/// and the role `label`, one server-assigned label, and the `tail` of region and suffix — and
+/// no port, which the cluster's one `Port` member carries.
+fn assert_minted_endpoint_name(case: &str, which: &str, label: &str, tail: &str, name: &str) {
+    assert!(
+        name.starts_with(label) && name.ends_with(tail),
+        "case {case:?}: expected a {which} endpoint of the form {label}<label>{tail}, got \
+         {name:?}"
+    );
+    assert!(
+        !name.contains(':'),
+        "case {case:?}: an endpoint member carries no port of its own, got {name:?}"
+    );
 }
 
 /// One filter row: the case, the filter the request carries, and the clusters it selects.

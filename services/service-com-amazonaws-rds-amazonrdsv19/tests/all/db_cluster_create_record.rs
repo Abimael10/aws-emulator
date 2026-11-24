@@ -356,14 +356,14 @@ struct Identity {
     arn: String,
 }
 
-/// One of the cluster's two endpoint names, asserting its published form on the way.
+/// One of the endpoint names a cluster MINTS, asserting its published form on the way.
 ///
-/// Every cluster publishes the documented DNS form
+/// A minted name carries the documented DNS form
 /// `<identifier>.<role><label>.<region>.<suffix>` — `cluster-` for the writer and
 /// `cluster-ro-` for the reader — in which the 12-character server-assigned label is visible:
-/// the CLUSTER mints both of its endpoint names from its own identifier, and the suffix is the
-/// zone its data plane is reached in (see `state::cluster_endpoint_names`). The model gives a
-/// DB cluster one `Port` for the pair, so neither member carries a port of its own.
+/// the CLUSTER mints the name from its own identifier, and the suffix is the zone its data
+/// plane is reached in (see `state::cluster_endpoint_names`). The model gives a DB cluster one
+/// `Port` for the pair, so no endpoint member carries a port of its own.
 fn endpoint_name(case: &str, identifier: &str, role: &str, suffix: &str, endpoint: &str) -> String {
     let prefix = format!("{identifier}.{role}");
     let tail = format!(".{REGION}.{suffix}");
@@ -407,11 +407,21 @@ fn identity_of(case: &str, identifier: &str, suffix: &str, cluster: &str) -> Ide
         "case {case:?}: expected 26 server-minted characters, got {resource_id:?}"
     );
 
-    // The writer endpoint is where a client OPENS a session, and the reader where it reads:
-    // both are names the CLUSTER mints from its own identifier, differing in the role label
-    // alone, whether or not this emulator serves the engine's wire.
+    // The reader endpoint is the name the CLUSTER mints from its own identifier, where the
+    // server-assigned label this test reads is visible. The writer endpoint is the member a
+    // client composes its connection from, so a cluster whose engine wire this emulator serves
+    // publishes the address that plane is answered at there, and every other cluster the name
+    // minted under the `cluster-` label.
     let endpoint = text(cluster, "Endpoint");
-    endpoint_name(case, identifier, "cluster-", suffix, &endpoint);
+    if suffix == SERVED_SUFFIX {
+        assert!(
+            endpoint.parse::<std::net::IpAddr>().is_ok(),
+            "case {case:?}: expected the address this emulator answers the cluster's engine \
+             wire at as its writer endpoint, got {endpoint:?}"
+        );
+    } else {
+        endpoint_name(case, identifier, "cluster-", suffix, &endpoint);
+    }
     let reader = text(cluster, "ReaderEndpoint");
 
     Identity {

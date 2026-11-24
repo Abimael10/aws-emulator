@@ -20,18 +20,21 @@
 //! reached at it — and the discriminating `cluster-`/`cluster-ro-` label is what tells a read
 //! path from a write path.
 //!
-//! WHICH suffix those names sit in depends on where that cluster's data plane is served,
-//! because a name a service hands a client is a name the client RESOLVES and then dials:
+//! WHICH of the two members a minted name is published in depends on where that cluster's
+//! data plane is served, because the member a client COMPOSES ITS CONNECTION FROM has to be
+//! an address that client can dial and this emulator resolves no name for its clients:
 //!
 //! * a cluster whose engine wire this emulator serves is reached on listeners of its own
-//!   ([`super::data_plane::cluster_endpoint`]), so both of its names sit under the engine's
-//!   own service label in the zone a resolver answers with the interface those listeners are
-//!   bound on ([`served_endpoint_suffix`]) — `localhost` and every name under it being
-//!   reserved for the loopback interface the core binds on (RFC 6761), so the pair of a
-//!   published name and the published `Port` is an address a session really opens on;
-//! * a cluster this emulator serves no data plane for publishes the AWS form, under the DNS
-//!   domain of the control plane that owns its engine ([`super::endpoint_domain`]): there is
-//!   no local plane for such a cluster to lead a client to.
+//!   ([`super::data_plane::cluster_endpoint`]), so its WRITER member publishes the host that
+//!   listener is answered at ([`super::DbClusterRecord::endpoint`]) beside the one published
+//!   `Port`, and only its reader member — which the model gives no port of its own, so no
+//!   client composes an address from it — carries a minted name, under the engine's own
+//!   service label in the zone a resolver answers with the interface those listeners are
+//!   bound on ([`served_endpoint_suffix`]), `localhost` and every name under it being
+//!   reserved for the loopback interface the core binds on (RFC 6761);
+//! * a cluster this emulator serves no data plane for publishes the AWS form for BOTH, under
+//!   the DNS domain of the control plane that owns its engine ([`super::endpoint_domain`]):
+//!   there is no local plane for such a cluster to lead a client to.
 //!
 //! A cluster whose data plane is an AWS API served at this emulator's own endpoint
 //! ([`super::engine_data_plane_is_an_api`] — an Amazon Neptune graph cluster) publishes no

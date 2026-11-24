@@ -446,12 +446,24 @@ async fn every_endpoint_of_a_cluster_publishes_the_address_of_its_own_kind() {
                      <cluster>.cluster-ro-<label>…, got {reader:?}",
                     row.case
                 );
-                assert!(
-                    writer.starts_with(&format!("{}.cluster-", row.cluster)),
-                    "case {:?}: expected a writer endpoint of the form \
-                     <cluster>.cluster-<label>…, got {writer:?}",
-                    row.case
-                );
+                // The WRITER entry is the member a client composes its connection from with
+                // the cluster's one `Port`, so for a cluster whose engine wire this emulator
+                // serves it publishes the ADDRESS that plane is answered at rather than a
+                // minted name; a cluster with no plane of this emulator's keeps the name.
+                match row.expected {
+                    Published::NamesWithCustomListener => assert!(
+                        writer.parse::<std::net::IpAddr>().is_ok(),
+                        "case {:?}: expected the address this emulator answers the cluster's \
+                         engine wire at as its writer endpoint, got {writer:?}",
+                        row.case
+                    ),
+                    _ => assert!(
+                        writer.starts_with(&format!("{}.cluster-", row.cluster)),
+                        "case {:?}: expected a writer endpoint of the form \
+                         <cluster>.cluster-<label>…, got {writer:?}",
+                        row.case
+                    ),
+                }
             }
         }
         // Every entry that publishes a NAME publishes a bare HOST: the cluster has one
