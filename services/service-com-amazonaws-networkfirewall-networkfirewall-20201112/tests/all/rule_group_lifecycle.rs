@@ -520,9 +520,11 @@ async fn rules_that_need_more_than_the_declared_capacity_are_refused() {
     }
 }
 
-/// RULE: `Capacity` is a positive number of capacity units, bounded above by what
-/// this emulator retains per rule group (`state::MAX_RULE_GROUP_CAPACITY`), and a
-/// request outside that range is refused with the error the model gives for it.
+/// RULE: `Capacity` is a positive number of capacity units, bounded above by the
+/// most a rule group may declare (`state::MAX_RULE_GROUP_CAPACITY`), and a
+/// request outside that range is refused as the unsupported parameter value it
+/// is — the modelled `InvalidRequestException`, whichever end of the range it
+/// falls outside.
 #[tokio::test]
 async fn the_declared_capacity_must_be_inside_the_allowed_range() {
     use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
@@ -533,7 +535,11 @@ async fn the_declared_capacity_must_be_inside_the_allowed_range() {
         ("negative", -1, Some("InvalidRequestException")),
         ("lowest-accepted", 1, None),
         ("at-the-ceiling", ceiling, None),
-        ("past-the-ceiling", ceiling + 1, Some("LimitExceededException")),
+        (
+            "past-the-ceiling",
+            ceiling + 1,
+            Some("InvalidRequestException"),
+        ),
     ];
 
     let harness = Harness::new();
@@ -1019,6 +1025,124 @@ async fn encryption_configuration_defaults_to_the_aws_owned_key() {
             firewall["Firewall"].get("EncryptionConfiguration"),
             Some(expected),
             "case {suffix:?}: expected the firewall's encryption settings, got {firewall:?}"
+        );
+    }
+}
+
+/// One stateless rule whose match criteria identify it: a single source address
+/// built from its priority, so a reader can tell which rule it is looking at and
+/// an entry that travelled away from its own priority is visible.
+fn priority_marked_rule(priority: i64) -> Value {
+    stateless_rule(
+        priority,
+        "aws:pass",
+        json!({ "Sources": [{
+            "AddressDefinition": format!("10.{}.{}.0/24", priority / 256, priority % 256),
+        }]}),
+    )
+}
+
+/// RULE: a stateless rule group's rules are stored in their EVALUATION order —
+/// ascending `Priority`, which is the order "Network Firewall evaluates the rules
+/// in a rule group" in (`StatelessRule$Priority`, `@range` 1..65535 and unique
+/// within the group) — so a read reports them lowest priority first whatever
+/// order the write listed them in, with every rule's own definition still
+/// attached to its own priority.
+///
+/// The rows span the submission orders a client can send the same rules in
+/// (already ascending, fully descending, one adjacent pair swapped, a shuffle)
+/// and the sizes and priority spreads they come in (a pair, three, five, and the
+/// published bounds 1 and 65535), on the create path and on the update path
+/// alike.
+#[tokio::test]
+async fn a_stateless_rule_groups_rules_are_stored_in_evaluation_order() {
+    // (case, the priorities in the order the request lists them)
+    let rows: &[(&str, &[i64])] = &[
+        ("already-ascending", &[10, 20]),
+        ("a-transposed-pair", &[20, 10]),
+        ("fully-descending", &[300, 200, 100]),
+        ("one-adjacent-pair-swapped", &[1, 3, 2, 4]),
+        ("shuffled", &[40, 10, 50, 20, 30]),
+        // The bounds the model declares for `Priority`, listed highest first.
+        ("the-published-bounds", &[65535, 1]),
+    ];
+
+    let harness = Harness::new();
+    for (case, submitted) in rows {
+        let mut ascending: Vec<i64> = submitted.to_vec();
+        ascending.sort_unstable();
+        let expected = stateless_group(
+            ascending
+                .iter()
+                .copied()
+                .map(priority_marked_rule)
+                .collect::<Vec<Value>>(),
+        );
+        let capacity = i64::try_from(submitted.len()).expect("a row holds a handful of rules");
+
+        // The create path.
+        let submitted_document = stateless_group(
+            submitted
+                .iter()
+                .copied()
+                .map(priority_marked_rule)
+                .collect::<Vec<Value>>(),
+        );
+        let created = harness
+            .ok(
+                "CreateRuleGroup",
+                &create_request(
+                    case,
+                    "STATELESS",
+                    capacity,
+                    &json!({ "RuleGroup": submitted_document }),
+                ),
+            )
+            .await;
+        let described = harness
+            .ok(
+                "DescribeRuleGroup",
+                &json!({ "RuleGroupName": case, "Type": "STATELESS" }),
+            )
+            .await;
+        assert_eq!(
+            described.get("RuleGroup"),
+            Some(&expected),
+            "case {case:?} submitted as {submitted:?}: expected the rules in ascending priority \
+             order, got {described:?}"
+        );
+
+        // The update path: the same rules resubmitted in the REVERSE of the
+        // submission order are stored in the same evaluation order.
+        let reversed: Vec<Value> = submitted
+            .iter()
+            .rev()
+            .copied()
+            .map(priority_marked_rule)
+            .collect();
+        let token = string_at(&created, &["UpdateToken"]).to_string();
+        harness
+            .ok(
+                "UpdateRuleGroup",
+                &json!({
+                    "RuleGroupName": case,
+                    "Type": "STATELESS",
+                    "UpdateToken": token,
+                    "RuleGroup": stateless_group(reversed),
+                }),
+            )
+            .await;
+        let described = harness
+            .ok(
+                "DescribeRuleGroup",
+                &json!({ "RuleGroupName": case, "Type": "STATELESS" }),
+            )
+            .await;
+        assert_eq!(
+            described.get("RuleGroup"),
+            Some(&expected),
+            "case {case:?} updated in reverse: expected the rules in ascending priority order, \
+             got {described:?}"
         );
     }
 }

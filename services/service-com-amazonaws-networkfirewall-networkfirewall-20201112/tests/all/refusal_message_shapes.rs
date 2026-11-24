@@ -336,8 +336,10 @@ async fn a_firewall_that_is_gone_reports_the_constant_not_found_message() {
 struct CapacityRow {
     label: &'static str,
     group_type: &'static str,
-    /// The `RulesSource` member the rules are given in, which names both the
-    /// refusal's stem and its context.
+    /// The `RulesSource` member the rules are ACCOUNTED under, which names both
+    /// the refusal's stem and its context — the member holding the individual
+    /// rules the service read out of the document, so rules given in Suricata
+    /// flat format are accounted as the stateful rules the string defines.
     member: &'static str,
     /// A document needing `required` capacity units.
     document: Value,
@@ -372,7 +374,9 @@ fn capacity_rows() -> Vec<CapacityRow> {
         CapacityRow {
             label: "three-suricata-lines",
             group_type: "STATEFUL",
-            member: "RulesString",
+            // The string's lines ARE the group's individual stateful rules, so
+            // that is the member they are accounted under.
+            member: "StatefulRules",
             document: rules_string_document(3),
             seed: rules_string_document(1),
             required: 3,
@@ -725,4 +729,190 @@ async fn a_refused_resource_policy_carries_one_constant_message() {
         json!(held),
         "the permitted subset must read back as the store holds it, got {described:?}"
     );
+}
+
+/// The two ways the same Suricata flat-format rules reach the service: the
+/// top-level `Rules` setting and `RuleGroup.RulesSource.RulesString`.
+fn flat_format_arrivals(rules: &Value) -> [(&'static str, Value); 2] {
+    [
+        ("rules", json!({ "Rules": rules })),
+        (
+            "rules-string",
+            json!({ "RuleGroup": { "RulesSource": { "RulesString": rules } } }),
+        ),
+    ]
+}
+
+/// RULE: rules given in Suricata flat format are the rule group's individual
+/// STATEFUL rules — `Rules` is "a string containing stateful rule group rules
+/// specifications in Suricata flat format, with one rule per line" whose "call
+/// response returns a RuleGroup object that Network Firewall has populated from
+/// your string" (`CreateRuleGroupRequest$Rules`) — so the capacity they consume is
+/// accounted against `RulesSource.StatefulRules`, and the built capacity refusal
+/// names that member in its stem and in its context, never the string they
+/// arrived as.
+///
+/// Rows span the rule counts a string can carry (one, two, four lines, each line
+/// consuming one unit) and both ways the string reaches the service; each row is
+/// refused one unit short and accepted at exactly the units its rules need.
+#[tokio::test]
+async fn rules_in_suricata_flat_format_are_accounted_as_stateful_rules() {
+    let harness = Harness::new();
+    let expected_member = "StatefulRules";
+
+    for lines in [1u32, 2, 4] {
+        let rules = rules_string_document(lines)["RulesSource"]["RulesString"].clone();
+        let required = i64::from(lines);
+        let expected = expected_capacity_message(expected_member, required);
+
+        for (arrival, specification) in flat_format_arrivals(&rules) {
+            let case = format!("{lines}-lines/{arrival}");
+            let mut request = json!({
+                "RuleGroupName": format!("flat-{lines}-{arrival}"),
+                "Type": "STATEFUL",
+                "Capacity": required - 1,
+            });
+            for (member, value) in specification
+                .as_object()
+                .expect("a specification is a JSON object")
+            {
+                request[member] = value.clone();
+            }
+            let (status, body) = harness.call("CreateRuleGroup", &request).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidRequestException"),
+                "case {case}: expected 400 InvalidRequestException for {required} units at a \
+                 capacity of {}, got {status} {body:?}",
+                required - 1
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, expected,
+                "case {case}: expected the built capacity message {expected:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains("RulesString"),
+                "case {case}: the refusal must name the member the rules are accounted under, \
+                 got {message:?}"
+            );
+            assert_eq!(
+                bracketed_parameter(&message),
+                Some(required.to_string().as_str()),
+                "case {case}: expected the required capacity in the parameter brackets, \
+                 got {message:?}"
+            );
+
+            // The boundary: exactly the units the rules need is accepted, and the
+            // stored rule group reports consuming them.
+            request["RuleGroupName"] = json!(format!("flat-{lines}-{arrival}-at-the-bound"));
+            request["Capacity"] = json!(required);
+            let created = harness.ok("CreateRuleGroup", &request).await;
+            assert_eq!(
+                created["RuleGroupResponse"]["ConsumedCapacity"],
+                json!(required),
+                "case {case}: expected the rules to consume {required} units, got {created:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a `Capacity` above the most a rule group may declare
+/// (`state::MAX_RULE_GROUP_CAPACITY`) is an unsupported parameter value, so it is
+/// refused with `InvalidRequestException` (HTTP 400) carrying the same built
+/// capacity shape about the request's own `Capacity` member — the stem and the
+/// context naming that member, the brackets carrying the capacity the REQUEST
+/// asked for — and the capacity at the ceiling is accepted.
+///
+/// Rows span the first value past the ceiling, one far past it and the largest
+/// `Capacity` the wire can carry, each on both halves of the service and with
+/// `DryRun` set and clear, plus the ceiling itself as the accepted boundary.
+#[tokio::test]
+async fn a_capacity_above_the_ceiling_is_refused_as_an_unsupported_capacity() {
+    let harness = Harness::new();
+    let ceiling = i64::from(state::MAX_RULE_GROUP_CAPACITY);
+
+    // (the half of the service, a document for it needing one unit)
+    let halves: [(&str, Value); 2] = [
+        ("STATEFUL", stateful_rules_document(1)),
+        ("STATELESS", stateless_document(1, 1)),
+    ];
+    // (case, the capacity the request declares)
+    let past_the_ceiling: [(&str, i64); 3] = [
+        ("one-past", ceiling + 1),
+        ("far-past", ceiling + 1_000),
+        ("the-largest-wire-capacity", i64::from(i32::MAX)),
+    ];
+
+    for (group_type, document) in &halves {
+        for (label, capacity) in past_the_ceiling {
+            for (variant, dry_run) in [("create", false), ("dry-run", true)] {
+                let case = format!("{group_type}/{label}/{variant}");
+                let name = format!("ceiling-{group_type}-{label}-{variant}").to_lowercase();
+                let (status, body) = harness
+                    .call(
+                        "CreateRuleGroup",
+                        &json!({
+                            "RuleGroupName": name,
+                            "Type": group_type,
+                            "Capacity": capacity,
+                            "RuleGroup": document,
+                            "DryRun": dry_run,
+                        }),
+                    )
+                    .await;
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "InvalidRequestException"),
+                    "case {case}: expected 400 InvalidRequestException for a Capacity of \
+                     {capacity}, got {status} {body:?}"
+                );
+                let expected =
+                    format!("Capacity capacity exceeded, parameter: [{capacity}], context: Capacity");
+                let message = error_message(&body);
+                assert_eq!(
+                    message, expected,
+                    "case {case}: expected the built capacity message {expected:?}, got \
+                     {message:?}"
+                );
+                assert_eq!(
+                    bracketed_parameter(&message),
+                    Some(capacity.to_string().as_str()),
+                    "case {case}: expected the requested capacity in the parameter brackets, \
+                     got {message:?}"
+                );
+                // A refused create persists nothing.
+                let (status, body) = harness
+                    .call(
+                        "DescribeRuleGroup",
+                        &json!({ "RuleGroupName": name, "Type": group_type }),
+                    )
+                    .await;
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "ResourceNotFoundException"),
+                    "case {case}: a refused create must persist nothing, got {status} {body:?}"
+                );
+            }
+        }
+
+        // The boundary: the ceiling itself is accepted and reported back.
+        let case = format!("{group_type}/at-the-ceiling");
+        let created = harness
+            .ok(
+                "CreateRuleGroup",
+                &json!({
+                    "RuleGroupName": format!("ceiling-{group_type}-accepted").to_lowercase(),
+                    "Type": group_type,
+                    "Capacity": ceiling,
+                    "RuleGroup": document,
+                }),
+            )
+            .await;
+        assert_eq!(
+            created["RuleGroupResponse"]["Capacity"],
+            json!(ceiling),
+            "case {case}: expected the ceiling to be accepted and reported, got {created:?}"
+        );
+    }
 }

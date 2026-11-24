@@ -541,16 +541,18 @@ async fn capacity_is_sufficient_when_it_covers_what_the_rules_consume() {
 
 /// RULE: a stateful rule submitted in Suricata flat format must be one the engine
 /// can load — its action is one the service implements, it assigns a signature id,
-/// and no two rules of one rule group assign the same one — and a rule group
-/// carrying one that cannot be loaded is refused with the rule as the service
-/// loaded it and the reason.
+/// and the id it assigns is assigned by no other rule of the same string — and a
+/// rule group carrying one that cannot be loaded is refused with the rule as the
+/// service loaded it and the reason.
 ///
 /// The rows span: an action the service does not implement; a signature id
-/// swallowed by an option value left unterminated; no signature id at all; one
-/// repeated by a later rule; two rules repeating an assigned id; and every rule
-/// loading cleanly. Each row is submitted BOTH through `Rules` and through
-/// `RuleGroup.RulesSource.RulesString`, the two ways the same rules reach the
-/// service.
+/// swallowed by an option value left unterminated; no signature id at all; an id
+/// two rules share; the same rule written twice; three rules sharing one id; a
+/// shared id beside a unique one; and every rule loading cleanly. A shared id is
+/// a property of the rules that share it, so EVERY one of them is reported, in
+/// the order they were written. Each row is submitted BOTH through `Rules` and
+/// through `RuleGroup.RulesSource.RulesString`, the two ways the same rules reach
+/// the service.
 #[tokio::test]
 async fn a_stateful_rule_in_suricata_flat_format_must_be_one_the_engine_can_load() {
     /// The refusal a rule the engine could not load carries.
@@ -589,22 +591,51 @@ async fn a_stateful_rule_in_suricata_flat_format_must_be_one_the_engine_can_load
             )),
         ),
         (
-            "a-signature-id-a-later-rule-repeats",
+            "a-signature-id-two-rules-share",
             "pass tcp any any -> any 443 (sid:1001; rev:1;)\n\
              drop tcp any any -> any 80 (sid:1001; rev:1;)",
-            Some(duplicate(
-                "drop tcp any any -> any 80 (sid:1001; rev:1; gid:1234567890;)",
+            Some(format!(
+                "{}\n{}",
+                duplicate("pass tcp any any -> any 443 (sid:1001; rev:1; gid:1234567890;)"),
+                duplicate("drop tcp any any -> any 80 (sid:1001; rev:1; gid:1234567890;)"),
             )),
         ),
         (
-            "two-rules-repeating-an-assigned-id",
+            // The same rule written twice: one refusal per copy.
+            "a-repeated-rule",
+            "pass tcp 10.1.0.0/16 any -> any 443 (msg:\"egress 443\"; sid:1001; rev:1;)\n\
+             pass tcp 10.1.0.0/16 any -> any 443 (msg:\"egress 443\"; sid:1001; rev:1;)",
+            Some(format!(
+                "{copy}\n{copy}",
+                copy = duplicate(concat!(
+                    r#"pass tcp 10.1.0.0/16 any -> any 443 (msg:"egress 443"; sid:1001; "#,
+                    "rev:1; gid:1234567890;)",
+                )),
+            )),
+        ),
+        (
+            "three-rules-sharing-an-id",
             "pass tcp any any -> any 443 (sid:7; rev:1;)\n\
              drop tcp any any -> any 80 (sid:7; rev:1;)\n\
              reject tcp any any -> any 25 (sid:7; rev:1;)",
             Some(format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
+                duplicate("pass tcp any any -> any 443 (sid:7; rev:1; gid:1234567890;)"),
                 duplicate("drop tcp any any -> any 80 (sid:7; rev:1; gid:1234567890;)"),
                 duplicate("reject tcp any any -> any 25 (sid:7; rev:1; gid:1234567890;)"),
+            )),
+        ),
+        (
+            // One repeated id beside one that is not: only the rules sharing an
+            // id are reported.
+            "one-shared-id-beside-a-unique-one",
+            "pass tcp any any -> any 443 (sid:11; rev:1;)\n\
+             pass udp any any -> any 53 (sid:12; rev:1;)\n\
+             drop tcp any any -> any 80 (sid:11; rev:2;)",
+            Some(format!(
+                "{}\n{}",
+                duplicate("pass tcp any any -> any 443 (sid:11; rev:1; gid:1234567890;)"),
+                duplicate("drop tcp any any -> any 80 (sid:11; rev:2; gid:1234567890;)"),
             )),
         ),
         (

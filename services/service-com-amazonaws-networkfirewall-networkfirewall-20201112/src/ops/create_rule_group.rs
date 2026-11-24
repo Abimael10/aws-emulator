@@ -255,29 +255,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group whose rules already need more than the capacity reserved for it could
         // never be used, so the request is refused rather than stored.
         if input.capacity > crate::state::MAX_RULE_GROUP_CAPACITY {
-            return Err(CreateRuleGroupErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "This emulator allows at most {} capacity units per rule group; this \
-                         request asked for {}.",
-                        crate::state::MAX_RULE_GROUP_CAPACITY,
-                        input.capacity
-                    )),
-                },
-            )
-            .into());
+            // A `Capacity` above the ceiling is a value the service does not
+            // accept, so it is the modelled client error carrying the same built
+            // capacity shape as the refusal below, about the request's own
+            // `Capacity` member: the brackets hold the capacity asked for, and
+            // the context names that member.
+            return Err(invalid_request(
+                &crate::state::declared_capacity_exceeded_message(input.capacity),
+            ));
         }
         let consumed = crate::state::required_capacity(&input.r#type, &rule_group);
         if consumed > input.capacity {
             // Built from the request, so it takes the service's built shape: the
-            // stem and context name the `RulesSource` member the rules arrived
-            // in, and the brackets carry the capacity they REQUIRE — what a
-            // client retries with.
+            // stem and context name the `RulesSource` member the rules are
+            // accounted under, and the brackets carry the capacity they REQUIRE
+            // — what a client retries with.
             return Err(invalid_request(&crate::state::capacity_exceeded_message(
                 &rule_group,
                 consumed,
             )));
         }
+
+        // The document as it is STORED, which is what every later read reports:
+        // a stateless rule group's rules are held in their evaluation order
+        // (`state::stored_rule_group_document`).
+        let rule_group = crate::state::stored_rule_group_document(rule_group);
 
         // "If set to TRUE, Network Firewall runs the analysis and then creates the rule
         // group for you", and the analyzer reports on stateless rule groups only, so a

@@ -14,7 +14,9 @@
 //! * the rule ASSIGNS A SIGNATURE ID, the `sid` keyword Suricata identifies a
 //!   signature by, since a rule that assigns none cannot be loaded at all;
 //! * and no two rules of one rule group assign the SAME signature id, which would
-//!   leave the engine unable to tell which signature a match belongs to.
+//!   leave the engine unable to tell which signature a match belongs to — so
+//!   every rule sharing a repeated id is reported, the first to assign it
+//!   included.
 //!
 //! A rule group carrying such a rule is refused rather than retained: a stored
 //! rule nothing can load would inspect no traffic while the rule group reports
@@ -32,7 +34,7 @@
 //! (`@length` 0..2000000) — and so is the refusal it builds, which carries at
 //! most one line per rule.
 
-use ::std::collections::HashSet;
+use ::std::collections::HashMap;
 
 use ::suricatax_rule_parser::scanner::{RuleScanEvent, RuleScanner};
 
@@ -139,24 +141,30 @@ fn rule_defect(scanned: &ScannedRule) -> Option<String> {
         .then(|| SID_NOT_ASSIGNED.to_owned())
 }
 
-/// One refusal per rule whose signature id an EARLIER rule of the same rules
-/// string already assigned, in the order the rules were written.
+/// One refusal per rule of the string that assigns a signature id ANOTHER rule
+/// of the same string also assigns, in the order the rules were written.
 ///
-/// The rules are loaded in order and each one registers its signature id, so the
-/// rule a clash is reported for is the one being loaded — the first rule to
-/// assign an id keeps it, and every later rule assigning the same one is a
-/// duplicate of a signature the engine already holds. The refusal names that
-/// rule inside the reason rather than in a `rule:` segment of its own, which is
-/// how a clash between rules is reported as against a defect in one rule's text.
+/// A signature id identifies one signature, so when two rules assign the same
+/// one the engine can tell neither of them apart — the clash is a property of
+/// the GROUP of rules sharing the id, not of whichever rule was read second, so
+/// every rule in that group is reported, including the one that assigned the id
+/// first, and a rules string that simply repeats a rule is reported once per
+/// copy. The refusal names the offending rule inside the reason rather than in a
+/// `rule:` segment of its own, which is how a clash between rules is reported as
+/// against a defect in one rule's text.
 fn duplicate_signature_refusals(scanned: &[(&str, ScannedRule)]) -> Vec<String> {
-    let mut assigned: HashSet<&str> = HashSet::new();
+    let mut assigned_by: HashMap<&str, usize> = HashMap::new();
+    for (_, scanned) in scanned {
+        if let Some(signature_id) = scanned.signature_id.as_deref() {
+            *assigned_by.entry(signature_id).or_default() += 1;
+        }
+    }
     scanned
         .iter()
         .filter(|(_, scanned)| {
-            scanned
-                .signature_id
-                .as_deref()
-                .is_some_and(|signature_id| !assigned.insert(signature_id))
+            scanned.signature_id.as_deref().is_some_and(|signature_id| {
+                assigned_by.get(signature_id).copied().unwrap_or_default() > 1
+            })
         })
         .map(|(rule, _)| refusal(&format!("Duplicate signature \"{}\"", loaded_rule(rule))))
         .collect()
@@ -376,11 +384,11 @@ mod tests {
         );
     }
 
-    /// RULE: a rule whose signature id an earlier rule already assigned is
-    /// reported, the rule that assigned it first is not, and a set of distinct
-    /// ids is accepted.
+    /// RULE: every rule assigning a signature id another rule of the same string
+    /// also assigns is reported — the one that assigned it first included, and a
+    /// repeated rule once per copy — while a set of distinct ids is accepted.
     #[test]
-    fn a_rule_repeating_an_earlier_signature_id_is_reported() {
+    fn every_rule_sharing_a_signature_id_is_reported() {
         let rules = "pass tcp 10.1.0.0/16 any -> any 443 (sid:1001; rev:1;)\n\
                      pass udp 10.2.0.0/16 any -> any 443 (sid:1002; rev:1;)\n\
                      drop tcp 10.3.0.0/16 any -> any 443 (sid:1001; rev:2;)\n\
@@ -389,12 +397,29 @@ mod tests {
         assert_eq!(
             reported.as_deref(),
             Some(
-                "stateful rule is invalid, reason: Duplicate signature \"drop tcp 10.3.0.0/16 \
+                "stateful rule is invalid, reason: Duplicate signature \"pass tcp 10.1.0.0/16 \
+                 any -> any 443 (sid:1001; rev:1; gid:1234567890;)\"\n\
+                 stateful rule is invalid, reason: Duplicate signature \"drop tcp 10.3.0.0/16 \
                  any -> any 443 (sid:1001; rev:2; gid:1234567890;)\"\n\
                  stateful rule is invalid, reason: Duplicate signature \"drop udp 10.4.0.0/16 \
                  any -> any 443 (sid:1001; rev:3; gid:1234567890;)\""
             ),
-            "expected the two rules repeating an assigned id reported, got {reported:?}"
+            "expected every rule assigning the repeated id reported, and the rule assigning \
+             1002 alone left out, got {reported:?}"
+        );
+
+        // A rules string that simply repeats a rule: both copies are reported.
+        let repeated = "pass tcp 10.1.0.0/16 any -> any 443 (msg:\"egress 443\"; sid:1001; rev:1;)\n\
+                        pass tcp 10.1.0.0/16 any -> any 443 (msg:\"egress 443\"; sid:1001; rev:1;)";
+        let reported = rules_string_breach(repeated);
+        let one_copy = concat!(
+            r#"stateful rule is invalid, reason: Duplicate signature "pass tcp 10.1.0.0/16 "#,
+            r#"any -> any 443 (msg:"egress 443"; sid:1001; rev:1; gid:1234567890;)""#,
+        );
+        assert_eq!(
+            reported.as_deref(),
+            Some(format!("{one_copy}\n{one_copy}").as_str()),
+            "expected one refusal per copy of the repeated rule, got {reported:?}"
         );
 
         let distinct = "pass tcp any any -> any any (sid:1;)\n\

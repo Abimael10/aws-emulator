@@ -311,6 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 consumed,
             )));
         }
+        // The document the update lands is stored the way a create stores one:
+        // a stateless rule group's rules in their evaluation order
+        // (`state::stored_rule_group_document`).
+        record.rule_group = crate::state::stored_rule_group_document(record.rule_group);
 
         // Every other member the request carries replaces what was stored; one it
         // omits leaves that part of the rule group as the last write left it, which

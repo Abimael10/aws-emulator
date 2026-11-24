@@ -198,13 +198,17 @@ pub const MAX_STORED_FLOW_OPERATIONS: usize = 1_000;
 
 /// The highest `Capacity` a rule group may be created with here.
 ///
-/// CHOSEN, not an AWS quota: the model puts NO range on `RuleCapacity`, and a
-/// rule group's retained rules are bounded only by the capacity they consume
-/// (`required_capacity` must not exceed `Capacity`), so capping the capacity is
-/// what keeps one request from making a single retained record arbitrarily
-/// large. It is far above any rule group an emulator serves, and a request past
-/// it is refused with the modelled `LimitExceededException` ("Unable to perform
-/// the operation because doing so would violate a limit setting").
+/// The model puts NO range on `RuleCapacity`, so the ceiling is enforced by the
+/// handler rather than by the constraint validator, and a request above it is
+/// refused as the malformed input it is: the modelled `InvalidRequestException`
+/// ("you specified an unsupported parameter name or value") carrying the built
+/// capacity refusal ([`declared_capacity_exceeded_message`]), and NOT a
+/// quota condition a client would retry against.
+///
+/// 30,000 units is the ceiling the recorded service refuses above; it also bounds
+/// what one request can make this emulator retain, since a rule group's rules are
+/// bounded only by the capacity they consume ([`required_capacity`] must not
+/// exceed `Capacity`).
 pub const MAX_RULE_GROUP_CAPACITY: i32 = 30_000;
 
 /// How many entries any one list inside a retained `FirewallPolicy` document may
@@ -583,20 +587,79 @@ pub fn too_many_log_destinations_message(found: usize) -> String {
 pub const MAX_STORED_RESOURCE_POLICIES: usize =
     MAX_STORED_FIREWALL_POLICIES + MAX_STORED_RULE_GROUPS;
 
+/// The `RulesSource` members a rule group's rules can be given in, as the
+/// model names them (`smithy_query(query="shape",shape="RulesSource")`).
+pub const RULES_SOURCE_STATELESS_RULES: &str = "StatelessRulesAndCustomActions";
+/// See [`RULES_SOURCE_STATELESS_RULES`].
+pub const RULES_SOURCE_STATEFUL_RULES: &str = "StatefulRules";
+/// See [`RULES_SOURCE_STATELESS_RULES`].
+pub const RULES_SOURCE_LIST: &str = "RulesSourceList";
+/// See [`RULES_SOURCE_STATELESS_RULES`].
+pub const RULES_SOURCE_RULES_STRING: &str = "RulesString";
+
 /// The `RulesSource` member `group`'s rules were given in, for an error message
 /// that names the offending part of the request. `rule_group_document_breach`
 /// has already refused a document that does not set exactly one of them.
 pub fn rules_source_member(group: &RuleGroup) -> &'static str {
     let source = &group.rules_source;
     if source.stateless_rules_and_custom_actions.is_some() {
-        "StatelessRulesAndCustomActions"
+        RULES_SOURCE_STATELESS_RULES
     } else if source.stateful_rules.is_some() {
-        "StatefulRules"
+        RULES_SOURCE_STATEFUL_RULES
     } else if source.rules_source_list.is_some() {
-        "RulesSourceList"
+        RULES_SOURCE_LIST
     } else {
-        "RulesString"
+        RULES_SOURCE_RULES_STRING
     }
+}
+
+/// The `RulesSource` member `group`'s rules are ACCOUNTED under — the member
+/// holding the individual rules the service read out of the document, which is
+/// what [`required_capacity`] totals and therefore what a capacity refusal
+/// names.
+///
+/// It differs from [`rules_source_member`], the member the request GAVE the
+/// rules in, for exactly one source: rules in Suricata flat format arrive as "a
+/// string containing stateful rule group rules specifications in Suricata flat
+/// format, with one rule per line", and "the call response returns a RuleGroup
+/// object that Network Firewall has populated from your string"
+/// (`CreateRuleGroupRequest$Rules`), so that string's lines ARE the rule group's
+/// individual stateful rules — counted one apiece by [`required_capacity`] — and
+/// the member they are accounted under is `StatefulRules`, whichever way the
+/// string reached the service (the top-level `Rules` setting or
+/// `RuleGroup.RulesSource.RulesString`).
+pub fn accounted_rules_source_member(group: &RuleGroup) -> &'static str {
+    if group.rules_source.rules_string.is_some() {
+        RULES_SOURCE_STATEFUL_RULES
+    } else {
+        rules_source_member(group)
+    }
+}
+
+/// `group` as this service STORES it, which is what every later read of the rule
+/// group reports.
+///
+/// One normalisation, over a stateless rule group's rules: `StatelessRule$Priority`
+/// "indicates the order in which to run this rule relative to all of the rules
+/// that are defined for a stateless rule group. Network Firewall evaluates the
+/// rules in a rule group starting with the lowest priority setting", and the
+/// priorities of one rule group are unique ([`stateless_rule_breach`] refuses a
+/// document where they are not), so the rules have ONE evaluation order and the
+/// stored list is held in it — ascending by priority — however the request
+/// happened to order them. A read then reports the rules in the order they run,
+/// and two requests that differ only in the order they list the same rules store
+/// the same rule group.
+///
+/// Nothing else about the document is rewritten: a stateful source has no
+/// ordering of its own (its rules are evaluated by the engine's own rule order,
+/// `StatefulRuleOptions$RuleOrder`) and is stored exactly as it was given.
+pub fn stored_rule_group_document(mut group: RuleGroup) -> RuleGroup {
+    if let Some(stateless) = group.rules_source.stateless_rules_and_custom_actions.as_mut() {
+        stateless
+            .stateless_rules
+            .sort_by_key(|rule| rule.priority);
+    }
+    group
 }
 
 /// Why `group` is not a rule group document of type `group_type`, or `None` when
@@ -618,10 +681,10 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
     let source = &group.rules_source;
     let stateless = source.stateless_rules_and_custom_actions.is_some();
     let members = [
-        ("RulesString", source.rules_string.is_some()),
-        ("RulesSourceList", source.rules_source_list.is_some()),
-        ("StatefulRules", source.stateful_rules.is_some()),
-        ("StatelessRulesAndCustomActions", stateless),
+        (RULES_SOURCE_RULES_STRING, source.rules_string.is_some()),
+        (RULES_SOURCE_LIST, source.rules_source_list.is_some()),
+        (RULES_SOURCE_STATEFUL_RULES, source.stateful_rules.is_some()),
+        (RULES_SOURCE_STATELESS_RULES, stateless),
     ];
     let given: Vec<&str> = members
         .into_iter()
@@ -1733,18 +1796,40 @@ pub fn context_message(stem: &str, context: &str) -> String {
 ///
 /// The refusal is one of the few this service builds FROM the request, and it
 /// takes the built shape with a context ([`parameter_context_message`]): the stem
-/// names the `RulesSource` member the rules were given in and the check that
-/// failed, the brackets carry the capacity those rules REQUIRE (what a client
-/// needs in order to retry with a sufficient `Capacity`, or to decide to split
-/// the rules when the capacity is fixed), and the context is the input path that
-/// member sits on. The capacity the rule group declares is not in the message:
-/// the caller sent it, and `RuleGroupResponse$Capacity` reports it back.
+/// names the `RulesSource` member the rules are ACCOUNTED under
+/// ([`accounted_rules_source_member`]) and the check that failed, the brackets
+/// carry the capacity those rules REQUIRE (what a client needs in order to retry
+/// with a sufficient `Capacity`, or to decide to split the rules when the
+/// capacity is fixed), and the context is the input path that member sits on. The
+/// capacity the rule group declares is not in the message: the caller sent it, and
+/// `RuleGroupResponse$Capacity` reports it back.
 pub fn capacity_exceeded_message(group: &RuleGroup, required: i32) -> String {
-    let member = rules_source_member(group);
+    let member = accounted_rules_source_member(group);
+    capacity_exceeded(member, required, &format!("RulesSource.{member}"))
+}
+
+/// The input member a rule group's declared capacity arrives on, which is both
+/// what its own refusal names and the context that refusal reports
+/// (`CreateRuleGroupRequest$Capacity`).
+pub const CAPACITY_MEMBER: &str = "Capacity";
+
+/// What a request declaring more capacity than a rule group may hold
+/// ([`MAX_RULE_GROUP_CAPACITY`]) is refused with: the SAME built capacity shape,
+/// about the request's own `Capacity` member rather than about a rules source —
+/// so the stem and the context name that member and the brackets carry the
+/// capacity the request asked for, which is the value that has to come down.
+pub fn declared_capacity_exceeded_message(capacity: i32) -> String {
+    capacity_exceeded(CAPACITY_MEMBER, capacity, CAPACITY_MEMBER)
+}
+
+/// The one shape every capacity refusal this service answers takes: `<member>
+/// capacity exceeded`, the capacity in parameter brackets, and the input path the
+/// exceeded capacity belongs to as context.
+fn capacity_exceeded(member: &str, capacity: i32, context: &str) -> String {
     parameter_context_message(
         &format!("{member} capacity exceeded"),
-        &required.to_string(),
-        &format!("RulesSource.{member}"),
+        &capacity.to_string(),
+        context,
     )
 }
 
