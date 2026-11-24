@@ -283,6 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.namespace,
                 &input.name,
             ),
+            // The id the service gives this dataset, minted once here so every reader of
+            // the dataset reports the same one for the life of the store.
+            dataset_id: crate::state::fresh_dataset_id(),
             schema,
             description: input.description,
             partition_spec: input.partition_spec,

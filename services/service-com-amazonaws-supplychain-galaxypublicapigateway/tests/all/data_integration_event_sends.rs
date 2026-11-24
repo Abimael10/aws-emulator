@@ -299,10 +299,31 @@ async fn a_sent_event_is_recorded_and_read_back() {
                 "case {case:?}: an unstamped event must be stamped by the service, got {event}"
             ),
         }
-        // An event that named no dataset target reports none.
+        // An event of an entity type names no target of its own, so the load it drove is
+        // reported against the dataset the service keeps for that type: no
+        // `datasetIdentifier`, because no client addresses that dataset, the APPEND
+        // operation the load performs (a value of the modelled
+        // `DataIntegrationEventDatasetOperationType`) and the load's terminal status.
+        let details = event
+            .get("datasetTargetDetails")
+            .unwrap_or_else(|| panic!("case {case:?}: the event reports no load: {event}"));
         assert!(
-            event.get("datasetTargetDetails").is_none(),
-            "case {case:?}: an event with no datasetTarget must report none, got {event}"
+            details.get("datasetIdentifier").is_none(),
+            "case {case:?}: a load into a dataset no client addressed names none, got {details}"
+        );
+        assert_eq!(
+            details.get("operationType").and_then(Value::as_str),
+            Some("APPEND"),
+            "case {case:?}: an entity event's load appends its records, got {details}"
+        );
+        assert_eq!(
+            details
+                .get("datasetLoadExecution")
+                .and_then(|execution| execution.get("status"))
+                .and_then(Value::as_str),
+            Some("SUCCEEDED"),
+            "case {case:?}: an accepted event's load must report its terminal status, got \
+             {details}"
         );
     }
 
@@ -406,6 +427,40 @@ async fn a_replayed_client_token_records_one_event() {
             .len(),
         2,
         "case \"another token\": the store must hold both events"
+    );
+
+    // The token is remembered per INSTANCE: an event belongs to the instance that was sent
+    // it, and the token is a value the request chooses, so the SAME token presented for
+    // another instance names no event of this one — it records that instance's own first
+    // event, and leaves this instance's events alone.
+    let other = emulator.given_instance().await;
+    let (status, body) = emulator.send_event(&other, request(&token)).await;
+    assert_eq!(
+        status, 200,
+        "case \"the same token, another instance\": expected 200, got {status} with {body}"
+    );
+    assert_ne!(
+        body["eventId"].as_str(),
+        Some(first.as_str()),
+        "case \"the same token, another instance\": a token of one instance must not answer \
+         with another instance's event, got {body}"
+    );
+    assert_eq!(
+        emulator
+            .listed_events("the same token, another instance", &other)
+            .await
+            .len(),
+        1,
+        "case \"the same token, another instance\": the send must record that instance's own \
+         event"
+    );
+    assert_eq!(
+        emulator
+            .listed_events("the same token, another instance", &instance_id)
+            .await
+            .len(),
+        2,
+        "case \"the same token, another instance\": the first instance's events are untouched"
     );
 }
 

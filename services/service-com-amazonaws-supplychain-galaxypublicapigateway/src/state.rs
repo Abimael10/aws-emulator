@@ -11,11 +11,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DataIntegrationEvent, DataIntegrationEventDatasetTargetDetails, DataIntegrationFlow,
+    DataIntegrationEvent, DataIntegrationEventDatasetLoadExecutionDetails,
+    DataIntegrationEventDatasetTargetDetails, DataIntegrationFlow,
+    DataIntegrationFlowDatasetSourceWire, DataIntegrationFlowDatasetTargetWire,
     DataIntegrationFlowExecution, DataIntegrationFlowExecutionOutputMetadata,
-    DataIntegrationFlowExecutionSourceInfo, DataIntegrationFlowSource, DataIntegrationFlowTarget,
-    DataIntegrationFlowTransformation, DataLakeDataset, DataLakeDatasetPartitionSpec,
-    DataLakeDatasetSchema, DataLakeNamespace, Instance,
+    DataIntegrationFlowExecutionSourceInfo, DataIntegrationFlowSource,
+    DataIntegrationFlowSourceWire, DataIntegrationFlowTarget, DataIntegrationFlowTargetWire,
+    DataIntegrationFlowTransformation, DataIntegrationFlowTriggerOptions, DataLakeDataset,
+    DataLakeDatasetPartitionSpec, DataLakeDatasetSchema, DataLakeNamespace, Instance,
 };
 
 /// The sentence AWS Supply Chain refuses the Product Bill Of Materials (BOM) import API
@@ -521,7 +524,18 @@ pub fn dataset_arn(region: &str, instance_id: &str, namespace: &str, name: &str)
 /// the custom defined namespace, every instance comes with below pre-defined namespaces:
 /// asc […] default […]". Every other namespace exists only once it has been created, so a
 /// dataset addressed to one that was never created names no namespace at all.
-pub const PREDEFINED_NAMESPACES: [&str; 2] = ["asc", "default"];
+pub const PREDEFINED_NAMESPACES: [&str; 2] = [SERVICE_DATASET_NAMESPACE, "default"];
+
+/// The namespace AWS Supply Chain keeps its OWN datasets in — the pre-defined `asc`
+/// namespace.
+///
+/// SOURCE: the model singles it out wherever a service-managed dataset matters — the
+/// `datasetTarget` member of `DataIntegrationFlowTarget` documents that "for AWS Supply
+/// Chain dataset under asc namespace, it has a connection_id internal field that is not
+/// allowed to be provided by client directly", and the entity `eventType` values each
+/// "Send data to" one of those datasets. Every other namespace holds datasets a customer
+/// defined, which is what [`flow_dataset_end_identity`] reports a dataset end's type from.
+pub const SERVICE_DATASET_NAMESPACE: &str = "asc";
 
 /// Whether `namespace` is one an instance comes with ([`PREDEFINED_NAMESPACES`]).
 pub fn is_predefined_namespace(namespace: &str) -> bool {
@@ -607,6 +621,14 @@ pub struct DataLakeDatasetRecord {
     pub namespace: String,
     pub name: String,
     pub arn: String,
+    /// The id this service gives the dataset, minted once when it is created.
+    ///
+    /// RECORDED behaviour, not modelled: no member of the `DataLakeDataset` shape carries
+    /// it, so no dataset read reports it — but a flow that reads or writes this dataset
+    /// names it by this id ([`flow_dataset_end_identity`] and
+    /// [`ComAmazonawsSupplychainGalaxypublicapigatewayState::dataset_id`]), which is why the
+    /// dataset owns one for its whole life rather than having one made up per projection.
+    pub dataset_id: String,
     pub schema: DataLakeDatasetSchema,
     pub description: Option<String>,
     pub partition_spec: Option<DataLakeDatasetPartitionSpec>,
@@ -678,6 +700,21 @@ pub fn data_integration_event_key(instance_id: &str, event_id: &str) -> DataInte
     (instance_id.to_string(), event_id.to_string())
 }
 
+/// How one send's `clientToken` is remembered: the instance the send addressed, then the
+/// token itself.
+///
+/// The instance is part of the key because the token is a value the REQUEST chooses while
+/// the event it recorded belongs to one instance: a send of another instance presenting the
+/// same token names no event of this one, and is recorded as the first send of its own
+/// instance instead.
+pub type EventIdempotencyKey = (String, String);
+
+/// The [`EventIdempotencyKey`] for one send, so the lookup and the insert build the key the
+/// same way.
+pub fn event_idempotency_key(instance_id: &str, client_token: &str) -> EventIdempotencyKey {
+    (instance_id.to_string(), client_token.to_string())
+}
+
 /// One persisted data-integration event — the whole record, not the wire shape.
 /// [`DataIntegrationEventRecord::to_wire`] projects it onto the modelled
 /// `DataIntegrationEvent` structure, so every handler answers from exactly these stored
@@ -738,6 +775,63 @@ pub const DATA_INTEGRATION_EVENT_TYPE_DATASET: &str = "scn.data.dataset";
 /// (`smithy_query(query="shape", shape="DataIntegrationEventDatasetLoadStatus")`).
 pub const DATASET_LOAD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
+/// The `DataIntegrationEventDatasetOperationType` an accepted event's load performs: it
+/// ADDS the event's records to the dataset rather than replacing or deleting any.
+///
+/// RECORDED behaviour for an event whose own request names no operation — every type beside
+/// [`DATA_INTEGRATION_EVENT_TYPE_DATASET`], whose request carries the operation itself.
+pub const DATASET_LOAD_OPERATION_TYPE_APPEND: &str = "APPEND";
+
+/// The load an accepted event of an ENTITY type drives, as the event reads report it.
+///
+/// Every event type beside [`DATA_INTEGRATION_EVENT_TYPE_DATASET`] is loaded into the
+/// data-lake dataset the service keeps for that type — each type's own documentation says
+/// which ("scn.data.supplyplan - Send data to supply_plan dataset", and one such line per
+/// type) — so the event the send records reports THAT load: the operation it performs
+/// ([`DATASET_LOAD_OPERATION_TYPE_APPEND`], the request having named none) and the status it
+/// reached ([`DATASET_LOAD_STATUS_SUCCEEDED`]), which is what lets a client that sent an
+/// event read back whether it was loaded.
+///
+/// It reports NO `datasetIdentifier`: that member is the dataset ARN a client addressed, and
+/// no client addresses the dataset the service keeps for an entity type (the model notes
+/// such a dataset carries internal fields "not allowed to be provided by client directly").
+/// RECORDED: the recorded event read of an entity event reports the details with that member
+/// absent, which is why it is optional on the structure (see
+/// `crate::ops::types::event_load_wire`).
+pub fn entity_event_dataset_load() -> DataIntegrationEventDatasetTargetDetails {
+    DataIntegrationEventDatasetTargetDetails {
+        dataset_identifier: None,
+        operation_type: DATASET_LOAD_OPERATION_TYPE_APPEND.to_string(),
+        dataset_load_execution: DataIntegrationEventDatasetLoadExecutionDetails {
+            status: DATASET_LOAD_STATUS_SUCCEEDED.to_string(),
+            // No failure to report for a load the store accepted.
+            message: None,
+        },
+    }
+}
+
+/// How a send refuses a `data` payload that is not the JSON the member documents
+/// (`ValidationException`, HTTP 400).
+///
+/// Its SOURCE is the recorded wire response of such a send. The whole sentence is FIXED: it
+/// names the class of defect in the payload — the payload itself is `@sensitive` and no part
+/// of it, nor its length or position, appears in the message. Stated once, here, beside the
+/// service's other refusal sentences.
+pub const MALFORMED_EVENT_DATA_MESSAGE: &str =
+    "Schema validation failed: Invalid JSON: Malformed JSON structure";
+
+/// Whether an event's `data` payload is one of the two JSON forms that member documents.
+///
+/// SOURCE: the `data` member's own documentation — "To send single data record, use
+/// JsonObject format; to send multiple data records, use JsonArray format" — so a payload
+/// that is not well-formed JSON, or is JSON that is neither an object nor an array, carries
+/// no record for the target dataset and is refused with [`MALFORMED_EVENT_DATA_MESSAGE`].
+/// Parsed with `serde_json`, which bounds its own nesting depth, rather than scanned here.
+pub fn event_data_is_well_formed(data: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(data)
+        .is_ok_and(|payload| payload.is_object() || payload.is_array())
+}
+
 /// How a send refuses a `datasetTarget` whose `datasetIdentifier` names no dataset this
 /// instance's data lake holds (`ResourceNotFoundException`, HTTP 404).
 ///
@@ -777,6 +871,61 @@ pub const FLOW_ENDPOINT_TYPE_DATASET: &str = "DATASET";
 /// transformation that is configured by `sqlTransformation`. Its sibling `NONE` carries
 /// no configuration at all.
 pub const FLOW_TRANSFORMATION_TYPE_SQL: &str = "SQL";
+
+/// Who manages a flow a caller created: the `managedBy` member of the flow reads.
+///
+/// RECORDED behaviour, not modelled (the on-disk `DataIntegrationFlow` declares no such
+/// member): a flow created through this API reads back as CUSTOMER-managed. It is seeded
+/// onto the record the create stores rather than read at projection time, so a flow this
+/// service ever comes to keep for itself reports its own value instead of this one.
+pub const FLOW_MANAGED_BY_CUSTOMER: &str = "CUSTOMER";
+
+/// How a flow a caller created is triggered: the `triggerType` of the `triggerOptions`
+/// member of the flow reads.
+///
+/// RECORDED behaviour, not modelled: the recorded flow read reports SOURCE_CHANGE beside a
+/// null schedule — the flow runs when the data at its source changes. Neither flow write
+/// carries a trigger member, so this is the trigger every flow a caller creates has, and it
+/// is seeded onto the record for the same reason as [`FLOW_MANAGED_BY_CUSTOMER`].
+pub const FLOW_TRIGGER_TYPE_SOURCE_CHANGE: &str = "SOURCE_CHANGE";
+
+/// The `datasetType` a flow read reports for an end reading or writing a dataset a customer
+/// defined — RECORDED: the recorded flow read reports CUSTOM for a dataset of a customer
+/// namespace.
+pub const FLOW_DATASET_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `datasetType` a flow read reports for an end whose dataset is one of the service's
+/// own, in [`SERVICE_DATASET_NAMESPACE`] — the namespace it is named after. INFERRED from
+/// the one distinction the model draws between the two kinds of dataset (see
+/// [`SERVICE_DATASET_NAMESPACE`]); no recording covers a flow end on such a dataset, so a
+/// later reader re-verifies this value against one.
+pub const FLOW_DATASET_TYPE_ASC: &str = "ASC";
+
+/// The identity a flow read reports for one dataset end of its pipeline: the id of the
+/// dataset the end moves and the kind of dataset it is.
+///
+/// RECORDED behaviour, not modelled — the on-disk dataset source/target configurations carry
+/// only `datasetIdentifier`, while the recorded flow read describes each dataset end by the
+/// dataset's `datasetId` and `datasetType`. The id is the one the DATASET owns
+/// ([`DataLakeDatasetRecord::dataset_id`]), resolved from the end's identifier against this
+/// store's data lake, so a flow names the same dataset by the same id for the life of that
+/// dataset and two datasets never share one; an end whose identifier names no dataset the
+/// lake holds has no id to report. The type says whether the dataset is one the service keeps
+/// in its own namespace ([`FLOW_DATASET_TYPE_ASC`]) or one a customer defined
+/// ([`FLOW_DATASET_TYPE_CUSTOM`]) — the one distinction the model draws between them (see
+/// [`SERVICE_DATASET_NAMESPACE`]) — and an identifier that names no dataset of this service
+/// carries the customer type, nothing about it saying the service keeps that dataset.
+pub fn flow_dataset_end_type(dataset_identifier: &str) -> String {
+    let kind = match tagged_resource(dataset_identifier) {
+        Some(TaggedResource::Dataset((_, namespace, _)))
+            if namespace == SERVICE_DATASET_NAMESPACE =>
+        {
+            FLOW_DATASET_TYPE_ASC
+        }
+        _ => FLOW_DATASET_TYPE_CUSTOM,
+    };
+    kind.to_string()
+}
 
 /// How a flow write refuses a request that declares a source, target or transformation
 /// type but carries none of the configuration that type is configured by.
@@ -901,6 +1050,11 @@ pub struct DataIntegrationFlowRecord {
     pub target: DataIntegrationFlowTarget,
     pub created_time: SystemTime,
     pub last_modified_time: SystemTime,
+    /// Who manages this flow ([`FLOW_MANAGED_BY_CUSTOMER`] for one a caller created).
+    pub managed_by: String,
+    /// What makes this flow run ([`FLOW_TRIGGER_TYPE_SOURCE_CHANGE`] for one a caller
+    /// created, which carries no trigger of its own).
+    pub trigger_type: String,
     /// The flow's tags. `tags` is `notProperty` on the create request and absent from the
     /// `DataIntegrationFlow` shape, so they are stored for the tagging operations to
     /// report rather than projected onto the wire shape here.
@@ -908,16 +1062,34 @@ pub struct DataIntegrationFlowRecord {
 }
 
 impl DataIntegrationFlowRecord {
-    /// This record as the modelled `DataIntegrationFlow` shape every flow read returns.
-    pub fn to_wire(&self) -> DataIntegrationFlow {
-        DataIntegrationFlow {
-            instance_id: self.instance_id.clone(),
-            name: self.name.clone(),
-            sources: self.sources.clone(),
-            transformation: self.transformation.clone(),
-            target: self.target.clone(),
-            created_time: as_date_time(self.created_time),
-            last_modified_time: as_date_time(self.last_modified_time),
+    /// Apply one flow UPDATE to this record: each configuration the request CARRIED replaces
+    /// the stored one, and a member the request omitted leaves that part of the flow as it
+    /// was. A request that carried a configuration wrote the flow, so `lastModifiedTime`
+    /// moves then — including where the configuration it wrote equals the one that was
+    /// stored, which is still a write; a request that carried none wrote nothing and leaves
+    /// the record, timestamp included, exactly as it was.
+    pub fn apply_update(
+        &mut self,
+        sources: Option<Vec<DataIntegrationFlowSource>>,
+        transformation: Option<DataIntegrationFlowTransformation>,
+        target: Option<DataIntegrationFlowTarget>,
+        now: SystemTime,
+    ) {
+        let mut written = false;
+        if let Some(sources) = sources {
+            self.sources = sources;
+            written = true;
+        }
+        if let Some(transformation) = transformation {
+            self.transformation = transformation;
+            written = true;
+        }
+        if let Some(target) = target {
+            self.target = target;
+            written = true;
+        }
+        if written {
+            self.last_modified_time = now;
         }
     }
 }
@@ -1120,12 +1292,18 @@ pub struct ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// addresses one by. A `BTreeMap` so one instance's events are contiguous and in
     /// `eventId` order, which is the order `ListDataIntegrationEvents` pages through.
     pub events: BTreeMap<DataIntegrationEventKey, DataIntegrationEventRecord>,
-    /// `clientToken` -> the event it recorded, so a replayed `SendDataIntegrationEvent`
-    /// (the operation is `@idempotent` and its `clientToken` is an `@idempotencyToken`)
-    /// answers with the event the first call recorded instead of recording a second one.
-    /// An entry is only ever written beside an event and dropped with it, so this table
-    /// holds no more entries than there are stored events.
-    pub event_idempotency: HashMap<String, DataIntegrationEventKey>,
+    /// `(instanceId, clientToken)` -> the event that token recorded, so a replayed
+    /// `SendDataIntegrationEvent` (the operation is `@idempotent` and its `clientToken` is
+    /// an `@idempotencyToken`) answers with the event the first call recorded instead of
+    /// recording a second one.
+    ///
+    /// Keyed by [`event_idempotency_key`] rather than by the token alone: a token is a value
+    /// the REQUEST chooses, and an event belongs to the instance that was sent it, so a
+    /// token one instance used must name no event of another's — the same instance-scoped
+    /// key discipline the event store itself keeps. An entry is only ever written beside an
+    /// event and dropped with it, so this table holds no more entries than there are stored
+    /// events.
+    pub event_idempotency: HashMap<EventIdempotencyKey, DataIntegrationEventKey>,
     /// Every live data-integration flow, keyed by [`FlowKey`] (`instanceId` then `name`)
     /// — the pair that identifies one flow, as every flow operation's two `@httpLabel`
     /// members do.
@@ -1333,7 +1511,7 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         // The idempotency tokens that named this instance's events go with them, so a
         // replayed send cannot be answered with an event the store no longer holds.
         self.event_idempotency
-            .retain(|_, (instance, _)| instance != instance_id);
+            .retain(|(instance, _), _| instance != instance_id);
     }
 
     /// A fresh `eventId` for `instance_id`: a lowercase-hex v4 UUID, as the model's `UUID`
@@ -1363,6 +1541,67 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
     /// holds no flow under that name.
     pub fn flow(&self, instance_id: &str, name: &str) -> Option<&DataIntegrationFlowRecord> {
         self.flows.get(&flow_key(instance_id, name))
+    }
+
+    /// `record` as the `DataIntegrationFlow` shape every flow read returns: the whole
+    /// definition the flow carries — its pipeline ends and transformation, its timestamps,
+    /// and how it is managed and triggered — with each dataset end resolved against THIS
+    /// store's data lake, so the end reports the identity of the dataset it moves
+    /// ([`flow_dataset_end_type`]).
+    pub fn flow_to_wire(&self, record: &DataIntegrationFlowRecord) -> DataIntegrationFlow {
+        DataIntegrationFlow {
+            instance_id: record.instance_id.clone(),
+            name: record.name.clone(),
+            sources: record
+                .sources
+                .iter()
+                .map(|source| DataIntegrationFlowSourceWire {
+                    source_type: source.source_type.clone(),
+                    source_name: source.source_name.clone(),
+                    s3_source: source.s3_source.clone(),
+                    dataset_source: source.dataset_source.as_ref().map(|configuration| {
+                        DataIntegrationFlowDatasetSourceWire {
+                            dataset_identifier: configuration.dataset_identifier.clone(),
+                            options: configuration.options.clone(),
+                            dataset_id: self.dataset_id(&configuration.dataset_identifier),
+                            dataset_type: flow_dataset_end_type(&configuration.dataset_identifier),
+                        }
+                    }),
+                })
+                .collect(),
+            transformation: record.transformation.clone(),
+            target: DataIntegrationFlowTargetWire {
+                target_type: record.target.target_type.clone(),
+                s3_target: record.target.s3_target.clone(),
+                dataset_target: record.target.dataset_target.as_ref().map(|configuration| {
+                    DataIntegrationFlowDatasetTargetWire {
+                        dataset_identifier: configuration.dataset_identifier.clone(),
+                        options: configuration.options.clone(),
+                        dataset_id: self.dataset_id(&configuration.dataset_identifier),
+                        dataset_type: flow_dataset_end_type(&configuration.dataset_identifier),
+                    }
+                }),
+            },
+            created_time: as_date_time(record.created_time),
+            last_modified_time: as_date_time(record.last_modified_time),
+            managed_by: record.managed_by.clone(),
+            trigger_options: DataIntegrationFlowTriggerOptions {
+                trigger_type: record.trigger_type.clone(),
+            },
+        }
+    }
+
+    /// The id the dataset `dataset_identifier` names owns
+    /// ([`DataLakeDatasetRecord::dataset_id`]), or `None` when this instance's data lake
+    /// holds no such dataset — there is then no dataset to have an id.
+    pub fn dataset_id(&self, dataset_identifier: &str) -> Option<String> {
+        let key = match tagged_resource(dataset_identifier)? {
+            TaggedResource::Dataset(key) => key,
+            _ => return None,
+        };
+        self.datasets
+            .get(&key)
+            .map(|record| record.dataset_id.clone())
     }
 
     /// The stored flow `name` of instance `instance_id` for a caller that is going to
@@ -1474,6 +1713,13 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
             }
         }
     }
+}
+
+/// A fresh id for one data-lake dataset ([`DataLakeDatasetRecord::dataset_id`]): a random
+/// (version 4) UUID, drawn through the same generator as every other id this service mints,
+/// so one dataset's id is unique among the store's datasets and stable for its whole life.
+pub fn fresh_dataset_id() -> String {
+    new_uuid_v4()
 }
 
 /// A fresh random (version 4) UUID in its canonical lowercase hyphenated form.

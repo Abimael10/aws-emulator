@@ -221,13 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The payload is parsed BEFORE anything is recorded: a `data` member that is not one
+        // of the two JSON forms the member documents carries no record to load, so the send
+        // is refused with the modelled 400 and the event is never recorded.
+        if !crate::state::event_data_is_well_formed(&input.data) {
+            return Err(SendDataIntegrationEventErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::MALFORMED_EVENT_DATA_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A replayed `clientToken` answers with the event the first call recorded: the
         // operation is `@idempotent` and its token is an `@idempotencyToken`, so a retry
-        // must not record a second event.
+        // must not record a second event. The token is remembered per INSTANCE, so a token
+        // another instance used names no event of this one and such a send is recorded as
+        // the first send of its own instance.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(recorded) = store
                 .event_idempotency
-                .get(token)
+                .get(&crate::state::event_idempotency_key(
+                    &input.instance_id,
+                    token,
+                ))
                 .and_then(|key| store.events.get(key))
             {
                 return Ok(SendDataIntegrationEventOutput {
@@ -238,8 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An event of the type that names its own target dataset is recorded against THAT
         // dataset, so a target the instance's data lake does not hold names nothing to load
-        // into and the event is not recorded at all. Every other event type names a dataset
-        // the service keeps for it, which no request addresses.
+        // into and the event is not recorded at all. Every other event type is loaded into
+        // the dataset the service keeps for it, which no request addresses.
         let dataset_target_details = match input.dataset_target {
             Some(target) => {
                 let resolved = crate::state::tagged_resource(&target.dataset_identifier)
@@ -261,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
                 Some(DataIntegrationEventDatasetTargetDetails {
-                    dataset_identifier: target.dataset_identifier,
+                    dataset_identifier: Some(target.dataset_identifier),
                     operation_type: target.operation_type,
                     dataset_load_execution: DataIntegrationEventDatasetLoadExecutionDetails {
                         status: crate::state::DATASET_LOAD_STATUS_SUCCEEDED.to_string(),
@@ -270,7 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 })
             }
-            None => None,
+            // Every other type is loaded into the dataset the service keeps for it, which no
+            // client addresses, so the load is reported without naming one.
+            None => Some(crate::state::entity_event_dataset_load()),
         };
 
         // The store holds its events for the life of the process and this is the only
@@ -316,7 +335,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::data_integration_event_key(&input.instance_id, &event_id);
         store.events.insert(key.clone(), record);
         if let Some(token) = input.client_token {
-            store.event_idempotency.insert(token, key);
+            store.event_idempotency.insert(
+                crate::state::event_idempotency_key(&input.instance_id, &token),
+                key,
+            );
         }
 
         Ok(SendDataIntegrationEventOutput { event_id })

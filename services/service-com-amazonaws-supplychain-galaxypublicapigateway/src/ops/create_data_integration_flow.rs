@@ -247,6 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: input.target,
             created_time: now,
             last_modified_time: now,
+            // A flow this API creates is the caller's, and it carries no trigger of its
+            // own: the request has no member for either, so both are what every flow a
+            // caller creates is.
+            managed_by: crate::state::FLOW_MANAGED_BY_CUSTOMER.to_string(),
+            trigger_type: crate::state::FLOW_TRIGGER_TYPE_SOURCE_CHANGE.to_string(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
 

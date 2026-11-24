@@ -22,13 +22,10 @@ pub struct DataIntegrationEvent {
     pub dataset_target_details: Option<DataIntegrationEventDatasetTargetDetails>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.supplychain#DataIntegrationEventDatasetTargetDetails")]
-#[derive(Debug, Clone, Default)]
-pub struct DataIntegrationEventDatasetTargetDetails {
-    pub dataset_identifier: String,
-    pub operation_type: String,
-    pub dataset_load_execution: DataIntegrationEventDatasetLoadExecutionDetails,
-}
+// `DataIntegrationEventDatasetTargetDetails` is declared in `types/event_load_wire.rs`
+// instead: the wire form of an event's dataset load leaves out `datasetIdentifier` when the
+// load wrote a dataset no client addressed, which the derive cannot express for a member the
+// model declares `@required`.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.supplychain#DataIntegrationEventDatasetLoadExecutionDetails")]
 #[derive(Debug, Clone, Default)]
@@ -214,17 +211,9 @@ pub struct DataIntegrationFlowDatasetTargetConfiguration {
     pub options: Option<DataIntegrationFlowDatasetOptions>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.supplychain#DataIntegrationFlow")]
-#[derive(Debug, Clone)]
-pub struct DataIntegrationFlow {
-    pub instance_id: String,
-    pub name: String,
-    pub sources: Vec<DataIntegrationFlowSource>,
-    pub transformation: DataIntegrationFlowTransformation,
-    pub target: DataIntegrationFlowTarget,
-    pub created_time: ::aws_smithy_types::DateTime,
-    pub last_modified_time: ::aws_smithy_types::DateTime,
-}
+// `DataIntegrationFlow` is declared in `types/flow_wire.rs` instead: the flow read's wire
+// form carries members the on-disk model does not declare (`managedBy`, `triggerOptions`,
+// and the dataset ends' `datasetId`/`datasetType`), which the derive cannot express.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.supplychain#DataLakeDatasetSchema")]
 #[derive(Debug, Clone, Default)]

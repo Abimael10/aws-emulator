@@ -7,11 +7,17 @@
 //!
 //! RULE under test: `CreateDataIntegrationFlow` persists one flow per
 //! (`instanceId`, `name`) pair of an existing instance, and `GetDataIntegrationFlow`
-//! answers with exactly the configuration (`sources`, `transformation`, `target`) and the
-//! timestamps the create stored; a pair that is already taken is a conflict, a request
+//! answers with exactly the definition the flow carries — its pipeline (`sources`,
+//! `transformation`, `target`, each dataset end with the identity of the dataset it moves),
+//! its timestamps, who manages it and what triggers it; a pair that is already taken is a
+//! conflict, a request
 //! whose declared source/target/transformation type carries none of its configuration is
 //! a validation failure that persists nothing, an `instanceId` naming no instance is an
 //! authorization failure, and a name the instance holds no flow under is a not-found.
+//!
+//! `UpdateDataIntegrationFlow` is how a stored flow changes: it applies each configuration
+//! its request carries, leaves the rest as it was, and answers with the flow a later read
+//! answers with.
 //!
 //! `DeleteDataIntegrationFlow` is the other side of that pair: it TAKES the entry out of
 //! the store, so a name it has removed is a name the instance holds no flow under — every
@@ -23,7 +29,7 @@
 //! `createdTime` stays the create's, and is refused for a pair the store holds no flow for
 //! or a declared type whose configuration the request omits.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,7 +40,9 @@ use service_com_amazonaws_supplychain_galaxypublicapigateway::ops::types::{
     DATA_INTEGRATION_FLOW_SOURCE_TYPE_VALUES, DATA_INTEGRATION_FLOW_TARGET_TYPE_VALUES,
     DATA_INTEGRATION_FLOW_TRANSFORMATION_TYPE_VALUES,
 };
-use service_com_amazonaws_supplychain_galaxypublicapigateway::state::MAX_FLOWS_PER_INSTANCE;
+use service_com_amazonaws_supplychain_galaxypublicapigateway::state::{
+    is_modelled_uuid, MAX_FLOWS_PER_INSTANCE,
+};
 use service_com_amazonaws_supplychain_galaxypublicapigateway::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -175,6 +183,55 @@ impl Emulator {
         self.send("PATCH", &flow_path(instance_id, name), Some(request))
             .await
     }
+
+    /// `CreateDataLakeNamespace` for `name`, asserted to succeed.
+    async fn given_namespace(&self, case: &str, instance_id: &str, name: &str) {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!("/api/datalake/instance/{instance_id}/namespaces/{name}"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeNamespace expected 200, got {status} with {body}"
+        );
+    }
+
+    /// `CreateDataLakeDataset` for one triple, returning the ARN the create reported — the
+    /// identifier a flow end names that dataset by.
+    async fn given_dataset(
+        &self,
+        case: &str,
+        instance_id: &str,
+        namespace: &str,
+        name: &str,
+    ) -> String {
+        let (status, body) = self
+            .send(
+                "PUT",
+                &format!(
+                    "/api/datalake/instance/{instance_id}/namespaces/{namespace}/datasets/{name}"
+                ),
+                Some(json!({
+                    "schema": {
+                        "name": "SimSchema",
+                        "fields": [{ "name": "id", "type": "STRING", "isRequired": true }],
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataLakeDataset expected 200, got {status} with {body}"
+        );
+        body.get("dataset")
+            .and_then(|dataset| dataset.get("arn"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case}: the create carried no dataset arn: {body}"))
+            .to_string()
+    }
 }
 
 /// The URI every flow operation is addressed at, as the model's `http` trait spells it:
@@ -275,6 +332,87 @@ fn dataset_identifier(instance_id: &str, namespace: &str, name: &str) -> String 
     )
 }
 
+/// The namespace AWS Supply Chain keeps its OWN data-lake datasets in: the one namespace the
+/// model singles out (`DataIntegrationFlowTarget$datasetTarget` — "for AWS Supply Chain
+/// dataset under asc namespace…"), which is what tells a dataset of the service from a
+/// dataset a customer defined.
+const SERVICE_NAMESPACE: &str = "asc";
+
+/// The `datasetType` a flow read reports for one dataset end, written out HERE rather than
+/// read from the crate so a drift in the service's projection fails this suite instead of
+/// travelling with it.
+///
+/// Its SOURCE is the recorded flow read, which describes each dataset end by the dataset's
+/// id and type and reports CUSTOM for a dataset of a customer namespace: the type says
+/// whether the dataset is one the service keeps in its own namespace or one a customer
+/// defined.
+fn expected_dataset_type(identifier: &str) -> &'static str {
+    let segments: Vec<&str> = identifier.split('/').collect();
+    let namespace = match segments.as_slice() {
+        [.., "namespaces", namespace, "datasets", _] => *namespace,
+        _ => panic!("the identifier {identifier:?} is not a dataset ARN"),
+    };
+    if namespace == SERVICE_NAMESPACE {
+        "ASC"
+    } else {
+        "CUSTOM"
+    }
+}
+
+/// One dataset end as the flow read reports it: the configuration the request carried, plus
+/// the dataset's type — and no `datasetId`, which only an end whose dataset the data lake
+/// actually holds has (the rows these helpers serve name datasets nothing created, so the
+/// read has no dataset to take an id from).
+fn expected_dataset_end(configuration: &Value) -> Value {
+    let identifier = configuration
+        .get("datasetIdentifier")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("a dataset end carries a datasetIdentifier: {configuration}"));
+    let mut projected = configuration.clone();
+    projected["datasetType"] = json!(expected_dataset_type(identifier));
+    projected
+}
+
+/// The `sources` a flow read reports for the `sources` a flow write carried: each S3 source
+/// as it was written, each dataset source with the dataset's identity beside its
+/// configuration.
+fn expected_sources(requested: &Value) -> Value {
+    let sources = requested
+        .as_array()
+        .unwrap_or_else(|| panic!("`sources` is a list: {requested}"));
+    Value::Array(
+        sources
+            .iter()
+            .map(|source| {
+                let mut projected = source.clone();
+                if let Some(configuration) = source.get("datasetSource") {
+                    projected["datasetSource"] = expected_dataset_end(configuration);
+                }
+                projected
+            })
+            .collect(),
+    )
+}
+
+/// The `target` a flow read reports for the `target` a flow write carried.
+fn expected_target(requested: &Value) -> Value {
+    let mut projected = requested.clone();
+    if let Some(configuration) = requested.get("datasetTarget") {
+        projected["datasetTarget"] = expected_dataset_end(configuration);
+    }
+    projected
+}
+
+/// How every flow a caller creates reads back as managed: the recorded `managedBy` of a
+/// customer-created flow.
+const EXPECTED_MANAGED_BY: &str = "CUSTOMER";
+
+/// How every flow a caller creates reads back as triggered: the recorded `triggerOptions` of
+/// a flow with no schedule — it runs when the data at its source changes.
+fn expected_trigger_options() -> Value {
+    json!({ "triggerType": "SOURCE_CHANGE" })
+}
+
 /// One row of the update table: the create that establishes the flow, and the update
 /// applied to it.
 struct UpdateRow {
@@ -284,7 +422,9 @@ struct UpdateRow {
 }
 
 /// The configuration the flow is expected to END UP with: each end the update carries,
-/// falling back to the one the create stored for an end the update says nothing about.
+/// falling back to the one the create stored for an end the update says nothing about — each
+/// as the READ reports it, so a dataset end carries the dataset identity the projection adds
+/// beside the configuration that was written ([`expected_sources`], [`expected_target`]).
 ///
 /// This is the rule under test spelled out once, independently of the handler, and read by
 /// every row.
@@ -295,7 +435,11 @@ fn expected_configuration(base: &Value, update: &Value) -> Value {
             .get(member)
             .or_else(|| base.get(member))
             .unwrap_or_else(|| panic!("the base create carries every end of the pipeline: {base}"));
-        expected[member] = value.clone();
+        expected[member] = match member {
+            "sources" => expected_sources(value),
+            "target" => expected_target(value),
+            _ => value.clone(),
+        };
     }
     expected
 }
@@ -532,9 +676,14 @@ async fn a_flow_round_trips_through_create_and_get() {
             row.name,
             "case {case}: the flow must report its own name, got {read}"
         );
+        let expected_sources = expected_sources(
+            row.request
+                .get("sources")
+                .unwrap_or_else(|| panic!("case {case}: the request carries sources")),
+        );
         assert_eq!(
             read.get("sources"),
-            row.request.get("sources"),
+            Some(&expected_sources),
             "case {case}: the stored sources must be the requested ones, got {read}"
         );
         assert_eq!(
@@ -542,9 +691,14 @@ async fn a_flow_round_trips_through_create_and_get() {
             row.request.get("transformation"),
             "case {case}: the stored transformation must be the requested one, got {read}"
         );
+        let expected_target = expected_target(
+            row.request
+                .get("target")
+                .unwrap_or_else(|| panic!("case {case}: the request carries a target")),
+        );
         assert_eq!(
             read.get("target"),
-            row.request.get("target"),
+            Some(&expected_target),
             "case {case}: the stored target must be the requested one, got {read}"
         );
         assert_eq!(
@@ -1435,6 +1589,275 @@ async fn a_delete_takes_only_the_addressed_flow() {
     }
 }
 
+/// One row of the projection table: the flow's name, the request that defines it, and
+/// whether each end of its pipeline names a dataset.
+struct ProjectionRow {
+    case: &'static str,
+    name: &'static str,
+    request: Value,
+    /// Whether `sources[0]` and `target` describe a dataset end, which is what carries the
+    /// dataset's identity.
+    source_names_dataset: bool,
+    target_names_dataset: bool,
+}
+
+/// RULE: a flow read reports the whole definition the flow carries — not only its pipeline
+/// configuration and timestamps, but who manages it, what triggers it, and for each end that
+/// reads or writes a data-lake dataset the identity of that dataset: the id the dataset owns
+/// and whether the lake or the customer defines it.
+///
+/// The rows differ along what the rule generalises over: which ends name datasets (both, the
+/// source only, the target only, neither), the namespace the dataset lives in (the service's
+/// own `asc`, the pre-defined `default`, one the caller created), whether the lake holds the
+/// dataset the end names, and whether the end carries the optional `options` member.
+#[tokio::test]
+async fn a_flow_reports_how_it_is_managed_triggered_and_which_datasets_it_moves() {
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance("projection").await;
+    emulator
+        .given_namespace("projection", &instance_id, "supply_custom")
+        .await;
+
+    // The datasets the lake HOLDS, each by the identifier a flow end names it by. A row
+    // below also names one the lake does not hold, which is the end that has no dataset to
+    // take an id from.
+    let mut held: BTreeSet<String> = BTreeSet::new();
+    for (namespace, name) in [
+        ("default", "product"),
+        ("asc", "inbound_order"),
+        ("supply_custom", "lines"),
+    ] {
+        held.insert(
+            emulator
+                .given_dataset("projection", &instance_id, namespace, name)
+                .await,
+        );
+    }
+
+    let rows = vec![
+        ProjectionRow {
+            case: "a dataset of a pre-defined customer namespace read into one of the \
+                   service's own",            name: "dataset-to-dataset",
+            request: json!({
+                "sources": [dataset_source(
+                    "product",
+                    &dataset_identifier(&instance_id, "default", "product"),
+                    None,
+                )],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": {
+                        "datasetIdentifier":
+                            dataset_identifier(&instance_id, "asc", "inbound_order"),
+                    },
+                },
+            }),
+            source_names_dataset: true,
+            target_names_dataset: true,
+        },
+        ProjectionRow {
+            case: "a dataset of a namespace the caller created, with every option, written \
+                   to S3",
+            name: "custom-namespace-to-s3",
+            request: json!({
+                "sources": [dataset_source(
+                    "lines",
+                    &dataset_identifier(&instance_id, "supply_custom", "lines"),
+                    Some(json!({ "loadType": "INCREMENTAL", "dedupeRecords": false })),
+                )],
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM lines" },
+                },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "lines/" },
+                },
+            }),
+            source_names_dataset: true,
+            target_names_dataset: false,
+        },
+        ProjectionRow {
+            case: "S3 read into a dataset of the service's own namespace",
+            name: "s3-to-dataset",
+            request: json!({
+                "sources": [s3_source("orders", "supply-landing", "orders/", Some("CSV"))],
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM orders" },
+                },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": {
+                        "datasetIdentifier":
+                            dataset_identifier(&instance_id, "asc", "shipment"),
+                        "options": { "loadType": "REPLACE" },
+                    },
+                },
+            }),
+            source_names_dataset: false,
+            target_names_dataset: true,
+        },
+        ProjectionRow {
+            case: "no dataset at either end",
+            name: "s3-to-s3",
+            request: json!({
+                "sources": [s3_source("raw", "supply-landing", "raw/", None)],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "raw/" },
+                },
+            }),
+            source_names_dataset: false,
+            target_names_dataset: false,
+        },
+    ];
+
+    // identifier -> the id the read reported for that dataset, collected across the rows so
+    // the invariants a minted id has (one per dataset, the same one every time) are asserted
+    // over all of them.
+    let mut reported_ids: BTreeMap<String, String> = BTreeMap::new();
+
+    for row in rows {
+        let case = row.case;
+        let (status, body) = emulator
+            .create_flow(&instance_id, row.name, row.request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: CreateDataIntegrationFlow expected 200, got {status} with {body}"
+        );
+
+        let (status, body) = emulator.get_flow(&instance_id, row.name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetDataIntegrationFlow expected 200, got {status} with {body}"
+        );
+        let read = flow_of(case, &body);
+
+        assert_eq!(
+            read.get("managedBy").and_then(Value::as_str),
+            Some(EXPECTED_MANAGED_BY),
+            "case {case}: a flow a caller created is the caller's, got {read}"
+        );
+        assert_eq!(
+            read.get("triggerOptions"),
+            Some(&expected_trigger_options()),
+            "case {case}: a flow with no schedule runs when its source changes, got {read}"
+        );
+
+        // Each dataset end carries the identity of the dataset it moves: the id that
+        // dataset owns, and the kind of dataset it is. An S3 end has no dataset and so
+        // carries neither member, and an end naming a dataset the lake does not hold has no
+        // id to report.
+        let source = read
+            .get("sources")
+            .and_then(|sources| sources.get(0))
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case}: the flow reports no source: {read}"));
+        let target = read
+            .get("target")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case}: the flow reports no target: {read}"));
+        for (end_case, end, member, names_dataset) in [
+            (
+                "source",
+                &source,
+                "datasetSource",
+                row.source_names_dataset,
+            ),
+            (
+                "target",
+                &target,
+                "datasetTarget",
+                row.target_names_dataset,
+            ),
+        ] {
+            match (names_dataset, end.get(member)) {
+                (true, Some(configuration)) => {
+                    let identifier = string_of(case, configuration, "datasetIdentifier");
+                    assert_eq!(
+                        configuration.get("datasetType").and_then(Value::as_str),
+                        Some(expected_dataset_type(&identifier)),
+                        "case {case}, {end_case}: the end must report the kind of dataset it \
+                         moves, got {configuration}"
+                    );
+                    let reported = configuration
+                        .get("datasetId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    match reported {
+                        Some(dataset_id) => {
+                            assert!(
+                                held.contains(&identifier),
+                                "case {case}, {end_case}: an end naming a dataset the lake does \
+                                 not hold must report no id, got {configuration}"
+                            );
+                            assert!(
+                                is_modelled_uuid(&dataset_id),
+                                "case {case}, {end_case}: the dataset's id must be of the \
+                                 modelled UUID shape, got {dataset_id:?}"
+                            );
+                            // One dataset keeps ONE id, however many ends and flows name it.
+                            if let Some(seen) = reported_ids.get(&identifier) {
+                                assert_eq!(
+                                    seen, &dataset_id,
+                                    "case {case}, {end_case}: one dataset must keep one id, got \
+                                     {dataset_id:?}"
+                                );
+                            } else {
+                                reported_ids.insert(identifier.clone(), dataset_id);
+                            }
+                        }
+                        None => assert!(
+                            !held.contains(&identifier),
+                            "case {case}, {end_case}: an end naming a dataset the lake holds \
+                             must report that dataset's id, got {configuration}"
+                        ),
+                    }
+                }
+                (true, None) => panic!(
+                    "case {case}, {end_case}: the flow reports no `{member}`, got {end}"
+                ),
+                (false, configuration) => assert!(
+                    configuration.is_none(),
+                    "case {case}, {end_case}: an end that names no dataset reports no \
+                     `{member}`, got {end}"
+                ),
+            }
+        }
+
+        // The projection is what the stored record says, so reading again says the same.
+        let (status, body) = emulator.get_flow(&instance_id, row.name).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: a second read expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            flow_of(case, &body),
+            read,
+            "case {case}: reading a flow must not change it, got {body}"
+        );
+    }
+
+    // Every dataset the lake holds and a row named was reported with an id, and no two of
+    // them share one.
+    assert_eq!(
+        reported_ids.len(),
+        held.len(),
+        "every held dataset a row named must have been reported with its id, got \
+         {reported_ids:?}"
+    );
+    let distinct: BTreeSet<&String> = reported_ids.values().collect();
+    assert_eq!(
+        distinct.len(),
+        reported_ids.len(),
+        "two datasets must not share one id, got {reported_ids:?}"
+    );
+}
+
 /// RULE: `UpdateDataIntegrationFlow` writes the ends of an EXISTING flow's pipeline that
 /// the request carries — `sources`, `transformation` and `target`, each replaced whole —
 /// leaves every end the request omits as it was, answers with the stored record, and moves
@@ -1622,6 +2045,15 @@ async fn an_update_writes_the_ends_it_carries_and_leaves_the_rest() {
             "case {case}: the update must write the ends it carries and leave the rest, got \
              {updated}"
         );
+        // What an update never touches: who manages the flow and what triggers it, which
+        // belong to the flow rather than to its pipeline.
+        for member in ["managedBy", "triggerOptions"] {
+            assert_eq!(
+                updated.get(member),
+                before.get(member),
+                "case {case}: an update must leave `{member}` as it was, got {updated}"
+            );
+        }
         assert_eq!(
             timestamp_of(case, &updated, "createdTime"),
             created_time,

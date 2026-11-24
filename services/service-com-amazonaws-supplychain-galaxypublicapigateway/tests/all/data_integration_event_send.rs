@@ -11,7 +11,9 @@
 //! `ResourceNotFoundException` (404) with the service's "Target dataset resource arn:
 //! <arn> is not valid", carrying the ARN the request sent and nothing else, and no event
 //! is recorded for it; once the identifier resolves, the send records exactly one event
-//! and every read answers from that record. An `instanceId` naming no instance of this
+//! and every read answers from that record. An event of any OTHER type names no target of
+//! its own, because the service keeps one dataset per entity type for it, so its event
+//! reports the load into THAT dataset. An `instanceId` naming no instance of this
 //! account is refused by the gateway's authorization step before the target is looked up
 //! at all, and an `eventId` an instance holds no event under is a not-found.
 //!
@@ -565,26 +567,30 @@ async fn a_send_against_a_dataset_the_instance_holds_is_recorded_and_read_back()
     );
 }
 
-/// RULE: an event type that names no target of its own carries no `datasetTarget`, so the
-/// send records it with no target details at all — every modelled `eventType` beside
-/// `scn.data.dataset`.
+/// RULE: an event type that names no target of its own is loaded into the dataset the
+/// service keeps for that type, so the send records it WITH that load — the APPEND operation
+/// the load performs and the status it reached — and WITHOUT a `datasetIdentifier`, because
+/// no client addresses that dataset. Every modelled `eventType` beside `scn.data.dataset`,
+/// whose event names its target itself.
 #[tokio::test]
-async fn an_event_that_names_no_target_is_recorded_without_one() {
+async fn an_event_of_an_entity_type_reports_the_load_into_its_own_dataset() {
     let emulator = Emulator::new();
     let instance = emulator.given_instance("event types").await;
 
-    let others: Vec<&str> = DATA_INTEGRATION_EVENT_TYPE_VALUES
+    // Every modelled event type beside the one that names its own target, so no type is left
+    // to ride on another's row.
+    let entity_types: Vec<&str> = DATA_INTEGRATION_EVENT_TYPE_VALUES
         .iter()
         .copied()
         .filter(|event_type| *event_type != DATASET_EVENT_TYPE)
         .collect();
     assert!(
-        others.len() > 1,
+        entity_types.len() > 1,
         "the modelled enum carries more than one non-dataset event type"
     );
 
     let mut recorded = 0;
-    for event_type in others {
+    for event_type in entity_types {
         let (status, body) = emulator
             .send_event(
                 &instance,
@@ -613,9 +619,26 @@ async fn an_event_that_names_no_target_is_recorded_without_one() {
             Some(event_type),
             "case {event_type:?}: the event must report the type it was sent as, got {event}"
         );
+        let details = event.get("datasetTargetDetails").unwrap_or_else(|| {
+            panic!("case {event_type:?}: the event reports no dataset load: {event}")
+        });
         assert!(
-            event.get("datasetTargetDetails").is_none(),
-            "case {event_type:?}: an event with no target reports none, got {event}"
+            details.get("datasetIdentifier").is_none(),
+            "case {event_type:?}: a load into a dataset no client addressed names none, got \
+             {details}"
+        );
+        // `APPEND` of the modelled `DataIntegrationEventDatasetOperationType`: the load adds
+        // the event's records to that dataset.
+        assert_eq!(
+            details.get("operationType").and_then(Value::as_str),
+            Some(DATA_INTEGRATION_EVENT_DATASET_OPERATION_TYPE_VALUES[0]),
+            "case {event_type:?}: an entity event's load appends, got {details}"
+        );
+        assert_eq!(
+            load_status(event_type, &event),
+            DATASET_LOAD_STATUS_SUCCEEDED,
+            "case {event_type:?}: an accepted event's load must reach its terminal status, got \
+             {event}"
         );
     }
 
@@ -723,4 +746,92 @@ async fn a_send_naming_an_unknown_instance_is_refused_by_authorization() {
         0,
         "case \"unknown instance\": the refused send must record nothing for the real instance"
     );
+}
+
+/// The sentence a send whose `data` payload is not the JSON its member documents is refused
+/// with, written out HERE rather than read from the crate: the wording is the requirement.
+/// Its SOURCE is the recorded wire response of such a send — the whole sentence is fixed,
+/// and no part of the payload (which is `@sensitive`) appears in it.
+const MALFORMED_DATA_SENTENCE: &str =
+    "Schema validation failed: Invalid JSON: Malformed JSON structure";
+
+/// RULE: the `data` member carries records as JSON — "To send single data record, use
+/// JsonObject format; to send multiple data records, use JsonArray format" — so a payload
+/// that is not well-formed JSON, or is JSON that is neither an object nor an array, carries
+/// no record at all: the send is refused `ValidationException` (400) with the service's
+/// sentence and records nothing. A payload of either documented form is accepted.
+#[tokio::test]
+async fn a_payload_that_is_not_the_documented_json_is_refused() {
+    let emulator = Emulator::new();
+    let instance = emulator.given_instance("payload").await;
+
+    // Rows spanning the forms a payload takes: both documented ones, JSON that is a scalar
+    // rather than a record or a list of them, JSON truncated at each end, JSON with a
+    // syntax error inside it, and text that is not JSON at all.
+    let rows: Vec<(&str, &str, bool)> = vec![
+        ("one record, the documented JsonObject form", "{\"id\": \"sim-1\"}", true),
+        ("the empty record, still an object", "{}", true),
+        (
+            "several records, the documented JsonArray form",
+            "[{\"id\": \"sim-1\"}, {\"id\": \"sim-2\"}]",
+            true,
+        ),
+        ("the empty list, still an array", "[]", true),
+        ("a JSON string, which is no record", "\"sim-1\"", false),
+        ("a JSON number, which is no record", "42", false),
+        ("a JSON boolean, which is no record", "true", false),
+        ("JSON null, which is no record", "null", false),
+        ("an object truncated at its end", "{\"id\": \"sim-1\"", false),
+        ("an object truncated at its start", "\"id\": \"sim-1\"}", false),
+        ("a list truncated at its end", "[{\"id\": \"sim-1\"}", false),
+        ("an object with a missing value", "{\"id\": }", false),
+        ("an object with an unquoted key", "{id: \"sim-1\"}", false),
+        ("two records with no list around them", "{\"a\": 1} {\"b\": 2}", false),
+        ("text that is not JSON at all", "id=sim-1", false),
+        ("a single brace", "{", false),
+    ];
+
+    let mut accepted = 0;
+    for (case, data, well_formed) in rows {
+        let (status, body) = emulator
+            .send_event(
+                &instance,
+                json!({
+                    "eventType": "scn.data.inventorylevel",
+                    "eventGroupId": format!("group-{accepted}"),
+                    "data": data,
+                }),
+            )
+            .await;
+        if well_formed {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a documented payload form expected 200, got {status} with {body}"
+            );
+            accepted += 1;
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a payload carrying no record must be refused, got {status} with \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(case, &body),
+                "ValidationException",
+                "case {case:?}: expected a ValidationException envelope, got {body}"
+            );
+            assert_eq!(
+                message_of(case, &body),
+                MALFORMED_DATA_SENTENCE,
+                "case {case:?}: the refusal must carry the service's sentence, got {body}"
+            );
+        }
+        // Only the accepted sends recorded anything, so a refused payload leaves the store
+        // exactly as it was.
+        assert_eq!(
+            emulator.stored_events(&instance),
+            accepted,
+            "case {case:?}: only an accepted send records an event"
+        );
+    }
 }

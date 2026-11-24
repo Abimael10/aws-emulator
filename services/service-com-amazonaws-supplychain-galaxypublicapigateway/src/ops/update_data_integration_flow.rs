@@ -230,17 +230,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        record.sources = sources;
-        record.transformation = transformation;
-        record.target = target;
-        // The write this call performed is what `lastModifiedTime` reports; `createdTime`
-        // belongs to the create and never moves.
-        record.last_modified_time = now;
+        // The write, with `lastModifiedTime` the instant of it; `createdTime` belongs to
+        // the create and never moves.
+        record.apply_update(Some(sources), Some(transformation), Some(target), now);
+        let updated = record.clone();
 
-        // Projected from the record that is now stored, so nothing in the response can
-        // differ from what a later `GetDataIntegrationFlow` reports.
+        // Projected from the record that is now stored — with its dataset ends resolved
+        // against this store's data lake — so nothing in the response can differ from what a
+        // later `GetDataIntegrationFlow` reports.
         Ok(UpdateDataIntegrationFlowOutput {
-            flow: record.to_wire(),
+            flow: store.flow_to_wire(&updated),
         })
     }
 }

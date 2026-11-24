@@ -23,12 +23,18 @@ pub mod delete_data_integration_flow_types;
 pub mod delete_data_lake_dataset_types;
 pub mod delete_data_lake_namespace_types;
 pub mod delete_instance_types;
+/// The schema and the codec for `DataIntegrationEventDatasetTargetDetails`, whose wire form
+/// leaves out a member the on-disk model declares `@required`.
+pub mod event_load_wire;
 pub mod get_bill_of_materials_import_job_types;
 pub mod get_data_integration_event_types;
 pub mod get_data_integration_flow_execution_types;
 pub mod get_data_integration_flow_types;
 pub mod get_data_lake_dataset_types;
 pub mod get_data_lake_namespace_types;
+/// The `DataIntegrationFlow` shape and the shapes of its pipeline ends, whose wire form
+/// carries members the on-disk model does not declare.
+pub mod flow_wire;
 pub mod get_instance_types;
 /// The schema and the codec for the `Instance` shape, whose wire form carries two members
 /// the on-disk model does not declare.
@@ -68,6 +74,8 @@ pub use delete_data_lake_namespace_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_instance_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use event_load_wire::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_bill_of_materials_import_job_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_data_integration_event_types::*;
@@ -79,6 +87,8 @@ pub use get_data_integration_flow_types::*;
 pub use get_data_lake_dataset_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_data_lake_namespace_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use flow_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_instance_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

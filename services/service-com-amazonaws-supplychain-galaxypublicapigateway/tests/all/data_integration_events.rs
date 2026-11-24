@@ -216,10 +216,10 @@ impl SeededEvent {
     /// data-lake dataset has.
     fn with_dataset_target(mut self, instance_id: &str, namespace: &str, dataset: &str) -> Self {
         self.dataset_target_details = Some(DataIntegrationEventDatasetTargetDetails {
-            dataset_identifier: format!(
+            dataset_identifier: Some(format!(
                 "arn:aws:scn:{REGION}:{}:instance/{instance_id}/namespaces/{namespace}/datasets/{dataset}",
                 engine::emulator_account_id()
-            ),
+            )),
             // The first entry of each modelled enum's value list, so the case names a
             // value the model admits rather than a string of its own.
             operation_type: DATA_INTEGRATION_EVENT_DATASET_OPERATION_TYPE_VALUES[0].to_string(),
@@ -507,7 +507,7 @@ async fn every_stored_event_of_the_addressed_instance_is_reported_exactly_as_per
                     panic!("case {case:?}: event carries no datasetTargetDetails: {actual}")
                 });
                 assert_eq!(
-                    string_member(&case, details, "datasetIdentifier"),
+                    Some(string_member(&case, details, "datasetIdentifier")),
                     target.dataset_identifier,
                     "case {case:?}: wrong datasetIdentifier: {details}"
                 );

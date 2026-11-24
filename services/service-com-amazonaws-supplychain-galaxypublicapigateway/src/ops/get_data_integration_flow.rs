@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match store.flow(&input.instance_id, &input.name) {
             Some(record) => Ok(GetDataIntegrationFlowOutput {
-                flow: record.to_wire(),
+                flow: store.flow_to_wire(record),
             }),
             None => Err(GetDataIntegrationFlowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
