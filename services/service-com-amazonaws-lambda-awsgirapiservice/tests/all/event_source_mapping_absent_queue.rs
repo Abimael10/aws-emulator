@@ -45,7 +45,12 @@ const FUNCTION: &str = "esm-absent-queue-fn";
 /// attempted, then the error code and the sentence Amazon SQS answers a read of an absent
 /// queue with (`AWS.SimpleQueueService.NonExistentQueue` / "The specified queue does not
 /// exist.", that service's own fixed text for the condition).
-const ABSENT_QUEUE_REFUSAL: &str = "Error occurred while ReceiveMessage. SQS Error Code: \
+///
+/// `pub(crate)` because this sentence has ONE owner here: the suite over WHICH refusal such a
+/// create answers when the role is short of the source's reads as well reads it from this
+/// constant (`tests/all/event_source_mapping_absent_queue_precedence.rs`), so the two tables
+/// cannot drift apart.
+pub(crate) const ABSENT_QUEUE_REFUSAL: &str = "Error occurred while ReceiveMessage. SQS Error Code: \
                                     AWS.SimpleQueueService.NonExistentQueue. SQS Error \
                                     Message: The specified queue does not exist.";
 

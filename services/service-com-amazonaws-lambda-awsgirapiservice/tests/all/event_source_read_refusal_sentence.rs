@@ -287,7 +287,12 @@ async fn a_withheld_source_read_is_refused_with_awss_fixed_sentence() {
 
 /// Lambda and IAM over the same engine as Amazon SQS, so the source a refused wiring named is
 /// a real queue read back out of the service that owns it.
-fn router_with_iam_and_queues() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the suite over which refusal a create answers when the named queue is
+/// absent AND the role is short of its reads drives both services too
+/// (`tests/all/event_source_mapping_absent_queue_precedence.rs`), so there is ONE harness that
+/// mounts the three services on one engine.
+pub(crate) fn router_with_iam_and_queues() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
