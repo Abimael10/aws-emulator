@@ -25,7 +25,7 @@
 //! what the claim-set deserialization reported.
 //! A token whose AUDIENCE is none the identity source accepts is that same
 //! `ValidationException` worded as the one fixed sentence AWS answers for it
-//! ([`AUDIENCE_NOT_ACCEPTED`]), which reports neither the claim the audience was read from
+//! ([`crate::ops::AUDIENCE_NOT_ACCEPTED`]), which reports neither the claim the audience was read from
 //! nor the value it held.
 //! A token whose ISSUER is no identity source of the store is the modelled
 //! `ResourceNotFoundException` instead: the call references an identity source the store
@@ -228,31 +228,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?;
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
-        // "You must specify either an accessToken, an identityToken, or both": the model
-        // declares both members optional, so the boundary validator cannot require one of
-        // them and this is the place that does. Both members are named, because either
-        // one satisfies the rule.
-        let presented: Vec<crate::state::token::PresentedToken<'_>> = [
-            (
-                crate::state::token::TokenKind::Access,
-                input.access_token.as_deref(),
-            ),
-            (
-                crate::state::token::TokenKind::Identity,
-                input.identity_token.as_deref(),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(kind, value)| {
-            value.map(|value| crate::state::token::PresentedToken { kind, value })
-        })
-        .collect();
-        if presented.is_empty() {
-            return Err(invalid_members([
-                crate::ops::InvalidInput::new(crate::ops::paths::ACCESS_TOKEN, TOKEN_REQUIRED),
-                crate::ops::InvalidInput::new(crate::ops::paths::IDENTITY_TOKEN, TOKEN_REQUIRED),
-            ]));
-        }
+        // The tokens the call presented, and the refusal of a call that presented none:
+        // one reading of those two members, shared with `BatchIsAuthorizedWithToken`
+        // ([`crate::ops::presented_tokens`]), because the rule is the token's.
+        let presented = crate::ops::presented_tokens(
+            input.access_token.as_deref(),
+            input.identity_token.as_deref(),
+        )
+        .map_err(refused)?;
 
         // The principal is the token's, so only the other two members of the Cedar triple
         // are read off the request — and each of them must be present for the same reason
@@ -260,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let required = |path: &str| {
             invalid(crate::ops::InvalidInput::new(
                 path,
-                REQUIRED_FOR_EVALUATION,
+                crate::ops::REQUIRED_FOR_EVALUATION,
             ))
         };
         let resource = crate::state::cedar::request_entity(input.resource.as_ref())
@@ -282,33 +265,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(invalid)?;
 
         // Each presented token is verified against the store's identity sources, and a
-        // call that presented two is decided for the one principal they agree on.
-        let now = ::std::time::SystemTime::now();
-        let mut identity: Option<crate::state::token::TokenIdentity> = None;
-        for token in presented {
-            let verified = crate::state::token::verify(&*self.engine, store, token, now)
-                .map_err(|refusal| refused(&input.policy_store_id, refusal))?;
-            identity = Some(match identity {
-                None => verified,
-                Some(first) => first.merged_with(verified).ok_or_else(|| {
-                    invalid_members([
-                        crate::ops::InvalidInput::new(
-                            crate::ops::paths::ACCESS_TOKEN,
-                            DIFFERENT_PRINCIPALS,
-                        ),
-                        crate::ops::InvalidInput::new(
-                            crate::ops::paths::IDENTITY_TOKEN,
-                            DIFFERENT_PRINCIPALS,
-                        ),
-                    ])
-                })?,
-            });
-        }
-        let identity = identity.ok_or_else(|| {
-            IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
-                message: "no presented token was read".to_string(),
-            })
-        })?;
+        // call that presented two is decided for the one principal they agree on — the
+        // one reading of a presented token both token operations go through.
+        let identity = crate::ops::token_identity(
+            &*self.engine,
+            store,
+            &input.policy_store_id,
+            presented,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(refused)?;
 
         // The `entities` slice of a call whose principal comes from the TOKEN carries only
         // resource and action entities: a principal entity is this call's to build out of
@@ -322,23 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "it is not a Cedar entity store: an entity store is a list of entities",
             )));
         };
-        // The principal types this store knows: the ones the identity source that issued
-        // the token generates — including the group type it maps, which this call builds
-        // entities of too — and the ones its schema declares.
-        let mut principal_entity_types: Vec<crate::state::cedar::PrincipalEntityType> = identity
-            .owned_entity_types
-            .iter()
-            .map(crate::state::cedar::PrincipalEntityType::from_identity_source)
-            .collect();
-        principal_entity_types.extend(
-            crate::state::cedar::schema_principal_entity_types(
-                store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
-            )
-            .map_err(refused_by_cedar)?,
-        );
-        crate::state::cedar::check_token_request_entities(supplied, &principal_entity_types)
-            .map_err(invalid)?;
-        supplied.extend(identity.entities());
+        // The slice is checked against the principal types this store knows and then
+        // joined by the entities the token named, which is one rule shared with
+        // `BatchIsAuthorizedWithToken` ([`crate::ops::add_token_identity_entities`]).
+        crate::ops::add_token_identity_entities(store, &identity, supplied)
+            .map_err(refused_by_cedar)?;
 
         let verdict = crate::state::cedar::authorize(
             store,
@@ -373,28 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// Why an absent member of the authorization triple is refused: the two members this
-/// operation reads off the request are modelled optional, so the boundary validator
-/// cannot require them and this is the place that does.
-const REQUIRED_FOR_EVALUATION: &str = "it is required to evaluate an authorization request";
-
-/// Why a call presenting no token at all is refused.
-const TOKEN_REQUIRED: &str =
-    "an authorization request takes its principal from a token, so either an access token \
-     or an identity token is required";
-
-/// Why a call presenting two tokens of two different users is refused: one call decides
-/// for one principal.
-const DIFFERENT_PRINCIPALS: &str =
-    "the access token and the identity token name different principals";
-
-/// The refusal a presented token whose audience the identity source does not accept is
-/// answered with: ONE fixed sentence, whichever member the token arrived in and whichever
-/// of its configured audiences the source lists them as, so a client can tell an audience
-/// failure apart from every other validation failure by matching it. It has no variable
-/// part — in particular the rejected token's own audience is not reported back.
-const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
 
 /// One offending request member as this operation's modelled `ValidationException`.
 fn invalid(invalid: crate::ops::InvalidInput) -> IsAuthorizedWithTokenError {
@@ -438,82 +370,26 @@ fn refused_by_cedar(refusal: crate::state::cedar::Refusal) -> IsAuthorizedWithTo
     }
 }
 
-/// The modelled error a token this call could not use is refused with.
+/// A presented token this call could not use, on this operation's error channel.
 ///
-/// A token that does not verify is refused as a BAD REQUEST, and the service words that
-/// refusal as a sentence naming the member and what failed — `Failed to verify
-/// IdentityToken: signature is invalid` — so the message is that sentence rather than this
-/// service's fixed `Invalid input`, while `fieldList` still names the member for a client
-/// that reads it. An audience the identity source does not accept is the exception the
-/// service words as fixed text instead ([`AUDIENCE_NOT_ACCEPTED`]).
-///
-/// A token whose BODY did not DECODE into a claim set is the same bad request worded for
-/// the stage it failed at — `Failed to decode IdentityToken: <what the deserialization
-/// reported>` — because nothing about such a token was verified: a client reading the
-/// message is told to repair the token it presented, where the verify sentence would send
-/// it to the trust its policy store configures.
-///
-/// A token whose issuer is no identity source of the store is the other kind of answer:
-/// nothing about the token is wrong, and what the call referenced — an identity source for
-/// that issuer IN this policy store — does not exist, so it is the modelled not-found,
-/// worded as the reference it was: the ISSUER the token claims and the policy store the
-/// request addressed, which `policy_store_id` carries. The exception's own `resourceId` /
-/// `resourceType` members still name the missing identity source.
-///
-/// A token whose signature could not be CHECKED is the third: nothing about the request is
-/// wrong and this service cannot say whether the signature is good, which is the modelled
-/// server fault rather than a refusal of the token.
-fn refused(
-    policy_store_id: &str,
-    refusal: crate::state::token::TokenRefusal,
-) -> IsAuthorizedWithTokenError {
+/// WHAT the answer is — the status, the code and the sentence — is the TOKEN's rule and
+/// not this operation's, so it is decided once in [`crate::ops::token_identity`] and
+/// described as a [`crate::ops::RefusedToken`]; this is only the lift of that description
+/// into the errors THIS operation models. `BatchIsAuthorizedWithToken` lifts the same
+/// three descriptions into its own, so the two operations cannot drift apart: a bad
+/// request is the modelled `ValidationException` whose `fieldList` names the member the
+/// token arrived in, a reference to an identity source the store does not hold is the
+/// modelled `ResourceNotFoundException`, and a signature this service could not check at
+/// all is the modelled `InternalServerException`, because nothing was decided.
+fn refused(refusal: crate::ops::RefusedToken) -> IsAuthorizedWithTokenError {
     match refusal {
-        crate::state::token::TokenRefusal::NotDecoded { kind, reason } => {
-            IsAuthorizedWithTokenErrorModeled::ValidationException(ValidationException {
-                message: format!("Failed to decode {}: {reason}", kind.reported_name()),
-                field_list: Some(vec![ValidationExceptionField {
-                    path: kind.path().to_string(),
-                    message: reason,
-                }]),
-            })
-            .into()
+        crate::ops::RefusedToken::InvalidInput(fields) => invalid_members(fields),
+        crate::ops::RefusedToken::NotFound(not_found) => {
+            IsAuthorizedWithTokenErrorModeled::ResourceNotFoundException(not_found).into()
         }
-        crate::state::token::TokenRefusal::NotVerified { kind, reason } => {
-            IsAuthorizedWithTokenErrorModeled::ValidationException(ValidationException {
-                message: format!("Failed to verify {}: {reason}", kind.reported_name()),
-                field_list: Some(vec![ValidationExceptionField {
-                    path: kind.path().to_string(),
-                    message: reason,
-                }]),
-            })
-            .into()
-        }
-        // The audience rule has its own fixed sentence, so this refusal is NOT composed
-        // from a reason about the token: the message is that sentence alone, and
-        // `fieldList` names the member the token arrived in without reporting anything the
-        // token claimed.
-        crate::state::token::TokenRefusal::AudienceNotAccepted { kind } => {
-            IsAuthorizedWithTokenErrorModeled::ValidationException(ValidationException {
-                message: AUDIENCE_NOT_ACCEPTED.to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    path: kind.path().to_string(),
-                    message: AUDIENCE_NOT_ACCEPTED.to_string(),
-                }]),
-            })
-            .into()
-        }
-        crate::state::token::TokenRefusal::NoIdentitySource(issuer) => {
-            IsAuthorizedWithTokenErrorModeled::ResourceNotFoundException(
-                crate::ops::identity_source_not_found_for_issuer(&issuer, policy_store_id),
-            )
-            .into()
-        }
-        crate::state::token::TokenRefusal::NotCheckable { issuer, reason } => {
+        crate::ops::RefusedToken::ServiceFault(message) => {
             IsAuthorizedWithTokenErrorModeled::InternalServerException(InternalServerException {
-                message: format!(
-                    "the signature of the token the issuer {issuer} minted could not be \
-                     checked: {reason}"
-                ),
+                message,
             })
             .into()
         }

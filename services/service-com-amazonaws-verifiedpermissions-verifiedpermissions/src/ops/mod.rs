@@ -987,6 +987,243 @@ pub fn deletion_protection_enabled() -> self::types::InvalidStateException {
     }
 }
 
+/// Why a member of the authorization triple an operation reads off the request is
+/// refused when the request did not carry it: the members are modelled optional, so
+/// the boundary validator cannot require them and the handler is what does.
+///
+/// Shared by every authorization operation, because the rule belongs to the Cedar
+/// request and not to the operation reading it: a decision is made for a COMPLETE
+/// triple, and the member a token-based call takes from the token is the only one
+/// the request does not supply.
+pub const REQUIRED_FOR_EVALUATION: &str = "it is required to evaluate an authorization request";
+
+/// Why a token-based authorization call that presented no token at all is refused.
+pub const TOKEN_REQUIRED: &str =
+    "an authorization request takes its principal from a token, so either an access token \
+     or an identity token is required";
+
+/// Why a call presenting two tokens of two different users is refused: one call
+/// decides for one principal.
+pub const DIFFERENT_PRINCIPALS: &str =
+    "the access token and the identity token name different principals";
+
+/// The refusal a presented token whose audience the identity source does not accept
+/// is answered with: ONE fixed sentence, whichever member the token arrived in and
+/// whichever of its configured audiences the source lists them as, so a client can
+/// tell an audience failure apart from every other validation failure by matching
+/// it. It has no variable part — in particular the rejected token's own audience is
+/// not reported back.
+pub const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
+
+/// What a presented token this service could not use is refused with, DESCRIBED for
+/// the operation that presented it: the shape of the answer, with the modelled error
+/// enum left to the caller to name.
+///
+/// The token rules are the TOKEN's and not the calling operation's, so the one
+/// translation of [`crate::state::token::TokenRefusal`] lives here
+/// ([`token_identity`]) and each token operation lifts the description into its own
+/// `…ErrorModeled` — the same split [`InvalidInput`] and
+/// [`crate::state::cedar::Refusal`] already make for the checks that raise them.
+#[derive(Debug, Clone)]
+pub enum RefusedToken {
+    /// A BAD REQUEST: the offending members, in the order a `fieldList` reports
+    /// them, each carrying the sentence the service words the refusal with where
+    /// the class of refusal has one ([`InvalidInput::worded`]).
+    InvalidInput(Vec<InvalidInput>),
+    /// The token's issuer is no identity source of the policy store the request
+    /// addressed, so the call references a resource the store does not hold.
+    NotFound(self::types::ResourceNotFoundException),
+    /// Nothing was decided about the token: this service cannot say whether its
+    /// signature is good, so there is no refusal of the token to answer with. The
+    /// message of the modelled server fault.
+    ServiceFault(String),
+}
+
+/// The tokens a token-based authorization call presented: at least one, because a
+/// call that presented none is refused before this exists.
+///
+/// "You must specify either an accessToken, an identityToken, or both", so a call
+/// carries one token or two — never none and never more — and the type says so,
+/// which is what leaves [`token_identity`] no empty case to answer for.
+#[derive(Debug, Clone, Copy)]
+pub struct PresentedTokens<'a> {
+    /// The first token the members were read in.
+    first: crate::state::token::PresentedToken<'a>,
+    /// The second, when the call presented both members.
+    second: Option<crate::state::token::PresentedToken<'a>>,
+}
+
+/// The tokens a token-based authorization call presented, in the order the members
+/// are read — refusing a call that presented none.
+///
+/// "You must specify either an accessToken, an identityToken, or both": the model
+/// declares both members optional, so the boundary validator cannot require one of
+/// them and this is the place that does. Both members are named in the refusal,
+/// because either one satisfies the rule.
+///
+/// Shared by the two operations that take their principal from a token, so both
+/// read the same members, in the same order, and refuse a tokenless call with the
+/// same sentence.
+pub fn presented_tokens<'a>(
+    access_token: Option<&'a str>,
+    identity_token: Option<&'a str>,
+) -> Result<PresentedTokens<'a>, RefusedToken> {
+    let mut presented = [
+        (crate::state::token::TokenKind::Access, access_token),
+        (crate::state::token::TokenKind::Identity, identity_token),
+    ]
+    .into_iter()
+    .filter_map(|(kind, value)| {
+        value.map(|value| crate::state::token::PresentedToken { kind, value })
+    });
+    let Some(first) = presented.next() else {
+        return Err(RefusedToken::InvalidInput(vec![
+            InvalidInput::new(paths::ACCESS_TOKEN, TOKEN_REQUIRED),
+            InvalidInput::new(paths::IDENTITY_TOKEN, TOKEN_REQUIRED),
+        ]));
+    };
+    Ok(PresentedTokens {
+        first,
+        second: presented.next(),
+    })
+}
+
+/// The ONE identity a token-based authorization call decides for: every presented
+/// token verified against `store`'s identity sources
+/// ([`crate::state::token::verify`]), and a call that presented two decided for the
+/// one principal they agree on.
+///
+/// This is the SINGLE reading of a presented token both token operations go through
+/// — `IsAuthorizedWithToken` and `BatchIsAuthorizedWithToken` — so a token the one
+/// accepts the other accepts, and a token either refuses is refused with the same
+/// status, the same code and the same sentence. `policy_store_id` is the store the
+/// request addressed, which the not-found description names beside the issuer.
+pub fn token_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &crate::state::PolicyStore,
+    policy_store_id: &str,
+    presented: PresentedTokens<'_>,
+    now: ::std::time::SystemTime,
+) -> Result<crate::state::token::TokenIdentity, RefusedToken> {
+    let verify = |token| {
+        crate::state::token::verify(engine, store, token, now)
+            .map_err(|refusal| refused_token(policy_store_id, refusal))
+    };
+    let identity = verify(presented.first)?;
+    let Some(second) = presented.second else {
+        return Ok(identity);
+    };
+    // Two tokens decide ONE request, so they have to name one principal: an access
+    // token and an identity token of two different users describe no single caller.
+    identity.merged_with(verify(second)?).ok_or_else(|| {
+        RefusedToken::InvalidInput(vec![
+            InvalidInput::new(paths::ACCESS_TOKEN, DIFFERENT_PRINCIPALS),
+            InvalidInput::new(paths::IDENTITY_TOKEN, DIFFERENT_PRINCIPALS),
+        ])
+    })
+}
+
+/// How a presented token the service could not use is refused, as the description
+/// the calling operation lifts into its own modelled errors.
+///
+/// A token that does not verify is refused as a BAD REQUEST, and the service words
+/// that refusal as a sentence naming the member and what failed — `Failed to verify
+/// IdentityToken: signature is invalid` — so the message is that sentence rather
+/// than this service's fixed `Invalid input`, while `fieldList` still names the
+/// member for a client that reads it. An audience the identity source does not
+/// accept is the exception the service words as fixed text instead
+/// ([`AUDIENCE_NOT_ACCEPTED`]), reporting neither the claim the audience was read
+/// from nor the value it held.
+///
+/// A token whose BODY did not DECODE into a claim set is the same bad request worded
+/// for the stage it failed at — `Failed to decode IdentityToken: <what the
+/// deserialization reported>` — because nothing about such a token was verified: a
+/// client reading the message is told to repair the token it presented, where the
+/// verify sentence would send it to the trust its policy store configures.
+///
+/// A token whose issuer is no identity source of the store is the other kind of
+/// answer: nothing about the token is wrong, and what the call referenced — an
+/// identity source for that issuer IN this policy store — does not exist, so it is
+/// the modelled not-found, worded as the reference it was
+/// ([`identity_source_not_found_for_issuer`]).
+///
+/// A token whose signature could not be CHECKED is the third: nothing about the
+/// request is wrong and this service cannot say whether the signature is good, which
+/// is the modelled server fault rather than a refusal of the token.
+fn refused_token(
+    policy_store_id: &str,
+    refusal: crate::state::token::TokenRefusal,
+) -> RefusedToken {
+    match refusal {
+        crate::state::token::TokenRefusal::NotDecoded { kind, reason } => {
+            RefusedToken::InvalidInput(vec![InvalidInput::new(kind.path(), reason.clone())
+                .worded(format!("Failed to decode {}: {reason}", kind.reported_name()))])
+        }
+        crate::state::token::TokenRefusal::NotVerified { kind, reason } => {
+            RefusedToken::InvalidInput(vec![InvalidInput::new(kind.path(), reason.clone())
+                .worded(format!("Failed to verify {}: {reason}", kind.reported_name()))])
+        }
+        // The audience rule has its own fixed sentence, so this refusal is NOT
+        // composed from a reason about the token: the message is that sentence alone,
+        // and `fieldList` names the member the token arrived in without reporting
+        // anything the token claimed.
+        crate::state::token::TokenRefusal::AudienceNotAccepted { kind } => {
+            RefusedToken::InvalidInput(vec![InvalidInput::new(
+                kind.path(),
+                AUDIENCE_NOT_ACCEPTED,
+            )
+            .worded(AUDIENCE_NOT_ACCEPTED)])
+        }
+        crate::state::token::TokenRefusal::NoIdentitySource(issuer) => RefusedToken::NotFound(
+            identity_source_not_found_for_issuer(&issuer, policy_store_id),
+        ),
+        crate::state::token::TokenRefusal::NotCheckable { issuer, reason } => {
+            RefusedToken::ServiceFault(format!(
+                "the signature of the token the issuer {issuer} minted could not be \
+                 checked: {reason}"
+            ))
+        }
+    }
+}
+
+/// Check the `entities` slice of a call whose principal comes from a TOKEN against
+/// the principal entity types `store` knows, then ADD the entities the token's
+/// identity contributes to it.
+///
+/// Such a call carries only resource and action entities, because the principal is
+/// the token's to build: the principal types are the ones the identity source that
+/// issued the token generates — including the group type it maps, which this call
+/// builds entities of too — and the ones the store's schema declares
+/// ([`crate::state::cedar::schema_principal_entity_types`]), and an entity of any of
+/// them is refused ([`crate::state::cedar::check_token_request_entities`]). Only
+/// then do the token's own entities join the slice, so the check never sees them.
+///
+/// Shared by the two operations that take their principal from a token, so the types
+/// they refuse, the member the refusal names and the entities the decision is made
+/// over are one implementation. The `Err` is
+/// [`crate::state::cedar::Refusal`], which the caller splits onto its own error
+/// channel exactly as it splits every other refusal that module raises: a member the
+/// caller can fix is the modelled `ValidationException`, stored state it cannot is a
+/// server fault.
+pub fn add_token_identity_entities(
+    store: &crate::state::PolicyStore,
+    identity: &crate::state::token::TokenIdentity,
+    supplied: &mut Vec<::serde_json::Value>,
+) -> Result<(), crate::state::cedar::Refusal> {
+    let mut principal_entity_types: Vec<crate::state::cedar::PrincipalEntityType> = identity
+        .owned_entity_types
+        .iter()
+        .map(crate::state::cedar::PrincipalEntityType::from_identity_source)
+        .collect();
+    principal_entity_types.extend(crate::state::cedar::schema_principal_entity_types(
+        store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
+    )?);
+    crate::state::cedar::check_token_request_entities(supplied, &principal_entity_types)
+        .map_err(crate::state::cedar::Refusal::InvalidInput)?;
+    supplied.extend(identity.entities());
+    Ok(())
+}
+
 /// Emit the structured audit record for a state-changing or destructive
 /// operation: when it happened, what operation ran, what it touched and how it
 /// came out.

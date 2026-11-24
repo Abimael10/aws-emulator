@@ -194,7 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // three must be present. Refused as a bad request rather than answered
         // with a deny, which would read as "evaluated and denied" — and the
         // refusal names the absent member in `fieldList`.
-        let required = |path: &str| invalid(crate::ops::InvalidInput::new(path, REQUIRED_FOR_EVALUATION));
+        let required = |path: &str| {
+            invalid(crate::ops::InvalidInput::new(
+                path,
+                crate::ops::REQUIRED_FOR_EVALUATION,
+            ))
+        };
         let principal = crate::state::cedar::request_entity(input.principal.as_ref())
             .ok_or_else(|| required(crate::ops::paths::PRINCIPAL))?;
         let resource = crate::state::cedar::request_entity(input.resource.as_ref())
@@ -272,11 +277,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// Why an absent member of the authorization triple is refused. The three
-/// members are modelled optional, so the boundary validator cannot require them
-/// and this is the place that does.
-const REQUIRED_FOR_EVALUATION: &str = "it is required to evaluate an authorization request";
 
 /// One offending request member as this operation's modelled
 /// `ValidationException`.
