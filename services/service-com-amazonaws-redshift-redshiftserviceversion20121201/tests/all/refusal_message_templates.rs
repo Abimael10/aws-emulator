@@ -123,6 +123,7 @@ async fn a_token_lifetime_outside_the_window_is_refused_in_the_documented_words(
                 ("ClusterIdentifier", cluster),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", MASTER_USERNAME),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
         )
         .await;

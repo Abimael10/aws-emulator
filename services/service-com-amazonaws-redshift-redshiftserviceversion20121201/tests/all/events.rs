@@ -171,6 +171,7 @@ fn write_cases() -> Vec<WriteCase> {
                 ("ClusterIdentifier", cluster.clone()),
                 ("NodeType", "ra3.xlplus".to_string()),
                 ("MasterUsername", "admin".to_string()),
+                ("MasterUserPassword", "Probe-Passw0rd".to_string()),
             ],
             event_id: "REDSHIFT-EVENT-2000",
             source_type: "cluster",

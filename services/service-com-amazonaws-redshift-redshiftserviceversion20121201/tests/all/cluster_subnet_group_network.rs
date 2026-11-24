@@ -698,6 +698,7 @@ async fn a_modify_replaces_the_network_and_a_delete_leaves_nothing() {
                 ("ClusterIdentifier", "subnet-group-user"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("ClusterSubnetGroupName", "in-use-subnets"),
             ],
         )
@@ -909,6 +910,7 @@ async fn a_subnet_group_refusal_names_the_identifier_in_its_stored_lower_case_fo
                     ("ClusterIdentifier", "folded-identifier-probe"),
                     ("NodeType", "ra3.xlplus"),
                     ("MasterUsername", "admin"),
+                    ("MasterUserPassword", "Probe-Passw0rd"),
                     ("ClusterSubnetGroupName", requested.as_str()),
                 ],
             )

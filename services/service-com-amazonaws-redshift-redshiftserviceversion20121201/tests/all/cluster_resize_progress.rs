@@ -41,6 +41,7 @@ async fn create(emulator: &Emulator, identifier: &str, extra: &[(&str, &str)]) {
         ("ClusterIdentifier", identifier),
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     params.extend_from_slice(extra);
     let created = emulator.call("CreateCluster", &params).await;

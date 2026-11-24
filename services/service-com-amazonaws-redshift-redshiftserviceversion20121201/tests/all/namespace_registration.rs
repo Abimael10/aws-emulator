@@ -170,6 +170,7 @@ async fn available_cluster(emulator: &Emulator, identifier: &str, shape: &[(&str
     let mut params: Vec<(&str, &str)> = vec![
         ("ClusterIdentifier", identifier),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     params.extend_from_slice(shape);
     let created = emulator.call("CreateCluster", &params).await;

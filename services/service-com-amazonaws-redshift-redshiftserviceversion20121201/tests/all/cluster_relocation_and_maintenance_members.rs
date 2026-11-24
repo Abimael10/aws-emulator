@@ -115,6 +115,7 @@ async fn a_clusters_relocation_is_reported_on_every_member_that_carries_it() {
             ("ClusterIdentifier", identifier.as_str()),
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         if let Some(option) = requested {
             params.push(("AvailabilityZoneRelocation", option));

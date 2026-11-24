@@ -81,6 +81,7 @@ async fn seeded_emulator() -> Emulator {
                 ("ClusterIdentifier", CLUSTER_WITH_DEFAULT),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("ManualSnapshotRetentionPeriod", &retention),
             ],
         )

@@ -773,6 +773,7 @@ pub(crate) async fn create_cluster_on(emulator: &Emulator, identifier: &str, gro
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("ClusterParameterGroupName", group),
             ],
         )

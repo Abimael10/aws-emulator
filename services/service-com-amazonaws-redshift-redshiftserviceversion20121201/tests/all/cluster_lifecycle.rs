@@ -47,6 +47,15 @@ pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(10);
 /// The gap between two polls of one loop.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// The admin password every create this harness makes carries.
+///
+/// A create has to come with admin credentials — either the password it sets or
+/// `ManageMasterPassword` — and the password it sets has to satisfy every
+/// published constraint (`crate::cluster_admin_password_rules`), so one
+/// compliant value stands here for every suite that only needs a cluster to
+/// exist.
+pub(crate) const HARNESS_MASTER_PASSWORD: &str = "Harness-Passw0rd";
+
 /// How many FRESH reads a case makes of one resource inside the span, to show
 /// that reading it materialises nothing the clock has not already made due.
 ///
@@ -953,7 +962,11 @@ impl Emulator {
         }
     }
 
-    /// Create a cluster with just the three required members.
+    /// Create a cluster with the members a create cannot leave out: the three
+    /// the model requires, and the admin password that stands for the admin
+    /// credentials a cluster has to be created with (a create that neither sets
+    /// one nor asks Amazon Redshift to manage one is refused —
+    /// `crate::cluster_admin_password_rules`).
     pub(crate) async fn create_minimal(&self, identifier: &str) -> Answer {
         self.call(
             "CreateCluster",
@@ -961,6 +974,7 @@ impl Emulator {
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", HARNESS_MASTER_PASSWORD),
             ],
         )
         .await
@@ -1399,19 +1413,49 @@ async fn an_identifier_is_accepted_exactly_when_it_satisfies_the_documented_synt
     let emulator = Emulator::new();
 
     let max = state::CLUSTER_IDENTIFIER_RULE.max_len;
-    let cluster_cases: Vec<(&str, String, bool)> = vec![
-        ("one letter", "c".to_string(), true),
-        ("letters, digits and hyphens", "my-cluster-01".to_string(), true),
-        ("at the published length bound", identifier_of_length(max), true),
-        ("one past the length bound", identifier_of_length(max + 1), false),
-        ("uppercase letter", "Demo-cluster".to_string(), false),
-        ("leading digit", "1cluster".to_string(), false),
-        ("trailing hyphen", "cluster-".to_string(), false),
-        ("two consecutive hyphens", "my--cluster".to_string(), false),
-        ("underscore", "my_cluster".to_string(), false),
-        ("dot", "my.cluster".to_string(), false),
+    // The last field is the refusal a rejected row carries: the case constraint
+    // has a sentence of its own (`state::CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL`,
+    // under the service's `InvalidParameterValue` code), while every other
+    // constraint is refused naming the member and what it broke.
+    let cluster_cases: Vec<(&str, String, bool, bool)> = vec![
+        ("one letter", "c".to_string(), true, false),
+        (
+            "letters, digits and hyphens",
+            "my-cluster-01".to_string(),
+            true,
+            false,
+        ),
+        (
+            "at the published length bound",
+            identifier_of_length(max),
+            true,
+            false,
+        ),
+        (
+            "one past the length bound",
+            identifier_of_length(max + 1),
+            false,
+            false,
+        ),
+        ("uppercase letter", "Demo-cluster".to_string(), false, true),
+        (
+            "every letter uppercase",
+            "DEMOCLUSTER".to_string(),
+            false,
+            true,
+        ),
+        ("leading digit", "1cluster".to_string(), false, false),
+        ("trailing hyphen", "cluster-".to_string(), false, false),
+        (
+            "two consecutive hyphens",
+            "my--cluster".to_string(),
+            false,
+            false,
+        ),
+        ("underscore", "my_cluster".to_string(), false, false),
+        ("dot", "my.cluster".to_string(), false, false),
     ];
-    for (case, identifier, accepted) in &cluster_cases {
+    for (case, identifier, accepted, uppercase) in &cluster_cases {
         let answer = emulator.create_minimal(identifier).await;
         let ok = answer.status == 200;
         assert_eq!(
@@ -1420,7 +1464,17 @@ async fn an_identifier_is_accepted_exactly_when_it_satisfies_the_documented_synt
             answer.status,
             answer.error_code()
         );
-        if !accepted {
+        if !accepted && *uppercase {
+            assert_eq!(
+                (answer.error_code().as_deref(), answer.text("Message").as_deref()),
+                (
+                    Some("InvalidParameterValue"),
+                    Some(state::CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL)
+                ),
+                "case ClusterIdentifier {case} ({identifier:?}): the case constraint has its own sentence, got body {}",
+                answer.body
+            );
+        } else if !accepted {
             assert_eq!(
                 answer.error_code().as_deref(),
                 Some("ValidationException"),
@@ -1516,6 +1570,7 @@ async fn the_cluster_type_and_the_node_count_must_describe_one_another() {
             ("ClusterIdentifier", &identifier),
             ("NodeType", "dc2.large"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", HARNESS_MASTER_PASSWORD),
         ];
         if let Some(kind) = cluster_type {
             params.push(("ClusterType", kind));
@@ -1560,6 +1615,7 @@ async fn the_cluster_type_and_the_node_count_must_describe_one_another() {
                 ("ClusterIdentifier", "shape-host"),
                 ("NodeType", "dc2.large"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", HARNESS_MASTER_PASSWORD),
                 ("ClusterType", "multi-node"),
                 ("NumberOfNodes", "4"),
             ],
@@ -1637,6 +1693,7 @@ async fn a_retention_period_is_accepted_exactly_inside_its_published_range() {
                     ("ClusterIdentifier", &identifier),
                     ("NodeType", "dc2.large"),
                     ("MasterUsername", "admin"),
+                    ("MasterUserPassword", HARNESS_MASTER_PASSWORD),
                     (member, &value),
                 ],
             )
@@ -1655,13 +1712,34 @@ async fn a_retention_period_is_accepted_exactly_inside_its_published_range() {
                 answer.text(member)
             );
         } else {
+            // The AUTOMATED period's own refusal is the service's
+            // `InvalidParameterValue` naming the period and its range; the
+            // manual one keeps the modelled retention fault.
+            let (code, message) = if member == "AutomatedSnapshotRetentionPeriod" {
+                (
+                    "InvalidParameterValue",
+                    Some(state::automated_retention_refusal_message(
+                        value.parse().expect("the row's period is a number"),
+                    )),
+                )
+            } else {
+                ("InvalidRetentionPeriodFault", None)
+            };
             assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("InvalidRetentionPeriodFault".to_string())),
-                "case {case} ({member}={value}): expected 400 InvalidRetentionPeriodFault, got {} / {:?}",
+                (400, Some(code.to_string())),
+                "case {case} ({member}={value}): expected 400 {code}, got {} / {:?}",
                 answer.status,
                 answer.error_code()
             );
+            if let Some(message) = message {
+                assert_eq!(
+                    answer.text("Message"),
+                    Some(message.clone()),
+                    "case {case} ({member}={value}): expected the message to name the period and its range, got {:?}",
+                    answer.text("Message")
+                );
+            }
         }
     }
 

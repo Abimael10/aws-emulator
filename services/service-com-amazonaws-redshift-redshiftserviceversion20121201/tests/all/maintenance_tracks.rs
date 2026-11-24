@@ -387,6 +387,7 @@ async fn every_cluster_runs_on_a_track_the_catalog_publishes() {
                             ("ClusterIdentifier", &identifier),
                             ("NodeType", "ra3.xlplus"),
                             ("MasterUsername", "admin"),
+                            ("MasterUserPassword", "Probe-Passw0rd"),
                             ("MaintenanceTrackName", track),
                         ],
                     )
@@ -493,6 +494,7 @@ async fn a_write_naming_an_unpublished_track_is_refused() {
                     ("ClusterIdentifier", "track-refused"),
                     ("NodeType", "ra3.xlplus"),
                     ("MasterUsername", "admin"),
+                    ("MasterUserPassword", "Probe-Passw0rd"),
                     ("MaintenanceTrackName", track),
                 ],
             ),

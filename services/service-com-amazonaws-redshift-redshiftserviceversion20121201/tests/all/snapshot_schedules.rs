@@ -27,7 +27,7 @@
 //! / `ClusterIdentifier` / `TagKeys` / `TagValues` filters, the service's
 //! `MaxRecords` window and its `Marker` cursor.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
@@ -942,6 +942,7 @@ async fn the_associated_clusters_are_the_clusters_that_name_the_schedule() {
                 ("ClusterIdentifier", "cluster-on-a-schedule"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("SnapshotScheduleIdentifier", "schedule-associated"),
             ],
         )
@@ -974,10 +975,21 @@ async fn the_associated_clusters_are_the_clusters_that_name_the_schedule() {
         Some(state::SCHEDULE_ASSOCIATION_STATE_MODIFYING),
     );
 
-    // The provisioning transition was due this long after the create, and
-    // nothing sleeps for it inside the handler.
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
-    let active = describe_one(&emulator, "schedule-associated").await;
+    // The provisioning transition is owed by the clock, so the read is taken
+    // again until the association reports itself applied rather than after a
+    // fixed wait: nothing sleeps for the span inside the handler, and a loaded
+    // host only costs this loop more polls.
+    let (active, _) = emulator
+        .poll_until(
+            "once the cluster is serving",
+            "DescribeSnapshotSchedules",
+            &[("ScheduleIdentifier", "schedule-associated")],
+            |read| {
+                read.text("ScheduleAssociationState").as_deref()
+                    == Some(state::SCHEDULE_ASSOCIATION_STATE_ACTIVE)
+            },
+        )
+        .await;
     assert_text(
         "once the cluster is serving",
         &active,
@@ -1039,6 +1051,7 @@ async fn snapshot_schedules_are_selected_by_the_documented_filters() {
                 ("ClusterIdentifier", "cluster-with-a-schedule"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("SnapshotScheduleIdentifier", "schedule-owner-team"),
             ],
         )
@@ -1717,6 +1730,7 @@ async fn a_schedule_a_cluster_takes_its_snapshots_on_cannot_be_deleted() {
                 ("ClusterIdentifier", "cluster-on-the-schedule"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("SnapshotScheduleIdentifier", "schedule-in-use"),
             ],
         )

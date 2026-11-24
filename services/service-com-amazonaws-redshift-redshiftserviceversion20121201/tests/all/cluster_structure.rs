@@ -103,16 +103,18 @@ fn multi_node_roles(count: usize) -> Vec<String> {
         .collect()
 }
 
-/// The three members every `CreateCluster` must carry, for one identifier.
+/// The members every `CreateCluster` must carry, for one identifier: the three
+/// the model requires and the admin password a create cannot be served without.
 fn required(identifier: &str) -> Vec<(String, String)> {
     vec![
         ("ClusterIdentifier".to_string(), identifier.to_string()),
         ("NodeType".to_string(), "ra3.xlplus".to_string()),
         ("MasterUsername".to_string(), "admin".to_string()),
+        ("MasterUserPassword".to_string(), PASSWORD.to_string()),
     ]
 }
 
-/// The admin password the rows that carry one use: it must never reach the wire,
+/// The admin password every row carries: it must never reach the wire,
 /// not even as the pending change that reports it.
 const PASSWORD: &str = "Structur3-Passw0rd";
 
@@ -280,7 +282,6 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
     for (index, case) in cases.iter().enumerate() {
         let identifier = format!("structure-{index:02}");
         let mut params = required(&identifier);
-        params.push(("MasterUserPassword".to_string(), PASSWORD.to_string()));
         params.extend(case.params.iter().cloned());
         let created = emulator.call("CreateCluster", &borrowed(&params)).await;
         assert_eq!(
@@ -800,6 +801,7 @@ async fn the_next_maintenance_window_start_is_the_next_occurrence_of_the_window(
                 ("ClusterIdentifier", "window-demo"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", PASSWORD),
                 ("PreferredMaintenanceWindow", "tue:05:30-tue:06:00"),
             ],
         )
@@ -863,6 +865,7 @@ async fn relocation_is_reported_as_the_request_asked_and_on_by_default() {
             ("ClusterIdentifier", identifier.as_str()),
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", PASSWORD),
         ];
         if let Some(value) = requested {
             params.push(("AvailabilityZoneRelocation", value));
@@ -943,6 +946,7 @@ async fn a_cluster_is_refused_above_the_published_node_count_bound() {
                     ("ClusterIdentifier", identifier.as_str()),
                     ("NodeType", "ra3.xlplus"),
                     ("MasterUsername", "admin"),
+                    ("MasterUserPassword", PASSWORD),
                     ("ClusterType", "multi-node"),
                     ("NumberOfNodes", nodes.as_str()),
                 ],

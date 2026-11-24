@@ -142,6 +142,7 @@ fn create_cluster_on_group(name: &str) -> Vec<(String, String)> {
         pair("ClusterIdentifier", &format!("wording-{suffix}")),
         pair("NodeType", "ra3.xlplus"),
         pair("MasterUsername", "admin"),
+        pair("MasterUserPassword", "Probe-Passw0rd"),
         pair("ClusterParameterGroupName", name),
     ]
 }

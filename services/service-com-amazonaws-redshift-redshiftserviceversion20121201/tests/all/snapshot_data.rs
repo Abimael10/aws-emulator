@@ -64,6 +64,7 @@ pub(crate) async fn create_cluster(
                 ("ClusterIdentifier", identifier),
                 ("NodeType", NODE_TYPE),
                 ("MasterUsername", MASTER_USERNAME),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("DBName", database),
             ],
         )

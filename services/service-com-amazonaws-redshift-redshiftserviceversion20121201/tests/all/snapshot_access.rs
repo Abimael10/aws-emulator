@@ -66,6 +66,7 @@ pub(crate) async fn creating_emulator(snapshots: &[&str]) -> (Emulator, String) 
                 ("ClusterIdentifier", CLUSTER),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
         )
         .await;

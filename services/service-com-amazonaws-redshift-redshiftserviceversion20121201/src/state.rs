@@ -103,6 +103,9 @@ mod clock;
 mod policy_resources;
 /// The cluster record: its derived members, its IAM roles and its shape.
 mod clusters;
+/// The content rules the admin password a cluster write carries is checked
+/// against.
+mod admin_password;
 /// The published event surface and the subscriptions scoped to it.
 mod events;
 /// The reserved-node offerings, their pricing and the exchange surface.
@@ -160,6 +163,7 @@ pub mod cluster_metrics;
 
 pub use cluster_metrics::*;
 
+pub use admin_password::*;
 pub use caller_identity::*;
 pub use clock::*;
 pub use cluster_data::*;
@@ -258,6 +262,23 @@ pub const ORDERABLE_NODE_TYPES: [&str; 10] = [
     "ra3.4xlarge",
     "ra3.16xlarge",
 ];
+
+/// Check the `NodeType` a cluster write names against the published catalog.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="NodeType")` — the "Valid Values" list [`ORDERABLE_NODE_TYPES`]
+/// carries. A value outside it names no compute node this service offers, so no
+/// cluster can be built on it; the refusal is Amazon Redshift's own recorded
+/// wording, whose one variable part is the node type the request asked for.
+///
+/// Shared from here rather than written at the call site, so an operation that
+/// comes to take a node type is checked against the same catalog this one is.
+pub fn check_node_type(node_type: &str) -> Result<(), String> {
+    if !ORDERABLE_NODE_TYPES.contains(&node_type) {
+        return Err(format!("Invalid node type: {node_type}"));
+    }
+    Ok(())
+}
 
 /// The node-type family Amazon Redshift publishes as the PREVIOUS generation of
 /// compute nodes.
@@ -379,6 +400,35 @@ pub fn orderable_cluster_types(node_type: &str) -> Vec<&'static str> {
 /// model expects of this member, and because this service's published node
 /// configurations quote the ranges around it.
 pub const DEFAULT_PORT: i32 = 5439;
+
+/// The inclusive range of ports a cluster may be asked to accept incoming
+/// connections on.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="Port")` — "For clusters with dc2 nodes - Select a port within the
+/// range 1150-65535". The same doc offers narrower bands to the current node
+/// families ("Select a port within the ranges 5431-5455 or 8191-8215"), and says
+/// in the same breath that a cluster need not move onto them; the range Amazon
+/// Redshift REFUSES outside of is this one, which is also the range its refusal
+/// quotes whatever node type the request named.
+pub const CLUSTER_PORT_RANGE: (i32, i32) = (1150, 65535);
+
+/// Check the `Port` a cluster write names against [`CLUSTER_PORT_RANGE`].
+///
+/// Recorded Amazon Redshift wording: the sentence names the port the request
+/// asked for and the range it is outside of, and carries no closing period.
+///
+/// Shared from here rather than written at the call site, so an operation that
+/// comes to take a port is checked against the same range this one is.
+pub fn check_cluster_port(port: i32) -> Result<(), String> {
+    if !(CLUSTER_PORT_RANGE.0..=CLUSTER_PORT_RANGE.1).contains(&port) {
+        return Err(format!(
+            "Invalid endpoint port: {port}. Valid range is {}-{}",
+            CLUSTER_PORT_RANGE.0, CLUSTER_PORT_RANGE.1
+        ));
+    }
+    Ok(())
+}
 
 /// The cluster parameter group family an engine version belongs to.
 ///
@@ -888,6 +938,23 @@ pub const MANUAL_RETENTION_BOUNDS: (i32, i32) = (1, 3653);
 
 /// The sentinel manual retention period meaning "retained indefinitely".
 pub const MANUAL_RETENTION_INDEFINITE: i32 = -1;
+
+/// What a `CreateCluster` naming an `AutomatedSnapshotRetentionPeriod` outside
+/// its published range is refused with.
+///
+/// Recorded Amazon Redshift wording for the create: the sentence names the
+/// period the request asked for and the published range it is outside of
+/// ([`AUTOMATED_RETENTION_BOUNDS`]), and the refusal carries the service's
+/// `InvalidParameterValue` code rather than the modelled
+/// `InvalidRetentionPeriodFault` — the value is one the member cannot take,
+/// which is the class that code states.
+pub fn automated_retention_refusal_message(period: i32) -> String {
+    format!(
+        "Invalid automated snapshot retention period: {period}. Retention period must be between \
+         {} and {}.",
+        AUTOMATED_RETENTION_BOUNDS.0, AUTOMATED_RETENTION_BOUNDS.1
+    )
+}
 
 /// Whether a manual retention period is one this service admits: the
 /// "indefinitely" sentinel, or a day count inside [`MANUAL_RETENTION_BOUNDS`].
@@ -3616,11 +3683,30 @@ pub const MIN_MULTI_NODE_NODES: i32 = 2;
 pub const SINGLE_NODE_COUNT_REFUSAL: &str =
     "Number of nodes must be 1 or not be supplied for cluster type single-node.";
 
-/// What a `NumberOfNodes` below [`MIN_MULTI_NODE_NODES`] asked for a
-/// `multi-node` cluster is refused with — including a request that names no
-/// count at all, which asks for the one-node shape.
+/// What a `NumberOfNodes` the request NAMED, below [`MIN_MULTI_NODE_NODES`],
+/// asked for a `multi-node` cluster is refused with.
+///
+/// Recorded Amazon Redshift wording: the sentence is about the count the request
+/// carried being too small, so it states the floor alone. It names the
+/// multi-node cluster type ([`CLUSTER_TYPE_MULTI_NODE`]) — the only type it can
+/// be about — and [`MIN_MULTI_NODE_NODES`], the published floor. A request that
+/// names NO count is refused with [`MULTI_NODE_COUNT_NOT_SUPPLIED`] instead,
+/// which says the count is missing as well.
 pub const MULTI_NODE_COUNT_REFUSAL: &str =
     "Number of nodes for cluster type multi-node must be greater than or equal to 2.";
+
+/// What a `multi-node` cluster asked for with NO `NumberOfNodes` at all is
+/// refused with.
+///
+/// Recorded Amazon Redshift wording: a separate sentence from
+/// [`MULTI_NODE_COUNT_REFUSAL`], because a request that names no count has
+/// broken a different half of the rule — "multi-node, the NumberOfNodes
+/// parameter is required" (`smithy_query(query="doc",
+/// shape="CreateClusterMessage", member="ClusterType")`) — and the sentence says
+/// so before it states the floor.
+pub const MULTI_NODE_COUNT_NOT_SUPPLIED: &str =
+    "Number of nodes must be supplied for cluster type multi-node and must be greater than or \
+     equal to 2.";
 
 /// The days a weekly maintenance window may name, in week order.
 ///

@@ -359,6 +359,7 @@ async fn a_state_dependent_refusal_carries_a_request_id() {
                 ("ClusterIdentifier", "envelope-cluster"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
             400,
             "ClusterAlreadyExists",

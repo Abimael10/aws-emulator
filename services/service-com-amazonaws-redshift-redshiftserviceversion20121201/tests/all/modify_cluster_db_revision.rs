@@ -197,6 +197,7 @@ async fn available_shaped_cluster(
     let mut params: Vec<(&str, &str)> = vec![
         ("ClusterIdentifier", identifier),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     params.extend_from_slice(shape);
     let created = emulator.call("CreateCluster", &params).await;
@@ -426,6 +427,7 @@ async fn a_resize_makes_the_cluster_busy_until_its_span_has_passed() {
         let mut params: Vec<(&str, &str)> = vec![
             ("ClusterIdentifier", identifier),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         params.extend_from_slice(row.created);
         let created = emulator.call("CreateCluster", &params).await;

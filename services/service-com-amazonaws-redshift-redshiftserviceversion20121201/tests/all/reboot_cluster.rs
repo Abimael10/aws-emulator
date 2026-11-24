@@ -112,6 +112,10 @@ async fn a_restart_reports_the_outage_and_ends_at_the_due_instant() {
         let mut params: Vec<(String, String)> = vec![
             ("ClusterIdentifier".to_string(), identifier.to_string()),
             ("MasterUsername".to_string(), "admin".to_string()),
+            (
+                "MasterUserPassword".to_string(),
+                "Probe-Passw0rd".to_string(),
+            ),
         ];
         for (name, value) in shape {
             params.push(((*name).to_string(), (*value).to_string()));

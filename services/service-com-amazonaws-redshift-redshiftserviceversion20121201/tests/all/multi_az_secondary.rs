@@ -242,6 +242,7 @@ async fn create(emulator: &Emulator, row: &Row) -> Answer {
         ("ClusterIdentifier", row.identifier),
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     let multi_az = row.created_multi_az.map(|on| on.to_string());
     if let Some(multi_az) = multi_az.as_deref() {
@@ -347,6 +348,7 @@ async fn the_reported_secondary_unit_is_stable_across_reads() {
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("MultiAZ", "true"),
             ],
         )
@@ -395,6 +397,7 @@ async fn failing_over_a_multi_az_cluster_swaps_its_two_zones() {
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("ClusterType", "multi-node"),
                 ("NumberOfNodes", "2"),
                 ("MultiAZ", "true"),
@@ -515,6 +518,7 @@ async fn a_multi_az_cluster_that_is_not_available_yet_cannot_fail_over_either() 
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("MultiAZ", "true"),
             ],
         )
@@ -561,6 +565,7 @@ async fn a_cluster_that_is_not_multi_az_cannot_fail_its_primary_over() {
                 ("ClusterIdentifier", row.identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ];
             let value = row.multi_az.map(|on| on.to_string());
             if let Some(value) = value.as_deref() {

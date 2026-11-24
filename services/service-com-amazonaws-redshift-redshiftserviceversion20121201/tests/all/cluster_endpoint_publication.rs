@@ -100,6 +100,7 @@ async fn a_cluster_publishes_its_endpoint_only_once_it_is_serving() {
             ("ClusterIdentifier", row.identifier),
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         params.extend(row.params.iter().copied());
         let created = emulator.call("CreateCluster", &params).await;

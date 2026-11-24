@@ -101,6 +101,7 @@ async fn a_pause_of_a_running_cluster_suspends_it_at_the_due_instant() {
         let mut params: Vec<(&str, &str)> = vec![
             ("ClusterIdentifier", identifier),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         params.extend_from_slice(shape);
         let created = emulator.call("CreateCluster", &params).await;

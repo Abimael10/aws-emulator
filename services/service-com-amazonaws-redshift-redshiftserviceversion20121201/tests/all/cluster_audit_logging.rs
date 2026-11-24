@@ -618,6 +618,7 @@ async fn enabling_logging_on_a_cluster_that_is_not_available_is_refused() {
                 ("ClusterIdentifier", "audit-provisioning-cluster"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
         )
         .await;

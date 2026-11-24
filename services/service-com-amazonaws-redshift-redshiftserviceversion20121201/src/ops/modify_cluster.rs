@@ -450,6 +450,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
             }
         }
 
+        // The admin password this call would set, against every constraint the
+        // service publishes for it — the same rule `CreateCluster` checks the
+        // password it is given against (`st::check_master_user_password`), so a
+        // password the service would not accept on a create cannot be applied
+        // by a modify either, and the refusal is decided on the request before
+        // anything the account holds is looked at.
+        if let Some(password) = input.master_user_password.as_deref() {
+            if let Err(message) = st::check_master_user_password(password) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
+
         // One reading of the emulator's own clock for everything this call does:
         // the transitions it materialises and the due instants it records are
         // then dated by the same instant, which is also the one the read that

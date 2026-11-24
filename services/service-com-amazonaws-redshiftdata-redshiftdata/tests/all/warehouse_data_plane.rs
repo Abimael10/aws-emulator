@@ -243,6 +243,7 @@ impl Harness {
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("DBName", DATABASE),
             ],
         )

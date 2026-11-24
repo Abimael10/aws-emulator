@@ -284,6 +284,7 @@ async fn a_delete_removes_exactly_the_schedule_the_request_names() {
                         ("ClusterIdentifier", cluster),
                         ("NodeType", "ra3.xlplus"),
                         ("MasterUsername", "admin"),
+                        ("MasterUserPassword", "Probe-Passw0rd"),
                         ("SnapshotScheduleIdentifier", &identifier),
                     ],
                 )

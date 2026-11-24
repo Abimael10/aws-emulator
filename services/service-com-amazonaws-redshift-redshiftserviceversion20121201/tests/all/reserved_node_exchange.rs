@@ -178,6 +178,7 @@ async fn available_cluster_of(emulator: &Emulator, identifier: &str, node_type: 
                 ("ClusterIdentifier", identifier),
                 ("NodeType", node_type),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
         )
         .await;

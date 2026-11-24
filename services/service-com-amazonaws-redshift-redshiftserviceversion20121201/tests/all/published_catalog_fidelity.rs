@@ -279,6 +279,7 @@ async fn every_shape_the_catalog_offers_is_a_cluster_the_service_creates() {
                 ("ClusterIdentifier", &identifier),
                 ("NodeType", node_type),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("ClusterType", cluster_type),
             ];
             if *cluster_type == "multi-node" {

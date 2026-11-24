@@ -69,6 +69,10 @@ async fn available_cluster(emulator: &Emulator, identifier: &str, roles: &[&str]
         ("ClusterIdentifier".to_string(), identifier.to_string()),
         ("NodeType".to_string(), "ra3.xlplus".to_string()),
         ("MasterUsername".to_string(), "admin".to_string()),
+        (
+            "MasterUserPassword".to_string(),
+            "Probe-Passw0rd".to_string(),
+        ),
     ];
     for (position, arn) in roles.iter().enumerate() {
         params.push((

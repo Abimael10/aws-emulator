@@ -280,6 +280,7 @@ async fn a_certificate_a_cluster_uses_cannot_be_deleted_until_the_cluster_is_gon
                 ("ClusterIdentifier", "hsm-cert-user"),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("HsmClientCertificateIdentifier", identifier),
             ],
         )

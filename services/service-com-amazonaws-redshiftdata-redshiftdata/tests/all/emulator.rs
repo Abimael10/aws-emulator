@@ -663,7 +663,8 @@ impl Warehouses {
             .unwrap_or_default();
         let body = format!(
             "Action=CreateCluster&Version=2012-12-01&ClusterIdentifier={identifier}\
-             &NodeType={node_type}&MasterUsername=admin{shape}{named_database}"
+             &NodeType={node_type}&MasterUsername=admin\
+             &MasterUserPassword=Probe-Passw0rd{shape}{named_database}"
         );
         let request = http::Request::builder()
             .method("POST")

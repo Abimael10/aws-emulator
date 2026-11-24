@@ -89,6 +89,7 @@ async fn create_cluster(
         ("ClusterIdentifier", identifier),
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     params.extend_from_slice(extra);
     emulator.call("CreateCluster", &params).await
@@ -230,6 +231,10 @@ async fn an_absent_reference_is_that_resources_own_fault_in_every_operation() {
                 ("NodeType".to_string(), "ra3.xlplus".to_string()),
                 ("MasterUsername".to_string(), "admin".to_string()),
                 (
+                    "MasterUserPassword".to_string(),
+                    "Probe-Passw0rd".to_string(),
+                ),
+                (
                     "ClusterSubnetGroupName".to_string(),
                     "nowhere-subnets".to_string(),
                 ),
@@ -244,6 +249,10 @@ async fn an_absent_reference_is_that_resources_own_fault_in_every_operation() {
                 ("ClusterIdentifier".to_string(), "absent-cpg".to_string()),
                 ("NodeType".to_string(), "ra3.xlplus".to_string()),
                 ("MasterUsername".to_string(), "admin".to_string()),
+                (
+                    "MasterUserPassword".to_string(),
+                    "Probe-Passw0rd".to_string(),
+                ),
                 (
                     "ClusterParameterGroupName".to_string(),
                     "nowhere-group".to_string(),

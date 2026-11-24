@@ -80,6 +80,7 @@ async fn serving_clusters(emulator: &Emulator) {
             ("ClusterIdentifier", identifier),
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         if let Some(status) = created_with {
             params.push(("AquaConfigurationStatus", status));

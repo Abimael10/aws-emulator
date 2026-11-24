@@ -496,6 +496,7 @@ async fn alarms_over_a_cluster_health_series_evaluate_at_every_dimension_set() {
             ("ClusterIdentifier", cluster.identifier),
             ("NodeType", NODE_TYPE),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         params.extend(cluster.params.iter().copied());
         redshift_call(&router, case, "CreateCluster", &params).await;

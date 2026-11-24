@@ -260,6 +260,7 @@ async fn an_available_cluster_publishes_its_health_cluster_wide_and_per_node() {
             ("ClusterIdentifier", row.identifier),
             ("NodeType", "ra3.xlplus"),
             ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Probe-Passw0rd"),
         ];
         params.extend(row.params.iter().copied());
         let created = emulator.call("CreateCluster", &params).await;

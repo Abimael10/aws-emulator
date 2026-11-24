@@ -724,6 +724,20 @@ pub const DB_REVISION_MODIFY_REQUIRES_AVAILABLE_CLUSTER: &str =
     "Cannot modify the cluster-db-revision right now because another operation is running. Check \
      the cluster's status and retry when the cluster is available.";
 
+/// What a `ClusterType` outside the published pair is refused with.
+///
+/// Recorded Amazon Redshift wording: fixed text naming the types a cluster can
+/// be, and NOT the value the request asked for — so the sentence is the same
+/// whatever unknown type was named. The types are
+/// [`ORDERABLE_CLUSTER_TYPES`], in the order the service publishes them, and the
+/// sentence carries no closing period.
+pub fn invalid_cluster_type_message() -> String {
+    format!(
+        "Invalid cluster type. Cluster type can be one of {}",
+        ORDERABLE_CLUSTER_TYPES.join(" or ")
+    )
+}
+
 /// Resolve the `ClusterType` / `NumberOfNodes` pair a request asks for, or say
 /// why the pair cannot hold.
 ///
@@ -748,12 +762,7 @@ pub fn resolve_cluster_shape(
     let kind = match requested_type {
         Some(CLUSTER_TYPE_SINGLE_NODE) => CLUSTER_TYPE_SINGLE_NODE,
         Some(CLUSTER_TYPE_MULTI_NODE) => CLUSTER_TYPE_MULTI_NODE,
-        Some(other) => {
-            return Err(format!(
-                "Invalid value for ClusterType: '{other}'. Valid Values: {}",
-                ORDERABLE_CLUSTER_TYPES.join(" | ")
-            ))
-        }
+        Some(_) => return Err(invalid_cluster_type_message()),
         // No `ClusterType`: a modify keeps the stored shape, and a create lets
         // the node count (default 1) say which shape is being asked for.
         None => match current {
@@ -781,7 +790,14 @@ pub fn resolve_cluster_shape(
         return Err(SINGLE_NODE_COUNT_REFUSAL.to_string());
     }
     if kind == CLUSTER_TYPE_MULTI_NODE && nodes < MIN_MULTI_NODE_NODES {
-        return Err(MULTI_NODE_COUNT_REFUSAL.to_string());
+        // Two sentences for the two halves of the rule: a count the request
+        // NAMED is only too small, while a request that named none has also left
+        // out a member this cluster type requires.
+        return Err(if requested_nodes.is_some() {
+            MULTI_NODE_COUNT_REFUSAL.to_string()
+        } else {
+            MULTI_NODE_COUNT_NOT_SUPPLIED.to_string()
+        });
     }
     // The UPPER bound belongs here too, beside the lower ones: this is the one
     // resolver every cluster write goes through, so no caller can carry a node

@@ -179,6 +179,7 @@ fn resource_cases(subnet_id: &str) -> Vec<ResourceCase> {
                     ("ClusterIdentifier", "tags-cluster"),
                     ("NodeType", "ra3.xlplus"),
                     ("MasterUsername", "admin"),
+                    ("MasterUserPassword", "Probe-Passw0rd"),
                 ]),
             )],
             arn: state::cluster_arn("tags-cluster", REGION),
@@ -197,6 +198,7 @@ fn resource_cases(subnet_id: &str) -> Vec<ResourceCase> {
                         ("ClusterIdentifier", "tags-snap-source"),
                         ("NodeType", "ra3.xlplus"),
                         ("MasterUsername", "admin"),
+                        ("MasterUserPassword", "Probe-Passw0rd"),
                     ]),
                 ),
                 (

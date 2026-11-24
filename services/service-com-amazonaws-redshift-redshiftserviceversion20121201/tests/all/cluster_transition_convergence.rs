@@ -389,6 +389,7 @@ async fn a_create_carrying_an_empty_list_member_is_accepted() {
                     ("ClusterIdentifier", cluster.as_str()),
                     ("NodeType", "ra3.xlplus"),
                     ("MasterUsername", "adminuser"),
+                    ("MasterUserPassword", "Probe-Passw0rd"),
                     ("ClusterType", "single-node"),
                     (member, ""),
                 ],

@@ -1071,6 +1071,7 @@ async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
                         ("ClusterIdentifier", cluster),
                         ("NodeType", "ra3.xlplus"),
                         ("MasterUsername", "admin"),
+                        ("MasterUserPassword", "Probe-Passw0rd"),
                         ("HsmConfigurationIdentifier", identifier),
                     ],
                 )

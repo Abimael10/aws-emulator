@@ -336,6 +336,7 @@ async fn a_created_cluster_runs_a_version_the_catalog_offers() {
                             ("ClusterIdentifier", identifier),
                             ("NodeType", "ra3.xlplus"),
                             ("MasterUsername", "admin"),
+                            ("MasterUserPassword", "Probe-Passw0rd"),
                             ("ClusterVersion", version),
                         ],
                     )

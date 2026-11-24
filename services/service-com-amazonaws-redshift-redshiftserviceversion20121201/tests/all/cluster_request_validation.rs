@@ -22,8 +22,10 @@
 //! request: the node-count/cluster-type pairing in both directions and at each
 //! bound, the maintenance window's documented FORM and its documented minimum
 //! LENGTH (at the bound, one minute short of it, wrapping the week, and
-//! malformed), a parameter group name that resolves to nothing, and a maintenance
-//! track outside the published catalog — beside the values at the edge of each
+//! malformed), the published node-type catalog and the published port range at
+//! each bound and one past it, the admin user name's documented grammar, a
+//! parameter group name that resolves to nothing, and a maintenance track
+//! outside the published catalog — beside the values at the edge of each
 //! constraint that must be ACCEPTED, because a rule that refuses everything is
 //! not the rule.
 
@@ -52,8 +54,8 @@ struct Accepted {
     overrides: Vec<(&'static str, &'static str)>,
 }
 
-/// `CreateCluster` with the three required members, `identifier`, and `overrides`
-/// applied on top.
+/// `CreateCluster` with the members a create cannot leave out, `identifier`, and
+/// `overrides` applied on top.
 async fn create(
     emulator: &Emulator,
     identifier: &str,
@@ -63,6 +65,7 @@ async fn create(
         ("ClusterIdentifier", identifier),
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Validat3-Password"),
         ("ClusterType", "single-node"),
     ];
     // An override REPLACES the baseline's own pair for that member, so a row that
@@ -137,17 +140,14 @@ async fn a_create_is_refused_before_anything_is_provisioned() {
             overrides: vec![("ClusterType", "multi-node")],
             status: 400,
             code: "InvalidParameterValue",
-            message: state::MULTI_NODE_COUNT_REFUSAL.to_string(),
+            message: state::MULTI_NODE_COUNT_NOT_SUPPLIED.to_string(),
         },
         Refused {
             case: "a cluster type the service does not publish",
             overrides: vec![("ClusterType", "mega-node")],
             status: 400,
             code: "InvalidParameterValue",
-            message: format!(
-                "Invalid value for ClusterType: 'mega-node'. Valid Values: {}",
-                state::ORDERABLE_CLUSTER_TYPES.join(" | ")
-            ),
+            message: state::invalid_cluster_type_message(),
         },
         Refused {
             case: "a parameter group name that resolves to nothing",
@@ -228,6 +228,62 @@ async fn a_create_is_refused_before_anything_is_provisioned() {
             code: "InvalidClusterTrack",
             message: "Invalid cluster track: nosuch.".to_string(),
         },
+        Refused {
+            case: "a node type the published catalog does not offer",
+            overrides: vec![("NodeType", "zz.enormous")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: "Invalid node type: zz.enormous".to_string(),
+        },
+        Refused {
+            case: "a node type the catalog offers in another case",
+            overrides: vec![("NodeType", "RA3.XLPLUS")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: "Invalid node type: RA3.XLPLUS".to_string(),
+        },
+        Refused {
+            case: "a port below the published range",
+            overrides: vec![("Port", "80")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: port_refusal_message("80"),
+        },
+        Refused {
+            case: "a port one below the published floor",
+            overrides: vec![("Port", "1149")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: port_refusal_message("1149"),
+        },
+        Refused {
+            case: "a port one above the published ceiling",
+            overrides: vec![("Port", "65536")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: port_refusal_message("65536"),
+        },
+        Refused {
+            case: "an admin user name carrying an uppercase letter",
+            overrides: vec![("MasterUsername", "Admin")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: master_username_refusal_message(),
+        },
+        Refused {
+            case: "an admin user name beginning with a digit",
+            overrides: vec![("MasterUsername", "1admin")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: master_username_refusal_message(),
+        },
+        Refused {
+            case: "an admin user name carrying a character the database cannot",
+            overrides: vec![("MasterUsername", "admin:user")],
+            status: 400,
+            code: "InvalidParameterValue",
+            message: master_username_refusal_message(),
+        },
     ];
 
     for (index, row) in rows.iter().enumerate() {
@@ -266,6 +322,29 @@ async fn a_create_is_refused_before_anything_is_provisioned() {
             described.error_code()
         );
     }
+}
+
+/// The refusal a `Port` outside the published range carries, for `port`.
+///
+/// The range is the one the service publishes
+/// ([`state::CLUSTER_PORT_RANGE`]); the sentence carries no closing period.
+fn port_refusal_message(port: &str) -> String {
+    format!(
+        "Invalid endpoint port: {port}. Valid range is {}-{}",
+        state::CLUSTER_PORT_RANGE.0,
+        state::CLUSTER_PORT_RANGE.1
+    )
+}
+
+/// The refusal an admin user name outside its documented grammar carries: one
+/// sentence stating the whole grammar, whatever part of it the name broke.
+fn master_username_refusal_message() -> String {
+    format!(
+        "MasterUsername parameter must be lowercase, begin with a letter, contain only \
+         alphanumeric characters, underscore ('_'), plus sign ('+'), dot ('.'), at ('@'), or \
+         hyphen ('-'), and be less than {} characters.",
+        state::MASTER_USERNAME_MAX_LEN
+    )
 }
 
 /// The refusal a window outside the documented `ddd:hh24:mi-ddd:hh24:mi` form
@@ -317,6 +396,25 @@ async fn a_value_at_the_edge_of_its_constraint_is_accepted() {
         Accepted {
             case: "a maintenance track the catalog publishes",
             overrides: vec![("MaintenanceTrackName", state::TRAILING_MAINTENANCE_TRACK)],
+        },
+        Accepted {
+            case: "a port at the published floor",
+            overrides: vec![("Port", "1150")],
+        },
+        Accepted {
+            case: "a port at the published ceiling",
+            overrides: vec![("Port", "65535")],
+        },
+        Accepted {
+            case: "every node type the published catalog offers",
+            // One row per published node type would create ten clusters; the
+            // entry the catalog publishes LAST stands for the list, which the
+            // refusal rows above are outside of.
+            overrides: vec![("NodeType", "ra3.16xlarge"), ("ClusterType", "multi-node"), ("NumberOfNodes", "2")],
+        },
+        Accepted {
+            case: "an admin user name carrying every character its grammar admits",
+            overrides: vec![("MasterUsername", "admin_user+1.2@host-3")],
         },
     ];
 

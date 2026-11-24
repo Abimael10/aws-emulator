@@ -68,6 +68,7 @@ async fn create_cluster(emulator: &Emulator, identifier: &str) {
                 ("ClusterIdentifier", identifier),
                 ("NodeType", "ra3.xlplus"),
                 ("MasterUsername", MASTER_USERNAME),
+                ("MasterUserPassword", "Probe-Passw0rd"),
             ],
         )
         .await;

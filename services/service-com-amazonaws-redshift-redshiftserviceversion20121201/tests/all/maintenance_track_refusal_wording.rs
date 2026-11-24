@@ -104,6 +104,7 @@ fn create_request(track: &str) -> Vec<(String, String)> {
         pair("ClusterIdentifier", "track-wording-created"),
         pair("NodeType", "ra3.xlplus"),
         pair("MasterUsername", "admin"),
+        pair("MasterUserPassword", "Probe-Passw0rd"),
         pair("MaintenanceTrackName", track),
     ]
 }
@@ -284,6 +285,7 @@ async fn a_published_track_is_never_refused() {
                     pair("ClusterIdentifier", &format!("track-created-{index}")),
                     pair("NodeType", "ra3.xlplus"),
                     pair("MasterUsername", "admin"),
+                    pair("MasterUserPassword", "Probe-Passw0rd"),
                     pair("MaintenanceTrackName", track),
                 ],
             ),

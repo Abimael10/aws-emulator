@@ -16,18 +16,26 @@
 //! the same identifier is refused with `ClusterAlreadyExistsFault`.
 //!
 //! Every value the request carries is checked BEFORE anything is provisioned: the
-//! node count against the cluster type it has to describe, the maintenance window
-//! against its documented form and minimum length, the retention periods against
-//! their published ranges and the maintenance track against the published
-//! catalog — a value outside its constraint is refused with `InvalidParameterValue`
-//! (the modelled `InvalidClusterTrackFault` for the track), so no invalid cluster
-//! is ever stored.
+//! cluster identifier against its documented syntax, the node type against the
+//! published catalog, the port against its published range, the node count
+//! against the cluster type it has to describe, the admin user name against its
+//! documented grammar, the admin password against every content rule the service
+//! publishes for it, the maintenance window against its documented form and
+//! minimum length, the retention periods against their published ranges and the
+//! maintenance track against the published catalog — a value outside its
+//! constraint is refused with `InvalidParameterValue` (the modelled
+//! `InvalidClusterTrackFault` for the track), so no invalid cluster is ever
+//! stored. A cluster is created with admin credentials or not at all: a request
+//! that neither sets a password nor asks Amazon Redshift to manage them is
+//! refused as well.
 //!
 //! The groups the request names the cluster into are resolved against the store
 //! BEFORE the cluster is allocated: an unknown `ClusterSubnetGroupName` answers
 //! `ClusterSubnetGroupNotFoundFault` and an unknown `ClusterParameterGroupName`
 //! answers `ClusterParameterGroupNotFoundFault`, so a refused create leaves no
-//! cluster behind for a later read to report.
+//! cluster behind for a later read to report. What the ACCOUNT already holds —
+//! the identifier the request re-used, the cluster quota — is only looked at
+//! once the request's own values and names have been found good.
 //!
 //! ## Shape of an operation
 //!
@@ -471,12 +479,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         let started = ::service_common::clock::now(&*self.engine);
         let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
 
+        // The case constraint of the cluster identifier has a refusal of its
+        // own: a create under an identifier carrying an uppercase letter is
+        // answered with the service's own sentence for that constraint
+        // (`st::CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL`) and its
+        // `InvalidParameterValue` code, so it is decided before the rest of the
+        // grammar is.
+        if st::carries_an_uppercase_letter(&input.cluster_identifier) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL,
+            ));
+        }
         if let Err(message) = st::check_identifier(
             st::CLUSTER_IDENTIFIER_RULE,
             "ClusterIdentifier",
             &input.cluster_identifier,
         ) {
             return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The port the cluster is asked to accept connections on, against the
+        // published range (`st::check_cluster_port`).
+        if let Some(port) = input.port {
+            if let Err(message) = st::check_cluster_port(port) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
+
+        // The compute node the cluster is to run on, against the catalog the
+        // service publishes (`st::check_node_type`): a node type it does not
+        // offer names no shape a cluster can be built on.
+        if let Err(message) = st::check_node_type(&input.node_type) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
         }
 
         // Bounded BEFORE the pair is resolved and before anything is derived
@@ -523,15 +557,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
             .contains(&automated_retention)
         {
-            return Err(CreateClusterErrorModeled::InvalidRetentionPeriodFault(
-                InvalidRetentionPeriodFault {
-                    message: Some(format!(
-                        "Invalid value for AutomatedSnapshotRetentionPeriod: {automated_retention}. It must be a value from {} to {}.",
-                        st::AUTOMATED_RETENTION_BOUNDS.0, st::AUTOMATED_RETENTION_BOUNDS.1
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::automated_retention_refusal_message(automated_retention),
+            ));
         }
         let manual_retention = input
             .manual_snapshot_retention_period
@@ -561,6 +589,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             ));
         }
 
+        // The admin password the request carries, against every constraint the
+        // service publishes for it (`st::check_master_user_password`) — here,
+        // with the other value checks, so a password the service would not
+        // accept is refused before the identifier it named is looked up and
+        // before any cluster is written.
+        if let Some(password) = input.master_user_password.as_deref() {
+            if let Err(message) = st::check_master_user_password(password) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
+
+        // The admin user the request names, against the grammar the service
+        // publishes for it (`st::check_master_username`): the cluster's admin is
+        // a user of its database, so a name the database could not carry names
+        // no admin at all and is refused before the cluster is written.
+        if let Err(message) = st::check_master_username(&input.master_username) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+        }
+
+        // A cluster has admin credentials either because Amazon Redshift manages
+        // them or because the request sets them, so a request that does not opt
+        // into the managed ones and names no password of its own asks for a
+        // cluster with no admin credential at all.
+        if !manage_master_password && input.master_user_password.is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::ADMIN_CREDENTIAL_REQUIRED,
+            ));
+        }
+
         // A maintenance track the service does not publish names no track at
         // all, so it is refused with the modelled `InvalidClusterTrackFault`
         // rather than stored on the cluster: the track set a cluster can be on
@@ -583,28 +640,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
 
         let mut store = state.lock();
         store.settle(started);
-        // Identity before capacity: a repeat create of a cluster that already
-        // exists would create nothing, so it keeps the more specific fault even
-        // when the store is full.
-        if store.cluster(&input.cluster_identifier).is_some() {
-            return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
-                ClusterAlreadyExistsFault {
-                    message: Some(st::CLUSTER_ALREADY_EXISTS.to_string()),
-                },
-            )
-            .into());
-        }
-        if store.clusters.len() >= st::CLUSTER_QUOTA {
-            return Err(CreateClusterErrorModeled::ClusterQuotaExceededFault(
-                ClusterQuotaExceededFault {
-                    message: Some(format!(
-                        "The request would exceed the allowed number of clusters ({}).",
-                        st::CLUSTER_QUOTA
-                    )),
-                },
-            )
-            .into());
-        }
 
         let identifier = input.cluster_identifier.clone();
         // The engine version the cluster runs, resolved BEFORE the record is
@@ -669,6 +704,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             }
             None => st::cluster_default_parameter_group(),
         };
+
+        // What the ACCOUNT already holds, decided once every value and every
+        // name the request carries has been found good: a request the service
+        // would not have accepted anyway is refused on its own contents, so a
+        // caller is never told to pick another identifier for a request whose
+        // own values are the defect.
+        //
+        // Identity before capacity: a repeat create of a cluster that already
+        // exists would create nothing, so it keeps the more specific fault even
+        // when the store is full.
+        if store.cluster(&identifier).is_some() {
+            return Err(CreateClusterErrorModeled::ClusterAlreadyExistsFault(
+                ClusterAlreadyExistsFault {
+                    message: Some(st::CLUSTER_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+        if store.clusters.len() >= st::CLUSTER_QUOTA {
+            return Err(CreateClusterErrorModeled::ClusterQuotaExceededFault(
+                ClusterQuotaExceededFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of clusters ({}).",
+                        st::CLUSTER_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
 
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();

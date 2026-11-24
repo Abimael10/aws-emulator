@@ -39,13 +39,14 @@ type ResizeRow = (&'static str, Params, &'static str, &'static str);
 /// the resize is served.
 type RestrictionRow = (&'static str, Params, bool);
 
-/// Create the cluster `identifier` with `extra` beside the three required
-/// members, and assert it was created.
+/// Create the cluster `identifier` with `extra` beside the members a create
+/// cannot leave out, and assert it was created.
 async fn create(emulator: &Emulator, case: &str, identifier: &str, extra: &[(&str, &str)]) -> Answer {
     let mut params: Vec<(&str, &str)> = vec![
         ("ClusterIdentifier", identifier),
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Probe-Passw0rd"),
     ];
     params.extend_from_slice(extra);
     let created = emulator.call("CreateCluster", &params).await;

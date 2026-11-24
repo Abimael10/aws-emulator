@@ -125,6 +125,25 @@ pub const EVENT_SUBSCRIPTION_NAME_RULE: IdentifierRule = IdentifierRule {
     lowercase_only: false,
 };
 
+/// What a request to CREATE a cluster under an identifier carrying an uppercase
+/// letter is refused with.
+///
+/// Recorded Amazon Redshift wording: fixed text with no variable part — it names
+/// neither the member nor the identifier — and no closing period. The
+/// case constraint is the one the service states this way; every other
+/// constraint of the identifier grammar ([`CLUSTER_IDENTIFIER_RULE`]) is refused
+/// by [`check_identifier`], which names the member and what it broke.
+pub const CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL: &str =
+    "Cannot create cluster with identifier containing uppercase letter";
+
+/// Whether `value` carries an uppercase letter, which a lowercase-only name may
+/// not: the one predicate every rule that forbids one is decided by, including
+/// the cluster identifier's own refusal
+/// ([`CLUSTER_IDENTIFIER_UPPERCASE_REFUSAL`]).
+pub fn carries_an_uppercase_letter(value: &str) -> bool {
+    value.chars().any(|character| character.is_ascii_uppercase())
+}
+
 /// Check `value` against `rule`, naming the member and the constraint it broke.
 ///
 /// `member` overrides the rule's own member name, so `NewClusterIdentifier` and
@@ -147,7 +166,7 @@ pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Resu
     if !holds_only_the_identifier_alphabet(value) {
         return refuse("The identifier contains a character that is neither alphanumeric nor a hyphen.");
     }
-    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
+    if rule.lowercase_only && carries_an_uppercase_letter(value) {
         return refuse("Alphabetic characters must be lowercase.");
     }
     if !begins_with_a_letter(value) {
@@ -315,6 +334,65 @@ pub fn check_parameter_group_identifier(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// How long an admin user name may be, in characters.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="MasterUsername")` — "Must be 1 - 128 alphanumeric characters or
+/// hyphens."
+pub const MASTER_USERNAME_MAX_LEN: usize = 128;
+
+/// What an admin user name outside its documented grammar is refused with.
+///
+/// Recorded Amazon Redshift wording: one sentence stating the WHOLE grammar,
+/// whatever part of it the value broke, with no variable part beyond the
+/// documented length bound — the member is named at the front, and the value is
+/// not echoed.
+///
+/// The sentence says "less than" the bound while the documented constraint is
+/// "Must be 1 - 128 alphanumeric characters", so a name of exactly
+/// [`MASTER_USERNAME_MAX_LEN`] characters is ADMITTED: the bound the service
+/// enforces is the documented inclusive one and the wording is its own, which is
+/// why [`check_master_username`] admits what this sentence reads as excluding.
+fn master_username_refusal_message() -> String {
+    format!(
+        "MasterUsername parameter must be lowercase, begin with a letter, contain only \
+         alphanumeric characters, underscore ('_'), plus sign ('+'), dot ('.'), at ('@'), or \
+         hyphen ('-'), and be less than {MASTER_USERNAME_MAX_LEN} characters."
+    )
+}
+
+/// Check the admin user name a cluster is created with against the grammar
+/// Redshift documents for it.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="MasterUsername")` — "Must be 1 - 128 alphanumeric characters or
+/// hyphens", "Must contain only lowercase letters, numbers, underscore, plus
+/// sign, period (dot), at symbol (@), or hyphen", "The first character must be a
+/// letter", "Must not contain a colon (:) or a slash (/)". The documented
+/// alphabet is the whole of what is admitted, so the colon and the slash that
+/// documentation calls out separately cannot pass it either. Its two remaining
+/// constraints — the name cannot be `PUBLIC`, and cannot be a reserved word —
+/// are refused by the database layer in wording of their own, so neither is
+/// answered with the grammar sentence here.
+pub fn check_master_username(value: &str) -> Result<(), String> {
+    let admitted = |character: char| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '_' | '+' | '.' | '@' | '-')
+    };
+    if value.is_empty()
+        || value.chars().count() > MASTER_USERNAME_MAX_LEN
+        || !value.chars().all(admitted)
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase())
+    {
+        return Err(master_username_refusal_message());
+    }
+    Ok(())
+}
+
 /// The syntax rule Redshift documents for a DATABASE object name — a database
 /// user, a database name or a database group name.
 ///
@@ -406,7 +484,7 @@ pub fn check_database_name(rule: DatabaseNameRule, value: &str) -> Result<(), St
     {
         return refuse("The name contains a character that is not allowed in it.");
     }
-    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
+    if rule.lowercase_only && carries_an_uppercase_letter(value) {
         return refuse("Alphabetic characters must be lowercase.");
     }
     if !value.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {

@@ -72,6 +72,7 @@ async fn harness(cluster: &str, snapshot: &str) -> Emulator {
                 ("ClusterIdentifier", cluster),
                 ("NodeType", NODE_TYPE),
                 ("MasterUsername", "admin"),
+                ("MasterUserPassword", "Probe-Passw0rd"),
                 ("NumberOfNodes", "4"),
             ],
         )
