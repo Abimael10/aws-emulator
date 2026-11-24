@@ -231,29 +231,31 @@ fn assert_recommendation_invariants(recommendation: &Value, look_back_period: &s
         (0.0..=4.0).contains(&risk),
         "case {arn}: PerformanceRisk is modelled 0..4, got {risk}: {option}"
     );
-    for (member, savings) in [
-        ("savingsOpportunity", &option["savingsOpportunity"]),
-        (
-            "savingsOpportunityAfterDiscounts",
-            &option["savingsOpportunityAfterDiscounts"],
-        ),
-    ] {
-        let percentage = number(savings, "savingsOpportunityPercentage");
-        assert!(
-            (0.0..=100.0).contains(&percentage),
-            "case {arn}/{member}: a savings percentage is a percentage, got {percentage}: \
-             {savings}"
-        );
-        assert_eq!(
-            savings["estimatedMonthlySavings"]["currency"],
-            json!("USD"),
-            "case {arn}/{member}: every money figure is in USD: {savings}"
-        );
-        assert!(
-            number(&savings["estimatedMonthlySavings"], "value") >= 0.0,
-            "case {arn}/{member}: a saving is not negative: {savings}"
-        );
-    }
+    // The saving: a percentage of monthly cost, in USD, never negative.
+    let savings = &option["savingsOpportunity"];
+    let percentage = number(savings, "savingsOpportunityPercentage");
+    assert!(
+        (0.0..=100.0).contains(&percentage),
+        "case {arn}: a savings percentage is a percentage, got {percentage}: {savings}"
+    );
+    assert_eq!(
+        savings["estimatedMonthlySavings"]["currency"],
+        json!("USD"),
+        "case {arn}: every money figure is in USD: {savings}"
+    );
+    assert!(
+        number(&savings["estimatedMonthlySavings"], "value") >= 0.0,
+        "case {arn}: a saving is not negative: {savings}"
+    );
+    // The saving net of Savings Plans and Reserved Instances discounts is reported only once
+    // the account activates the savings-estimation-mode preference, and no caller of this
+    // helper stores one.
+    assert_eq!(
+        option["savingsOpportunityAfterDiscounts"],
+        Value::Null,
+        "case {arn}: the after-discount member is reported only once the account activates \
+         the preference: {option}"
+    );
 }
 
 #[tokio::test]

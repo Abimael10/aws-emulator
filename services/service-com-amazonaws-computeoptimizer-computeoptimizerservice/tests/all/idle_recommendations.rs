@@ -22,14 +22,18 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
     IdleDimension, IdleEstimatedMonthlySavings, IdleRecommendation, IdleSavingsOpportunity,
-    IdleSavingsOpportunityAfterDiscounts, IdleUtilizationMetric,
+    IdleSavingsOpportunityAfterDiscounts, IdleUtilizationMetric, SAVINGS_ESTIMATION_MODE_VALUES,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     idle_savings_value, service_state, IdleResourceAnalysis, ANALYSIS_DELAY,
     DIMENSION_SAVINGS_VALUE, DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT, IDLE_MAX_PAGE_SIZE,
+    RESOURCE_TYPE_IDLE, SAVINGS_ESTIMATION_AFTER_DISCOUNTS, SCOPE_ACCOUNT_ID, SCOPE_ORGANIZATION,
 };
 
-use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in};
+use crate::harness::{
+    call, call_in_region, emulator_with_engine, error_code, get_preferences, make_analysis_due,
+    opt_in, put_preference,
+};
 
 /// The ONE account this emulator presents, and so the only account any reader of this
 /// service can report on — the account the seeded analysis is held for. Taken from the
@@ -350,7 +354,10 @@ async fn the_seeded_analysis_is_reported_member_for_member() {
             "accountId": own_account(),
             "finding": resource.finding,
             "savingsOpportunity": savings,
-            "savingsOpportunityAfterDiscounts": savings,
+            // This account stored no savings-estimation-mode preference, and that
+            // preference is what activates the after-discount member, so it is reported
+            // on no recommendation here.
+            "savingsOpportunityAfterDiscounts": Value::Null,
             "lookBackPeriodInDays": resource.look_back_days,
         });
         for (member, wanted) in expected.as_object().expect("an object of members") {
@@ -454,7 +461,9 @@ async fn a_recorded_analysis_is_reported_from_its_own_record() {
         "accountId": own_account(),
         "finding": "Idle",
         "savingsOpportunity": savings,
-        "savingsOpportunityAfterDiscounts": savings,
+        // No savings-estimation-mode preference is in force, so the member that
+        // preference activates is not reported.
+        "savingsOpportunityAfterDiscounts": Value::Null,
         // Observed for 30 days, so the 14-day default is what was analysed.
         "lookBackPeriodInDays": 14.0,
         "utilizationMetrics": [{
@@ -774,14 +783,18 @@ async fn order_by_sorts_the_selection_on_the_requested_savings_dimension() {
             descending.clone(),
         ),
         (
-            "SavingsValueAfterDiscount ascending",
+            // `SavingsValueAfterDiscount` reads the savings opportunity net of discounts,
+            // which the savings-estimation-mode preference activates. This account stored
+            // none, so no recommendation carries that member and every one sorts as its
+            // modelled default — leaving the record order the sort started from.
+            "SavingsValueAfterDiscount with the preference unset",
             json!({"orderBy": {"dimension": "SavingsValueAfterDiscount", "order": "Asc"}}),
-            ascending.clone(),
+            own_arns.clone(),
         ),
         (
-            "SavingsValueAfterDiscount descending",
+            "SavingsValueAfterDiscount descending with the preference unset",
             json!({"orderBy": {"dimension": "SavingsValueAfterDiscount", "order": "Desc"}}),
-            descending.clone(),
+            own_arns.clone(),
         ),
         (
             "a dimension with no order sorts ascending",
@@ -807,6 +820,42 @@ async fn order_by_sorts_the_selection_on_the_requested_savings_dimension() {
         let body = get_idle(&router, case, request).await;
         assert_eq!(
             reported_arns(&body),
+            wanted,
+            "case {case:?}: expected {wanted:?}, got {body}"
+        );
+    }
+
+    // Once the account activates the savings-estimation-mode preference for its idle
+    // resources, every recommendation carries the member `SavingsValueAfterDiscount` reads,
+    // and that dimension sorts on it — in both directions.
+    put_preference(
+        &router,
+        &json!({
+            "resourceType": RESOURCE_TYPE_IDLE,
+            "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+        }),
+    )
+    .await;
+    for (case, order, wanted) in [
+        (
+            "SavingsValueAfterDiscount ascending with the preference active",
+            "Asc",
+            &ascending,
+        ),
+        (
+            "SavingsValueAfterDiscount descending with the preference active",
+            "Desc",
+            &descending,
+        ),
+    ] {
+        let body = get_idle(
+            &router,
+            case,
+            json!({"orderBy": {"dimension": "SavingsValueAfterDiscount", "order": order}}),
+        )
+        .await;
+        assert_eq!(
+            &reported_arns(&body),
             wanted,
             "case {case:?}: expected {wanted:?}, got {body}"
         );
@@ -1255,4 +1304,163 @@ async fn a_read_is_refused_while_the_account_is_not_opted_in() {
         held,
         "neither a refused nor an accepted read may change the store"
     );
+}
+
+/// One row of the savings-estimation-mode table: the preference an account stored, and whether
+/// the savings member net of discounts is then reported for its idle resources.
+struct SavingsEstimation {
+    /// What this row is about.
+    case: &'static str,
+    /// The `PutRecommendationPreferences` request to store first, or `None` for an account that
+    /// stored nothing at all.
+    request: Option<Value>,
+    /// Whether `savingsOpportunityAfterDiscounts` is then reported on each recommendation.
+    after_discounts: bool,
+}
+
+/// The `SavingsEstimationMode` value that DEACTIVATES the preference: the one the model
+/// declares beside the value that activates it
+/// (`crate::ops::types::SAVINGS_ESTIMATION_MODE_VALUES`), rather than a spelling written into
+/// this suite.
+fn deactivating_mode() -> &'static str {
+    SAVINGS_ESTIMATION_MODE_VALUES
+        .iter()
+        .copied()
+        .find(|value| *value != SAVINGS_ESTIMATION_AFTER_DISCOUNTS)
+        .expect("the model declares a value that deactivates the preference")
+}
+
+/// The savings-estimation-mode preference in force for an idle resource is applied to its
+/// recommendation: the savings member net of discounts is reported exactly when a record that
+/// applies to the resource activates the preference, and is reported on no recommendation when
+/// none does — "specify the `AfterDiscounts` status to activate the preference, or specify
+/// `BeforeDiscounts` to deactivate the preference".
+///
+/// The rows span the scopes an idle-resource preference can be stored at (the account default,
+/// the account, the organization), the value that deactivates the preference, a scope naming
+/// another account and a record of another resource type — the last two applying to nothing
+/// this request reports.
+#[tokio::test]
+async fn the_savings_estimation_mode_preference_is_applied_to_idle_recommendations() {
+    let rows: Vec<SavingsEstimation> = vec![
+        SavingsEstimation {
+            case: "an account that stored no preference",
+            request: None,
+            after_discounts: false,
+        },
+        SavingsEstimation {
+            case: "the value that deactivates the preference",
+            request: Some(json!({
+                "resourceType": RESOURCE_TYPE_IDLE,
+                "savingsEstimationMode": deactivating_mode(),
+            })),
+            after_discounts: false,
+        },
+        SavingsEstimation {
+            case: "activated as the account default",
+            request: Some(json!({
+                "resourceType": RESOURCE_TYPE_IDLE,
+                "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+            })),
+            after_discounts: true,
+        },
+        SavingsEstimation {
+            case: "activated at the account scope",
+            request: Some(json!({
+                "resourceType": RESOURCE_TYPE_IDLE,
+                "scope": {"name": SCOPE_ACCOUNT_ID, "value": own_account()},
+                "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+            })),
+            after_discounts: true,
+        },
+        SavingsEstimation {
+            case: "activated at the organization scope",
+            request: Some(json!({
+                "resourceType": RESOURCE_TYPE_IDLE,
+                "scope": {"name": SCOPE_ORGANIZATION, "value": "ALL_ACCOUNTS"},
+                "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+            })),
+            after_discounts: true,
+        },
+        SavingsEstimation {
+            case: "activated for another account, which applies to no resource here",
+            request: Some(json!({
+                "resourceType": RESOURCE_TYPE_IDLE,
+                "scope": {"name": SCOPE_ACCOUNT_ID, "value": MEMBER_ACCOUNT},
+                "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+            })),
+            after_discounts: false,
+        },
+        SavingsEstimation {
+            case: "activated for another resource type, which applies to no idle resource",
+            request: Some(json!({
+                "resourceType": "EbsVolume",
+                "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
+            })),
+            after_discounts: false,
+        },
+    ];
+
+    for row in &rows {
+        // A fresh store per row: a preference one row stored must not decide another's. The
+        // analysis is made due by moving the enrollment instant back rather than by waiting,
+        // so nothing here depends on how fast the host runs.
+        let (router, engine) = emulator_with_engine();
+        opt_in(&router).await;
+        make_analysis_due(&engine);
+        record(&engine, vec![recorded_instance()]);
+        if let Some(request) = &row.request {
+            put_preference(&router, request).await;
+            // The preference round-trips: what was written is what the preference reader
+            // reports, whatever the recommendation reader then makes of it.
+            let resource_type = request["resourceType"]
+                .as_str()
+                .expect("the request names a resource type");
+            let stored = get_preferences(&router, resource_type, request.get("scope")).await;
+            assert_eq!(
+                stored["recommendationPreferencesDetails"][0]["savingsEstimationMode"],
+                request["savingsEstimationMode"],
+                "case {:?}: the stored preference must report the mode that was written, \
+                 got {stored}",
+                row.case
+            );
+        }
+
+        let body = get_idle(&router, row.case, json!({"maxResults": IDLE_MAX_PAGE_SIZE})).await;
+        let reported = body["idleRecommendations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {:?}: a list of recommendations: {body}", row.case))
+            .clone();
+        assert_eq!(
+            reported.len(),
+            seeded().len() + 1,
+            "case {:?}: every idle resource of the account is reported, got {body}",
+            row.case
+        );
+        for got in &reported {
+            let case = format!("{} / {}", row.case, got["resourceArn"]);
+            // The saving the analysis implies is reported whatever the preference says: the
+            // whole of what an idle resource costs.
+            let before = &got["savingsOpportunity"];
+            let saved = before["estimatedMonthlySavings"]["value"]
+                .as_f64()
+                .unwrap_or_default();
+            assert!(
+                saved > 0.0,
+                "case {case:?}: dropping an idle resource saves what it costs, got {got}"
+            );
+            // Nothing in this service's analysis records a negotiated discount, so where the
+            // preference activates the after-discount member it restates those same figures —
+            // and where no record activates it, the member is not reported at all.
+            let expected = if row.after_discounts {
+                before.clone()
+            } else {
+                Value::Null
+            };
+            assert_eq!(
+                got["savingsOpportunityAfterDiscounts"], expected,
+                "case {case:?}: expected savingsOpportunityAfterDiscounts {expected}, got {got}"
+            );
+        }
+    }
 }

@@ -314,10 +314,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `FindingReasonCode` filter on what this service DERIVED, not on anything the
         // request supplied — and both depend on the look-back period, so neither can be
         // known earlier.
+        //
+        // Whether the savings net of Savings Plans and Reserved Instances discounts are
+        // reported for a function: the account activates that member by storing the
+        // savings-estimation-mode preference for the function — "specify the `AfterDiscounts`
+        // status to activate the preference" — and until it does, the member that preference
+        // activates is reported on no option. Resolved per function through the one resolution
+        // of this service, exactly as the instance, group, database and Amazon ECS service
+        // readers resolve it.
         let matching: Vec<LambdaFunctionRecommendation> = selected
             .into_iter()
             .map(|function| {
-                function.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
+                let after_discounts = guard.reports_savings_after_discounts(
+                    &function.function_arn(&region),
+                    crate::state::SOURCE_TYPE_LAMBDA_FUNCTION,
+                    &function.account_id,
+                );
+                function.to_recommendation(
+                    &region,
+                    &look_back_period,
+                    after_discounts,
+                    last_refresh_timestamp,
+                )
             })
             // "Functions with a finding of unavailable are not returned unless you specify
             // the filter parameter with a value of Unavailable in your

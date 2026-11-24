@@ -148,10 +148,15 @@ impl IdleResourceAnalysis {
 
     /// The modelled `IdleRecommendation` this analysis yields at the endpoint in `region`
     /// under `look_back_period`, as generated at `last_refresh_timestamp`.
+    ///
+    /// `after_discounts` is whether the account activated the savings-estimation-mode
+    /// preference for the resource ([`EffectivePreferences::after_discounts`]), which is what
+    /// decides whether the savings member net of discounts is reported at all.
     pub fn to_recommendation(
         &self,
         region: &str,
         look_back_period: &str,
+        after_discounts: bool,
         last_refresh_timestamp: Option<DateTime>,
     ) -> IdleRecommendation {
         let look_back_days = self.analysed_days(look_back_period);
@@ -173,13 +178,17 @@ impl IdleResourceAnalysis {
                 savings_opportunity_percentage: percentage,
                 estimated_monthly_savings: estimated(),
             }),
-            // This emulator prices every resource from public pricing and records no
-            // negotiated discount ([`SAVINGS_ESTIMATION_SOURCE`]), so the after-discount
-            // figures are the before-discount ones — the same stance the volume, function and
-            // group readers of this service take.
-            savings_opportunity_after_discounts: Some(IdleSavingsOpportunityAfterDiscounts {
-                savings_opportunity_percentage: percentage,
-                estimated_monthly_savings: estimated(),
+            // The savings net of Savings Plans and Reserved Instances discounts are reported
+            // only once the account activates the preference that "activates" them, the one
+            // gate every recommendation surface of this service applies. This emulator prices
+            // every resource from public pricing and records no negotiated discount
+            // ([`SAVINGS_ESTIMATION_SOURCE`]), so where the member is reported its figures are
+            // the before-discount ones.
+            savings_opportunity_after_discounts: after_discounts.then(|| {
+                IdleSavingsOpportunityAfterDiscounts {
+                    savings_opportunity_percentage: percentage,
+                    estimated_monthly_savings: estimated(),
+                }
             }),
             utilization_metrics: (!self.utilization_metrics.is_empty())
                 .then(|| self.utilization_metrics.clone()),

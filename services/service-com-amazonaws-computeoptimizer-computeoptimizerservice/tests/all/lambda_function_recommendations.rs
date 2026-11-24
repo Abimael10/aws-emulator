@@ -477,9 +477,9 @@ fn assert_recommendation_invariants(recommendation: &Value) {
     );
 
     // The saving: never negative, in a currency the model names, a percentage of monthly
-    // cost that is zero exactly when the amount is, and the same before and after discounts
-    // (this service records no negotiated discount).
-    for member in ["savingsOpportunity", "savingsOpportunityAfterDiscounts"] {
+    // cost that is zero exactly when the amount is.
+    {
+        let member = "savingsOpportunity";
         let opportunity = &option[member];
         let value = number(&opportunity["estimatedMonthlySavings"], "value");
         let percentage = number(opportunity, "savingsOpportunityPercentage");
@@ -512,6 +512,15 @@ fn assert_recommendation_invariants(recommendation: &Value) {
             );
         }
     }
+    // The saving net of Savings Plans and Reserved Instances discounts is reported only once
+    // the account activates the savings-estimation-mode preference, and no caller of this
+    // helper stores one.
+    assert_eq!(
+        option["savingsOpportunityAfterDiscounts"],
+        Value::Null,
+        "case {case:?}: the after-discount member is reported only once the account activates \
+         the preference, got {option}"
+    );
 }
 
 /// The recommendations reported are exactly the functions AWS LAMBDA holds for the account:

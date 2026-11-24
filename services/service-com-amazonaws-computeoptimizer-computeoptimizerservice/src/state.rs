@@ -3834,6 +3834,29 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .unwrap_or_else(|| DEFAULT_LOOK_BACK_PERIOD.to_string())
     }
 
+    /// Whether the savings members net of Savings Plans and Reserved Instances discounts are
+    /// reported for one resource — the resource `resource_arn` names, of `resource_type`, owned
+    /// by `account_id`.
+    ///
+    /// The savings-estimation-mode preference is what "activates" those members ("specify the
+    /// `AfterDiscounts` status to activate the preference, or specify `BeforeDiscounts` to
+    /// deactivate the preference"), so until a record that applies to the resource activates
+    /// it, the member that preference activates is reported on no option. Resolved through the
+    /// ONE test of this crate ([`EffectivePreferences::after_discounts`]) over the ONE
+    /// resolution [`effective_preferences_for`], so what a recommendation reports cannot
+    /// disagree with the preferences a read of that resource reports.
+    ///
+    /// [`effective_preferences_for`]: Self::effective_preferences_for
+    pub fn reports_savings_after_discounts(
+        &self,
+        resource_arn: &str,
+        resource_type: &str,
+        account_id: &str,
+    ) -> bool {
+        self.effective_preferences_for(resource_arn, resource_type, account_id)
+            .after_discounts()
+    }
+
     /// The licensed Amazon EC2 instances whose observation a caller can read, in instance-id
     /// order.
     ///

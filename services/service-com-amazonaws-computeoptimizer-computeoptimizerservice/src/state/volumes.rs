@@ -198,10 +198,14 @@ impl ObservedVolume {
     /// better performance for your workload", and `Optimized` otherwise, where "Compute
     /// Optimizer might [still] recommend a new generation volume type"
     /// (`VolumeRecommendation$finding`).
+    /// `after_discounts` is whether the account activated the savings-estimation-mode
+    /// preference for the volume ([`EffectivePreferences::after_discounts`]), which is what
+    /// decides whether the savings member net of discounts is reported at all.
     pub fn to_recommendation(
         &self,
         region: &str,
         look_back_period: &str,
+        after_discounts: bool,
         last_refresh_timestamp: Option<DateTime>,
     ) -> VolumeRecommendation {
         let look_back_days = self.analysed_days(look_back_period);
@@ -231,19 +235,22 @@ impl ObservedVolume {
                         value,
                     }),
                 }),
+                // The savings net of Savings Plans and Reserved Instances discounts are
+                // reported only once the account activates the preference that "activates"
+                // them, the one gate every recommendation surface of this service applies.
                 // This emulator prices a volume from the public price table in
-                // [`volume_monthly_cost`] and records no negotiated discount for storage,
-                // so the after-discount figures are the before-discount ones — which is
-                // what the reported [`SAVINGS_ESTIMATION_SOURCE`] says.
-                savings_opportunity_after_discounts: savings.map(|(percentage, value)| {
-                    EBSSavingsOpportunityAfterDiscounts {
+                // [`volume_monthly_cost`] and records no negotiated discount for storage, so
+                // where the member is reported its figures are the before-discount ones —
+                // which is what the reported [`SAVINGS_ESTIMATION_SOURCE`] says.
+                savings_opportunity_after_discounts: savings
+                    .filter(|_| after_discounts)
+                    .map(|(percentage, value)| EBSSavingsOpportunityAfterDiscounts {
                         savings_opportunity_percentage: percentage,
                         estimated_monthly_savings: Some(EBSEstimatedMonthlySavings {
                             currency: Some(CURRENCY_USD.to_string()),
                             value,
                         }),
-                    }
-                }),
+                    }),
             }]),
             last_refresh_timestamp,
             current_performance_risk: Some(performance_risk_band(current_risk).to_string()),

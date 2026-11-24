@@ -1347,8 +1347,20 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         volumes
             .iter()
             .map(|volume| {
-                let recommendation =
-                    volume.to_recommendation(region, &look_back_period, last_refresh_timestamp);
+                // The savings members net of discounts are in the file exactly where the
+                // reader reports them: only once the account activated the preference that
+                // activates them, resolved the way the reader resolves it.
+                let after_discounts = self.reports_savings_after_discounts(
+                    &volume.volume_arn(region),
+                    RESOURCE_TYPE_EBS_VOLUME,
+                    account_id,
+                );
+                let recommendation = volume.to_recommendation(
+                    region,
+                    &look_back_period,
+                    after_discounts,
+                    last_refresh_timestamp,
+                );
                 volume_row(&recommendation, last_refresh)
             })
             .collect()
@@ -2568,7 +2580,12 @@ fn idle_row(
     // an `IdleSavingsOpportunity` is named for is its percentage: "the estimated monthly
     // savings possible as a percentage of monthly cost".
     put_number(&mut row, "SavingsOpportunity", percentage);
-    put_number(&mut row, "SavingsOpportunityAfterDiscount", percentage);
+    // The saving net of Savings Plans and Reserved Instances discounts is in the file exactly
+    // where the reader reports it: only once the account activated the preference that
+    // activates it ([`EffectivePreferences::after_discounts`]).
+    if preferences.after_discounts() {
+        put_number(&mut row, "SavingsOpportunityAfterDiscount", percentage);
+    }
     for metric in &analysis.utilization_metrics {
         let (Some(name), Some(statistic)) = (metric.name.as_deref(), metric.statistic.as_deref())
         else {

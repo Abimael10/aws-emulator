@@ -321,10 +321,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no stored preference can apply to an idle resource. What a recommendation reports as
         // analysed is still that period capped by how long the resource has been observed.
         let look_back_period = crate::state::DEFAULT_LOOK_BACK_PERIOD;
+        // Whether the savings net of Savings Plans and Reserved Instances discounts are
+        // reported for a resource: the account activates that member by storing the
+        // savings-estimation-mode preference for the resource — "specify the `AfterDiscounts`
+        // status to activate the preference" — and until it does, the member that preference
+        // activates is reported on no recommendation. Resolved per resource through the one
+        // resolution of this service, exactly as the instance, group, database and Amazon ECS
+        // service readers resolve it.
         let analysed: Vec<IdleRecommendation> = guard
             .visible_idle_recommendations()
             .map(|analysis| {
-                analysis.to_recommendation(&region, look_back_period, last_refresh_timestamp)
+                let after_discounts = guard.reports_savings_after_discounts(
+                    &analysis.arn_in(&region),
+                    crate::state::RESOURCE_TYPE_IDLE,
+                    &analysis.account_id,
+                );
+                analysis.to_recommendation(
+                    &region,
+                    look_back_period,
+                    after_discounts,
+                    last_refresh_timestamp,
+                )
             })
             .collect();
 

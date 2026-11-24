@@ -34,7 +34,7 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED,
-    RESOURCE_TYPE_EBS_VOLUME,
+    RESOURCE_TYPE_EBS_VOLUME, SAVINGS_ESTIMATION_AFTER_DISCOUNTS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -771,22 +771,32 @@ fn assert_configuration(
 /// The table spans the look-back preference the rule generalises over: none at all, and each
 /// `LookBackPeriodPreference` the model declares. A longer period analyses samples a shorter one
 /// left out, so it changes the option a volume gets — which is what proves the exported row is
-/// computed under the period in force rather than frozen at the default.
+/// computed under the period in force rather than frozen at the default. One more row activates
+/// the savings-estimation-mode preference, the preference that decides whether the reader
+/// reports a saving net of discounts at all, so the file is checked with those columns both
+/// held and withheld.
 #[tokio::test]
 async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
-    // (case, the `lookBackPeriod` the preference asks for, or none at all)
-    let mut rows: Vec<(String, Option<&str>)> = vec![("no preference at all".to_string(), None)];
+    // (case, the `lookBackPeriod` the preference asks for, whether the savings-estimation-mode
+    //  preference is activated)
+    let mut rows: Vec<(String, Option<&str>, bool)> =
+        vec![("no preference at all".to_string(), None, false)];
     rows.extend(
         LOOK_BACK_PERIOD_PREFERENCE_VALUES
             .iter()
-            .map(|period| (format!("a {period} look-back preference"), Some(*period))),
+            .map(|period| (format!("a {period} look-back preference"), Some(*period), false)),
     );
+    rows.push((
+        "an activated savings-estimation-mode preference".to_string(),
+        None,
+        true,
+    ));
 
     // What each case exported for one volume's option, so the table is shown to prove that the
     // preference reaches the file.
     let mut option_iops: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
-    for (case, look_back_period) in rows {
+    for (case, look_back_period, after_discounts) in rows {
         // A fresh emulator per row: one volume export job runs per Region at a time, so each row
         // gets its own store rather than waiting on the previous row's job.
         let router = analysed_emulator().await;
@@ -796,6 +806,14 @@ async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
                 &router,
                 &json!({"resourceType": RESOURCE_TYPE_EBS_VOLUME,
                         "lookBackPeriod": look_back_period}),
+            )
+            .await;
+        }
+        if after_discounts {
+            put_preference(
+                &router,
+                &json!({"resourceType": RESOURCE_TYPE_EBS_VOLUME,
+                        "savingsEstimationMode": SAVINGS_ESTIMATION_AFTER_DISCOUNTS}),
             )
             .await;
         }
@@ -951,31 +969,58 @@ async fn the_export_file_states_what_the_reader_reports_for_every_volume() {
             for (column, expected) in [
                 ("RecommendationOptionsSavingsOpportunityPercentage", percentage),
                 ("RecommendationOptionsEstimatedMonthlySavingsValue", value),
-                (
-                    "RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage",
-                    after["savingsOpportunityPercentage"].as_f64().unwrap_or_default(),
-                ),
-                (
-                    "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts",
-                    after["estimatedMonthlySavings"]["value"].as_f64().unwrap_or_default(),
-                ),
             ] {
                 assert_figure(&case, header, row, column, expected);
             }
-            for (column, expected) in [
-                ("RecommendationOptionsEstimatedMonthlySavingsCurrency", currency),
-                (
-                    "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts",
+            assert_eq!(
+                cell(
+                    header,
+                    row,
+                    "RecommendationOptionsEstimatedMonthlySavingsCurrency"
+                ),
+                currency,
+                "case {case:?}: the currency column of {arn} must state the currency the \
+                 reader reports, got {row:?}"
+            );
+            // The saving net of Savings Plans and Reserved Instances discounts is in the file
+            // exactly where the reader reports it: the savings-estimation-mode preference is
+            // what activates that member, so a row of an account that activated none holds no
+            // after-discount cell at all.
+            let after_columns = [
+                "RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage",
+                "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts",
+                "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts",
+            ];
+            if after.is_null() {
+                for column in after_columns {
+                    assert_eq!(
+                        cell(header, row, column),
+                        "",
+                        "case {case:?}: {column} of {arn} must be empty while the reader \
+                         reports no saving net of discounts, got {row:?}"
+                    );
+                }
+            } else {
+                for (column, expected) in [
+                    (
+                        after_columns[0],
+                        after["savingsOpportunityPercentage"].as_f64().unwrap_or_default(),
+                    ),
+                    (
+                        after_columns[1],
+                        after["estimatedMonthlySavings"]["value"].as_f64().unwrap_or_default(),
+                    ),
+                ] {
+                    assert_figure(&case, header, row, column, expected);
+                }
+                assert_eq!(
+                    cell(header, row, after_columns[2]),
                     after["estimatedMonthlySavings"]["currency"]
                         .as_str()
                         .unwrap_or_default(),
-                ),
-            ] {
-                assert_eq!(
-                    cell(header, row, column),
-                    expected,
-                    "case {case:?}: {column} of {arn} must state the currency the reader \
-                     reports, got {row:?}"
+                    "case {case:?}: {} of {arn} must state the currency the reader reports, \
+                     got {row:?}",
+                    after_columns[2]
                 );
             }
 

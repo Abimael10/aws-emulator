@@ -304,10 +304,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The recommendation is computed first and filtered second: `Finding` filters on
         // the finding this service derived, not on anything the request supplied — and
         // the finding depends on the look-back period, so it cannot be known earlier.
+        //
+        // Whether the savings net of Savings Plans and Reserved Instances discounts are
+        // reported for a volume: the account activates that member by storing the
+        // savings-estimation-mode preference for the volume — "specify the `AfterDiscounts`
+        // status to activate the preference" — and until it does, the member that preference
+        // activates is reported on no option. Resolved per volume through the one resolution
+        // of this service, exactly as the instance, group, database and Amazon ECS service
+        // readers resolve it.
         let matching: Vec<VolumeRecommendation> = selected
             .into_iter()
             .map(|volume| {
-                volume.to_recommendation(&region, &look_back_period, last_refresh_timestamp)
+                let after_discounts = guard.reports_savings_after_discounts(
+                    &volume.volume_arn(&region),
+                    crate::state::RESOURCE_TYPE_EBS_VOLUME,
+                    &volume.account_id,
+                );
+                volume.to_recommendation(
+                    &region,
+                    &look_back_period,
+                    after_discounts,
+                    last_refresh_timestamp,
+                )
             })
             .filter(|recommendation| filters.iter().all(|filter| filter.matches(recommendation)))
             .collect();
