@@ -353,6 +353,38 @@ impl ObjectEncryption {
         self.bucket_key_enabled.filter(|enabled| *enabled)
     }
 
+    /// Whether a COPY of an object stored under this configuration reports an S3 Bucket Key,
+    /// and as what — given whether either half of that copy is a DIRECTORY bucket.
+    ///
+    /// A copy with a directory bucket on either side uses no S3 Bucket Key at all: "S3 Bucket
+    /// Keys aren't supported, when you copy SSE-KMS encrypted objects from general purpose
+    /// buckets to directory buckets, from directory buckets to general purpose buckets, or
+    /// between directory buckets, through `CopyObject`, `UploadPartCopy`, the Copy operation in
+    /// Batch Operations, or the import jobs. In this case, Amazon S3 makes a call to KMS every
+    /// time a copy request is made for a KMS-encrypted object"
+    /// (`CopyObjectRequest$BucketKeyEnabled`). So such a copy of an SSE-KMS object states
+    /// `false`: the per-object KMS call the copy itself made is the fact this member reports,
+    /// and it is stated whatever bucket-key setting the object the copy WROTE is stored under —
+    /// which every later reader of that object goes on reporting
+    /// ([`Self::reported_bucket_key_enabled`]), since a Bucket Key "is always enabled for GET
+    /// and PUT operations in a directory bucket and can't be disabled"
+    /// (`PutBucketEncryption`'s own documentation).
+    ///
+    /// Every other copy is served by the Bucket Key the object carries, so it reports the
+    /// object-level projection unchanged. The member belongs to SSE-KMS alone ("for object
+    /// encryption with server-side encryption using Key Management Service (KMS) keys",
+    /// `PutObjectRequest$BucketKeyEnabled`), so a copy of an object under any other encryption
+    /// reports nothing here whichever buckets it crossed.
+    pub fn reported_copy_bucket_key_enabled(
+        &self,
+        across_a_directory_bucket: bool,
+    ) -> Option<bool> {
+        if across_a_directory_bucket {
+            return self.uses_kms().then_some(false);
+        }
+        self.reported_bucket_key_enabled()
+    }
+
     /// How many bytes this record retains — the caller-supplied strings it holds, which
     /// the per-bucket and service-wide budgets must count like every other string kept
     /// beside an object.

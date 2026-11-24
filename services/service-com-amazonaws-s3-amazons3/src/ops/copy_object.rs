@@ -772,6 +772,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             .naming_bucket(&source.bucket));
         };
 
+        // Whether this copy has a DIRECTORY bucket on EITHER side, which is what decides
+        // whether an S3 Bucket Key serves it at all — read here, while both buckets are
+        // resolved, and carried to the answer below
+        // ([`crate::state::ObjectEncryption::reported_copy_bucket_key_enabled`] holds the rule
+        // for every copy of this service).
+        let across_a_directory_bucket = into_a_directory_bucket || source_bucket.is_directory();
+
         // WHO is asking, for the READ half of this copy. "You must have READ access to the
         // source object" (`CopyObject`'s own documentation), which is `s3:GetObject` on the
         // object `x-amz-copy-source` names — or the version-scoped action when the reference
@@ -1458,7 +1465,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 &input.key,
                 &encryption,
             ),
-            bucket_key_enabled: encryption.reported_bucket_key_enabled(),
+            // Whether an S3 Bucket Key served THIS COPY, which is not the setting the object
+            // it wrote is stored under whenever a directory bucket is on either side of it:
+            // such a copy makes a per-object KMS call instead
+            // ([`crate::state::ObjectEncryption::reported_copy_bucket_key_enabled`] carries the
+            // rule and its published sentence), while every reader of the destination object
+            // goes on reporting what that object was stored with.
+            bucket_key_enabled: encryption
+                .reported_copy_bucket_key_enabled(across_a_directory_bucket),
             // "If the object expiration is configured, the response includes this header"
             // (`CopyObjectOutput$Expiration`): the DESTINATION bucket's lifecycle
             // configuration applied to the copy just stored, computed from it the way

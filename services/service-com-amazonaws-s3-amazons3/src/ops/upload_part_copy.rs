@@ -422,6 +422,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that names one.
         let encryption = upload.encryption.clone();
         let initiated_algorithm = upload.checksum_algorithm.clone();
+        // WHAT KIND of bucket this copy writes into, read while that bucket is resolved: an S3
+        // Bucket Key does not serve a copy with a directory bucket on either side, whatever the
+        // upload was initiated with, and the source half is read the same way below.
+        let into_a_directory_bucket = destination.is_directory();
         // A part of an upload initiated under a customer-provided key must present that key,
         // and a part of an upload initiated without one must present none — judged through the
         // one rule every part write of this service is judged by
@@ -449,6 +453,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .naming_bucket(&source.bucket));
         };
+        // Whether this copy has a DIRECTORY bucket on EITHER side, which is what decides
+        // whether an S3 Bucket Key serves it at all — the same reading `CopyObject` takes of
+        // the two halves of its own copy
+        // ([`crate::state::ObjectEncryption::reported_copy_bucket_key_enabled`] holds the rule
+        // for every copy of this service).
+        let across_a_directory_bucket = into_a_directory_bucket || source_bucket.is_directory();
+
         // WHO is asking, for the READ this part copy makes of its source. "You must have READ
         // access to the source object" (`UploadPartCopy`'s own documentation of the
         // permissions it needs), which is `s3:GetObject` on the object `x-amz-copy-source`
@@ -773,7 +784,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `UploadPart` reports it for a part of the same upload.
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
-            bucket_key_enabled: encryption.reported_bucket_key_enabled(),
+            // Whether an S3 Bucket Key served THIS COPY: a copy with a directory bucket on
+            // either side makes a per-object KMS call instead of using one, whatever the
+            // upload's own initiation settled
+            // ([`crate::state::ObjectEncryption::reported_copy_bucket_key_enabled`] carries the
+            // rule and its published sentence).
+            bucket_key_enabled: encryption
+                .reported_copy_bucket_key_enabled(across_a_directory_bucket),
             // "If server-side encryption with a customer-provided encryption key was
             // requested, the response will include this header"
             // (`UploadPartCopyOutput$SSECustomerAlgorithm` and `$SSECustomerKeyMD5`) — the
