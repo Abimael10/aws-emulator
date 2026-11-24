@@ -497,12 +497,24 @@ impl PendingTransition {
     /// wholly elapsed leaves the move due at once, and an instant in the future is treated
     /// as now.
     pub fn starting_at(to: InstanceStateName, started_at: SystemTime) -> Self {
+        Self::due_after(to, started_at, TRANSITION_DELAY)
+    }
+
+    /// The same move, read the same way, but due `span` after `started_at` rather than one
+    /// [`TRANSITION_DELAY`] after it.
+    ///
+    /// For an instance another service of this emulator launches as PART of work of its own
+    /// (an Auto Scaling group's member coming into service): that service owes the whole
+    /// move, so the instance reaches `running` at the instant that service reports its own
+    /// work settled rather than at a span of this one's, and the two can never disagree about
+    /// an instance one of them already reports in service.
+    pub fn due_after(to: InstanceStateName, started_at: SystemTime, span: Duration) -> Self {
         let elapsed = SystemTime::now()
             .duration_since(started_at)
             .unwrap_or_default();
         Self {
             to,
-            due_at: due_instant(TRANSITION_DELAY.saturating_sub(elapsed)),
+            due_at: due_instant(span.saturating_sub(elapsed)),
             reason: None,
         }
     }

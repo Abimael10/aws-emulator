@@ -16,8 +16,9 @@
 //! materialise what the clock already made due):
 //!
 //! * an instance Amazon EC2 Auto Scaling just launched is reported `Pending` and
-//!   becomes `InService`; one it is scaling in is reported `Terminating` and then
-//!   leaves the group ([`LIFECYCLE_TRANSITION`]);
+//!   becomes `InService` ([`LAUNCH_TRANSITION`], the span of a launch the group has
+//!   already made); one it is scaling in is reported `Terminating` and then leaves the
+//!   group ([`LIFECYCLE_TRANSITION`], the span every move OUT of service takes);
 //! * a capacity change that asked to honour the group's cooldown waits for that
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
 //! * a running instance refresh replaces one instance of its group per
@@ -353,6 +354,12 @@ pub mod group_teardown;
 /// and the placement of the instance it moved.
 pub mod activity_records;
 
+/// How a paginated read of this service pages: the `NextToken` it issues and resumes from,
+/// the page one request's `MaxRecords` asks for, and the refusals an unusable token or page
+/// size is answered with.
+mod pagination;
+pub use pagination::*;
+
 /// The fixed reference-data catalogs this service publishes through its zero-input
 /// describes, and the one reader of each that decides membership of it.
 mod reference_catalogs;
@@ -370,6 +377,24 @@ pub use activity_records::{
 /// transient state. The real wait depends on the instance; this emulator picks a
 /// short, fixed span (chosen, not documented) and never sleeps for it.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
+
+/// How long an instance a group LAUNCHED spends `Pending` before it is in service.
+///
+/// The launch itself is finished when the call that asked for it answers: the instances are
+/// minted in Amazon EC2 and the group holds them already, so the span adds nothing but the
+/// transient state Amazon EC2 Auto Scaling reports before an instance is in service. A caller
+/// reading the group in the same instant as that call still sees it — which is the whole of
+/// what a transient span is for — and nothing else waits on it.
+///
+/// It is far shorter than the span the moves OUT of service take ([`LIFECYCLE_TRANSITION`]),
+/// because a launch is what a CLIENT waits on: a client written against Amazon EC2 Auto
+/// Scaling looks again at the interval the real service's provisioning work calls for — tens
+/// of seconds — and probes before it sleeps, so a launch this service has already made and
+/// then withholds from the read that follows the call costs that client one whole interval,
+/// and a sequence that chains several launches (a scale-out, a scale-out the group's load
+/// balancing blocks, and the launch that repairing the attachment owes) is not observable
+/// inside the client's budget at all. Chosen, not documented, and never slept for.
+pub const LAUNCH_TRANSITION: Duration = Duration::from_millis(2);
 
 /// How long a group waits before ATTEMPTING an owed launch again, once the attempt it made
 /// was one Amazon EC2 took back ([`StoredGroup::launch_retry_due`]).
@@ -2253,7 +2278,7 @@ impl AutoScalingState {
     /// service and marking it unhealthy due to a failed health check", so an instance inside
     /// that window is not marked on a failed check however the load balancer reports it; the
     /// member's own default is [`DEFAULT_HEALTH_CHECK_GRACE_PERIOD`], and the window runs
-    /// from the instant the instance came into service ([`LIFECYCLE_TRANSITION`] after it was
+    /// from the instant the instance came into service ([`LAUNCH_TRANSITION`] after it was
     /// launched). An instance on its way out of the group is leaving whatever its targets
     /// report.
     ///
@@ -2313,9 +2338,10 @@ impl AutoScalingState {
                 {
                     continue;
                 }
-                // Checked only once the instance has come into service and the group's grace
-                // period after it has elapsed.
-                let checked_from = instance.launched_at + LIFECYCLE_TRANSITION + grace;
+                // Checked only once the instance has come into service ([`LAUNCH_TRANSITION`]
+                // after the launch placed it) and the group's grace period after that has
+                // elapsed.
+                let checked_from = instance.launched_at + LAUNCH_TRANSITION + grace;
                 if now < checked_from {
                     continue;
                 }
@@ -2330,10 +2356,10 @@ impl AutoScalingState {
     }
 
     /// Set a group's desired capacity and move its instances to match: launch what
-    /// is missing (`Pending`, in service once [`LIFECYCLE_TRANSITION`] is due) and
-    /// scale in what is surplus (`Terminating`, gone once it is due). Each launch
-    /// and each termination records its own scaling activity, and the group enters
-    /// its cooldown.
+    /// is missing (`Pending`, in service once [`LAUNCH_TRANSITION`] is due) and
+    /// scale in what is surplus (`Terminating`, gone once [`LIFECYCLE_TRANSITION`] is due).
+    /// Each launch and each termination records its own scaling activity, and the group
+    /// enters its cooldown.
     ///
     /// The instances are the account's OWN Amazon EC2 instances: the launch goes
     /// through [`ec2_instances::launch`], which mints them in the account's Amazon EC2
@@ -2410,13 +2436,16 @@ impl AutoScalingState {
             group.surplus_capacity_units(desired_capacity)
         };
         let due = now + LIFECYCLE_TRANSITION;
+        // What an instance this change brings INTO service settles at, which is the span a
+        // launch the group has already made owes ([`LAUNCH_TRANSITION`]).
+        let launch_due = now + LAUNCH_TRANSITION;
 
         // A group whose warm pool has already prepared instances draws on THOSE before it
         // launches anything: a prepared instance leaves the pool under its own id and comes
         // into service through `Pending` ([`Self::consume_warm_pool`]), so the scale-out
         // only launches what the pool could not cover.
         let needed = usize::try_from(to_launch).unwrap_or(0);
-        let promoted = self.consume_warm_pool(engine, group_name, needed, now, due);
+        let promoted = self.consume_warm_pool(engine, group_name, needed, now, launch_due);
         let wanted = needed.saturating_sub(promoted.len());
         let launch = self.launch_into_group(
             engine,
@@ -2424,7 +2453,7 @@ impl AutoScalingState {
                 group_name,
                 count: wanted,
                 launched_at: now,
-                due,
+                due: launch_due,
                 // A capacity change launches from the group's own launch source.
                 desired_configuration: None,
                 destination: LaunchDestination::Group,
@@ -2486,7 +2515,7 @@ impl AutoScalingState {
                     instance_id: &instance_id,
                     cause: &cause,
                     start_time: now,
-                    due,
+                    due: launch_due,
                 },
             );
         }
@@ -2607,7 +2636,10 @@ impl AutoScalingState {
             })
             .collect();
         for (name, arn, count, from, desired) in owed {
-            let due = now + LIFECYCLE_TRANSITION;
+            // Every instance this pass brings into service settles at the launch span
+            // ([`LAUNCH_TRANSITION`]), exactly as the capacity change that asked for the
+            // capacity would have settled it.
+            let due = now + LAUNCH_TRANSITION;
             // The capacity a group is owed is met from its warm pool first, exactly as a
             // capacity change meets it ([`Self::consume_warm_pool`]): the instances the pool
             // has prepared are the group's to bring into service, so a shortfall the pool
@@ -3030,6 +3062,10 @@ impl AutoScalingState {
                 launched_at: request.launched_at,
                 launch_sequence: first_sequence
                     .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+                // The instance settles at the instant the launch that placed it is due,
+                // which the caller asking for the launch states: a launch into the GROUP is
+                // due one launch transition out ([`LAUNCH_TRANSITION`]), and one into a warm
+                // pool at the span that pool's own preparation takes ([`warm_pools`]).
                 transition_due: Some(request.due),
                 // A freshly launched instance has failed no health check, so the group's
                 // check owes nothing on it.
@@ -3434,13 +3470,17 @@ impl AutoScalingState {
     ) -> Option<String> {
         let arn = self.groups.get(group_name).map(|group| group.arn.clone())?;
         let due = now + LIFECYCLE_TRANSITION;
+        // The replacement is an instance coming INTO service, so it settles at the launch
+        // span ([`LAUNCH_TRANSITION`]); the instance it replaces leaves over the span a move
+        // out of service takes.
+        let launch_due = now + LAUNCH_TRANSITION;
         let launch = self.launch_into_group(
             engine,
             &GroupLaunch {
                 group_name,
                 count: 1,
                 launched_at: now,
-                due,
+                due: launch_due,
                 desired_configuration,
                 destination: LaunchDestination::Group,
                 // A replacement places across the whole of the group's own configuration.
@@ -3468,7 +3508,7 @@ impl AutoScalingState {
                     instance_id: launched_id,
                     cause,
                     start_time: now,
-                    due,
+                    due: launch_due,
                 },
             );
         }
@@ -4584,204 +4624,6 @@ pub fn declared_instance_types(
         .unwrap_or_default()
 }
 
-/// Decode a `NextToken` into the offset it names, or `None` when the token is not
-/// one this service issued.
-///
-/// The paginated describes in this service page over a name-ordered list, so an
-/// issued token is the offset the next page starts at, behind a marker: anything
-/// without the marker, and the offset 0 (the first page is reached with no token
-/// at all, so no token for it is ever issued), is not a token this service gave
-/// out.
-pub fn decode_next_token(token: &str) -> Option<usize> {
-    token
-        .strip_prefix(NEXT_TOKEN_MARKER)?
-        .parse::<usize>()
-        .ok()
-        .filter(|offset| *offset > 0)
-}
-
-/// The message a paginated read refuses an unusable `NextToken` with in the PAST tense,
-/// the form `DescribeAutoScalingGroups` and `DescribeScalingActivities` serve.
-///
-/// The refusal quotes the token the caller sent — that is the only thing the caller can
-/// act on, since the token it is holding is not one this service will resume from. The
-/// quoted token is the only variable part; the rest is fixed text, as the recorded
-/// refusals of the reads that serve this sentence state it.
-pub fn invalid_next_token_message(token: &str) -> String {
-    format!("The token '{token}' was invalid")
-}
-
-/// The same sentence in the PRESENT tense, the form `DescribeNotificationConfigurations`,
-/// `DescribeScheduledActions`, `DescribeAutoScalingInstances` and `DescribeWarmPool`
-/// serve: the sentence is about the token the caller is holding now.
-///
-/// Separate from [`invalid_next_token_message`] because the sentence is each read's own —
-/// the reads that answer the past-tense form state it as recorded for them, and
-/// `DescribePolicies` names the member by its role ([`invalid_pagination_token_message`]) —
-/// so one read's wording is not the others' to change.
-pub fn invalid_next_token_message_in_present_tense(token: &str) -> String {
-    format!("The token '{token}' is invalid")
-}
-
-/// The message `DescribeInstanceRefreshes` refuses an unusable `NextToken` with: the
-/// present-tense sentence about the token the caller is holding, TERMINATED by a period,
-/// as that read's own recorded refusal states it.
-///
-/// Separate from the two above because how the sentence ends is each read's own: this one
-/// closes it, the reads above leave it open, and `DescribePolicies` names the member by its
-/// role instead ([`invalid_pagination_token_message`]). The token the request sent, quoted,
-/// is the only variable part.
-pub fn invalid_next_token_message_terminated(token: &str) -> String {
-    format!("{}.", invalid_next_token_message_in_present_tense(token))
-}
-
-/// The refusal the reads that treat an unusable `NextToken` as a bad member VALUE answer:
-/// the member as the model names it, and the value the request submitted for it.
-///
-/// Those reads answer the service-common `ValidationError` rather than the modelled
-/// `InvalidNextToken`, so this is the whole message and the token is its only variable
-/// part.
-pub fn next_token_value_violation_message(token: &str) -> String {
-    format!("NextToken: {token}")
-}
-
-/// The refusal those same reads answer a request that carries a `NextToken` WITHOUT a
-/// `MaxRecords` with.
-///
-/// `DescribeLoadBalancers` and `DescribeTrafficSources` page a group's attachments against the
-/// page size the request states, and their recorded refusal of a token sent with no page size
-/// is this sentence: a resumption token names a position inside a page sequence, so the size
-/// that sequence was produced under has to be stated beside it. Wholly fixed text — it names
-/// the two members the rule is about and nothing the request carried — and it is answered
-/// BEFORE the token itself is read, because a token without the page size is unusable whatever
-/// it says. `DescribeLoadBalancerTargetGroups` answers its own recorded refusal for that
-/// request ([`next_token_value_violation_message`]), so the precedence is each read's.
-pub fn next_token_without_max_records_message() -> String {
-    "Cannot specify NextToken without MaxRecords".to_string()
-}
-
-/// The message `DescribePolicies` refuses an unusable `NextToken` with: the sentence that
-/// operation's own recorded refusal states, which names the member by its role (a
-/// pagination token) and quotes the token the caller sent.
-///
-/// Separate from [`invalid_next_token_message`] because the sentence is this
-/// operation's: the one above is the example wording its callers already answer with,
-/// and rewording them is not this operation's to do.
-pub fn invalid_pagination_token_message(token: &str) -> String {
-    format!("The pagination token '{token}' is invalid")
-}
-
-/// Encode the offset the next page starts at as a `NextToken`.
-pub fn encode_next_token(offset: usize) -> String {
-    format!("{NEXT_TOKEN_MARKER}{offset}")
-}
-
-/// The marker every `NextToken` this service issues carries, so a token it never
-/// issued is refused rather than read as an offset.
-const NEXT_TOKEN_MARKER: &str = "next-";
-
-/// One page of a name-ordered list, plus the `NextToken` that follows it.
-///
-/// `max_records` is the request's `MaxRecords`; absent or out of range it falls
-/// back to [`DEFAULT_MAX_RECORDS`], and it is capped at [`MAX_MAX_RECORDS`].
-pub fn page<T: Clone>(items: &[T], offset: usize, max_records: Option<i32>) -> (Vec<T>, Option<String>) {
-    let limit = page_limit(max_records);
-    let start = offset.min(items.len());
-    let end = start.saturating_add(limit).min(items.len());
-    let next = (end < items.len()).then(|| encode_next_token(end));
-    (items[start..end].to_vec(), next)
-}
-
-/// How many items one page holds, from the request's `MaxRecords`: absent or
-/// non-positive it falls back to [`DEFAULT_MAX_RECORDS`], and it is capped at
-/// [`MAX_MAX_RECORDS`].
-///
-/// Separate from [`page`] because a describe that pages over its own cursor
-/// rather than over an offset still bounds its page the same way.
-pub fn page_limit(max_records: Option<i32>) -> usize {
-    max_records
-        .filter(|value| *value > 0)
-        .map_or(DEFAULT_MAX_RECORDS, |value| {
-            (value as usize).min(MAX_MAX_RECORDS)
-        })
-}
-
-/// A request's `MaxRecords` when it is outside the range the model documents
-/// ("The default value is 50 and the maximum value is 100"), for an operation to
-/// refuse: `None` when the request omits it or carries an acceptable value.
-pub fn max_records_out_of_range(max_records: Option<i32>) -> Option<i32> {
-    max_records_out_of_range_within(
-        max_records,
-        i32::try_from(MAX_MAX_RECORDS).unwrap_or(i32::MAX),
-    )
-}
-
-/// The same test for a read whose own ceiling is not [`MAX_MAX_RECORDS`] — the
-/// name-ordered describes honour 100 and `DescribeWarmPool` honours 50 — so the bound
-/// checked and the bound stated ([`max_records_violation_message_within`]) cannot drift
-/// apart.
-pub fn max_records_out_of_range_within(max_records: Option<i32>, ceiling: i32) -> Option<i32> {
-    max_records.filter(|value| *value < MIN_MAX_RECORDS || *value > ceiling)
-}
-
-/// The message a paginated read refuses a `MaxRecords` outside that range with: the
-/// sentence that belongs to the bound the value missed
-/// ([`max_records_violation_message_within`]).
-pub fn max_records_violation_message(max_records: i32) -> String {
-    max_records_violation_message_within(
-        max_records,
-        i32::try_from(MAX_MAX_RECORDS).unwrap_or(i32::MAX),
-    )
-}
-
-/// The same sentence for a read whose own ceiling is not [`MAX_MAX_RECORDS`]: the
-/// name-ordered describes honour 100 and `DescribeWarmPool` honours 50, so the ceiling
-/// the value missed is the caller's to name.
-///
-/// THE ONE COPY of that sentence for every paginated read of this service, whichever
-/// ceiling it holds its pages to — and a value is weighed against TWO bounds, under the
-/// sentence each of them carries:
-///
-/// * the member's own bounds, which every paginated read of the service shares
-///   ([`MIN_MAX_RECORDS`] to [`MAX_MAX_RECORDS`]): a value outside them is a member value
-///   outside its bounds and is stated as one ([`constraint_violation_message`]), naming the
-///   bound of the MEMBER rather than the read's own cap;
-/// * the page cap of THIS read, where it is smaller than the member's ceiling: a value
-///   inside the member's bounds but past that cap asks for more records than the read
-///   returns, which is the service's own limit ([`over_page_cap_message`]).
-pub fn max_records_violation_message_within(max_records: i32, ceiling: i32) -> String {
-    let member_ceiling = i32::try_from(MAX_MAX_RECORDS).unwrap_or(i32::MAX);
-    if max_records < MIN_MAX_RECORDS {
-        return constraint_violation_message(
-            max_records,
-            "maxRecords",
-            &format!("Member must have value greater than or equal to {MIN_MAX_RECORDS}"),
-        );
-    }
-    if max_records > member_ceiling {
-        return constraint_violation_message(
-            max_records,
-            "maxRecords",
-            &format!("Member must have value less than or equal to {member_ceiling}"),
-        );
-    }
-    over_page_cap_message(ceiling)
-}
-
-/// The sentence a paginated read refuses a `MaxRecords` inside the member's own bounds but
-/// ABOVE the page cap it holds its pages to with, which names that cap.
-///
-/// `MaxRecords` is a plain integer in this service's model, with no range of its own
-/// (`smithy_query(query="shape",shape="MaxRecords")`), so a cap smaller than the member's
-/// ceiling is not a constraint the request failed to satisfy: it is how many records the
-/// read is willing to return, and the refusal says so. The cap is the operation's own — the
-/// name-ordered describes hold their pages to [`MAX_MAX_RECORDS`] and the instance and
-/// warm-pool reads to [`DEFAULT_MAX_RECORDS`] — so it is the only variable part of the
-/// sentence; the rest is fixed text.
-pub fn over_page_cap_message(ceiling: i32) -> String {
-    format!("The number of records returned is limited to {ceiling}")
-}
-
 /// Join the values a refusal names into the comma-separated list a service message
 /// carries, so no refusal shows a caller Rust's own debug formatting.
 ///
@@ -4819,41 +4661,3 @@ pub fn constraint_violation_message(
          constraint: {constraint}"
     )
 }
-
-/// The most names a describe may filter by, which the model documents on
-/// `AutoScalingGroupNames`: "By default, you can only specify up to 50 names. You
-/// can optionally increase this limit using the MaxRecords property."
-pub fn max_filter_names(max_records: Option<i32>) -> usize {
-    max_records
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(DEFAULT_MAX_RECORDS)
-        .max(DEFAULT_MAX_RECORDS)
-}
-
-/// `MaxRecords` when the request omits it.
-///
-/// From the model's own documentation for `AutoScalingGroupNamesType$MaxRecords`:
-/// "The default value is 50 and the maximum value is 100."
-pub const DEFAULT_MAX_RECORDS: usize = 50;
-
-/// The largest `MaxRecords` the service honours (same documentation).
-pub const MAX_MAX_RECORDS: usize = 100;
-
-/// The smallest `MaxRecords` a request may ask for: a page holds items, so it holds at
-/// least one.
-pub const MIN_MAX_RECORDS: i32 = 1;
-
-/// `MaxRecords` when a read of the scaling activities omits it.
-///
-/// From the model's own documentation for `DescribeScalingActivitiesType$MaxRecords`:
-/// "The default value is 100 and the maximum value is 100" — a larger default than the
-/// name-ordered describes take, so that operation names it where it pages.
-pub const DEFAULT_ACTIVITY_MAX_RECORDS: i32 = 100;
-
-/// `MaxRecords` when a read of a group's load-balancer attachments omits it.
-///
-/// From the model's own documentation for
-/// `DescribeLoadBalancerTargetGroupsRequest$MaxRecords`: "The default value is 100 and the
-/// maximum value is 100" — the same larger default the scaling activities take, stated
-/// separately because it is that operation's documentation that says so.
-pub const DEFAULT_ATTACHMENT_MAX_RECORDS: i32 = 100;

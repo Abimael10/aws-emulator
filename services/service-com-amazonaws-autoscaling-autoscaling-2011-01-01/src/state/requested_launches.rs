@@ -35,7 +35,7 @@ use crate::ops::types::{InstanceCollection, LaunchInstancesError2};
 use super::{
     ec2_instances, zone_id_of, AutoScalingState, BlockedLaunch, FailedLifecycleStep, GroupLaunch,
     GroupLaunchOutcome, InstanceLifecycle, InstanceLifecycleChange, LaunchDestination,
-    PendingCapacity, LAUNCH_FAILED_SENTENCE, LIFECYCLE_TRANSITION, PROCESS_LAUNCH,
+    PendingCapacity, LAUNCH_FAILED_SENTENCE, LAUNCH_TRANSITION, PROCESS_LAUNCH,
     UNPLACED_INSTANCE_MESSAGE,
 };
 
@@ -218,7 +218,9 @@ impl AutoScalingState {
         let desired = group.desired_capacity;
         let max_size = group.max_size;
         let launch_suspended = group.is_process_suspended(PROCESS_LAUNCH);
-        let due = now + LIFECYCLE_TRANSITION;
+        // The instances this request launches are instances coming INTO service, so they
+        // settle at the launch span ([`super::LAUNCH_TRANSITION`]).
+        let due = now + LAUNCH_TRANSITION;
 
         let launch = if launch_suspended {
             GroupLaunchOutcome::unplaced(

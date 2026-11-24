@@ -331,13 +331,17 @@ pub fn launch<Eng: Send + Sync + 'static>(
             public_ip: None,
             // …so Amazon maps no public address to it when it starts either.
             mapped_public_ipv4: false,
-            // A launched instance is `pending` and becomes `running` on Amazon EC2's own
-            // clock, so a caller that describes it straight away still sees `pending` —
-            // the same transient state the group reports it `Pending` for.
+            // A launched instance is `pending` and becomes `running` when the group's own
+            // launch transition is due, so a caller that describes it straight away still
+            // sees `pending` — the same transient state, over the same span, that the group
+            // reports it `Pending` for ([`crate::state::LAUNCH_TRANSITION`]). The two
+            // services settle it together: a member the group reports in service is an
+            // instance Amazon EC2 reports running.
             state: ec2::InstanceStateName::Pending,
-            pending_transition: Some(ec2::PendingTransition::starting_at(
+            pending_transition: Some(ec2::PendingTransition::due_after(
                 ec2::InstanceStateName::Running,
                 launch_time,
+                crate::state::LAUNCH_TRANSITION,
             )),
             state_transition_reason: None,
             state_reason: None,

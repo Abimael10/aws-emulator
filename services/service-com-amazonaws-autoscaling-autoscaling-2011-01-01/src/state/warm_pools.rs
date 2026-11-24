@@ -442,8 +442,9 @@ impl StoredGroup {
     ///
     /// A pool state the request CHANGES is owed by the instances the pool already holds:
     /// each settled one re-enters [`WARMED_PENDING`] and reaches the new state when
-    /// [`LIFECYCLE_TRANSITION`] is due, exactly as a freshly launched one does, so a
-    /// caller that reads the pool straight after the change still sees the transition.
+    /// [`LIFECYCLE_TRANSITION`] is due, exactly as an instance the pool itself prepares
+    /// does, so a caller that reads the pool straight after the change still sees the
+    /// transition.
     ///
     /// The put is also a change that can leave the pool short — of what it now maintains —
     /// so it records the preparation it owes from its own instant
