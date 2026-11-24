@@ -10816,6 +10816,7 @@ dependencies = [
 name = "service-com-amazonaws-athena-amazonathena"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
  "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",

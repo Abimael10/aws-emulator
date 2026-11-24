@@ -10,6 +10,8 @@
 //! by the SerDe the catalog recorded — never values synthesised from the query or from the
 //! table's definition.
 
+/// The data files a table of the Iceberg open table format holds.
+mod iceberg_tables;
 /// The records one object of the columnar Parquet format holds.
 pub(super) mod parquet_objects;
 /// The compression one TEXT object at a table's location carries.
@@ -198,7 +200,15 @@ pub struct DataSource {
     partitions: Vec<PartitionSplit>,
     /// Where the data lives, as the catalog recorded it.
     location: Option<String>,
-    /// How the objects there are decoded.
+    /// WHERE the Iceberg metadata of a table of that open table format lives, as its catalog
+    /// entry records it ([`METADATA_LOCATION_PROPERTY`]): the one object a read of such a
+    /// table goes THROUGH, because what the table holds is what its current snapshot names
+    /// and not what its location happens to hold ([`iceberg_tables`]). `None` for a Hive
+    /// table, whose data is every object at its location.
+    iceberg_metadata: Option<String>,
+    /// How the objects there are decoded. For an Iceberg table — which is read through its
+    /// metadata rather than through this entry — each data file is decoded as the format its
+    /// own manifest entry names, and this is the format Iceberg writes one in by default.
     decoder: Decoder,
     /// How many lines at the head of each object are a header.
     skip_header_lines: usize,
@@ -230,6 +240,24 @@ struct PartitionSplit {
     /// descriptor records, and otherwise the Hive directory of the table's location that
     /// its values name ([`hive_partition_location`]).
     location: String,
+}
+
+/// ONE SPLIT a read decodes: the unit of work Hive calls a split is one object of the data a
+/// table holds, and this is everything decoding it takes.
+#[derive(Debug, Clone, Copy)]
+struct Split<'held> {
+    /// How the object's bytes hold a record.
+    decoder: &'held Decoder,
+    /// The bytes to decode, with whatever compression the object carried already undone.
+    body: &'held [u8],
+    /// Where the object lives, which a failure to OPEN it at all names.
+    at: &'held str,
+    /// The values the hidden metadata columns of this object carry, which every row read out
+    /// of it holds beside its own fields.
+    metadata: &'held [::rusqlite::types::Value],
+    /// The partition values this object's own partition carries, which every row read out of
+    /// it holds for the table's partition keys.
+    partition: &'held [String],
 }
 
 /// One DATA DIRECTORY a read of a table scans: where to list, and which partition the rows
@@ -458,19 +486,28 @@ impl DataSource {
         // catalog marks as such and holds no metadata location for cannot be read at all
         // — which is a failure of the caller's own catalog entry, of Athena's published
         // class for it, and not a storage format this engine merely does not decode.
-        if is_iceberg(&table_parameters, &library, input_format.as_deref())
-            && property(&table_parameters, METADATA_LOCATION_PROPERTY).is_none()
-        {
+        let iceberg = is_iceberg(&table_parameters, &library, input_format.as_deref());
+        let iceberg_metadata =
+            property(&table_parameters, METADATA_LOCATION_PROPERTY).map(str::to_string);
+        if iceberg && iceberg_metadata.is_none() {
             return Err(Failure::iceberg_without_metadata_location());
         }
-        let decoder = decoder_of(&library, input_format.as_deref(), &serde_parameters)
-            .ok_or_else(|| {
-                Failure::emulator(format!(
+        // How the objects of a table are decoded is what its catalog entry records — for a
+        // HIVE table, whose data IS those objects. An Iceberg table's data files are not read
+        // through that entry at all: each one is decoded as the format its own manifest entry
+        // names ([`iceberg_tables`]), so an entry carrying Iceberg's own serialization
+        // library — which reads no data file — is no obstacle to reading the table.
+        let decoder = match decoder_of(&library, input_format.as_deref(), &serde_parameters) {
+            Some(decoder) => decoder,
+            None if iceberg => Decoder::Parquet,
+            None => {
+                return Err(Failure::emulator(format!(
                     "the data of {}.{} is stored as {library}, which this emulator's query \
                      engine does not read",
                     relation.database, relation.table
-                ))
-            })?;
+                )))
+            }
+        };
         let columns = ddl::relation_columns(table);
         // What the entry DECLARES has to be readable as a table definition before a read of
         // it can be planned: the catalog stores a column's type as the text a client wrote
@@ -498,6 +535,7 @@ impl DataSource {
             partitions: partition_splits(table, location.as_deref()),
             columns,
             location,
+            iceberg_metadata,
             decoder,
             skip_header_lines: table_parameters
                 .get(SKIP_HEADER_PROPERTY)
@@ -684,6 +722,18 @@ impl DataSource {
         metadata: &[MetadataColumn],
         read_columns: Option<&HashSet<String>>,
     ) -> Result<(Vec<Vec<::rusqlite::types::Value>>, usize), Failure> {
+        // A table of an OPEN TABLE FORMAT is read through its own metadata: what it holds is
+        // what its current committed snapshot names, so an object at its location that no
+        // snapshot reaches is no part of its data ([`Self::snapshot_rows`]).
+        if let Some(metadata_location) = self.iceberg_metadata.as_deref() {
+            return self.snapshot_rows(
+                metadata_location,
+                objects,
+                budget,
+                metadata,
+                read_columns,
+            );
+        }
         let mut rows: Vec<Vec<::rusqlite::types::Value>> = Vec::new();
         let mut scanned = 0usize;
         // A table whose catalog entry names no location has nothing under it to read.
@@ -731,7 +781,7 @@ impl DataSource {
                 // cutoff the query's workgroup sets and this emulator's own cap are both
                 // measured on the stored data a read goes through
                 // ([`Budget::charge_scan`]).
-                let going_through = self.scanned_bytes(&object.body, read_columns);
+                let going_through = self.scanned_bytes(&self.decoder, &object.body, read_columns);
                 budget.charge_scan(&self.relation, going_through)?;
                 scanned = scanned.saturating_add(going_through);
                 let split = format!("s3://{bucket_name}/{key}");
@@ -741,9 +791,90 @@ impl DataSource {
                     .iter()
                     .map(|column| column.value(&split, object))
                     .collect();
-                let body = self.uncompressed(key, &object.body, &split, budget)?;
-                self.decode(&body, &split, &held, &partition, &mut rows, budget)?;
+                let body =
+                    self.uncompressed(&self.decoder, key, &object.body, &split, budget)?;
+                self.decode(
+                    Split {
+                        decoder: &self.decoder,
+                        body: &body,
+                        at: &split,
+                        metadata: &held,
+                        partition: &partition,
+                    },
+                    &mut rows,
+                    budget,
+                )?;
             }
+        }
+        Ok((rows, scanned))
+    }
+
+    /// The rows the data files of this table's current COMMITTED SNAPSHOT decode to, and the
+    /// bytes read for them, for a table of the Iceberg open table format.
+    ///
+    /// The snapshot decides which rows a query sees: the files it names are read, each as the
+    /// format its own manifest entry declares, and nothing else at the table's location is
+    /// read at all. A table whose metadata names no current snapshot holds no row and goes
+    /// through no data, which is what makes an aggregate over a table nothing has committed
+    /// to count its rows as absent.
+    fn snapshot_rows(
+        &self,
+        metadata_location: &str,
+        objects: &s3_state::ComAmazonawsS3Amazons3State,
+        budget: &mut Budget,
+        metadata: &[MetadataColumn],
+        read_columns: Option<&HashSet<String>>,
+    ) -> Result<(Vec<Vec<::rusqlite::types::Value>>, usize), Failure> {
+        let mut rows: Vec<Vec<::rusqlite::types::Value>> = Vec::new();
+        let mut scanned = 0usize;
+        let files = iceberg_tables::committed_data_files(
+            objects,
+            metadata_location,
+            &self.relation,
+            budget,
+        )?;
+        for file in files {
+            budget.charge_deadline()?;
+            let decoder = file.decoder().ok_or_else(|| {
+                Failure::emulator(format!(
+                    "a data file of {}.{} is stored in the {} format, which this emulator's \
+                     query engine does not read",
+                    self.relation.database, self.relation.table, file.format
+                ))
+            })?;
+            let Some((bucket_name, key)) = parse_s3_uri(&file.path) else {
+                return Err(Failure::location_not_readable(&file.path));
+            };
+            // A data file the snapshot names and the store does not hold is a table whose
+            // data cannot be dereferenced, exactly as an absent location is.
+            let Some(object) = objects
+                .bucket(&bucket_name)
+                .and_then(|bucket| bucket.object(&key))
+            else {
+                return Err(Failure::location_not_readable(&file.path));
+            };
+            let going_through = self.scanned_bytes(&decoder, &object.body, read_columns);
+            budget.charge_scan(&self.relation, going_through)?;
+            scanned = scanned.saturating_add(going_through);
+            let held: Vec<::rusqlite::types::Value> = metadata
+                .iter()
+                .map(|column| column.value(&file.path, object))
+                .collect();
+            let body = self.uncompressed(&decoder, &key, &object.body, &file.path, budget)?;
+            // The partition a row belongs to is recorded in the file's own manifest entry
+            // rather than in its path, and the tables this reader is handed are unpartitioned
+            // ones, so a declared partition key holds no value here.
+            self.decode(
+                Split {
+                    decoder: &decoder,
+                    body: &body,
+                    at: &file.path,
+                    metadata: &held,
+                    partition: &[],
+                },
+                &mut rows,
+                budget,
+            )?;
         }
         Ok((rows, scanned))
     }
@@ -761,9 +892,14 @@ impl DataSource {
     /// however few columns the statement projects. A statement that names every column (a
     /// wildcard projection) goes through the whole object either way, and so does a columnar
     /// object this reader cannot read the metadata of.
-    fn scanned_bytes(&self, body: &[u8], read_columns: Option<&HashSet<String>>) -> usize {
+    fn scanned_bytes(
+        &self,
+        decoder: &Decoder,
+        body: &[u8],
+        read_columns: Option<&HashSet<String>>,
+    ) -> usize {
         let whole = body.len();
-        if self.decoder != Decoder::Parquet {
+        if *decoder != Decoder::Parquet {
             return whole;
         }
         let Some(named) = read_columns else {
@@ -875,12 +1011,13 @@ impl DataSource {
     /// rather than held.
     fn uncompressed<'body>(
         &self,
+        decoder: &Decoder,
         key: &str,
         body: &'body [u8],
         split: &str,
         budget: &mut Budget,
     ) -> Result<Cow<'body, [u8]>, Failure> {
-        if matches!(self.decoder, Decoder::Parquet) {
+        if matches!(decoder, Decoder::Parquet) {
             return Ok(Cow::Borrowed(body));
         }
         let Some(codec) = text_codecs::of_key(key) else {
@@ -909,31 +1046,27 @@ impl DataSource {
 
     /// Decode one object's bytes into the rows it holds, appending them to `rows`.
     ///
-    /// `split` is where the object this reads lives, which a failure to OPEN it at all names
-    /// — the unit of work Hive calls a split is one object of the table's location.
-    ///
-    /// `metadata` are the values the hidden metadata columns of this object carry, which
-    /// every row read out of it holds beside its own fields, and `partition` the partition
-    /// values the object's own partition carries, which every row read out of it holds for
-    /// the table's partition keys.
-    ///
     /// STREAMING, and budget-charged BEFORE each row is built: one record is read, charged
     /// and converted at a time, so a read stops at the first row over budget instead of
     /// holding a whole object's decoded records in memory first.
     fn decode(
         &self,
-        body: &[u8],
-        split: &str,
-        metadata: &[::rusqlite::types::Value],
-        partition: &[String],
+        held: Split<'_>,
         rows: &mut Vec<Vec<::rusqlite::types::Value>>,
         budget: &mut Budget,
     ) -> Result<(), Failure> {
+        let Split {
+            decoder,
+            body,
+            at: split,
+            metadata,
+            partition,
+        } = held;
         // Only the cells the read MATERIALISES are built, so the width one row charges
         // against the budget is the width of the row the engine is handed.
         let materialised = self.materialised();
         let width = materialised.len().saturating_add(metadata.len());
-        match &self.decoder {
+        match decoder {
             Decoder::Delimited { separator, quote } => {
                 // A text SerDe reads a split's bytes AS TEXT, byte for byte: a byte that is
                 // not text stands for the replacement character the way Hive's own text

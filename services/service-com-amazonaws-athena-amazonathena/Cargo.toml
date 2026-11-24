@@ -96,6 +96,12 @@ parquet = { version = "60.2", default-features = false, features = [
     "snap",
     "flate2-rust_backend",
 ] }
+# `apache-avro`: a table of the ICEBERG open table format is read through its metadata, and
+# the manifest list and the manifests a snapshot names its data files in are Avro containers,
+# so they are read by the Apache implementation of that format — the same one this workspace
+# writes them with (`state::catalog_sql::data::iceberg_tables`). Only the container format is
+# read, so no codec feature is enabled.
+apache-avro = { version = "0.17", default-features = false }
 # The codecs an object of a TEXT table can be compressed with, chosen by the extension of
 # the object's own key before the text SerDe reads it
 # (`state::catalog_sql::data::text_codecs`). Each one is read by the maintained decoder for
