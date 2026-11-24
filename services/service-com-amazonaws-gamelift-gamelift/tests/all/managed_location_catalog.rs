@@ -69,9 +69,10 @@ fn entry<'a>(locations: &'a [Value], name: &str) -> Option<&'a Value> {
 /// documentation links to ("Learn more Service locations"), which the emulator's own
 /// catalog (`crate::state::MANAGED_LOCATIONS`) carries: Regions, whose beacon is
 /// `gamelift-ping.<region>.api.aws`, and Local Zones of a Region, whose beacon is
-/// `gamelift-ping-<zone code>.<parent region>.api.aws`. The rows deliberately include
-/// locations in both forms, in Regions on three continents, and are not only the ones the
-/// recorded response happened to list first.
+/// `gamelift-ping-<city code>.<parent region>.api.aws`, the city code being the zone name
+/// without the trailing index. The rows deliberately include locations in both forms, in
+/// Regions on four continents, and are not only the ones the recorded response happened to
+/// list first.
 const CATALOG_ROWS: &[(&str, &str)] = &[
     // A Region in each of three continents, none of them the Region these requests are
     // signed for.
@@ -80,13 +81,108 @@ const CATALOG_ROWS: &[(&str, &str)] = &[
     ("ap-northeast-1", "gamelift-ping.ap-northeast-1.api.aws"),
     // The Region the requests ARE signed for, which the catalog carries like any other.
     ("us-west-2", "gamelift-ping.us-west-2.api.aws"),
-    // Local Zones of two different parent Regions.
-    ("us-east-1-atl-1", "gamelift-ping-atl-1.us-east-1.api.aws"),
-    ("us-west-2-lax-1", "gamelift-ping-lax-1.us-west-2.api.aws"),
+    // Further Regions the service publishes, on two more continents.
+    ("mx-central-1", "gamelift-ping.mx-central-1.api.aws"),
+    ("ap-southeast-7", "gamelift-ping.ap-southeast-7.api.aws"),
+    ("eu-south-1", "gamelift-ping.eu-south-1.api.aws"),
+    ("eu-south-2", "gamelift-ping.eu-south-2.api.aws"),
+    ("il-central-1", "gamelift-ping.il-central-1.api.aws"),
+    // Local Zones of three different parent Regions, each beacon naming the zone's city
+    // and not the index that distinguishes the zones of that city.
+    ("us-east-1-atl-1", "gamelift-ping-atl.us-east-1.api.aws"),
+    ("us-east-1-atl-2", "gamelift-ping-atl.us-east-1.api.aws"),
+    ("us-east-1-iah-2", "gamelift-ping-iah.us-east-1.api.aws"),
+    ("us-east-1-bue-1", "gamelift-ping-bue.us-east-1.api.aws"),
+    ("us-west-2-lax-1", "gamelift-ping-lax.us-west-2.api.aws"),
+    ("us-west-2-den-1", "gamelift-ping-den.us-west-2.api.aws"),
+    ("af-south-1-los-1", "gamelift-ping-los.af-south-1.api.aws"),
     // And two the recorded response did list, one Region and one Local Zone.
     ("ap-south-1", "gamelift-ping.ap-south-1.api.aws"),
-    ("us-east-1-mia-2", "gamelift-ping-mia-2.us-east-1.api.aws"),
+    ("us-east-1-mia-2", "gamelift-ping-mia.us-east-1.api.aws"),
 ];
+
+/// The Local Zones of one city, which share that city's one published beacon: the parent
+/// Region, the city code the beacon host name carries, and the zones of that city the
+/// published catalog holds (`crate::state::MANAGED_LOCATIONS`). The last three rows are
+/// cities whose catalog entry is a single zone — one of them indexed `-2`, and one in a
+/// Region on another continent — so the index is stripped there too.
+const CITY_ZONE_GROUPS: &[(&str, &str, &[&str])] = &[
+    ("us-east-1", "atl", &["us-east-1-atl-1", "us-east-1-atl-2"]),
+    ("us-east-1", "chi", &["us-east-1-chi-1", "us-east-1-chi-2"]),
+    ("us-east-1", "dfw", &["us-east-1-dfw-1", "us-east-1-dfw-2"]),
+    ("us-east-1", "iah", &["us-east-1-iah-1", "us-east-1-iah-2"]),
+    ("us-west-2", "phx", &["us-west-2-phx-1", "us-west-2-phx-2"]),
+    ("us-east-1", "mia", &["us-east-1-mia-2"]),
+    ("us-east-1", "lim", &["us-east-1-lim-1"]),
+    ("af-south-1", "los", &["af-south-1-los-1"]),
+];
+
+/// A managed location's beacon host name is published per hosting location: one host name
+/// per Region, and one per Local Zone CITY — so the zones of a city share a beacon and no
+/// beacon host name carries a zone's numeric index.
+#[tokio::test]
+async fn a_local_zone_beacon_names_its_city_and_the_zones_of_a_city_share_it() {
+    let gamelift = GameLift::new();
+    let listed = list_locations(&gamelift, json!({"Filters": ["AWS"], "Limit": 200})).await;
+
+    for (region, city, zones) in CITY_ZONE_GROUPS {
+        let expected = json!({
+            "UDPEndpoint": {
+                "Domain": format!("gamelift-ping-{city}.{region}.api.aws"),
+                "Port": PING_BEACON_PORT,
+            }
+        });
+        for zone in *zones {
+            let Some(reported) = entry(&listed, zone) else {
+                panic!("case {zone:?}: the catalog must carry this Local Zone");
+            };
+            assert_eq!(
+                reported["PingBeacon"], expected,
+                "case {zone:?}: expected the beacon published for city {city:?} in {region:?}, \
+                 got {reported}"
+            );
+        }
+    }
+
+    // And across the WHOLE served catalog, no beacon host label carries a trailing numeric
+    // segment: a Region's label is the bare prefix, a Local Zone's is the prefix plus its
+    // city code.
+    for reported in &listed {
+        let name = reported["LocationName"].as_str().unwrap_or_default();
+        if reported["PingBeacon"].is_null() {
+            continue;
+        }
+        let domain = reported["PingBeacon"]["UDPEndpoint"]["Domain"]
+            .as_str()
+            .unwrap_or_default();
+        let (label, dns_zone) = domain
+            .split_once('.')
+            .unwrap_or_else(|| panic!("case {name:?}: expected a host name, got {domain:?}"));
+        assert!(
+            dns_zone.ends_with("api.aws"),
+            "case {name:?}: expected a beacon in the service's published zone, got {domain:?}"
+        );
+        let Some(suffix) = label.strip_prefix("gamelift-ping") else {
+            panic!("case {name:?}: expected the published beacon prefix, got {domain:?}");
+        };
+        match suffix.strip_prefix('-') {
+            Some(city) => {
+                let indexed = city.split('-').next_back().is_some_and(|segment| {
+                    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
+                });
+                assert!(
+                    !indexed,
+                    "case {name:?}: a Local Zone beacon names its city without the zone \
+                     index, got {domain:?}"
+                );
+            }
+            None => assert!(
+                suffix.is_empty(),
+                "case {name:?}: expected the published beacon prefix, got {domain:?}"
+            ),
+        }
+    }
+}
 
 /// The `AWS` filter serves the published catalog of managed locations, every one of them
 /// carrying its ping beacon and none of them an ARN.

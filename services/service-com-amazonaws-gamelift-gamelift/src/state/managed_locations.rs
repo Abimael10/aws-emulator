@@ -25,8 +25,10 @@ pub const PING_BEACON_PORT: i32 = 7770;
 
 /// The host-name prefix every managed location's ping beacon carries, in the service's own
 /// `api.aws` zone: `gamelift-ping.<region>.api.aws` for a Region and
-/// `gamelift-ping-<zone code>.<parent region>.api.aws` for a Local Zone, where the zone
-/// code is the part of the location's name that follows its parent Region.
+/// `gamelift-ping-<city code>.<parent region>.api.aws` for a Local Zone, where the city
+/// code is the city/airport code of the zone — the part of the location's name that
+/// follows its parent Region, without the trailing numeric index that distinguishes the
+/// zones of one city, so those zones share the city's one beacon.
 const PING_BEACON_PREFIX: &str = "gamelift-ping";
 
 /// The DNS zone the beacons are published in.
@@ -40,11 +42,17 @@ const PING_BEACON_SUFFIX: &str = "api.aws";
 /// `^[A-Za-z0-9\-]+$`), so the value set is not in the model: it is the published Amazon
 /// GameLift Servers service-location list (the "Service locations" reference
 /// `ListLocations`' own doc links to, which names the Regions and the Local Zones the
-/// service offers). Listed Region by Region, each Region followed by its Local Zones and
-/// the Regions in name order, so one reader can see at a glance which locations belong
-/// together — and so the list a paginated walk pages over is stable.
+/// service offers) — the Regions the service offers for managed hosting and the Local
+/// Zones of those Regions, and only those: a Region or zone the service does not offer is
+/// not a location a caller may deploy a fleet to, so reporting one would tell a client a
+/// `CreateFleet` is legal when it is not.
+///
+/// Listed Region by Region, each Region followed by its Local Zones and the Regions in
+/// name order, so one reader can see at a glance which locations belong together — and so
+/// the list a paginated walk pages over is stable.
 pub const MANAGED_LOCATIONS: &[(&str, &str)] = &[
     ("af-south-1", "af-south-1"),
+    ("af-south-1-los-1", "af-south-1"),
     ("ap-east-1", "ap-east-1"),
     ("ap-northeast-1", "ap-northeast-1"),
     ("ap-northeast-2", "ap-northeast-2"),
@@ -54,40 +62,36 @@ pub const MANAGED_LOCATIONS: &[(&str, &str)] = &[
     ("ap-southeast-2", "ap-southeast-2"),
     ("ap-southeast-3", "ap-southeast-3"),
     ("ap-southeast-5", "ap-southeast-5"),
+    ("ap-southeast-7", "ap-southeast-7"),
     ("ca-central-1", "ca-central-1"),
     ("eu-central-1", "eu-central-1"),
-    ("eu-central-2", "eu-central-2"),
     ("eu-north-1", "eu-north-1"),
+    ("eu-south-1", "eu-south-1"),
+    ("eu-south-2", "eu-south-2"),
     ("eu-west-1", "eu-west-1"),
     ("eu-west-2", "eu-west-2"),
     ("eu-west-3", "eu-west-3"),
     ("il-central-1", "il-central-1"),
-    ("me-central-1", "me-central-1"),
     ("me-south-1", "me-south-1"),
+    ("mx-central-1", "mx-central-1"),
     ("sa-east-1", "sa-east-1"),
     ("us-east-1", "us-east-1"),
     ("us-east-1-atl-1", "us-east-1"),
-    ("us-east-1-bos-1", "us-east-1"),
+    ("us-east-1-atl-2", "us-east-1"),
     ("us-east-1-bue-1", "us-east-1"),
     ("us-east-1-chi-1", "us-east-1"),
     ("us-east-1-chi-2", "us-east-1"),
     ("us-east-1-dfw-1", "us-east-1"),
     ("us-east-1-dfw-2", "us-east-1"),
     ("us-east-1-iah-1", "us-east-1"),
+    ("us-east-1-iah-2", "us-east-1"),
     ("us-east-1-lim-1", "us-east-1"),
     ("us-east-1-mci-1", "us-east-1"),
-    ("us-east-1-mia-1", "us-east-1"),
     ("us-east-1-mia-2", "us-east-1"),
-    ("us-east-1-msp-1", "us-east-1"),
-    ("us-east-1-nyc-1", "us-east-1"),
-    ("us-east-1-phl-1", "us-east-1"),
-    ("us-east-1-qro-1", "us-east-1"),
-    ("us-east-1-scl-1", "us-east-1"),
     ("us-east-2", "us-east-2"),
     ("us-west-1", "us-west-1"),
     ("us-west-2", "us-west-2"),
     ("us-west-2-den-1", "us-west-2"),
-    ("us-west-2-las-1", "us-west-2"),
     ("us-west-2-lax-1", "us-west-2"),
     ("us-west-2-phx-1", "us-west-2"),
     ("us-west-2-phx-2", "us-west-2"),
@@ -142,10 +146,26 @@ pub fn ping_beacon_domain(location: &str) -> String {
         .and_then(|rest| rest.strip_prefix('-'))
     {
         Some(zone) if !zone.is_empty() => {
-            format!("{PING_BEACON_PREFIX}-{zone}.{region}.{PING_BEACON_SUFFIX}")
+            let city = local_zone_city_code(zone);
+            format!("{PING_BEACON_PREFIX}-{city}.{region}.{PING_BEACON_SUFFIX}")
         }
         _ => format!("{PING_BEACON_PREFIX}.{region}.{PING_BEACON_SUFFIX}"),
     }
+}
+
+/// The city/airport code of a Local Zone, given the part of its name that follows its
+/// parent Region: `zone` without the trailing numeric index.
+///
+/// A Local Zone's name is `<parent region>-<city code>-<index>`, the index distinguishing
+/// the zones a city holds. The beacon is published per hosting CITY, so the zones of one
+/// city share one host name and the index is not part of it. A remainder that carries no
+/// trailing numeric segment is a city code already and is used whole.
+fn local_zone_city_code(zone: &str) -> &str {
+    zone.rsplit_once('-')
+        .filter(|(city, index)| {
+            !city.is_empty() && !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or(zone, |(city, _)| city)
 }
 
 /// The `PingBeacon` a managed location carries.
