@@ -20,12 +20,14 @@
 //!   outside those five is not an attribute of an entity at all;
 //! * `Entity$attributes`, "additional attributes of the entity that are not used to specify
 //!   the identity of the entity", which identify nothing: which names a producer may fill in
-//!   there is published outside this model (the guide that member links to), so nothing of
-//!   them is judged here.
+//!   there is published outside this model (the guide that member links to), and a producer's
+//!   OWN name carries whatever text it likes — but a name that guide publishes a set of values
+//!   for states one of those values, and nothing else can be read as that attribute
+//!   ([`ATTRIBUTE_VALUE_CATALOGUE`]).
 //!
-//! The REQUIRED fields of the identity map are read first and its extra key names after them
-//! ([`error_type`]), so an entity that identifies nothing is reported for what it is missing
-//! rather than for what it carries besides.
+//! The REQUIRED fields of the identity map are read first, its extra key names after them, and
+//! the additional attributes beside it last ([`error_type`]), so an entity that identifies
+//! nothing is reported for what it is missing rather than for what it carries besides.
 //!
 //! Every value the rejection can carry is one of the modelled
 //! [`EntityRejectionErrorType`](crate::ops::types::ENTITY_REJECTION_ERROR_TYPE_VALUES)
@@ -91,8 +93,44 @@ const INVALID_TYPE_VALUE: &str = "InvalidTypeValue";
 const MISSING_REQUIRED_FIELDS: &str = "MissingRequiredFields";
 
 /// The error type for an entity whose `keyAttributes` carry an attribute that states ANOTHER
-/// entity type's identity than the one the entity declared.
+/// entity type's identity than the one the entity declared, and for an entity whose
+/// `attributes` state a value outside the set published for the attribute they are under
+/// ([`ATTRIBUTE_VALUE_CATALOGUE`]).
 const INVALID_ATTRIBUTES: &str = "InvalidAttributes";
+
+/// The `attributes` names whose values are drawn from a PUBLISHED set, each with that set.
+///
+/// `Entity$attributes` links its names to "How to add related information to telemetry" in the
+/// CloudWatch User Guide
+/// (`smithy_query(query="doc",shape="Entity",member="attributes")`), where the table of
+/// attributes gives these two their valid values: the platform an entity runs on, and where
+/// the name of a service entity came from. Every other name in that table — the Kubernetes,
+/// EC2 and host coordinates, and a producer's own additions — carries free text, which is why
+/// only these two are listed here.
+const ATTRIBUTE_VALUE_CATALOGUE: [(&str, &[&str]); 2] = [
+    (
+        "PlatformType",
+        &[
+            "AWS::EC2",
+            "AWS::ECS",
+            "AWS::EKS",
+            "AWS::Lambda",
+            "K8s",
+            "Generic",
+        ],
+    ),
+    (
+        "AWS.ServiceNameSource",
+        &[
+            "Instrumentation",
+            "UserConfiguration",
+            "ClientIamRole",
+            "K8sWorkload",
+            "RdsDbInstance",
+            "CloudFormationStack",
+        ],
+    ),
+];
 
 /// Why `entity` was rejected, or `None` for a request that carried no entity or carried one
 /// this service can read — in which case the response reports no `rejectedEntityInfo` at all
@@ -114,7 +152,9 @@ pub fn rejection(entity: Option<&Entity>) -> Option<RejectedEntityInfo> {
 /// held to what its identity map carries BESIDES that identity: a key name outside the five
 /// the member admits, and one of the five that states another type's identity. So an entity
 /// that identifies nothing is reported for what it is missing rather than for what it carries
-/// beyond it.
+/// beyond it. The ADDITIONAL attributes come last, because they identify nothing at all: only
+/// a name the catalogue publishes values for can fail to be read there
+/// ([`states_unpublished_value`]).
 fn error_type(entity: &Entity) -> Option<&'static str> {
     let key_attributes = entity.key_attributes.as_ref()?;
     let Some(entity_type) = key_attributes
@@ -150,13 +190,33 @@ fn error_type(entity: &Entity) -> Option<&'static str> {
     {
         return Some(INVALID_KEY_ATTRIBUTES);
     }
-    key_attributes
-        .keys()
-        .any(|key| {
-            ![TYPE_ATTRIBUTE, ENVIRONMENT_ATTRIBUTE].contains(&key.as_str())
-                && !identified_by.contains(&key.as_str())
-        })
-        .then_some(INVALID_ATTRIBUTES)
+    if key_attributes.keys().any(|key| {
+        ![TYPE_ATTRIBUTE, ENVIRONMENT_ATTRIBUTE].contains(&key.as_str())
+            && !identified_by.contains(&key.as_str())
+    }) {
+        return Some(INVALID_ATTRIBUTES);
+    }
+    // The additional attributes identify nothing, so they are read last — and only the ones
+    // whose values are published can fail to be read at all.
+    states_unpublished_value(entity.attributes.as_ref()).then_some(INVALID_ATTRIBUTES)
+}
+
+/// Whether `attributes` states, under a name the attribute catalogue publishes values for, a
+/// value that is not one of them — which is what makes an additional attribute unreadable.
+///
+/// A name the catalogue does not carry is a producer's own, and "additional attributes of the
+/// entity that are not used to specify the identity of the entity" identify nothing, so such a
+/// name's value is free text and is read as given.
+fn states_unpublished_value(attributes: Option<&HashMap<String, String>>) -> bool {
+    let Some(attributes) = attributes else {
+        return false;
+    };
+    attributes.iter().any(|(name, value)| {
+        ATTRIBUTE_VALUE_CATALOGUE
+            .iter()
+            .find(|(attribute, _)| *attribute == name.as_str())
+            .is_some_and(|(_, published)| !published.contains(&value.as_str()))
+    })
 }
 
 /// Whether `attributes` states nothing under `attribute`: an attribute present with no text
@@ -288,8 +348,8 @@ mod tests {
     }
 
     /// RULE: beside a complete identity, the identity map is held to the five names it may
-    /// carry and to the ones that state the TYPE it declared — while the `attributes` beside
-    /// it, which identify nothing, decide nothing.
+    /// carry and to the ones that state the TYPE it declared — while an `attributes` name the
+    /// catalogue publishes no values for carries whatever text it is given.
     #[test]
     fn the_identity_map_is_held_to_the_names_it_may_carry() {
         let identity = [
@@ -380,6 +440,71 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected the rejection {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: an additional attribute whose name the catalogue publishes values for states one
+    /// of those values; anything else cannot be read as that attribute.
+    ///
+    /// Every published value of every catalogued name is admitted, and each name is also given
+    /// a value outside its set — including one that belongs to the OTHER catalogued name, so a
+    /// value is read under the name it is stated for rather than against the catalogue as a
+    /// whole.
+    #[test]
+    fn an_additional_attribute_is_held_to_the_values_published_for_it() {
+        let with_attributes = |attributes: Attributes| Entity {
+            key_attributes: Some(
+                [
+                    ("Type".to_string(), "Service".to_string()),
+                    ("Name".to_string(), "orders".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            attributes: Some(attributes.into_iter().collect()),
+        };
+        let one = |name: &str, value: &str| -> Attributes {
+            vec![(name.to_string(), value.to_string())]
+        };
+        for (name, published) in ATTRIBUTE_VALUE_CATALOGUE {
+            for value in published {
+                let case = format!("{name}={value}, a published value");
+                let rejected = rejection(Some(&with_attributes(one(name, value))));
+                let actual = rejected.as_ref().map(|info| info.error_type.as_str());
+                assert_eq!(
+                    actual, None,
+                    "case {case:?}: expected no rejection, got {actual:?}"
+                );
+            }
+            // A value of the OTHER catalogued name, and one no name publishes.
+            let unpublished: Vec<&str> = ATTRIBUTE_VALUE_CATALOGUE
+                .iter()
+                .filter(|(other, _)| *other != name)
+                .flat_map(|(_, values)| values.iter().copied())
+                .chain(["", "  ", "not-a-published-value", "aws::ec2"])
+                .filter(|value| !published.contains(value))
+                .collect();
+            for value in unpublished {
+                let case = format!("{name}={value:?}, not a published value");
+                let rejected = rejection(Some(&with_attributes(one(name, value))));
+                let actual = rejected.as_ref().map(|info| info.error_type.as_str());
+                assert_eq!(
+                    actual,
+                    Some(INVALID_ATTRIBUTES),
+                    "case {case:?}: expected the rejection {INVALID_ATTRIBUTES:?}, got {actual:?}"
+                );
+            }
+            // A name the catalogue does not carry takes the same text as free text.
+            let case = format!("a producer's own name carrying {name}'s rejected value");
+            let rejected = rejection(Some(&with_attributes(one(
+                "Producer.OwnAttribute",
+                "not-a-published-value",
+            ))));
+            let actual = rejected.as_ref().map(|info| info.error_type.as_str());
+            assert_eq!(
+                actual, None,
+                "case {case:?}: expected no rejection, got {actual:?}"
             );
         }
     }
