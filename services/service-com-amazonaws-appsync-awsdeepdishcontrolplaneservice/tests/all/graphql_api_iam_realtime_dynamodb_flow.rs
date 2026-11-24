@@ -37,15 +37,15 @@ use crate::graphql_api_realtime_endpoint::{exchange, handshake, next_frame, quer
 
 /// The Region every call of this suite is signed for, which is also the Region the API is
 /// created in — the `appsync` control-plane helper this suite shares signs for it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The path each of the API's two endpoints is served at.
-const REALTIME_PATH: &str = "/graphql";
-const GRAPHQL_PATH: &str = "/graphql";
+pub(crate) const REALTIME_PATH: &str = "/graphql";
+pub(crate) const GRAPHQL_PATH: &str = "/graphql";
 
 /// The table the resolvers of this suite resolve against, and its one key attribute.
-const TABLE: &str = "appsync-realtime-notes";
-const KEY_ATTRIBUTE: &str = "id";
+pub(crate) const TABLE: &str = "appsync-realtime-notes";
+pub(crate) const KEY_ATTRIBUTE: &str = "id";
 
 /// The name of the `AMAZON_DYNAMODB` data source both resolvers are bound to.
 const DATA_SOURCE: &str = "Notes";
@@ -184,7 +184,12 @@ async fn a_signed_subscriber_receives_the_mutation_a_dynamodb_resolver_wrote_and
 }
 
 /// A router with the three services the recorded topology spans, over ONE engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// Shared with every suite that drives the same topology — the versioned data source
+/// ([`crate::graphql_api_dynamodb_versioned_data_source`]) and the DynamoDB helper module a
+/// resolver imports ([`crate::graphql_api_dynamodb_helper_module`]) — so they all stand the
+/// services up one way.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // What a case pins is what the endpoints ANSWER for the identity the access key id
@@ -218,7 +223,7 @@ fn emulator() -> MultiServiceRouter {
 /// signed for. The signature itself is not verified by a service — the emulator verifies
 /// request signatures at its front door — so what a case pins is what the endpoint answers
 /// material of this mode.
-fn sigv4_material() -> String {
+pub(crate) fn sigv4_material() -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR/20260101/{REGION}/appsync/aws4_request, \
          SignedHeaders=accept;content-encoding;content-type;host;x-amz-date, Signature=0000"
@@ -228,7 +233,7 @@ fn sigv4_material() -> String {
 /// The authorization object a signed real-time client carries in the handshake's `header`
 /// parameter: the fields it would have signed on a request to the API's `GRAPHQL` endpoint,
 /// `host` among them — which is that endpoint's authority and not the real-time one's.
-fn signed_auth_object(graphql: &str) -> Value {
+pub(crate) fn signed_auth_object(graphql: &str) -> Value {
     json!({
         "accept": "application/json, text/javascript",
         "content-encoding": "amz-1.0",
@@ -241,7 +246,7 @@ fn signed_auth_object(graphql: &str) -> Value {
 
 /// POST one signed GraphQL document to the address the API published, as a client does, and
 /// answer the document it was served — asserting it was answered 200 and carried no errors.
-async fn signed_graphql(case: &str, graphql: &str, document: &Value) -> Value {
+pub(crate) async fn signed_graphql(case: &str, graphql: &str, document: &Value) -> Value {
     let (status, _, answered) = try_post_answer(
         case,
         graphql,
@@ -270,8 +275,9 @@ async fn signed_graphql(case: &str, graphql: &str, document: &Value) -> Value {
 /// asserting it was served.
 ///
 /// `pub(crate)`: the versioned-data-source suite
-/// ([`crate::graphql_api_dynamodb_versioned_data_source`]) reads what the table holds through
-/// this same client, so both suites reach that service one way.
+/// ([`crate::graphql_api_dynamodb_versioned_data_source`]) and the one that drives the DynamoDB
+/// helper module a resolver imports ([`crate::graphql_api_dynamodb_helper_module`]) read what
+/// the table holds through this same client, so every suite reaches that service one way.
 pub(crate) async fn dynamodb(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
@@ -336,7 +342,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 
 /// Create the table the resolvers resolve against through DynamoDB's own API, wait until that
 /// service first reports it `ACTIVE`, and answer the ARN it holds it under.
-async fn create_table(router: &MultiServiceRouter) -> String {
+pub(crate) async fn create_table(router: &MultiServiceRouter) -> String {
     let created = dynamodb(
         router,
         "CreateTable",

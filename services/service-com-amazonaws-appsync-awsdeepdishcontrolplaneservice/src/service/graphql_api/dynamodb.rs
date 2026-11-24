@@ -7,8 +7,10 @@
 //! The request half of such a step returns the data source's own request object: an
 //! `operation` naming the call to make and, beside it, the members that call takes — the
 //! `key` of one item, the `attributeValues` of one to write, the `update` and `condition`
-//! expressions, or the `query`/`filter` of a selection. The result the response half is then
-//! handed is what DynamoDB answered, with every attribute value UNMARSHALLED
+//! expressions, or the `query`/`filter` of a selection. Code written for the APPSYNC_JS
+//! runtime may have that object BUILT for it rather than writing it out, by the DynamoDB
+//! helper module AppSync publishes for exactly that ([`helpers`]). The result the response half
+//! is then handed is what DynamoDB answered, with every attribute value UNMARSHALLED
 //! ([`plain_value`]): a single-item operation answers the item itself, and `Query` and `Scan`
 //! answer `items`, `nextToken` and `scannedCount`.
 //!
@@ -60,6 +62,7 @@ use super::mapping_template::utilities::dynamodb::{
 };
 use super::PlaneContext;
 
+pub mod helpers;
 pub mod versioned;
 
 /// The `AMAZON_DYNAMODB` data source a step resolves against, as the step's own record

@@ -16,10 +16,12 @@
 //! A FRESH engine per call, so nothing of one evaluation is reachable from the next: no
 //! global, no module instance and no value outlives the call that made it. Inside that
 //! engine the code reaches the language and the host functions of this module's own (the
-//! log, the appended error, the id mint, the DynamoDB marshalling, the relational-database
-//! statement helpers and the record of the `extensions` calls it made), and a module resolver
-//! that answers with the TWO specifiers AppSync's own resolvers import
-//! ([`crate::service::event_api::handlers::UTILS_MODULE`] and [`RDS_UTILS_MODULE`]) — so an
+//! log, the appended error, the id mint, the DynamoDB marshalling, the DynamoDB request
+//! builders, the relational-database statement helpers and the record of the `extensions`
+//! calls it made), and a module resolver
+//! that answers with the specifiers AppSync's own resolvers import
+//! ([`crate::service::event_api::handlers::UTILS_MODULE`], [`RDS_UTILS_MODULE`] and
+//! [`DYNAMODB_UTILS_MODULE`]) — so an
 //! `import` of anything
 //! else fails to resolve rather than reaching a host path. Plain QuickJS registers no
 //! filesystem, process, environment, network, host-library or thread API, and this module
@@ -82,6 +84,15 @@ use crate::state::{now_nanos, offset_of, splitmix64};
 #[path = "appsync_js/rds_module.rs"]
 mod rds_module;
 use rds_module::{RDS_HOST_FUNCTION, RDS_UTILS_MODULE, RDS_UTILS_MODULE_SOURCE};
+
+/// The `@aws-appsync/utils/dynamodb` module: the request builders a resolver over an
+/// `AMAZON_DYNAMODB` data source writes its request with, declared beside this file for the
+/// same reason.
+#[path = "appsync_js/dynamodb_module.rs"]
+mod dynamodb_module;
+use dynamodb_module::{
+    DDB_HOST_FUNCTION, DYNAMODB_UTILS_MODULE, DYNAMODB_UTILS_MODULE_SOURCE,
+};
 
 /// How long one evaluation may run before it is stopped.
 ///
@@ -1102,8 +1113,37 @@ fn install_host(
         .set(RDS_HOST_FUNCTION, Func::from(rds_helper))
         .map_err(|error| {
             format!("the sandbox relational database helpers could not be installed: {error}")
+        })?;
+    globals
+        .set(DDB_HOST_FUNCTION, Func::from(ddb_helper))
+        .map_err(|error| {
+            format!("the sandbox DynamoDB request builders could not be installed: {error}")
         })
 }
+
+/// What one call of a `@aws-appsync/utils/dynamodb` helper came to, as the JSON document the
+/// sandbox reads back: `value` for the request object it built, or `error` for the fault it
+/// states.
+///
+/// The builders themselves are the service's ONE reading of them
+/// (`crate::service::graphql_api::dynamodb::helpers`), so the request a resolver has built for
+/// it and the request another writes out by hand are read by one place. Nothing of the host is
+/// reachable through it: it is a pure transformation of the payload the call was made with.
+fn ddb_helper(helper: String, arguments: String) -> String {
+    use crate::service::graphql_api::dynamodb::helpers;
+
+    let args: Vec<::serde_json::Value> =
+        ::serde_json::from_str(&arguments).unwrap_or_default();
+    let answered = match helpers::call(&helper, &args) {
+        Ok(Some(value)) => ::serde_json::json!({"value": value}),
+        Ok(None) => ::serde_json::json!({"error": format!("{NO_SUCH_DDB_HELPER}{helper}")}),
+        Err(fault) => ::serde_json::json!({"error": fault}),
+    };
+    answered.to_string()
+}
+
+/// How a call naming a DynamoDB request builder this runtime does not publish is stated.
+const NO_SUCH_DDB_HELPER: &str = "No such helper: ";
 
 /// What one call of a `@aws-appsync/utils/rds` helper came to, as the JSON document the
 /// sandbox reads back: `value` for what the helper answered, or `error` for the fault it
@@ -1630,7 +1670,7 @@ impl Resolver for UtilsResolver {
 
 /// The modules this runtime provides, each by the specifier an `import` names it with, and
 /// the source each is declared from ([`UtilsLoader`]).
-const PROVIDED_MODULES: &[&str] = &[UTILS_MODULE, RDS_UTILS_MODULE];
+const PROVIDED_MODULES: &[&str] = &[UTILS_MODULE, RDS_UTILS_MODULE, DYNAMODB_UTILS_MODULE];
 
 /// How a provided module is loaded: from the source this crate carries for it. No path is
 /// opened for either.
@@ -1648,6 +1688,8 @@ impl Loader for UtilsLoader {
             UTILS_MODULE_SOURCE
         } else if path == RDS_UTILS_MODULE {
             RDS_UTILS_MODULE_SOURCE
+        } else if path == DYNAMODB_UTILS_MODULE {
+            DYNAMODB_UTILS_MODULE_SOURCE
         } else {
             return Err(::rquickjs::Error::new_loading(path.to_string()));
         };
