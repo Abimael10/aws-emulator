@@ -69,9 +69,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         let directory = self.directories.get(directory_id)?;
         let teardown = DirectoryTeardown {
             directory_id: directory.directory_id.clone(),
-            security_group_id: directory
-                .provisioned_security_group_id()
-                .map(str::to_string),
+            security_group_id: directory.provisioned_security_group_id().map(str::to_string),
             network_interface_ids: directory.provisioned_network_interface_ids(),
         };
         self.retire_directory(&teardown.directory_id, now);

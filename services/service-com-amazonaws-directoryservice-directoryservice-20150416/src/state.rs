@@ -3940,7 +3940,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// This is the ONLY write a reporting operation performs: the changes here were
     /// owed at `now` whether or not anybody called, because each due instant was stored
     /// when the record it belongs to was created — a directory's stage when
-    /// `CreateDirectory` ran, a snapshot's status when `CreateSnapshot` ran, an IP
+    /// `CreateDirectory` ran, the teardown's stages when `DeleteDirectory` ran, a
+    /// snapshot's status when `CreateSnapshot` ran, an IP
     /// route's status when `AddIpRoutes` or `RemoveIpRoutes` ran, an assessment's
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
