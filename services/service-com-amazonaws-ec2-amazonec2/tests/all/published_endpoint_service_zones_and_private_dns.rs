@@ -131,7 +131,7 @@ fn member(case: &str, body: &str, name: &str) -> Option<String> {
 /// The zones the Region has, as `DescribeAvailabilityZones` reports them: `(name, id)` pairs in
 /// the order that report lists them, which is the pairing an endpoint service's two zone lists
 /// have to agree with.
-async fn zones_of_region(
+pub(crate) async fn zones_of_region(
     case: &str,
     router: &MultiServiceRouter,
     region: &str,

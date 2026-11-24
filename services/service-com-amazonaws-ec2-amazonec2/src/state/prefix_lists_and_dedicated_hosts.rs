@@ -2871,6 +2871,9 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
     AwsEndpointService { label: "codeguru-profiler", types: INTERFACE_ONLY },
     AwsEndpointService { label: "codeguru-reviewer", types: INTERFACE_ONLY },
     AwsEndpointService { label: "codepipeline", types: INTERFACE_ONLY },
+    // The connections API of AWS CodeConnections, which the guide publishes under the
+    // `codestar-connections` name the service shipped as.
+    AwsEndpointService { label: "codestar-connections.api", types: INTERFACE_ONLY },
     AwsEndpointService { label: "cognito-identity", types: INTERFACE_ONLY },
     AwsEndpointService { label: "cognito-idp", types: INTERFACE_ONLY },
     AwsEndpointService { label: "comprehend", types: INTERFACE_ONLY },
@@ -2896,6 +2899,9 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
     AwsEndpointService { label: "eks-auth", types: INTERFACE_ONLY },
     AwsEndpointService { label: "elasticache", types: INTERFACE_ONLY },
     AwsEndpointService { label: "elasticbeanstalk", types: INTERFACE_ONLY },
+    // The DEDICATED service the health agent of an AWS Elastic Beanstalk environment reports
+    // to, which the guide publishes beside the plain `elasticbeanstalk` API service.
+    AwsEndpointService { label: "elasticbeanstalk-health", types: INTERFACE_ONLY },
     AwsEndpointService { label: "elasticfilesystem", types: INTERFACE_ONLY },
     AwsEndpointService { label: "elasticloadbalancing", types: INTERFACE_ONLY },
     AwsEndpointService { label: "elasticmapreduce", types: INTERFACE_ONLY },
@@ -2914,13 +2920,22 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
     AwsEndpointService { label: "guardduty-data", types: INTERFACE_ONLY },
     AwsEndpointService { label: "healthlake", types: INTERFACE_ONLY },
     AwsEndpointService { label: "identitystore", types: INTERFACE_ONLY },
+    // EC2 Image Builder, the service an image pipeline and its build are driven through: the
+    // guide publishes it, so a build network with no route to the internet reaches it through
+    // an interface endpoint beside the `ssm`, `ssmmessages`, `ec2messages` and `logs` ones its
+    // build instance needs.
+    AwsEndpointService { label: "imagebuilder", types: INTERFACE_ONLY },
     AwsEndpointService { label: "inspector2", types: INTERFACE_ONLY },
     AwsEndpointService { label: "iot.data", types: INTERFACE_ONLY },
     AwsEndpointService { label: "iotsitewise.api", types: INTERFACE_ONLY },
+    // The DATA plane of AWS IoT SiteWise, published beside its API service.
+    AwsEndpointService { label: "iotsitewise.data", types: INTERFACE_ONLY },
     AwsEndpointService { label: "kendra", types: INTERFACE_ONLY },
     AwsEndpointService { label: "kinesis-firehose", types: INTERFACE_ONLY },
     AwsEndpointService { label: "kinesis-streams", types: INTERFACE_ONLY },
     AwsEndpointService { label: "kms", types: INTERFACE_ONLY },
+    // The FIPS 140 endpoint of AWS KMS, which the guide publishes beside the plain `kms` one.
+    AwsEndpointService { label: "kms-fips", types: INTERFACE_ONLY },
     AwsEndpointService { label: "lakeformation", types: INTERFACE_ONLY },
     AwsEndpointService { label: "lambda", types: INTERFACE_ONLY },
     AwsEndpointService { label: "license-manager", types: INTERFACE_ONLY },
@@ -2946,13 +2961,20 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
     AwsEndpointService { label: "s3", types: GATEWAY_AND_INTERFACE },
     AwsEndpointService { label: "s3express", types: INTERFACE_ONLY },
     AwsEndpointService { label: "sagemaker.api", types: INTERFACE_ONLY },
+    // The runtime of the Amazon SageMaker feature store, published beside the control-plane
+    // `sagemaker.api` and the inference `sagemaker.runtime` services.
+    AwsEndpointService { label: "sagemaker.featurestore-runtime", types: INTERFACE_ONLY },
     AwsEndpointService { label: "sagemaker.runtime", types: INTERFACE_ONLY },
     AwsEndpointService { label: "scheduler", types: INTERFACE_ONLY },
+    // The Amazon EventBridge schema registry, which the guide publishes under its own label
+    // rather than under the `events` one of the event bus API.
+    AwsEndpointService { label: "schemas", types: INTERFACE_ONLY },
     AwsEndpointService { label: "secretsmanager", types: INTERFACE_ONLY },
     AwsEndpointService { label: "securityhub", types: INTERFACE_ONLY },
     AwsEndpointService { label: "serverlessrepo", types: INTERFACE_ONLY },
     AwsEndpointService { label: "servicecatalog", types: INTERFACE_ONLY },
     AwsEndpointService { label: "servicediscovery", types: INTERFACE_ONLY },
+    AwsEndpointService { label: "servicequotas", types: INTERFACE_ONLY },
     AwsEndpointService { label: "snow-device-management", types: INTERFACE_ONLY },
     AwsEndpointService { label: "sns", types: INTERFACE_ONLY },
     AwsEndpointService { label: "sqs", types: INTERFACE_ONLY },
@@ -2973,6 +2995,8 @@ pub(super) const AWS_ENDPOINT_SERVICES: &[AwsEndpointService] = &[
     AwsEndpointService { label: "textract", types: INTERFACE_ONLY },
     AwsEndpointService { label: "timestream", types: INTERFACE_ONLY },
     AwsEndpointService { label: "transcribe", types: INTERFACE_ONLY },
+    // The STREAMING transcription service, published beside the batch `transcribe` one.
+    AwsEndpointService { label: "transcribestreaming", types: INTERFACE_ONLY },
     AwsEndpointService { label: "transfer", types: INTERFACE_ONLY },
     AwsEndpointService { label: "translate", types: INTERFACE_ONLY },
     AwsEndpointService { label: "waf-regional", types: INTERFACE_ONLY },
