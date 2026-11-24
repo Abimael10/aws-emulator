@@ -134,14 +134,12 @@ pub struct DisassociateSourceViews<Eng> {
 }
 
 /// The modeled `ResourceNotFoundException` (HTTP 404) for an `arn` no billing
-/// view of this account is stored under, in this service's shared ARN-validation
-/// form (`state::invalid_billing_view_arn`).
+/// view of this account is stored under, in this service's one form for the view
+/// a request identifies by `arn` (`state::unresolved_billing_view_arn`).
 fn not_found(arn: &str) -> DisassociateSourceViewsError {
-    DisassociateSourceViewsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: crate::state::invalid_billing_view_arn(arn),
-        resource_id: arn.to_string(),
-        resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-    })
+    DisassociateSourceViewsErrorModeled::ResourceNotFoundException(
+        crate::state::unresolved_billing_view_arn(arn),
+    )
     .into()
 }
 

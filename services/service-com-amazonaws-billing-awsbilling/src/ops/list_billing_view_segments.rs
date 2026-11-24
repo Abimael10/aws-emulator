@@ -327,12 +327,12 @@ fn resolve_view<'state>(
 ) -> Result<&'state crate::state::BillingView, ListBillingViewSegmentsError> {
     let view = match &input.arn {
         Some(arn) => state.billing_views.get(arn).ok_or_else(|| {
+            // The ARN this request identifies its view by, resolving to nothing:
+            // refused in this service's one form for that case
+            // (`state::unresolved_billing_view_arn`), the same one every other
+            // operation resolving its request's own `arn` answers.
             ListBillingViewSegmentsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Billing view {arn} does not exist"),
-                    resource_id: arn.clone(),
-                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::unresolved_billing_view_arn(arn),
             )
         })?,
         // Every account has a PRIMARY billing view, so its absence is not a

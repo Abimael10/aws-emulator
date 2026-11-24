@@ -180,11 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let view = state.billing_views.get(&input.arn).ok_or_else(|| {
-            GetBillingViewErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Billing view {} does not exist", input.arn),
-                resource_id: input.arn.clone(),
-                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-            })
+            // An ARN of the caller's own account that no view is stored under is
+            // reported in this service's one form for the view a request
+            // identifies by `arn` (`state::unresolved_billing_view_arn`), so
+            // this read, its sibling reads and the writers that resolve the same
+            // member refuse the same ARN identically.
+            GetBillingViewErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved_billing_view_arn(&input.arn),
+            )
         })?;
 
         // `sourceViewCount` is "the number of source views associated with this

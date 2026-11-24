@@ -388,15 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let view = state.billing_views.get(&input.arn).ok_or_else(|| {
+            // A read that resolves one `BillingViewArn` reports the ARN it could
+            // not resolve, in this service's one form for the view a request
+            // identifies by `arn` (`state::unresolved_billing_view_arn`).
             ListSourceViewsForBillingViewErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // A read that resolves one `BillingViewArn` reports the ARN
-                    // it could not resolve, in this service's own ARN-validation
-                    // form (`state::invalid_billing_view_arn`).
-                    message: crate::state::invalid_billing_view_arn(&input.arn),
-                    resource_id: input.arn.clone(),
-                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::unresolved_billing_view_arn(&input.arn),
             )
         })?;
 

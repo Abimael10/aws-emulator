@@ -155,13 +155,24 @@ fn invalid_field(member: &str, why: &str) -> AssociateSourceViewsError {
     .into()
 }
 
-/// The modeled `ResourceNotFoundException` (HTTP 404) for a billing-view ARN no
-/// view is stored under, named by the member that carried it — the one wording
-/// every operation resolving such an ARN shares
-/// ([`crate::state::billing_view_not_found`]).
-fn not_found(arn: &str, member: &str) -> AssociateSourceViewsError {
+/// The modeled `ResourceNotFoundException` (HTTP 404) for the `arn` this request
+/// acts on when no billing view of this account is stored under it — this
+/// service's one form for the view a request identifies by `arn`
+/// ([`crate::state::unresolved_billing_view_arn`]), shared with every other
+/// operation that resolves that member.
+fn not_found(arn: &str) -> AssociateSourceViewsError {
     AssociateSourceViewsErrorModeled::ResourceNotFoundException(
-        crate::state::billing_view_not_found(arn, member),
+        crate::state::unresolved_billing_view_arn(arn),
+    )
+    .into()
+}
+
+/// The modeled `ResourceNotFoundException` (HTTP 404) for a `sourceViews` entry
+/// no billing view is stored under — the member-named wording every writer of a
+/// view's source list shares ([`crate::state::billing_view_not_found`]).
+fn source_view_not_found(arn: &str) -> AssociateSourceViewsError {
+    AssociateSourceViewsErrorModeled::ResourceNotFoundException(
+        crate::state::billing_view_not_found(arn, "sourceViews"),
     )
     .into()
 }
@@ -218,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(target) = state.billing_views.get(&input.arn) else {
-            return Err(not_found(&input.arn, "arn"));
+            return Err(not_found(&input.arn));
         };
         let target_is_managed = target.is_managed();
         // The gate below needs the status string for its refusal, and the borrow
@@ -264,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would point at nothing: the rule every writer of this field shares,
         // `ComAmazonawsBillingAwsbillingState::unknown_source_view`.
         if let Some(missing) = state.unknown_source_view(&input.source_views) {
-            return Err(not_found(missing, "sourceViews"));
+            return Err(source_view_not_found(missing));
         }
 
         // `BillingViewHealthStatusException`: "a billing view's health status

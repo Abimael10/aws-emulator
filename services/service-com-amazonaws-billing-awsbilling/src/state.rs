@@ -212,7 +212,7 @@ pub const PAGE_TOKEN_FIELD_REFUSAL: &str = "The pagination token is not valid.";
 /// The tagging operations identify a resource by `ResourceArn` and answer a
 /// FIXED sentence for one that names no resource: the refusal does not echo the
 /// requested ARN back, unlike the billing-view reads, whose refusal is built by
-/// [`invalid_billing_view_arn`]. The ARN is still reported where the model has a
+/// [`unresolved_billing_view_arn`]. The ARN is still reported where the model has a
 /// member for it, `ResourceNotFoundException$resourceId`.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 
@@ -1647,11 +1647,33 @@ pub fn add_source_views(held: &mut Vec<String>, requested: impl IntoIterator<Ite
 /// that names no view of this account: the requested ARN, in brackets, reported
 /// as an invalid billing view ARN.
 ///
-/// One form, stated once: `ListBillingViews` already refuses an `arns` filter
-/// entry with it, and the billing-view reads that resolve a single `arn` answer
-/// the same way.
+/// One form, stated once: `ListBillingViews` refuses an `arns` filter entry with
+/// it, and every operation that resolves the view its own request identifies by
+/// `arn` answers the same sentence, as the modeled `ResourceNotFoundException`
+/// built by [`unresolved_billing_view_arn`] — the only place that payload is
+/// assembled.
 pub fn invalid_billing_view_arn(arn: &str) -> String {
     format!("[{arn}] is an invalid billing view arn")
+}
+
+/// The modeled `ResourceNotFoundException` payload (HTTP 404) for the billing
+/// view a request identifies by its own `arn` member when this account holds no
+/// view under that ARN — "The specified ARN in the request doesn't exist".
+///
+/// ONE form for that case, stated once, so an unresolvable ARN of the caller's
+/// own account draws the same refusal whichever operation resolved it, read or
+/// write: the message is this service's ARN-validation sentence
+/// ([`invalid_billing_view_arn`]), and the modeled members report the ARN that
+/// resolved to nothing and the billing-view resource type. A billing-view ARN a
+/// request names BESIDE that view — a source the view draws from — is a
+/// different refusal, which names the member it arrived in
+/// ([`billing_view_not_found`]).
+pub fn unresolved_billing_view_arn(arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: invalid_billing_view_arn(arn),
+        resource_id: arn.to_string(),
+        resource_type: BILLING_VIEW_RESOURCE_TYPE.to_string(),
+    }
 }
 
 /// The `ValidationException` payload for an ARN that names no `CUSTOM` billing
@@ -1681,10 +1703,15 @@ pub fn not_a_custom_view(arn: &str, action: &str) -> ValidationException {
 /// The modeled `ResourceNotFoundException` payload (HTTP 404) for a billing-view
 /// ARN no stored view answers to, named by the request member that carried it.
 ///
-/// Shared by every operation that resolves a billing-view ARN a request names —
-/// the view it acts on and the source views it draws from (see
+/// Shared by every operation that resolves a billing-view ARN a request names
+/// BESIDE the view it acts on —
+/// the source views that view draws from (see
 /// [`ComAmazonawsBillingAwsbillingState::unknown_source_view`]) — so the same
-/// unresolvable ARN is refused in one wording whichever operation was asked.
+/// unresolvable source is refused in one wording whichever writer of the field
+/// was asked, and the refusal says which member carried it. The view the
+/// request identifies by its own `arn` is refused by
+/// [`unresolved_billing_view_arn`] instead, in this service's ARN-validation
+/// form.
 pub fn billing_view_not_found(arn: &str, member: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("{member}: billing view {arn} does not exist"),
