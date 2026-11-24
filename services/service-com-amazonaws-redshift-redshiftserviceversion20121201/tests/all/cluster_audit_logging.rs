@@ -109,7 +109,7 @@ fn granted_resource(bucket: &str, action: &str) -> String {
 /// on `bucket`, each statement conditioned the way the guide's own policy
 /// conditions it when `conditioned` — on the delivering account and the cluster
 /// the logs are of.
-fn delivery_policy(bucket: &str, actions: &[&str], conditioned: bool) -> String {
+pub(crate) fn delivery_policy(bucket: &str, actions: &[&str], conditioned: bool) -> String {
     let account = account_id();
     let condition = if conditioned {
         format!(
@@ -136,14 +136,18 @@ fn delivery_policy(bucket: &str, actions: &[&str], conditioned: bool) -> String 
 }
 
 /// Both documented permissions, which is what the guide's policy grants.
-const DOCUMENTED_ACTIONS: [&str; 2] = ["s3:GetBucketAcl", "s3:PutObject"];
+///
+/// `pub(crate)` for the same reason as the three helpers below: a sibling suite
+/// that has to put a delivery policy on a bucket of its own grants the same two
+/// actions from here rather than keeping a second copy of them.
+pub(crate) const DOCUMENTED_ACTIONS: [&str; 2] = ["s3:GetBucketAcl", "s3:PutObject"];
 
 /// Create `bucket` in [`REGION`] through Amazon S3's own `CreateBucket`, and put
 /// `policy` on it when the case gives one.
 ///
 /// A regional endpoint requires the create to state its own location constraint,
 /// so every bucket here names the Region it is created in.
-async fn create_bucket(emulator: &Emulator, bucket: &str, policy: Option<String>) {
+pub(crate) async fn create_bucket(emulator: &Emulator, bucket: &str, policy: Option<String>) {
     let s3 = emulator.s3();
     s3.create_bucket()
         .bucket(bucket)
@@ -175,7 +179,7 @@ async fn create_bucket(emulator: &Emulator, bucket: &str, policy: Option<String>
 /// The provisioning span is crossed by moving the emulator's own clock, and the
 /// cluster is then read until it reports itself available — the CONDITION the
 /// case waits on — so nothing here waits for a fixed time.
-async fn serving_cluster(emulator: &Emulator, case: &str, identifier: &str) {
+pub(crate) async fn serving_cluster(emulator: &Emulator, case: &str, identifier: &str) {
     let created = emulator.create_minimal(identifier).await;
     assert_eq!(
         created.status, 200,
