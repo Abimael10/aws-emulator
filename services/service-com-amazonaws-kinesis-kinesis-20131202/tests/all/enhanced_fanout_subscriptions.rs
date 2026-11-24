@@ -5,9 +5,10 @@
 //!
 //! RULE: `SubscribeToShard` is SERVED from this service's own state — HTTP 200 whose body is
 //! an AWS event stream opening with the frame a client reads the output shape out of
-//! (`:event-type` `initial-response`), then one `SubscribeToShardEvent` carrying the records
-//! the shard retains from the position the request named, the `ContinuationSequenceNumber` a
-//! consumer reads on from and how far behind the tip of the shard it is — and every request it
+//! (`:event-type` `initial-response`), then a `SubscribeToShardEvent` every second for as long
+//! as the subscription holds its shard, each carrying the records the shard retains from where
+//! the one before it left off, the `ContinuationSequenceNumber` a consumer reads on from and
+//! how far behind the tip of the shard it is — and every request it
 //! will not serve is refused with one of the errors the MODEL declares for it, each a client
 //! error at HTTP 400 (`AccessDeniedException`, `DryRunOperationException`,
 //! `InvalidArgumentException`, `LimitExceededException`, `ResourceInUseException`,
@@ -15,6 +16,10 @@
 //! declare. The records it pushes are the records the pull reader (`GetShardIterator` ->
 //! `GetRecords`) serves for the same position, because one rule decides where a reader of a
 //! shard starts and what one read of it delivers.
+//!
+//! Because every event is its own read of the stored shard, a record written WHILE a
+//! subscription is being served is delivered by a later event of that same subscription, and
+//! the event that ends a shard a reshard CLOSED carries its children and no checkpoint.
 //!
 //! A `ConsumerARN` is its stream's ARN extended, so the `ShardId` it is given is resolved
 //! inside THAT stream and no other: a shard id only another stream's map carries is refused as
@@ -180,9 +185,9 @@ fn decode_frames(case: &str, body: &[u8]) -> Vec<Frame> {
     frames
 }
 
-/// Subscribe with `body`, assert the whole wire shape of a SERVED subscription, and answer the
-/// one `SubscribeToShardEvent` it pushed.
-async fn subscribed_event(emulator: &Emulator, case: &str, body: &Value) -> Value {
+/// Subscribe with `body`, assert the whole wire shape of a SERVED subscription, and answer
+/// every `SubscribeToShardEvent` it pushed, in the order it pushed them.
+async fn subscribed_events(emulator: &Emulator, case: &str, body: &Value) -> Vec<Value> {
     let (status, headers, payload) = emulator.call_raw("SubscribeToShard", body).await;
     assert_eq!(
         status,
@@ -208,11 +213,20 @@ async fn subscribed_event(emulator: &Emulator, case: &str, body: &Value) -> Valu
         .iter()
         .map(|frame| (frame.message_type.as_str(), frame.event_type.as_str()))
         .collect();
+    let expected: Vec<(&str, &str)> = std::iter::once(("event", INITIAL_RESPONSE))
+        .chain(std::iter::repeat_n(
+            ("event", DATA_EVENT),
+            framed.len().saturating_sub(1),
+        ))
+        .collect();
     assert_eq!(
-        framed,
-        vec![("event", INITIAL_RESPONSE), ("event", DATA_EVENT)],
+        framed, expected,
         "case {case}: a subscription opens with the frame the output shape arrives in and \
-         then pushes one data event, got {framed:?}"
+         then pushes data events, got {framed:?}"
+    );
+    assert!(
+        framed.len() > 1,
+        "case {case}: a served subscription pushes at least one event, got {framed:?}"
     );
     assert_eq!(
         frames[0].payload,
@@ -221,7 +235,20 @@ async fn subscribed_event(emulator: &Emulator, case: &str, body: &Value) -> Valu
          response carries none, got {}",
         frames[0].payload
     );
-    frames[1].payload.clone()
+    frames[1..]
+        .iter()
+        .map(|frame| frame.payload.clone())
+        .collect()
+}
+
+/// Subscribe with `body` and answer the FIRST event it pushed: the one that carries the
+/// records the shard already held at the position the request named.
+async fn subscribed_event(emulator: &Emulator, case: &str, body: &Value) -> Value {
+    subscribed_events(emulator, case, body)
+        .await
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case}: a served subscription pushes an event"))
 }
 
 /// The `Data` of every record one event delivered, decoded from the base64 the wire carries a
@@ -736,6 +763,48 @@ fn a_subscription_holds_its_shard_only_while_its_stream_is_live() {
     }
 }
 
+/// An ending stream releases the shard ITS OWN subscription held and no other: the end of one
+/// stream cannot free a shard the subscription now reading it holds, which is what a takeover
+/// leaves behind — "if you call SubscribeToShard 5 seconds or more after a successful call, the
+/// second call takes over the subscription".
+#[test]
+fn an_ending_stream_releases_only_the_subscription_it_established() {
+    let established = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let mut consumer = ConsumerRecord::registered_at(
+        &stream_arn(REGION, "efo-released"),
+        "releasing",
+        established,
+        HashMap::new(),
+    );
+
+    // (case, the instant the ending stream was established at, whether the shard is still
+    // held afterwards) — the record's own instant, and the instants of a stream established
+    // before and after it, each one of which is a different subscription.
+    let rows = [
+        ("the stream that recorded it", established, false),
+        (
+            "an earlier stream whose shard was taken over",
+            established - Duration::from_secs(30),
+            true,
+        ),
+        (
+            "a stream established later",
+            established + Duration::from_millis(1),
+            true,
+        ),
+    ];
+    for (case, ended, still_held) in rows {
+        consumer.subscribed_at(FIRST_SHARD, established);
+        consumer.subscription_ended_at(FIRST_SHARD, ended);
+        let holds = consumer.holds_subscription(FIRST_SHARD, established);
+        assert_eq!(
+            holds, still_held,
+            "case {case:?}: expected the shard to be held {still_held} after that stream \
+             ended, got {holds}"
+        );
+    }
+}
+
 /// A dry run is refused with the error the model declares for it and establishes nothing: the
 /// real subscription that follows it is served.
 #[tokio::test]
@@ -957,6 +1026,13 @@ async fn a_subscription_that_drains_a_closed_shard_reports_its_child_shards() {
         delivered(case, &event),
         vec!["before the split".to_string()],
         "case {case:?}: a closed shard still serves the records it retains, got {event}"
+    );
+    // The end of a closed shard has nowhere to continue from: the consumer reads on in the
+    // children this same event names, so the event carries NO ContinuationSequenceNumber.
+    assert_eq!(
+        event["ContinuationSequenceNumber"],
+        Value::Null,
+        "case {case:?}: the event that ends a closed shard reports no checkpoint, got {event}"
     );
     let children: Vec<String> = event["ChildShards"]
         .as_array()
@@ -1189,5 +1265,161 @@ async fn a_shard_of_another_stream_is_refused_and_changes_nothing() {
         vec!["other-record".to_string()],
         "case {after:?}: the other stream's records are untouched by a subscription that \
          named one of its shard ids, got {retained:?}"
+    );
+}
+
+/// A subscription is not one answer: while it HOLDS its shard it goes on PUSHING events, one
+/// about every second, even over a shard nothing is writing to — which is what a consumer
+/// reading an idle shard sees, and what makes the shard progress it reports followable at all.
+///
+/// Each of those events is a read of the stored shard in its own right, so each reports where
+/// the consumer now stands, and an idle shard's events carry no record.
+#[tokio::test]
+async fn a_live_subscription_goes_on_pushing_events_while_it_holds_the_shard() {
+    let emulator = Emulator::new();
+    let stream = "efo-pushing";
+    active_stream(&emulator, "setup", stream, 1).await;
+    let consumer_arn = active_consumer(&emulator, "setup", stream, "pushed-to").await;
+
+    let case = "a subscription over an idle shard";
+    let events = subscribed_events(
+        &emulator,
+        case,
+        &json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": FIRST_SHARD,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        }),
+    )
+    .await;
+    assert!(
+        events.len() > 1,
+        "case {case:?}: a subscription that holds its shard pushes more than the one event, \
+         got {} event(s): {events:?}",
+        events.len()
+    );
+    for (index, event) in events.iter().enumerate() {
+        let served = delivered(case, event);
+        assert!(
+            served.is_empty(),
+            "case {case:?}: nothing was written to this shard, so event {index} delivers no \
+             record, got {served:?}"
+        );
+        assert!(
+            event["ContinuationSequenceNumber"].is_string(),
+            "case {case:?}: event {index} reports the checkpoint the consumer reads on from, \
+             got {event}"
+        );
+        assert_eq!(
+            event["MillisBehindLatest"], json!(0),
+            "case {case:?}: event {index} has delivered everything the shard retains, so it \
+             is caught up, got {event}"
+        );
+    }
+}
+
+/// A record written WHILE a subscription is being served is delivered by a later event of
+/// that same subscription: the subscription reads the stored shard again for every event it
+/// pushes, which is the only way a consumer that started at the TIP of a shard
+/// (`LATEST` — "start reading just after the most recent record in the shard") sees anything
+/// at all.
+#[tokio::test]
+async fn a_record_written_during_a_subscription_is_delivered_by_a_later_event() {
+    let emulator = Emulator::new();
+    let stream = "efo-while-live";
+    active_stream(&emulator, "setup", stream, 1).await;
+    let consumer_arn = active_consumer(&emulator, "setup", stream, "reading-the-tip").await;
+
+    // (case, the position the subscription starts at) — the tip of the shard, where nothing
+    // written before the subscription is admitted, and its horizon, where everything is.
+    for (case, position) in [
+        ("from the tip", json!({ "Type": "LATEST" })),
+        ("from the horizon", json!({ "Type": "TRIM_HORIZON" })),
+    ] {
+        let payload = format!("written while live, {case}");
+        let body = json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": FIRST_SHARD,
+            "StartingPosition": position,
+        });
+        // The write is issued against the same emulator WHILE the subscription is being
+        // served, rather than before or after it.
+        let (events, _) = tokio::join!(
+            subscribed_events(&emulator, case, &body),
+            put(&emulator, case, stream, &payload),
+        );
+        let served: Vec<String> = events
+            .iter()
+            .flat_map(|event| delivered(case, event))
+            .collect();
+        assert!(
+            served.contains(&payload),
+            "case {case:?}: expected the subscription to deliver {payload:?} it was written \
+             while live, got {served:?}"
+        );
+    }
+}
+
+/// Two overlapping subscriptions of one consumer to one shard: exactly ONE is served and the
+/// other is refused as the contended subscription it is — "if you call SubscribeToShard again
+/// with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
+/// ResourceInUseException" — and the refusal names the consumer and the shard at fault.
+#[tokio::test]
+async fn one_of_two_overlapping_subscriptions_is_refused_as_contended() {
+    let emulator = Emulator::new();
+    let stream = "efo-contended";
+    active_stream(&emulator, "setup", stream, 1).await;
+    let consumer_arn = active_consumer(&emulator, "setup", stream, "contending").await;
+    let body = json!({
+        "ConsumerARN": consumer_arn,
+        "ShardId": FIRST_SHARD,
+        "StartingPosition": { "Type": "TRIM_HORIZON" },
+    });
+
+    let case = "two subscriptions at once";
+    let (first, second) = tokio::join!(
+        emulator.call_raw("SubscribeToShard", &body),
+        emulator.call_raw("SubscribeToShard", &body),
+    );
+    let mut served = 0usize;
+    let mut refused = 0usize;
+    for (status, _headers, payload) in [first, second] {
+        if status == 200 {
+            served += 1;
+            let frames = decode_frames(case, &payload);
+            assert!(
+                frames.len() > 1,
+                "case {case:?}: the served subscription pushes events, got {} frame(s)",
+                frames.len()
+            );
+            continue;
+        }
+        refused += 1;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a contended subscription is refused with a modelled client \
+             error, got {status} with {:?}",
+            String::from_utf8_lossy(&payload)
+        );
+        let response: Value = serde_json::from_slice(&payload).unwrap_or_else(|error| {
+            panic!("case {case:?}: the refusal must be a JSON envelope: {error}")
+        });
+        assert_eq!(
+            error_code(&response),
+            "ResourceInUseException",
+            "case {case:?}: expected the contended refusal, got {response}"
+        );
+        let message = error_message(&response);
+        for names in [consumer_arn.as_str(), FIRST_SHARD] {
+            assert!(
+                message.contains(names),
+                "case {case:?}: expected the refusal to name {names:?}, got {message:?}"
+            );
+        }
+    }
+    assert_eq!(
+        (served, refused),
+        (1, 1),
+        "case {case:?}: exactly one of two overlapping subscriptions is served"
     );
 }

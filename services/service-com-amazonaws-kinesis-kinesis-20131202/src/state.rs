@@ -1014,6 +1014,20 @@ impl ConsumerRecord {
         self.subscriptions.remove(shard_id);
     }
 
+    /// Release the shard ONE subscription held: the one established at `established_at`, and
+    /// nothing else.
+    ///
+    /// The same end as [`Self::subscription_ended`] for the caller that established it, and a
+    /// no-op for a caller whose subscription a LATER one has already taken over ("if you call
+    /// SubscribeToShard 5 seconds or more after a successful call, the second call takes over
+    /// the subscription") — so an ending stream cannot release a shard the subscription now
+    /// reading it holds.
+    pub fn subscription_ended_at(&mut self, shard_id: &str, established_at: SystemTime) {
+        if self.subscriptions.get(shard_id) == Some(&established_at) {
+            self.subscriptions.remove(shard_id);
+        }
+    }
+
     /// The consumer's status at `now`: `CREATING` until the transition its registration
     /// armed falls due, `ACTIVE` from then on. Derived from the stored instant, so two
     /// reads at the same instant agree and no read has to write.

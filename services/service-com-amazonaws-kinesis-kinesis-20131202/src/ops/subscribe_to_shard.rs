@@ -19,24 +19,32 @@
 //! "This operation establishes an HTTP/2 connection between the consumer you specify in the
 //! ConsumerARN parameter and the shard you specify in the ShardId parameter. After the
 //! connection is successfully established, Kinesis Data Streams pushes records from the shard
-//! to the consumer over this connection." The subscription this emulator serves is ONE
-//! response rather than a connection held open, so it carries the frame a client reads the
-//! output shape out of (`service_common::event_stream::INITIAL_RESPONSE_EVENT`, carrying no
-//! member, because the stream is this output's only one) and then ONE
-//! `SubscribeToShardEvent` over the records the shard holds from the position the request
-//! named — read out of the stored shard, never synthesised, by the same shared read of a
-//! shard `GetRecords` serves its page from ([`crate::state::read_shard_from`]), so the push
-//! reader and the pull reader deliver the same records in the same order.
+//! to the consumer over this connection." A subscription this emulator serves is one RESPONSE
+//! whose body is that stream: the frame a client reads the output shape out of
+//! (`service_common::event_stream::INITIAL_RESPONSE_EVENT`, carrying no member, because the
+//! stream is this output's only one) and then an event every [`PUSH_INTERVAL`] for as long as
+//! the subscription HOLDS its shard — not one event and done, because a consumer reading an
+//! idle shard is pushed one about every second and a consumer reading the tip of one is
+//! pushed what arrives while it reads.
+//!
+//! Every one of those events is its own read of the stored shard, never synthesised, by the
+//! same shared read of a shard `GetRecords` serves its page from
+//! ([`crate::state::read_shard_from`]) from the position the one before it left off at — so
+//! the push reader and the pull reader deliver the same records in the same order, and a
+//! record WRITTEN while the subscription is being served is delivered by the next event
+//! rather than missed.
 //!
 //! The records one event carries are bounded by the ceilings that shared read is given
-//! ([`MAX_EVENT_RECORDS`] / [`MAX_EVENT_BYTES`]), and the event reports where the reader now
+//! ([`max_event_records`] / [`MAX_EVENT_BYTES`]), and the event reports where the reader now
 //! stands: `ContinuationSequenceNumber` — "Use this as SequenceNumber in the next call to
 //! SubscribeToShard, with StartingPosition set to AT_SEQUENCE_NUMBER or
 //! AFTER_SEQUENCE_NUMBER. Use ContinuationSequenceNumber for checkpointing because it
 //! captures your shard progress even when no data is written to the shard" — and
 //! `MillisBehindLatest`, how far behind the tip of the shard the subscription is.
 //! `ChildShards` is carried only "at the end of the current shard", which is a shard a
-//! reshard closed and whose retained records the subscription has delivered.
+//! reshard closed and whose retained records the subscription has delivered; that event
+//! carries no `ContinuationSequenceNumber` at all ([`ShardEndEvent`]) — a shard that is over
+//! has nowhere to continue from — and it is the last event of the subscription.
 //!
 //! ## What one subscription holds, and for how long
 //!
@@ -45,17 +53,22 @@
 //! contended is what the next call is judged against: "If you call SubscribeToShard again
 //! with the same ConsumerARN and ShardId within 5 seconds of a successful call, you'll get a
 //! ResourceInUseException. If you call SubscribeToShard 5 seconds or more after a successful
-//! call, the second call takes over the subscription."
+//! call, the second call takes over the subscription." That window
+//! ([`crate::state::SUBSCRIPTION_TAKEOVER_WINDOW`]) is as long as this service calls a
+//! subscription contended, so it is how long one goes on pushing: a caller reading one of
+//! these streams gets the events of one such span and renews from the
+//! `ContinuationSequenceNumber` the last of them reported, which is the loop the service
+//! documents for the 5 minutes a real connection lives — "your consumer starts receiving
+//! events of type SubscribeToShardEvent over the HTTP/2 connection for up to 5 minutes, after
+//! which time you need to call SubscribeToShard again to renew the subscription if you want
+//! to continue to receive records".
 //!
-//! That record is RELEASED the moment the event stream ends
-//! ([`crate::state::ConsumerRecord::subscription_ended`]), which for the one response this
-//! emulator serves a subscription as is the instant its frames are complete. A consumer
-//! whose stream is over holds no shard, so the renewal the service documents — "your
-//! consumer starts receiving events of type SubscribeToShardEvent over the HTTP/2 connection
-//! for up to 5 minutes, after which time you need to call SubscribeToShard again to renew
-//! the subscription if you want to continue to receive records", from the
-//! `ContinuationSequenceNumber` the last event reported — is SERVED rather than refused, and
-//! the refusal is left to say what it is for: a subscription that is still being read.
+//! The record is RELEASED the moment that event stream ends
+//! ([`crate::state::ConsumerRecord::subscription_ended`]), which is the instant its frames are
+//! complete. A consumer whose stream is over holds no shard, so the renewal above is SERVED
+//! rather than refused, and the refusal is left to say what it is for: a subscription that is
+//! still being read — which is what the OTHER of two overlapping subscriptions of one
+//! consumer to one shard is refused as.
 //!
 //! ## Input
 //!
@@ -215,6 +228,77 @@ fn internal(message: String) -> SubscribeToShardErrorModeled {
     })
 }
 
+/// ONE event of a live subscription, with what the subscription needs to go on pushing: where
+/// the next event reads from and what this delivery measured.
+struct Pushed {
+    /// The event itself, framed into the body as it is produced.
+    event: PushedEvent,
+    /// Where the event AFTER this one starts reading ([`SubscribeToShard::pushed`]).
+    next: crate::state::ShardPosition,
+    /// The `AWS/Kinesis` observations this delivery made, published off the answer.
+    measured: crate::state::Measured,
+}
+
+/// Which of the two forms one pushed event takes.
+enum PushedEvent {
+    /// An event of a shard the subscription goes on reading: it reports the checkpoint the
+    /// consumer reads on from.
+    Open(SubscribeToShardEvent),
+    /// The event that ends a CLOSED shard, carrying the children the consumer reads on in and
+    /// no checkpoint. The shard's end is the subscription's end, so nothing is pushed after
+    /// it.
+    ShardEnd(ShardEndEvent),
+}
+
+impl PushedEvent {
+    /// This event as ONE `vnd.amazon.eventstream` frame, through the service's own protocol:
+    /// both forms are the one modelled `SubscribeToShardEvent` member of the output union, so
+    /// they are framed under the same `:event-type` and differ only in the members they carry.
+    fn framed(
+        &self,
+        protocol: &dyn ::smithy_server_runtime::ServerHttpProtocol,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        match self {
+            Self::Open(event) => frame_event(
+                protocol,
+                SUBSCRIBE_TO_SHARD_EVENT,
+                false,
+                event,
+                &SubscribeToShardEvent::SCHEMA,
+            ),
+            Self::ShardEnd(event) => frame_event(
+                protocol,
+                SUBSCRIBE_TO_SHARD_EVENT,
+                false,
+                event,
+                &ShardEndEvent::SCHEMA,
+            ),
+        }
+    }
+
+    /// Whether this event is the end of the shard, and so the end of the subscription.
+    fn ends(&self) -> bool {
+        matches!(self, Self::ShardEnd(_))
+    }
+}
+
+/// How often a live subscription pushes an event: a consumer reading an IDLE shard is sent one
+/// about every second, which is what makes a subscription over a shard nothing is writing to
+/// observable at all (recorded behaviour; the model says only that "Kinesis Data Streams
+/// pushes records from the shard to the consumer over this connection").
+const PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The most events ONE subscription pushes: its span
+/// ([`crate::state::SUBSCRIPTION_TAKEOVER_WINDOW`], as long as this service calls a
+/// subscription contended) over [`PUSH_INTERVAL`], plus the one pushed the moment it is
+/// established.
+///
+/// A count rather than only a deadline, so what one response can hold is a constant of this
+/// crate whatever the clock does: a wall clock that steps backwards cannot make a
+/// subscription push more than this.
+const MAX_PUSHED_EVENTS: u32 = 1 + (crate::state::SUBSCRIPTION_TAKEOVER_WINDOW.as_millis()
+    / PUSH_INTERVAL.as_millis()) as u32;
+
 impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
     /// Resolve the subscription the request asks for, refuse whatever stands in the way, and
     /// RECORD the subscription it established.
@@ -228,7 +312,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         region: &str,
         now: std::time::SystemTime,
         input: &SubscribeToShardInput,
-    ) -> Result<(SubscribeToShardEvent, crate::state::Measured), SubscribeToShardErrorModeled> {
+    ) -> Result<Pushed, SubscribeToShardErrorModeled> {
         // "Before you call this operation, call RegisterStreamConsumer to register the
         // consumer with Kinesis Data Streams": the consumer's ARN names the stream it was
         // registered with, so the stream is resolved first and the consumer inside it — a
@@ -329,78 +413,18 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             ));
         }
 
-        // A record outside the stream's retention window is trimmed, so it is not among the
-        // records any position of this shard reads.
-        let retained: Vec<&crate::state::DataRecord> = shard.retained(trim_horizon).collect();
-        let read = crate::state::read_shard_from(
-            &position,
-            &retained,
-            max_event_records(),
-            MAX_EVENT_BYTES,
-            now,
-        );
-        let event = SubscribeToShardEvent {
-            records: read.records.iter().map(|record| record.to_shape()).collect(),
-            // "Use ContinuationSequenceNumber for checkpointing because it captures your
-            // shard progress even when no data is written to the shard": the newest record
-            // this consumer has now seen, and the shard's own first sequence number while it
-            // has seen none — every record the shard can hold is numbered past that one, so
-            // reading on AFTER it delivers all of them.
-            continuation_sequence_number: read.last_seen.map_or_else(
-                || shard.starting_sequence_number.clone(),
-                |record| record.sequence_number.clone(),
-            ),
-            millis_behind_latest: read.millis_behind_latest,
-            // "The list of the child shards of the current shard, returned only at the end of
-            // the current shard": a shard is closed by a reshard, and a consumer that has
-            // been delivered everything a closed one retains reads on from the shards that
-            // reshard produced from it.
-            child_shards: (!shard.is_open() && read.drained)
-                .then(|| stream.child_shards_of(&shard.shard_id))
-                .filter(|children| !children.is_empty()),
-        };
+        // The first event of the subscription, and where it reads on from.
+        let pushed = Self::pushed(stream, shard, &position, now);
 
-        // What this delivery did, as the `AWS/Kinesis` series report it: the records it
-        // retrieved from the shard (stream-level, and shard-level where the stream's enhanced
-        // monitoring names the metric — a record retrieved from a shard is counted the same
-        // way whichever reader asked for it) and the `SubscribeToShard` families of the
-        // subscription itself. Collected here, under the store guard, and published by the
-        // caller once that guard is released.
-        let delivered_records = crate::state::counted(read.records.len());
-        let delivered_bytes =
-            crate::state::counted(read.records.iter().fold(0usize, |total, record| {
-                total.saturating_add(record.stored_bytes())
-            }));
-        let lag = f64::from(i32::try_from(read.millis_behind_latest).unwrap_or(i32::MAX));
-        let mut measured = crate::state::Measured::new();
-        measured.record_outgoing(
+        // What the subscription ITSELF measured, beside what each of its events does
+        // ([`Self::pushed`]): one established subscription.
+        let mut measured = pushed.measured;
+        measured.record_for_the_call(
             &series,
-            &input.shard_id,
-            delivered_records,
-            delivered_bytes,
+            crate::state::SUBSCRIBE_TO_SHARD_SUCCESS,
+            1.0,
             now,
         );
-        measured.record(
-            &series,
-            crate::state::ITERATOR_AGE,
-            &input.shard_id,
-            lag,
-            now,
-        );
-        for (call_series, value) in [
-            (crate::state::SUBSCRIBE_TO_SHARD_SUCCESS, 1.0),
-            (
-                crate::state::SUBSCRIBE_TO_SHARD_EVENT_RECORDS,
-                delivered_records,
-            ),
-            (
-                crate::state::SUBSCRIBE_TO_SHARD_EVENT_BYTES,
-                delivered_bytes,
-            ),
-            (crate::state::SUBSCRIBE_TO_SHARD_EVENT_LAG, lag),
-        ] {
-            measured.record_for_the_call(&series, call_series, value, now);
-        }
 
         // The subscription is established and is now being served, so it is recorded on the
         // consumer it was established for: that is what another call to the same consumer
@@ -413,29 +437,179 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             consumer.subscribed_at(&input.shard_id, now);
         }
 
-        Ok((event, measured))
+        Ok(Pushed { measured, ..pushed })
+    }
+
+    /// ONE event of a live subscription over `shard`: the records the shard retains from
+    /// `position`, where the subscription reads on from, whether this is the shard's end, and
+    /// what the delivery measured.
+    ///
+    /// The records are read out of the stored shard by the same shared read a `GetRecords`
+    /// page is served from ([`crate::state::read_shard_from`]), under the ceilings that read
+    /// is given ([`max_event_records`] / [`MAX_EVENT_BYTES`]), so the push reader and the
+    /// pull reader deliver the same records in the same order.
+    fn pushed(
+        stream: &crate::state::Stream,
+        shard: &crate::state::ShardRecord,
+        position: &crate::state::ShardPosition,
+        now: std::time::SystemTime,
+    ) -> Pushed {
+        // Which `AWS/Kinesis` series this delivery is measured into: the stream's name, and
+        // the shard-level metrics its enhanced monitoring names
+        // (`crate::state::stream_metrics`).
+        let series = crate::state::StreamSeries::of(stream);
+        // A record outside the stream's retention window is trimmed, so it is not among the
+        // records any position of this shard reads.
+        let trim_horizon = stream.trim_horizon(now);
+        let retained: Vec<&crate::state::DataRecord> = shard.retained(trim_horizon).collect();
+        let read = crate::state::read_shard_from(
+            position,
+            &retained,
+            max_event_records(),
+            MAX_EVENT_BYTES,
+            now,
+        );
+        // "The list of the child shards of the current shard, returned only at the end of
+        // the current shard": a shard is closed by a reshard, and a consumer that has been
+        // delivered everything a closed one retains reads on from the shards that reshard
+        // produced from it.
+        let child_shards = (!shard.is_open() && read.drained)
+            .then(|| stream.child_shards_of(&shard.shard_id))
+            .filter(|children| !children.is_empty());
+        // That end is where the SUBSCRIPTION ends too: there is nothing left on this shard
+        // to push, and what the consumer does next is subscribe to the children the event
+        // names.
+        let records: Vec<Record> = read.records.iter().map(|record| record.to_shape()).collect();
+        let event = match child_shards {
+            Some(child_shards) => PushedEvent::ShardEnd(ShardEndEvent {
+                records,
+                millis_behind_latest: read.millis_behind_latest,
+                child_shards: Some(child_shards),
+            }),
+            None => PushedEvent::Open(SubscribeToShardEvent {
+                records,
+                // "Use ContinuationSequenceNumber for checkpointing because it captures your
+                // shard progress even when no data is written to the shard": the newest
+                // record this consumer has now seen, and the shard's own first sequence
+                // number while it has seen none — every record the shard can hold is numbered
+                // past that one, so reading on AFTER it delivers all of them.
+                continuation_sequence_number: read.last_seen.map_or_else(
+                    || shard.starting_sequence_number.clone(),
+                    |record| record.sequence_number.clone(),
+                ),
+                millis_behind_latest: read.millis_behind_latest,
+                // A shard that is still being read reports no children: "The list of the
+                // child shards of the current shard, returned only at the end of the current
+                // shard."
+                child_shards: None,
+            }),
+        };
+
+        // Where the NEXT event of this subscription starts: just after the newest record
+        // this one delivered, and the position this one carried while it delivered none —
+        // which is how a record written DURING the subscription is picked up by the event
+        // after it.
+        let next = read.last_seen.map_or_else(
+            || position.clone(),
+            |record| {
+                crate::state::ShardPosition::AfterSequenceNumber(record.sequence_number.clone())
+            },
+        );
+
+        // What this delivery did, as the `AWS/Kinesis` series report it: the records it
+        // retrieved from the shard (stream-level, and shard-level where the stream's enhanced
+        // monitoring names the metric — a record retrieved from a shard is counted the same
+        // way whichever reader asked for it) and the `SubscribeToShardEvent` families of the
+        // event itself. Collected here, under the store guard, and published by the caller
+        // once that guard is released.
+        let delivered_records = crate::state::counted(read.records.len());
+        let delivered_bytes =
+            crate::state::counted(read.records.iter().fold(0usize, |total, record| {
+                total.saturating_add(record.stored_bytes())
+            }));
+        let lag = f64::from(i32::try_from(read.millis_behind_latest).unwrap_or(i32::MAX));
+        let mut measured = crate::state::Measured::new();
+        measured.record_outgoing(
+            &series,
+            &shard.shard_id,
+            delivered_records,
+            delivered_bytes,
+            now,
+        );
+        measured.record(
+            &series,
+            crate::state::ITERATOR_AGE,
+            &shard.shard_id,
+            lag,
+            now,
+        );
+        for (event_series, value) in [
+            (
+                crate::state::SUBSCRIBE_TO_SHARD_EVENT_RECORDS,
+                delivered_records,
+            ),
+            (
+                crate::state::SUBSCRIBE_TO_SHARD_EVENT_BYTES,
+                delivered_bytes,
+            ),
+            (crate::state::SUBSCRIBE_TO_SHARD_EVENT_LAG, lag),
+        ] {
+            measured.record_for_the_call(&series, event_series, value, now);
+        }
+
+        Pushed {
+            event,
+            next,
+            measured,
+        }
+    }
+
+    /// The event the subscription pushes NEXT, read from the store again at `now`, or `None`
+    /// when there is nothing left to push it over: a stream, consumer or shard that has gone
+    /// away while the subscription was being served ends the stream rather than failing it.
+    fn pushed_again(
+        store: &crate::state::ComAmazonawsKinesisKinesis20131202State,
+        region: &str,
+        now: std::time::SystemTime,
+        input: &SubscribeToShardInput,
+        position: &crate::state::ShardPosition,
+    ) -> Option<Pushed> {
+        let stream_arn = crate::state::stream_arn_of_consumer(&input.consumer_arn);
+        let stream = store.stream_by_arn(now, region, stream_arn)?;
+        if !stream.serves_shards(now) {
+            return None;
+        }
+        stream.consumer_by_arn(&input.consumer_arn)?;
+        let shard = stream
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == input.shard_id)?;
+        Some(Self::pushed(stream, shard, position, now))
     }
 
     /// Release the shard the subscription this request established was holding: its event
     /// stream has ENDED.
     ///
-    /// The subscription this emulator serves is ONE response, so its stream ends when the
-    /// frames of that response are complete, which is where this is called from. From then
-    /// on the consumer holds nothing, and the renewal the service documents — call
-    /// `SubscribeToShard` again from the `ContinuationSequenceNumber` the last event
-    /// reported — is served rather than refused as a contended subscription.
+    /// The stream of the subscription this emulator serves ends when the frames of its
+    /// response are complete, which is where this is called from. From then on the consumer
+    /// holds nothing for it, and the renewal the service documents — call `SubscribeToShard`
+    /// again from the `ContinuationSequenceNumber` the last event reported — is served rather
+    /// than refused as a contended subscription.
     ///
-    /// Releasing a subscription nothing holds is nothing to do, which is why a consumer,
-    /// stream or shard that has gone away in the meantime is simply not found here.
+    /// Only the record THIS call wrote is released: `established_at` is the instant it
+    /// recorded, so a subscription a LATER call established for the same consumer and shard —
+    /// having taken it over once the documented window passed — keeps holding the shard for
+    /// itself. Releasing a subscription nothing holds is nothing to do, which is why a
+    /// consumer, stream or shard that has gone away in the meantime is simply not found here.
     fn release(
         store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
         region: &str,
-        now: std::time::SystemTime,
+        established_at: std::time::SystemTime,
         input: &SubscribeToShardInput,
     ) {
         let stream_key = {
             let Some(stream) = store.stream_by_arn(
-                now,
+                established_at,
                 region,
                 crate::state::stream_arn_of_consumer(&input.consumer_arn),
             ) else {
@@ -448,7 +622,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             .get_mut(&stream_key)
             .and_then(|stream| stream.consumer_by_arn_mut(&input.consumer_arn))
         {
-            consumer.subscription_ended(&input.shard_id);
+            consumer.subscription_ended_at(&input.shard_id, established_at);
         }
     }
 
@@ -591,34 +765,75 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             Self::establish(&mut store, region, now, input)
         };
         let protocol = svc.definition().protocol();
-        let event = match established {
-            Ok((event, measured)) => {
-                // The store guard above is released, so what the delivery measured goes into
-                // the CloudWatch store now — off the answer, exactly as the pull reader's
-                // page is published (`crate::ops::get_records`).
-                measured.publish(&*self.engine);
-                event
-            }
+        let mut pushed = match established {
+            Ok(pushed) => pushed,
             Err(error) => return error_response(protocol, &error),
         };
 
         // The body opens with the frame a client reads the OUTPUT shape out of, before any
         // event of the subscription: `SubscribeToShardOutput`'s only member is the stream
         // itself, so that frame carries no member.
-        let framed = frame_empty_initial_response(protocol).and_then(|mut frames| {
-            frames.extend(frame_event(
-                protocol,
-                SUBSCRIBE_TO_SHARD_EVENT,
-                false,
-                &event,
-                &SubscribeToShardEvent::SCHEMA,
-            )?);
-            Ok(frames)
-        });
+        let mut framed = frame_empty_initial_response(protocol);
+
+        // Then the events, for as long as the subscription is LIVE: one straight away, and
+        // one every [`PUSH_INTERVAL`] after that while the consumer still holds the shard —
+        // the window a later call takes a subscription over after
+        // (`crate::state::SUBSCRIPTION_TAKEOVER_WINDOW`), which is as long as this service
+        // calls a subscription contended and so as long as it is one being read. Each of
+        // those reads the stored shard AGAIN, so a record written while the subscription is
+        // being served is delivered by the event after it, and the shard's own end ends the
+        // subscription.
+        //
+        // Both halves of what this body can cost are CONSTANTS of this crate rather than
+        // anything a request chooses: how many events it holds is [`MAX_PUSHED_EVENTS`], and
+        // how much each of them carries is the per-event ceiling the shared read is given
+        // ([`max_event_records`] / [`MAX_EVENT_BYTES`]). The deadline below is MONOTONIC and
+        // the count bounds the loop whatever the wall clock does. The wait between two events
+        // is the one await point of the loop, so a caller that goes away, a timeout and a
+        // shutdown all land while the subscription is being served, and no store guard is held
+        // across it.
+        let ends_at = tokio::time::Instant::now() + crate::state::SUBSCRIPTION_TAKEOVER_WINDOW;
+        let mut measured = crate::state::Measured::new();
+        let mut events = 0u32;
+        loop {
+            if let Ok(frames) = framed.as_mut() {
+                match pushed.event.framed(protocol) {
+                    Ok(event) => frames.extend(event),
+                    Err(error) => framed = Err(error),
+                }
+            }
+            measured.absorb(pushed.measured);
+            events = events.saturating_add(1);
+            if pushed.event.ends() || framed.is_err() || events >= MAX_PUSHED_EVENTS {
+                break;
+            }
+            if tokio::time::Instant::now() + PUSH_INTERVAL >= ends_at {
+                break;
+            }
+            tokio::time::sleep(PUSH_INTERVAL).await;
+            let at = std::time::SystemTime::now();
+            let again = {
+                let store = state.lock();
+                Self::pushed_again(&store, region, at, input, &pushed.next)
+            };
+            match again {
+                Some(again) => pushed = again,
+                // The stream, the consumer or the shard is gone: the event stream is over,
+                // which is what a consumer reading a resource that was removed under it sees.
+                None => break,
+            }
+        }
+
+        // The store guard above is released, so what the subscription's events measured goes
+        // into the CloudWatch store now — off the answer, exactly as the pull reader's page is
+        // published (`crate::ops::get_records`).
+        measured.publish(&*self.engine);
 
         // The event stream is complete, so the subscription it carried is OVER and the shard
         // it held is released: the next call of this consumer to this shard is the renewal
-        // the service documents, not a second reader contending with this one.
+        // the service documents, not a second reader contending with this one. Only the record
+        // THIS call wrote is released — a subscription another call established in the
+        // meantime holds the shard for itself.
         {
             let mut store = state.lock();
             Self::release(&mut store, region, now, input);

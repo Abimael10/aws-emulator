@@ -317,6 +317,15 @@ impl<O> StatedPerOperation<O> {
 /// The two CEILINGS passed are MODEL constants, from the largest list this service's model
 /// declares ([`submitted_batch`]), so no response is sized by the request: past them the
 /// framework's own summary stands.
+///
+/// A violation found on a list ELEMENT is stated at the LIST MEMBER, quoting the whole list
+/// the request carried ([`validation`] rule 6), which no violation carries: that reading is
+/// the tree's own (`service_common::validation::refusing_violations_with_lists`) and is asked
+/// for ONLY when such a violation is among them, so every other request — and every request
+/// that satisfies the model — pays nothing for it. It is the one place this crate reads a
+/// request twice, for the same reason the re-read above exists: the framework hands no
+/// already-built input over, and the echo mode this service's own clauses need is not the one
+/// that collects the lists.
 fn stated_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
@@ -337,7 +346,9 @@ fn stated_refusal<O: Operation>(
             quoting_the_submitted_collection(violation, echo)
         })
         .collect();
-    let stated = validation::refusal(&violations)?;
+    let stated = validation::refusal(&violations, || {
+        ::service_common::validation::refusing_violations_with_lists::<O>(protocol, req).1
+    })?;
     Some((violations, stated))
 }
 
@@ -465,7 +476,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // An authentication refusal (HTTP 403) is not an input-constraint failure and keeps
         // the framework's wording.
         match refusal {
-            Refusal::Invalid(violations) => validation::refusal(violations),
+            Refusal::Invalid(violations) => {
+                validation::refusal(violations, ::std::collections::HashMap::new)
+            }
             _ => None,
         }
     }

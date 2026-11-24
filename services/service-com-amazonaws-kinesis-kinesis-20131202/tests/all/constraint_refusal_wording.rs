@@ -298,39 +298,114 @@ async fn an_out_of_set_value_lists_the_value_set_in_aws_order() {
     }
 }
 
-/// The same order for a value carried at a POSITION OF A LIST rather than by a member of its
-/// own: the set a shard-level metric has to be in is listed the one way, whatever the clause
-/// states around it (which member a broken element is reported at, and the value it echoes,
-/// are their own rule and are pinned where that rule lives).
-#[tokio::test]
-async fn an_out_of_set_element_lists_the_value_set_in_aws_order() {
-    let emulator = Emulator::new();
-
-    // MetricsName, as the model declares it: [IncomingBytes, IncomingRecords, OutgoingBytes,
-    // OutgoingRecords, WriteProvisionedThroughputExceeded,
-    // ReadProvisionedThroughputExceeded, IteratorAgeMilliseconds, ALL]
-    // (`smithy_query(query="shape", shape="com.amazonaws.kinesis#MetricsName")`), listed in
-    // the order the front door states it — the widest set this service carries, and neither
-    // of the two orders a model offers.
-    const METRICS: &str = "[ALL, IteratorAgeMilliseconds, IncomingBytes, \
+/// MetricsName's value set, as a clause nested at the list member states it. The model
+/// declares it [IncomingBytes, IncomingRecords, OutgoingBytes, OutgoingRecords,
+/// WriteProvisionedThroughputExceeded, ReadProvisionedThroughputExceeded,
+/// IteratorAgeMilliseconds, ALL] (`smithy_query(query="shape",
+/// shape="com.amazonaws.kinesis#MetricsName")`); this is that set in the order the front door
+/// lists one — the widest set this service carries, and neither of the two orders a model
+/// offers.
+const METRICS_SET: &str = "[ALL, IteratorAgeMilliseconds, IncomingBytes, \
                            WriteProvisionedThroughputExceeded, OutgoingRecords, \
                            ReadProvisionedThroughputExceeded, IncomingRecords, OutgoingBytes]";
 
-    for (case, operation) in [
-        ("a metric enhanced monitoring does not report", "EnableEnhancedMonitoring"),
-        ("a metric enhanced monitoring cannot drop", "DisableEnhancedMonitoring"),
-    ] {
-        let message = refusal(
-            &emulator,
-            case,
-            operation,
-            &json!({ "StreamName": "enum-order", "ShardLevelMetrics": ["NotARealMetric"] }),
-        )
-        .await;
-        let requirement = format!("Member must satisfy enum value set: {METRICS}");
-        assert!(
-            message.contains(&requirement),
-            "case {case:?}: expected the requirement {requirement:?}, got {message:?}"
+/// A constraint broken by an ELEMENT of a list member is stated AT THAT MEMBER: the whole
+/// list the request carried as the value, the member's own unindexed path, and the ELEMENT
+/// SHAPE'S WHOLE declared constraint set nested inside `Member must satisfy constraint:
+/// [ … ]` — one clause however many elements offended and however many of an element's
+/// constraints they broke.
+///
+/// The rows differ along what the rule generalises over: which list member carries the
+/// elements, which operation carried it, which constraint class the elements broke, how many
+/// of them offended, and where in the list they sat.
+#[tokio::test]
+async fn a_broken_element_is_stated_at_the_list_member_it_sat_in() {
+    let emulator = Emulator::new();
+
+    // TagKey is modelled `len 1..128` (`smithy_query(query="shape",
+    // shape="com.amazonaws.kinesis#TagKeyList")` -> member TagKey), so the set nested for a
+    // tag-key list is those two bounds, the maximum first.
+    const TAG_KEY_SET: &str = "Member must have length less than or equal to 128, Member must \
+                               have length greater than or equal to 1";
+    let long_key = "k".repeat(129);
+    let metrics_set = format!("Member must satisfy enum value set: {METRICS_SET}");
+
+    // (case, operation, body, member path, the list as the clause quotes it, the nested set).
+    let rows: Vec<(&str, &str, Value, &str, String, &str)> = vec![
+        (
+            "a metric enhanced monitoring does not report",
+            "EnableEnhancedMonitoring",
+            json!({ "StreamName": "element-clause", "ShardLevelMetrics": ["NotARealMetric"] }),
+            "shardLevelMetrics",
+            "[NotARealMetric]".to_string(),
+            metrics_set.as_str(),
+        ),
+        (
+            "a metric enhanced monitoring cannot drop",
+            "DisableEnhancedMonitoring",
+            json!({ "StreamName": "element-clause", "ShardLevelMetrics": ["NotARealMetric"] }),
+            "shardLevelMetrics",
+            "[NotARealMetric]".to_string(),
+            metrics_set.as_str(),
+        ),
+        (
+            // One offending element among accepted ones: the clause quotes the WHOLE list,
+            // in the order the request carried it.
+            "an unknown metric after an accepted one",
+            "EnableEnhancedMonitoring",
+            json!({
+                "StreamName": "element-clause",
+                "ShardLevelMetrics": ["IncomingBytes", "NotAMetric"],
+            }),
+            "shardLevelMetrics",
+            "[IncomingBytes, NotAMetric]".to_string(),
+            metrics_set.as_str(),
+        ),
+        (
+            // TWO offending elements are ONE validation error about one member.
+            "two unknown metrics",
+            "DisableEnhancedMonitoring",
+            json!({
+                "StreamName": "element-clause",
+                "ShardLevelMetrics": ["NotAMetric", "AlsoNotAMetric"],
+            }),
+            "shardLevelMetrics",
+            "[NotAMetric, AlsoNotAMetric]".to_string(),
+            metrics_set.as_str(),
+        ),
+        (
+            // Another member, another operation and another constraint class: a tag key
+            // outside the length its element shape declares.
+            "a tag key past its length",
+            "RemoveTagsFromStream",
+            json!({ "StreamName": "element-clause", "TagKeys": [long_key.clone()] }),
+            "tagKeys",
+            format!("[{long_key}]"),
+            TAG_KEY_SET,
+        ),
+        (
+            "an empty tag key beside a good one",
+            "UntagResource",
+            json!({
+                "ResourceARN": stream_arn(REGION, "element-clause"),
+                "TagKeys": ["keep", ""],
+            }),
+            "tagKeys",
+            "[keep, ]".to_string(),
+            TAG_KEY_SET,
+        ),
+    ];
+
+    for (case, operation, body, path, list, set) in rows {
+        let message = refusal(&emulator, case, operation, &body).await;
+        let clause = format!(
+            "Value '{list}' at '{path}' failed to satisfy constraint: Member must satisfy \
+             constraint: [{set}]"
+        );
+        assert_eq!(
+            message,
+            envelope(&[clause.as_str()]),
+            "case {case:?}: expected the clause {clause:?}, got {message:?}"
         );
     }
 }

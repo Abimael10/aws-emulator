@@ -18,7 +18,11 @@
 //! so there are no modelled response headers to serialize.
 //!
 //! Each structure is declared exactly once across this service's `types/` modules, and
-//! `types/mod.rs` re-exports them all.
+//! `types/mod.rs` re-exports them all — with ONE event shape declared twice here, as the two
+//! forms a pushed event takes: [`SubscribeToShardEvent`] carries the checkpoint a consumer
+//! reads on from, and [`ShardEndEvent`] is the last event of a shard a reshard closed, which
+//! carries none. The model marks that member `@required`, so the difference cannot be an
+//! optional field on one shape.
 #![allow(unused_imports)]
 
 use super::*;
@@ -56,6 +60,25 @@ pub struct StartingPosition {
 pub struct SubscribeToShardEvent {
     pub records: Vec<Record>,
     pub continuation_sequence_number: String,
+    pub millis_behind_latest: i64,
+    pub child_shards: Option<Vec<ChildShard>>,
+}
+
+/// The SAME `SubscribeToShardEvent`, as the event that ends a CLOSED shard carries it: with
+/// no `ContinuationSequenceNumber` at all, because a shard that is over has nowhere to
+/// continue from — the consumer reads on in the `ChildShards` this event names.
+///
+/// A second Rust shape for the one event shape, rather than an optional member on the shape
+/// above, because the model marks that member `@required`: a required member's field cannot be
+/// absent, so the member is left out of this declaration instead (`unsupported`). Every event
+/// but a closed shard's last is the shape above, which carries it.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.kinesis#SubscribeToShardEvent",
+    unsupported = ["ContinuationSequenceNumber"]
+)]
+#[derive(Debug, Clone, Default)]
+pub struct ShardEndEvent {
+    pub records: Vec<Record>,
     pub millis_behind_latest: i64,
     pub child_shards: Option<Vec<ChildShard>>,
 }

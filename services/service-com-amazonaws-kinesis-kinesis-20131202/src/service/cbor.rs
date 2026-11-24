@@ -155,7 +155,9 @@ impl<Eng: Send + Sync + 'static> Service for ServedInCbor<Eng> {
         // The same module the mounted service words a refusal through, so a refused request
         // carries one sentence whichever encoding it arrived in.
         match refusal {
-            Refusal::Invalid(violations) => super::validation::refusal(violations),
+            Refusal::Invalid(violations) => {
+                super::validation::refusal(violations, ::std::collections::HashMap::new)
+            }
             _ => None,
         }
     }

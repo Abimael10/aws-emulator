@@ -326,6 +326,13 @@ impl Measured {
         self.push(stream, series, None, value, at);
     }
 
+    /// Take over everything `other` measured, so one call that answers in SEVERAL steps — an
+    /// event stream pushing an event per second — publishes what all of them measured
+    /// together instead of taking the metric store's guard once per step.
+    pub fn absorb(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
     /// Hold one observation of `series` under one identity: the stream alone (`None`) or the
     /// stream and one of its shards.
     fn push(
