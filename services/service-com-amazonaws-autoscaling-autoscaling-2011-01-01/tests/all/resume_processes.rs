@@ -759,3 +759,197 @@ async fn the_instances_a_resumption_launches_are_real_ec2_instances() {
         );
     }
 }
+
+/// Every process the service publishes — not only the few the tables above name — can be
+/// suspended on its own and turned off again by a resumption that names it, and a resumption
+/// of a process the group is already running is served and leaves it running.
+///
+/// The catalog is read over the wire from `DescribeScalingProcessTypes`, the service's own
+/// statement of the processes a request may name, so this row set covers whatever that
+/// catalog holds rather than a list written out here.
+#[tokio::test]
+async fn every_published_process_round_trips_through_a_suspension_and_a_resumption() {
+    let engine = new_engine();
+    let router = router_with(engine.clone());
+    let subnets = seed_subnets(&engine, 1);
+    let catalog = published_catalog(&router).await;
+
+    for (index, process) in catalog.iter().enumerate() {
+        // The group holds no instance, so the two processes that move instances have nothing
+        // to move when they come back: this row is about the suspension itself.
+        let name = format!("round-trip-{index}");
+        create_group(&router, &name, &subnets[0].id, 0).await;
+        let named = vec![process.clone()];
+
+        let (status, body) = process_call(&router, "SuspendProcesses", &name, &named).await;
+        assert_eq!(
+            status, 200,
+            "case {process:?}: suspending expected 200, got {status}: {body}"
+        );
+        let reported = reported_suspensions(&router, &name).await;
+        assert_eq!(
+            reported
+                .iter()
+                .map(|(suspended, _)| suspended.clone())
+                .collect::<Vec<String>>(),
+            vec![process.clone()],
+            "case {process:?}: the group must report exactly that process suspended, got \
+             {reported:?}"
+        );
+
+        // Resumed TWICE, because a process is either suspended or it is not: the second
+        // resumption names one the group is already running, which is served and changes
+        // nothing.
+        for attempt in 1..=2 {
+            let (status, body) = process_call(&router, "ResumeProcesses", &name, &named).await;
+            assert_eq!(
+                status, 200,
+                "case {process:?}, resumption {attempt}: expected 200, got {status}: {body}"
+            );
+            let reported = reported_suspensions(&router, &name).await;
+            assert!(
+                reported.is_empty(),
+                "case {process:?}, resumption {attempt}: the group must report no suspension, \
+                 got {reported:?}"
+            );
+        }
+    }
+}
+
+/// One step of the scoping table: the group whose processes are resumed, what the resumption
+/// names, and what EVERY group then reports suspended.
+struct ScopeCase {
+    case: &'static str,
+    /// The group the resumption names.
+    group: &'static str,
+    /// What that resumption names.
+    resume: Named,
+    /// Each group and the processes it then reports suspended, in the order it reports them.
+    expected: &'static [(&'static str, &'static [&'static str])],
+}
+
+/// A resumption belongs to the group it names: it turns off that group's suspensions and
+/// leaves every other group's alone, reasons included — even where the groups have the same
+/// process suspended.
+#[tokio::test]
+async fn a_resumption_is_scoped_to_the_group_it_names() {
+    let engine = new_engine();
+    let router = router_with(engine.clone());
+    let subnets = seed_subnets(&engine, 1);
+    let catalog = published_catalog(&router).await;
+
+    // The suspensions each group starts with OVERLAP, so a resumption that reached past the
+    // group it names would show up in another group's read.
+    let initial: [(&str, &[&str]); 3] = [
+        ("scoped-a", &["Launch", "HealthCheck"]),
+        ("scoped-b", &["HealthCheck", "AZRebalance"]),
+        ("scoped-c", &["ScheduledActions", "Launch"]),
+    ];
+    for (group, processes) in initial {
+        create_group(&router, group, &subnets[0].id, 0).await;
+        let named: Vec<String> = processes
+            .iter()
+            .map(|process| (*process).to_string())
+            .collect();
+        let (status, body) = process_call(&router, "SuspendProcesses", group, &named).await;
+        assert_eq!(
+            status, 200,
+            "suspending {processes:?} on {group}: expected 200, got {status}: {body}"
+        );
+    }
+
+    // The reason every suspension carries before any resumption, so a suspension no
+    // resumption named can be held to the reason it has had since it was suspended.
+    let mut reasons: Vec<(&str, String, String)> = Vec::new();
+    for (group, _) in initial {
+        for (process, reason) in reported_suspensions(&router, group).await {
+            reasons.push((group, process, reason));
+        }
+    }
+
+    let cases = [
+        ScopeCase {
+            case: "one group's whole set resumed by naming none",
+            group: "scoped-a",
+            resume: Named::Omitted,
+            expected: &[
+                ("scoped-a", &[]),
+                ("scoped-b", &["AZRebalance", "HealthCheck"]),
+                ("scoped-c", &["Launch", "ScheduledActions"]),
+            ],
+        },
+        ScopeCase {
+            case: "one process resumed on a group that shares it with another group",
+            group: "scoped-b",
+            resume: Named::Processes(vec!["HealthCheck"]),
+            expected: &[
+                ("scoped-a", &[]),
+                ("scoped-b", &["AZRebalance"]),
+                ("scoped-c", &["Launch", "ScheduledActions"]),
+            ],
+        },
+        ScopeCase {
+            case: "a process the named group is already running while another group has it \
+                   suspended",
+            group: "scoped-b",
+            resume: Named::Processes(vec!["Launch"]),
+            expected: &[
+                ("scoped-a", &[]),
+                ("scoped-b", &["AZRebalance"]),
+                ("scoped-c", &["Launch", "ScheduledActions"]),
+            ],
+        },
+        ScopeCase {
+            case: "the whole published catalog resumed on one group",
+            group: "scoped-c",
+            resume: Named::WholePublishedCatalog,
+            expected: &[
+                ("scoped-a", &[]),
+                ("scoped-b", &["AZRebalance"]),
+                ("scoped-c", &[]),
+            ],
+        },
+    ];
+
+    for case in &cases {
+        let (status, body) =
+            process_call(&router, "ResumeProcesses", case.group, &case.resume.names(&catalog))
+                .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200, got {status}: {body}",
+            case.case
+        );
+
+        for (group, expected) in case.expected.iter().copied() {
+            let reported = reported_suspensions(&router, group).await;
+            let expected_names: Vec<String> = expected
+                .iter()
+                .map(|process| (*process).to_string())
+                .collect();
+            assert_eq!(
+                reported
+                    .iter()
+                    .map(|(process, _)| process.clone())
+                    .collect::<Vec<String>>(),
+                expected_names,
+                "case {:?}: {group} must report the suspended processes {expected_names:?}, \
+                 got {reported:?}",
+                case.case
+            );
+            for (process, reason) in &reported {
+                let earlier = reasons
+                    .iter()
+                    .find(|(held, suspended, _)| *held == group && suspended == process)
+                    .map(|(_, _, reason)| reason.clone())
+                    .unwrap_or_default();
+                assert_eq!(
+                    *reason, earlier,
+                    "case {:?}: {group}'s {process} keeps the reason it carried, got \
+                     {reason:?} after {earlier:?}",
+                    case.case
+                );
+            }
+        }
+    }
+}
