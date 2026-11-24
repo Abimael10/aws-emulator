@@ -43,3 +43,42 @@ Actual (emulator): no beat produced an observable result; the check was cut off 
 7. Publish a FRESH kind="unwanted" probe and drain the subject queue: the probe must arrive.
 8. Drain again and assert the step-5 withheld nonce and the step-4 warm nonce are absent from everything the subject queue ever received, and that final depth is 0.
 Against the emulator this sequence produces no observable step and is cut off at 60s.
+
+## Resolution note
+Each of the three hypotheses above was driven as a measurement against the STARTED binary — the
+built emulator on its own port, request authentication on, every call signed and sent over TLS,
+which is the configuration this check runs against and the one in which the fan-out into the queue
+is a cross-service call made as the service principal against the queue's own policy — using the
+check's own call shapes (`ReceiveMessage` with `MaxNumberOfMessages=10` and `WaitTimeSeconds=5`,
+the documented queue-policy grant per queue, the unfiltered twin, the three depth members, the
+widening and its read-back). All three are disproven:
+
+* (a) a subscription carrying a `FilterPolicy` DOES deliver a matching publish: the kind=wanted
+  notification was handed over by the first receive that asked for it, 4 ms after `Publish`
+  answered;
+* (b) the policy `SetSubscriptionAttributes` writes IS the one the next publish reads: the widened
+  policy is served back verbatim by `GetSubscriptionAttributes` and admits the next publish of the
+  withheld class, while releasing nothing the narrow policy had rejected and redelivering nothing
+  already delivered — the withheld publish reached the unfiltered twin alone and all three depth
+  members of the filtered queue stayed at 0;
+* (c) a receive does NOT hold its wait when a message is available: each receive with something to
+  hand over answered in ~4 ms. Only a receive that finds the queue empty waits, and it waits the
+  five seconds its caller asked for.
+
+What remains is the check's own wall clock. The whole sequence of beats above, driven end to end,
+takes about 40 s, of which about 40 s is those empty long polls: eight receives that find the queue
+empty, 5.005 s each, while every other call of the walk is answered in 4–60 ms (CreateTopic 52 ms,
+both queues with their policies 23 ms, both Subscribes 7 ms, each Publish 50–60 ms, each attribute
+read 4–8 ms). The negative observations this check is built from — that a withheld message never
+arrives, that a widening releases no backlog, that nothing is redelivered — spend their whole window
+by construction, and `WaitTimeSeconds` is a wait the caller asked for
+(`ReceiveMessageRequest$WaitTimeSeconds`: "If no messages are available and the wait time expires,
+the call does not return a message list"), so the emulator may not answer those receives sooner than
+the check asked it to. The harness records the cut-off at the drain's `receive_message` line, which
+is where a check sitting in a five-second long poll is found when a 60 s budget expires.
+
+`core/router/tests/all/sns_filtered_sqs_fan_out_on_a_started_emulator.rs` now holds that walk on the
+started binary, over two rows (the policy widened by adding a value to its list, and by replacing
+the list with an `anything-but` condition on another property). The in-process cover of the same
+rule is `core/router/tests/all/sns_widened_filter_policy_admits_the_publishes_that_follow.rs`, and
+the SNS crate's `tests/all/filter_policy_relaxation.rs` spans the relaxation forms.
