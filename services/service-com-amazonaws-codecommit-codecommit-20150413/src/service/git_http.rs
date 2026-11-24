@@ -74,13 +74,17 @@
 //! authorization step ([`super::git_authorization`], which also states what a
 //! credential can and cannot prove here).
 //!
-//! It verifies no request SIGNATURE, and cannot: a git credential is not a SigV4
-//! credential, and the secret half of one is held by the credential store, which
-//! hands a secret back to nobody — so there is nothing here to check a password
-//! against, and refusing every git request instead is exactly the defect this
-//! transport fixes. That matches the emulator's posture for the data planes it
-//! serves: it binds loopback by default (`EMULATOR_BIND_ADDRESS`) and holds only
-//! emulated state.
+//! A credential that resolves to NO principal is answered with that same `401` and
+//! challenge: the git credentials of this service are a user name and a password, the
+//! account keeps the verifier of the password it minted, and a pair it never issued —
+//! a wrong password, a credential since deleted or made inactive, a user name nothing
+//! holds — authenticates nobody, so there is no principal to decide a step for. It
+//! verifies no request SIGNATURE: a git credential is not a SigV4 credential, and the
+//! secret half of an access key is held by the credential store, which hands a secret
+//! back to nobody, so a credential presented as an access key id is resolved to the
+//! principal the registry that minted it names ([`super::git_authorization`]). That
+//! matches the emulator's posture for the data planes it serves: it binds loopback by
+//! default (`EMULATOR_BIND_ADDRESS`) and holds only emulated state.
 
 use std::time::SystemTime;
 
@@ -119,8 +123,10 @@ const FLUSH: &[u8] = b"0000";
 /// presents HTTPS git credentials as HTTP Basic ones) and the realm it names.
 const BASIC_CHALLENGE: &str = "Basic realm=\"CodeCommit\"";
 
-/// What a request that presented no credential at all is told. A git client prints
-/// its own message for a `401`; this is the body behind it.
+/// What a request this transport authenticates nobody for is told — one that presented
+/// no credential at all, and one whose credentials this account never issued. A git
+/// client prints its own message for a `401`; this is the body behind it, and it is one
+/// body for both, because a refusal must not say which half of a credential was wrong.
 const CREDENTIALS_REQUIRED: &str =
     "This repository requires the git credentials of an authorized IAM principal.";
 
@@ -203,8 +209,8 @@ impl Response {
         }
     }
 
-    /// The refusal of a request that presented no credential: a `401` carrying the
-    /// challenge under which the client may present one.
+    /// The refusal of a request this transport authenticates nobody for: a `401`
+    /// carrying the challenge under which the client may present credentials.
     pub fn challenge(message: &str) -> Self {
         Self {
             www_authenticate: Some(BASIC_CHALLENGE.to_string()),
@@ -296,10 +302,11 @@ pub const MAX_REQUEST_BODY_BYTES: usize = git_pack::MAX_PACK_BYTES + 64 * 1024;
 /// bytes — happens before the store guard this function is handed is taken.
 ///
 /// `caller` is the principal the credentials the request PRESENTED speak for
-/// ([`super::git_authorization`]), or `None` for a request that presented none —
-/// which is answered with a challenge, because every request to a CodeCommit
-/// repository's git transport is made with git credentials and the principal behind
-/// them is what the authorization steps below are decided for.
+/// ([`super::git_authorization`]), or `None` for a request that presented none and for
+/// one whose credentials this account never issued — each answered with a challenge,
+/// because every request to a CodeCommit repository's git transport is made with git
+/// credentials and the principal behind them is what the authorization steps below are
+/// decided for.
 ///
 /// Each of those steps is one IAM decision, taken BEFORE the state of the repository
 /// is consulted: a refusal is an authorization refusal and never git's own

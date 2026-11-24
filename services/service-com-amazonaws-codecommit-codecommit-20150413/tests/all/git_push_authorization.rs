@@ -175,15 +175,17 @@ async fn assume_push_role(router: &MultiServiceRouter, case: &str, role_arn: &st
 /// credential helper appends to the access key id after a `%`, which the transport
 /// must read past to find the credential it names.
 fn basic(user: &str, session: Option<&str>) -> String {
-    use base64::Engine as _;
     let user = match session {
         Some(token) => format!("{user}%{token}"),
         None => user.to_string(),
     };
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{user}:a-signature"))
-    )
+    basic_with_password(&user, "a-signature")
+}
+
+/// [`basic`], with the password the credentials carry named: the `ServicePassword` of
+/// an IAM service-specific credential, which is the secret half the transport verifies.
+fn basic_with_password(user: &str, password: &str) -> String {
+    crate::wire::git_basic_credentials(user, password)
 }
 
 /// One answer from the git transport.
@@ -858,13 +860,15 @@ async fn the_keyless_advertisement_step_is_what_the_null_guard_narrows() {
 async fn a_service_specific_git_credential_speaks_for_the_user_that_holds_it() {
     // The second documented way to get CodeCommit git credentials: an IAM
     // service-specific credential, whose generated `ServiceUserName` is what a client
-    // puts in the URL. It must reach the same decision the session credentials of a
-    // role reach — the policies of the identity that HOLDS it.
+    // puts in the URL and whose `ServicePassword` is the secret it proves itself with.
+    // It must reach the same decision the session credentials of a role reach — the
+    // policies of the identity that HOLDS it.
     let (router, engine) = emulator_with_sts();
     let repo = repository(&router, "service-credential").await;
     let user = "Mary_Major";
     let user_arn = crate::wire::hold_long_term_key_for(&engine, user, "AKIDGITUSERKEY");
     let service_user_name = format!("{user}-at-{}", engine::emulator_account_id());
+    let service_password = "the-password-this-account-minted";
     {
         let state = iam::service_state(&*engine).expect("the engine carries the IAM store");
         let mut store = state.lock();
@@ -879,6 +883,12 @@ async fn a_service_specific_git_credential_speaks_for_the_user_that_holds_it() {
         store
             .user_inline_policies
             .insert(iam::name_key(user), embedded);
+        // What the account keeps of the password it minted: its verifier, which is what
+        // the transport checks the presented password against.
+        let held = store.hold_password(service_password);
+        store
+            .service_specific_credential_secrets
+            .insert("ACCAEXAMPLEGITCREDENTIAL".to_string(), held);
         store.service_specific_credentials.insert(
             "ACCAEXAMPLEGITCREDENTIAL".to_string(),
             service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::ServiceSpecificCredentialMetadata {
@@ -908,7 +918,7 @@ async fn a_service_specific_git_credential_speaks_for_the_user_that_holds_it() {
             "POST",
             &format!("{}/git-receive-pack", repo.clone_url),
             Some("application/x-git-receive-pack-request"),
-            Some(basic(&service_user_name, None)),
+            Some(basic_with_password(&service_user_name, service_password)),
             push_body(&repo.base, &repo.next, reference),
         )
         .await;

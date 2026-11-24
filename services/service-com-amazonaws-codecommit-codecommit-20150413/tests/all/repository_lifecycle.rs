@@ -40,7 +40,9 @@ pub(crate) const ENDPOINT_AUTHORITY: &str = "codecommit.us-west-2.amazonaws.com"
 /// The account holds the default caller's long-term access key for an IAM user of
 /// its own ([`crate::wire::hold_long_term_key`]), which is the position a long-term
 /// key is in on AWS: it belongs to a user, and that user is the principal every ARN
-/// this service records for the request names.
+/// this service records for the request names. It also holds the CodeCommit git
+/// credential the git transport suites present ([`crate::wire::hold_git_credential`]),
+/// because that transport serves only credentials the account ISSUED.
 ///
 /// `pub(crate)` here and below: this module is the wire harness every suite in
 /// this test target shares, so a sibling suite drives the emulator exactly the
@@ -55,6 +57,7 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
         )),
     );
     crate::wire::hold_long_term_key(&engine, crate::wire::DEFAULT_ACCESS_KEY_ID);
+    crate::wire::hold_git_credential(&engine);
     (router, engine)
 }
 

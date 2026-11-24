@@ -34,7 +34,8 @@
 //!    `codecommit.amazonaws.com` is a generated `ServiceUserName`. Both are resolved
 //!    through the stores that MINTED them — the STS session registry and the IAM
 //!    account — so the principal a refusal is decided for is the one the caller
-//!    reads back for its own credentials.
+//!    reads back for its own credentials, and a credential NO store of this emulator
+//!    holds speaks for nobody at all.
 //! 2. **what it may do** — the identity-based policy documents in force on that
 //!    principal and the permissions boundary that caps them, read through the IAM
 //!    service's OWN accessors, where the collection rule lives.
@@ -48,12 +49,28 @@
 //! dependency cycle — the same reason every other service that decides this keeps
 //! its lookups beside its own state.
 //!
-//! The password is NOT verified, and cannot be: the secret half of a git credential
-//! is held by the credential store, which hands a secret back to nobody, so there is
-//! nothing here to check it against. What the credential identifies is still the
-//! principal that minted it, which is what the authorization decision needs; a
-//! request that presents NO credential at all is answered with a challenge instead
-//! ([`crate::service::git_http`]), as the service it emulates answers one.
+//! The PASSWORD is verified wherever the store that minted the credential kept
+//! something to verify it against. An IAM service-specific credential for this service
+//! is a (`ServiceUserName`, `ServicePassword`) pair, and the user name is not the
+//! secret — `ListServiceSpecificCredentials` reports it — so the password is the whole
+//! proof: the account keeps the VERIFIER of the password it minted, and this transport
+//! asks the account whether the pair a request presented is one it issued. A pair whose
+//! password does not verify, and a credential no store holds a record of (one deleted,
+//! one made inactive, one nothing ever minted), identify nobody: they resolve to no
+//! principal, which the transport answers with the same challenge a request presenting
+//! NO credential gets ([`crate::service::git_http`]), as the service it emulates answers
+//! one. The ambient principal — the account's own credential, which holds no IAM
+//! policies — belongs to the access key id this emulator PUBLISHED for itself and to no
+//! other presented value.
+//!
+//! What a credential presented as a SigV4 access key id proves is its IDENTITY and not
+//! its signature: the secret half of an access key or a session is held by the
+//! emulator's credential store, which hands a secret back to nobody, and the signature
+//! the credential helper writes is over a canonical request of its own rather than over
+//! this HTTP request, so there is nothing here to recompute it with. Such a credential
+//! is therefore resolved only to the principal the registry that minted it names, and
+//! an access key id no registry holds is refused like any other credential this
+//! emulator never issued.
 //!
 //! The decision is taken with no guard of this service's own store held, and it
 //! writes to neither store it reads.
@@ -192,47 +209,79 @@ impl GitPrincipal {
 }
 
 /// The principal the credentials a git request PRESENTED speak for, or `None` for a
-/// request that presented none at all — which is what the transport answers with a
-/// challenge rather than with a decision.
+/// request this transport can authenticate nobody for: one that presented no credential
+/// at all, and one whose credential no store of this emulator holds or whose password
+/// does not verify against what the store that minted it kept. Each of those is
+/// answered with a challenge rather than with a decision.
 pub fn presented_principal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     authorization: Option<&str>,
 ) -> Option<GitPrincipal> {
     let presented = presented_credential(authorization?)?;
-    Some(principal_of(engine, &presented))
+    principal_of(engine, &presented)
 }
 
-/// The credential id a git request presents, as the two clients of this transport
-/// present one: the user name of HTTP Basic credentials (a git client), or the
-/// access key id in the credential scope of a SigV4 signature (an SDK or a test
-/// driving the same endpoint).
-///
-/// `None` when the header carries neither, which is a request that identifies
-/// nobody.
-fn presented_credential(authorization: &str) -> Option<String> {
+/// The credential a git request presents: the id it NAMES, and the secret half it
+/// offers as proof of holding it.
+#[derive(Clone)]
+struct PresentedCredential {
+    /// The id, as the two clients of this transport present one: the user name of HTTP
+    /// Basic credentials (a git client), or the access key id in the credential scope of
+    /// a SigV4 signature (an SDK or a test driving the same endpoint).
+    id: String,
+    /// The password of HTTP Basic credentials — the `ServicePassword` of a git
+    /// credential, or the signature the CodeCommit credential helper writes for a
+    /// caller's access key. `None` for a request that presents a SigV4 `Authorization`
+    /// header instead, which names a credential and carries no password.
+    secret: Option<String>,
+}
+
+/// Prints the id and whether a secret was presented, never the secret: this type holds
+/// the password a request offered, so a formatter of it must not be able to put that
+/// password anywhere a value of it can be read back.
+impl std::fmt::Debug for PresentedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedCredential")
+            .field("id", &self.id)
+            .field("presented_a_secret", &self.secret.is_some())
+            .finish()
+    }
+}
+
+/// The credential a git request presents, or `None` when the header carries neither
+/// form, which is a request that identifies nobody.
+fn presented_credential(authorization: &str) -> Option<PresentedCredential> {
     let value = authorization.trim();
     if let Some((scheme, rest)) = value.split_once(' ') {
         if scheme.eq_ignore_ascii_case("basic") {
-            return basic_user_name(rest.trim());
+            return basic_credential(rest.trim());
         }
     }
-    sigv4_access_key_id(value)
+    sigv4_access_key_id(value).map(|id| PresentedCredential { id, secret: None })
 }
 
-/// The user name of HTTP Basic credentials, with the session token the CodeCommit
-/// credential helper appends to an access key id removed: `user:password`
+/// The HTTP Basic credentials a git client presents, with the session token the
+/// CodeCommit credential helper appends to an access key id removed: `user:password`
 /// base64-encoded is what the scheme carries, and the helper writes
 /// `<access key id>%<session token>` as the user.
-fn basic_user_name(encoded: &str) -> Option<String> {
+fn basic_credential(encoded: &str) -> Option<PresentedCredential> {
     let decoded = ::base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()?;
     let text = String::from_utf8(decoded).ok()?;
-    let user = text.split_once(':').map_or(text.as_str(), |(user, _)| user);
+    let (user, secret) = match text.split_once(':') {
+        Some((user, secret)) => (user, Some(secret.to_string())),
+        // A value carrying no separator presents a user name and no password at all,
+        // which proves nothing about any credential that has one.
+        None => (text.as_str(), None),
+    };
     let user = user
         .split_once(SESSION_TOKEN_SEPARATOR)
         .map_or(user, |(id, _)| id);
-    (!user.is_empty()).then(|| user.to_string())
+    (!user.is_empty()).then(|| PresentedCredential {
+        id: user.to_string(),
+        secret,
+    })
 }
 
 /// The access key id a SigV4 `Authorization` header names, read by the CORE's own
@@ -248,39 +297,44 @@ fn sigv4_access_key_id(authorization: &str) -> Option<String> {
 }
 
 /// The principal the presented credential speaks for, and the documents in force on
-/// it.
+/// it, or `None` when this emulator issued no such credential.
 ///
 /// Resolved in the order the credential forms are minted in: a session of one of the
 /// account's roles (the STS registry `sts:AssumeRole` writes), an IAM user's own
 /// long-term access key (the map `iam:GetUser` resolves a caller through), and an
-/// IAM service-specific credential's generated user name (the registry
-/// `CreateServiceSpecificCredential` writes). A credential none of them holds a
-/// record for is the account's own published credential, which holds no
-/// identity-based policies — the position AWS account root credentials are in.
-fn principal_of<Eng: Send + Sync + 'static>(engine: &Eng, presented: &str) -> GitPrincipal {
+/// IAM service-specific credential's generated user name together with the password
+/// minted for it (the registry `CreateServiceSpecificCredential` writes). The access
+/// key id this emulator published for itself resolves to the account's own published
+/// credential, which holds no identity-based policies — the position AWS account root
+/// credentials are in. Anything else is a credential this account never issued.
+fn principal_of<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    presented: &PresentedCredential,
+) -> Option<GitPrincipal> {
     let now = SystemTime::now();
     let session = sts_store::service_state(engine).and_then(|sts| {
         let store = sts.lock();
-        let session = store.session(presented)?;
+        let session = store.session(&presented.id)?;
         // An expired session credential speaks for nobody: it carries no document,
         // so every step it asks for is refused, and the refusal still names what was
         // presented rather than a blank principal.
         Some((session.identity.arn.clone(), session.is_expired(now)))
     });
     if let Some((arn, true)) = session {
-        return GitPrincipal {
+        return Some(GitPrincipal {
             arn: format!("an expired session credential ({arn})"),
             ..GitPrincipal::default()
-        };
+        });
     }
     let Some(iam) = iam_store::service_state(engine) else {
-        // No IAM store on this engine: no principal of it can carry a policy, so
-        // there is nothing to judge the credential on.
-        return GitPrincipal {
-            arn: session.map(|(arn, _)| arn).unwrap_or_default(),
+        // No IAM store on this engine: it holds no credential record for anything to
+        // be resolved through, and no principal of it could carry a policy — so only a
+        // session the STS registry itself named speaks for anybody here.
+        return session.map(|(arn, _)| GitPrincipal {
+            arn,
             unbounded: true,
             ..GitPrincipal::default()
-        };
+        });
     };
     let store = iam.lock();
     let mut principal = match session {
@@ -288,7 +342,7 @@ fn principal_of<Eng: Send + Sync + 'static>(engine: &Eng, presented: &str) -> Gi
             arn,
             ..GitPrincipal::default()
         },
-        None => long_term_principal(&store, presented),
+        None => long_term_principal(&store, presented, now)?,
     };
     // Which IAM identity the principal's policies are held under is read through the
     // tree's shared readings of a principal ARN.
@@ -308,54 +362,98 @@ fn principal_of<Eng: Send + Sync + 'static>(engine: &Eng, presented: &str) -> Gi
         let user_arn = principal.arn.clone();
         principal.read_policies_of(&store, &user_arn);
     }
-    principal
+    Some(principal)
 }
 
-/// The principal a credential that names no STS session speaks for: the IAM user
-/// that holds the long-term access key, the user that holds the service-specific git
-/// credential of that generated user name, or the account's own published credential
-/// when the account holds neither.
+/// The principal a credential that names no STS session speaks for: the IAM user that
+/// holds the long-term access key, the user that holds the service-specific git
+/// credential the presented user name and password are one issued pair of, or the
+/// account's own published credential when the presented id is the access key id this
+/// emulator published for itself.
+///
+/// `None` for everything else — a user name the account holds no credential for, a
+/// credential it no longer holds, and a right user name with a wrong password — because
+/// none of those is a credential this account issued, and a credential it did not issue
+/// identifies nobody to decide anything for.
 fn long_term_principal(
     store: &iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State,
-    presented: &str,
-) -> GitPrincipal {
+    presented: &PresentedCredential,
+    now: SystemTime,
+) -> Option<GitPrincipal> {
     if let Some(user) = store
         .access_keys
-        .get(presented)
+        .get(&presented.id)
         .and_then(|record| store.users.get(&record.user_key))
     {
-        return GitPrincipal {
+        return Some(GitPrincipal {
             arn: user.arn.clone(),
             ..GitPrincipal::default()
-        };
+        });
     }
-    if let Some(user) = git_credential_holder(store, presented) {
-        return GitPrincipal {
+    if let Some(user) = git_credential_holder(store, presented, now) {
+        return Some(GitPrincipal {
             arn: user,
             ..GitPrincipal::default()
-        };
+        });
     }
-    // The account's own published credential, and every credential this account
-    // holds no record for: no identity-based policy is in force on it.
-    GitPrincipal {
-        arn: ::service_common::caller_principal::ambient_user_arn(),
-        unbounded: true,
-        ..GitPrincipal::default()
+    if published_by_this_emulator(&presented.id) {
+        // The account's own published credential: no identity-based policy is in force
+        // on it, which is the position AWS account root credentials are in.
+        return Some(GitPrincipal {
+            arn: ::service_common::caller_principal::ambient_user_arn(),
+            unbounded: true,
+            ..GitPrincipal::default()
+        });
     }
+    None
 }
 
-/// The ARN of the IAM user that holds the ACTIVE service-specific credential for
-/// this service whose generated user name is `service_user_name`, or `None` when the
-/// account holds none.
+/// The ARN of the IAM user that holds the ACTIVE service-specific credential for this
+/// service whose generated user name and password are the pair `presented` offers, or
+/// `None` when the account issued no such pair.
+///
+/// The question is the ACCOUNT's, asked through its own accessor: the account keeps the
+/// verifier of every `ServicePassword` it minted, and nothing else in this emulator can
+/// say whether a password is one it issued. A request presenting no password at all
+/// offers no proof of such a credential, so it is not one.
 fn git_credential_holder(
     store: &iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State,
-    service_user_name: &str,
+    presented: &PresentedCredential,
+    now: SystemTime,
 ) -> Option<String> {
-    let held = store.service_specific_credentials.values().find(|credential| {
-        credential.service_name == GIT_CREDENTIAL_SERVICE
-            && credential.status == iam_store::CREDENTIAL_STATUS_ACTIVE
-            && credential.service_user_name.as_deref() == Some(service_user_name)
-    })?;
+    let secret = presented.secret.as_deref()?;
+    let held = store.service_specific_credential_for_user_name(
+        GIT_CREDENTIAL_SERVICE,
+        &presented.id,
+        secret,
+        unix_seconds(now),
+    )?;
     let user = store.users.get(&iam_store::name_key(&held.user_name))?;
     Some(user.arn.clone())
+}
+
+/// Whether `presented` is the access key id this emulator PUBLISHED for itself: the
+/// credential a caller is handed at start, which this emulator mints and nothing else
+/// holds a record of.
+///
+/// Asked of the IAM account's OWN reading of that question
+/// (`iam_store::authorization::caller_identity::is_published`), which is the same one its
+/// handlers resolve a nameless caller through, so this transport and that account cannot
+/// disagree about which presented id is the account's own credential.
+///
+/// `false` when this emulator published none — authentication off, so nothing was minted
+/// — and then nothing reaches the ambient principal this way: a git client must present
+/// a credential the ACCOUNT holds, which for this transport is a service-specific
+/// credential of an IAM user.
+fn published_by_this_emulator(presented: &str) -> bool {
+    iam_store::authorization::caller_identity::is_published(presented)
+}
+
+/// `now` as whole seconds since the epoch, the unit the IAM account counts a
+/// credential's expiry in.
+fn unix_seconds(now: SystemTime) -> i64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
+        .unwrap_or_default()
 }

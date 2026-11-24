@@ -120,6 +120,103 @@ pub(crate) fn emulator_with_callers(
     (router, engine)
 }
 
+/// The IAM user the git credentials the suites present belong to.
+pub(crate) const GIT_CREDENTIAL_USER: &str = "GitCaller";
+
+/// The `ServicePassword` the account minted with those credentials: the secret half of
+/// the pair, which the git transport verifies against the verifier the account keeps of
+/// it. A value of this harness's own — `CreateServiceSpecificCredential` generates one
+/// no test can predict, so a suite that holds a credential ITSELF holds the verifier of
+/// the password it will present.
+pub(crate) const GIT_SERVICE_PASSWORD: &str = "harness-git-credential-password";
+
+/// The `ServiceUserName` of those credentials: the generated user name
+/// `CreateServiceSpecificCredential` reports for an IAM user, which is what a client
+/// puts in a clone URL.
+pub(crate) fn git_service_user_name() -> String {
+    format!("{GIT_CREDENTIAL_USER}-at-{}", engine::emulator_account_id())
+}
+
+/// Record "the account holds an ACTIVE CodeCommit git credential for
+/// [`GIT_CREDENTIAL_USER`], whose password is [`GIT_SERVICE_PASSWORD`], for a user that
+/// may pull and push" — the records `iam:CreateUser`, `iam:PutUserPolicy` and
+/// `iam:CreateServiceSpecificCredential` write — and answer its `ServiceUserName`.
+///
+/// The git transport serves only credentials the ACCOUNT ISSUED, so a suite driving it
+/// holds a credential the same way the documented setup flow creates one: an IAM user,
+/// a policy granting `codecommit:GitPull`/`codecommit:GitPush`, and a service-specific
+/// credential for `codecommit.amazonaws.com` whose password the account keeps a verifier
+/// of. One definition for every suite, so none of them invents a credential nothing
+/// issued.
+pub(crate) fn hold_git_credential(engine: &engine::InMemoryEngine) -> String {
+    let service_user_name = git_service_user_name();
+    hold_long_term_key_for(engine, GIT_CREDENTIAL_USER, GIT_CREDENTIAL_ACCESS_KEY);
+    let state = iam::service_state(engine).expect("the in-memory engine carries the IAM store");
+    let mut store = state.lock();
+    let mut granted = std::collections::BTreeMap::new();
+    granted.insert(
+        iam::name_key(GIT_ACCESS_POLICY),
+        iam::InlinePolicy {
+            policy_name: GIT_ACCESS_POLICY.to_string(),
+            policy_document: serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["codecommit:GitPull", "codecommit:GitPush"],
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
+        },
+    );
+    store
+        .user_inline_policies
+        .insert(iam::name_key(GIT_CREDENTIAL_USER), granted);
+    let held = store.hold_password(GIT_SERVICE_PASSWORD);
+    store
+        .service_specific_credential_secrets
+        .insert(GIT_CREDENTIAL_ID.to_string(), held);
+    store.service_specific_credentials.insert(
+        GIT_CREDENTIAL_ID.to_string(),
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::ServiceSpecificCredentialMetadata {
+            user_name: GIT_CREDENTIAL_USER.to_string(),
+            status: iam::CREDENTIAL_STATUS_ACTIVE.to_string(),
+            service_user_name: Some(service_user_name.clone()),
+            service_credential_alias: None,
+            create_date: ::aws_smithy_types::DateTime::from_secs(0),
+            expiration_date: None,
+            service_specific_credential_id: GIT_CREDENTIAL_ID.to_string(),
+            service_name: GIT_CREDENTIAL_SERVICE.to_string(),
+        },
+    );
+    service_user_name
+}
+
+/// The access key id the harness holds for [`GIT_CREDENTIAL_USER`], so the git
+/// credential belongs to a user of the account like any other principal.
+const GIT_CREDENTIAL_ACCESS_KEY: &str = "AKIDGITCALLERKEY";
+
+/// The `ServiceSpecificCredentialId` the account holds that credential under.
+const GIT_CREDENTIAL_ID: &str = "ACCAHARNESSGITCREDENT";
+
+/// The name of the inline policy that grants it the two git actions.
+const GIT_ACCESS_POLICY: &str = "harness-git-access";
+
+/// The service principal a CodeCommit git credential is created for.
+const GIT_CREDENTIAL_SERVICE: &str = "codecommit.amazonaws.com";
+
+/// The `Authorization` header a git client sends once it has been challenged: git
+/// credentials as HTTP Basic ones, which is how a git client presents HTTPS git
+/// credentials. `password` is the secret half it offers — the one the account minted
+/// unless a suite is checking what a wrong one is answered with.
+pub(crate) fn git_basic_credentials(user: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
+
 /// A `clientRequestToken` no other call in this test target has used.
 ///
 /// `CreatePullRequest` REQUIRES the member on the wire: an AWS SDK fills it in from

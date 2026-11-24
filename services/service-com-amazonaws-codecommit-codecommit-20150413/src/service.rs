@@ -735,8 +735,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // WHO the request speaks for, resolved before this service's store is
         // locked: the principal reads the IAM and STS stores, and the decisions the
         // transport takes per authorization step are then made from that snapshot
-        // alone, so no two stores are held at once. `None` is a request that
-        // presented no credential, which the transport answers with a challenge.
+        // alone, so no two stores are held at once. `None` is a request this transport
+        // authenticates nobody for — one that presented no credential, and one whose
+        // credentials this account never issued — which the transport answers with a
+        // challenge.
         let caller = git_authorization::presented_principal(
             &*self.engine,
             req.headers().get("authorization"),

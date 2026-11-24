@@ -26,19 +26,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::repository_lifecycle::{emulator, ok, string_at};
 
-/// The user name of the git credentials every request here presents. The account
-/// holds no record of it, so it speaks for no IAM identity and no identity-based
-/// policy is in force on it.
-const GIT_USER: &str = "body-bound-user-at-000000000000";
+/// The `ServiceUserName` of the git credentials every request here presents: the IAM
+/// service-specific credential the shared harness holds
+/// ([`crate::wire::hold_git_credential`]), because the transport serves only credentials
+/// the account ISSUED.
+fn git_user() -> String {
+    crate::wire::git_service_user_name()
+}
 
 /// The `Authorization` header a git client sends once it has been challenged: the git
-/// credentials as HTTP Basic ones.
+/// credentials as HTTP Basic ones, with the password the account minted with them.
 fn git_credentials() -> String {
-    use base64::Engine as _;
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{GIT_USER}:password"))
-    )
+    crate::wire::git_basic_credentials(&git_user(), crate::wire::GIT_SERVICE_PASSWORD)
 }
 
 /// Send one git transport request the way a git client does: no SigV4 credential, no

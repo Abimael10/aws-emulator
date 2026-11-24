@@ -1606,22 +1606,81 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         secret: &str,
         now_secs: i64,
     ) -> Option<&ServiceSpecificCredentialMetadata> {
+        self.usable_service_specific_credentials(service_name, now_secs)
+            .find(|(credential_id, _)| self.secret_was_issued_as(credential_id, secret))
+            .map(|(_, credential)| credential)
+    }
+
+    /// The ACTIVE service-specific credential of `service_name` whose generated user
+    /// name is `service_user_name` and whose secret half is `secret`, or `None` when
+    /// the account issued no such credential.
+    ///
+    /// This is the question the issuing service asks of a credential presented as a USER
+    /// NAME AND A PASSWORD — the form `ServiceSpecificCredential$ServiceUserName` and
+    /// `$ServicePassword` carry, which is what a client presents as HTTP Basic
+    /// credentials — as [`Self::service_specific_credential_for_secret`] is the same
+    /// question for the bearer form. The user name is not the proof: it is reported by
+    /// `ListServiceSpecificCredentials`, so the PASSWORD is what has to verify, and a
+    /// request naming a user name the account holds a credential for with any other
+    /// password speaks for nobody.
+    ///
+    /// Both halves must belong to ONE credential: only an `Active` one answers, and one
+    /// past its own `ExpirationDate` at `now_secs` does not, for the reasons stated on
+    /// [`Self::service_specific_credential_for_secret`]. The user name compares
+    /// case-folded, as every IAM entity name the account keys on does — "names are not
+    /// distinguished by case" — and the generated user name is built from one.
+    ///
+    /// A READ: asking changes nothing a later caller sees.
+    pub fn service_specific_credential_for_user_name(
+        &self,
+        service_name: &str,
+        service_user_name: &str,
+        secret: &str,
+        now_secs: i64,
+    ) -> Option<&ServiceSpecificCredentialMetadata> {
+        self.usable_service_specific_credentials(service_name, now_secs)
+            .find(|(credential_id, credential)| {
+                credential
+                    .service_user_name
+                    .as_deref()
+                    .is_some_and(|held| held.eq_ignore_ascii_case(service_user_name))
+                    && self.secret_was_issued_as(credential_id, secret)
+            })
+            .map(|(_, credential)| credential)
+    }
+
+    /// Every service-specific credential of `service_name` the account would
+    /// authenticate a request with at `now_secs`, with the id it holds each under: the
+    /// one filter both questions above are asked through, so the two forms a credential
+    /// is presented in cannot differ about which credentials are usable.
+    fn usable_service_specific_credentials<'a>(
+        &'a self,
+        service_name: &str,
+        now_secs: i64,
+    ) -> impl Iterator<Item = (&'a String, &'a ServiceSpecificCredentialMetadata)> + 'a {
+        // Case-folded once and owned by the filter, so the credentials it answers are
+        // borrowed from this account alone and outlive the name that selected them.
+        let service_name = service_name.to_ascii_lowercase();
         self.service_specific_credentials
             .iter()
-            .filter(|(_, credential)| {
+            .filter(move |(_, credential)| {
                 let expired = credential
                     .expiration_date
                     .is_some_and(|expires_at| expires_at.secs() <= now_secs);
-                credential.service_name.eq_ignore_ascii_case(service_name)
+                credential.service_name.eq_ignore_ascii_case(&service_name)
                     && credential.status == CREDENTIAL_STATUS_ACTIVE
                     && !expired
             })
-            .find(|(credential_id, _)| {
-                self.service_specific_credential_secrets
-                    .get(*credential_id)
-                    .is_some_and(|held| held.verifies(secret))
-            })
-            .map(|(_, credential)| credential)
+    }
+
+    /// Whether `secret` is the secret half the account issued for the credential it
+    /// holds under `credential_id` — answered by the verifier it keeps of that secret
+    /// ([`Self::service_specific_credential_secrets`]), never by the secret, which the
+    /// create response is the only time of.
+    fn secret_was_issued_as(&self, credential_id: &str, secret: &str) -> bool {
+        self.service_specific_credential_secrets
+            .get(credential_id)
+            .is_some_and(|held| held.verifies(secret))
     }
 
     /// How many sets of service-specific credentials the user keyed by `user_key`

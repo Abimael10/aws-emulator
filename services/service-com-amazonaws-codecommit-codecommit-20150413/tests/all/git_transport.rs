@@ -85,22 +85,23 @@ async fn git(
     content_type: Option<&str>,
     body: Vec<u8>,
 ) -> GitReply {
-    git_as(router, method, url, content_type, body, Some(GIT_USER)).await
+    git_as(router, method, url, content_type, body, Some(&git_user())).await
 }
 
-/// The user name of the git credentials the cases here present. The account holds no
-/// record of it, so it speaks for no IAM identity and no identity-based policy is in
-/// force on it — the position the account's own credentials are in.
-const GIT_USER: &str = "git-user-at-000000000000";
+/// The `ServiceUserName` of the git credentials the cases here present: the IAM
+/// service-specific credential for `codecommit.amazonaws.com` the shared harness holds
+/// ([`crate::wire::hold_git_credential`]), for a user the account grants
+/// `codecommit:GitPull` and `codecommit:GitPush`. The transport serves only credentials
+/// the account ISSUED, so a suite driving it presents one it holds.
+fn git_user() -> String {
+    crate::wire::git_service_user_name()
+}
 
-/// The `Authorization` header a git client sends once it has been challenged:
-/// Basic credentials whose user name is the git credential's.
+/// The `Authorization` header a git client sends once it has been challenged: Basic
+/// credentials whose user name is the git credential's and whose password is the
+/// `ServicePassword` minted with it.
 fn basic(user: &str) -> String {
-    use base64::Engine as _;
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{user}:password"))
-    )
+    crate::wire::git_basic_credentials(user, crate::wire::GIT_SERVICE_PASSWORD)
 }
 
 /// [`git`], with the git credentials the request presents named — `None` for a
@@ -2316,7 +2317,7 @@ async fn the_transport_is_claimed_by_path_whatever_host_the_client_was_given() {
             .method("GET")
             .uri("/v1/repos/hosts/info/refs?service=git-upload-pack")
             .header("user-agent", "git/2.43.0")
-            .header("authorization", basic(GIT_USER));
+            .header("authorization", basic(&git_user()));
         if let Some(host) = host {
             request = request.header("host", host);
         }
@@ -2472,6 +2473,10 @@ async fn a_git_client_is_served_without_a_sigv4_signature() {
             &engine,
         )),
     );
+    // The git credentials this request presents are ones the ACCOUNT issued, exactly as
+    // on the shared harness: a git request carries no SigV4 signature, but it does carry
+    // a credential, and the transport serves only one the account holds.
+    crate::wire::hold_git_credential(&engine);
     let seeded_key = crate::harness::seeded_encryption_key(&engine, "us-west-2");
     engine
         .state::<service_com_amazonaws_codecommit_codecommit_20150413::ComAmazonawsCodecommitCodecommit20150413State>()
@@ -3558,7 +3563,7 @@ async fn the_announced_https_origin_serves_the_git_transport_it_names() {
              Host: {authority}\r\nUser-Agent: git/2.43.0\r\nConnection: close\r\n"
         );
         if authenticated {
-            request.push_str(&format!("Authorization: {}\r\n", basic(GIT_USER)));
+            request.push_str(&format!("Authorization: {}\r\n", basic(&git_user())));
         }
         request.push_str("\r\n");
         let answer = exchange(label, &authority, encrypted, &request).await;

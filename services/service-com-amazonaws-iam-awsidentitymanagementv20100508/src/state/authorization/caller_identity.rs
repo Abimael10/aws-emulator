@@ -95,7 +95,12 @@ fn published_credential_of(store: &IamState, access_key_id: String) -> Option<Pu
 /// answer cannot drift from the credential requests are actually verified against. A
 /// process that published no pair at all (authentication off, so nothing was minted)
 /// answers `false`: there is no published credential for a request to be signed with.
-fn is_published(access_key_id: &str) -> bool {
+///
+/// `pub` because another service's data plane asks the same question of a credential
+/// presented to IT — CodeCommit's git transport, resolving which presented id is the
+/// account's own published credential — and two copies of this test could disagree about
+/// which id that is.
+pub fn is_published(access_key_id: &str) -> bool {
     ::emulator_server::SigV4Authenticator::minted_credentials()
         .is_some_and(|published| published.access_key_id == access_key_id)
 }
