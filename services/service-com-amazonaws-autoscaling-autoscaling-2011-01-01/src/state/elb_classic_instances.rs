@@ -128,6 +128,11 @@ pub fn attached_names(group: &StoredGroup) -> Vec<&str> {
 /// An instance counts while it is not on its way out of the group: an instance that is still
 /// `Pending` has launched and is being brought into service, which is what the registration
 /// is part of, and one that is `Terminating` is leaving.
+///
+/// An instance the group brought into service while the process that registers its instances
+/// was suspended owes NOTHING in any of them, for the rest of its life in the group
+/// ([`crate::state::StoredInstance::takes_load_balancer_registration`]): that is what the
+/// suspension withholds, and resuming the process does not make the registration owed.
 pub fn wanted_of(store: &AutoScalingState, group_name: &str) -> Vec<InstanceRegistration> {
     let Some(group) = store.groups.get(group_name) else {
         return Vec::new();
@@ -135,7 +140,7 @@ pub fn wanted_of(store: &AutoScalingState, group_name: &str) -> Vec<InstanceRegi
     let mut registrations = Vec::new();
     for name in attached_names(group) {
         for instance in &group.instances {
-            if instance.is_leaving_group() {
+            if instance.is_leaving_group() || !instance.takes_load_balancer_registration() {
                 continue;
             }
             registrations.push(InstanceRegistration {
@@ -220,6 +225,7 @@ pub fn attachment_states<Eng: Send + Sync + 'static>(
     // carries.
     let owed: BTreeSet<String> = group
         .active_instances()
+        .filter(|instance| instance.takes_load_balancer_registration())
         .map(|instance| workload(&group.arn, &instance.instance_id))
         .collect();
     // What an attachment is in before anything of it is registered — which is where every

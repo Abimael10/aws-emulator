@@ -295,6 +295,12 @@ impl AutoScalingState {
                     // ([`super::lifecycle_actions`]).
                     pending_lifecycle_actions: Vec::new(),
                     held_step: None,
+                    // An instance a CALLER attaches is registered with the group's load
+                    // balancing by the attach itself — `AttachInstances` is not the process
+                    // that adds the instances a group launches
+                    // ([`super::suspended_processes::PROCESS_ADD_TO_LOAD_BALANCER`]) — so
+                    // nothing is withheld from it.
+                    load_balancer_registration_withheld: false,
                 })
             })
             .collect();

@@ -557,6 +557,11 @@ pub fn launch_blocked_message(unresolved: &[String]) -> String {
 /// forms the attachment takes — the group's own `TargetGroupARNs` and an `elbv2` traffic
 /// source — because either one associates that target group with the group, and each target
 /// group is counted once however many times it is named.
+///
+/// An instance the group brought into service while the process that registers its instances
+/// was suspended owes NOTHING in any of them, for the rest of its life in the group
+/// ([`crate::state::StoredInstance::takes_load_balancer_registration`]): that is what the
+/// suspension withholds, and resuming the process does not make the registration owed.
 pub fn wanted_of(store: &AutoScalingState, group_name: &str) -> Vec<TargetRegistration> {
     let Some(group) = store.groups.get(group_name) else {
         return Vec::new();
@@ -564,7 +569,7 @@ pub fn wanted_of(store: &AutoScalingState, group_name: &str) -> Vec<TargetRegist
     let mut registrations = Vec::new();
     for arn in attached_arns(group) {
         for instance in &group.instances {
-            if instance.is_leaving_group() {
+            if instance.is_leaving_group() || !instance.takes_load_balancer_registration() {
                 continue;
             }
             registrations.push(TargetRegistration {
@@ -641,6 +646,7 @@ pub fn attachment_states<Eng: Send + Sync + 'static>(
     // carries.
     let owed: BTreeSet<String> = group
         .active_instances()
+        .filter(|instance| instance.takes_load_balancer_registration())
         .map(|instance| workload(&group.arn, &instance.instance_id))
         .collect();
     // What an attachment is in before anything of it is registered — which is where every

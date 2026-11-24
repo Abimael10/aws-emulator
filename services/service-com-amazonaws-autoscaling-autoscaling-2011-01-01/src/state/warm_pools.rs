@@ -600,6 +600,7 @@ impl AutoScalingState {
             .iter()
             .map(|instance| instance.instance_id.clone())
             .collect();
+        let withhold_registration = !group.registers_with_load_balancers();
         for instance in &mut taken {
             // The transient state every instance this group brings into service is reported
             // in, for the span the group owes it; the instance keeps its id, its placement,
@@ -611,6 +612,12 @@ impl AutoScalingState {
             // ([`super::instance_health`]).
             instance.lifecycle_state = LIFECYCLE_PENDING.to_string();
             instance.transition_due = Some(due);
+            // THIS is where a pooled instance comes into service, so this is the call that
+            // owes it its registration with the group's load balancing — withheld, for the
+            // rest of its life in the group, while the process that performs the
+            // registration is suspended
+            // ([`super::suspended_processes::PROCESS_ADD_TO_LOAD_BALANCER`]).
+            instance.load_balancer_registration_withheld = withhold_registration;
         }
         group.instances.extend(taken);
         super::ec2_instances::set_running(engine, &ids, true, now);

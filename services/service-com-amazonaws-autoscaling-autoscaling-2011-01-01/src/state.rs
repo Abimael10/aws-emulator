@@ -968,6 +968,18 @@ pub struct StoredInstance {
     /// activity it recorded and the event it queued — neither of which is a fact until that
     /// hold resolves ([`lifecycle_actions::HeldStep`]).
     pub held_step: Option<HeldStep>,
+    /// Whether this instance came into service while the group had the process that
+    /// registers its instances with its load balancing suspended
+    /// ([`StoredGroup::registers_with_load_balancers`]), so the group registers it with
+    /// NONE of its attachments ([`elbv2_targets::wanted_of`]).
+    ///
+    /// Written once, when the group brought the instance into service, and never cleared:
+    /// resuming the process registers the instances that come into service after it, not the
+    /// ones that came into service while it was suspended
+    /// ([`suspended_processes::PROCESS_ADD_TO_LOAD_BALANCER`]). `false` for every instance
+    /// brought into service by a group running that process. Not part of what the API
+    /// reports for an instance.
+    pub load_balancer_registration_withheld: bool,
 }
 
 impl StoredInstance {
@@ -2807,11 +2819,17 @@ impl AutoScalingState {
         // Elastic Load Balancing v2 can take no registration into stops the launch that
         // would have to register there: the group launches nothing and records the refusal
         // that names the target group instead. A warm pool's own instances, which no
-        // attachment takes, are not held to it.
+        // attachment takes, are not held to it, and neither is a group that registers
+        // nothing because the process that registers is suspended
+        // ([`StoredGroup::registers_with_load_balancers`]) — there is then no registration
+        // for that attachment to fail.
         //
         // The attachment STAYS: the group keeps reporting what the client attached until the
         // client detaches it, so the refusal is the whole of what the launch did.
-        if request.count > 0 && request.destination == LaunchDestination::Group {
+        if request.count > 0
+            && request.destination == LaunchDestination::Group
+            && group.registers_with_load_balancers()
+        {
             let unresolved = elbv2_targets::unresolved_attachments(engine, group);
             if !unresolved.is_empty() {
                 let reason = elbv2_targets::launch_blocked_message(&unresolved);
@@ -2841,6 +2859,13 @@ impl AutoScalingState {
         };
         let tags = group.tags.clone();
         let protected = group.new_instances_protected_from_scale_in;
+        // Whether an instance this launch brings INTO SERVICE is registered with the group's
+        // load balancing, which is the group's own `AddToLoadBalancer`
+        // ([`StoredGroup::registers_with_load_balancers`]). A launch into the warm pool
+        // brings nothing into service — the instance is registered, or not, by the call that
+        // takes it out of the pool ([`warm_pools`]) — so it is marked there instead.
+        let withhold_registration = request.destination == LaunchDestination::Group
+            && !group.registers_with_load_balancers();
         // Everything the group already holds, its warm pool included: the placement of a
         // fresh instance follows how many the group has placed so far.
         let placed = group.instances.len() + group.warm_pool_instance_count();
@@ -2987,6 +3012,7 @@ impl AutoScalingState {
                 // ([`lifecycle_actions`]).
                 pending_lifecycle_actions: Vec::new(),
                 held_step: None,
+                load_balancer_registration_withheld: withhold_registration,
             })
             .collect();
         let launched_ids: Vec<String> = launched

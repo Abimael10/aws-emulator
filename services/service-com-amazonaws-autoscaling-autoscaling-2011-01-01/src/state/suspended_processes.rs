@@ -48,13 +48,37 @@
 //! ([`PROCESS_REPLACE_UNHEALTHY`]). So a group that has suspended the replacement alone goes
 //! on reporting a member it found unhealthy, in the lifecycle state that member already
 //! held, and one that has suspended the check alone reaches no verdict to act on.
+//!
+//! `AddToLoadBalancer` is the registration a group's load balancing is made of
+//! ([`PROCESS_ADD_TO_LOAD_BALANCER`]): while it is suspended the group still launches the
+//! instance and brings it into service, and registers it with none of the load balancers or
+//! target groups it is attached to ([`super::elbv2_targets`]). That registration is owed by
+//! the instance coming into service, so an instance that came into service while the process
+//! was suspended is not registered by the resumption either — the mark stays on the instance
+//! ([`super::StoredInstance::load_balancer_registration_withheld`]) and only the instances
+//! that come into service after the resumption are registered.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::SuspendedProcess;
 
-use super::StoredGroup;
+use super::{StoredGroup, StoredInstance};
+
+impl StoredInstance {
+    /// Whether this instance is one the group's load balancing owes a registration for:
+    /// nothing was withheld from it when the group brought it into service
+    /// ([`StoredInstance::load_balancer_registration_withheld`]).
+    ///
+    /// THE ONE reading of that mark, for every load balancer kind a group registers its
+    /// instances with — a Classic Load Balancer ([`super::elb_classic_instances`]) and an
+    /// Elastic Load Balancing v2 target group ([`super::elbv2_targets`]) — so the suspension
+    /// withholds the registration from both alike.
+    #[must_use]
+    pub fn takes_load_balancer_registration(&self) -> bool {
+        !self.load_balancer_registration_withheld
+    }
+}
 
 /// The process that adds instances to a group when it scales out, as the catalog names it.
 pub const PROCESS_LAUNCH: &str = "Launch";
@@ -94,6 +118,18 @@ pub const PROCESS_HEALTH_CHECK: &str = "HealthCheck";
 /// ([`super::AutoScalingState::reconcile_unhealthy_instances`]); resuming it leaves the
 /// replacement owed, so the group then performs it with no further call from anybody.
 pub const PROCESS_REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
+
+/// The process that REGISTERS a group's instances with the load balancers and target groups
+/// the group is attached to, as the catalog names it.
+///
+/// What it does is "add instances to the attached load balancer or target group when they
+/// launch", so while it is suspended the group brings an instance into service without
+/// registering it anywhere ([`super::elbv2_targets`]) — and because the registration belongs
+/// to the instance coming into service rather than to the attachment, resuming the process
+/// does not register the instances that came into service while it was suspended: only the
+/// ones that come into service afterwards are registered, and an earlier one is registered
+/// by whoever registers it with the load balancing service itself.
+pub const PROCESS_ADD_TO_LOAD_BALANCER: &str = "AddToLoadBalancer";
 
 /// The suspended processes of ONE group: the instant each process was suspended at, keyed
 /// by the process name.
@@ -189,6 +225,20 @@ impl StoredGroup {
     #[must_use]
     pub fn replaces_unhealthy_instances(&self) -> bool {
         !self.is_process_suspended(PROCESS_REPLACE_UNHEALTHY)
+    }
+
+    /// Whether this group REGISTERS an instance it brings into service with the load
+    /// balancers and target groups it is attached to: the process that performs the
+    /// registration is running ([`PROCESS_ADD_TO_LOAD_BALANCER`]).
+    ///
+    /// THE ONE reading of that question, for every instance the group itself brings into
+    /// service — one it launched for its capacity and one it took out of its warm pool — so
+    /// an instance that came into service while the process was suspended carries no
+    /// registration for the rest of its life in the group
+    /// ([`super::StoredInstance::load_balancer_registration_withheld`]).
+    #[must_use]
+    pub fn registers_with_load_balancers(&self) -> bool {
+        !self.is_process_suspended(PROCESS_ADD_TO_LOAD_BALANCER)
     }
 
     /// This group's suspensions as the API reports them — one `SuspendedProcess` each.
