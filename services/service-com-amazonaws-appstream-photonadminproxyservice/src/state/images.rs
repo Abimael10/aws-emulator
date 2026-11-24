@@ -14,11 +14,13 @@
 //! The shipped table below is a fixed snapshot of the base-image families AWS publishes,
 //! written with AWS's own base-image naming
 //! (`AppStream-[Graphics-<accelerator>-]<operating system>-<MM-DD-YYYY>`, the release date
-//! of the published image). It carries, for every operating system this API models an
-//! image platform for, the general-purpose base image, and for every operating system AWS
+//! of the published image). It carries, for every release batch the catalog publishes
+//! ([`PUBLISHED_RELEASE_DATES`]) and every operating system this API models an image
+//! platform for, the general-purpose base image, and for every operating system AWS
 //! publishes accelerated images for, one base image per graphics accelerator — so a client
-//! choosing an image finds one for each instance family it can launch a fleet on. The
-//! platform tokens are `PlatformType`'s (`PLATFORM_TYPE_VALUES` in
+//! choosing an image finds one for each instance family it can launch a fleet on, under
+//! every batch still published rather than under one frozen date. The platform tokens are
+//! `PlatformType`'s (`PLATFORM_TYPE_VALUES` in
 //! `ops/types/shared_types.rs`), and the supported instance families are the ones the
 //! model's `Image$SupportedInstanceFamilies` doc enumerates
 //! (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`:
@@ -34,7 +36,7 @@ use std::collections::BTreeMap;
 
 use crate::ops::types::{
     Application, Image, ImagePermissions, ImageSoftwareMetadata, ImageStateChangeReason,
-    ResourceError,
+    ImageVolumeConfig, ResourceError,
 };
 
 use super::{
@@ -66,6 +68,23 @@ pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
 /// provided images have type \"native\"" (`IMAGE_TYPE_VALUES` in
 /// `ops/types/shared_types.rs`).
 pub const IMAGE_TYPE_NATIVE: &str = "NATIVE";
+
+/// The `DynamicAppProvidersEnabled` of an image that serves its applications from the
+/// image itself (`DYNAMIC_APP_PROVIDERS_ENABLED_VALUES` in `ops/types/shared_types.rs`).
+/// A published base image carries no dynamic app provider, so dynamic app providers are
+/// not enabled within it.
+pub const DYNAMIC_APP_PROVIDERS_DISABLED: &str = "DISABLED";
+
+/// The `ImageSharedWithOthers` of an image that is shared with no other account
+/// (`IMAGE_SHARED_WITH_OTHERS_VALUES` in `ops/types/shared_types.rs`). Only an account's
+/// own private image can be shared, so a published base image is never shared by one.
+pub const IMAGE_SHARED_WITH_OTHERS_FALSE: &str = "FALSE";
+
+/// The `LatestAppstreamAgentVersion` of an image that does not carry the newest agent
+/// (`LATEST_APPSTREAM_AGENT_VERSION_VALUES` in `ops/types/shared_types.rs`). A published
+/// base image carries the agent of the batch it was released in rather than one that moves
+/// as agents are released, so it reports that it is not on the latest.
+pub const LATEST_APPSTREAM_AGENT_VERSION_FALSE: &str = "FALSE";
 
 /// How many images one `DescribeImages` page carries.
 ///
@@ -100,6 +119,36 @@ pub fn image_arn(region: &str, name: &str) -> String {
 pub fn published_image_arn(region: &str, name: &str) -> String {
     format!("arn:aws:{ARN_NAMESPACE}:{region}::{IMAGE_ARN_RESOURCE_TYPE}/{name}")
 }
+
+/// The ARN `resource-type` segment of an image recipe, the segment before the recipe's
+/// name in the ARN of the published build an image was made from.
+pub const RECIPE_ARN_RESOURCE_TYPE: &str = "recipe";
+
+/// `arn:aws:appstream:<region>::recipe/<name>` — the ARN of a recipe AWS publishes.
+///
+/// A published recipe is addressed exactly as the published image built from it is: no
+/// account owns it, so the ARN's account field is EMPTY and the Region is the one the
+/// request asks about ([`published_image_arn`]).
+pub fn published_recipe_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::{RECIPE_ARN_RESOURCE_TYPE}/{name}")
+}
+
+/// The instance family of an image written as the TOKEN the `InstanceFamily` member
+/// carries, given the family's display name as `Image$SupportedInstanceFamilies` enumerates
+/// it ("General Purpose", "Graphics G4"): the same words in upper case, joined by
+/// underscores.
+fn instance_family_token(family: &str) -> String {
+    family.to_uppercase().replace(' ', "_")
+}
+
+/// The size of an image's root volume in GB. The model's `VolumeConfig$VolumeSizeInGb`
+/// doc: "Valid range is 200-500 GB. The default is 200 GB, which is included in the hourly
+/// instance rate", so an image nobody has grown the volume of reports the default.
+const ROOT_VOLUME_SIZE_IN_GB: i32 = 200;
+
+/// The volume type an image's root volume is provisioned as, the member of the volume
+/// configuration the on-disk model does not declare (`ops/types/image_wire.rs`).
+const ROOT_VOLUME_TYPE: &str = "gp2";
 
 /// An RFC 3339 instant as the modelled timestamp; the epoch for text that is not one, so
 /// a mis-written table row cannot panic a read.
@@ -156,6 +205,24 @@ pub struct ImageRecord {
     /// One of `IMAGE_TYPE_VALUES`.
     pub image_type: Option<String>,
     pub image_software_metadata: Option<ImageSoftwareMetadata>,
+    /// The one instance family the image runs on, as the member of that name states it:
+    /// the family of [`Self::supported_instance_families`] written as a token
+    /// ([`instance_family_token`]).
+    pub instance_family: Option<String>,
+    /// Whether the account brings the licence of the operating system the image runs.
+    pub byol: Option<bool>,
+    /// The configuration of the image's root volume.
+    pub root_volume_config: Option<ImageVolumeConfig>,
+    /// Whether the image serves a dynamic application catalog.
+    pub dynamic_application_catalog_enabled: Option<bool>,
+    /// The name of the published recipe the image was built from, and `None` for an image
+    /// built from no published recipe. A recipe AWS publishes is addressed by the
+    /// accountless ARN of the Region the request asks about, the way the published image
+    /// itself is ([`ImageRecord::arn`]), so the record keeps the NAME and the read builds
+    /// the ARN ([`published_recipe_arn`]).
+    pub appstream_recipe_name: Option<String>,
+    /// When that recipe was released.
+    pub appstream_recipe_released: Option<::aws_smithy_types::DateTime>,
 }
 
 impl ImageRecord {
@@ -182,15 +249,17 @@ impl ImageRecord {
             platform: Some(self.platform.clone()),
             description: reported_text(self.description.as_deref()),
             state_change_reason: self.state_change_reason.clone(),
-            // A collection with no entries is something the image does not have, so the
-            // member is ABSENT rather than present-and-empty — the same representation
-            // every other resource of this service renders its collections with.
-            applications: reported(&self.applications),
+            // An image reports the applications it carries and the errors it has, both as
+            // a list that is PRESENT and empty when there are none: unlike a stack's
+            // cleared attributes, neither list is a configuration an image can be without
+            // — an image with no application catalog and nothing wrong with it reports two
+            // empty lists.
+            applications: Some(self.applications.clone()),
             created_time: Some(self.created_time),
             public_base_image_released_date: self.public_base_image_released_date,
             appstream_agent_version: self.appstream_agent_version.clone(),
             image_permissions: self.image_permissions.clone(),
-            image_errors: reported(&self.image_errors),
+            image_errors: Some(self.image_errors.clone()),
             latest_appstream_agent_version: self.latest_appstream_agent_version.clone(),
             supported_instance_families: reported(&self.supported_instance_families),
             dynamic_app_providers_enabled: self.dynamic_app_providers_enabled.clone(),
@@ -198,6 +267,15 @@ impl ImageRecord {
             managed_software_included: self.managed_software_included,
             image_type: self.image_type.clone(),
             image_software_metadata: self.image_software_metadata.clone(),
+            instance_family: self.instance_family.clone(),
+            byol: self.byol,
+            root_volume_config: self.root_volume_config.clone(),
+            dynamic_application_catalog_enabled: self.dynamic_application_catalog_enabled,
+            appstream_recipe_arn: self
+                .appstream_recipe_name
+                .as_deref()
+                .map(|recipe| published_recipe_arn(region, recipe)),
+            appstream_recipe_release_timestamp: self.appstream_recipe_released,
         }
     }
 }
@@ -219,9 +297,13 @@ struct Accelerator {
     family: &'static str,
 }
 
-/// One graphics accelerator per accelerated instance family the model's
-/// `Image$SupportedInstanceFamilies` doc enumerates, so the catalog carries an image a
-/// client can launch each of those families with.
+/// The graphics accelerators the published catalog carries base images for: one per
+/// accelerated instance family the model's `Image$SupportedInstanceFamilies` doc
+/// enumerates (`Graphics G4`, `Graphics G5`, `Graphics G6`), plus the accelerators AWS has
+/// published base images for since that doc was written, which name their family by the
+/// same `Graphics <token>` convention the enumerated ones do — so a client choosing an
+/// image finds one for each accelerated family it can launch a fleet or an image builder
+/// on.
 const GRAPHICS_ACCELERATORS: &[Accelerator] = &[
     Accelerator {
         token: "G4dn",
@@ -234,6 +316,14 @@ const GRAPHICS_ACCELERATORS: &[Accelerator] = &[
     Accelerator {
         token: "G6",
         family: "Graphics G6",
+    },
+    Accelerator {
+        token: "G7",
+        family: "Graphics G7",
+    },
+    Accelerator {
+        token: "NV",
+        family: "Graphics NV",
     },
 ];
 
@@ -308,12 +398,22 @@ const PUBLISHED_OPERATING_SYSTEMS: &[PublishedOs] = &[
 /// AWS refreshes its published base images in batches and names every image of a batch
 /// after the day the batch was released, so the date is the `<MM-DD-YYYY>` tail of each
 /// image's name and the `PublicBaseImageReleasedDate` it reports. The shipped snapshot
-/// transcribes one such batch — the one this crate's catalog has carried since it was
-/// seeded, the `06-17-2024` tail of the published names it was written from; a batch AWS
-/// releases later is another entry here, and the images of every entry are published side
-/// by side, because a batch does not withdraw the one before it — which is why this is a
-/// list of batches rather than a single date, even while the snapshot ships one.
-const PUBLISHED_RELEASE_DATES: &[&str] = &["2024-06-17"];
+/// transcribes every batch the catalog is known to publish, oldest first. The images of
+/// every entry are published SIDE BY SIDE, because a batch does not withdraw the one
+/// before it: an account can still address an image of an older batch, and that is why
+/// this is a list rather than the single most recent date. A batch released later is
+/// another entry here and needs no other change.
+const PUBLISHED_RELEASE_DATES: &[&str] = &[
+    "2024-06-17",
+    "2025-05-30",
+    "2025-07-28",
+    "2025-09-05",
+    "2025-11-10",
+    "2026-02-18",
+    "2026-04-16",
+    "2026-08-31",
+    "2026-09-22",
+];
 
 /// One published base image: an operating system, the accelerator it is built for when it
 /// is a graphics image, and the release date of the batch it belongs to.
@@ -378,6 +478,9 @@ impl PublishedImage {
     fn record(&self) -> ImageRecord {
         let released = instant(&format!("{}T00:00:00Z", self.released));
         let name = self.name();
+        let recipe_name = name.clone();
+        let families = self.supported_instance_families();
+        let families_token = families.first().map(|family| instance_family_token(family));
         ImageRecord {
             // AWS publishes the image under its own name, so the name to display for it
             // is that name.
@@ -406,13 +509,33 @@ impl PublishedImage {
             // Sharing permissions belong to an account's own private image.
             image_permissions: None,
             image_errors: Vec::new(),
-            latest_appstream_agent_version: None,
-            supported_instance_families: self.supported_instance_families(),
-            dynamic_app_providers_enabled: None,
-            image_shared_with_others: None,
-            managed_software_included: None,
+            latest_appstream_agent_version: Some(
+                LATEST_APPSTREAM_AGENT_VERSION_FALSE.to_string(),
+            ),
+            supported_instance_families: families,
+            dynamic_app_providers_enabled: Some(DYNAMIC_APP_PROVIDERS_DISABLED.to_string()),
+            image_shared_with_others: Some(IMAGE_SHARED_WITH_OTHERS_FALSE.to_string()),
+            // A published base image includes no licence-included application.
+            managed_software_included: Some(false),
             image_type: Some(IMAGE_TYPE_NATIVE.to_string()),
             image_software_metadata: None,
+            // The one family of the image, which for a published base image is the first
+            // (and for a graphics image the only) family it supports.
+            instance_family: families_token,
+            // AWS publishes the licence of the operating system with the image, so the
+            // account brings none of its own.
+            byol: Some(false),
+            root_volume_config: Some(ImageVolumeConfig {
+                volume_size_in_gb: Some(ROOT_VOLUME_SIZE_IN_GB),
+                volume_type: Some(ROOT_VOLUME_TYPE.to_string()),
+            }),
+            // The image carries the applications it was built with rather than a catalog
+            // resolved at session start.
+            dynamic_application_catalog_enabled: Some(false),
+            // AWS publishes the recipe a base image was built from beside the image, under
+            // the image's own name, and releases the two together.
+            appstream_recipe_name: Some(recipe_name),
+            appstream_recipe_released: Some(released),
         }
     }
 }

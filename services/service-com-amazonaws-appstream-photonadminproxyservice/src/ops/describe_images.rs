@@ -5,8 +5,11 @@
 //! the base images AWS publishes, seeded into the store, and every image an operation of
 //! this API mints — a page at a time, so a client can enumerate the images visible to the
 //! account and pick one for a fleet or an image builder. `Names` or `Arns` select the
-//! images to report and a name or ARN naming none answers `ResourceNotFoundException`
-//! (HTTP 400); `Type` narrows the report to one visibility.
+//! images to report and a name or ARN naming none answers `ResourceNotFoundException`,
+//! which this service serves over the status it answers every refusal with — HTTP 400,
+//! not the 404 the shape's own `@httpError` trait states (see
+//! `crate::state::modelled_error_status`, the one place that mapping is applied);
+//! `Type` narrows the report to one visibility.
 //!
 //! ## Shape of an operation
 //!

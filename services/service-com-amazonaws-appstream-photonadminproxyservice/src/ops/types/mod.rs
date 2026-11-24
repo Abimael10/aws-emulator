@@ -81,6 +81,10 @@ pub mod drain_session_instance_types;
 pub mod enable_user_types;
 pub mod expire_session_types;
 pub mod get_export_image_task_types;
+// The image every reader reports, whose wire form carries six members the on-disk model
+// does not declare — so its schema and codec are written out rather than derived. See that
+// module's own note.
+pub mod image_wire;
 pub mod list_associated_fleets_types;
 pub mod list_associated_stacks_types;
 pub mod list_entitled_applications_types;
@@ -247,6 +251,8 @@ pub use enable_user_types::*;
 pub use expire_session_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_export_image_task_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use image_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_associated_fleets_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

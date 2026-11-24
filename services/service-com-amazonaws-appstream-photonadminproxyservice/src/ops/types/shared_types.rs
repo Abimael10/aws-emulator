@@ -395,34 +395,9 @@ pub struct NetworkAccessConfiguration {
     pub eni_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appstream#Image")]
-#[derive(Debug, Clone, Default)]
-pub struct Image {
-    pub name: String,
-    pub arn: Option<String>,
-    pub base_image_arn: Option<String>,
-    pub display_name: Option<String>,
-    pub state: Option<String>,
-    pub visibility: Option<String>,
-    pub image_builder_supported: Option<bool>,
-    pub image_builder_name: Option<String>,
-    pub platform: Option<String>,
-    pub description: Option<String>,
-    pub state_change_reason: Option<ImageStateChangeReason>,
-    pub applications: Option<Vec<Application>>,
-    pub created_time: Option<::aws_smithy_types::DateTime>,
-    pub public_base_image_released_date: Option<::aws_smithy_types::DateTime>,
-    pub appstream_agent_version: Option<String>,
-    pub image_permissions: Option<ImagePermissions>,
-    pub image_errors: Option<Vec<ResourceError>>,
-    pub latest_appstream_agent_version: Option<String>,
-    pub supported_instance_families: Option<Vec<String>>,
-    pub dynamic_app_providers_enabled: Option<String>,
-    pub image_shared_with_others: Option<String>,
-    pub managed_software_included: Option<bool>,
-    pub image_type: Option<String>,
-    pub image_software_metadata: Option<ImageSoftwareMetadata>,
-}
+// `Image` is NOT derived here: the image AppStream reports carries members the on-disk
+// model does not declare, so its schema and codec are written out in
+// [`super::image_wire`] — the same arrangement `Stack` and `Theme` take.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.appstream#ImageStateChangeReason")]
 #[derive(Debug, Clone, Default)]

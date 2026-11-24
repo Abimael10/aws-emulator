@@ -29,7 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use crate::images::{catalog as published_catalog, describe, image_arn, published_image_arn};
+use crate::images::{
+    catalog as published_catalog, describe, image_arn, published_image_arn, walk,
+};
 use crate::refusal_messages::{not_found_sentence, refusal};
 use crate::stack_fleet_lifecycle::Emulator;
 
@@ -290,15 +292,18 @@ async fn every_form_of_the_read_is_answered_from_the_catalog() {
     }
 
     for (case, request, expected) in rows {
-        let (page, next_token) = describe(&emulator, &case, request).await;
-        let reported: Vec<String> = crate::images::reported_names(&page);
         match expected {
-            Some(expected) => assert_eq!(
-                reported, expected,
-                "case {case:?}: expected {expected:?}, got {reported:?}"
-            ),
+            Some(expected) => {
+                let reported = crate::images::reported_names(&walk(&emulator, &case, request).await);
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?}: expected {expected:?}, got {reported:?}"
+                );
+            }
             // A page of one: the first image of the catalog, with more to come.
             None => {
+                let (page, next_token) = describe(&emulator, &case, request).await;
+                let reported: Vec<String> = crate::images::reported_names(&page);
                 assert_eq!(
                     reported,
                     names[..1].to_vec(),

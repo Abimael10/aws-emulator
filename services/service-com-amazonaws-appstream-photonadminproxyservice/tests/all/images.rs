@@ -69,9 +69,12 @@ const PLATFORM_TYPES: &[&str] = &[
     "WINDOWS_SERVER_2025",
 ];
 
-/// The instance families an image may state support for, as the model's
-/// `Image$SupportedInstanceFamilies` doc enumerates them
-/// (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`).
+/// The instance families an image may state support for: the ones the model's
+/// `Image$SupportedInstanceFamilies` doc enumerates
+/// (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`), plus
+/// the accelerated families published since that doc was written, which the catalog names
+/// by the same `Graphics <accelerator>` convention
+/// (`GRAPHICS_ACCELERATORS` in `src/state/images.rs`).
 const INSTANCE_FAMILIES: &[&str] = &[
     "General Purpose",
     "Compute Optimized",
@@ -79,6 +82,8 @@ const INSTANCE_FAMILIES: &[&str] = &[
     "Graphics G4",
     "Graphics G5",
     "Graphics G6",
+    "Graphics G7",
+    "Graphics NV",
 ];
 
 /// The largest page this read answers with: `DescribeImages`'s `MaxResults` targets
@@ -133,17 +138,38 @@ pub(crate) fn reported_names(images: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Every image one form of this read reports, walked to the end of its pages.
+///
+/// The catalog covers every release batch AWS publishes, so a read of all of it spans more
+/// pages than the 25 records one page carries ([`MAX_PAGE`]): a reader that wants the whole
+/// answer follows `NextToken` until there is none, which is what an SDK paginator does.
+///
+/// Shared with the other suites in this target, so every whole-answer read is walked the
+/// same way.
+pub(crate) async fn walk(emulator: &Emulator, case: &str, request: Value) -> Vec<Value> {
+    let mut images: Vec<Value> = Vec::new();
+    let mut next_token: Option<Value> = None;
+    loop {
+        let mut page_request = request.clone();
+        if let Some(token) = next_token.clone() {
+            page_request["NextToken"] = token;
+        }
+        let (page, token) = describe(emulator, case, page_request).await;
+        images.extend(page);
+        next_token = token;
+        if next_token.is_none() {
+            break;
+        }
+    }
+    images
+}
+
 /// Every image the catalog holds, read through the front door with no filters.
 ///
 /// Shared with the other suites in this target, so every suite reads the whole catalog the
 /// same way.
 pub(crate) async fn catalog(emulator: &Emulator) -> Vec<Value> {
-    let (images, next_token) = describe(emulator, "the whole catalog", json!({})).await;
-    assert!(
-        next_token.is_none(),
-        "case \"the whole catalog\": the shipped catalog fits one page, got a NextToken"
-    );
-    images
+    walk(emulator, "the whole catalog", json!({})).await
 }
 
 #[tokio::test]
@@ -229,12 +255,23 @@ async fn the_catalog_is_reported_with_the_members_a_client_picks_an_image_by() {
             }
 
             // An account's own activity fills these; nothing produced a published image
-            // here and nothing has gone wrong with it, so they are absent rather than
-            // present-and-empty.
-            for member in ["ImageBuilderName", "BaseImageArn", "ImageErrors", "Applications"] {
+            // here, so they are absent rather than present-and-empty.
+            for member in ["ImageBuilderName", "BaseImageArn"] {
                 assert!(
                     image.get(member).is_none(),
                     "case {case:?}: {member} belongs to an account's own image, got {image}"
+                );
+            }
+
+            // The applications an image carries and the errors it has are reported as a
+            // list that is PRESENT and empty when there are none: neither is a
+            // configuration an image can be without.
+            for member in ["ImageErrors", "Applications"] {
+                assert_eq!(
+                    image[member].as_array().map(Vec::len),
+                    Some(0),
+                    "case {case:?}: {member} is reported empty on a published image, \
+                     got {image}"
                 );
             }
 
@@ -297,7 +334,7 @@ async fn a_read_reports_exactly_the_images_the_request_names() {
         };
 
         let case = format!("Names {selection:?}");
-        let (images, _) = describe(&emulator, &case, json!({ "Names": selection })).await;
+        let images = walk(&emulator, &case, json!({ "Names": selection })).await;
         assert_eq!(
             reported_names(&images),
             expected,
@@ -310,7 +347,7 @@ async fn a_read_reports_exactly_the_images_the_request_names() {
             .map(|name| published_image_arn(region, name))
             .collect();
         let case = format!("Arns {arns:?}");
-        let (images, _) = describe(&emulator, &case, json!({ "Arns": arns })).await;
+        let images = walk(&emulator, &case, json!({ "Arns": arns })).await;
         assert_eq!(
             reported_names(&images),
             expected,
@@ -492,7 +529,7 @@ async fn the_type_member_narrows_the_report_to_one_visibility() {
         };
 
         let case = format!("Type {visibility}");
-        let (images, _) = describe(&emulator, &case, json!({ "Type": visibility })).await;
+        let images = walk(&emulator, &case, json!({ "Type": visibility })).await;
         assert_eq!(
             reported_names(&images),
             expected,
@@ -501,7 +538,7 @@ async fn the_type_member_narrows_the_report_to_one_visibility() {
         );
 
         let case = format!("Type {visibility} with Names");
-        let (images, _) = describe(
+        let images = walk(
             &emulator,
             &case,
             json!({ "Names": [all[0].clone()], "Type": visibility }),
