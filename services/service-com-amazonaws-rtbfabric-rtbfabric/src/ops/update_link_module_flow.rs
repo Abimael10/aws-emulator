@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLinkModuleFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLinkModuleFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLinkModuleFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures the module flow a link runs: the modules the call states are the
+//! whole flow, replacing whatever flow the link had taken before, in the order
+//! stated. A flow reaches service exactly when the link carrying it does, so the
+//! stated modules are held as the link's PENDING flow and become the flow in
+//! service at the instant the clock makes the link's way to `ACTIVE` due — a
+//! link that is up is answered `PENDING_UPDATE` and the clock owes it `ACTIVE`
+//! again, and a link still moving through its own lifecycle keeps the status
+//! that lifecycle owes it and takes the flow into service when it comes up. A
+//! flow of no modules is a change of its own: it clears the flow in service. A
+//! retry under the same `clientToken` is answered from the record rather than
+//! applied again, and that token restating different modules is refused. A link
+//! in a status nothing moves it out of cannot be configured ->
+//! `ConflictException` (409), a flow past the modules one link holds ->
+//! `ServiceQuotaExceededException` (402), and an id that names no link on the
+//! addressed gateway -> `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +178,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLinkModuleFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLinkModuleFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLinkModuleFlow"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLinkModuleFlowErrorModeled::InternalServerException(InternalServerException {
+                message: "the rtbfabric emulator has no state store for this request".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The answer below reports a stored status, so the transitions the clock
+        // has already made due are materialised first: each was owed at this
+        // same instant whether or not anybody called.
+        store.settle_all(now);
+
+        // `clientToken` is an `@idempotencyToken`: a retry of a change the link has
+        // taken is answered with that link rather than applied to it again, and the
+        // same token carrying DIFFERENT modules is refused rather than silently
+        // answering for a flow the caller did not send. The model declares no
+        // `IdempotentParameterMismatch`, so that refusal is this operation's
+        // `ValidationException` (400), exactly as the sibling updates and creates
+        // of this service refuse it.
+        let fingerprint =
+            crate::state::parameter_fingerprint(&format!("modules={:?}", input.modules));
+        let key = crate::state::idempotency_key(Self::NAME, &input.client_token);
+
+        let Some(link) = store.find_link_mut(&input.gateway_id, &input.link_id) else {
+            return Err(UpdateLinkModuleFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // Fixed text: this service's not-found names no id, so the
+                    // refusal says the same thing whichever link was addressed.
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The records of the changes this link has taken live on the link itself,
+        // so a retry is answered from the resource it addressed.
+        match link.accepted_updates.classify(&key, &fingerprint) {
+            crate::state::Retry::Mismatch => {
+                return Err(UpdateLinkModuleFlowErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "clientToken {} was already used for a {} request with different parameters",
+                            input.client_token,
+                            Self::NAME,
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::Retry::Replay => {
+                // The same flow under the same token: report the record that
+                // change left rather than apply it a second time.
+                return Ok(UpdateLinkModuleFlowOutput {
+                    gateway_id: input.gateway_id.clone(),
+                    link_id: link.link_id.clone(),
+                    status: link.status.clone(),
+                });
+            }
+            crate::state::Retry::Fresh => {}
+        }
+
+        if link.terminal() {
+            // Nothing moves a link out of these statuses, so it has no flow left
+            // to configure.
+            return Err(UpdateLinkModuleFlowErrorModeled::ConflictException(
+                ConflictException {
+                    message: link.status_conflict_message(&input.gateway_id, "configured"),
+                },
+            )
+            .into());
+        }
+
+        // The store's own bound on one link's flow, checked BEFORE the flow is
+        // stored, and after the token, so a retry of this call replays its own
+        // change rather than being measured again.
+        if input.modules.len() > crate::state::FLOW_MODULES_PER_LINK_QUOTA {
+            return Err(
+                UpdateLinkModuleFlowErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds a limit of {} modules in a link's module flow",
+                            crate::state::FLOW_MODULES_PER_LINK_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `modules` is required and states the whole flow, so what it carries
+        // replaces whatever flow the link had taken — an empty list included,
+        // which is the flow of no modules. The flow is held as the one awaiting
+        // the link and put in service when the link is, so a reader sees the flow
+        // actually running beside the one coming.
+        link.pending_module_flow = Some(input.modules);
+        link.updated_at = now;
+        // The token records the call this link served, so a retry of it is
+        // recognised — and the same token restating other modules is still
+        // refused rather than applied.
+        link.accepted_updates.accept(key, fingerprint);
+        if link.is_up() {
+            // The link is carrying traffic, so the flow is being changed under
+            // live traffic: this call reports the update as pending, and the clock
+            // owes the link its way back up with the new flow in service.
+            link.status = crate::state::LINK_STATUS_PENDING_UPDATE.to_string();
+            link.settles_at = Some(now + crate::state::PROVISIONING_DELAY);
+        }
+        // A link that is not up yet keeps the status its own lifecycle owes it;
+        // the flow it has just taken comes into service with the link.
+
+        Ok(UpdateLinkModuleFlowOutput {
+            gateway_id: input.gateway_id.clone(),
+            link_id: link.link_id.clone(),
+            status: link.status.clone(),
+        })
     }
 }

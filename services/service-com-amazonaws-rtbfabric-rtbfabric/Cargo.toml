@@ -45,6 +45,9 @@ sha2 = { workspace = true }
 # non-greedy `@httpLabel` path segment, and a tag key carrying `+` or `/` in the
 # `tagKeys` query parameter, exactly as an AWS SDK encodes them.
 percent-encoding = "2.3"
+# Declares one module per `tests/all/<name>.rs`, so a suite needs no hand-written
+# declaration in the `all` target's root.
+automod = { workspace = true }
 
 [lints]
 workspace = true

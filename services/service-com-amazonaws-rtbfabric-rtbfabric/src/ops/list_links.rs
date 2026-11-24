@@ -272,7 +272,7 @@ fn described(link: &crate::state::Link) -> ListLinksResponseStructure {
         updated_at: crate::state::timestamp(link.updated_at),
         direction: Some(link.direction.clone()),
         flow_modules: Some(link.flow_modules.clone()),
-        pending_flow_modules: Some(link.pending_flow_modules.clone()),
+        pending_flow_modules: Some(link.pending_flow_modules()),
         attributes: link.attributes.clone(),
         log_settings: Some(link.log_settings.clone()),
         connectivity_type: Some(link.connectivity_type.clone()),

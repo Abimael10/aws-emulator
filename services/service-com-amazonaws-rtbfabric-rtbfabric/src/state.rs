@@ -99,6 +99,17 @@ pub const GATEWAY_QUOTA: usize = 1_000;
 /// ever created.
 pub const LINK_QUOTA: usize = 5_000;
 
+/// How many modules one link's module flow holds before `UpdateLinkModuleFlow`
+/// refuses with the modelled `ServiceQuotaExceededException` (HTTP 402).
+///
+/// AWS publishes no per-flow module count, so this bound is the emulator's own,
+/// for the same reason as [`GATEWAY_QUOTA`]: it is what stops one link's stored
+/// flow growing without end, while sitting far above any flow an emulator
+/// serves. It is checked against the flow the call states, BEFORE that flow is
+/// stored, so the store never holds more than this many modules for a link.
+pub const FLOW_MODULES_PER_LINK_QUOTA: usize = 100;
+
+
 /// How many `@idempotencyToken` records the store keeps before a create refuses
 /// with the modelled `ServiceQuotaExceededException` (HTTP 402).
 ///
@@ -330,11 +341,24 @@ pub struct Link {
     pub log_settings: LinkLogSettings,
     pub http_responder_allowed: Option<bool>,
     pub timeout_in_millis: Option<i64>,
+    /// The module flow in service on this link: what the flow this link runs
+    /// holds, in the order the call that configured it stated the modules.
     pub flow_modules: Vec<ModuleConfiguration>,
-    pub pending_flow_modules: Vec<ModuleConfiguration>,
+    /// The module flow this link has taken and not yet put in service, `None`
+    /// when no flow is awaiting it. It becomes [`flow_modules`](Self::flow_modules)
+    /// at the instant the clock makes the link's way to `ACTIVE` due, so a flow
+    /// reaches service exactly when the link carrying it does — which is why the
+    /// change is held here rather than written straight over the flow in
+    /// service. `Some(Vec::new())` is a flow of no modules, a change of its own:
+    /// it is what clears the flow in service.
+    pub pending_module_flow: Option<Vec<ModuleConfiguration>>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// Every `@idempotencyToken` an accepted change of this link's configuration
+    /// was presented under, which is what a retried update is answered from.
+    /// See [`AcceptedUpdates`].
+    pub accepted_updates: AcceptedUpdates,
 }
 
 impl Link {
@@ -355,15 +379,31 @@ impl Link {
     /// Materialise the transition the clock has already made due — the request
     /// reaching the peer, or the accepted link coming up — dated at the instant
     /// it was owed rather than now, so the record does not depend on when it was
-    /// next read.
+    /// next read. A link reaching service takes the module flow awaiting it into
+    /// service with it, because a flow runs exactly when the link carrying it
+    /// does.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.settles_at.filter(|due| *due <= now) {
             if let Some(next) = Self::owed_status(&self.status) {
                 self.status = next.to_string();
                 self.updated_at = due;
+                if next == LINK_STATUS_ACTIVE {
+                    // The link is in service now, so the module flow awaiting it
+                    // is the flow it runs, and nothing is awaiting it any more.
+                    if let Some(taken) = self.pending_module_flow.take() {
+                        self.flow_modules = taken;
+                    }
+                }
             }
             self.settles_at = None;
         }
+    }
+
+    /// The module flow this link has taken and not yet put in service, as a
+    /// reader reports it: the modules awaiting the link, and no module at all
+    /// when nothing is awaiting it.
+    pub fn pending_flow_modules(&self) -> Vec<ModuleConfiguration> {
+        self.pending_module_flow.clone().unwrap_or_default()
     }
 
     /// Whether `gateway_id` is one of this link's two ends — either end may read
