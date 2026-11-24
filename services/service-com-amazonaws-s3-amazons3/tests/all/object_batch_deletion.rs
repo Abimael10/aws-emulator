@@ -1118,3 +1118,219 @@ async fn a_versioned_batch_delete_is_served_whatever_its_quiet_element_spells() 
         );
     }
 }
+
+/// How the `VersionId` an identifier pins, which names no version of the key it is pinned
+/// on, is built for a row of
+/// [`an_unresolvable_version_pin_is_one_error_per_entry_whatever_the_batch_around_it`].
+#[derive(Debug)]
+enum Unresolvable {
+    /// A version id this run really minted — for ANOTHER key of the same bucket. The nearest
+    /// miss a client's own bookkeeping produces, and a token this store itself issued, so
+    /// nothing but the PAIRING makes it name no version.
+    OtherKeysVersion,
+    /// A token of the shape this store mints that it never issued.
+    Shaped,
+}
+
+#[tokio::test]
+async fn an_unresolvable_version_pin_is_one_error_per_entry_whatever_the_batch_around_it() {
+    // RULE: a `VersionId` resolves against the versions stored for the KEY it is pinned on, so
+    // an identifier whose pair names no stored version is that key's own `Errors` entry —
+    // `NoSuchVersion` "indicates that the version ID specified in the request does not match an
+    // existing version", with the key and the version id the request sent echoed back — once
+    // per identifier the payload carries, never in `Deleted`, and the versions the bucket holds
+    // are left where they are. The response mode decides only whether the SUCCESSES are
+    // reported: "in quiet mode the response includes only keys where the delete operation
+    // encountered an error".
+    //
+    // The rows differ along what makes the pair unresolvable (a real version id of another key
+    // of the same bucket, a token of the minted shape nothing issued), along the bucket's
+    // versioning state (`Enabled`, `Suspended`, never set at all) and along the response mode —
+    // and each row rides in ONE batch beside a resolvable version of another key and a second
+    // copy of the same unresolvable identifier, so the accounting over the whole payload is
+    // graded with the classification.
+    //
+    // (case, the bucket's versioning status — `None` for a bucket whose state is never set —,
+    // how the unresolvable token is built, quiet).
+    let rows: [(&str, Option<&str>, Unresolvable, bool); 5] = [
+        (
+            "an id minted for another key of the same bucket",
+            Some("Enabled"),
+            Unresolvable::OtherKeysVersion,
+            false,
+        ),
+        (
+            "an id minted for another key, reported in quiet mode",
+            Some("Enabled"),
+            Unresolvable::OtherKeysVersion,
+            true,
+        ),
+        (
+            "a token of the minted shape nothing issued",
+            Some("Enabled"),
+            Unresolvable::Shaped,
+            false,
+        ),
+        (
+            "a token nothing issued, on a bucket whose versioning is suspended",
+            Some("Suspended"),
+            Unresolvable::Shaped,
+            false,
+        ),
+        (
+            "a token nothing issued, on a bucket whose versioning was never set",
+            None,
+            Unresolvable::Shaped,
+            false,
+        ),
+    ];
+    for (case, status, form, quiet) in rows {
+        // A fresh store per row, so one row's deletes cannot decide another's.
+        let router = router();
+        let name = "batch-delete-pinned-pairs";
+        bucket(&router, name).await;
+        if let Some(status) = status {
+            set_versioning(&router, name, status).await;
+        }
+        // The key the unresolvable identifier is pinned on, the key whose own version the same
+        // batch really removes, and the key whose minted id one row borrows.
+        let pinned = "pinned.bin";
+        let doomed = "doomed.bin";
+        let lender = "lender.bin";
+        let minted = write_keys(&router, name, &[pinned, doomed, lender]).await;
+        // A bucket that carries no versioning state mints no ids at all, and the version it
+        // holds is the `null` version every reader names it by.
+        let version_of = |key: &str| {
+            let id = minted[key].clone();
+            if id.is_empty() {
+                "null".to_string()
+            } else {
+                id
+            }
+        };
+        let doomed_id = version_of(doomed);
+        let bogus = match form {
+            Unresolvable::OtherKeysVersion => version_of(lender),
+            // The width this store mints, which is also the width the rows above pin.
+            Unresolvable::Shaped => "c".repeat(VERSION_ID_CHARS),
+        };
+        assert_ne!(
+            bogus,
+            version_of(pinned),
+            "case {case:?}: the token must name no version of the key it is pinned on"
+        );
+
+        // One payload: the unresolvable identifier, a resolvable one of another key, and the
+        // unresolvable identifier a second time.
+        let identifiers: Vec<Identifier> = vec![
+            (pinned, Some(bogus.as_str())),
+            (doomed, Some(doomed_id.as_str())),
+            (pinned, Some(bogus.as_str())),
+        ];
+        let answer = delete_objects(&router, name, &identifiers, quiet).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the batch itself answers 200, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let result = delete_result_of(&answer);
+        let deleted_pairs: Vec<(String, String)> = result
+            .deleted
+            .iter()
+            .map(|entry| {
+                (
+                    entry.get("Key").cloned().unwrap_or_default(),
+                    entry.get("VersionId").cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let errored: Vec<(String, String, String, String)> = result
+            .errors
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry.get(name).cloned().unwrap_or_default();
+                (
+                    field("Key"),
+                    field("VersionId"),
+                    field("Code"),
+                    field("Message"),
+                )
+            })
+            .collect();
+
+        // The unresolvable pair is on the error side once per identifier that named it, under
+        // the absent-version code and that code's own fixed sentence, with the pair echoed.
+        let refused = (
+            pinned.to_string(),
+            bogus.clone(),
+            "NoSuchVersion".to_string(),
+            "The specified version does not exist.".to_string(),
+        );
+        assert_eq!(
+            errored,
+            vec![refused.clone(), refused],
+            "case {case:?}: each identifier naming no stored version of its key is reported \
+             once on the error side, got {errored:?} in body {:?}",
+            text(&answer)
+        );
+        // And nowhere on the success side, whatever the response mode: quiet leaves the
+        // successes out, verbose reports the one version the batch really removed.
+        assert_eq!(
+            deleted_pairs,
+            if quiet {
+                Vec::new()
+            } else {
+                vec![(doomed.to_string(), doomed_id.clone())]
+            },
+            "case {case:?}: only the resolvable version is reported deleted, and only in \
+             verbose mode, got {deleted_pairs:?} in body {:?}",
+            text(&answer)
+        );
+        // Every identifier the payload carried is accounted for exactly once in verbose mode,
+        // across the two lists together, and the two lists are disjoint.
+        if !quiet {
+            assert_eq!(
+                deleted_pairs.len() + errored.len(),
+                identifiers.len(),
+                "case {case:?}: every identifier is reported exactly once, got \
+                 {deleted_pairs:?}/{errored:?}"
+            );
+            let overlap: Vec<&(String, String)> = deleted_pairs
+                .iter()
+                .filter(|pair| errored.iter().any(|(key, id, _, _)| (key, id) == (&pair.0, &pair.1)))
+                .collect();
+            assert!(
+                overlap.is_empty(),
+                "case {case:?}: the two lists must be disjoint, got {overlap:?}"
+            );
+        }
+
+        // The refused identifier took nothing away: the key it was pinned on still answers a
+        // read, as does the key whose id one row borrowed — while the version the batch really
+        // named is gone from the listing.
+        for still_there in [pinned, lender] {
+            let read = get_object(&router, name, still_there, "", &[]).await;
+            assert_eq!(
+                (read.status, text(&read)),
+                (200, format!("body of {still_there}")),
+                "case {case:?}: {still_there:?} must still be readable, got {} with body {:?}",
+                read.status,
+                text(&read)
+            );
+        }
+        let held: Vec<(String, String)> =
+            version_listing_of(&list_object_versions(&router, name, "").await).entries();
+        assert!(
+            !held.contains(&(doomed.to_string(), doomed_id.clone())),
+            "case {case:?}: the version the batch removed must be gone, the listing still \
+             reports {held:?}"
+        );
+        assert!(
+            held.iter().any(|(key, _)| key == pinned),
+            "case {case:?}: the key the refused identifier named must keep its version, the \
+             listing reports {held:?}"
+        );
+    }
+}
