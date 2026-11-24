@@ -31,7 +31,6 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::absent_s3_address_messages::S3_BUCKET_DOES_NOT_EXIST;
 use crate::media_object_resolution::{
     call, emulator, emulator_without_the_object_store, given_staged_media, ABSENT_BUCKET, BUCKET,
     PAST_THE_TRANSITION, STAGED_KEYS,
@@ -61,9 +60,9 @@ struct Row {
     name: &'static str,
     /// The `Media.MediaFileUri` the start carries.
     uri: fn() -> String,
-    /// The sentence the refusal states: it names WHAT is absent — the bucket, or an
-    /// object in a bucket that is there (`crate::absent_s3_address_messages`, the home
-    /// of that rule).
+    /// The sentence the refusal states: the one every media address that resolves to no
+    /// object gets, whichever part of it the store holds none of
+    /// (`crate::absent_s3_address_messages`, the home of that rule).
     absent: &'static str,
 }
 
@@ -75,7 +74,7 @@ fn no_such_object() -> Vec<Row> {
             case: "a bucket the store does not hold",
             name: "absent-bucket",
             uri: || format!("s3://{ABSENT_BUCKET}/dictation.wav"),
-            absent: S3_BUCKET_DOES_NOT_EXIST,
+            absent: MEDIA_NAMES_NO_OBJECT,
         },
         Row {
             case: "a key nothing was ever written to",

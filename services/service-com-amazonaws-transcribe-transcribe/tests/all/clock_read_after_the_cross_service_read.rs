@@ -37,7 +37,8 @@ use service_com_amazonaws_transcribe_transcribe::state;
 use smithy_server_runtime::{ErasedServiceDefinition, MultiServiceRouter, Service};
 
 use crate::media_object_resolution::{
-    call, given_object, BUCKET, MEDIA_BYTES, PAST_THE_TRANSITION, STAGED_KEYS,
+    call, given_object, given_output_buckets, BUCKET, MEDIA_BYTES, MEDICAL_OUTPUT_BUCKET,
+    PAST_THE_TRANSITION, SCRIBE_OUTPUT_BUCKET, STAGED_KEYS,
 };
 use crate::transcription_jobs::Reply;
 
@@ -73,9 +74,10 @@ const COMPLETED: &str = "COMPLETED";
 
 /// This emulator's own Amazon S3 with the one read a job start awaits made SLOW: it
 /// answers the `HeadObject` a start resolves its `Media` location with only after
-/// [`MEDIA_HOP`], and every other request at full speed, so a suite can stage objects
-/// and let builds read them cheaply while still holding one start's cross-service read
-/// open across a transition span.
+/// [`MEDIA_HOP`], and every other request — the HEAD of a BUCKET a start's output is
+/// directed into included — at full speed, so a suite can stage objects and let builds
+/// read them cheaply while still holding one start's cross-service read open across a
+/// transition span.
 struct SlowObjectStore {
     inner: service_com_amazonaws_s3_amazons3::EmulatedService<engine::InMemoryEngine>,
 }
@@ -90,11 +92,19 @@ impl Service for SlowObjectStore {
             return false;
         }
         // The wait sits where the store CLAIMS the request — one point, reached once
-        // per request and before its handler runs — and only for the method the media
-        // read uses, so staging an object and the reads a build makes stay fast. A
-        // blocking sleep is what the caller sees: the call is in-process, so the start
-        // handler awaiting the answer is simply not answered until it is over.
-        if parts.method == http::Method::HEAD {
+        // per request and before its handler runs — and only for the request the media
+        // read makes, a HEAD of an OBJECT (a path-style address carrying a key under its
+        // bucket), so staging an object, the reads a build makes and the HEAD of a bucket
+        // a start's output is directed into all stay fast. A blocking sleep is what the
+        // caller sees: the call is in-process, so the start handler awaiting the answer is
+        // simply not answered until it is over.
+        let addresses_an_object = parts
+            .uri
+            .path()
+            .trim_start_matches('/')
+            .split_once('/')
+            .is_some_and(|(_, key)| !key.is_empty());
+        if parts.method == http::Method::HEAD && addresses_an_object {
             std::thread::sleep(MEDIA_HOP);
         }
         true
@@ -117,12 +127,14 @@ fn emulator() -> Arc<MultiServiceRouter> {
 }
 
 /// The same emulator with the media every row below names already stored, which is the
-/// upload a caller performs before a start names the location.
+/// upload a caller performs before a start names the location, and with the buckets those
+/// rows direct their output into created.
 async fn emulator_with_staged_media() -> Arc<MultiServiceRouter> {
     let emulator = emulator();
     for key in STAGED_KEYS {
         given_object(&emulator, BUCKET, key, MEDIA_BYTES).await;
     }
+    given_output_buckets(&emulator).await;
     emulator
 }
 
@@ -327,7 +339,7 @@ fn named_references() -> Vec<NamedReference> {
                 json!({
                     "MedicalScribeJobName": job,
                     "Media": {"MediaFileUri": media},
-                    "OutputBucketName": "example-scribe-output",
+                    "OutputBucketName": SCRIBE_OUTPUT_BUCKET,
                     "DataAccessRoleArn": ROLE_ARN,
                     "Settings": {
                         "ShowSpeakerLabels": true,
@@ -394,7 +406,7 @@ fn families() -> Vec<Family> {
                     "MedicalTranscriptionJobName": job,
                     "LanguageCode": "en-US",
                     "Media": {"MediaFileUri": media},
-                    "OutputBucketName": "example-medical-output",
+                    "OutputBucketName": MEDICAL_OUTPUT_BUCKET,
                     "Specialty": "PRIMARYCARE",
                     "Type": "DICTATION"
                 })
@@ -427,7 +439,7 @@ fn families() -> Vec<Family> {
                 json!({
                     "MedicalScribeJobName": job,
                     "Media": {"MediaFileUri": media},
-                    "OutputBucketName": "example-scribe-output",
+                    "OutputBucketName": SCRIBE_OUTPUT_BUCKET,
                     "DataAccessRoleArn": ROLE_ARN,
                     "Settings": {"ShowSpeakerLabels": true, "MaxSpeakerLabels": 30}
                 })

@@ -502,6 +502,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .await;
 
+        // "The name of the Amazon S3 bucket where you want your transcription output
+        // stored" (`OutputBucketName`): a bucket the caller directs its output to has to
+        // be one the object store holds, so a start naming a bucket that store says is
+        // not there is refused with the bucket sentence and no job is stored whose
+        // reported output locations nothing would serve (see
+        // [`crate::state::resolve_output_bucket`], which also states why an answer that is
+        // not S3 reporting an absent bucket refuses nothing). Judged BEFORE the media
+        // below, so a request whose output bucket and whose input media are both
+        // unresolvable is told that the bucket it named is not there.
+        if crate::state::resolve_output_bucket(ctx, &region, input.output_bucket_name.as_deref())
+            .await
+            == crate::state::OutputBucketVerdict::Absent
+        {
+            return Err(bad_request(crate::state::S3_BUCKET_DOES_NOT_EXIST));
+        }
+
         // "To make a StartTranscriptionJob request, you must first upload your media
         // file into an Amazon S3 bucket; you can then specify the Amazon S3 location of
         // the file using the Media parameter": the location is resolved against this
@@ -518,10 +534,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &[input.media.media_file_uri.as_deref().unwrap_or_default()],
         )
         .await;
-        // The refusal states what the object store answered is absent — the bucket, or
-        // an object in a bucket that is there.
-        if let crate::state::MediaVerdict::Absent(message) = media_resolution.verdict {
-            return Err(bad_request(message));
+        // The media address resolved to no object of the store, so the refusal states
+        // that it names no media file — one sentence however that address fails.
+        if media_resolution.verdict == crate::state::MediaVerdict::Absent {
+            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
         }
         // What the clock owes this job instead of a transcript, judged once here from
         // the media the request pointed at: a job the service found nothing wrong with

@@ -365,10 +365,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .flatten()
         .collect();
         let media_resolution = crate::state::resolve_media_objects(ctx, &region, &media_uris).await;
-        // The refusal states what the object store answered is absent — the bucket, or
-        // an object in a bucket that is there.
-        if let crate::state::MediaVerdict::Absent(message) = media_resolution.verdict {
-            return Err(bad_request(message));
+        // The media address resolved to no object of the store, so the refusal states
+        // that it names no media file — one sentence however that address fails.
+        if media_resolution.verdict == crate::state::MediaVerdict::Absent {
+            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
         }
 
         // The clock is read HERE, after the cross-service read above and with nothing

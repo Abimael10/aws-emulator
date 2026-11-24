@@ -5,18 +5,18 @@
 //! the assembled emulator runs them.
 //!
 //! THE RULE THESE ROWS ASSERT: a refusal grounded in the object store's own
-//! absent-address answer states what the store said is absent, as the member the request
-//! named the location in words it.
+//! absent-address answer states what the MEMBER that named the location is about.
 //!
-//! * The MEDIA a job start is pointed at distinguishes the two: a bucket the store holds
-//!   none of is refused with the bucket sentence ([`S3_BUCKET_DOES_NOT_EXIST`]), because
-//!   the caller has nowhere to have uploaded any media yet, while an address whose bucket
-//!   is there and whose object is not is refused with the object sentence
-//!   ([`URI_NAMES_NO_OBJECT`]).
-//! * The FILE a custom vocabulary, medical vocabulary or vocabulary filter is built from
-//!   makes no such distinction: those members are about the file, and their recorded
-//!   refusal is the object sentence however the address fails to resolve — the bucket
-//!   included.
+//! * A location naming a FILE — the media a job start is pointed at, and the file a
+//!   custom vocabulary, medical vocabulary or vocabulary filter is built from — is
+//!   refused with the object sentence ([`URI_NAMES_NO_OBJECT`]) however the address fails
+//!   to resolve: a bucket the store holds none of and a key a bucket that IS there holds
+//!   none of alike, because either way the address names no file.
+//! * A location naming a BUCKET for the job's OUTPUT (`OutputBucketName`) is refused with
+//!   the bucket sentence ([`S3_BUCKET_DOES_NOT_EXIST`]) when the store holds no such
+//!   bucket: there is nowhere for the results to be written. It is judged before the
+//!   media, so a request whose output bucket and whose input media are both unresolvable
+//!   is told that the bucket is not there.
 //!
 //! Both sentences are entirely FIXED texts carrying no value of the request, both ride
 //! this service's modelled `BadRequestException` on HTTP 400, and either way NOTHING is
@@ -25,10 +25,10 @@
 //! The rows are a TABLE spanning what the rule generalises over: which operation names
 //! the location (all four job starts, and the three creates that build a resource from a
 //! file), which member names it (`Media.MediaFileUri`, the `Media.RedactedMediaFileUri`
-//! Call Analytics accepts instead, `VocabularyFileUri`, `VocabularyFilterFileUri`), and
-//! how the address fails to resolve (an absent bucket with a root key and with a nested
-//! key under it, an absent key at the bucket root and under a nested prefix, and a key
-//! that only prefixes a stored one).
+//! Call Analytics accepts instead, `VocabularyFileUri`, `VocabularyFilterFileUri`,
+//! `OutputBucketName`), and how the address fails to resolve (an absent bucket with a
+//! root key and with a nested key under it, an absent key at the bucket root and under a
+//! nested prefix, and a key that only prefixes a stored one).
 //!
 //! The last test is the control that keeps the refusals honest: the same requests over
 //! the staged object are accepted and read back, so what the rows above refuse is the
@@ -53,19 +53,19 @@ const STAGED_KEYS: &[&str] = &["dictation.wav", "clinic/visits/terms.txt"];
 /// here transcribes audio — so the same content serves both kinds of row.
 const STAGED_BYTES: &[u8] = b"Aardvark\nTranscribe\n";
 
-/// The refusal a job start whose media is in a bucket the store holds none of carries,
-/// as the service words that error class.
+/// The refusal a start that directs its output into a bucket the store holds none of
+/// carries, as the service words that error class.
 ///
 /// `pub(crate)`: the suites over the media-resolution and start-precondition rules
 /// (`crate::media_object_resolution`, `crate::transcription_job_absent_media_state`,
-/// `crate::call_analytics_job_start_preconditions`) assert the same sentence and read it
-/// from here rather than keeping copies of it.
+/// `crate::call_analytics_job_start_preconditions`) read this service's absent-address
+/// sentences from here rather than keeping copies of them.
 pub(crate) const S3_BUCKET_DOES_NOT_EXIST: &str =
     "The specified S3 bucket doesn't exist. Make sure the bucket exists and try your \
      request again.";
 
-/// The refusal an address whose object the store holds none of carries — every absent
-/// address of a terms file, and a job's media in a bucket that IS there.
+/// The refusal an address naming a FILE the store holds none of carries — every absent
+/// address of a terms file, and every absent address of a job's media.
 pub(crate) const URI_NAMES_NO_OBJECT: &str =
     "The URI that you provided doesn't point to an S3 object. Make sure that the object \
      exists and try your request again.";
@@ -85,8 +85,8 @@ const CLIENT_ERROR_STATUS: u16 = 400;
 /// The shape every refusal here carries.
 const CLIENT_ERROR_SHAPE: &str = "BadRequestException";
 
-/// One operation that names an Amazon S3 location, with the reader that proves whether
-/// anything was stored.
+/// One operation that names an Amazon S3 location of a FILE, with the reader that proves
+/// whether anything was stored.
 struct Row {
     /// What this row varies, named in every assertion.
     case: &'static str,
@@ -97,10 +97,6 @@ struct Row {
     read: &'static str,
     /// The member the request and the reader name the resource with.
     name_member: &'static str,
-    /// The sentence this operation's own member words an absent BUCKET with: the bucket
-    /// one for the media a job start is pointed at, the object one for the file a
-    /// resource is built from.
-    absent_bucket: &'static str,
 }
 
 /// Every operation of this service whose request is validated against an Amazon S3
@@ -119,7 +115,6 @@ fn rows() -> Vec<Row> {
             },
             read: "GetTranscriptionJob",
             name_member: "TranscriptionJobName",
-            absent_bucket: S3_BUCKET_DOES_NOT_EXIST,
         },
         Row {
             case: "a medical transcription job's media",
@@ -136,7 +131,6 @@ fn rows() -> Vec<Row> {
             },
             read: "GetMedicalTranscriptionJob",
             name_member: "MedicalTranscriptionJobName",
-            absent_bucket: S3_BUCKET_DOES_NOT_EXIST,
         },
         Row {
             case: "a Call Analytics job naming its input audio in RedactedMediaFileUri",
@@ -149,7 +143,6 @@ fn rows() -> Vec<Row> {
             },
             read: "GetCallAnalyticsJob",
             name_member: "CallAnalyticsJobName",
-            absent_bucket: S3_BUCKET_DOES_NOT_EXIST,
         },
         Row {
             case: "a Medical Scribe job's media",
@@ -165,7 +158,6 @@ fn rows() -> Vec<Row> {
             },
             read: "GetMedicalScribeJob",
             name_member: "MedicalScribeJobName",
-            absent_bucket: S3_BUCKET_DOES_NOT_EXIST,
         },
         Row {
             case: "a custom vocabulary's table file",
@@ -177,9 +169,8 @@ fn rows() -> Vec<Row> {
                     "VocabularyFileUri": uri
                 })
             },
-            read: "GetVocabulary",
             name_member: "VocabularyName",
-            absent_bucket: URI_NAMES_NO_OBJECT,
+            read: "GetVocabulary",
         },
         Row {
             case: "a custom medical vocabulary's table file",
@@ -191,9 +182,8 @@ fn rows() -> Vec<Row> {
                     "VocabularyFileUri": uri
                 })
             },
-            read: "GetMedicalVocabulary",
             name_member: "VocabularyName",
-            absent_bucket: URI_NAMES_NO_OBJECT,
+            read: "GetMedicalVocabulary",
         },
         Row {
             case: "a custom vocabulary filter's word file",
@@ -205,9 +195,8 @@ fn rows() -> Vec<Row> {
                     "VocabularyFilterFileUri": uri
                 })
             },
-            read: "GetVocabularyFilter",
             name_member: "VocabularyFilterName",
-            absent_bucket: URI_NAMES_NO_OBJECT,
+            read: "GetVocabularyFilter",
         },
     ]
 }
@@ -217,9 +206,6 @@ struct Absence {
     /// What this row varies, named in every assertion.
     case: &'static str,
     uri: fn() -> String,
-    /// Whether the part the store holds none of is the BUCKET, which is what the two
-    /// sentences differ over.
-    bucket_is_absent: bool,
 }
 
 /// Every way the store itself answers that nothing is at the address, crossed with the
@@ -230,27 +216,22 @@ fn absences() -> Vec<Absence> {
         Absence {
             case: "a bucket the store does not hold, with a key at its root",
             uri: || format!("s3://{ABSENT_BUCKET}/{}", STAGED_KEYS[0]),
-            bucket_is_absent: true,
         },
         Absence {
             case: "a bucket the store does not hold, with a nested key under it",
             uri: || format!("s3://{ABSENT_BUCKET}/{}", STAGED_KEYS[1]),
-            bucket_is_absent: true,
         },
         Absence {
             case: "a key the staged bucket does not hold, at its root",
             uri: || format!("s3://{BUCKET}/never-uploaded.wav"),
-            bucket_is_absent: false,
         },
         Absence {
             case: "a key the staged bucket does not hold, under a nested prefix",
             uri: || format!("s3://{BUCKET}/clinic/visits/never-uploaded.txt"),
-            bucket_is_absent: false,
         },
         Absence {
             case: "a key that only prefixes a stored one",
             uri: || format!("s3://{BUCKET}/dictation"),
-            bucket_is_absent: false,
         },
     ]
 }
@@ -265,11 +246,11 @@ async fn emulator_with_staged_objects() -> Transcribe {
     transcribe
 }
 
-/// RULE: the refusal states what the object store said is absent, as the member that
-/// named the location words it — for every operation that resolves an S3 address — and
-/// nothing is stored either way.
+/// RULE: an address naming a FILE that resolves to nothing is refused with the object
+/// sentence — whichever operation named it, and whichever part of the address the store
+/// holds none of — and nothing is stored.
 #[tokio::test]
-async fn a_refusal_about_an_absent_s3_address_names_what_is_absent() {
+async fn a_refusal_about_an_absent_s3_file_names_the_object() {
     let transcribe = emulator_with_staged_objects().await;
 
     for row in rows() {
@@ -277,11 +258,6 @@ async fn a_refusal_about_an_absent_s3_address_names_what_is_absent() {
             let case = format!("{} / {}", row.case, absence.case);
             let name = format!("{}-{index}", row.operation);
             let uri = (absence.uri)();
-            let expected = if absence.bucket_is_absent {
-                row.absent_bucket
-            } else {
-                URI_NAMES_NO_OBJECT
-            };
 
             let refused = transcribe
                 .call(row.operation, (row.request)(&name, &uri))
@@ -289,8 +265,9 @@ async fn a_refusal_about_an_absent_s3_address_names_what_is_absent() {
             refused.refused(&case, CLIENT_ERROR_STATUS, CLIENT_ERROR_SHAPE);
             let message = refused.error_message(&case);
             assert_eq!(
-                message, expected,
-                "case {case:?}: expected the refusal {expected:?}, got {message:?}"
+                message, URI_NAMES_NO_OBJECT,
+                "case {case:?}: expected the refusal {URI_NAMES_NO_OBJECT:?}, got \
+                 {message:?}"
             );
             // The texts are the service's own: no part of the address the caller named
             // appears in them.
@@ -307,6 +284,166 @@ async fn a_refusal_about_an_absent_s3_address_names_what_is_absent() {
                 .await
                 .refused(&case, CLIENT_ERROR_STATUS, CLIENT_ERROR_SHAPE);
         }
+    }
+}
+
+/// One operation that names a BUCKET of the caller's for the output of the job it starts
+/// (`OutputBucketName`), with the reader that proves whether anything was stored.
+struct OutputRow {
+    /// What this row varies, named in every assertion.
+    case: &'static str,
+    operation: &'static str,
+    /// This operation's request, naming the job `name`, its media `uri` and `bucket` as
+    /// the bucket its output is to be written into.
+    request: fn(&str, &str, &str) -> Value,
+    read: &'static str,
+    /// The member the request and the reader name the job with.
+    name_member: &'static str,
+}
+
+/// Every operation of this service that takes an `OutputBucketName`: the one where the
+/// member is optional and the two where it is `@required`
+/// (`smithy_query(query="operation", operation="StartTranscriptionJob,\
+/// StartMedicalTranscriptionJob,StartMedicalScribeJob")`). `StartCallAnalyticsJob` takes
+/// none, naming a whole `OutputLocation` URI instead.
+fn output_rows() -> Vec<OutputRow> {
+    vec![
+        OutputRow {
+            case: "a transcription job's output bucket",
+            operation: "StartTranscriptionJob",
+            request: |name, uri, bucket| {
+                json!({
+                    "TranscriptionJobName": name,
+                    "LanguageCode": LANGUAGE_CODE,
+                    "Media": {"MediaFileUri": uri},
+                    "OutputBucketName": bucket
+                })
+            },
+            read: "GetTranscriptionJob",
+            name_member: "TranscriptionJobName",
+        },
+        OutputRow {
+            case: "a medical transcription job's required output bucket",
+            operation: "StartMedicalTranscriptionJob",
+            request: |name, uri, bucket| {
+                json!({
+                    "MedicalTranscriptionJobName": name,
+                    "LanguageCode": LANGUAGE_CODE,
+                    "Media": {"MediaFileUri": uri},
+                    "OutputBucketName": bucket,
+                    "Specialty": "PRIMARYCARE",
+                    "Type": "CONVERSATION"
+                })
+            },
+            read: "GetMedicalTranscriptionJob",
+            name_member: "MedicalTranscriptionJobName",
+        },
+        OutputRow {
+            case: "a Medical Scribe job's required output bucket",
+            operation: "StartMedicalScribeJob",
+            request: |name, uri, bucket| {
+                json!({
+                    "MedicalScribeJobName": name,
+                    "Media": {"MediaFileUri": uri},
+                    "OutputBucketName": bucket,
+                    "DataAccessRoleArn": ROLE_ARN,
+                    "Settings": {"ShowSpeakerLabels": true, "MaxSpeakerLabels": 2}
+                })
+            },
+            read: "GetMedicalScribeJob",
+            name_member: "MedicalScribeJobName",
+        },
+    ]
+}
+
+/// RULE: a start directed at an output bucket the store holds none of is refused with the
+/// BUCKET sentence, whatever its media says — the member names a bucket, so that is the
+/// absence the refusal states — and nothing is stored.
+///
+/// The media varies along the rows: one staged object, and one address that resolves to
+/// nothing (whose own refusal would be the object sentence), which is what pins the order
+/// the two are judged in.
+#[tokio::test]
+async fn a_start_directed_at_an_absent_output_bucket_names_the_bucket() {
+    let transcribe = emulator_with_staged_objects().await;
+    let media = [
+        ("media the store holds", format!("s3://{BUCKET}/{}", STAGED_KEYS[0])),
+        (
+            "media the store does not hold either",
+            format!("s3://{ABSENT_BUCKET}/{}", STAGED_KEYS[0]),
+        ),
+    ];
+
+    for row in output_rows() {
+        for (index, (media_case, uri)) in media.iter().enumerate() {
+            let case = format!("{} / {media_case}", row.case);
+            let name = format!("{}-absent-output-{index}", row.operation);
+
+            let refused = transcribe
+                .call(row.operation, (row.request)(&name, uri, ABSENT_BUCKET))
+                .await;
+            refused.refused(&case, CLIENT_ERROR_STATUS, CLIENT_ERROR_SHAPE);
+            let message = refused.error_message(&case);
+            assert_eq!(
+                message, S3_BUCKET_DOES_NOT_EXIST,
+                "case {case:?}: expected the refusal {S3_BUCKET_DOES_NOT_EXIST:?}, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(ABSENT_BUCKET),
+                "case {case:?}: the refusal must carry no value of the request, got \
+                 {message:?}"
+            );
+
+            // Refused before anything was recorded.
+            transcribe
+                .call(row.read, json!({row.name_member: &name}))
+                .await
+                .refused(&case, CLIENT_ERROR_STATUS, CLIENT_ERROR_SHAPE);
+        }
+    }
+}
+
+/// The other side of the same rule: with the output bucket one the store HOLDS, the same
+/// starts are judged by their media — an unresolvable media address is refused with the
+/// object sentence, and a staged one is accepted and reads back.
+#[tokio::test]
+async fn a_start_whose_output_bucket_is_held_is_judged_by_its_media() {
+    let transcribe = emulator_with_staged_objects().await;
+
+    for row in output_rows() {
+        let case = format!("{} / held, over unresolvable media", row.case);
+        let name = format!("{}-held-output-absent-media", row.operation);
+        let refused = transcribe
+            .call(
+                row.operation,
+                (row.request)(
+                    &name,
+                    &format!("s3://{BUCKET}/never-uploaded.wav"),
+                    BUCKET,
+                ),
+            )
+            .await;
+        refused.refused(&case, CLIENT_ERROR_STATUS, CLIENT_ERROR_SHAPE);
+        let message = refused.error_message(&case);
+        assert_eq!(
+            message, URI_NAMES_NO_OBJECT,
+            "case {case:?}: expected the refusal {URI_NAMES_NO_OBJECT:?}, got {message:?}"
+        );
+
+        let case = format!("{} / held, over staged media", row.case);
+        let name = format!("{}-held-output-staged-media", row.operation);
+        transcribe
+            .call(
+                row.operation,
+                (row.request)(&name, &format!("s3://{BUCKET}/{}", STAGED_KEYS[0]), BUCKET),
+            )
+            .await
+            .ok_status(&case, 200);
+        transcribe
+            .call(row.read, json!({row.name_member: &name}))
+            .await
+            .ok(&case);
     }
 }
 

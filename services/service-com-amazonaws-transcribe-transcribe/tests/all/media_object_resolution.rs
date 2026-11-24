@@ -36,7 +36,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::absent_s3_address_messages::{S3_BUCKET_DOES_NOT_EXIST, URI_NAMES_NO_OBJECT};
+use crate::absent_s3_address_messages::URI_NAMES_NO_OBJECT;
 use crate::transcription_jobs::{dispatch, Reply};
 
 /// The Region both services are addressed in. Amazon S3 places a bucket created with no
@@ -58,6 +58,14 @@ pub(crate) const BUCKET: &str = "example-media";
 
 /// A bucket name no `CreateBucket` below ever creates.
 pub(crate) const ABSENT_BUCKET: &str = "example-media-missing";
+
+/// The bucket the medical rows below direct their output into (`OutputBucketName`, a
+/// required member of that start), created before any row names it
+/// ([`given_output_buckets`]).
+pub(crate) const MEDICAL_OUTPUT_BUCKET: &str = "example-medical-output";
+
+/// The bucket the Medical Scribe rows below direct their output into.
+pub(crate) const SCRIBE_OUTPUT_BUCKET: &str = "example-scribe-output";
 
 /// The keys staged in [`BUCKET`]: one at the bucket root and one under a nested prefix,
 /// each named with one of the modelled `MediaFormat` extensions
@@ -184,13 +192,7 @@ pub(crate) async fn given_object(
     key: &str,
     bytes: &[u8],
 ) {
-    let (status, body) = s3(emulator, "PUT", &format!("/{bucket}"), &[]).await;
-    assert_eq!(
-        status,
-        200,
-        "the bucket {bucket} must be created first, got HTTP {status} with body {:?}",
-        String::from_utf8_lossy(&body)
-    );
+    given_bucket(emulator, bucket).await;
     let (status, body) = s3(emulator, "PUT", &format!("/{bucket}/{key}"), bytes).await;
     assert_eq!(
         status,
@@ -200,13 +202,41 @@ pub(crate) async fn given_object(
     );
 }
 
+/// `PUT /<bucket>` — `CreateBucket` — so the object store really HOLDS that bucket: the
+/// bucket a caller creates before a request names it.
+///
+/// Needed on its own wherever a request directs a job's OUTPUT into a bucket of the
+/// caller's (`OutputBucketName`), because a start naming a bucket the store does not hold
+/// is refused for that bucket before its media is ever read
+/// (`crate::absent_s3_address_messages`, the home of that rule).
+pub(crate) async fn given_bucket(emulator: &MultiServiceRouter, bucket: &str) {
+    let (status, body) = s3(emulator, "PUT", &format!("/{bucket}"), &[]).await;
+    assert_eq!(
+        status,
+        200,
+        "the bucket {bucket} must be created first, got HTTP {status} with body {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Create the output buckets the shared start requests name
+/// ([`Family::start_request`]), so a row below is refused for its MEDIA and never for the
+/// bucket it directs its output into.
+pub(crate) async fn given_output_buckets(emulator: &MultiServiceRouter) {
+    for bucket in [MEDICAL_OUTPUT_BUCKET, SCRIBE_OUTPUT_BUCKET] {
+        given_bucket(emulator, bucket).await;
+    }
+}
+
 /// `PUT /<bucket>` — `CreateBucket` — then `PUT /<bucket>/<key>` — `PutObject` — for
 /// every key of [`STAGED_KEYS`], so the object store really holds the media the
-/// accepted rows below name.
+/// accepted rows below name, and the output buckets those rows direct their results into
+/// ([`given_output_buckets`]).
 pub(crate) async fn given_staged_media(emulator: &MultiServiceRouter) {
     for key in STAGED_KEYS {
         given_object(emulator, BUCKET, key, MEDIA_BYTES).await;
     }
+    given_output_buckets(emulator).await;
 }
 
 /// The same staging, for an object that DECLARES the natural language of its content:
@@ -311,7 +341,7 @@ impl Family {
                 "MedicalTranscriptionJobName": name,
                 "LanguageCode": "en-US",
                 "Media": media,
-                "OutputBucketName": "example-medical-output",
+                "OutputBucketName": MEDICAL_OUTPUT_BUCKET,
                 "Specialty": "PRIMARYCARE",
                 "Type": "DICTATION"
             }),
@@ -322,7 +352,7 @@ impl Family {
             Self::Scribe => json!({
                 "MedicalScribeJobName": name,
                 "Media": media,
-                "OutputBucketName": "example-scribe-output",
+                "OutputBucketName": SCRIBE_OUTPUT_BUCKET,
                 "DataAccessRoleArn": ROLE_ARN,
                 "Settings": {"ShowSpeakerLabels": true, "MaxSpeakerLabels": 2}
             }),
@@ -339,10 +369,10 @@ struct MediaCase {
     name: &'static str,
     /// The `Media` the start request carries.
     media: fn() -> Value,
-    /// For an unresolvable row, the sentence the refusal states — which names WHAT the
-    /// store said is absent, the bucket or an object in a bucket that is there
-    /// (`crate::absent_s3_address_messages`, the home of that rule). Empty for a
-    /// resolvable row, which is refused nothing.
+    /// For an unresolvable row, the sentence the refusal states — the one sentence every
+    /// media address that resolves to no object gets, whichever part of it the store
+    /// holds none of (`crate::absent_s3_address_messages`, the home of that rule). Empty
+    /// for a resolvable row, which is refused nothing.
     absent: &'static str,
 }
 
@@ -356,7 +386,7 @@ fn unresolvable() -> Vec<MediaCase> {
             family: Family::Transcription,
             name: "missing-bucket",
             media: || json!({"MediaFileUri": format!("s3://{ABSENT_BUCKET}/dictation.wav")}),
-            absent: S3_BUCKET_DOES_NOT_EXIST,
+            absent: URI_NAMES_NO_OBJECT,
         },
         MediaCase {
             case: "a medical transcription job whose key nothing was ever written to",

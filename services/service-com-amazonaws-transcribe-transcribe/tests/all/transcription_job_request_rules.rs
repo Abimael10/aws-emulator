@@ -827,6 +827,10 @@ async fn every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks() {
         // names is staged first, or the start would be refused for its media instead.
         let transcribe = Transcribe::with_object_store();
         transcribe.given_media_objects(STAGED_MEDIA).await;
+        // The medical and Medical Scribe starts direct their output into a bucket of
+        // their own, and a start naming one the store does not hold is refused for that
+        // bucket before its media is read, so those buckets are created too.
+        transcribe.given_output_buckets().await;
         let case = family.case;
         let vocabulary = format!("family-terms-{index}");
 

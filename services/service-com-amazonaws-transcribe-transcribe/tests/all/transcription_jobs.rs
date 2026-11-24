@@ -342,6 +342,26 @@ impl Transcribe {
         crate::media_object_resolution::given_object(&self.router, bucket, key, bytes).await;
     }
 
+    /// Create `bucket` in this emulator's own Amazon S3 — the bucket a caller creates
+    /// before directing a job's OUTPUT into it.
+    ///
+    /// Needed with [`Self::with_object_store`] wherever a start names an
+    /// `OutputBucketName` of its own: with the store mounted, a start directed at a bucket
+    /// it reports it does not hold is refused for that bucket
+    /// (`crate::absent_s3_address_messages`, the home of that rule), so a suite that
+    /// mounts it creates the output buckets its rows name. Reaches the store through the
+    /// one staging path (`crate::media_object_resolution::given_bucket`).
+    pub(crate) async fn given_bucket(&self, bucket: &str) {
+        crate::media_object_resolution::given_bucket(&self.router, bucket).await;
+    }
+
+    /// Create the output buckets the shared start requests name
+    /// (`crate::media_object_resolution::given_output_buckets`), for a suite that drives
+    /// those requests through this harness.
+    pub(crate) async fn given_output_buckets(&self) {
+        crate::media_object_resolution::given_output_buckets(&self.router).await;
+    }
+
     /// Wait until the custom language model `name`, held in `region`, is one a job may
     /// APPLY — polling `DescribeLanguageModel` exactly as a caller must.
     ///

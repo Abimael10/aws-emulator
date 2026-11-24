@@ -195,11 +195,13 @@ async fn read_job(transcribe: &Transcribe, job: &str) -> Reply {
         .await
 }
 
-/// An emulator with the object store beside the service and the media every start names
-/// already staged.
+/// An emulator with the object store beside the service, the media every start names
+/// already staged and the bucket every start directs its output into created — a start
+/// naming an output bucket the store does not hold is refused for that bucket.
 async fn emulator() -> Transcribe {
     let transcribe = Transcribe::with_object_store();
     transcribe.given_media_objects(&[MEDIA_URI]).await;
+    transcribe.given_output_buckets().await;
     transcribe
 }
 

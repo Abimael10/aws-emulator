@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::absent_s3_address_messages::S3_BUCKET_DOES_NOT_EXIST;
 use crate::call_analytics_jobs::{
     create_named_resources, get, list, names_of, MODEL_TRAINING_BUCKET, MODEL_TRAINING_KEY,
     PAST_THE_TRANSITION,
@@ -87,8 +86,9 @@ enum Unmet {
     /// The media the start names is an address the object store reports it does not
     /// hold: a key a bucket that IS there holds none of.
     Media,
-    /// The media the start names is in a BUCKET the object store does not hold at all,
-    /// which the refusal words its own way (`crate::absent_s3_address_messages`).
+    /// The media the start names is in a BUCKET the object store does not hold at all —
+    /// the same refusal, because the member names a media FILE and that address resolves
+    /// to none either way (`crate::absent_s3_address_messages`).
     MediaBucket,
     /// A settings member names a custom resource the account does not hold; the word is
     /// the family that member reads, which a refusal names.
@@ -104,8 +104,9 @@ impl Unmet {
     /// The refusal wording that satisfies this row.
     fn expected_message(&self) -> String {
         match self {
-            Self::Media | Self::MediaAndNotHeld => MEDIA_NAMES_NO_OBJECT.to_string(),
-            Self::MediaBucket => S3_BUCKET_DOES_NOT_EXIST.to_string(),
+            Self::Media | Self::MediaBucket | Self::MediaAndNotHeld => {
+                MEDIA_NAMES_NO_OBJECT.to_string()
+            }
             Self::NotHeld(kind) => not_found_message(kind),
         }
     }

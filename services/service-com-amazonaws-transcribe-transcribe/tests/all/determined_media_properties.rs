@@ -141,14 +141,17 @@ fn rate_names(row: &RateRow) -> (String, String) {
 }
 
 /// The emulator these rows run on: transcribe beside this emulator's own Amazon S3, on
-/// one shared engine.
-fn transcribe() -> Transcribe {
-    Transcribe::with_object_store()
+/// one shared engine, with the buckets the shared start requests direct their output into
+/// created — a start naming an output bucket the store does not hold is refused for it.
+async fn transcribe() -> Transcribe {
+    let transcribe = Transcribe::with_object_store();
+    transcribe.given_output_buckets().await;
+    transcribe
 }
 
 #[tokio::test]
 async fn a_finished_job_reports_the_sample_rate_its_stored_media_declares() {
-    let transcribe = transcribe();
+    let transcribe = transcribe().await;
     let rows = rate_rows();
 
     for row in &rows {
@@ -195,7 +198,7 @@ async fn a_finished_job_reports_the_sample_rate_its_stored_media_declares() {
 
 #[tokio::test]
 async fn a_rate_the_request_declared_is_kept_and_undeterminable_media_leaves_it_absent() {
-    let transcribe = transcribe();
+    let transcribe = transcribe().await;
     // The audio every row below is pointed at declares 44100 Hz, so a row that reports
     // anything else reports something other than what the media says.
     let key = "mixed/declared.wav";
@@ -264,7 +267,7 @@ async fn a_rate_the_request_declared_is_kept_and_undeterminable_media_leaves_it_
 
 #[tokio::test]
 async fn every_family_that_reports_the_member_determines_it_from_the_same_media() {
-    let transcribe = transcribe();
+    let transcribe = transcribe().await;
     let key = "families/shared.wav";
     given_object(&transcribe.router, MEDIA_BUCKET, key, &wave(24_000)).await;
     let media = json!({"MediaFileUri": format!("s3://{MEDIA_BUCKET}/{key}")});
@@ -319,7 +322,7 @@ fn switched_off() -> Value {
 
 #[tokio::test]
 async fn a_finished_job_reports_the_effective_settings_it_ran_with() {
-    let transcribe = transcribe();
+    let transcribe = transcribe().await;
     let key = "settings/audio.wav";
     given_object(&transcribe.router, MEDIA_BUCKET, key, &wave(16_000)).await;
 

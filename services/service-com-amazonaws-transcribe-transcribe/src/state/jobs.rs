@@ -818,13 +818,14 @@ pub enum MediaVerdict {
     /// No object of the object store answers for the media the request named — either
     /// Amazon S3 reports that nothing it named is there, or the URI is of the S3
     /// scheme and addresses no object of it at all
-    /// ([`s3_uri_addresses_no_object`]): the start is refused and nothing is stored.
+    /// ([`s3_uri_addresses_no_object`]): the start is refused with
+    /// [`URI_NAMES_NO_OBJECT`] and nothing is stored.
     ///
-    /// The payload is the sentence that refusal states, which is the one the store's own
-    /// answer grounds ([`absent_address_message`]): a BUCKET the store does not hold is
-    /// a different failure from a key that bucket does not hold, and the message is the
-    /// only thing that tells a caller which.
-    Absent(&'static str),
+    /// ONE sentence for every media address that does not resolve, whichever part of it
+    /// the store holds none of: the member names the media FILE a job is to process, so
+    /// an address that resolves to no file is the same failure whether the bucket or the
+    /// key is the part that is not there.
+    Absent,
     /// Every object the request addressed resolved, so the service has seen the stored
     /// media it is to process.
     Resolved,
@@ -847,14 +848,14 @@ pub const URI_NAMES_NO_OBJECT: &str =
     "The URI that you provided doesn't point to an S3 object. Make sure that the object \
      exists and try your request again.";
 
-/// The refusal a start whose media is in a BUCKET the object store does not hold gets.
+/// The refusal a start that names a BUCKET of its own for its OUTPUT the object store
+/// does not hold gets ([`resolve_output_bucket`]).
 ///
-/// A missing bucket is a different failure from a missing object inside one: the caller
-/// has nowhere to have uploaded any media yet, so this sentence says the bucket itself is
-/// not there rather than sending the caller to look for a key in it
-/// ([`URI_NAMES_NO_OBJECT`], which the same start answers for a key a bucket that IS
-/// there holds none of). Entirely FIXED text, like its counterpart: neither the bucket
-/// name nor the URI appears in it.
+/// A bucket the caller directs its results to is a different thing from the media file it
+/// points the job at: there is nothing to write the transcript into, so this sentence says
+/// the bucket itself is not there, while an input address that resolves to no file is the
+/// object sentence ([`URI_NAMES_NO_OBJECT`]) whichever part of it is missing. Entirely
+/// FIXED text, like its counterpart: neither the bucket name nor the URI appears in it.
 pub const S3_BUCKET_DOES_NOT_EXIST: &str =
     "The specified S3 bucket doesn't exist. Make sure the bucket exists and try your \
      request again.";
@@ -863,40 +864,21 @@ pub const S3_BUCKET_DOES_NOT_EXIST: &str =
 /// not there at all, rather than something inside it.
 pub(super) const ABSENT_BUCKET_CODE: &str = "NoSuchBucket";
 
-/// Which of this service's two absent-address sentences S3's own absent answer grounds
-/// for the MEDIA a job start was pointed at: the bucket one
-/// ([`S3_BUCKET_DOES_NOT_EXIST`]) where the store answered that it holds no such BUCKET,
-/// and the object one ([`URI_NAMES_NO_OBJECT`]) for an address whose bucket is there and
-/// whose object is not.
-///
-/// One judgement for every job family's media, so the four starts cannot disagree about
-/// which failure a store answer denotes. The file a custom vocabulary's terms are read
-/// from makes no such distinction ([`crate::state::VocabularyFileVerdict::NoSuchObject`]):
-/// its members' recorded refusal is the object sentence however that address fails to
-/// resolve. `code` is the code the store sent, absent for an answer that carried none.
-pub(super) fn absent_address_message(code: Option<&str>) -> &'static str {
-    if code == Some(ABSENT_BUCKET_CODE) {
-        S3_BUCKET_DOES_NOT_EXIST
-    } else {
-        URI_NAMES_NO_OBJECT
-    }
-}
-
-/// The Amazon S3 error codes in which S3 reports that an object a request names is NOT
+/// The Amazon S3 error codes in which S3 reports that an address a request names is NOT
 /// THERE: a bucket it does not hold ([`ABSENT_BUCKET_CODE`]), a key that bucket does not
-/// hold (`NoSuchKey`), a version it holds none of (`NoSuchVersion`), and the code
-/// `HeadObject` models for either (`NotFound`, which a HEAD carries no body to spell
-/// out). The bucket code is the one [`absent_address_message`] reads, so it is named from
-/// there rather than spelled a second time here.
+/// hold (`NoSuchKey`), a version it holds none of (`NoSuchVersion`), and the code a HEAD
+/// models for either (`NotFound`, which a HEAD carries no body to spell out — the code a
+/// `HeadBucket` of an absent bucket answers with too, which is why the bucket a start
+/// directs its OUTPUT to is judged by the same list, [`resolve_output_bucket`]).
 ///
 /// The code is required TOGETHER WITH the 404 status ([`object_is_absent`]), and never
 /// the status alone, because a status is not evidence that S3 answered at all: a request
 /// that reached no S3 is a 404 too, and that is this emulator failing to ask rather than
-/// a verdict about the object. The list is deliberately CLOSED, and holds only the codes
-/// that say the object is absent — the refusal this wording states
-/// ([`URI_NAMES_NO_OBJECT`]) is about an object that is not there, so a code
-/// reporting something else about it (a read that is not permitted, a refusal S3 adds
-/// later) answers [`MediaVerdict::Unknown`] and refuses nothing.
+/// a verdict about the address. The list is deliberately CLOSED, and holds only the codes
+/// that say the address is absent — the refusals this service words from it are about
+/// something that is not there, so a code reporting something else about it (a read that
+/// is not permitted, a refusal S3 adds later) answers [`MediaVerdict::Unknown`] (or
+/// [`OutputBucketVerdict::Unknown`]) and refuses nothing.
 pub(super) const ABSENT_OBJECT_CODES: &[&str] =
     &[ABSENT_BUCKET_CODE, "NoSuchKey", "NoSuchVersion", "NotFound"];
 
@@ -904,11 +886,12 @@ pub(super) const ABSENT_OBJECT_CODES: &[&str] =
 /// address: HTTP 404 AND one of the codes it sends for a missing one
 /// ([`ABSENT_OBJECT_CODES`]).
 ///
-/// One judgement for every read this service makes of a caller-named object, whichever
+/// One judgement for every read this service makes of a caller-named address, whichever
 /// operation of the object store asked: the `HeadObject` a job's media is resolved with
-/// ([`resolve_media_objects`]) and the `GetObject` a vocabulary's file is read with
-/// ([`resolve_vocabulary_file`]) answer an absent object the same way, so what "the
-/// object is not there" means cannot differ between them.
+/// ([`resolve_media_objects`]), the `HeadBucket` an output bucket is resolved with
+/// ([`resolve_output_bucket`]) and the `GetObject` a vocabulary's file is read with
+/// ([`resolve_vocabulary_file`]) answer an absent address the same way, so what "it is
+/// not there" means cannot differ between them.
 pub(super) fn object_is_absent<E>(
     error: &::aws_sdk_s3::error::SdkError<
         E,
@@ -978,7 +961,7 @@ pub async fn resolve_media_objects(
             // at all ([`s3_uri_addresses_no_object`]), so the start is refused without
             // asking the store: there is no object for it to answer about.
             if s3_uri_addresses_no_object(uri) {
-                return MediaResolution::verdict(MediaVerdict::Absent(URI_NAMES_NO_OBJECT));
+                return MediaResolution::verdict(MediaVerdict::Absent);
             }
             continue;
         };
@@ -1002,11 +985,10 @@ pub async fn resolve_media_objects(
             Err(error) => {
                 if object_is_absent(&error) {
                     // S3 says nothing is there: the refusal is grounded, and it states
-                    // WHAT the store answered is absent — the bucket, or an object in a
-                    // bucket that is there ([`absent_address_message`]).
-                    return MediaResolution::verdict(MediaVerdict::Absent(
-                        absent_address_message(error.code()),
-                    ));
+                    // that the address names no media FILE ([`URI_NAMES_NO_OBJECT`]) —
+                    // one sentence for a bucket the store does not hold and for a key a
+                    // bucket that is there holds none of alike.
+                    return MediaResolution::verdict(MediaVerdict::Absent);
                 }
                 // Any other answer is not S3 reporting an absent object, so it refuses
                 // nothing — and it is worth a warning, because a deployment with no S3
@@ -1038,6 +1020,81 @@ pub async fn resolve_media_objects(
         // verdict is.
         language,
         sample_rate,
+    }
+}
+
+/// What asking this emulator's own Amazon S3 about the bucket a start named for its
+/// OUTPUT established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputBucketVerdict {
+    /// Amazon S3 reports that it holds no such bucket: the start is refused with
+    /// [`S3_BUCKET_DOES_NOT_EXIST`] and nothing is stored, because there is nowhere for
+    /// the results the job would produce to be written.
+    Absent,
+    /// The store answers for the bucket, or the request named none of its own, so there
+    /// is nothing about the output location to refuse.
+    Held,
+    /// Nothing is known about the bucket: there was no object store to ask, or its answer
+    /// was not S3 reporting an absent bucket. Nothing is refused on an assumption.
+    Unknown,
+}
+
+/// Resolve the bucket a start named for its OUTPUT against this emulator's own Amazon S3
+/// and report what that established.
+///
+/// `OutputBucketName` is "The name of the Amazon S3 bucket where you want your
+/// transcription output stored" (`smithy_query(query="operation",
+/// operation="StartTranscriptionJob")`, and the same sentence on the medical and Medical
+/// Scribe starts), so it names a bucket the SERVICE is to write into: a start directed at
+/// a bucket the object store does not hold has nowhere to put the results, and is refused
+/// with the bucket sentence ([`S3_BUCKET_DOES_NOT_EXIST`]) before anything is stored —
+/// never accepted into a job whose reported output locations no store would serve. A
+/// request naming no output bucket of its own ([`None`], or the empty value the member's
+/// own length allows) directs its output nowhere of the caller's, so there is nothing to
+/// resolve.
+///
+/// Judged BEFORE the media the job is to read ([`resolve_media_objects`]): where a
+/// request's output bucket and its input media are both unresolvable, what it is told is
+/// that the bucket it named is not there. The two sentences cannot be confused for that
+/// reason — this one is about the destination the request named, the media's is about the
+/// file it pointed the job at.
+///
+/// Whether the bucket is there is established with a `HeadBucket`, "to determine if a
+/// bucket exists and if you have permission to access it", and the verdict is read from
+/// S3's own absent answer and never from an HTTP status alone ([`object_is_absent`]):
+/// with no S3 to ask, nothing is known and the start is accepted, exactly as an
+/// unresolvable media read refuses nothing.
+pub async fn resolve_output_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: Option<&str>,
+) -> OutputBucketVerdict {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let Some(bucket) = bucket.map(str::trim).filter(|name| !name.is_empty()) else {
+        return OutputBucketVerdict::Held;
+    };
+    match s3_client(ctx, region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+    {
+        Ok(_) => OutputBucketVerdict::Held,
+        Err(error) if object_is_absent(&error) => OutputBucketVerdict::Absent,
+        Err(error) => {
+            // Not S3 reporting an absent bucket, so it refuses nothing — and it is worth
+            // a warning, because a deployment with no S3 mounted to ask is one where this
+            // check does not run. The caller's own value is rendered with its escaped
+            // `Debug` form, so a bucket name carrying a newline cannot forge a log line.
+            ::tracing::warn!(
+                bucket = ?bucket,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                code = ?error.code(),
+                "the output bucket could not be resolved against this emulator's Amazon S3"
+            );
+            OutputBucketVerdict::Unknown
+        }
     }
 }
 

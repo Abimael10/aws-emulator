@@ -346,6 +346,9 @@ const STAGED_MEDIA: &[&str] = &["s3://example-media/dictation.wav"];
 async fn given_the_object_store() -> Transcribe {
     let transcribe = Transcribe::with_object_store();
     transcribe.given_media_objects(STAGED_MEDIA).await;
+    // The medical and Medical Scribe rows direct their output into a bucket of their own,
+    // and a start naming one the store does not hold is refused for that bucket.
+    transcribe.given_output_buckets().await;
     transcribe
 }
 

@@ -2824,11 +2824,10 @@ pub enum VocabularyFileVerdict {
     /// ([`s3_uri_addresses_no_object`]): the request named a file that is not there, so
     /// it is refused and nothing is recorded ([`URI_NAMES_NO_OBJECT`]).
     ///
-    /// ONE sentence for every way such an address fails to resolve, unlike the media a
-    /// job start is pointed at ([`MediaVerdict`], which names the bucket when the store
-    /// says it holds none): the members that name this file are about the FILE, and the
-    /// recorded refusal for an address whose bucket the store does not hold is the very
-    /// sentence a key it does not hold gets.
+    /// ONE sentence for every way such an address fails to resolve, exactly as the media a
+    /// job start is pointed at answers for its own ([`MediaVerdict::Absent`]): the members
+    /// that name this file are about the FILE, so the refusal for an address whose bucket
+    /// the store does not hold is the very sentence a key it does not hold gets.
     NoSuchObject,
     /// The file holds more bytes than a custom vocabulary may
     /// ([`MAX_VOCABULARY_CONTENT_BYTES`]), so it is refused rather than built from —

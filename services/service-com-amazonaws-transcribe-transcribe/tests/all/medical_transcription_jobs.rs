@@ -187,6 +187,11 @@ async fn given_what_the_rows_name() -> Transcribe {
     let transcribe = Transcribe::with_object_store();
     transcribe.given_media_objects(STAGED_MEDIA).await;
     for (_, request) in start_requests() {
+        // The bucket a row directs its output into: a start naming one the object store
+        // does not hold is refused for that bucket before its media is read.
+        if let Some(bucket) = request["OutputBucketName"].as_str() {
+            transcribe.given_bucket(bucket).await;
+        }
         let Some(name) = request["Settings"]["VocabularyName"].as_str() else {
             continue;
         };

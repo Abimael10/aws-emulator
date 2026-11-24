@@ -794,6 +794,12 @@ async fn a_location_in_the_callers_own_bucket_is_reported_unsigned_on_this_endpo
     ];
 
     for (case, start, request, _, _, _) in &rows {
+        // The bucket each row directs its output into is the caller's own, created before
+        // the start names it: a start naming a bucket the object store does not hold is
+        // refused for that bucket.
+        if let Some(bucket) = request["OutputBucketName"].as_str() {
+            crate::media_object_resolution::given_bucket(&router, bucket).await;
+        }
         call(&router, start, request.clone()).await.ok(case);
     }
 
