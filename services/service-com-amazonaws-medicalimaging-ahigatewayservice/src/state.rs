@@ -91,6 +91,10 @@ pub use dicom_instance::*;
 mod modelled_attribute;
 pub use modelled_attribute::*;
 
+/// Whether the customer managed KMS key a request names is one AWS KMS holds.
+mod kms_key;
+pub use kms_key::*;
+
 /// What a DICOM import job's completion WRITES, and what its outcome is decided from.
 pub mod import_job_output;
 

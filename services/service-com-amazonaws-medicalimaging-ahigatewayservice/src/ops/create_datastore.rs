@@ -22,6 +22,11 @@
 //! entries than one resource may hold ([`crate::state::MAX_TAGS_PER_RESOURCE`]), is
 //! refused with `ValidationException` and creates no data store.
 //!
+//! So is the `kmsKeyArn`, one step further out: the key the data store's content is to be
+//! encrypted under is resolved against the service that owns keys
+//! ([`crate::state::unlocatable_kms_key`]), and a key AWS KMS holds none of is refused
+//! with `ValidationException` rather than minting a data store nothing could decrypt.
+//!
 //! ---
 //!
 //! # Modeled contract for `CreateDatastore`
@@ -164,6 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tags
             .as_ref()
             .and_then(|tags| crate::state::tag_map_refusal("tags", tags))
+        {
+            return Err(
+                CreateDatastoreErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // "The Amazon Resource Name (ARN) assigned to the Key Management Service (KMS) key
+        // for accessing encrypted data": a data store's content is encrypted under that
+        // key, so the key is resolved against the service that OWNS keys before anything is
+        // minted ([`crate::state::unlocatable_kms_key`]). A key AWS KMS answers it holds
+        // none of is the modelled `ValidationException`, and the call creates no data store
+        // and consumes no `clientToken` — exactly as the tag map above it. Asked before
+        // this service's own store is reached, so no guard is held across the hop.
+        if let Some(message) =
+            crate::state::unlocatable_kms_key(ctx, &region, input.kms_key_arn.as_deref()).await
         {
             return Err(
                 CreateDatastoreErrorModeled::ValidationException(ValidationException { message })
