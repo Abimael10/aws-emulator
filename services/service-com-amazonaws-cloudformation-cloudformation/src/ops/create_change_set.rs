@@ -530,7 +530,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ones the request supplies — in that order of precedence, which is the set
         // `merged_parameters` and `parameters_in_force` resolve to under the lock below. The
         // stack's half is read under a lock of its own, released before the reads.
-        let (stack_template, stack_processed, stack_parameters, stack_notification_arns) = {
+        // The same read answers what the stack this change set targets IS, when it is
+        // already there: its `StackId`. A change set is the PLAN of the operation that would
+        // be executed, so the template it plans is evaluated in the identity of the stack it
+        // targets — the execution evaluates it in exactly that scope
+        // ([`crate::state::StoredStack::deploy_template`]) — and a name CloudFormation
+        // GENERATES is derived from the stack's id, so a declaration naming itself from a
+        // `Ref` to another resource of the stack resolves here to the identifier that
+        // resource really carries only while this scope carries the stack's own id.
+        let (
+            stack_template,
+            stack_processed,
+            stack_parameters,
+            stack_notification_arns,
+            stack_id_in_force,
+        ) = {
             let store = state.lock();
             match store
                 .resolve(&region, &input.stack_name)
@@ -541,12 +555,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     stack.processed_template.clone(),
                     stack.parameters.clone(),
                     stack.notification_arns.clone(),
+                    stack.stack_id.clone(),
                 ),
                 None => (
                     None,
                     crate::state::template::Processed::Same,
                     Vec::new(),
                     Vec::new(),
+                    // A stack this call MINTS has no id until it is minted, so a
+                    // declaration built from one resolves to nothing here.
+                    String::new(),
                 ),
             }
         };
@@ -597,9 +615,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::nested_change_set::PlanningScope {
                     region: &region,
                     stack_name: &input.stack_name,
-                    // The stack's ID exists only once the stack does, so a declaration built
-                    // from it resolves to nothing here.
-                    stack_id: "",
+                    // The identity the execution would evaluate this template in: the
+                    // targeted stack's own id, and nothing for a stack this call mints,
+                    // whose id exists only once the stack does.
+                    stack_id: &stack_id_in_force,
                     notification_arns: topics_in_force,
                 },
                 declared_in_force.as_ref(),
@@ -643,18 +662,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service would know it by ([`early_validation::named_resources`]): what the
         // existence check asks about, and what an adopted resource is reported under.
         //
-        // The scope a stated name is evaluated in is what the REQUEST carries: the Region,
-        // the stack's name and the parameter values this change set would deploy with. The
-        // stack's ID exists only once the stack does, so a name built from it resolves to
-        // nothing here and that resource is simply not asked about — a name no service holds
-        // is never reported as taken.
+        // The scope a stated name is evaluated in is the scope the EXECUTION would evaluate
+        // it in: the Region, the stack's name, the identity of the stack this change set
+        // targets and the parameter values it would deploy with. A stack this call MINTS has
+        // no id yet, so a name built from one resolves to nothing there and that resource is
+        // simply not asked about — a name no service holds is never reported as taken.
         let named_resources = match (&declared_submitted, &values_in_force) {
             (Some(declared), Some(values)) => early_validation::named_resources(
                 declared,
                 crate::state::template::StackScope {
                     region: &region,
                     stack_name: &input.stack_name,
-                    stack_id: "",
+                    // The id of the stack this change set targets, so a name the plan would
+                    // create is the name the execution would create: a generated name is
+                    // derived from it, so a declaration naming itself from a `Ref` to
+                    // another resource of the stack resolves to the identifier that
+                    // resource really carries. Empty for a stack this call mints, whose id
+                    // exists only once the stack does.
+                    stack_id: &stack_id_in_force,
                     // The topics this change set would put in force: what a name built
                     // from `AWS::NotificationARNs` would resolve to under it.
                     notification_arns: topics_in_force,
