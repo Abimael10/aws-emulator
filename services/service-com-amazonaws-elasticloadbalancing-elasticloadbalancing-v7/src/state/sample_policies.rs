@@ -41,6 +41,13 @@ pub const SERVER_DEFINED_CIPHER_ORDER_ATTRIBUTE: &str = "Server-Defined-Cipher-O
 
 /// The cipher attributes of the SSL negotiation policy type, in the published order: one per
 /// cipher suite a negotiation configuration can turn on.
+///
+/// The order is the published one ROW FOR ROW, including where the ephemeral
+/// Diffie-Hellman rows sit among the ECDHE/AES rows rather than after them:
+/// `DHE-RSA-AES128-SHA` is published between `ECDHE-RSA-AES128-SHA` and
+/// `ECDHE-ECDSA-AES256-GCM-SHA384`, and `DHE-DSS-AES128-SHA` between `AES256-SHA` and
+/// `CAMELLIA128-SHA`. A description is projected over this list positionally, so grouping
+/// the suites by family here would report them at positions the published catalog does not.
 pub const SSL_CIPHER_ATTRIBUTES: &[&str] = &[
     "ECDHE-ECDSA-AES128-GCM-SHA256",
     "ECDHE-RSA-AES128-GCM-SHA256",
@@ -48,6 +55,7 @@ pub const SSL_CIPHER_ATTRIBUTES: &[&str] = &[
     "ECDHE-RSA-AES128-SHA256",
     "ECDHE-ECDSA-AES128-SHA",
     "ECDHE-RSA-AES128-SHA",
+    "DHE-RSA-AES128-SHA",
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
     "ECDHE-ECDSA-AES256-SHA384",
@@ -60,7 +68,6 @@ pub const SSL_CIPHER_ATTRIBUTES: &[&str] = &[
     "AES256-GCM-SHA384",
     "AES256-SHA256",
     "AES256-SHA",
-    "DHE-RSA-AES128-SHA",
     "DHE-DSS-AES128-SHA",
     "CAMELLIA128-SHA",
     "EDH-RSA-DES-CBC3-SHA",

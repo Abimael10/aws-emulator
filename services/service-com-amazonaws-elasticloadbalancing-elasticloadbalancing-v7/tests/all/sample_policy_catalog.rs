@@ -22,6 +22,10 @@
 //! * each configuration reports the protocols and cipher suites ITS publication enables,
 //!   which is what the per-row table below checks on policies and ciphers the issue that
 //!   filed this did not cite.
+//! * every description reports that attribute set in the ONE published order, whichever
+//!   policy it describes, whatever that policy enables and however the request selects it:
+//!   the published positions of the ephemeral-Diffie-Hellman rows among the ECDHE/AES rows
+//!   included, since `PolicyAttributeDescriptions` is a list a caller may read by index.
 
 use super::wire::{call, emulator, error_message, param, Wire};
 use service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::state::{
@@ -77,6 +81,7 @@ const PUBLISHED_ATTRIBUTE_NAMES: &[&str] = &[
     "ECDHE-RSA-AES128-SHA256",
     "ECDHE-ECDSA-AES128-SHA",
     "ECDHE-RSA-AES128-SHA",
+    "DHE-RSA-AES128-SHA",
     "ECDHE-ECDSA-AES256-GCM-SHA384",
     "ECDHE-RSA-AES256-GCM-SHA384",
     "ECDHE-ECDSA-AES256-SHA384",
@@ -89,7 +94,6 @@ const PUBLISHED_ATTRIBUTE_NAMES: &[&str] = &[
     "AES256-GCM-SHA384",
     "AES256-SHA256",
     "AES256-SHA",
-    "DHE-RSA-AES128-SHA",
     "DHE-DSS-AES128-SHA",
     "CAMELLIA128-SHA",
     "EDH-RSA-DES-CBC3-SHA",
@@ -119,6 +123,21 @@ impl Reported {
             .iter()
             .find(|(name, _)| name == attribute)
             .map(|(_, value)| value.as_deref().unwrap_or_default())
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the description carries no {attribute:?} attribute, got {:?}",
+                    self.policy_name, self.attribute_names
+                )
+            })
+    }
+
+    /// The POSITION this description reported the attribute named `attribute` at, failing
+    /// the test when the description left the attribute out. `PolicyAttributeDescriptions`
+    /// is a list, so a position is part of what a caller reads.
+    fn position(&self, attribute: &str) -> usize {
+        self.attribute_names
+            .iter()
+            .position(|name| name == attribute)
             .unwrap_or_else(|| {
                 panic!(
                     "case {:?}: the description carries no {attribute:?} attribute, got {:?}",
@@ -556,4 +575,128 @@ async fn policy_names_selects_from_the_catalog_and_a_name_outside_it_is_refused(
         catalog,
         "the catalog must answer the same on every describe"
     );
+}
+
+/// Attributes the published table lists NEXT to one another, in that order.
+///
+/// Every description carries the whole attribute set, so each pair below must land at
+/// adjacent positions in every `PolicyAttributeDescriptions` list. The rows span the kinds
+/// of neighbour the table has — two protocol rows, the server cipher-order row against the
+/// protocol row before it and the first cipher row after it, the ephemeral-Diffie-Hellman
+/// rows between the ECDHE/AES rows that surround them, and neighbours among the legacy
+/// cipher rows the issue that filed this did not cite.
+///
+/// Source: the predefined-SSL-security-policy table of the Classic Load Balancer
+/// documentation, whose rows are the attributes of the SSL negotiation policy type.
+const PUBLISHED_NEIGHBOURS: &[(&str, &str)] = &[
+    ("Protocol-TLSv1", "Protocol-SSLv3"),
+    ("Protocol-TLSv1.1", "Protocol-TLSv1.2"),
+    ("Protocol-TLSv1.2", SERVER_DEFINED_CIPHER_ORDER_ATTRIBUTE),
+    (
+        SERVER_DEFINED_CIPHER_ORDER_ATTRIBUTE,
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+    ),
+    ("ECDHE-ECDSA-AES128-SHA256", "ECDHE-RSA-AES128-SHA256"),
+    // The ephemeral-Diffie-Hellman rows sit among the ECDHE/AES rows, not after them.
+    ("ECDHE-RSA-AES128-SHA", "DHE-RSA-AES128-SHA"),
+    ("DHE-RSA-AES128-SHA", "ECDHE-ECDSA-AES256-GCM-SHA384"),
+    ("AES256-SHA", "DHE-DSS-AES128-SHA"),
+    ("DHE-DSS-AES128-SHA", "CAMELLIA128-SHA"),
+    // The legacy rows the table lists after Camellia.
+    ("CAMELLIA128-SHA", "EDH-RSA-DES-CBC3-SHA"),
+    ("EDH-RSA-DES-CBC3-SHA", "DES-CBC3-SHA"),
+    ("DES-CBC3-SHA", "ECDHE-RSA-RC4-SHA"),
+    ("ECDHE-RSA-RC4-SHA", "RC4-SHA"),
+    ("ECDHE-ECDSA-RC4-SHA", "RC4-MD5"),
+];
+
+#[tokio::test]
+async fn the_attribute_set_is_reported_at_its_published_positions() {
+    let router = emulator();
+    let catalog = whole_catalog(&router).await;
+
+    for policy in &catalog {
+        for (earlier, later) in PUBLISHED_NEIGHBOURS {
+            let before = policy.position(earlier);
+            let after = policy.position(later);
+            assert_eq!(
+                after,
+                before + 1,
+                "case ({:?}, {earlier:?} then {later:?}): the published table lists them \
+                 next to each other, got positions {before} and {after} in {:?}",
+                policy.policy_name,
+                policy.attribute_names
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_published_order_does_not_follow_the_policy_or_the_request() {
+    let router = emulator();
+    let catalog = whole_catalog(&router).await;
+    let published: Vec<String> = PUBLISHED_ATTRIBUTE_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+
+    // The order is the policy TYPE's, so it cannot follow what a configuration enables: the
+    // rows below differ in how many suites the policy turns on (the widest sample enables
+    // every published suite, the newest only the forward-secret and AES ones, the oldest
+    // neither) and in whether the request selects the policy alone or among others.
+    let selections: &[(&str, &[&str])] = &[
+        ("the whole catalog", &[]),
+        (
+            "the widest configuration alone",
+            &["ELBSample-OpenSSLDefaultCipherPolicy"],
+        ),
+        (
+            "the newest configuration alone",
+            &["ELBSample-ELBSecurityPolicy-2016-08"],
+        ),
+        (
+            "the oldest configuration alone",
+            &["ELBSample-ELBSecurityPolicy-2011-08"],
+        ),
+        (
+            "the widest and the newest together",
+            &[
+                "ELBSample-OpenSSLDefaultCipherPolicy",
+                "ELBSample-ELBSecurityPolicy-2016-08",
+            ],
+        ),
+    ];
+
+    for (case, names) in selections {
+        let answer = describe_samples(&router, REGION, names).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the sample describe must succeed, got {}",
+            answer.body
+        );
+        let selected = reported(&answer);
+        assert!(
+            !selected.is_empty(),
+            "case {case:?}: the selection must report at least one policy, got {}",
+            answer.body
+        );
+        for policy in &selected {
+            assert_eq!(
+                policy.attribute_names, published,
+                "case ({case:?}, {:?}): the attribute set must be reported in the published \
+                 order, got {:?}",
+                policy.policy_name, policy.attribute_names
+            );
+        }
+    }
+
+    // Reported at the same positions by the unfiltered describe, so no selection reorders
+    // the list a caller reads by index.
+    for policy in &catalog {
+        assert_eq!(
+            policy.attribute_names, published,
+            "case {:?}: the whole catalog must report the published order too, got {:?}",
+            policy.policy_name, policy.attribute_names
+        );
+    }
 }
