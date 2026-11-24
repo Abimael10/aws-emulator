@@ -365,6 +365,12 @@ pub use step_records::*;
 /// re-exported the same way.
 mod step_failure_actions;
 mod instance_group_record;
+
+/// What a cluster that is already running may be given on top of the instance groups it was
+/// launched with ([`added_instance_groups`]), split out of this root as its own concern and
+/// re-exported the same way.
+mod added_instance_groups;
+pub use added_instance_groups::*;
 pub use step_failure_actions::*;
 pub use release_catalog::*;
 pub use spark_releases::*;
@@ -3071,8 +3077,8 @@ pub struct ClusterRecord {
     /// The instance groups this cluster carries, in the order they were created: the
     /// ones `RunJobFlow` was given (or the ones its `MasterInstanceType` /
     /// `SlaveInstanceType` / `InstanceCount` imply — see
-    /// [`implied_instance_group_configs`]), and then every `AddInstanceGroups`, which is
-    /// still a scaffold stub under its own issue. `ListInstanceGroups` projects these.
+    /// [`implied_instance_group_configs`]), and then every `AddInstanceGroups`.
+    /// `ListInstanceGroups` projects these.
     pub groups: Vec<InstanceGroupRecord>,
     /// The DNS name of this cluster's master node, decided when the cluster was launched
     /// ([`master_dns_name`]) and reported once the clock has brought that node up

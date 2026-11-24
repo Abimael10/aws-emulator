@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddInstanceGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddInstanceGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddInstanceGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends one [`crate::state::InstanceGroupRecord`] per submitted `InstanceGroupConfig`
+//! to the cluster the request names, each under the instance group id EMR mints for it,
+//! and answers with those ids, the job flow id and the cluster's ARN. The Amazon EC2
+//! instances the added groups ask for are then provisioned in the service that owns
+//! instances ([`crate::state::settle_cluster_capacity`]), so `ListInstanceGroups` and
+//! `ListInstances` report what was really added. A job flow id this service resolves no
+//! cluster for, a cluster that is shutting down or gone, a cluster whose instances are
+//! instance FLEETS, a role the cluster already carries its single group of, an instance
+//! type the cluster's release does not offer and a configuration past the bounds a group
+//! is held to are each refused with the 400 `ValidationException` channel — this
+//! operation models no client error of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +145,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddInstanceGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddInstanceGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            cluster_state, instance_collection_type, InstanceGroupRecord,
+            MAX_INSTANCE_GROUPS_PER_CLUSTER,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The Region this request was signed for, which is where the added groups'
+        // instances are launched: a cluster's instances live in the Region its endpoint
+        // answers on.
+        let region = crate::state::request_region(ctx.parts());
+
+        // This operation models no client error, so every request it must refuse is
+        // answered with the 400 `ValidationException` channel rather than a 501 or an
+        // empty 200.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddInstanceGroups"))
+        // The SHAPE of the job flow id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller has
+        // to fix — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.job_flow_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.job_flow_id),
+            ));
+        }
+
+        // "Instance groups to add" (`AddInstanceGroupsInput$InstanceGroups` doc): the
+        // member is required and the model bounds its length nowhere, so a list that
+        // arrives EMPTY names nothing to add and is refused rather than answered as an
+        // addition that happened.
+        if input.instance_groups.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::empty_instance_group_list_message(),
+            ));
+        }
+
+        // Bounded before the store is touched: one cluster carries at most
+        // `MAX_INSTANCE_GROUPS_PER_CLUSTER` groups, so a longer list cannot be added to any
+        // cluster whatever that cluster already holds, and the walks below are capped by
+        // the same number.
+        if input.instance_groups.len() > MAX_INSTANCE_GROUPS_PER_CLUSTER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "InstanceGroups names {} instance groups; a cluster carries at most \
+                 {MAX_INSTANCE_GROUPS_PER_CLUSTER}",
+                input.instance_groups.len()
+            )));
+        }
+
+        // An added group is the same `InstanceGroupConfig` a launch states its capacity in,
+        // so it is held to the same bounds every path that persists one holds it to
+        // ([`crate::state::validate_instance_group_config`]) and its configuration tree to
+        // the same reading of which classification Amazon EMR applies where
+        // ([`crate::state::launch_classification_refusal`]).
+        for config in &input.instance_groups {
+            if let Err(message) = crate::state::validate_instance_group_config(config) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
+        if let Some(message) =
+            crate::state::launch_classification_refusal(&[], &input.instance_groups, &[])
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddInstanceGroupsErrorModeled::InternalServerError(InternalServerError {}).into(),
+            );
+        };
+
+        // Everything this call writes to the store happens inside this block, so the
+        // store's guard is out of scope — whichever branch was taken — before the capacity
+        // settling below is awaited: a call into another service is never made while this
+        // service's guard is held.
+        let (cluster_arn, group_ids) = {
+            let mut store = state.lock();
+
+            // Adding capacity changes this cluster, so every transition the clock already
+            // made due is materialised before the addition is judged — `cluster_mut` is
+            // what does that.
+            //
+            // `AddInstanceGroups` reaches the cluster as a JOB FLOW — "job flow in which to
+            // add the instance groups" (`AddInstanceGroupsInput$JobFlowId` doc) — and that
+            // surface words its unknown-id refusal without naming the id.
+            let Some(cluster) = store.cluster_mut(&input.job_flow_id, now) else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::unknown_job_flow_message(),
+                ));
+            };
+            let cluster_arn = cluster.arn.clone();
+            let cluster_state_now = cluster.status.state.clone();
+            let collection_type = cluster.instances.instance_collection_type.clone();
+            let release_label = cluster.release_label.clone();
+            let held_groups = cluster.groups.len();
+            let role_refusal = crate::state::added_instance_group_role_refusal(
+                &cluster.groups,
+                &input.instance_groups,
+            );
+
+            // "Adds one or more instance groups to a RUNNING cluster" (this operation's
+            // doc): a cluster that is shutting down or gone releases its whole capacity
+            // rather than provisioning any, so there is nothing to add capacity to. The
+            // sentence the legacy job-flow surface states that with is CONSTANT.
+            if !cluster_state::ACTIVE.contains(&cluster_state_now.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::job_flow_not_modifiable_message(),
+                ));
+            }
+
+            // A cluster is launched with instance groups or with instance fleets, never
+            // both ("the RunJobFlow request can contain InstanceFleets parameters or
+            // InstanceGroups parameters, but not both"), so an instance group cannot be
+            // added to a cluster whose instances are fleets — the same exclusion
+            // `AddInstanceFleet` holds the other way round.
+            if collection_type != instance_collection_type::INSTANCE_GROUP {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Cluster '{}' uses instance fleets, so an instance group cannot be \
+                     added to it.",
+                    input.job_flow_id
+                )));
+            }
+
+            // One cluster carries a bounded number of instance groups, so this entry point
+            // cannot grow one cluster's group list past the ceiling a launch is held to
+            // either.
+            if held_groups.saturating_add(input.instance_groups.len())
+                > MAX_INSTANCE_GROUPS_PER_CLUSTER
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Cluster '{}' already carries {held_groups} instance groups; a cluster \
+                     carries at most {MAX_INSTANCE_GROUPS_PER_CLUSTER}.",
+                    input.job_flow_id
+                )));
+            }
+
+            // WHICH roles this cluster can still be given a group of, read off the groups
+            // it already carries ([`crate::state::added_instance_group_role_refusal`]): the
+            // primary node and the file system each live in a single group.
+            if let Some(message) = role_refusal {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+
+            // The RELEASE the cluster is already running decides which Amazon EC2 instance
+            // types its capacity can be provisioned from, so every instance type the
+            // addition names is resolved against that release — against the same catalog
+            // `ListSupportedInstanceTypes` answers from, and with the same sentence a
+            // launch against that release earns. A cluster that names no release label
+            // names no release to resolve against, the way a launch that named none does
+            // not.
+            if let Some(label) = release_label.as_deref() {
+                if let Some(release) = crate::state::catalog_release(label) {
+                    if let Some(instance_type) = crate::state::unsupported_added_instance_type(
+                        release,
+                        &input.instance_groups,
+                    ) {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::unsupported_instance_type_message(&instance_type, label),
+                        ));
+                    }
+                }
+            }
+
+            // One InstanceGroupRecord per submitted config, in request order, each under
+            // the id EMR minted for it: the same records `RunJobFlow` appends for the
+            // groups a launch carried, so `ListInstanceGroups` projects both the same way.
+            // The ids are minted off the store itself, which is why the cluster is reached
+            // again through the map's own lookup rather than through the borrow above.
+            let mut group_ids = Vec::with_capacity(input.instance_groups.len());
+            for _ in 0..input.instance_groups.len() {
+                group_ids.push(store.mint_instance_group_id());
+            }
+            let Some(cluster) = store.clusters.get_mut(&input.job_flow_id) else {
+                return Err(
+                    AddInstanceGroupsErrorModeled::InternalServerError(InternalServerError {})
+                        .into(),
+                );
+            };
+            for (group_id, config) in group_ids.iter().cloned().zip(input.instance_groups) {
+                cluster
+                    .groups
+                    .push(InstanceGroupRecord::from_config(group_id, config, now));
+            }
+            drop(store);
+            (cluster_arn, group_ids)
+        };
+
+        // "The target number of instances for the instance group"
+        // (`InstanceGroupConfig$InstanceCount` doc) is what each added group now asks for,
+        // so the cluster is provisioned up to it in the service that OWNS instances — the
+        // one settling of capacity every target move of this service goes through
+        // ([`crate::state::settle_cluster_capacity`]), made with no store guard held.
+        crate::state::settle_cluster_capacity(&*self.engine, ctx, &region, &input.job_flow_id, now)
+            .await;
+
+        Ok(AddInstanceGroupsOutput {
+            job_flow_id: Some(input.job_flow_id),
+            instance_group_ids: Some(group_ids),
+            cluster_arn: Some(cluster_arn),
+        })
     }
 }
