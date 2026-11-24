@@ -54,6 +54,12 @@ use crate::api_lifecycle::{as_str, call, emulator, error_code, REGION};
 /// value" (`ExportApi$Specification`).
 pub(crate) const OAS30: &str = "OAS30";
 
+/// The sentence an export naming a specification this operation does not serve is refused
+/// with — fixed text that quotes nothing out of the request, so every unsupported spelling
+/// gets it. Asserted over a table of its own in `crate::api_export_published_server`.
+pub(crate) const UNSUPPORTED_SPECIFICATION_MESSAGE: &str =
+    "Invalid export type detected. Currently, the only specification version is OAS30";
+
 /// The document-level extensions and the operation-level one an export carries, each named
 /// as this service's own definition reader reads it.
 const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
@@ -1166,7 +1172,7 @@ async fn an_export_request_outside_what_the_operation_serves_is_refused() {
             "OAS31?outputType=JSON".to_string(),
             400,
             "BadRequestException",
-            "Invalid value for Specification: 'OAS31'. Valid values are: OAS30.".to_string(),
+            UNSUPPORTED_SPECIFICATION_MESSAGE.to_string(),
         ),
         (
             "the one specification it serves, spelled in lower case",
@@ -1174,7 +1180,7 @@ async fn an_export_request_outside_what_the_operation_serves_is_refused() {
             "oas30?outputType=JSON".to_string(),
             400,
             "BadRequestException",
-            "Invalid value for Specification: 'oas30'. Valid values are: OAS30.".to_string(),
+            UNSUPPORTED_SPECIFICATION_MESSAGE.to_string(),
         ),
         (
             "an output type this operation does not serve",

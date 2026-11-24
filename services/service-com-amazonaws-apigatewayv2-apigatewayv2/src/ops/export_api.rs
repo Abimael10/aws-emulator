@@ -173,11 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specification, an output type or an export version this service does not serve
         // describes no export at all.
         if input.specification != OAS30_SPECIFICATION {
-            return Err(bad_request(format!(
-                "Invalid value for Specification: '{}'. Valid values are: \
-                 {OAS30_SPECIFICATION}.",
-                input.specification
-            )));
+            return Err(bad_request(unsupported_specification_message()));
         }
         if !OUTPUT_TYPE_VALUES.contains(&input.output_type.as_str()) {
             // API Gateway words this refusal in the member's OWN terms: it states the
@@ -296,6 +292,21 @@ fn not_found(message: String) -> ExportApiError {
 /// The one `Specification` this operation serves: "OAS30, for OpenAPI 3.0, is the only
 /// supported value" (`ExportApi$Specification`).
 const OAS30_SPECIFICATION: &str = "OAS30";
+
+/// What a request naming a `Specification` this operation does not serve is refused with.
+///
+/// API Gateway states one sentence for that refusal, whichever unsupported value was asked
+/// for: it names the kind of value that was wrong and the one specification version an export
+/// is written in, and it quotes NOTHING out of the request — so every spelling outside the
+/// one served value, a near miss and the served value in another case included, is refused
+/// with the same text. The version it names is [`OAS30_SPECIFICATION`] itself, the one this
+/// operation serves, so the sentence cannot drift from what the catalog admits.
+fn unsupported_specification_message() -> String {
+    format!(
+        "Invalid export type detected. Currently, the only specification version is \
+         {OAS30_SPECIFICATION}"
+    )
+}
 
 /// The version an exported OAS30 document DECLARES (`openapi`, the member every OpenAPI 3
 /// document carries): the OpenAPI 3.0 patch release this exporter writes. Within 3.0, so
@@ -499,8 +510,14 @@ const EXPORTED_VERSION_ZONE: &str = "UTC";
 /// The document's one Server Object: the address the exported configuration is CALLED at,
 /// templated by the base path it is served under.
 ///
-/// The url is the api's own endpoint followed by the [`BASE_PATH_VARIABLE`] template, and
-/// that variable's default is the base path THIS export is of: "The stage name is typically
+/// The url is the api's own PUBLISHED endpoint ([`crate::state::Api::api_endpoint`], the one
+/// address this api announces for a caller to invoke it at) followed by the
+/// [`BASE_PATH_VARIABLE`] template. A Server Object's url is an address a reader of the
+/// document DIALS — an OpenAPI client or code generator calls the api there — so it is the
+/// same value `Api$ApiEndpoint` reports rather than a second address written here: whichever
+/// endpoint a caller reaches this emulator at, the document and the member agree.
+///
+/// That variable's default is the base path THIS export is of: "The stage name is typically
 /// appended to this URI to form a complete path to a deployed API stage"
 /// (`Api$ApiEndpoint`), so a named stage's export carries its name there, while the stage
 /// that serves the api's root ([`crate::state::DEFAULT_STAGE_NAME`]) and the api's latest
