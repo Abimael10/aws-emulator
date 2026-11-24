@@ -176,36 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // The same two refusals `TagResource` answers, for the same reason: a
-        // managed view's tags are not the customer's to read through this API.
-        if state
-            .billing_views
-            .get(&input.resource_arn)
-            .is_some_and(crate::state::BillingView::is_managed)
-        {
-            return Err(ListTagsForResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::MANAGED_VIEW_NOT_TAGGABLE.to_string(),
-                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "resourceArn".to_string(),
-                        message: crate::state::MANAGED_VIEW_NOT_TAGGABLE.to_string(),
-                    }]),
-                },
-            )
-            .into());
-        }
-
-        let view = state.billing_views.get(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // The same fixed sentence `TagResource` answers: the tagging
-                // APIs do not echo the requested ARN into the message, only into
-                // `resourceId`.
-                message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                resource_id: input.resource_arn.clone(),
-                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-            })
-        })?;
+        // The same two refusals `TagResource` and `UntagResource` answer, taken
+        // by the same decision in `crate::state`: a managed view's tags are not
+        // the customer's to read through this API, and an ARN naming no stored
+        // resource does not exist. Lifted here into the modeled errors THIS
+        // operation declares.
+        let view = state
+            .tagging_target(&input.resource_arn)
+            .map_err(|refusal| -> ListTagsForResourceError {
+                match refusal {
+                    crate::state::TaggingRefusal::Managed(why) => {
+                        ListTagsForResourceErrorModeled::ValidationException(why).into()
+                    }
+                    crate::state::TaggingRefusal::Absent(missing) => {
+                        ListTagsForResourceErrorModeled::ResourceNotFoundException(missing).into()
+                    }
+                }
+            })?;
 
         // `tags` is a BTreeMap, so the list is in key order on every read and a
         // caller comparing two responses sees a difference only where one is.

@@ -192,34 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // A managed view's tags are the service's own, so it is not taggable
-        // whether or not the request is otherwise well formed: see
-        // `BillingView::is_managed`. This is decided before the request's tags
-        // are looked at so that neither refusal depends on the other.
-        if state
-            .billing_views
-            .get(&input.resource_arn)
-            .is_some_and(crate::state::BillingView::is_managed)
-        {
-            return Err(invalid_field(
-                "resourceArn",
-                crate::state::MANAGED_VIEW_NOT_TAGGABLE,
-            ));
-        }
-
-        let Some(view) = state.billing_views.get_mut(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // The tagging APIs answer a FIXED sentence here: the ARN the
-                    // request carried is reported in `resourceId`, the member the
-                    // model has for it, and not echoed into the message.
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
-        };
+        // Which resources are taggable is the tagging plane's one decision,
+        // taken in `crate::state` for all three of its operations: a managed
+        // view's tags are the service's own, so it is not taggable whether or
+        // not the request is otherwise well formed, and an ARN naming no stored
+        // resource does not exist. Decided before the request's tags are looked
+        // at, so neither refusal depends on the other, and lifted here into the
+        // modeled errors THIS operation declares.
+        let view = state
+            .tagging_target_mut(&input.resource_arn)
+            .map_err(|refusal| -> TagResourceError {
+                match refusal {
+                    crate::state::TaggingRefusal::Managed(why) => {
+                        TagResourceErrorModeled::ValidationException(why).into()
+                    }
+                    crate::state::TaggingRefusal::Absent(missing) => {
+                        TagResourceErrorModeled::ResourceNotFoundException(missing).into()
+                    }
+                }
+            })?;
 
         // A tag set is keyed by key, so one request may not carry a key twice:
         // the two entries would decide the stored value by arrival order. The

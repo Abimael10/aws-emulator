@@ -129,20 +129,6 @@ pub struct UntagResource<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
-/// Refuse a request member as invalid, in the modeled `ValidationException`
-/// shape (HTTP 400) this operation declares.
-fn invalid_field(member: &str, why: &str) -> UntagResourceError {
-    UntagResourceErrorModeled::ValidationException(ValidationException {
-        message: why.to_string(),
-        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: why.to_string(),
-        }]),
-    })
-    .into()
-}
-
 impl<Eng> UntagResource<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -194,34 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // The same two refusals the other tagging operations answer, for the same
-        // reason: a managed view's tags are the service's own, not the customer's
-        // to remove. Decided before the request's keys are looked at, so neither
-        // refusal depends on the other.
-        if state
-            .billing_views
-            .get(&input.resource_arn)
-            .is_some_and(crate::state::BillingView::is_managed)
-        {
-            return Err(invalid_field(
-                "resourceArn",
-                crate::state::MANAGED_VIEW_NOT_TAGGABLE,
-            ));
-        }
-
-        let Some(view) = state.billing_views.get_mut(&input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // The fixed sentence the tagging APIs answer: the ARN the
-                    // request carried is reported in `resourceId`, the member the
-                    // model has for it, and not echoed into the message.
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: input.resource_arn.clone(),
-                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-                },
-            )
-            .into());
-        };
+        // The same two refusals the other tagging operations answer, taken by
+        // the same decision in `crate::state`, for the same reason: a managed
+        // view's tags are the service's own, not the customer's to remove, and
+        // an ARN naming no stored resource does not exist. Decided before the
+        // request's keys are looked at, so neither refusal depends on the other,
+        // and lifted here into the modeled errors THIS operation declares.
+        let view = state
+            .tagging_target_mut(&input.resource_arn)
+            .map_err(|refusal| -> UntagResourceError {
+                match refusal {
+                    crate::state::TaggingRefusal::Managed(why) => {
+                        UntagResourceErrorModeled::ValidationException(why).into()
+                    }
+                    crate::state::TaggingRefusal::Absent(missing) => {
+                        UntagResourceErrorModeled::ResourceNotFoundException(missing).into()
+                    }
+                }
+            })?;
 
         // A request names keys, not values, and removal shrinks the set — so,
         // unlike attaching a value, which `TagResource` refuses to decide by

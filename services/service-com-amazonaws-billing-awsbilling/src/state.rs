@@ -91,6 +91,11 @@ mod billing_view_segments;
 
 pub use billing_view_segments::*;
 
+/// The decision the tagging operations share about the resource an ARN names.
+mod tagging;
+
+pub use tagging::*;
+
 /// When each account of the billing family was linked and subscribed to
 /// Enterprise Support, which `ListEnterpriseSupportLinkedAccountCharges`
 /// prorates an account's spend by.
