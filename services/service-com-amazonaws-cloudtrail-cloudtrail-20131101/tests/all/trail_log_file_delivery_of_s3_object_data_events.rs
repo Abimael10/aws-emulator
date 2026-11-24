@@ -999,3 +999,388 @@ async fn an_object_selector_admits_what_its_own_fields_say_it_does() {
         );
     }
 }
+
+/// One advanced event selector of the object data events of ONE bucket, whose `resources.ARN`
+/// statement is `arn_statement` — the one statement a row varies.
+fn object_selector_with(name: &str, arn_statement: Value) -> Value {
+    json!([{
+        "Name": name,
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": [DATA_CATEGORY]},
+            {"Field": "resources.type", "Equals": [OBJECT_RESOURCE_TYPE]},
+            arn_statement,
+        ],
+    }])
+}
+
+/// Point a trail at `bucket` under `key_prefix`, install `selectors` on it ADDRESSED BY ITS OWN
+/// ARN, read them back and start it logging — the five calls a client installs such a
+/// configuration with, each of which must be served.
+///
+/// Addressing the trail by the ARN `CreateTrail` answered, and reading the selectors back, is
+/// what a client does before it relies on them: a field selector carrying two operators has to
+/// round-trip unchanged, or what the trail then delivers is not what the client asked for.
+async fn logging_trail_by_arn(
+    emulator: &Emulator,
+    trail: &str,
+    bucket: &str,
+    key_prefix: &str,
+    selectors: &Value,
+) {
+    let created = emulator
+        .cloudtrail(
+            "setup",
+            "CreateTrail",
+            &json!({
+                "Name": trail,
+                "S3BucketName": bucket,
+                "S3KeyPrefix": key_prefix,
+                "IsMultiRegionTrail": false,
+                "IncludeGlobalServiceEvents": false,
+            }),
+        )
+        .await;
+    let trail_arn = text(&created.body, "TrailARN");
+    assert!(
+        !trail_arn.is_empty(),
+        "setup: CreateTrail must answer the trail's ARN, got {}",
+        created.body
+    );
+    let installed = emulator
+        .cloudtrail(
+            "setup",
+            "PutEventSelectors",
+            &json!({"TrailName": trail_arn, "AdvancedEventSelectors": selectors}),
+        )
+        .await;
+    assert_eq!(
+        installed.body.get("AdvancedEventSelectors"),
+        Some(selectors),
+        "setup: PutEventSelectors must echo the selectors as submitted, got {}",
+        installed.body
+    );
+    let read = emulator
+        .cloudtrail(
+            "setup",
+            "GetEventSelectors",
+            &json!({"TrailName": trail_arn}),
+        )
+        .await;
+    assert_eq!(
+        read.body.get("AdvancedEventSelectors"),
+        Some(selectors),
+        "setup: GetEventSelectors must report the selectors as submitted, got {}",
+        read.body
+    );
+    emulator
+        .cloudtrail("setup", "StartLogging", &json!({"Name": trail_arn}))
+        .await;
+    let status = emulator
+        .cloudtrail("setup", "GetTrailStatus", &json!({"Name": trail_arn}))
+        .await;
+    assert_eq!(
+        status.body.get("IsLogging"),
+        Some(&json!(true)),
+        "setup: expected the trail to report itself logging, got {}",
+        status.body
+    );
+}
+
+/// One object call of a row, and what the two trails must deliver for it.
+struct Narrowed {
+    case: &'static str,
+    /// The operation the call reaches, which is also the `eventName` of its record.
+    operation: &'static str,
+    /// The key the call addressed, which the record carries and whose object ARN is the
+    /// resource the record names.
+    key: String,
+    /// Whether the call only REPORTED state, which the record carries as `readOnly`.
+    read_only: bool,
+    /// Whether the trail whose field selector carries the NEGATIVE operator delivers it. The
+    /// control trail, carrying only the positive one, delivers every call of the row.
+    admitted: bool,
+    /// The id the caller was answered under, which joins the record to this call.
+    request_id: String,
+}
+
+/// Assert that the trail delivering under `key_prefix` delivered exactly the calls it admits —
+/// every call of `calls` for the control leg, and only the admitted ones when
+/// `only_admitted` — and that each delivered record is the record of its own call.
+async fn assert_delivered(
+    emulator: &Emulator,
+    case: &str,
+    leg: &str,
+    buckets: (&str, &str),
+    key_prefix: &str,
+    calls: &[Narrowed],
+    only_admitted: bool,
+) {
+    let (log_bucket, data_bucket) = buckets;
+    let prefix = delivery_prefix(key_prefix);
+    let delivered = emulator.delivered_object_records(log_bucket, &prefix).await;
+    for call in calls {
+        let expected = !only_admitted || call.admitted;
+        let matching: Vec<&(String, Value)> = delivered
+            .iter()
+            .filter(|(_, record)| text(record, "requestID") == call.request_id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            usize::from(expected),
+            "case {case:?}, {leg} trail, call {:?}: expected {} delivered record(s) of the \
+             call answered as {:?}, got {} among records of {:?}",
+            call.case,
+            usize::from(expected),
+            call.request_id,
+            matching.len(),
+            delivered
+                .iter()
+                .map(|(_, record)| (
+                    text(record, "eventName"),
+                    text(
+                        record.get("requestParameters").unwrap_or(&Value::Null),
+                        "key"
+                    )
+                ))
+                .collect::<Vec<(String, String)>>()
+        );
+        if !expected {
+            continue;
+        }
+        let (key, record) = matching[0];
+        assert_eq!(
+            (
+                text(record, "eventName").as_str(),
+                text(record, "eventSource").as_str(),
+                text(record, "eventCategory").as_str(),
+            ),
+            (call.operation, S3_EVENT_SOURCE, DATA_CATEGORY),
+            "case {case:?}, {leg} trail, call {:?}: expected the data record of {} by \
+             {S3_EVENT_SOURCE}, got {record}",
+            call.case,
+            call.operation
+        );
+        assert_eq!(
+            record.get("readOnly"),
+            Some(&json!(call.read_only)),
+            "case {case:?}, {leg} trail, call {:?}: expected readOnly == {}, got {record}",
+            call.case,
+            call.read_only
+        );
+        assert_eq!(
+            (
+                record.pointer("/resources/0/type"),
+                record.pointer("/resources/0/ARN"),
+                record.pointer("/resources/1"),
+            ),
+            (
+                Some(&json!(OBJECT_RESOURCE_TYPE)),
+                Some(&json!(object_arn(data_bucket, &call.key))),
+                None,
+            ),
+            "case {case:?}, {leg} trail, call {:?}: expected exactly the one object the call \
+             acted on as the record's resource, got {record}",
+            call.case
+        );
+        assert_eq!(
+            (
+                record.pointer("/requestParameters/bucketName"),
+                record.pointer("/requestParameters/key"),
+            ),
+            (
+                Some(&json!(data_bucket)),
+                Some(&json!(call.key.clone())),
+            ),
+            "case {case:?}, {leg} trail, call {:?}: expected the address the call named, got \
+             {record}",
+            call.case
+        );
+        assert!(
+            key.starts_with(&prefix) && key.ends_with(LOG_FILE_SUFFIX),
+            "case {case:?}, {leg} trail, call {:?}: expected the record under the trail's own \
+             prefix {prefix:?} in a {LOG_FILE_SUFFIX} file, got {key:?}",
+            call.case
+        );
+    }
+}
+
+/// RULE's sixth side: a NEGATIVE operator stated on the SAME field selector as the positive one
+/// it narrows EXCLUDES what it matches from what that positive admits — so a logging trail
+/// delivers the object calls inside its ARN scope MINUS the ones its exclusion names, and a
+/// trail carrying only the positive operator delivers both sides. Two trails of one account
+/// deliver into ONE bucket, each under its own `S3KeyPrefix`, so what arrived for one selector
+/// is never read as the other's.
+///
+/// The rows differ along WHICH exclusion the field selector carries — the three the model
+/// documents, for the first few characters of the field, its last few, and its exact value
+/// (`smithy_query(query="shape",shape="AdvancedFieldSelector")`: `NotStartsWith`, `NotEndsWith`
+/// and `NotEquals` are "an operator that excludes events that match the first few characters /
+/// the last few characters / the exact value of the event record field specified as the value of
+/// `Field`", and the same shape's `Field` notes that selectors support no wildcards, so these
+/// are the sanctioned way to name a set of objects) — and so along which object of one included
+/// bucket each one leaves out.
+#[tokio::test]
+async fn a_negative_operator_withholds_the_objects_it_names_from_an_included_bucket() {
+    // (case, the operator member, its operand over the bucket, the key that operand excludes)
+    type ExclusionRow = (&'static str, &'static str, fn(&str) -> String, &'static str);
+    let rows: Vec<ExclusionRow> = vec![
+        (
+            "a key prefix of the bucket left out",
+            "NotStartsWith",
+            |bucket| format!("arn:aws:s3:::{bucket}/excluded/"),
+            "excluded/report.csv",
+        ),
+        (
+            "a key suffix left out",
+            "NotEndsWith",
+            |_| ".tmp".to_string(),
+            "included/scratch.tmp",
+        ),
+        (
+            "one object left out by its whole ARN",
+            "NotEquals",
+            |bucket| format!("arn:aws:s3:::{bucket}/included/secret.csv"),
+            "included/secret.csv",
+        ),
+    ];
+
+    for (case, operator, operand, excluded_key) in rows {
+        let emulator = Emulator::new();
+        let (log_bucket, data_bucket) = ("arn-exclusion-trail-logs", "arn-exclusion-subject");
+        let (control_prefix, excluding_prefix) = ("obs/ctrl", "obs/excl");
+        emulator.log_bucket(log_bucket).await;
+        emulator.bucket(data_bucket).await;
+
+        let admitting = json!({
+            "Field": "resources.ARN",
+            "StartsWith": [format!("arn:aws:s3:::{data_bucket}/")],
+        });
+        let mut narrowing = admitting.clone();
+        narrowing[operator] = json!([operand(data_bucket)]);
+        logging_trail_by_arn(
+            &emulator,
+            "arn-exclusion-control",
+            log_bucket,
+            control_prefix,
+            &object_selector_with("all-objects-in-bucket", admitting),
+        )
+        .await;
+        logging_trail_by_arn(
+            &emulator,
+            "arn-exclusion-excluding",
+            log_bucket,
+            excluding_prefix,
+            &object_selector_with("objects-except-the-excluded-ones", narrowing),
+        )
+        .await;
+
+        // The calls of one round: the admitted object written and read, the excluded object
+        // written and read — so the excluded calls are as eligible for delivery as the rest —
+        // and a last write of an admitted object, which is what tells a withheld record from
+        // one that had not landed yet.
+        let admitted_key = "included/report.csv";
+        let barrier_key = "included/barrier.csv";
+        let mut calls: Vec<Narrowed> = Vec::new();
+        for (call_case, operation, method, key, read_only, admitted) in [
+            (
+                "a write inside the ARN scope",
+                "PutObject",
+                "PUT",
+                admitted_key,
+                false,
+                true,
+            ),
+            (
+                "a read inside the ARN scope",
+                "GetObject",
+                "GET",
+                admitted_key,
+                true,
+                true,
+            ),
+            (
+                "a write of the excluded object",
+                "PutObject",
+                "PUT",
+                excluded_key,
+                false,
+                false,
+            ),
+            (
+                "a read of the excluded object",
+                "GetObject",
+                "GET",
+                excluded_key,
+                true,
+                false,
+            ),
+            (
+                "the last write inside the ARN scope",
+                "PutObject",
+                "PUT",
+                barrier_key,
+                false,
+                true,
+            ),
+        ] {
+            let body = if read_only { "" } else { "ledger" };
+            let answered = emulator
+                .object_call(method, &format!("/{data_bucket}/{key}"), body)
+                .await;
+            assert_eq!(
+                answered.status, 200,
+                "case {case:?}, call {call_case:?}: expected HTTP 200 from the object call, \
+                 got {} with {}",
+                answered.status, answered.body
+            );
+            calls.push(Narrowed {
+                case: call_case,
+                operation,
+                key: key.to_string(),
+                read_only,
+                admitted,
+                request_id: answered.request_id,
+            });
+        }
+
+        assert_delivered(
+            &emulator,
+            case,
+            "control",
+            (log_bucket, data_bucket),
+            control_prefix,
+            &calls,
+            false,
+        )
+        .await;
+        assert_delivered(
+            &emulator,
+            case,
+            "excluding",
+            (log_bucket, data_bucket),
+            excluding_prefix,
+            &calls,
+            true,
+        )
+        .await;
+
+        // ...and nothing the exclusion names reached the excluding trail at all, whichever call
+        // addressed it: the leak a consumer of that prefix would read as an exclusion that does
+        // not hold.
+        let leaked: Vec<String> = emulator
+            .delivered_object_records(log_bucket, &delivery_prefix(excluding_prefix))
+            .await
+            .into_iter()
+            .filter(|(_, record)| {
+                record.pointer("/resources/0/ARN")
+                    == Some(&json!(object_arn(data_bucket, excluded_key)))
+            })
+            .map(|(_, record)| text(&record, "eventName"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "case {case:?}: expected the excluding trail to withhold every call on \
+             {excluded_key:?}, got the records of {leaked:?}"
+        );
+    }
+}
