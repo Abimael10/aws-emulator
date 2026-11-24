@@ -32,6 +32,15 @@
 //!    in the token their writers spelled report ONE `definitionHash`, because the digest is
 //!    taken over the canonical form of the document rather than over the token its writer
 //!    spelled (`automated_reasoning_policies.rs` pins the digest itself).
+//! 7. **The format token is one token on every revision**: the draft, the version cut from
+//!    it and the draft a re-import wrote all state it.
+//! 8. **The format token is the document FORMAT's and nothing else**: for policies that
+//!    have cut one, two, three and four versions, in more than one region, every revision
+//!    exports a document stating the one format version, while the member that does carry
+//!    the addressed revision's own resource version
+//!    (`GetAutomatedReasoningPolicy$version`: a number, or `DRAFT`) reports that — so the
+//!    format token is neither the revision number, nor the `:N` suffix of the ARN, nor the
+//!    region the policy lives in.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="ExportAutomatedReasoningPolicyVersion")`,
@@ -767,5 +776,237 @@ async fn the_exported_format_token_is_the_modelled_default_on_every_revision() {
              reported, got {:?}",
             reimported.body
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. The format token is the DOCUMENT format's and nothing else: not the addressed
+//    revision's own resource version, and not the region the policy lives in.
+// ---------------------------------------------------------------------------------------
+
+/// What `GetAutomatedReasoningPolicy` reports as the RESOURCE version of the working
+/// revision an unversioned ARN names — a different member from the definition document's
+/// format token, under the same name: `AutomatedReasoningPolicyVersion`
+/// (`^([1-9][0-9]{0,11})$`) for a numbered version and this for the draft, which
+/// `smithy_query(query="doc",shape="CreateAutomatedReasoningPolicyResponse",member="version")`
+/// documents as "The initial version is always DRAFT".
+const DRAFT_RESOURCE_VERSION: &str = "DRAFT";
+
+async fn create_policy_in_region(emu: &Emulator, region: &str, body: Value) -> Reply {
+    emu.call_in_region(region, "POST", "/automated-reasoning-policies", Some(body))
+        .await
+}
+
+async fn export_in_region(emu: &Emulator, region: &str, policy_arn: &str) -> Reply {
+    emu.call_in_region(
+        region,
+        "GET",
+        &format!(
+            "/automated-reasoning-policies/{}/export",
+            label(policy_arn)
+        ),
+        None,
+    )
+    .await
+}
+
+async fn get_policy_in_region(emu: &Emulator, region: &str, policy_arn: &str) -> Reply {
+    emu.call_in_region(
+        region,
+        "GET",
+        &format!("/automated-reasoning-policies/{}", label(policy_arn)),
+        None,
+    )
+    .await
+}
+
+async fn update_policy_in_region(
+    emu: &Emulator,
+    region: &str,
+    policy_arn: &str,
+    body: Value,
+) -> Reply {
+    emu.call_in_region(
+        region,
+        "PATCH",
+        &format!("/automated-reasoning-policies/{}", label(policy_arn)),
+        Some(body),
+    )
+    .await
+}
+
+async fn create_version_in_region(
+    emu: &Emulator,
+    region: &str,
+    policy_arn: &str,
+    definition_hash: &str,
+) -> Reply {
+    emu.call_in_region(
+        region,
+        "POST",
+        &format!(
+            "/automated-reasoning-policies/{}/versions",
+            label(policy_arn)
+        ),
+        Some(json!({ "lastUpdatedDefinitionHash": definition_hash })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_exported_definition_states_the_format_and_never_the_revisions_resource_version() {
+    // TWO members named `version` meet on this resource and mean different things, which is
+    // the confusion this pins: the definition document's
+    // `AutomatedReasoningPolicyDefinition$version` is the FORMAT the document is written in
+    // (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`: target
+    // `AutomatedReasoningPolicyFormatVersion`, a plain string, `@default("1")`), while
+    // `GetAutomatedReasoningPolicy`'s `version` is the addressed revision's own RESOURCE
+    // version (`AutomatedReasoningPolicyVersion`, `^([1-9][0-9]{0,11})$`, or `DRAFT`).
+    //
+    // Rows differ along how many versions the policy has cut — so the revisions addressed
+    // run past the first number, and a token taken from the revision number, from the `:N`
+    // suffix of the ARN, or from the count of versions cut cannot pass — and along the
+    // region the policy lives in, which the ARN of every revision carries.
+    struct Row {
+        case: &'static str,
+        region: &'static str,
+        cuts: u32,
+    }
+
+    let rows = [
+        Row {
+            case: "no version cut, the suites' region",
+            region: REGION,
+            cuts: 0,
+        },
+        Row {
+            case: "one version cut, the suites' region",
+            region: REGION,
+            cuts: 1,
+        },
+        Row {
+            case: "three versions cut, the suites' region",
+            region: REGION,
+            cuts: 3,
+        },
+        Row {
+            case: "two versions cut, another region",
+            region: "eu-west-1",
+            cuts: 2,
+        },
+        Row {
+            case: "four versions cut, another region",
+            region: "ap-southeast-2",
+            cuts: 4,
+        },
+    ];
+
+    let emu = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let (case, region) = (row.case, row.region);
+        let created = create_policy_in_region(
+            &emu,
+            region,
+            json!({
+                "name": format!("format token policy {index}"),
+                "policyDefinition": definition(&["types", "variables", "rules"], (1, 1, 1), true),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateAutomatedReasoningPolicy must answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        let policy_arn = created.text("policyArn");
+        assert!(
+            policy_arn.contains(region) && policy_arn.contains(ACCOUNT),
+            "case {case:?}: the policy must be minted in the region and account the request \
+             addressed, got {policy_arn:?}"
+        );
+        let mut draft_hash = created.text("definitionHash");
+
+        // Every cut freezes the draft as it stands, and the draft is rewritten between cuts,
+        // so the versions hold DIFFERENT definitions under one format.
+        for number in 1..=row.cuts {
+            let cut = create_version_in_region(&emu, region, &policy_arn, &draft_hash).await;
+            assert_eq!(
+                cut.status, 200,
+                "case {case:?} version {number}: CreateAutomatedReasoningPolicyVersion must \
+                 answer 200, got {} {:?}",
+                cut.status, cut.body
+            );
+            let rewritten = update_policy_in_region(
+                &emu,
+                region,
+                &policy_arn,
+                json!({
+                    "policyDefinition": definition(
+                        &["types", "variables", "rules"],
+                        (number as usize + 1, 1, number as usize),
+                        true,
+                    ),
+                }),
+            )
+            .await;
+            assert_eq!(
+                rewritten.status, 200,
+                "case {case:?} after version {number}: UpdateAutomatedReasoningPolicy must \
+                 answer 200, got {} {:?}",
+                rewritten.status, rewritten.body
+            );
+            draft_hash = rewritten.text("definitionHash");
+        }
+
+        // Every revision the export can be addressed by: each numbered version, and the
+        // draft the writes left behind.
+        let mut revisions: Vec<(String, String)> = (1..=row.cuts)
+            .map(|number| (format!("{policy_arn}:{number}"), number.to_string()))
+            .collect();
+        revisions.push((policy_arn.clone(), DRAFT_RESOURCE_VERSION.to_string()));
+
+        for (revision_arn, resource_version) in &revisions {
+            let exported = export_in_region(&emu, region, revision_arn).await;
+            assert_eq!(
+                exported.status, 200,
+                "case {case:?}/{revision_arn}: ExportAutomatedReasoningPolicyVersion must \
+                 answer 200, got {} {:?}",
+                exported.status, exported.body
+            );
+            assert_eq!(
+                exported.body.get("version").and_then(Value::as_str),
+                Some(DEFAULT_FORMAT_VERSION),
+                "case {case:?}/{revision_arn}: the exported definition must state the format \
+                 version this service writes definitions in ({DEFAULT_FORMAT_VERSION:?}), got \
+                 {:?}",
+                exported.body.get("version")
+            );
+
+            // And the member that DOES carry the revision's own version reports it, so the
+            // two are told apart rather than one standing in for the other.
+            let read = get_policy_in_region(&emu, region, revision_arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}/{revision_arn}: GetAutomatedReasoningPolicy must answer 200, \
+                 got {} {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.text("version"),
+                *resource_version,
+                "case {case:?}/{revision_arn}: the addressed revision's resource version must \
+                 be {resource_version:?}, got {:?}",
+                read.get("version")
+            );
+            if resource_version != DEFAULT_FORMAT_VERSION {
+                assert_ne!(
+                    exported.body.get("version").and_then(Value::as_str),
+                    Some(resource_version.as_str()),
+                    "case {case:?}/{revision_arn}: the exported definition's format token must \
+                     not be the revision's resource version {resource_version:?}, got {:?}",
+                    exported.body.get("version")
+                );
+            }
+        }
     }
 }
