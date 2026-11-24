@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP coverage of the Security Hub CSPM member association slice:
-//! `EnableSecurityHub` → `CreateMembers` → `GetMembers`.
+//! `EnableSecurityHub` → `CreateMembers` → `GetMembers`, and of the organization
+//! slice beside it: `EnableOrganizationAdminAccount` →
+//! `ListOrganizationAdminAccounts`.
 //!
 //! Every case drives the real restJson1 wire path through `MultiServiceRouter`, so a
 //! route, a status code or a serialized member that is wrong on the wire fails here.
@@ -26,6 +28,20 @@ const ADMINISTRATOR_ID: &str = "000000000000";
 /// administrator account added the member account, but has not yet invited the member
 /// account" (`smithy_query(query="shape", shape="Member")`, member `MemberStatus`).
 const STATUS_CREATED: &str = "Created";
+
+/// `AdminStatus$ENABLED`: the status of a designated delegated administrator
+/// (`smithy_query(query="shape", shape="AdminStatus")`).
+const ADMIN_STATUS_ENABLED: &str = "ENABLED";
+
+/// Every value of `SecurityHubFeature` (`smithy_query(query="shape",
+/// shape="SecurityHubFeature")`), plus the absent parameter, which "defaults to
+/// Security Hub CSPM" — the first value below.
+const SECURITY_HUB_FEATURES: [&str; 2] = ["SecurityHub", "SecurityHubV2"];
+
+/// `AdminsMaxResults`' published bounds: `@range(min: 1, max: 10)`
+/// (`smithy_query(query="operation", operation="ListOrganizationAdminAccounts")`).
+const ADMINS_MAX_RESULTS_MIN: usize = 1;
+const ADMINS_MAX_RESULTS_MAX: usize = 10;
 
 /// One emulator with the Security Hub service mounted, driven over HTTP.
 struct Harness {
@@ -109,6 +125,53 @@ impl Harness {
             "EnableSecurityHub must succeed, got {status} with {body}"
         );
         harness
+    }
+
+    /// One `EnableOrganizationAdminAccount` call. `Feature` is sent only when named,
+    /// so a row can exercise the documented default.
+    async fn enable_organization_admin_account(
+        &self,
+        region: &str,
+        admin_account_id: &str,
+        feature: Option<&str>,
+    ) -> (u16, Value) {
+        let body = match feature {
+            Some(feature) => {
+                json!({ "AdminAccountId": admin_account_id, "Feature": feature })
+            }
+            None => json!({ "AdminAccountId": admin_account_id }),
+        };
+        self.call("POST", "/organization/admin/enable", region, Some(body))
+            .await
+    }
+
+    /// One `ListOrganizationAdminAccounts` call. Every parameter is `@httpQuery`-bound
+    /// (`smithy_query(query="operation",
+    /// operation="ListOrganizationAdminAccounts")`), so each is sent on the query
+    /// string exactly as an SDK would.
+    async fn list_organization_admin_accounts(
+        &self,
+        region: &str,
+        feature: Option<&str>,
+        max_results: Option<usize>,
+        next_token: Option<&str>,
+    ) -> (u16, Value) {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(feature) = feature {
+            query.push(format!("Feature={feature}"));
+        }
+        if let Some(max_results) = max_results {
+            query.push(format!("MaxResults={max_results}"));
+        }
+        if let Some(next_token) = next_token {
+            query.push(format!("NextToken={next_token}"));
+        }
+        let path = if query.is_empty() {
+            "/organization/admin".to_string()
+        } else {
+            format!("/organization/admin?{}", query.join("&"))
+        };
+        self.call("GET", &path, region, None).await
     }
 }
 
@@ -678,4 +741,522 @@ async fn members_are_scoped_to_the_hub_that_created_them() {
              neither list, got {body}"
         );
     }
+}
+
+/// The `AdminAccounts` list of a `ListOrganizationAdminAccounts` response.
+fn admin_accounts_of(body: &Value) -> &Vec<Value> {
+    body["AdminAccounts"].as_array().unwrap_or_else(|| {
+        panic!("ListOrganizationAdminAccounts must answer an AdminAccounts list, got {body}")
+    })
+}
+
+/// RULE: `EnableOrganizationAdminAccount` designates the account it names as the
+/// organization's delegated administrator for the feature of the call (Security Hub
+/// CSPM when the call names none) in the Region it was signed for, and answers that
+/// designation; `ListOrganizationAdminAccounts` reports exactly the designation the
+/// same feature and Region holds, `ENABLED`, and nothing for any other feature or
+/// Region.
+///
+/// The table spans what the rule generalises over: the account designated, the feature
+/// (absent, so the documented default, and each value `SecurityHubFeature` declares)
+/// and the Region the call is signed for.
+#[tokio::test]
+async fn designating_an_organization_administrator_round_trips_per_feature_and_region() {
+    // Rows: the feature as the request carries it, and the feature the designation is
+    // therefore filed under.
+    let features = [
+        (None, SECURITY_HUB_FEATURES[0]),
+        (Some(SECURITY_HUB_FEATURES[0]), SECURITY_HUB_FEATURES[0]),
+        (Some(SECURITY_HUB_FEATURES[1]), SECURITY_HUB_FEATURES[1]),
+    ];
+
+    for (row, (requested, effective)) in features.iter().enumerate() {
+        for region in [REGION, OTHER_REGION] {
+            // A different account per row, so no row can pass on another's state.
+            let admin = account_id(row * 2 + usize::from(region == OTHER_REGION));
+            let case = format!("Feature={requested:?} in {region} for {admin}");
+            let harness = Harness::new();
+
+            let (status, body) = harness
+                .enable_organization_admin_account(region, &admin, *requested)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: EnableOrganizationAdminAccount expected 200, got {status} with \
+                 {body}"
+            );
+            assert_eq!(
+                body["AdminAccountId"].as_str(),
+                Some(admin.as_str()),
+                "case {case:?}: the response must name the designated account, got {body}"
+            );
+            assert_eq!(
+                body["Feature"].as_str(),
+                Some(*effective),
+                "case {case:?}: expected Feature {effective}, got {body}"
+            );
+
+            // The designation is read back through the operation that reports it.
+            let (status, body) = harness
+                .list_organization_admin_accounts(region, *requested, None, None)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListOrganizationAdminAccounts expected 200, got {status} with \
+                 {body}"
+            );
+            let listed = admin_accounts_of(&body);
+            assert_eq!(
+                listed.len(),
+                1,
+                "case {case:?}: expected exactly the designated account, got {body}"
+            );
+            assert_eq!(
+                listed[0]["AccountId"].as_str(),
+                Some(admin.as_str()),
+                "case {case:?}: expected {admin}, got {}",
+                listed[0]
+            );
+            assert_eq!(
+                listed[0]["Status"].as_str(),
+                Some(ADMIN_STATUS_ENABLED),
+                "case {case:?}: expected {ADMIN_STATUS_ENABLED}, got {}",
+                listed[0]
+            );
+            assert_eq!(
+                body["Feature"].as_str(),
+                Some(*effective),
+                "case {case:?}: the list must report the feature it answered for, got {body}"
+            );
+            assert!(
+                body["NextToken"].is_null(),
+                "case {case:?}: one designation is one page, so NextToken must be absent, got \
+                 {body}"
+            );
+
+            // Every other feature, and every other Region, holds no designation: the
+            // designation is scoped to the pair it was made for.
+            let other_feature = SECURITY_HUB_FEATURES
+                .iter()
+                .find(|value| **value != *effective)
+                .expect("SecurityHubFeature declares more than one value");
+            let other_region = if region == REGION { OTHER_REGION } else { REGION };
+            for (scope, scope_region, scope_feature) in [
+                ("the other feature", region, Some(*other_feature)),
+                ("the other Region", other_region, *requested),
+            ] {
+                let (status, body) = harness
+                    .list_organization_admin_accounts(scope_region, scope_feature, None, None)
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} / {scope}: expected 200, got {status} with {body}"
+                );
+                assert!(
+                    admin_accounts_of(&body).is_empty(),
+                    "case {case:?} / {scope}: expected no designation, got {body}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: an `AdminAccountId` that is not a 12-digit Amazon Web Services account id is
+/// an invalid input parameter — `InvalidInputException` (400) — and that is the
+/// refusal whatever the call could otherwise do to the organization, so it holds both
+/// on an organization with no delegated administrator and on one that already has a
+/// different account designated; nothing is designated either way.
+#[tokio::test]
+async fn malformed_admin_account_ids_are_refused_before_the_designation_is_looked_at() {
+    // One row per way an id can miss the 12-digit form, plus the published bounds (11
+    // and 13 digits). The empty id is left out: `AdminAccountId` is a
+    // `NonEmptyString` (pattern `\S`), so the boundary validation refuses it before
+    // the handler runs.
+    let malformed = [
+        ("not an account id at all", "not-an-account"),
+        ("too short", "123"),
+        ("one digit short", "11111111111"),
+        ("one digit long", "1111111111111"),
+        ("not all digits", "00000000000a"),
+        ("padded with a space", " 00000000000"),
+        ("hyphenated", "0000-0000-000"),
+    ];
+    let designated = "919191919191";
+
+    for (case, bad) in malformed {
+        // The scopes differ in what the SAME call would otherwise run into: an
+        // organization that has designated nobody, and one that already has a
+        // DIFFERENT account designated — the state with its own refusal, which the
+        // malformed parameter must take precedence over.
+        for (scope, designate_first) in [
+            ("with no administrator designated", false),
+            ("with another account already designated", true),
+        ] {
+            let harness = Harness::new();
+            if designate_first {
+                let (status, body) = harness
+                    .enable_organization_admin_account(REGION, designated, None)
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} / {scope}: the first designation expected 200, got {status} \
+                     with {body}"
+                );
+            }
+
+            let (status, body) = harness
+                .enable_organization_admin_account(REGION, bad, None)
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} ({bad:?}) / {scope}: expected 400, got {status} with {body}"
+            );
+            assert_eq!(
+                body["Code"].as_str(),
+                Some("InvalidInputException"),
+                "case {case:?} ({bad:?}) / {scope}: expected InvalidInputException, got {body}"
+            );
+            // The refusal names the member in its wire spelling and quotes back the
+            // value the request carried, whatever that value was.
+            let expected_message = format!("Invalid accountId: {bad}");
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {case:?} ({bad:?}) / {scope}: expected {expected_message:?}, got {body}"
+            );
+
+            // A refused designation writes nothing: the organization still holds
+            // exactly what it held before the call.
+            let (status, body) = harness
+                .list_organization_admin_accounts(REGION, None, None, None)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} / {scope}: ListOrganizationAdminAccounts expected 200, got \
+                 {status} with {body}"
+            );
+            let listed = admin_accounts_of(&body);
+            let expected: Vec<&str> = if designate_first {
+                vec![designated]
+            } else {
+                Vec::new()
+            };
+            let actual: Vec<&str> = listed
+                .iter()
+                .filter_map(|entry| entry["AccountId"].as_str())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({bad:?}) / {scope}: expected {expected:?}, got {body}"
+            );
+        }
+    }
+}
+
+/// RULE: a feature holds one delegated administrator per Region — designating the
+/// account it already holds is the same designation and changes nothing, while
+/// designating a different account is refused and leaves the one in place.
+#[tokio::test]
+async fn one_delegated_administrator_per_feature_and_region() {
+    for feature in [None, Some(SECURITY_HUB_FEATURES[1])] {
+        let harness = Harness::new();
+        let first = "151515151515";
+        let second = "161616161616";
+
+        for attempt in 1..=2 {
+            let (status, body) = harness
+                .enable_organization_admin_account(REGION, first, feature)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case Feature={feature:?} attempt {attempt}: designating {first} expected 200, \
+                 got {status} with {body}"
+            );
+        }
+
+        let (status, body) = harness
+            .enable_organization_admin_account(REGION, second, feature)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case Feature={feature:?}: a second administrator expected 400, got {status} with \
+             {body}"
+        );
+        assert!(
+            body["Message"]
+                .as_str()
+                .is_some_and(|message| message.contains(first)),
+            "case Feature={feature:?}: the refusal must name the account that holds the \
+             designation, got {body}"
+        );
+
+        let (status, body) = harness
+            .list_organization_admin_accounts(REGION, feature, None, None)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case Feature={feature:?}: ListOrganizationAdminAccounts expected 200, got {status} \
+             with {body}"
+        );
+        let listed = admin_accounts_of(&body);
+        assert_eq!(
+            listed.len(),
+            1,
+            "case Feature={feature:?}: the feature holds one administrator, got {body}"
+        );
+        assert_eq!(
+            listed[0]["AccountId"].as_str(),
+            Some(first),
+            "case Feature={feature:?}: the first designation must stand, got {body}"
+        );
+    }
+}
+
+/// RULE: a `Feature` outside the modelled `SecurityHubFeature` names no feature of
+/// this service, and a `MaxResults` outside its published range or a `NextToken` this
+/// operation never issued are refused too — each a 400 rather than silently read as
+/// something else. The published bounds themselves are accepted.
+#[tokio::test]
+async fn organization_admin_parameters_are_refused_outside_their_published_values() {
+    let harness = Harness::new();
+    let admin = "171717171717";
+    let (status, body) = harness
+        .enable_organization_admin_account(REGION, admin, None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "EnableOrganizationAdminAccount expected 200, got {status} with {body}"
+    );
+
+    // `SecurityHubFeature` declares exactly two values; anything else is refused by
+    // both operations, and neither published value is.
+    for (case, feature, expected) in [
+        ("the default feature", SECURITY_HUB_FEATURES[0], 200),
+        ("the V2 feature", SECURITY_HUB_FEATURES[1], 200),
+        ("a feature of another service", "GuardDuty", 400),
+        ("a lowercased published value", "securityhub", 400),
+        ("an empty feature", "", 400),
+    ] {
+        let (status, body) = harness
+            .list_organization_admin_accounts(REGION, Some(feature), None, None)
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?} (Feature={feature:?}): ListOrganizationAdminAccounts expected \
+             {expected}, got {status} with {body}"
+        );
+        let (status, body) = harness
+            .enable_organization_admin_account(REGION, admin, Some(feature))
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?} (Feature={feature:?}): EnableOrganizationAdminAccount expected \
+             {expected}, got {status} with {body}"
+        );
+    }
+
+    // `MaxResults` is `@range(min: 1, max: 10)`: each bound is accepted, and the value
+    // one past each is refused.
+    for (case, max_results, expected) in [
+        ("the minimum page size", ADMINS_MAX_RESULTS_MIN, 200),
+        ("the maximum page size", ADMINS_MAX_RESULTS_MAX, 200),
+        (
+            "one below the minimum page size",
+            ADMINS_MAX_RESULTS_MIN - 1,
+            400,
+        ),
+        (
+            "one past the maximum page size",
+            ADMINS_MAX_RESULTS_MAX + 1,
+            400,
+        ),
+    ] {
+        let (status, body) = harness
+            .list_organization_admin_accounts(REGION, None, Some(max_results), None)
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {case:?} (MaxResults={max_results}): expected {expected}, got {status} with \
+             {body}"
+        );
+    }
+
+    // A `NextToken` is only ever one this operation issued: a value the caller
+    // invented, and one minted by another list of this service, are both refused.
+    for (case, token) in [
+        ("not a token at all", "not-a-token".to_string()),
+        ("an empty-looking cursor", "00".to_string()),
+        (
+            "a token minted by another list",
+            ::hex::encode("securityhub:members:0"),
+        ),
+    ] {
+        let (status, body) = harness
+            .list_organization_admin_accounts(REGION, None, None, Some(&token))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} ({token}): expected 400, got {status} with {body}"
+        );
+    }
+}
+
+/// RULE: administration is delegated to an account OTHER than the organization's
+/// management account — which is the account making the call — so a designation that
+/// names the calling account is refused with `InvalidAccessException` (401), stating
+/// the permission and nothing else, and designates nothing; every other account can be
+/// designated in the same Region straight afterwards.
+///
+/// The table spans what the rule generalises over: the feature (absent, so the
+/// documented default, and each value `SecurityHubFeature` declares) and the Region the
+/// call is signed for.
+#[tokio::test]
+async fn the_calling_account_cannot_be_its_own_delegated_administrator() {
+    /// The whole sentence Security Hub refuses the designation with: fixed text, with
+    /// no account id, Region or reason interpolated.
+    const DENIED: &str = "You don't have permissions to perform the requested operation";
+
+    let features = [
+        None,
+        Some(SECURITY_HUB_FEATURES[0]),
+        Some(SECURITY_HUB_FEATURES[1]),
+    ];
+
+    for feature in features {
+        for region in [REGION, OTHER_REGION] {
+            let case = format!("Feature={feature:?} in {region}");
+            let harness = Harness::new();
+
+            let (status, body) = harness
+                .enable_organization_admin_account(region, ADMINISTRATOR_ID, feature)
+                .await;
+            assert_eq!(
+                status, 401,
+                "case {case:?}: designating the calling account expected 401, got {status} with \
+                 {body}"
+            );
+            assert_eq!(
+                body["Code"].as_str(),
+                Some("InvalidAccessException"),
+                "case {case:?}: expected InvalidAccessException, got {body}"
+            );
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(DENIED),
+                "case {case:?}: expected {DENIED:?}, got {body}"
+            );
+
+            // The refusal designated nothing, so the feature still holds no
+            // administrator at all.
+            let (status, body) = harness
+                .list_organization_admin_accounts(region, feature, None, None)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListOrganizationAdminAccounts expected 200, got {status} with \
+                 {body}"
+            );
+            assert!(
+                admin_accounts_of(&body).is_empty(),
+                "case {case:?}: a refused designation must persist nothing, got {body}"
+            );
+
+            // Only the calling account is refused: another account is designated in
+            // the same Region and feature right after.
+            let other = "202020202020";
+            let (status, body) = harness
+                .enable_organization_admin_account(region, other, feature)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: designating {other} expected 200, got {status} with {body}"
+            );
+            let (status, body) = harness
+                .list_organization_admin_accounts(region, feature, None, None)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListOrganizationAdminAccounts expected 200, got {status} with \
+                 {body}"
+            );
+            let listed: Vec<&str> = admin_accounts_of(&body)
+                .iter()
+                .filter_map(|entry| entry["AccountId"].as_str())
+                .collect();
+            assert_eq!(
+                listed,
+                vec![other],
+                "case {case:?}: expected {other} to hold the designation, got {body}"
+            );
+        }
+    }
+}
+
+/// RULE: this emulator holds delegated administrator designations for a bounded number
+/// of Regions — the Region a designation is filed under comes from the caller's own
+/// credential scope — so a designation that would be the first in one Region past that
+/// bound is the modelled `LimitExceededException` (429), while a Region the store
+/// already holds a designation in is never refused by the bound, whichever feature the
+/// further designation is for.
+#[tokio::test]
+async fn the_region_bound_refuses_one_region_too_many() {
+    // The bound this emulator holds (`crate::state::MAX_ORGANIZATION_ADMIN_REGIONS`);
+    // it is the emulator's own, not a published Security Hub quota.
+    const MAX_REGIONS: usize = 64;
+
+    let harness = Harness::new();
+    let admin = "212121212121";
+    let region_of = |n: usize| format!("us-emulated-{n}");
+
+    for n in 0..MAX_REGIONS {
+        let region = region_of(n);
+        let (status, body) = harness
+            .enable_organization_admin_account(&region, admin, None)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case Region {n} of {MAX_REGIONS}: expected 200, got {status} with {body}"
+        );
+    }
+
+    // Inside the bound: the same Region again, and the other feature in a Region the
+    // store already holds a designation in.
+    for (case, region, feature) in [
+        ("the same Region and feature again", region_of(0), None),
+        (
+            "the other feature in a Region already held",
+            region_of(0),
+            Some(SECURITY_HUB_FEATURES[1]),
+        ),
+    ] {
+        let (status, body) = harness
+            .enable_organization_admin_account(&region, admin, feature)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+    }
+
+    // One Region past the bound is refused, and designates nothing there.
+    let one_too_many = region_of(MAX_REGIONS);
+    let (status, body) = harness
+        .enable_organization_admin_account(&one_too_many, admin, None)
+        .await;
+    assert_eq!(
+        status, 429,
+        "case one Region past the bound: expected 429, got {status} with {body}"
+    );
+    let (status, body) = harness
+        .list_organization_admin_accounts(&one_too_many, None, None, None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case one Region past the bound: ListOrganizationAdminAccounts expected 200, got \
+         {status} with {body}"
+    );
+    assert!(
+        admin_accounts_of(&body).is_empty(),
+        "case one Region past the bound: a refused designation must persist nothing, got {body}"
+    );
 }

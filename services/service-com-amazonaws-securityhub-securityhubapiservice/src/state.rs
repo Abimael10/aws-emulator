@@ -38,6 +38,13 @@ mod hub_v2;
 
 pub use hub_v2::*;
 
+/// The organization's delegated administrator designations, kept beside the hub below
+/// rather than inside it, because a designation belongs to the organization the
+/// management account manages and not to any one account's subscription.
+mod organization;
+
+pub use organization::*;
+
 /// The hub resource is one per account and Region, named `hub/default`.
 pub type HubKey = (String, String);
 
@@ -329,6 +336,9 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     pub automation_rules: HashMap<AutomationRuleKey, AutomationRule>,
     /// The enabled standards, keyed by hub + standard ARN.
     pub standards: HashMap<StandardsSubscriptionKey, StandardsSubscriptionRecord>,
+    /// The organization's delegated administrator designations, keyed by Region +
+    /// `SecurityHubFeature` — the identity [`OrganizationAdminKey`] describes.
+    pub organization_admins: HashMap<OrganizationAdminKey, OrganizationAdminRecord>,
     /// Source of [`StoredFinding::imported_seq`] / [`StoredFinding::updated_seq`]
     /// and of [`AutomationRule::created_seq`].
     pub write_seq: u64,

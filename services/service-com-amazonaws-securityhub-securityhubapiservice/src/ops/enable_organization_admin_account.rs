@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableOrganizationAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableOrganizationAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableOrganizationAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +112,33 @@ impl From<EnableOrganizationAdminAccountErrorModeled> for EnableOrganizationAdmi
     }
 }
 
+/// The modelled 400 for an input parameter this operation cannot act on.
+fn invalid_input(message: String) -> EnableOrganizationAdminAccountError {
+    EnableOrganizationAdminAccountErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        code: Some("InvalidInputException".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 429 for a designation this store will not hold.
+fn limit_exceeded(message: String) -> EnableOrganizationAdminAccountError {
+    EnableOrganizationAdminAccountErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+        code: Some("LimitExceededException".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 401 for a caller whose account may not perform this action.
+fn invalid_access(message: String) -> EnableOrganizationAdminAccountError {
+    EnableOrganizationAdminAccountErrorModeled::InvalidAccessException(InvalidAccessException {
+        message: Some(message),
+        code: Some("InvalidAccessException".to_string()),
+    })
+    .into()
+}
+
 /// The `EnableOrganizationAdminAccount` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +175,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableOrganizationAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableOrganizationAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableOrganizationAdminAccount"))
+        // `AdminAccountId` is "the Amazon Web Services account identifier of the
+        // account to designate as the Security Hub CSPM administrator account"
+        // (`smithy_query(query="operation",
+        // operation="EnableOrganizationAdminAccount")`) but targets `NonEmptyString`
+        // (`@pattern("\\S")`), so the boundary validation accepts any non-blank value.
+        // A value that cannot be an account id at all is an invalid input parameter,
+        // and the parameter is checked FIRST: the refusal is about the request, so it
+        // does not depend on what the caller may do to this organization or on
+        // anything the store holds.
+        if !crate::state::is_account_id(&input.admin_account_id) {
+            return Err(invalid_input(crate::state::invalid_account_id_message(
+                &input.admin_account_id,
+            )));
+        }
+
+        // "The feature for which the delegated admin account is enabled. Defaults to
+        // Security Hub CSPM if not specified" — a value outside `SecurityHubFeature`
+        // names no feature this service has.
+        let feature = crate::state::requested_feature(input.feature.as_deref());
+        if !crate::state::is_security_hub_feature(&feature) {
+            return Err(invalid_input(
+                crate::state::unknown_security_hub_feature_message(&feature),
+            ));
+        }
+
+        // A delegated administrator is an account OTHER than the organization's
+        // management account, which is the account making this call: Amazon Web
+        // Services does not let an organization's management account be registered as
+        // the delegated administrator of a service integrated with that organization.
+        // So a designation that names the calling account delegates administration to
+        // nobody, and is the account-standing refusal `InvalidAccessException` — "the
+        // account doesn't have permission to perform this action"
+        // (`smithy_query(query="operation",
+        // operation="EnableOrganizationAdminAccount")`). Checked AFTER the parameters
+        // above: an input value this operation cannot act on at all is refused
+        // whatever the call could otherwise do.
+        if !crate::state::may_be_delegated_to(&input.admin_account_id) {
+            return Err(invalid_access(
+                crate::state::ORGANIZATION_DELEGATION_DENIED_MESSAGE.to_string(),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableOrganizationAdminAccountError::Modeled(
+                EnableOrganizationAdminAccountErrorModeled::InternalException(InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+
+        let key =
+            crate::state::organization_admin_key(&crate::state::request_region(ctx), &feature);
+        let mut store = state.lock();
+        if let Some(current) = store.organization_admins.get(&key) {
+            // A feature holds one delegated administrator per Region, so designating
+            // a DIFFERENT account is refused rather than silently replacing the
+            // account the organization already delegated to. Designating the account
+            // it already holds is the same designation, and falls through to the
+            // report below without writing anything.
+            if current.admin_account_id != input.admin_account_id {
+                return Err(invalid_input(
+                    crate::state::organization_admin_already_designated_message(
+                        &current.admin_account_id,
+                    ),
+                ));
+            }
+        } else if crate::state::organization_admin_region_ceiling_reached(&store, &key) {
+            return Err(limit_exceeded(
+                crate::state::organization_admin_region_ceiling_message(&key.region),
+            ));
+        }
+
+        let designated = crate::state::designate_organization_admin(
+            &mut store,
+            &key,
+            &input.admin_account_id,
+        );
+
+        // Both output members report the designation the store now holds, which is
+        // also what `ListOrganizationAdminAccounts` answers for this feature.
+        Ok(EnableOrganizationAdminAccountOutput {
+            admin_account_id: Some(designated.admin_account_id),
+            feature: Some(key.feature),
+        })
     }
 }

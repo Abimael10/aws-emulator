@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrganizationAdminAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrganizationAdminAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrganizationAdminAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +113,35 @@ impl From<ListOrganizationAdminAccountsErrorModeled> for ListOrganizationAdminAc
     }
 }
 
+/// The modelled 400 for an input parameter this operation cannot act on.
+fn invalid_input(message: String) -> ListOrganizationAdminAccountsError {
+    ListOrganizationAdminAccountsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        code: Some("InvalidInputException".to_string()),
+    })
+    .into()
+}
+
+/// `MaxResults`' upper bound (`AdminsMaxResults`, range 1..10 —
+/// `smithy_query(query="operation", operation="ListOrganizationAdminAccounts")`), which
+/// is also the page size used when the caller names none.
+const MAX_RESULTS_LIMIT: usize = 10;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:organizationadmins:";
+
+/// A `NextToken` resuming at `offset` in the ordered result.
+fn encode_next_token(offset: usize) -> String {
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
+}
+
 /// The `ListOrganizationAdminAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +178,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOrganizationAdminAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrganizationAdminAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrganizationAdminAccounts"))
+        // "The feature where the delegated administrator account is listed. Defaults
+        // to Security Hub CSPM if not specified" (`smithy_query(query="operation",
+        // operation="ListOrganizationAdminAccounts")`): the two features hold their
+        // designations independently, so a value outside `SecurityHubFeature` names
+        // no feature this service has.
+        let feature = crate::state::requested_feature(input.feature.as_deref());
+        if !crate::state::is_security_hub_feature(&feature) {
+            return Err(invalid_input(
+                crate::state::unknown_security_hub_feature_message(&feature),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOrganizationAdminAccountsError::Modeled(
+                ListOrganizationAdminAccountsErrorModeled::InternalException(InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+
+        // A pure report: nothing below writes to the store.
+        let key =
+            crate::state::organization_admin_key(&crate::state::request_region(ctx), &feature);
+        let store = state.lock();
+        let designations = crate::state::organization_admins_in(&store, &key);
+
+        // `MaxResults` is modelled `@range(min: 1, max: 10)`, so the boundary
+        // validation already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > designations.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let total = designations.len();
+        let admin_accounts: Vec<AdminAccount> = designations
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(crate::state::admin_account_view)
+            .collect();
+        let next_offset = offset + admin_accounts.len();
+        let next_token = (next_offset < total).then(|| encode_next_token(next_offset));
+
+        Ok(ListOrganizationAdminAccountsOutput {
+            // Present and empty while the feature holds no delegated administrator in
+            // this Region: an empty list is the answer, and a client reads it the same
+            // way as a full one.
+            admin_accounts: Some(admin_accounts),
+            next_token,
+            feature: Some(key.feature),
+        })
     }
 }
