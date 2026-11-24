@@ -1250,6 +1250,21 @@ pub fn insufficient_lake_formation_describe_table(table_name: &str) -> String {
 /// [`database_not_found`], whose recorded wording does name its resource.
 pub const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
+/// A request whose `CatalogId` selects the DATA CATALOG an entity lives in but is not
+/// spelled the way such an id is ([`super::is_data_catalog_id`]): it carries no account-id
+/// prefix, or characters no catalog id is written with.
+///
+/// Recorded constant: the whole sentence pair is fixed text. It states the rule — the
+/// account-id prefix, and the characters an id may carry — and interpolates nothing: not
+/// the rejected id, not an account, not a Region and not a name. Being a verdict on the
+/// request rather than on the store, it is answered as the operation's modelled
+/// `InvalidInputException` before the catalog is resolved, so it never depends on which
+/// catalogs happen to exist ([`CATALOG_NOT_FOUND`] is the miss a WELL-FORMED id that names
+/// no catalog earns).
+pub const CATALOG_ID_INVALID: &str = "Catalog id is invalid. The catalog id must be \
+     prepended with the account id prefix and can only contain lowercase letters, numbers, \
+     underscores, and slashes.";
+
 /// A `DeleteCatalog` whose `CatalogId` addresses the account's own Data Catalog — the
 /// catalog every account HAS, which holds the catalogs a create registers and is not
 /// one of them.

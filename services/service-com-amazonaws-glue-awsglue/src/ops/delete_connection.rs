@@ -167,6 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         match catalog_refusal {
             None => {}
+            // This operation models no `InvalidInputException`, so the catalog-id grammar
+            // verdict has no error code here that a strongly typed client could map: the id
+            // addresses no catalog of this account either way, which is the miss below.
+            Some(crate::state::CatalogRefusal::Invalid(_)) => {
+                return Err(DeleteConnectionErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::CATALOG_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
             Some(crate::state::CatalogRefusal::NotFound(message)) => {
                 return Err(DeleteConnectionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {

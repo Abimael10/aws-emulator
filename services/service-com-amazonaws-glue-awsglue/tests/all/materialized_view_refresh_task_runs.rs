@@ -283,8 +283,9 @@ async fn a_stored_run_is_reported_member_for_member() {
 }
 
 /// The `CatalogId` is resolved before the run is looked up: a catalog of ANOTHER account is
-/// refused as unauthorized, and a catalog this account holds nothing under is the catalog
-/// miss — so a run id is never answered out of a catalog the caller cannot read.
+/// refused as unauthorized, a catalog this account holds nothing under is the catalog
+/// miss, and an id that is no catalog id at all is refused as invalid input — so a run id is
+/// never answered out of a catalog the caller cannot read.
 #[tokio::test]
 async fn the_catalog_is_resolved_before_the_run_is_looked_up() {
     let router = emulator();
@@ -303,8 +304,13 @@ async fn the_catalog_is_resolved_before_the_run_is_looked_up() {
         ),
         (
             "a catalog this account holds nothing under",
-            "never-created".to_string(),
+            format!("{ACCOUNT_ID}:never-created"),
             "EntityNotFoundException",
+        ),
+        (
+            "an id carrying no account-id prefix, which is no catalog id at all",
+            "never-created".to_string(),
+            "InvalidInputException",
         ),
     ] {
         let (status, body) = call(
@@ -339,7 +345,11 @@ async fn the_catalog_is_resolved_before_the_run_is_looked_up() {
 #[tokio::test]
 async fn a_run_of_another_catalog_is_not_an_answer() {
     let run_id = "55555555-5555-4555-8555-555555555555";
-    let holding_catalog = "holding-catalog";
+    let holding_catalog_name = "holding-catalog";
+    // A `CatalogId` that SELECTS a Data Catalog carries the holding account's id prefix, so
+    // a catalog registered inside this account is addressed by that id and not by its bare
+    // name (see `crate::state::is_data_catalog_id`).
+    let holding_catalog = format!("{ACCOUNT_ID}:{holding_catalog_name}");
     let at = SystemTime::UNIX_EPOCH + SEEDED_EPOCH;
 
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -351,7 +361,7 @@ async fn a_run_of_another_catalog_is_not_an_answer() {
         &router,
         "CreateCatalog",
         &json!({
-            "Name": holding_catalog,
+            "Name": holding_catalog_name,
             "CatalogInput": {
                 "FederatedCatalog": {
                     "Identifier": format!("arn:aws:s3tables:us-east-1:{ACCOUNT_ID}:bucket/held"),
@@ -367,7 +377,7 @@ async fn a_run_of_another_catalog_is_not_an_answer() {
         .materialized_view_refresh_task_runs
         .push(MaterializedViewRefreshTaskRunEntry {
             id: run_id.to_string(),
-            catalog_id: holding_catalog.to_string(),
+            catalog_id: holding_catalog.clone(),
             database_name: "analytics".to_string(),
             table_name: "daily_orders".to_string(),
             role: None,
@@ -414,7 +424,7 @@ async fn a_run_of_another_catalog_is_not_an_answer() {
     .await;
     assert_eq!(
         reported["MaterializedViewRefreshTaskRun"]["CatalogId"].as_str(),
-        Some(holding_catalog),
+        Some(holding_catalog.as_str()),
         "case the holding catalog: the read must report the run of that catalog, got {reported}"
     );
     assert_eq!(

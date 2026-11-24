@@ -201,6 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::catalog_refusal`).
         match crate::state::catalog_refusal(&state.lock(), &catalog_id, &region, Self::NAME) {
             None => {}
+            Some(crate::state::CatalogRefusal::Invalid(message)) => {
+                return Err(invalid_input(message))
+            }
             Some(crate::state::CatalogRefusal::NotFound(message)) => {
                 return Err(not_found(message))
             }

@@ -183,6 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
         let region = crate::state::request_region(ctx.parts());
+        // An id that is no Data Catalog id at all is refused on its spelling, ahead of the
+        // authorization decision below (see `crate::state::invalid_data_catalog_id`).
+        if let Some(message) = crate::state::invalid_data_catalog_id(&catalog_id) {
+            return Err(CreateDatabaseErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
         // A `CatalogId` this emulator does not hold must not be conjured into existence
         // by the create: the only catalog it holds is its own account's, so any other id
         // names another account's catalog, reachable only through that catalog's own

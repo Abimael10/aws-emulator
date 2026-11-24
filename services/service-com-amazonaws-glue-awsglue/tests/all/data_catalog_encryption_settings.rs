@@ -446,17 +446,26 @@ async fn the_named_catalog_id_and_the_default_address_one_catalog() {
     }
 }
 
-/// A `CatalogId` this emulator holds no Data Catalog under belongs to another account,
-/// so both operations refuse it with HTTP 400 `AccessDeniedException` naming the catalog
-/// ARN the request addressed — and the write leaves no catalog behind, so the default
-/// catalog's own settings are untouched.
+/// A `CatalogId` this emulator holds no Data Catalog under is refused by both operations
+/// with HTTP 400, and WHICH refusal follows the id's own spelling: a well-formed id of
+/// another account is `AccessDeniedException` naming the catalog ARN the request addressed,
+/// while an id that is no catalog id at all — one carrying no account-id prefix — is
+/// `InvalidInputException` stating the grammar, before any authorization decision. Either
+/// way the write leaves no catalog behind, so the default catalog's own settings are
+/// untouched.
 #[tokio::test]
 async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations() {
-    // Ids that are not this emulator's account: another twelve-digit account, a shorter
-    // one, and a name-shaped id.
-    let foreign_ids = ["210987654321", "1234", "other-catalog"];
+    // The rows differ along the SHAPE of the id: another twelve-digit account, a catalog of
+    // another account, digits too few for an account number, and a name-shaped id carrying
+    // no account prefix at all.
+    let foreign_ids = [
+        ("210987654321", "AccessDeniedException"),
+        ("210987654321:other-catalog", "AccessDeniedException"),
+        ("1234", "InvalidInputException"),
+        ("other-catalog", "InvalidInputException"),
+    ];
 
-    for foreign in foreign_ids {
+    for (foreign, expected_code) in foreign_ids {
         let router = emulator();
         put_settings(
             &router,
@@ -489,15 +498,28 @@ async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations()
                 "case {foreign:?} / {operation}: expected 400, got {status} with {body}"
             );
             assert!(
-                error_code(&body).contains("AccessDeniedException"),
-                "case {foreign:?} / {operation}: expected AccessDeniedException, got {body}"
+                error_code(&body).contains(expected_code),
+                "case {foreign:?} / {operation}: expected {expected_code}, got {body}"
             );
             let message = error_message(&body);
-            assert!(
-                message.contains(foreign),
-                "case {foreign:?} / {operation}: the refusal is built from the request, so it \
-                 must name the CatalogId it refused, got {message:?}"
-            );
+            if expected_code == "AccessDeniedException" {
+                assert!(
+                    message.contains(foreign),
+                    "case {foreign:?} / {operation}: the authorization refusal is built from \
+                     the request, so it must name the CatalogId it refused, got {message:?}"
+                );
+            } else {
+                // The grammar verdict states the rule and interpolates nothing — not the
+                // rejected id, not an account, not a Region.
+                assert_eq!(
+                    message,
+                    "Catalog id is invalid. The catalog id must be prepended with the account \
+                     id prefix and can only contain lowercase letters, numbers, underscores, \
+                     and slashes.",
+                    "case {foreign:?} / {operation}: expected the fixed grammar sentence \
+                     carrying no part of the request, got {message:?}"
+                );
+            }
         }
 
         // The refused calls stored nothing: this account's catalog still reports what

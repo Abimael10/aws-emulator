@@ -864,6 +864,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // An id that is no Data Catalog id at all is refused on its spelling, ahead of the
+        // authorization decision below (see `crate::state::invalid_data_catalog_id`).
+        if let Some(message) = crate::state::invalid_data_catalog_id(&catalog_id) {
+            return Err(invalid_input(message));
+        }
         // Whether the caller may search this catalog at all is decided BEFORE anything is
         // read out of it: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`), so

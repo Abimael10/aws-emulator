@@ -199,6 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         match catalog_refusal {
             None => {}
+            Some(crate::state::CatalogRefusal::Invalid(message)) => {
+                return Err(BatchDeleteTableVersionErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
             Some(crate::state::CatalogRefusal::NotFound(message)) => {
                 return Err(BatchDeleteTableVersionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {

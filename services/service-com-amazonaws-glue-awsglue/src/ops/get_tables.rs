@@ -500,6 +500,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::catalog_refusal(&state.lock(), &catalog_id, &region, Self::NAME);
         match catalog_refusal {
             None => {}
+            Some(crate::state::CatalogRefusal::Invalid(message)) => {
+                return Err(GetTablesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
             Some(crate::state::CatalogRefusal::NotFound(message)) => {
                 return Err(GetTablesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {

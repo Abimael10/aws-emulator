@@ -8,7 +8,9 @@
 //! writes nothing — including the `CreateTableDefaultPermissions` the create recorded,
 //! which is the catalog's `ALL`-to-`IAM_ALLOWED_PRINCIPALS` default when the create
 //! named no grants (see `crate::state::default_create_table_default_permissions`). An
-//! absent catalog or database is `EntityNotFoundException`.
+//! absent catalog or database is `EntityNotFoundException`, while a `CatalogId` that is no
+//! catalog id at all is `InvalidInputException` decided from the request alone, before the
+//! catalog is resolved (see `crate::state::is_data_catalog_id`).
 //!
 //! What it answers is governed by Lake Formation: a database that exists is reported only
 //! to a principal holding a Lake Formation permission on it, on a resource inside it, or
@@ -175,10 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the caller may read this catalog at all is decided BEFORE the entity
         // lookup: a `CatalogId` of another account is reachable only through that
         // catalog's own resource policy (see `crate::state::catalog_refusal`).
+        // ... and whether the id even addresses a Data Catalog is decided before THAT: an
+        // id outside the catalog-id grammar is a verdict on the request, so it is refused as
+        // invalid input rather than resolved and reported as an absent catalog.
         let catalog_refusal =
             crate::state::catalog_refusal(&state.lock(), &catalog_id, &region, Self::NAME);
         match catalog_refusal {
             None => {}
+            Some(crate::state::CatalogRefusal::Invalid(message)) => {
+                return Err(GetDatabaseErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
             Some(crate::state::CatalogRefusal::NotFound(message)) => {
                 return Err(GetDatabaseErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {

@@ -44,6 +44,70 @@ pub fn is_catalog_name(name: &str) -> bool {
 /// catalog's own `Name` may carry none of the path separators ([`CATALOG_NAME_PATTERN`]).
 pub const CATALOG_PATH_SEPARATOR: char = '/';
 
+/// The separator a `CatalogId` names the ACCOUNT holding a catalog with: the account's own
+/// number, then this separator, then the path of the catalog inside that account's Data
+/// Catalog ([`child_catalog_id`], [`parse_catalog_reference`]).
+pub const CATALOG_ID_ACCOUNT_SEPARATOR: char = ':';
+
+/// Whether `character` is one a `CatalogId` may carry after its account-id prefix: a
+/// lowercase letter, a digit, an underscore, the nesting separator
+/// ([`CATALOG_PATH_SEPARATOR`]) that spells a catalog held inside another one, or the
+/// hyphen the catalog-name grammar admits ([`messages::ROOT_CATALOG_NOT_DELETABLE`] states
+/// that grammar, and the path segments of an id ARE catalog names, so an id has to be able
+/// to spell every name a create may store).
+fn is_data_catalog_id_character(character: char) -> bool {
+    character.is_ascii_lowercase()
+        || character.is_ascii_digit()
+        || character == '_'
+        || character == '-'
+        || character == CATALOG_PATH_SEPARATOR
+}
+
+/// Whether `catalog_id` is spelled the way a `CatalogId` that selects a DATA CATALOG is:
+/// the holding account's own number ([`ACCOUNT_ID_DIGITS`]), alone or followed by the path
+/// of a catalog inside it, written in the characters a catalog id carries
+/// ([`is_data_catalog_id_character`]).
+///
+/// The account-id prefix is what makes the id address a Data Catalog at all — every Data
+/// Catalog belongs to one account, and an id carrying no such prefix names none — so a bare
+/// path, a value of some other shape, or a path carrying characters outside the id's own
+/// character set is no catalog id and can never become one, however the store changes.
+/// That makes it a verdict on the REQUEST, which is why it is answered as invalid input
+/// ([`messages::CATALOG_ID_INVALID`]) rather than as the miss a well-formed id that names
+/// no catalog earns ([`messages::CATALOG_NOT_FOUND`]) or the authorization refusal an id of
+/// another account earns.
+///
+/// This is a narrower grammar than the one a catalog's own `Name` satisfies
+/// ([`is_catalog_name`], which admits the upper case and every character but the path
+/// separators): the catalog operations keep measuring an id against the NAME pattern,
+/// because they address a catalog RESOURCE by its name, while the operations that look an
+/// entity up INSIDE a Data Catalog measure the id that selects that catalog against this
+/// one.
+pub fn is_data_catalog_id(catalog_id: &str) -> bool {
+    // Split at the first separator without slicing by index, so no arithmetic on a
+    // request-derived string decides where the account prefix ends.
+    let (account_id, path) =
+        match catalog_id.split_once([CATALOG_ID_ACCOUNT_SEPARATOR, CATALOG_PATH_SEPARATOR]) {
+            Some((account_id, path)) => (account_id, Some(path)),
+            None => (catalog_id, None),
+        };
+    is_account_id(account_id)
+        && path.is_none_or(|path| {
+            !path.is_empty() && path.chars().all(is_data_catalog_id_character)
+        })
+}
+
+/// The invalid-input sentence a `CatalogId` that selects no Data Catalog it could ever
+/// select earns ([`is_data_catalog_id`]), or `None` for an id that is spelled as one.
+///
+/// Measured before the catalog is resolved, so it precedes both the cross-account
+/// authorization decision and the entity lookup: the operations that tell a missing catalog
+/// from a foreign one take it as part of [`catalog_refusal`], and the ones that can report
+/// only the authorization refusal ([`foreign_catalog_refusal`]) ask for it first.
+pub fn invalid_data_catalog_id(catalog_id: &str) -> Option<String> {
+    (!is_data_catalog_id(catalog_id)).then(|| messages::CATALOG_ID_INVALID.to_string())
+}
+
 /// The first segment of the catalog path `name` that is no catalog NAME at all, or `None`
 /// when every segment is one.
 ///
@@ -299,7 +363,7 @@ pub fn account_data_catalog(region: &str) -> crate::ops::types::Catalog {
 /// the account it is served for — and the catalog it created is then addressed by this
 /// id, which is what [`parse_catalog_reference`] reads back apart.
 pub fn child_catalog_id(account_id: &str, name: &str) -> String {
-    format!("{account_id}:{name}")
+    format!("{account_id}{CATALOG_ID_ACCOUNT_SEPARATOR}{name}")
 }
 
 /// A `CatalogId` naming one catalog RESOURCE, split into the account whose Data Catalog
@@ -330,7 +394,7 @@ pub struct CatalogReference {
 /// `Catalog$Name` cannot be.
 pub fn parse_catalog_reference(catalog_id: &str) -> CatalogReference {
     if let Some((account_id, name)) = catalog_id
-        .split_once(':')
+        .split_once(CATALOG_ID_ACCOUNT_SEPARATOR)
         .filter(|(prefix, _)| is_account_id(prefix))
     {
         return CatalogReference {
@@ -420,6 +484,10 @@ pub(super) fn glue_arn_for_account(region: &str, account_id: &str, resource: &st
 /// Every other catalog-addressed operation goes through [`catalog_refusal`], which tells
 /// the missing catalog and the foreign one apart; the sentence here is the same one that
 /// decision carries for a foreign catalog, so the two cannot disagree about it.
+///
+/// This answers AUTHORIZATION only, so a caller that can report invalid input asks
+/// [`invalid_data_catalog_id`] first: an id that is no catalog id is refused on its
+/// spelling, ahead of the authorization decision this makes.
 pub fn foreign_catalog_refusal(catalog_id: &str, region: &str, action: &str) -> Option<String> {
     (!is_known_catalog(catalog_id))
         .then(|| messages::not_authorized_on_catalog(action, &catalog_arn(region, catalog_id)))
@@ -429,6 +497,13 @@ pub fn foreign_catalog_refusal(catalog_id: &str, region: &str, action: &str) -> 
 /// BEFORE the entity lookup ([`catalog_refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogRefusal {
+    /// `catalog_id` is no Data Catalog id at all: it is not spelled the way an id that
+    /// selects a Data Catalog is ([`is_data_catalog_id`]), so it selects nothing the store
+    /// could hold and nothing any create could make. Carries the grammar sentence
+    /// ([`messages::CATALOG_ID_INVALID`]), to be answered as the operation's own
+    /// `InvalidInputException` — a verdict on the request, decided before the catalog is
+    /// resolved and before authorization over it is considered.
+    Invalid(String),
     /// `catalog_id` names no Data Catalog at all: it is not an Amazon Web Services account
     /// number, so it addresses no account's Data Catalog, and it names no catalog this
     /// account holds either — there is no catalog for an entity to be looked up in.
@@ -445,8 +520,14 @@ pub enum CatalogRefusal {
 /// the account's own Data Catalog ([`is_known_catalog`]) or a catalog resource a
 /// `CreateCatalog` registered in it ([`ComAmazonawsGlueAwsglueState::catalog_definition`]).
 ///
-/// The two refusals answer two different faults, and WHICH one an id earns is decided by
-/// what the id addresses rather than by what the store happens to hold:
+/// The three refusals answer three different faults, and WHICH one an id earns is decided
+/// by what the id addresses rather than by what the store happens to hold:
+///
+/// * An id that is not spelled the way a Data Catalog id is ([`is_data_catalog_id`])
+///   addresses no catalog any account could hold, so it is refused on the request's own
+///   terms — invalid input — before the catalog is resolved at all. Answering it as a miss
+///   would tell a caller its identifier is well formed and merely unused, which sends a
+///   validate-then-create flow down a branch that can never succeed.
 ///
 /// * An id that is an account number other than this endpoint's own addresses that
 ///   account's Data Catalog, which is reachable on the real service only through that
@@ -464,12 +545,22 @@ pub enum CatalogRefusal {
 ///
 /// `action` is the operation's own name, which the authorization refusal names as the IAM
 /// action ([`IAM_ACTION_PREFIX`]) the caller may not perform.
+///
+/// An operation whose modelled error set carries no `InvalidInputException` cannot report
+/// the first of those: an error code outside an operation's modelled set is one no strongly
+/// typed client can map, so such an operation keeps answering its catalog miss.
 pub fn catalog_refusal(
     store: &ComAmazonawsGlueAwsglueState,
     catalog_id: &str,
     region: &str,
     action: &str,
 ) -> Option<CatalogRefusal> {
+    // The GRAMMAR comes first: an id that is no catalog id cannot be resolved, so the
+    // refusal it earns is a verdict on the request rather than on the store, and it
+    // precedes both the authorization decision and the entity lookup.
+    if let Some(message) = invalid_data_catalog_id(catalog_id) {
+        return Some(CatalogRefusal::Invalid(message));
+    }
     if is_known_catalog(catalog_id) {
         return None;
     }

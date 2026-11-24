@@ -53,6 +53,12 @@ const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and ru
 /// The whole `Message` a request addressed to a catalog that does not exist earns.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
+/// The whole `Message` a request whose `CatalogId` is no catalog id at all earns: fixed
+/// text stating the grammar, interpolating nothing from the request.
+const CATALOG_ID_INVALID: &str = "Catalog id is invalid. The catalog id must be prepended \
+     with the account id prefix and can only contain lowercase letters, numbers, \
+     underscores, and slashes.";
+
 /// The whole `Message` the schema read answers for a `SchemaId` that addresses no schema
 /// set completely.
 const SCHEMA_ID_INCOMPLETE: &str =
@@ -382,12 +388,14 @@ async fn a_run_read_answers_the_run_miss_for_either_half_of_the_pair() {
 
 /// Rule 4: a `CatalogId` naming no catalog this endpoint serves is the catalog MISS,
 /// answered before any authorization decision, while a catalog id of another account stays
-/// the authorization refusal.
+/// the authorization refusal and an id that is no catalog id at all is the INPUT refusal
+/// answered ahead of both.
 ///
-/// The rows differ along the SHAPE of the id — digits too few for an account number, a
-/// bare name, a Region-shaped value, a name qualified by this account, and a name in
-/// another casing — crossed with the operations that resolve a `CatalogId` before looking
-/// an entity up.
+/// The miss rows differ along the SHAPE of the id a well-formed address can take — a name
+/// this account holds no catalog under, a nested path, a name in another casing — and the
+/// invalid rows along HOW the id leaves the catalog-id grammar (no account-id prefix, digits
+/// too few for an account number, a Region-shaped value, upper case, a dot), each crossed
+/// with the operations that resolve a `CatalogId` before looking an entity up.
 #[tokio::test]
 async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
     let router = emulator();
@@ -409,14 +417,14 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
     ];
 
     let misses = [
-        ("too few digits for an account number", "12345".to_string()),
-        ("a bare name nothing created", "never-created".to_string()),
-        ("a Region-shaped value", REGION.to_string()),
         (
             "a name this account holds no catalog under",
             format!("{ACCOUNT_ID}:never-created"),
         ),
-        ("a name in another casing", "NEVER-CREATED".to_string()),
+        (
+            "a nested path this account holds no catalog under",
+            format!("{ACCOUNT_ID}:never-created/inner"),
+        ),
     ];
     for (case, catalog_id) in &misses {
         for (operation, request) in &operations {
@@ -432,6 +440,42 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
                 CATALOG_NOT_FOUND,
             )
             .await;
+        }
+    }
+
+    // An id that is no catalog id at all is a verdict on the REQUEST: it carries no
+    // account-id prefix, or characters no catalog id is written with, so it selects no Data
+    // Catalog any account could hold and is refused as invalid input before the catalog is
+    // resolved — with the whole sentence fixed, naming no part of the request.
+    let malformed = [
+        ("a bare name nothing created", "never-created".to_string()),
+        ("too few digits for an account number", "12345".to_string()),
+        ("a Region-shaped value", REGION.to_string()),
+        ("a name in another casing", "NEVER-CREATED".to_string()),
+        (
+            "a prefixed name carrying a character no id is written with",
+            format!("{ACCOUNT_ID}:never.created"),
+        ),
+    ];
+    for (case, catalog_id) in &malformed {
+        for (operation, request) in &operations {
+            let label = format!("{case} via {operation}");
+            let mut body = request.clone();
+            body["CatalogId"] = json!(catalog_id);
+            let answer = assert_refusal(
+                &router,
+                &label,
+                operation,
+                &body,
+                "InvalidInputException",
+                CATALOG_ID_INVALID,
+            )
+            .await;
+            assert!(
+                !error_message(&answer).contains(catalog_id.as_str()),
+                "case {label}: the grammar verdict carries no part of the request, got {:?}",
+                error_message(&answer)
+            );
         }
     }
 
@@ -483,17 +527,31 @@ async fn a_catalog_id_naming_no_catalog_is_a_miss_before_authorization() {
         }),
     )
     .await;
-    for catalog_id in ["stored-catalog", &format!("{ACCOUNT_ID}:stored-catalog")] {
-        assert_refusal(
-            &router,
-            &format!("a stored catalog addressed as {catalog_id:?}"),
-            "GetDatabase",
-            &json!({ "CatalogId": catalog_id, "Name": "present_db" }),
-            ENTITY_NOT_FOUND,
-            "Database present_db not found.",
-        )
-        .await;
-    }
+    // A catalog this account DOES hold is resolved from its account-qualified id, so the
+    // miss above is decided from stored state: the request reaches the entity lookup and
+    // earns the ENTITY's miss. The same catalog named WITHOUT the account-id prefix is no
+    // catalog id at all, which is the input refusal rather than a lookup.
+    assert_refusal(
+        &router,
+        "a stored catalog addressed by its account-qualified id",
+        "GetDatabase",
+        &json!({
+            "CatalogId": format!("{ACCOUNT_ID}:stored-catalog"),
+            "Name": "present_db",
+        }),
+        ENTITY_NOT_FOUND,
+        "Database present_db not found.",
+    )
+    .await;
+    assert_refusal(
+        &router,
+        "a stored catalog addressed by its bare name",
+        "GetDatabase",
+        &json!({ "CatalogId": "stored-catalog", "Name": "present_db" }),
+        "InvalidInputException",
+        CATALOG_ID_INVALID,
+    )
+    .await;
 
     // The account's own catalog still serves the database, addressed by id or by default.
     for catalog_id in [None, Some(ACCOUNT_ID.to_string())] {
