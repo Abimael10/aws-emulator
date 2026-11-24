@@ -367,20 +367,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         .map_err(trigger_failed)?;
         let registered = self.store(planned, &decision)?;
 
-        // A pool that routes a medium's messages to a custom sender delivers this sign-up's
-        // code by handing it to that function instead of sending it, with the app client the
-        // registration was made through as the event's caller. Which sender receives it is
-        // decided by the medium the code travelled over — the attribute it was addressed to.
-        // A sign-up that sent no code at all — the pool verifies nothing the user holds a
-        // value for — hands over nothing either.
+        // Whatever this pool's `LambdaConfig` puts over the message this sign-up sent is fired
+        // here, with the app client the registration was made through as the event's caller: a
+        // custom sender for the medium the code travelled over is handed the code and delivers
+        // it, and a pool that delivers the message itself has its custom message function word
+        // it ([`crate::state::lambda_triggers::message_delivery`]). Which medium that is was
+        // decided by the attribute the code was addressed to. A sign-up that sent no code at
+        // all — the pool verifies nothing the user holds a value for — fires nothing either.
         if let Some(issued_code) = registered.issued_code {
-            crate::state::lambda_triggers::custom_sender::fire_over_medium(
+            crate::state::lambda_triggers::message_delivery::fire_over_medium(
                 ctx,
                 &state,
                 &registered.user_pool_id,
                 &registered.username,
                 &issued_code.medium,
-                crate::state::lambda_triggers::custom_sender::Stage::SignUp,
+                crate::state::lambda_triggers::message_delivery::Stage::SignUp,
                 caller,
                 input.client_metadata.as_ref(),
                 &issued_code.code,

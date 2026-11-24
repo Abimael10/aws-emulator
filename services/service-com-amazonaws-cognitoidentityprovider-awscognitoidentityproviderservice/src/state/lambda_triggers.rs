@@ -14,7 +14,8 @@
 //! work into:
 //!
 //! 1. a builder ([`post_confirmation`], [`pre_authentication`], [`pre_token_generation`],
-//!    [`pre_sign_up::pre_sign_up`]) resolves the member and builds the event, from the pool
+//!    [`pre_sign_up::pre_sign_up`], [`message_delivery::pending`]) resolves the member and
+//!    builds the event, from the pool
 //!    and the user read under the state lock;
 //! 2. [`invoke`] performs the invocation, after the operation has RELEASED that lock, so
 //!    no other request of this service waits on a function.
@@ -62,6 +63,10 @@ use super::{User, UserPool};
 /// message of a pool that configures one is routed to instead of being mailed.
 pub mod custom_email;
 
+/// The custom MESSAGE trigger, whose configured function every message a pool that configures
+/// one DELIVERS ITSELF is asked the wording of.
+pub mod custom_message;
+
 /// The custom sender machinery both senders share: the event, the encrypted code and the
 /// invocation a pool that routes a medium's messages to a function owes.
 pub mod custom_sender;
@@ -72,6 +77,9 @@ pub mod custom_sms;
 
 /// The encrypted message a custom sender's code travels in.
 pub mod esdk;
+
+/// Which trigger one of a pool's messages is routed to: the one place that decision is taken.
+pub mod message_delivery;
 
 /// The pre-sign-up trigger, which every operation that registers an account has the pool's
 /// configured function evaluate that account before it is stored.

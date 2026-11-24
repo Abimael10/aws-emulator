@@ -322,8 +322,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The invitation message one create or resend sends: the user it is addressed to, and the
-/// temporary password it carries.
+/// The invitation message one create or resend sends: the user it is addressed to, the
+/// temporary password it carries, and the mediums it travels over.
 ///
 /// No `Debug`: the password it holds is a credential, and a type that carries one stays out
 /// of every formatter.
@@ -332,13 +332,15 @@ struct Invitation {
     /// The STORED username of the user invited, however the request named it.
     username: String,
     /// The temporary password the message carries, which is what its recipient signs in
-    /// with once.
-    temporary_password: String,
-    /// The custom senders this invitation is handed to: the DISTINCT senders of the mediums
-    /// the request asked for whose function the pool configures, since each sender is the
-    /// channel of its own medium and a medium carries one message however many times the
-    /// request names it.
-    senders: ::std::collections::BTreeSet<crate::state::lambda_triggers::custom_sender::Sender>,
+    /// with once. `None` where nothing is handed the credential itself: the pool delivers
+    /// the message over every medium asked for, and only a custom sender is handed the
+    /// password rather than a message worded around it.
+    temporary_password: Option<String>,
+    /// The mediums this invitation travels over: the DISTINCT mediums the request asked for,
+    /// since each medium carries one message however many times the request names it, and
+    /// each is routed to whatever the pool's `LambdaConfig` puts over its message
+    /// ([`crate::state::lambda_triggers::message_delivery`]).
+    mediums: ::std::collections::BTreeSet<crate::state::lambda_triggers::message_delivery::Sender>,
 }
 
 /// The `MessageActionType` value that sends no message at all: "set to SUPPRESS to suppress
@@ -428,44 +430,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         // send the welcome message. Specify SMS if the phone number will be used. The
         // default value is SMS" (`AdminCreateUser.DesiredDeliveryMediums`) — so the
         // invitation travels over each medium the request asked for, where it asked for a
-        // message at all. A pool whose `LambdaConfig` routes a medium's messages to a custom
-        // sender delivers it by handing the temporary password it carries to that function —
+        // message at all. What the pool's `LambdaConfig` puts over that message is what this
+        // emulator carries it on: a medium whose messages are ROUTED AWAY —
         // `CustomEmailSender` "rout[ing] all email notifications from a user pool to a
         // Lambda function" and `CustomSMSSender` "all SMS notifications ... to a Lambda
-        // function that delivers the message using custom logic" (this service's model) —
-        // which is the one channel this emulator carries a message over. The senders are the
-        // DISTINCT senders of the mediums asked for — a medium is one channel however many
-        // times the list names it, so the invitation is handed over once per medium — and
-        // there are two mediums in all ([`crate::state::DELIVERY_MEDIUM_ATTRIBUTES`]), so
-        // what this create hands over is bounded by them rather than by the request's size.
+        // function that delivers the message using custom logic" — hands the temporary
+        // password to that function, and a medium the pool delivers itself has its message
+        // WORDED by the pool's custom message function, which "returns a runtime-customized
+        // message subject and body for your user pool to deliver to a user" (this service's
+        // model). The mediums are the DISTINCT ones asked for — a medium is one channel
+        // however many times the list names it, so the invitation is carried once per medium
+        // — and there are two mediums in all ([`crate::state::DELIVERY_MEDIUM_ATTRIBUTES`]),
+        // so what this create fires is bounded by them rather than by the request's size.
         let sends_message = input.message_action.as_deref() != Some(SUPPRESS_MESSAGE);
         let requested_mediums = input
             .desired_delivery_mediums
             .clone()
             .unwrap_or_default();
-        let senders: ::std::collections::BTreeSet<
-            crate::state::lambda_triggers::custom_sender::Sender,
+        let mediums: ::std::collections::BTreeSet<
+            crate::state::lambda_triggers::message_delivery::Sender,
         > = requested_mediums
             .iter()
             .filter_map(|medium| {
-                crate::state::lambda_triggers::custom_sender::Sender::of_medium(medium)
+                crate::state::lambda_triggers::message_delivery::Sender::of_medium(medium)
             })
-            .filter(|sender| sender.configured_function(pool).is_some())
             .collect();
-        let delivers_invitation = sends_message && !senders.is_empty();
+        // The mediums whose messages this pool routes to a custom sender, which is what is
+        // handed the credential the invitation carries.
+        let hands_over_the_password = sends_message
+            && mediums
+                .iter()
+                .any(|sender| sender.configured_function(pool).is_some());
+        let words_the_message = sends_message
+            && !mediums.is_empty()
+            && crate::state::lambda_triggers::custom_message::configured(&pool.lambda_config)
+                .is_some();
+        let delivers_invitation = hands_over_the_password || words_the_message;
         // The credential the invitation carries: the one the request submitted, or — "if you
         // don't specify a value, Amazon Cognito generates one for you"
         // (`AdminCreateUser.TemporaryPassword`) — one the pool mints itself
         // ([`crate::state::UserPool::generated_temporary_password`]). It is minted only
-        // where the invitation that carries it is delivered: a password nothing can read
-        // would be a credential that does not exist.
+        // where something is HANDED it: a password nothing can read would be a credential
+        // that does not exist, and a function asked for the wording of a message is handed
+        // the placeholder the credential travels in rather than the credential.
         let temporary_password = match input
             .temporary_password
             .clone()
             .filter(|submitted| !submitted.is_empty())
         {
             Some(submitted) => Some(submitted),
-            None => delivers_invitation.then(|| pool.generated_temporary_password()),
+            None => hands_over_the_password.then(|| pool.generated_temporary_password()),
         };
         // Every attribute written has to be one the pool's schema declares.
         let requested_attributes = input.user_attributes.clone().unwrap_or_default();
@@ -670,13 +684,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 answer: Box::new(AdminCreateUserOutput {
                     user: Some(stored),
                 }),
-                invitation: temporary_password
-                    .filter(|_| delivers_invitation)
-                    .map(|temporary_password| Invitation {
-                        username,
-                        temporary_password,
-                        senders: senders.clone(),
-                    }),
+                invitation: delivers_invitation.then(|| Invitation {
+                    username,
+                    temporary_password,
+                    mediums: mediums.clone(),
+                }),
             });
         }
         if resend {
@@ -835,13 +847,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         Ok(Planned::Create(Box::new(Creating {
             user_pool_id: input.user_pool_id.clone(),
             key,
-            invitation: temporary_password
-                .filter(|_| delivers_invitation)
-                .map(|temporary_password| Invitation {
-                    username: user.username.clone(),
-                    temporary_password,
-                    senders,
-                }),
+            invitation: delivers_invitation.then(|| Invitation {
+                username: user.username.clone(),
+                temporary_password,
+                mediums,
+            }),
             user,
             dispatch,
             migrations,
@@ -849,15 +859,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         })))
     }
 
-    /// Deliver `invitation`, which on a pool that routes a medium's messages to a custom
-    /// sender means handing the temporary password it carries to the configured function —
-    /// one invocation per medium the create asked for.
+    /// Deliver `invitation` over each medium it travels on: on a medium whose messages the pool
+    /// routes to a custom sender that means handing the temporary password it carries to the
+    /// configured function, and on one the pool delivers itself it means asking the pool's
+    /// custom message function for the wording
+    /// ([`crate::state::lambda_triggers::message_delivery`]) — one invocation per medium.
     ///
     /// Called with this service's lock RELEASED, and with the account the invitation is for
     /// already stored: the message reports the user as the create or resend left it, and
     /// nothing else of this service waits on the function being invoked. A request that
-    /// sends no invitation, and a pool that configures no custom sender for the mediums it
-    /// asked for, hand over nothing.
+    /// sends no invitation, and a pool that puts no trigger over the mediums it asked for,
+    /// invoke nothing.
     async fn deliver_invitation(
         &self,
         input: &AdminCreateUserInput,
@@ -871,20 +883,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
-        for sender in &invitation.senders {
-            crate::state::lambda_triggers::custom_sender::fire(
-                ctx,
-                &state,
-                &input.user_pool_id,
-                &invitation.username,
-                *sender,
-                crate::state::lambda_triggers::custom_sender::Stage::AdminCreateUser,
-                caller,
-                input.client_metadata.as_ref(),
-                &invitation.temporary_password,
-            )
-            .await
-            .map_err(trigger_failed)?;
+        for sender in &invitation.mediums {
+            // The credential is handed to a custom sender and to nothing else, so a medium
+            // the pool delivers itself fires the invocation that asks only for the wording.
+            let fired = match invitation.temporary_password.as_deref() {
+                Some(temporary_password) => {
+                    crate::state::lambda_triggers::message_delivery::fire(
+                        ctx,
+                        &state,
+                        &input.user_pool_id,
+                        &invitation.username,
+                        *sender,
+                        crate::state::lambda_triggers::message_delivery::Stage::AdminCreateUser,
+                        caller,
+                        input.client_metadata.as_ref(),
+                        temporary_password,
+                    )
+                    .await
+                }
+                None => {
+                    crate::state::lambda_triggers::message_delivery::fire_wording(
+                        ctx,
+                        &state,
+                        &input.user_pool_id,
+                        &invitation.username,
+                        *sender,
+                        crate::state::lambda_triggers::message_delivery::Stage::AdminCreateUser,
+                        caller,
+                        input.client_metadata.as_ref(),
+                    )
+                    .await
+                }
+            };
+            fired.map_err(trigger_failed)?;
         }
         Ok(())
     }

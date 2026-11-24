@@ -230,23 +230,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
         // The update is written under this service's lock, and that lock is
-        // RELEASED before the pool's custom email sender is invoked: nothing else
+        // RELEASED before any of the pool's trigger functions is invoked: nothing else
         // of this service can be served while a function is being waited for.
         let issued = self.write_update(&input)?;
 
-        // A pool that routes a medium's messages to a custom sender delivers each code
-        // this update sent by handing it to that function instead of sending it — one
-        // invocation per message, each to the sender of the medium its own attribute is
-        // reached over. This operation is authorized by IAM credentials and names no app
-        // client, so the event reports none.
+        // Whatever this pool's `LambdaConfig` puts over each message this update sent is fired
+        // here — one invocation per message, over the medium its own attribute is reached
+        // over: a custom sender for that medium is handed the code and delivers it, and a pool
+        // that delivers the message itself has its custom message function word it
+        // ([`crate::state::lambda_triggers::message_delivery`]). This operation is authorized
+        // by IAM credentials and names no app client, so the event reports none.
         for code in issued {
-            crate::state::lambda_triggers::custom_sender::fire_over_medium(
+            crate::state::lambda_triggers::message_delivery::fire_over_medium(
                 ctx,
                 &state,
                 &input.user_pool_id,
                 &code.username,
                 &code.medium,
-                crate::state::lambda_triggers::custom_sender::Stage::UpdateUserAttribute,
+                crate::state::lambda_triggers::message_delivery::Stage::UpdateUserAttribute,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
                 input.client_metadata.as_ref(),
                 &code.code,

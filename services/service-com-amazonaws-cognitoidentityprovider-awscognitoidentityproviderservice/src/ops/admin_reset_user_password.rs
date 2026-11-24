@@ -211,18 +211,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // served while a function is being waited for.
         let issued = self.begin_reset(&input)?;
 
-        // A pool that routes a medium's messages to a custom sender delivers this code by
-        // handing it to that function instead of sending it. It is the same password-reset
-        // code `ForgotPassword` sends, so it is delivered under that stage's source, to the
-        // sender of the medium the reset message travelled over; this operation is
-        // authorized by IAM credentials and names no app client, so the event reports none.
-        crate::state::lambda_triggers::custom_sender::fire_over_medium(
+        // Whatever this pool's `LambdaConfig` puts over the reset message is fired here: a
+        // custom sender for the medium it travels over is handed the code and delivers it, and
+        // a pool that delivers the message itself has its custom message function word it
+        // ([`crate::state::lambda_triggers::message_delivery`]). It is the same password-reset
+        // code `ForgotPassword` sends, so it is fired under that stage's source, over the
+        // medium the reset message travelled on; this operation is authorized by IAM
+        // credentials and names no app client, so the event reports none.
+        crate::state::lambda_triggers::message_delivery::fire_over_medium(
             ctx,
             &state,
             &input.user_pool_id,
             &issued.username,
             &issued.medium,
-            crate::state::lambda_triggers::custom_sender::Stage::ForgotPassword,
+            crate::state::lambda_triggers::message_delivery::Stage::ForgotPassword,
             crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
             input.client_metadata.as_ref(),
             &issued.code,

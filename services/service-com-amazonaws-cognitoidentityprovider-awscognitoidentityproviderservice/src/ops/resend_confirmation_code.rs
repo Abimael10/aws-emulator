@@ -297,24 +297,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmatio
             ));
         }
         // The code is issued under this service's lock, and that lock is RELEASED before
-        // the pool's custom email sender is invoked: nothing else of this service can be
+        // any of the pool's trigger functions is invoked: nothing else of this service can be
         // served while a function is being waited for.
         let resent = self.resend(input)?;
 
-        // A pool that routes a medium's messages to a custom sender delivers this code by
-        // handing it to that function instead of sending it, with the app client this
-        // request named as the event's caller. Which sender receives it is decided by the
-        // medium the code travelled over. A request that issued no code at all — one naming
-        // a user the pool does not hold, answered with a simulated delivery — hands over
-        // nothing either.
+        // Whatever this pool's `LambdaConfig` puts over the message this resend sent is fired
+        // here, with the app client this request named as the event's caller: a custom sender
+        // for the medium it travels over is handed the code and delivers it, and a pool that
+        // delivers the message itself has its custom message function word it
+        // ([`crate::state::lambda_triggers::message_delivery`]). A request that issued no code
+        // at all — one naming a user the pool does not hold, answered with a simulated
+        // delivery — fires nothing either.
         if let Some(issued) = resent.issued {
-            crate::state::lambda_triggers::custom_sender::fire_over_medium(
+            crate::state::lambda_triggers::message_delivery::fire_over_medium(
                 ctx,
                 &state,
                 &issued.user_pool_id,
                 &issued.username,
                 &issued.medium,
-                crate::state::lambda_triggers::custom_sender::Stage::ResendCode,
+                crate::state::lambda_triggers::message_delivery::Stage::ResendCode,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
                 input.client_metadata.as_ref(),
                 &issued.code,

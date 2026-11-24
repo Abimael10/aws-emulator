@@ -57,6 +57,31 @@ Verbatim from the replay:
 - 'expected the call to be refused, but it succeeded: {HTTPStatusCode: 200}' (trigger with no invoke permission)
 - InvalidParameterException on SignUp: "Value 'sim2real-xsvc-stk-f5cec73b11a9-UserPoolClient-49CBDF9BFBC2' at 'clientId' failed to satisfy constraint"
 
+## Resolution
+
+Cause 2 — FIXED. A pool that configures `LambdaConfig.CustomMessage` now has that function asked
+for the wording of every message the pool itself delivers, before the message goes out, and the
+issuing operation is gated on that invocation
+(`src/state/lambda_triggers/custom_message.rs`, dispatched from the one place a message's trigger
+is chosen, `src/state/lambda_triggers/message_delivery.rs`). The replay check
+`cognito-custom-message-trigger-modifies-message` passes.
+
+Cause 3 — FIXED before this report was worked: `SignUp` accepts the `ClientId` a
+CloudFormation-created app client's `Ref` resolves to (the replay key
+`cognito-identity-provider|SignUp|InvalidParameterException` reads `fixed`).
+
+Cause 1 — FIXED before this report was worked, for every check of it that reaches a verdict: the
+seven units this cause lists all pass except `apigw-cognito-authorizer-missing-token-not-delivered`,
+whose own failure site has moved off the `401` assertion this issue keyed it by and into the
+check's fixed-window absence watch (`_stays_absent`, at `time.sleep(interval_s)`), which the
+harness kills at its 60 s cap. The gate's own answers are pinned by
+`services/service-com-amazonaws-apigateway-backplanecontrolservice/tests/all/stage_cognito_gate_spares_its_backend.rs`:
+`401` `{"message":"Unauthorized"}` for nothing presented at the identity source and for a value
+that is no verifiable pool token, the integration's own `200` for a token the authorizer's pool
+minted, never a `5xx`, and no backend run on a refused request. That remaining wall-clock failure
+is carried by `20261119T065828Z-apigateway-cognito-idp-lambda-a-request-with-no.md`, which owns
+that replay key.
+
 ## Steps to Reproduce
 1. CreateRestApi + a Lambda proxy integration + a COGNITO_USER_POOLS authorizer, CreateDeployment, then GET the stage URL with a valid ID token (expect 200) and with a tampered token (expect 401). Observe 500 for both.
 2. CreateUserPool with LambdaConfig.PreSignUp pointing at a function returning autoConfirmUser=true, then SignUp -> expect UserConfirmed=true.

@@ -498,7 +498,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> InitiateAuth<Eng>
             }
             USER_AUTH => {
                 // The code is minted under this service's lock, which this statement owns
-                // and releases: the pool's custom sender is invoked on no lock at all, like
+                // and releases: the pool's message trigger is invoked on no lock at all, like
                 // every other trigger of this service.
                 let (answer, issued) = email_otp_sign_in(
                     &mut state.lock(),
@@ -506,16 +506,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> InitiateAuth<Eng>
                     &auth_parameters,
                     now,
                 )?;
-                // A pool that routes a medium's messages to a custom sender delivers this
-                // one-time password by handing it to that function instead of sending it.
+                // Whatever this pool's `LambdaConfig` puts over the message this one-time
+                // password travels in is fired here: a custom sender for the medium it travels
+                // over is handed the code and delivers it, and a pool that delivers the
+                // message itself has its custom message function word it
+                // ([`crate::state::lambda_triggers::message_delivery`]).
                 if let Some(issued) = issued {
-                    crate::state::lambda_triggers::custom_sender::fire_over_attribute(
+                    crate::state::lambda_triggers::message_delivery::fire_over_attribute(
                         ctx,
                         &state,
                         &issued.user_pool_id,
                         &issued.username,
                         &issued.attribute,
-                        crate::state::lambda_triggers::custom_sender::Stage::Authentication,
+                        crate::state::lambda_triggers::message_delivery::Stage::Authentication,
                         caller,
                         client_metadata,
                         &issued.code,
@@ -837,19 +840,21 @@ async fn password_sign_in(
                     code,
                 },
             );
-            // A pool that routes a medium's messages to a custom sender delivers
-            // a one-time password it sent over that medium by handing it to the
-            // configured function instead of sending it, as the challenge of the
-            // choice-based flow does. Which sender receives it is decided by the
-            // attribute the challenge addressed its message to.
+            // Whatever this pool's `LambdaConfig` puts over the message a one-time
+            // password it sent travels in is fired here, as the challenge of the
+            // choice-based flow does: a custom sender for the medium is handed the code
+            // and delivers it, and a pool that delivers the message itself has its custom
+            // message function word it
+            // ([`crate::state::lambda_triggers::message_delivery`]). Which medium that is
+            // was decided by the attribute the challenge addressed its message to.
             if let Some((delivered, attribute)) = delivered {
-                crate::state::lambda_triggers::custom_sender::fire_over_attribute(
+                crate::state::lambda_triggers::message_delivery::fire_over_attribute(
                     ctx,
                     store,
                     &user_pool_id,
                     &username,
                     &attribute,
-                    crate::state::lambda_triggers::custom_sender::Stage::Authentication,
+                    crate::state::lambda_triggers::message_delivery::Stage::Authentication,
                     caller,
                     client_metadata,
                     &delivered,

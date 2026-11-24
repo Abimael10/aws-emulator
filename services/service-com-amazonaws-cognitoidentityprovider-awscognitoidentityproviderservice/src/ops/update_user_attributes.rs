@@ -319,11 +319,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|pool| pool.apply_attribute_update(&plan, now))
                 .ok_or_else(internal_error)?;
 
-            // A pool that routes a medium's messages to a custom sender delivers each code
-            // this update sent by handing it to that function instead of sending it — one
-            // invocation per message, read back from the codes the write recorded, each to
-            // the sender of the medium its own attribute is reached over. The app client is
-            // the one the access token was issued to, since this operation names none.
+            // Whatever this pool's `LambdaConfig` puts over each message this update sent is
+            // fired here — one invocation per message, read back from the codes the write
+            // recorded, over the medium its own attribute is reached over: a custom sender for
+            // that medium is handed the code and delivers it, and a pool that delivers the
+            // message itself has its custom message function word it
+            // ([`crate::state::lambda_triggers::message_delivery`]). The app client is the one
+            // the access token was issued to, since this operation names none.
             let client_id = guard
                 .token(&input.access_token)
                 .map(|record| record.client_id.clone());
@@ -337,14 +339,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &crate::state::CodePurpose::AttributeVerification(attribute.clone()),
                     )?;
                     let sender =
-                        crate::state::lambda_triggers::custom_sender::Sender::of_attribute(
+                        crate::state::lambda_triggers::message_delivery::Sender::of_attribute(
                             attribute,
                         )?;
-                    crate::state::lambda_triggers::custom_sender::pending(
+                    crate::state::lambda_triggers::message_delivery::pending(
                         pool,
                         user,
                         sender,
-                        crate::state::lambda_triggers::custom_sender::Stage::UpdateUserAttribute,
+                        crate::state::lambda_triggers::message_delivery::Stage::UpdateUserAttribute,
                         crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
                         input.client_metadata.as_ref(),
                         &issued.code,
@@ -355,7 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         for invocation in pending {
-            crate::state::lambda_triggers::custom_sender::invoke(ctx, invocation)
+            crate::state::lambda_triggers::message_delivery::invoke(ctx, invocation)
                 .await
                 .map_err(trigger_failed)?;
         }

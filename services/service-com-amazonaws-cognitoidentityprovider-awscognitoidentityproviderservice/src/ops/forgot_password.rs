@@ -339,20 +339,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
             }
         };
 
-        // A pool that routes a medium's messages to a custom sender delivers this code by
-        // handing it to that function instead of sending it, with the app client this
-        // request named as the event's caller. Which sender receives it is decided by the
-        // medium the reset message travelled over — the recovery destination this pool
-        // chose. A request that issued no code at all — one naming a user the pool does not
-        // hold, answered with a simulated delivery — hands over nothing either.
+        // Whatever this pool's `LambdaConfig` puts over the reset message is fired here, with
+        // the app client this request named as the event's caller: a custom sender for the
+        // medium it travels over is handed the code and delivers it, and a pool that delivers
+        // the message itself has its custom message function word it
+        // ([`crate::state::lambda_triggers::message_delivery`]). Which medium that is was
+        // decided by the recovery destination this pool chose. A request that issued no code at
+        // all — one naming a user the pool does not hold, answered with a simulated delivery —
+        // fires nothing either.
         if let Some(issued) = asked.issued {
-            crate::state::lambda_triggers::custom_sender::fire_over_medium(
+            crate::state::lambda_triggers::message_delivery::fire_over_medium(
                 ctx,
                 &state,
                 &issued.user_pool_id,
                 &issued.username,
                 &issued.medium,
-                crate::state::lambda_triggers::custom_sender::Stage::ForgotPassword,
+                crate::state::lambda_triggers::message_delivery::Stage::ForgotPassword,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
                 input.client_metadata.as_ref(),
                 &issued.code,

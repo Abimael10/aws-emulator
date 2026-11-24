@@ -637,20 +637,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                         issued_by: crate::state::SessionIssuer::SignIn,
                     },
                 );
-                // A pool that routes a medium's messages to a custom sender
-                // delivers a one-time password it sent over that medium by
-                // handing it to the configured function instead of sending it,
-                // as the client-side sign-in does for the one-time password of
-                // its own challenge. Which sender receives it is decided by the
-                // attribute the challenge addressed its message to.
+                // Whatever this pool's `LambdaConfig` puts over the message a one-time
+                // password it sent travels in is fired here, as the client-side
+                // sign-in does for the one-time password of its own challenge: a
+                // custom sender for the medium is handed the code and delivers it,
+                // and a pool that delivers the message itself has its custom message
+                // function word it
+                // ([`crate::state::lambda_triggers::message_delivery`]). Which medium
+                // that is was decided by the attribute the challenge addressed its
+                // message to.
                 if let Some((delivered, attribute)) = delivered {
-                    crate::state::lambda_triggers::custom_sender::fire_over_attribute(
+                    crate::state::lambda_triggers::message_delivery::fire_over_attribute(
                         ctx,
                         &state,
                         &input.user_pool_id,
                         &username,
                         &attribute,
-                        crate::state::lambda_triggers::custom_sender::Stage::Authentication,
+                        crate::state::lambda_triggers::message_delivery::Stage::Authentication,
                         caller,
                         client_metadata,
                         &delivered,
