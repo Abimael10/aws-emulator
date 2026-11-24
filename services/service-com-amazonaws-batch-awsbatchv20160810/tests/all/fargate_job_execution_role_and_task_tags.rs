@@ -284,7 +284,11 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, String)
 }
 
 /// The text of the first `<name>` element of an XML answer: the id Amazon EC2 minted.
-fn element(xml: &str, name: &str) -> String {
+///
+/// `pub(crate)` because every suite of this one test binary that stands a network up through
+/// Amazon EC2's own `ec2Query` API reads the minted ids the same way, so the reading lives
+/// here once rather than in each of them.
+pub(crate) fn element(xml: &str, name: &str) -> String {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let from = xml
