@@ -44,6 +44,14 @@
 //! The socket's life is the load balancer's: the handle is held on the store under the load
 //! balancer's ARN, and dropping it (the delete) closes the port and severs every connection
 //! in flight on it.
+//!
+//! WHICH KINDS of connection that address accepts is the load balancer's own LISTENERS to say,
+//! and it is stated beside the address ([`ListenerKinds`]): a connection in the clear reaches a
+//! listener that terminates no TLS and an encrypted one reaches a listener that does, so a kind
+//! this load balancer holds no listener for is a connection nothing accepts there. A client of
+//! this emulator that knows the kind it is about to open — an origin fetch addressed `http://`
+//! or `https://` — reads that statement and is told the connection cannot be made, instead of
+//! being answered by a listener it never reached.
 
 use std::sync::{Arc, OnceLock};
 
@@ -90,6 +98,40 @@ impl LoadBalancerEndpoint {
     /// it has minted the ARN. Called once; a second call changes nothing.
     pub fn serves(&self, load_balancer_arn: &str) {
         let _ = self.load_balancer.set(load_balancer_arn.to_string());
+    }
+}
+
+/// Which kinds of connection ONE load balancer's published address accepts, read from this
+/// service's own records on every question.
+///
+/// `LoadBalancer$DNSName` is the address a client dials, and what answers there are the load
+/// balancer's LISTENERS: a connection in the clear reaches a listener that terminates no TLS
+/// and an encrypted one reaches a listener that does
+/// ([`crate::service::listener_socket::listener_reached`], the one reading of that question).
+/// A kind the load balancer holds no listener for is a connection nothing accepts at that
+/// address, so a client of this emulator that knows which kind it is about to open is told so
+/// rather than being answered by a listener it never reached
+/// ([`::service_common::dialable_data_planes::AcceptsConnections`]).
+struct ListenerKinds {
+    /// The load balancer this socket serves, published once the create that opened it has
+    /// minted the ARN. Before then the address accepts nothing: there is no load balancer to
+    /// read listeners off.
+    load_balancer: Arc<OnceLock<String>>,
+    /// The ONE shared store the control plane writes, so the answer is the listener
+    /// configuration a create, a modify or a delete has just persisted.
+    state: ::engine::ServiceState<super::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State>,
+}
+
+impl ::service_common::dialable_data_planes::AcceptsConnections for ListenerKinds {
+    fn accepts_connection(&self, encrypted: bool) -> bool {
+        let Some(load_balancer_arn) = self.load_balancer.get() else {
+            return false;
+        };
+        let store = self.state.lock();
+        let Some(record) = store.load_balancers.get(load_balancer_arn) else {
+            return false;
+        };
+        crate::service::listener_socket::listener_reached(&store, record, encrypted).is_some()
     }
 }
 
@@ -146,7 +188,17 @@ pub async fn open_load_balancer_endpoint<Eng: Send + Sync + 'static>(
     // does on the socket, so the record carries no TLS upgrader of its own.
     let dialable =
         ::service_common::dialable_data_planes::DialablePlanes::of(engine).map(|planes| {
-            let plane = ::service_common::dialable_data_planes::served_in_process(served, None);
+            // Which kinds of connection that address accepts is the load balancer's own
+            // listeners to say ([`ListenerKinds`]), so a client that dials a kind this load
+            // balancer has no listener for is answered as one dialling a port nothing listens
+            // on — rather than by whichever listener it does have.
+            let accepts = Arc::new(ListenerKinds {
+                load_balancer: Arc::clone(&load_balancer),
+                state: shared.state::<super::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State>(),
+            });
+            let plane = ::service_common::dialable_data_planes::served_in_process_accepting(
+                served, None, accepts,
+            );
             planes.opening([authority.clone()], super::SERVICE_NAMESPACE, &plane)
         });
     Some(LoadBalancerEndpoint {

@@ -99,6 +99,16 @@
 //! no HTTPS at all, so an origin over one of those is reachable over plaintext and
 //! unreachable over TLS ([`origin_accepts_scheme`]).
 //!
+//! An origin whose endpoint is one this emulator opened for a RESOURCE of its own — a load
+//! balancer's `DNSName`, any other published per-resource address — is the one case where the
+//! endpoint accepts a connection of one kind and not of the other: those listeners answer the
+//! kinds the resource's own configuration gives them, so the port `OriginProtocolPolicy`
+//! chose either has a listener behind it or has none ([`origin_connection_opens`]). An origin
+//! request of a kind nothing there accepts is never sent, and the viewer is answered the `504`
+//! CloudFront answers for an origin connection that never came about — which is also what a
+//! request the origin accepted and then left unanswered within its read timeout gets. Neither
+//! carries a byte of the origin's content.
+//!
 //! One origin shape is worth naming because it is the one the Lambda-function-URL
 //! topology uses: a function URL host is served by Lambda's own function-URL data plane
 //! (`services/service-com-amazonaws-lambda-awsgirapiservice/src/service/function_url.rs`),
@@ -389,6 +399,13 @@ const HTTPS_DEFAULT_PORT: i32 = 443;
 /// origin.
 const BAD_GATEWAY: u16 = 502;
 
+/// The status a viewer request gets when the origin CONNECTION was never completed: CloudFront
+/// "can't connect to the origin" — the origin accepted no connection of the kind the origin's
+/// protocol policy opens, or closed it — and the one it gets when the origin accepted the
+/// request and then did not answer within the read timeout. Both are the same thing to a
+/// viewer: no answer came from the origin at all.
+const GATEWAY_TIMEOUT: u16 = 504;
+
 /// The status a viewer request gets when the CloudFront function the matched behaviour
 /// associates produced no event object for the edge to continue from — it raised, it did not
 /// compile, it returned something that is no event object, or a bound of the runtime stopped
@@ -424,6 +441,14 @@ const BAD_REQUEST: u16 = 400;
 /// The detail line CloudFront's generated page carries when it could not reach the
 /// origin, from CloudFront's own troubleshooting of a 502.
 const NO_ORIGIN_DETAIL: &str = "CloudFront wasn't able to connect to the origin.";
+
+/// The detail line CloudFront's generated page carries when the origin CONNECTION itself did
+/// not come about, which is what the viewer is told for every answer under
+/// [`GATEWAY_TIMEOUT`]: the attempt to open it failed, the origin closed it, or no response
+/// arrived on it in time.
+const NO_ORIGIN_CONNECTION_DETAIL: &str =
+    "CloudFront attempted to establish a connection with the origin, but either the attempt \
+     failed or the origin closed the connection.";
 
 /// The detail line CloudFront's generated page carries for a viewer its geographic
 /// restriction refuses.
@@ -2733,6 +2758,62 @@ fn origin_accepts_scheme(uri: &str) -> bool {
     !names_a_service_endpoint(host)
 }
 
+/// Whether a connection of the kind an origin request is addressed over can be OPENED to the
+/// endpoint it names at all — the question the port the protocol policy chose decides, and the
+/// one only the endpoint's owner can answer.
+///
+/// An origin whose `DomainName` is an address this emulator opened for one of its own resources
+/// — a load balancer's `DNSName`, any other published per-resource endpoint — is reached at
+/// that resource's own listeners, and WHICH kinds of connection those listeners answer is the
+/// owning service's to say ([`::service_common::dialable_data_planes::AcceptsConnections`]): a
+/// load balancer admits a connection in the clear where it has a listener that terminates no
+/// TLS and an encrypted one where it has a listener that does, and a kind it holds no listener
+/// for is a connection it never accepts — which is the position an origin port a security group
+/// does not admit is in. That is what `OriginProtocolPolicy` decides between: `http-only`
+/// opens the connection in the clear on `HTTPPort`, `https-only` an encrypted one on
+/// `HTTPSPort`, and `match-viewer` whichever the viewer itself dialled ([`origin_uri`]).
+///
+/// `true` for every address no such plane answers at: an AWS service endpoint, a bucket's
+/// website surface and a host of nobody's are not per-resource endpoints, and whether the
+/// scheme reaches them is [`origin_accepts_scheme`]'s question, while an origin nothing serves
+/// at all is reported by the fetch itself.
+fn origin_connection_opens<Eng: Send + Sync + 'static>(engine: &Eng, uri: &str) -> bool {
+    let Some((scheme, _rest)) = uri.split_once("://") else {
+        return true;
+    };
+    let Some(authority) = authority_of(uri) else {
+        return true;
+    };
+    let Some(port) = origin_port(authority, scheme) else {
+        return true;
+    };
+    let Some(planes) = ::service_common::dialable_data_planes::DialablePlanes::of(engine) else {
+        return true;
+    };
+    let host = bare_host(authority);
+    let Some(dialed) = planes.dialable(host, port) else {
+        return true;
+    };
+    dialed
+        .plane
+        .accepts_connection(!scheme.eq_ignore_ascii_case(PLAINTEXT_SCHEME))
+}
+
+/// The port an origin request is addressed at: the one the authority states, and the default
+/// port of its scheme otherwise.
+///
+/// `None` for an authority whose port is no port at all, which addresses nothing.
+fn origin_port(authority: &str, scheme: &str) -> Option<u16> {
+    if !states_a_port(authority) {
+        let default = match scheme.eq_ignore_ascii_case(PLAINTEXT_SCHEME) {
+            true => HTTP_DEFAULT_PORT,
+            false => HTTPS_DEFAULT_PORT,
+        };
+        return u16::try_from(default).ok();
+    }
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
 /// Whether `host` is an AWS SERVICE ENDPOINT of this emulator: a host the front door
 /// resolves a service from ([`service_named_by_host`]) in one of the zones AWS serves its
 /// service endpoints in.
@@ -3141,6 +3222,15 @@ impl Fetched {
 /// The fetch goes through the transport `OperationContext::callback` hands this handler,
 /// so an origin this emulator serves answers it in process. An origin that answers
 /// nothing at all is reported as CloudFront reports an origin it could not reach.
+///
+/// The CONNECTION comes first: an origin endpoint that accepts no connection of the kind this
+/// origin's protocol policy opens ([`origin_connection_opens`]) is one no request is sent to at
+/// all, and the viewer is answered the [`GATEWAY_TIMEOUT`] CloudFront answers for a connection
+/// that never came about. `ConnectionAttempts` buys nothing against it — "the number of times
+/// that CloudFront attempts to connect to the origin" over an endpoint that admits the kind
+/// not at all is the same refusal each time — and `ConnectionTimeout`, "the number of seconds
+/// that CloudFront waits when trying to establish a connection to the origin", bounds a wait
+/// that is already over: nothing was dialled, so there is nothing to wait for.
 async fn fetch_origin<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
@@ -3150,6 +3240,18 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
     received: Instant,
 ) -> Fetched {
     let mut fetch = fetch;
+    if !origin_connection_opens(engine, &fetch.uri) {
+        ::tracing::warn!(
+            uri = %fetch.uri,
+            "the origin endpoint accepts no connection of the kind this origin's protocol \
+             policy opens, so no origin request was made"
+        );
+        return Fetched::of_cloudfront(generated(
+            GATEWAY_TIMEOUT,
+            NO_ORIGIN_CONNECTION_DETAIL,
+            cf_id,
+        ));
+    }
     let body = match fetch.body.take() {
         // The body the edge produced for the origin: the viewer's own, with the fields the
         // behaviour's field-level encryption configuration designates replaced by ciphertext
@@ -3265,7 +3367,11 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
                 timeout_seconds = fetch.read_timeout.as_secs(),
                 "the origin did not answer within its read timeout"
             );
-            return Fetched::of_cloudfront(generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id));
+            return Fetched::of_cloudfront(generated(
+                GATEWAY_TIMEOUT,
+                NO_ORIGIN_CONNECTION_DETAIL,
+                cf_id,
+            ));
         }
         Ok(Err(error)) => {
             ::tracing::warn!(
@@ -3273,7 +3379,11 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the configured origin could not be reached"
             );
-            return Fetched::of_cloudfront(generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id));
+            return Fetched::of_cloudfront(generated(
+                GATEWAY_TIMEOUT,
+                NO_ORIGIN_CONNECTION_DETAIL,
+                cf_id,
+            ));
         }
         Ok(Ok(response)) => response,
     };

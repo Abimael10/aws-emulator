@@ -57,11 +57,42 @@ use ::emulator_server::{ListenerConn, NativeHandler, TlsUpgrader};
 /// (`service_com_amazonaws_lambda_awsgirapiservice::state::execution::guest_socket`).
 const CONNECTION_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Which KINDS of connection a plane accepts, where it does not accept every kind.
+///
+/// A plane that reads byte 0 itself answers both a connection in the clear and one that opens
+/// with a TLS handshake, which is what every plane recorded through [`served_in_process`]
+/// does. A plane whose resource answers only SOME of them states which with
+/// [`served_in_process_accepting`]: a load balancer serves a connection in the clear from a
+/// listener that terminates no TLS and an encrypted one from a listener that does, so a kind
+/// it holds no listener for is a connection it never accepts.
+///
+/// Implemented over the OWNING service's own records and asked on every question, so a
+/// resource whose listeners have changed is answered out of what it holds now.
+pub trait AcceptsConnections: Send + Sync + 'static {
+    /// Whether a connection of this kind can be opened to this plane at all — `encrypted` for
+    /// one that opens with a TLS handshake, and in the clear otherwise.
+    fn accepts_connection(&self, encrypted: bool) -> bool;
+}
+
 /// A data plane an in-process client may open a connection to.
 ///
 /// Implemented by [`served_in_process`] for a plane served by a core listener's own protocol
 /// handler, which is every plane this emulator opens.
 pub trait DialablePlane: Send + Sync + 'static {
+    /// Whether a connection of this kind would be accepted at all ([`AcceptsConnections`]),
+    /// for a client that knows which kind it is about to open — an HTTP client dialling
+    /// `http://` or `https://`, as opposed to a client that writes raw bytes and learns the
+    /// answer from the plane closing the connection.
+    ///
+    /// `true` unless the owning service stated otherwise, which is what a plane that reads
+    /// byte 0 itself accepts. [`DialablePlane::dial`] opens the connection either way: a
+    /// client that does not state a kind is answered by the plane's own handler, which is
+    /// where a connection it will not serve is closed.
+    fn accepts_connection(&self, encrypted: bool) -> bool {
+        let _ = encrypted;
+        true
+    }
+
     /// Open ONE connection to this plane: the stream answered is the CLIENT end of a pipe
     /// whose other end this plane's own handler is serving, so the bytes written to it are
     /// the bytes that handler reads, and the bytes it writes are the ones read back.
@@ -98,6 +129,10 @@ pub fn connected_from() -> Option<SocketAddr> {
 
 /// A plane served by the protocol handler of a core listener: the ONE kind this emulator has.
 struct ServedInProcess<H> {
+    /// Which kinds of connection the resource behind this plane accepts, where its owning
+    /// service stated them ([`served_in_process_accepting`]); `None` for a plane that accepts
+    /// every kind.
+    accepts: Option<Arc<dyn AcceptsConnections>>,
     /// The handler the core runs for every connection accepted on the listener, shared with
     /// the listener itself — so a connection opened here is served by the very handler that
     /// serves a client dialling the published address, over the same resource state.
@@ -112,6 +147,12 @@ struct ServedInProcess<H> {
 }
 
 impl<H: NativeHandler> DialablePlane for ServedInProcess<H> {
+    fn accepts_connection(&self, encrypted: bool) -> bool {
+        self.accepts
+            .as_ref()
+            .is_none_or(|accepts| accepts.accepts_connection(encrypted))
+    }
+
     fn dial(
         &self,
         from: Option<SocketAddr>,
@@ -154,7 +195,31 @@ pub fn served_in_process<H: NativeHandler>(
     handler: Arc<H>,
     tls: Option<TlsUpgrader>,
 ) -> Arc<dyn DialablePlane> {
-    Arc::new(ServedInProcess { handler, tls })
+    Arc::new(ServedInProcess {
+        accepts: None,
+        handler,
+        tls,
+    })
+}
+
+/// The same plane, for a resource that accepts only SOME kinds of connection: `accepts` is
+/// asked which, over the owning service's own records ([`AcceptsConnections`]).
+///
+/// What it answers is read by a client that knows the kind it is about to open
+/// ([`DialablePlane::accepts_connection`]); the handler still serves every connection
+/// [`DialablePlane::dial`] opens, so a client that states no kind is answered exactly as it is
+/// on the resource's own socket.
+#[must_use]
+pub fn served_in_process_accepting<H: NativeHandler>(
+    handler: Arc<H>,
+    tls: Option<TlsUpgrader>,
+    accepts: Arc<dyn AcceptsConnections>,
+) -> Arc<dyn DialablePlane> {
+    Arc::new(ServedInProcess {
+        accepts: Some(accepts),
+        handler,
+        tls,
+    })
 }
 
 /// ONE protocol handler served at BOTH ends of a resource's data plane: the listener the core
@@ -542,6 +607,41 @@ mod tests {
             planes.is_empty(),
             "expected no address to be left open, got {planes:?}"
         );
+    }
+
+    /// A resource that answers an ENCRYPTED connection and nothing in the clear, for the rows
+    /// below.
+    struct OnlyEncrypted;
+
+    impl AcceptsConnections for OnlyEncrypted {
+        fn accepts_connection(&self, encrypted: bool) -> bool {
+            encrypted
+        }
+    }
+
+    /// RULE: a plane accepts every kind of connection unless its owning service stated which
+    /// kinds it accepts, and then it accepts exactly those.
+    ///
+    /// The rows span what the reading generalises over: both kinds of connection, against a
+    /// plane that reads byte 0 itself and one whose resource answers one kind alone.
+    #[test]
+    fn a_plane_accepts_the_kinds_of_connection_its_service_stated() {
+        let reads_byte_zero = served_in_process(Arc::new(Answering), None);
+        let one_kind =
+            served_in_process_accepting(Arc::new(Answering), None, Arc::new(OnlyEncrypted));
+        let rows: &[(&str, &Arc<dyn DialablePlane>, bool, bool)] = &[
+            ("a plane that negotiates in band, in the clear", &reads_byte_zero, false, true),
+            ("a plane that negotiates in band, encrypted", &reads_byte_zero, true, true),
+            ("a resource answering encrypted connections alone, in the clear", &one_kind, false, false),
+            ("the same resource, encrypted", &one_kind, true, true),
+        ];
+        for (case, plane, encrypted, expected) in rows {
+            let accepted = plane.accepts_connection(*encrypted);
+            assert_eq!(
+                accepted, *expected,
+                "case {case:?}: expected accepts_connection {expected}, got {accepted}"
+            );
+        }
     }
 
     /// An engine this emulator did not build vends no records, so an address resolves to

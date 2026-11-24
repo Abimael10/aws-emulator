@@ -134,6 +134,46 @@ fn cleartext_protocols(family: crate::state::LoadBalancerFamily) -> &'static [&'
     }
 }
 
+/// The listener of `record` that a connection of one kind REACHES: the lowest-numbered listener
+/// that answers such a connection — the port a load balancer's first listener is given.
+///
+/// A connection in the clear is served by a listener that terminates no TLS, and a TLS
+/// connection by one that does, which is the bracket the model puts on a listener's
+/// certificates and security policy ([`crate::state::terminates_tls`]); WHICH protocols carry a
+/// connection in the clear is the load balancer's own family's ([`cleartext_protocols`]) — an
+/// Application Load Balancer's `HTTP` listener, and a Network Load Balancer's `TCP` one.
+///
+/// `None` for a load balancer that has no listener for the kind at all, which is a connection
+/// it never accepts: a TLS connection to a load balancer that terminates no TLS has no
+/// certificate to present and no rules to evaluate, so there is nothing to serve on it. The ONE
+/// reading of that question, for the socket that serves such a connection ([`ListenerSocket`])
+/// and for the statement of which kinds the published address accepts
+/// ([`crate::state::LoadBalancerEndpoint`]).
+pub(crate) fn listener_reached<'s>(
+    store: &'s ElbState,
+    record: &crate::state::LoadBalancerRecord,
+    tls: bool,
+) -> Option<&'s crate::state::ListenerRecord> {
+    let mut listeners: Vec<&crate::state::ListenerRecord> = record
+        .listener_arns
+        .iter()
+        .filter_map(|arn| store.listeners.get(arn))
+        .filter(|listener| match tls {
+            true => crate::state::terminates_tls(listener.protocol.as_deref()),
+            false => listener
+                .protocol
+                .as_deref()
+                .is_some_and(|protocol| cleartext_protocols(record.family()).contains(&protocol)),
+        })
+        .collect();
+    listeners.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then_with(|| left.arn.cmp(&right.arn))
+    });
+    listeners.first().copied()
+}
+
 /// How many request BODIES this service reads at once across every load balancer's socket:
 /// the core's own HTTP in-flight cap, one permit per request, taken before a byte of a body
 /// is read and released when the answer is written.
@@ -533,32 +573,7 @@ impl ListenerSocket {
         ) = {
             let store = self.state.lock();
             let record = store.load_balancers.get(load_balancer_arn)?;
-            // Every listener of this load balancer that answers a connection of this kind,
-            // lowest port first — the port its first listener is given.
-            let mut listeners: Vec<&crate::state::ListenerRecord> = record
-                .listener_arns
-                .iter()
-                .filter_map(|arn| store.listeners.get(arn))
-                .filter(|listener| {
-                    // A connection in the clear is served by a listener that terminates no
-                    // TLS, and a TLS connection by one that does — which is the bracket the
-                    // model puts on a listener's certificates and security policy
-                    // ([`crate::state::terminates_tls`]). WHICH protocols carry a connection
-                    // in the clear is the load balancer's own family's
-                    // ([`cleartext_protocols`]): an Application Load Balancer's `HTTP`
-                    // listener, and a Network Load Balancer's `TCP` one.
-                    match tls {
-                        true => crate::state::terminates_tls(listener.protocol.as_deref()),
-                        false => listener.protocol.as_deref().is_some_and(|protocol| {
-                            cleartext_protocols(record.family()).contains(&protocol)
-                        }),
-                    }
-                })
-                .collect();
-            listeners.sort_by(|left, right| {
-                left.port.cmp(&right.port).then_with(|| left.arn.cmp(&right.arn))
-            });
-            let listener = listeners.first().copied()?;
+            let listener = listener_reached(&store, record, tls)?;
             (
                 record.name.clone(),
                 listener.port,
