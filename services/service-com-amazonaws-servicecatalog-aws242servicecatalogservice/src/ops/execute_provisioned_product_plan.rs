@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteProvisionedProductPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteProvisionedProductPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteProvisionedProductPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -148,18 +138,257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteProvisionedProductPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteProvisionedProductPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let now = std::time::SystemTime::now();
+
+        // What this execution needs about the plan, resolved under the lock — which is
+        // RELEASED before the change set behind the plan is read, so no store lock is
+        // held across an await.
+        let (change_set, plan_region) = {
+            let mut state = state.lock();
+
+            // A provisioned product whose termination the clock has settled stopped
+            // existing at that instant — and so did the plan that planned a change to it
+            // — so those entries are dropped before anything is resolved.
+            state.forget_terminated_provisioned_products(now);
+
+            // The plan is addressed by id alone. A plan whose provisioned product no
+            // longer exists plans the change of a resource that is gone, so it does not
+            // resolve either and takes exactly the refusal a read of it takes.
+            let plan = match state.provisioned_product_plan(&input.plan_id, now) {
+                Some(plan) => plan,
+                None => return Err(plan_not_found(&input.plan_id)),
+            };
+
+            // A plan is executed ONCE: "you can create one plan for each provisioned
+            // product", and executing it carries its resource changes out. So a plan
+            // something has already executed is in no state to be executed again — and
+            // `IdempotencyToken` is `@idempotencyToken`, so a REPEAT of the request that
+            // executed it answers that execution's own record instead of carrying the
+            // same change out twice.
+            if let Some(execution) = plan.execution.as_ref() {
+                if execution.idempotency_token == input.idempotency_token {
+                    if let Some(record) = state.records.get(&execution.record_id) {
+                        return Ok(ExecuteProvisionedProductPlanOutput {
+                            record_detail: Some(record.detail(now)),
+                        });
+                    }
+                }
+                let (status, _) = state
+                    .executed_plan_status(plan, now)
+                    .unwrap_or((crate::state::PLAN_STATUS_EXECUTE_SUCCESS, None));
+                return Err(invalid_state(not_executable(&input.plan_id, status)));
+            }
+
+            (plan.change_set.clone(), plan.region.clone())
+        };
+
+        // "A plan includes the list of resources to be created ... when the plan is
+        // executed", and that list is the change set CloudFormation computed: the plan's
+        // status is that change set's status, so whether the plan CAN be executed is
+        // asked of CloudFormation rather than derived here. A plan whose change set is
+        // still being computed, or that CloudFormation could not plan at all, has no
+        // settled list of changes to carry out.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteProvisionedProductPlan"))
+        // The read is dispatched IN PROCESS, by the framework's callback connector, to
+        // the CloudFormation mounted beside this service, in the Region the plan was
+        // created in — where its change set lives, whatever Region THIS request was
+        // signed for (`crate::state::in_process_cloudformation`).
+        let report = crate::state::plan_report(ctx, &plan_region, change_set.as_ref()).await;
+        let change_set_id = match (report.status.as_str(), &change_set) {
+            (
+                crate::state::PLAN_STATUS_CREATE_SUCCESS,
+                Some(crate::state::PlanChangeSet::Created(id)),
+            ) => id.clone(),
+            (status, _) => return Err(invalid_state(not_executable(&input.plan_id, status))),
+        };
+
+        // Everything this execution records is written under the lock, which is released
+        // again before the change set is executed: the plan and the provisioned product
+        // are re-resolved first, because the store was unlocked while the change set was
+        // read.
+        let (provisioned_product_id, record_id, record_detail, executed) = {
+            let mut state = state.lock();
+            let plan = match state.provisioned_product_plan(&input.plan_id, now) {
+                Some(plan) if plan.execution.is_none() => plan.clone(),
+                Some(plan) => {
+                    let (status, _) = state
+                        .executed_plan_status(plan, now)
+                        .unwrap_or((crate::state::PLAN_STATUS_EXECUTE_SUCCESS, None));
+                    return Err(invalid_state(not_executable(&input.plan_id, status)));
+                }
+                None => return Err(plan_not_found(&input.plan_id)),
+            };
+            let Some(provisioned) = state.provisioned_product(&plan.provisioned_product_id, now)
+            else {
+                return Err(plan_not_found(&input.plan_id));
+            };
+
+            // The change is carried out ON the provisioned product, so that provisioned
+            // product has to be in a state to take it: one whose last operation is still
+            // in flight is being changed already, and there is nothing settled for the
+            // planned change to be applied to.
+            let provisioned_status = state.provisioned_product_status(provisioned, now);
+            if !crate::state::PLAN_EXECUTABLE_PROVISIONED_PRODUCT_STATUSES
+                .contains(&provisioned_status)
+            {
+                return Err(invalid_state(format!(
+                    "A plan cannot be executed for provisioned product {} in status \
+                     {provisioned_status}.",
+                    provisioned.name
+                )));
+            }
+
+            // "Provisions or modifies a product based on the resource changes for the
+            // specified plan": WHICH of the two this execution is, is what the record
+            // type says. A provisioned product the plan itself brought into existence has
+            // had no operation performed on it — its resources "have not yet been
+            // created" — so executing the plan PROVISIONS it; a provisioned product that
+            // was already provisioned is MODIFIED by the same execution.
+            let record_type = if provisioned.plan_created {
+                crate::state::RECORD_TYPE_PROVISION_PRODUCT
+            } else {
+                crate::state::RECORD_TYPE_UPDATE_PROVISIONED_PRODUCT
+            };
+            let provisioned_product_name = provisioned.name.clone();
+            let provisioned_product_type = provisioned.r#type.clone();
+            let provisioned_product_arn = provisioned.arn.clone();
+
+            let record_id = state.next_record_id();
+            let record = crate::state::Record {
+                id: record_id.clone(),
+                record_type: record_type.to_string(),
+                provisioned_product_id: plan.provisioned_product_id.clone(),
+                provisioned_product_name,
+                provisioned_product_type,
+                // The launch this execution carries out is the one the PLAN resolved: the
+                // product, the version and the launch path it was created with, which is
+                // what the plan's change set was computed over.
+                product_id: plan.product_id.clone(),
+                provisioning_artifact_id: plan.provisioning_artifact_id.clone(),
+                path_id: plan.path_id.clone(),
+                created_time: now,
+                // The operation this record describes is not instantaneous: the record is
+                // answered in the non-terminal status and the clock owes its completion,
+                // so a caller acting straight after this call still sees the provisioned
+                // product `UNDER_CHANGE` and the plan's execution in flight.
+                completed_at: now + crate::state::PROVISIONING_COMPLETES_AFTER,
+                // "One or more tags": the tags of the request this record is the record
+                // of, which for an execution are the plan's own.
+                tags: plan.tags.clone(),
+                // What became of the deployment is not known yet: the request is accepted
+                // here and the change set is executed below, so the outcome is written
+                // once CloudFormation has answered for it.
+                failure: None,
+            };
+            let record_detail = record.detail(now);
+            state.remember_record(record);
+
+            if let Some(provisioned) = state
+                .provisioned_products
+                .get_mut(&plan.provisioned_product_id)
+            {
+                provisioned.record_ids.push(record_id.clone());
+                // The plan provisions the product VERSION it was created for, through the
+                // launch path it resolved, so both are what the provisioned product
+                // carries from here on.
+                provisioned.provisioning_artifact_id = plan.provisioning_artifact_id.clone();
+                provisioned.path_id = plan.path_id.clone();
+                // An operation HAS now been performed on this provisioned product, so its
+                // status is derived from that operation's record rather than from the
+                // plan that created it.
+                provisioned.plan_created = false;
+            }
+            if let Some(stored) = state.provisioned_product_plans.get_mut(&input.plan_id) {
+                stored.execution = Some(crate::state::PlanExecution {
+                    record_id: record_id.clone(),
+                    idempotency_token: input.idempotency_token.clone(),
+                    executed_at: now,
+                });
+            }
+
+            (
+                plan.provisioned_product_id.clone(),
+                record_id,
+                record_detail,
+                crate::state::ExecutedChange {
+                    change_set: change_set_id,
+                    provisioned_product_arn,
+                },
+            )
+        };
+
+        // The resource changes the plan lists are carried out by CloudFormation, which is
+        // what holds the change set and what stands the stack behind the provisioned
+        // product up: the execution is submitted, not recorded as having happened here.
+        //
+        // The request has already been accepted at this point — the record answers in the
+        // non-terminal status — so an execution CloudFormation refuses does not un-accept
+        // it: what it does is SETTLE the operation as a failure. The record then carries
+        // CloudFormation's own refusal as its one `RecordError` and reaches `FAILED` when
+        // the clock owes its completion, the plan reports `EXECUTE_FAILED` with that same
+        // sentence, and the provisioned product reports `ERROR`. A call NOTHING answered
+        // decided nothing, so it settles neither way.
+        match crate::state::execute_change_set(&*self.engine, ctx, &plan_region, &executed).await {
+            crate::state::LaunchOutcome::Deployed(stack_id) => {
+                if let Some(provisioned) = state
+                    .lock()
+                    .provisioned_products
+                    .get_mut(&provisioned_product_id)
+                {
+                    provisioned.stack_id = Some(stack_id);
+                }
+            }
+            crate::state::LaunchOutcome::Refused(failure) => {
+                ::tracing::debug!(
+                    plan = %input.plan_id,
+                    reason = %failure.description,
+                    "CloudFormation refused to carry this plan's resource changes out"
+                );
+                state.lock().fail_record(&record_id, failure);
+            }
+            crate::state::LaunchOutcome::Unanswered(reason) => ::tracing::debug!(
+                plan = %input.plan_id,
+                %reason,
+                "nothing answered for this plan's execution"
+            ),
+        }
+
+        Ok(ExecuteProvisionedProductPlanOutput {
+            record_detail: Some(record_detail),
+        })
     }
+}
+
+/// This operation's not-found error for a plan id that resolves to no stored plan: the
+/// sentence a plan's own refusal is worded with, shared with every other read of a plan
+/// ([`crate::state::plan_not_found_message`]).
+fn plan_not_found(plan_id: &str) -> ExecuteProvisionedProductPlanError {
+    ExecuteProvisionedProductPlanErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::plan_not_found_message(plan_id)),
+        },
+    )
+    .into()
+}
+
+/// This operation's state error: the plan the request names exists, but not in a state
+/// this operation can act on.
+fn invalid_state(message: String) -> ExecuteProvisionedProductPlanError {
+    ExecuteProvisionedProductPlanErrorModeled::InvalidStateException(InvalidStateException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The sentence this operation refuses a plan that is in no state to be executed with:
+/// the plan addressed, the status it is in, and the one status a plan can be executed
+/// from. A plan is executable once its change set has been computed and nothing has
+/// executed it, so every other `ProvisionedProductPlanStatus` is refused this way.
+fn not_executable(plan_id: &str, status: &str) -> String {
+    format!(
+        "Plan {plan_id} cannot be executed in status {status}: the plan must be in status {}.",
+        crate::state::PLAN_STATUS_CREATE_SUCCESS
+    )
 }

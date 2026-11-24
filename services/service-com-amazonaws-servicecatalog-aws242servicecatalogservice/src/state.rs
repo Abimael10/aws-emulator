@@ -890,10 +890,10 @@ pub struct ProvisionedProductPlan {
     /// because a resource holds each tag key once, exactly as a provisioned product's
     /// tags are stored.
     pub tags: BTreeMap<String, String>,
-    /// Creation instant, minted once when the plan was created. Also the instant the
-    /// plan record was last written: nothing in this service updates a stored plan
-    /// after it is created — the status it reports lives in the change set behind it —
-    /// so this is the "UTC time stamp when the plan was last updated" too.
+    /// Creation instant, minted once when the plan was created. The instant the plan
+    /// record was last written is this one until something EXECUTES the plan, which is
+    /// the one operation that writes a stored plan again
+    /// ([`ProvisionedProductPlan::execution`]).
     pub created_time: SystemTime,
     /// The `IdempotencyToken` the request that created this plan carried.
     pub idempotency_token: String,
@@ -911,6 +911,30 @@ pub struct ProvisionedProductPlan {
     /// records what CloudFormation answered — a plan whose change set is still being
     /// asked for, which is a plan still being created.
     pub change_set: Option<PlanChangeSet>,
+    /// The execution of this plan: what `ExecuteProvisionedProductPlan` recorded when it
+    /// provisioned or modified the product the plan planned a change to. `None` for a
+    /// plan nothing has executed, which is the only plan an execution can be accepted
+    /// for.
+    pub execution: Option<PlanExecution>,
+}
+
+/// The execution of one plan: the record of the request that executed it, and when.
+///
+/// Executing a plan is one request operation ON the provisioned product the plan plans a
+/// change to — "provisions or modifies a product based on the resource changes for the
+/// specified plan" — so what became of it lives in that operation's RECORD, and the plan
+/// holds the handle to it rather than a second copy of its status
+/// ([`ComAmazonawsServicecatalogAws242servicecatalogserviceState::executed_plan_status`]).
+#[derive(Debug, Clone)]
+pub struct PlanExecution {
+    /// The id of the record of the request that executed this plan.
+    pub record_id: String,
+    /// The `IdempotencyToken` that request carried, so a repeat of it answers the same
+    /// record rather than executing the plan a second time.
+    pub idempotency_token: String,
+    /// The instant the plan was executed, which is the instant the plan record was last
+    /// written.
+    pub executed_at: SystemTime,
 }
 
 /// What CloudFormation answered when it was asked to compute the change set a plan is.
@@ -940,6 +964,19 @@ pub const PLAN_STATUS_CREATE_SUCCESS: &str = "CREATE_SUCCESS";
 /// plan's status message is the reason CloudFormation gave.
 pub const PLAN_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 
+/// `ProvisionedProductPlanStatus`'s non-terminal value for a plan whose EXECUTION is
+/// still in flight: the change it planned has been carried out and the operation that
+/// carried it out has not completed yet.
+pub const PLAN_STATUS_EXECUTE_IN_PROGRESS: &str = "EXECUTE_IN_PROGRESS";
+
+/// `ProvisionedProductPlanStatus`'s terminal value for a plan whose execution completed.
+pub const PLAN_STATUS_EXECUTE_SUCCESS: &str = "EXECUTE_SUCCESS";
+
+/// `ProvisionedProductPlanStatus`'s terminal value for a plan whose execution did not
+/// happen: the deployment it carried out was refused, and the plan's status message is
+/// the reason the service that owns that deployment gave.
+pub const PLAN_STATUS_EXECUTE_FAILED: &str = "EXECUTE_FAILED";
+
 /// The sentence a read of a plan refuses a plan id that resolves to no stored plan
 /// with: this service words a missing plan by the identifier the request addressed it
 /// by, which is the only variable part — the rest is fixed text.
@@ -960,6 +997,22 @@ pub fn plan_not_found_message(plan_id: &str) -> String {
 pub const PLAN_READY_PROVISIONED_PRODUCT_STATUSES: &[&str] = &[
     PROVISIONED_PRODUCT_STATUS_AVAILABLE,
     PROVISIONED_PRODUCT_STATUS_TAINTED,
+];
+
+/// The `ProvisionedProductStatus` values a provisioned product must be in for the plan
+/// of a change to it to be EXECUTED: the stable ones a plan can be created against
+/// ([`PLAN_READY_PROVISIONED_PRODUCT_STATUSES`]) plus the one a provisioned product a
+/// plan brought into existence sits in — "the plan operations were performed to provision
+/// a new product, but resources have not yet been created. After reviewing the list of
+/// resources to be created, execute the plan".
+///
+/// The transitive statuses are what no plan can be executed against: an operation on the
+/// provisioned product is already in flight, so there is nothing settled for the planned
+/// change to be applied to.
+pub const PLAN_EXECUTABLE_PROVISIONED_PRODUCT_STATUSES: &[&str] = &[
+    PROVISIONED_PRODUCT_STATUS_AVAILABLE,
+    PROVISIONED_PRODUCT_STATUS_TAINTED,
+    PROVISIONED_PRODUCT_STATUS_PLAN_IN_PROGRESS,
 ];
 
 impl ProvisionedProductPlan {
@@ -1015,6 +1068,11 @@ pub const RECORD_TYPE_PROVISION_PRODUCT: &str = "PROVISION_PRODUCT";
 /// [`RECORD_TYPE_PROVISION_PRODUCT`] for the three values the member documents.
 pub const RECORD_TYPE_TERMINATE_PROVISIONED_PRODUCT: &str = "TERMINATE_PROVISIONED_PRODUCT";
 
+/// The `RecordType` of a record a request that MODIFIES an existing provisioned product
+/// creates — `UpdateProvisionedProduct`, and the execution of a plan of a change to one
+/// ([`RECORD_TYPE_PROVISION_PRODUCT`] names the three values the member documents).
+pub const RECORD_TYPE_UPDATE_PROVISIONED_PRODUCT: &str = "UPDATE_PROVISIONED_PRODUCT";
+
 /// The record types `ProvisionedProductDetail$LastProvisioningRecordId` counts as a
 /// provisioning request: its documentation names ProvisionProduct,
 /// UpdateProvisionedProduct, ExecuteProvisionedProductPlan and
@@ -1022,7 +1080,7 @@ pub const RECORD_TYPE_TERMINATE_PROVISIONED_PRODUCT: &str = "TERMINATE_PROVISION
 /// values above.
 pub const PROVISIONING_RECORD_TYPES: &[&str] = &[
     RECORD_TYPE_PROVISION_PRODUCT,
-    "UPDATE_PROVISIONED_PRODUCT",
+    RECORD_TYPE_UPDATE_PROVISIONED_PRODUCT,
     RECORD_TYPE_TERMINATE_PROVISIONED_PRODUCT,
 ];
 
@@ -1775,9 +1833,14 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             plan_type: Some(plan.plan_type.clone()),
             provisioning_artifact_id: Some(plan.provisioning_artifact_id.clone()),
             status: None,
-            // Nothing updates a stored plan after it is created, so the instant it was
-            // last updated is the instant it was created.
-            updated_time: Some(reported_time(plan.created_time)),
+            // "The UTC time stamp when the plan was last updated": the instant the plan
+            // was created, until something EXECUTES it — the one operation that writes a
+            // stored plan again.
+            updated_time: Some(reported_time(
+                plan.execution
+                    .as_ref()
+                    .map_or(plan.created_time, |executed| executed.executed_at),
+            )),
             notification_arns: Some(plan.notification_arns.clone()),
             provisioning_parameters: Some(plan.provisioning_parameters.clone()),
             tags: Some(plan.tag_list()),
@@ -1793,6 +1856,42 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         self.provisioned_products
             .get(&plan.provisioned_product_id)
             .map(|provisioned| provisioned.name.clone())
+    }
+
+    /// The `ProvisionedProductPlanStatus` an EXECUTED plan reports at `now`, and the
+    /// message that status carries; `None` for a plan nothing has executed, whose status
+    /// is the status of the change set it is ([`plan_report`]).
+    ///
+    /// Executing a plan "provisions or modifies a product based on the resource changes
+    /// for the specified plan", which is one request operation on that provisioned
+    /// product: so what became of the execution is what the RECORD of that request says
+    /// — in flight until the clock owes that record's completion, and afterwards the
+    /// terminal value its outcome names, carrying the refusing service's own sentence for
+    /// a deployment that did not happen.
+    pub fn executed_plan_status(
+        &self,
+        plan: &ProvisionedProductPlan,
+        now: SystemTime,
+    ) -> Option<(&'static str, Option<String>)> {
+        let execution = plan.execution.as_ref()?;
+        // A plan whose record the store has evicted to stay within [`MAX_RECORDS`] was
+        // executed all the same, and that execution completed: the same reading
+        // [`Self::provisioned_product_status`] makes of a provisioned product with no
+        // readable history.
+        let Some(record) = self.records.get(&execution.record_id) else {
+            return Some((PLAN_STATUS_EXECUTE_SUCCESS, None));
+        };
+        let status = match record.status(now) {
+            RECORD_STATUS_CREATED => PLAN_STATUS_EXECUTE_IN_PROGRESS,
+            RECORD_STATUS_FAILED => PLAN_STATUS_EXECUTE_FAILED,
+            _ => PLAN_STATUS_EXECUTE_SUCCESS,
+        };
+        let message = record
+            .errors(now)
+            .into_iter()
+            .next()
+            .and_then(|error| error.description);
+        Some((status, message))
     }
 
     /// Store the record of one request operation, keeping the map at [`MAX_RECORDS`].

@@ -430,6 +430,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The change set is created in the Region this request was signed for,
                 // and that is where every later read of this plan looks for it.
                 region: region.clone(),
+                // This plan has only been computed, and nothing has executed it: the
+                // change it plans is carried out by `ExecuteProvisionedProductPlan`,
+                // which is what records an execution here.
+                execution: None,
                 // The change set this plan IS has not been asked for yet: this call does
                 // that next, and records what CloudFormation answered.
                 change_set: None,

@@ -642,6 +642,78 @@ fn stack_carries_no_template(physical_id: &str) -> String {
     format!("The stack {physical_id} carries no template.")
 }
 
+/// The change a plan's EXECUTION carries out, as CloudFormation is asked to execute it.
+///
+/// A plan IS a change set, so executing the plan is executing that change set: the
+/// resources it lists are created or modified by CloudFormation, and the stack behind the
+/// provisioned product is the one the change set belongs to.
+#[derive(Debug, Clone)]
+pub struct ExecutedChange {
+    /// The change set CloudFormation computed for the plan
+    /// ([`super::PlanChangeSet::Created`]).
+    pub change_set: String,
+    /// The ARN of the provisioned product the change is carried out for: the resource
+    /// Service Catalog deploys ON BEHALF OF ([`super::ServicePrincipalCall`]).
+    pub provisioned_product_arn: String,
+}
+
+/// Execute the change set `executed` names — which is what provisions or modifies the
+/// product the plan planned the change to — and answer what became of that deployment
+/// ([`LaunchOutcome`]).
+///
+/// The execution is submitted as SERVICE CATALOG's own call, on behalf of the provisioned
+/// product the change is for, for the same reason the launch itself is
+/// ([`create_launch_stack`]): the stack the change set deploys carries the tags recording
+/// the launch graph, which are in AWS's reserved namespace. A call this service cannot
+/// make as its own principal is made as the caller's instead, so the change is carried out
+/// either way.
+///
+/// The stack is the change set's own — a CREATE change set brought it into existence in
+/// `REVIEW_IN_PROGRESS` and this execution is what deploys it — so the handle every later
+/// read of the resources behind the provisioned product uses is read off the change set
+/// rather than composed here.
+pub async fn execute_change_set<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    executed: &ExecutedChange,
+) -> LaunchOutcome {
+    let as_service =
+        super::ServicePrincipalCall::begin(engine, ctx, &executed.provisioned_product_arn);
+    let cloudformation = match &as_service {
+        Some(call) => call.cloudformation(ctx, region),
+        None => in_process_cloudformation(ctx, region),
+    };
+    // Which stack this change set belongs to, read BEFORE it is executed: the change set
+    // is a plan ON that stack from the moment it is created, and nothing about the
+    // execution moves it.
+    let stack = cloudformation
+        .describe_change_set()
+        .change_set_name(&executed.change_set)
+        .send()
+        .await
+        .ok()
+        .and_then(|described| described.stack_id);
+    if let Err(error) = cloudformation
+        .execute_change_set()
+        .change_set_name(&executed.change_set)
+        .send()
+        .await
+    {
+        return answered_launch(&error);
+    }
+    match stack {
+        Some(stack_id) => LaunchOutcome::Deployed(stack_id),
+        // The change was carried out, and nothing said which stack it was carried out on:
+        // evidence of nothing about the deployment rather than a refusal of it, so the
+        // record of the request stays as it was accepted.
+        None => LaunchOutcome::Unanswered(format!(
+            "CloudFormation named no stack for the change set {}.",
+            executed.change_set
+        )),
+    }
+}
+
 /// What the change set `change_set` names says about the plan it backs.
 ///
 /// A plan whose change set has not been recorded yet is still being created; one

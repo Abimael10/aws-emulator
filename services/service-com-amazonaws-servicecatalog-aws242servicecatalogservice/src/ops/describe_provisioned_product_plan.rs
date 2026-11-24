@@ -162,13 +162,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // which is where it was made: the Region THIS request was
                         // signed for does not move it.
                         plan.region.clone(),
+                        // A plan something has EXECUTED reports the status of that
+                        // execution, which is what the record of the request that
+                        // executed it says rather than anything the change set behind the
+                        // plan still holds (`crate::state::executed_plan_status`).
+                        state
+                            .executed_plan_status(plan, now)
+                            .map(|(status, message)| (status.to_string(), message)),
                     )
                 })
         };
         // The plan is addressed by id alone. A plan whose provisioned product has been
         // terminated plans the change of a resource that no longer exists, so it does
         // not resolve either and takes exactly this refusal.
-        let (mut details, change_set, region) = match read {
+        let (mut details, change_set, region, executed) = match read {
             Some(read) => read,
             None => {
                 return Err(
@@ -212,8 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // beside this service: no socket is opened and no host name is resolved
         // (`crate::state::in_process_cloudformation`).
         let report = crate::state::plan_report(ctx, &region, change_set.as_ref()).await;
-        details.status = Some(report.status);
-        details.status_message = report.status_message;
+        let (status, status_message) = match executed {
+            Some((status, message)) => (status, message),
+            None => (report.status, report.status_message),
+        };
+        details.status = Some(status);
+        details.status_message = status_message;
 
         // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
         // caller-imposed bound: the whole remaining list is reported.
