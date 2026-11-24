@@ -561,11 +561,14 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
     // that isn't valid" — because none of these entries names the ONE revision the call
     // acts on: "You must specify a revision." A row whose FAMILY part is not a family name
     // fails on the family first, and carries the fixed sentence Amazon ECS states for
-    // that: nothing of the request reaches it.
+    // that; a row whose family IS a family name and whose revision part names no revision
+    // number carries the failed LOOKUP instead, since nothing about its spelling is wrong.
+    // Nothing of the request reaches either sentence.
     let eleven: Vec<String> = (1..=11).map(|slot| format!("{family}:{slot}")).collect();
     let arn_without_revision =
         format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}");
     const FAMILY_CHARACTERS: &str = "Family contains invalid characters.";
+    const NOT_FOUND: &str = "Unable to describe task definition.";
     /// The sentence a reference that names a family but no revision earns, for the
     /// `taskDefinitions` entry `reference`.
     fn needs_a_revision(reference: &str) -> String {
@@ -583,7 +586,7 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
         (
             "revision zero",
             vec![format!("{family}:0")],
-            FAMILY_CHARACTERS.to_string(),
+            NOT_FOUND.to_string(),
         ),
         (
             "family and the wildcard revision",
@@ -839,12 +842,17 @@ async fn a_delete_in_progress_revision_cannot_run_new_work_but_its_service_still
     for operation in ["RunTask", "CreateService", "UpdateService"] {
         for reference in [format!("{family}:1"), definition_arn(family, 1)] {
             let case = format!("{operation} on the DELETE_IN_PROGRESS revision {reference:?}");
+            // The class is the one that operation answers for a revision it may not use: a
+            // create names the bad parameter it was given, an update the identifier fault.
+            let want = match operation {
+                "UpdateService" => "ClientException",
+                _ => "InvalidParameterException",
+            };
             let (code, message) =
                 refusal(&router, operation, request_for(operation, &reference), &case).await;
             assert_eq!(
-                code, "InvalidParameterException",
-                "case {case:?}: expected an InvalidParameterException, got {code} with \
-                 {message:?}"
+                code, want,
+                "case {case:?}: expected a {want}, got {code} with {message:?}"
             );
         }
     }

@@ -194,11 +194,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for reference in &input.task_definitions {
             let Some((family, revision)) = crate::state::parse_task_definition_reference(reference)
             else {
-                return Err(DeleteTaskDefinitionsErrorModeled::ClientException(
-                    ClientException {
-                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
-                    },
-                )
+                // WHICH fault the entry carries is what the refusal states
+                // ([`crate::state::task_definition_reference_fault`]): the family left
+                // blank, a family outside the character set a family name is spelled in, or
+                // a well-formed family whose remainder names no revision this account holds.
+                let fault = crate::state::task_definition_reference_fault(reference)
+                    .unwrap_or(crate::state::TaskDefinitionReferenceFault::FamilyCharacters);
+                return Err(match fault {
+                    crate::state::TaskDefinitionReferenceFault::FamilyBlank => {
+                        DeleteTaskDefinitionsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(crate::state::blank_member_message(
+                                    crate::state::TASK_DEFINITION_SUBJECT,
+                                )),
+                            },
+                        )
+                    }
+                    crate::state::TaskDefinitionReferenceFault::FamilyCharacters => {
+                        DeleteTaskDefinitionsErrorModeled::ClientException(ClientException {
+                            message: Some(
+                                crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string(),
+                            ),
+                        })
+                    }
+                    crate::state::TaskDefinitionReferenceFault::RevisionNumber => {
+                        DeleteTaskDefinitionsErrorModeled::ClientException(ClientException {
+                            message: Some(
+                                crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        })
+                    }
+                }
                 .into());
             };
             let Some(revision) = revision else {

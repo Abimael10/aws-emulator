@@ -698,6 +698,38 @@ pub fn cluster_name_from_reference(reference: Option<&str>) -> String {
     }
 }
 
+/// The member every operation names the cluster it acts in, as the words its refusal is
+/// built from ([`member_subject`], which opens the sentence `Cluster`).
+pub const CLUSTER_MEMBER: &str = "cluster";
+
+/// Whether `reference` is a value a `cluster` member takes: "The short name or full Amazon
+/// Resource Name (ARN) of the cluster" — the two FORMS every such member documents, a
+/// cluster ARN ([`is_cluster_arn`]) or a cluster NAME ([`is_valid_name`]).
+pub fn is_cluster_reference(reference: &str) -> bool {
+    is_cluster_arn(reference) || is_valid_name(reference)
+}
+
+/// The refusal a `cluster` reference earns when it is NEITHER of the two forms the member
+/// documents ([`is_cluster_reference`]), or `None` for a value that is one of them.
+///
+/// A value that is neither names no cluster in any account, so there is nothing to resolve
+/// and nothing to report as absent either: it is the bad parameter it is, stated as every
+/// caller-supplied name outside the pattern is ([`name_pattern_message`]) — the member, the
+/// pattern a cluster name has to match, and the value the request spelled, so the caller is
+/// told which of the identifiers it sent to change. Decided from the REQUEST alone, so it is
+/// answered before the cluster is looked up and whatever this account holds.
+///
+/// A reference that is absent, empty or nothing but whitespace carries no cluster name to
+/// judge: it names the default cluster, exactly as [`cluster_name_from_reference`] reads it
+/// ("If you do not specify a cluster, the default cluster is assumed").
+pub fn cluster_reference_violation(reference: Option<&str>) -> Option<String> {
+    let reference = reference
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    (!is_cluster_reference(reference))
+        .then(|| name_pattern_message(&member_subject(CLUSTER_MEMBER), reference))
+}
+
 /// The task ARN a `task`/`tasks` entry refers to: the value as given when it is already
 /// an ARN, otherwise the ARN a task of that id in `cluster_name` would carry. Every
 /// such member's doc: "the task ID or full ARN entry of the task".
@@ -3063,6 +3095,79 @@ pub(super) fn split_revision_reference<'a>(
         Some((family, revision)) => (family, Some(revision)),
         None => (tail, None),
     })
+}
+
+/// What is wrong with a `taskDefinition` reference that names no revision at all — the
+/// fault in the VALUE, read off the value alone and so decided before the store is
+/// consulted. The condition [`parse_task_definition_reference`] answers `None` for, told
+/// apart into the three faults a caller has three different things to do about.
+///
+/// Every form the member documents ("The family and revision (family:revision) or full ARN
+/// of the task definition") carries a FAMILY, and a family is "Up to 255 letters (uppercase
+/// and lowercase), numbers, underscores, and hyphens" — so a value whose family part is
+/// missing is a member left blank, one whose family part is outside that set names no family,
+/// and one whose family IS a family name has nothing left wrong with it but the revision
+/// beside it.
+///
+/// WHICH modelled class and sentence each fault earns belongs to the operation that resolved
+/// the reference, exactly as the two not-found sentences this module already keeps apart do
+/// ([`TASK_DEFINITION_NOT_FOUND_MESSAGE`] against
+/// [`TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE`]): this type says only which of the three
+/// faults the value carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDefinitionReferenceFault {
+    /// The reference carries NO family text: the member was left blank.
+    FamilyBlank,
+    /// The family part carries a character a family name is not spelled in, or the value
+    /// carries no family part to read at all (an ARN of some other resource).
+    FamilyCharacters,
+    /// The family IS a family name, and the revision part beside it names no revision
+    /// number — a revision counter is a positive whole number, and `family:*` names every
+    /// revision of the family rather than none.
+    RevisionNumber,
+}
+
+/// How a refusal names the member a `taskDefinition` reference came in, where the sentence
+/// names the member itself ([`blank_member_message`]): the words Amazon ECS writes it in.
+pub const TASK_DEFINITION_SUBJECT: &str = "Task Definition";
+
+/// `InvalidParameterException$message` for a `taskDefinition` whose FAMILY part carries no
+/// text, on an operation that resolves the family in order to put a revision to work. One of
+/// the sentence family this API states a member left unset in
+/// ([`container_member_required_message`] states the same fault of a container member).
+pub const TASK_DEFINITION_FAMILY_BLANK_MESSAGE: &str = "Family should not be null or empty.";
+
+/// `InvalidParameterException$message` for a `taskDefinition` whose family is a family name
+/// and whose REVISION part names no revision number, on an operation that resolves the
+/// reference in order to put the revision to work: the part of the value that is wrong, in
+/// one fixed sentence carrying neither the value nor the family.
+pub const TASK_DEFINITION_REVISION_NUMBER_MESSAGE: &str = "Invalid revision number.";
+
+/// Which of the three faults a `taskDefinition` reference carries, or `None` when it is a
+/// reference to a revision ([`parse_task_definition_reference`] reads one).
+///
+/// The family part is read FIRST and judged on its own — blank before character set, since a
+/// member left blank is a different fault to the caller than one spelled wrong — and only a
+/// reference whose family IS a family name is reported for the revision beside it.
+pub fn task_definition_reference_fault(reference: &str) -> Option<TaskDefinitionReferenceFault> {
+    if parse_task_definition_reference(reference).is_some() {
+        return None;
+    }
+    Some(
+        match split_revision_reference(reference, TASK_DEFINITION_RESOURCE_TYPE) {
+            // An ARN that names some other resource carries no family part to read, so it
+            // names no family at all — the same fault as a family part spelled in
+            // characters a family name is not spelled in.
+            None => TaskDefinitionReferenceFault::FamilyCharacters,
+            Some((family, _)) if family.trim().is_empty() => {
+                TaskDefinitionReferenceFault::FamilyBlank
+            }
+            Some((family, _)) if !is_valid_name(family) => {
+                TaskDefinitionReferenceFault::FamilyCharacters
+            }
+            Some(_) => TaskDefinitionReferenceFault::RevisionNumber,
+        },
+    )
 }
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the

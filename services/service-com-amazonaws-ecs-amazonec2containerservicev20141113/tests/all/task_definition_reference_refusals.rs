@@ -120,7 +120,9 @@ async fn a_reference_that_resolves_to_an_unusable_revision_is_not_an_unknown_ide
     // The rows differ along WHAT the reference resolves to — a held revision in a status
     // the call may not use, or nothing at all — and along the FORM the reference takes:
     // `family:revision`, a full ARN, and a bare family. The expected code is the
-    // requirement.
+    // requirement: a revision the call may not use is answered in the class that operation
+    // answers for it (the creates name the bad parameter, the update the identifier fault),
+    // and a reference that resolves to nothing is an unknown identifier throughout.
     let rows: Vec<(&str, String, &str)> = vec![
         (
             "a deregistered revision of a family that still has an ACTIVE one, as \
@@ -178,6 +180,13 @@ async fn a_reference_that_resolves_to_an_unusable_revision_is_not_an_unknown_ide
     for operation in ["CreateService", "RunTask", "UpdateService"] {
         for (slot, (row, reference, want)) in rows.iter().enumerate() {
             let case = format!("{operation}: {row}");
+            // An UPDATE answers a revision it may not use in the `ClientException` its own
+            // recorded refusal carries, where a create names the bad parameter; a reference
+            // that resolves to nothing is the same unknown identifier on every one of them.
+            let want = match (operation, *want) {
+                ("UpdateService", "InvalidParameterException") => "ClientException",
+                (_, want) => want,
+            };
             let (code, message) = refusal(
                 &router,
                 operation,
@@ -186,7 +195,7 @@ async fn a_reference_that_resolves_to_an_unusable_revision_is_not_an_unknown_ide
             )
             .await;
             assert_eq!(
-                &code, want,
+                code, want,
                 "case {case:?}: expected {want} for {reference:?}, got {code} ({message:?})"
             );
             assert!(

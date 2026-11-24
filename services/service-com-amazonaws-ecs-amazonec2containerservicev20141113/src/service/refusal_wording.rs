@@ -48,6 +48,14 @@
 //!
 //! An operation absent from here, and a condition absent from the operation's own function,
 //! keeps exactly the refusal it had: there is no AWS sentence to put in its place.
+//!
+//! Beside those sits ONE rule about one MEMBER rather than about an operation
+//! ([`cluster_reference_refusal`]): the `cluster` a request names has to be one of the two
+//! forms that member documents, and a value that is neither names no cluster in any account.
+//! Its sentence is the same whichever operation carried the member, and it is stated here
+//! because the model declares no `@pattern` for the framework's walk to key it on — and
+//! because it has to be answered BEFORE the cluster is resolved, which each handler does for
+//! itself.
 
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
 use ::smithy_server_runtime::ServerHttpProtocol;
@@ -134,12 +142,165 @@ const TARGET_TYPE_MEMBER: &str = "targetType";
 /// request earns no refusal of its own here — which leaves it to the framework's walk and to
 /// the operation exactly as before.
 ///
+/// Two layers, in this order: the condition the OPERATION words its own sentence for
+/// ([`operation_condition_refusal`]), and then the one MEMBER rule every operation that takes
+/// it shares — the `cluster` the request names, which has to be one of the two forms that
+/// member documents ([`cluster_reference_refusal`]).
+pub fn operation_worded_refusal(
+    operation: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    operation_condition_refusal(operation, protocol, req)
+        .or_else(|| cluster_reference_refusal(operation, protocol, req))
+}
+
+/// The `cluster` reference `req` carries, judged against the two forms that member documents
+/// ("The short name or full Amazon Resource Name (ARN) of the cluster") — the sentence a
+/// value that is NEITHER earns ([`crate::state::cluster_reference_violation`]), or `None`
+/// when the request names a cluster in one of those forms, names none at all, or names the
+/// operation nothing of this kind.
+///
+/// Stated HERE rather than in each operation because it is ONE rule about ONE member, worded
+/// the same way whichever operation carried it: the `cluster` a request names is the scope it
+/// acts in, and a value that is neither a cluster ARN nor a cluster name names no cluster in
+/// any account — so it is answered as the bad parameter it is, before the cluster is resolved
+/// and so before a request that could never name a cluster is reported as one that names a
+/// cluster this account does not hold. The model declares no `@pattern` on the member, so the
+/// framework's own walk has nothing to key it on.
+///
+/// The operations listed are the ones whose `cluster` member names a cluster of this
+/// service's own API. The daemon, gateway and express-gateway surfaces take a `clusterArn`
+/// (and `DescribeClusters` a `clusters` LIST) whose refusals those operations word
+/// themselves, so neither is keyed here.
+fn cluster_reference_refusal(
+    operation: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    /// The `cluster` of an input whose member is optional ("If you do not specify a cluster,
+    /// the default cluster is assumed").
+    macro_rules! optional_cluster {
+        ($input:ty, $schema:expr) => {
+            read_input::<$input>(protocol, $schema, req).and_then(|input| input.cluster)
+        };
+    }
+    /// The `cluster` of an input that requires the member.
+    macro_rules! required_cluster {
+        ($input:ty, $schema:expr) => {
+            read_input::<$input>(protocol, $schema, req).map(|input| input.cluster)
+        };
+    }
+    let reference: Option<String> = match operation {
+        "CreateCapacityProvider" => {
+            optional_cluster!(CreateCapacityProviderInput, CREATE_CAPACITY_PROVIDER_INPUT_SCHEMA)
+        }
+        "CreateService" => optional_cluster!(CreateServiceInput, CREATE_SERVICE_INPUT_SCHEMA),
+        "CreateTaskSet" => required_cluster!(CreateTaskSetInput, CREATE_TASK_SET_INPUT_SCHEMA),
+        "DeleteAttributes" => {
+            optional_cluster!(DeleteAttributesInput, DELETE_ATTRIBUTES_INPUT_SCHEMA)
+        }
+        "DeleteCapacityProvider" => {
+            optional_cluster!(DeleteCapacityProviderInput, DELETE_CAPACITY_PROVIDER_INPUT_SCHEMA)
+        }
+        "DeleteCluster" => required_cluster!(DeleteClusterInput, DELETE_CLUSTER_INPUT_SCHEMA),
+        "DeleteService" => optional_cluster!(DeleteServiceInput, DELETE_SERVICE_INPUT_SCHEMA),
+        "DeleteTaskSet" => required_cluster!(DeleteTaskSetInput, DELETE_TASK_SET_INPUT_SCHEMA),
+        "DeregisterContainerInstance" => optional_cluster!(
+            DeregisterContainerInstanceInput,
+            DEREGISTER_CONTAINER_INSTANCE_INPUT_SCHEMA
+        ),
+        "DescribeCapacityProviders" => optional_cluster!(
+            DescribeCapacityProvidersInput,
+            DESCRIBE_CAPACITY_PROVIDERS_INPUT_SCHEMA
+        ),
+        "DescribeContainerInstances" => optional_cluster!(
+            DescribeContainerInstancesInput,
+            DESCRIBE_CONTAINER_INSTANCES_INPUT_SCHEMA
+        ),
+        "DescribeServices" => {
+            optional_cluster!(DescribeServicesInput, DESCRIBE_SERVICES_INPUT_SCHEMA)
+        }
+        "DescribeTaskSets" => {
+            required_cluster!(DescribeTaskSetsInput, DESCRIBE_TASK_SETS_INPUT_SCHEMA)
+        }
+        "DescribeTasks" => optional_cluster!(DescribeTasksInput, DESCRIBE_TASKS_INPUT_SCHEMA),
+        "DiscoverPollEndpoint" => {
+            optional_cluster!(DiscoverPollEndpointInput, DISCOVER_POLL_ENDPOINT_INPUT_SCHEMA)
+        }
+        "ExecuteCommand" => optional_cluster!(ExecuteCommandInput, EXECUTE_COMMAND_INPUT_SCHEMA),
+        "GetTaskProtection" => {
+            required_cluster!(GetTaskProtectionInput, GET_TASK_PROTECTION_INPUT_SCHEMA)
+        }
+        "ListAttributes" => optional_cluster!(ListAttributesInput, LIST_ATTRIBUTES_INPUT_SCHEMA),
+        "ListContainerInstances" => {
+            optional_cluster!(ListContainerInstancesInput, LIST_CONTAINER_INSTANCES_INPUT_SCHEMA)
+        }
+        "ListServiceDeployments" => {
+            optional_cluster!(ListServiceDeploymentsInput, LIST_SERVICE_DEPLOYMENTS_INPUT_SCHEMA)
+        }
+        "ListServices" => optional_cluster!(ListServicesInput, LIST_SERVICES_INPUT_SCHEMA),
+        "ListTasks" => optional_cluster!(ListTasksInput, LIST_TASKS_INPUT_SCHEMA),
+        "PutAttributes" => optional_cluster!(PutAttributesInput, PUT_ATTRIBUTES_INPUT_SCHEMA),
+        "PutClusterCapacityProviders" => required_cluster!(
+            PutClusterCapacityProvidersInput,
+            PUT_CLUSTER_CAPACITY_PROVIDERS_INPUT_SCHEMA
+        ),
+        "RegisterContainerInstance" => optional_cluster!(
+            RegisterContainerInstanceInput,
+            REGISTER_CONTAINER_INSTANCE_INPUT_SCHEMA
+        ),
+        "RunTask" => optional_cluster!(RunTaskInput, RUN_TASK_INPUT_SCHEMA),
+        "StartTask" => optional_cluster!(StartTaskInput, START_TASK_INPUT_SCHEMA),
+        "StopTask" => optional_cluster!(StopTaskInput, STOP_TASK_INPUT_SCHEMA),
+        "SubmitAttachmentStateChanges" => optional_cluster!(
+            SubmitAttachmentStateChangesInput,
+            SUBMIT_ATTACHMENT_STATE_CHANGES_INPUT_SCHEMA
+        ),
+        "SubmitContainerStateChange" => optional_cluster!(
+            SubmitContainerStateChangeInput,
+            SUBMIT_CONTAINER_STATE_CHANGE_INPUT_SCHEMA
+        ),
+        "SubmitTaskStateChange" => {
+            optional_cluster!(SubmitTaskStateChangeInput, SUBMIT_TASK_STATE_CHANGE_INPUT_SCHEMA)
+        }
+        "UpdateCapacityProvider" => {
+            optional_cluster!(UpdateCapacityProviderInput, UPDATE_CAPACITY_PROVIDER_INPUT_SCHEMA)
+        }
+        "UpdateCluster" => required_cluster!(UpdateClusterInput, UPDATE_CLUSTER_INPUT_SCHEMA),
+        "UpdateClusterSettings" => {
+            required_cluster!(UpdateClusterSettingsInput, UPDATE_CLUSTER_SETTINGS_INPUT_SCHEMA)
+        }
+        "UpdateContainerAgent" => {
+            optional_cluster!(UpdateContainerAgentInput, UPDATE_CONTAINER_AGENT_INPUT_SCHEMA)
+        }
+        "UpdateContainerInstancesState" => optional_cluster!(
+            UpdateContainerInstancesStateInput,
+            UPDATE_CONTAINER_INSTANCES_STATE_INPUT_SCHEMA
+        ),
+        "UpdateService" => optional_cluster!(UpdateServiceInput, UPDATE_SERVICE_INPUT_SCHEMA),
+        "UpdateServicePrimaryTaskSet" => required_cluster!(
+            UpdateServicePrimaryTaskSetInput,
+            UPDATE_SERVICE_PRIMARY_TASK_SET_INPUT_SCHEMA
+        ),
+        "UpdateTaskProtection" => {
+            required_cluster!(UpdateTaskProtectionInput, UPDATE_TASK_PROTECTION_INPUT_SCHEMA)
+        }
+        "UpdateTaskSet" => required_cluster!(UpdateTaskSetInput, UPDATE_TASK_SET_INPUT_SCHEMA),
+        _ => None,
+    };
+    crate::state::cluster_reference_violation(reference.as_deref())
+}
+
+/// The sentence the condition an OPERATION words its own way earns, or `None` when the
+/// request earns none.
+///
 /// `operation` is the routing key the request resolved to, so a condition one operation
 /// words its own way cannot reach another. The operations named below are read TWICE — once
 /// here and once by the dispatch sequence that follows — which is the cost of wording a
 /// refusal the framework's own walk cannot word: a second pass over a body the framework has
 /// already bounded, for the handful of operations listed.
-pub fn operation_worded_refusal(
+fn operation_condition_refusal(
     operation: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,

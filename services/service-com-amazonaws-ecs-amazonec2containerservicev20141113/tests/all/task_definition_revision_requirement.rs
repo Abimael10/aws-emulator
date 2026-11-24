@@ -15,8 +15,10 @@
 //!
 //! The contrast the same table asserts: `DescribeTaskDefinition`'s member resolves "the
 //! latest ACTIVE revision" of a family, so for it a bare family is an ANSWER rather than a
-//! refusal and a family part outside the family character set is the family-charset
-//! `ClientException` — the read path keeps that sentence.
+//! refusal, a family part outside the family character set is the family-charset
+//! `ClientException`, a family part left blank is the member's own blank-parameter refusal,
+//! and a family that IS a family name whose revision part names no revision number is the
+//! failed lookup — the read path keeps each of those sentences.
 //!
 //! The rows vary the identifier along what the rule generalises over: the FORM (bare
 //! family, `family:*`, an ARN with no revision, an ARN of another resource kind, a value
@@ -47,6 +49,11 @@ const FAMILY_CHARACTERS: &str = "Family contains invalid characters.";
 
 /// The sentence a reference that names a revision this account holds none of earns.
 const NOT_FOUND: &str = "Unable to describe task definition.";
+
+/// The sentence the READ path answers a `taskDefinition` whose FAMILY part carries no text
+/// at all — the member left blank, which is a bad parameter rather than an identifier this
+/// service cannot read.
+const TASK_DEFINITION_BLANK: &str = "Task Definition can not be blank.";
 
 /// An ECS ARN in the caller's own account, for the resource path `resource`.
 fn ecs_arn(resource: &str) -> String {
@@ -100,12 +107,12 @@ async fn an_identifier_that_spells_no_revision_is_refused_for_the_missing_revisi
         (
             "a revision part that is no number",
             format!("{FAMILY}:latest"),
-            Some(("ClientException", FAMILY_CHARACTERS)),
+            Some(("ClientException", NOT_FOUND)),
         ),
         (
             "nothing but a colon",
             ":".to_string(),
-            Some(("ClientException", FAMILY_CHARACTERS)),
+            Some(("InvalidParameterException", TASK_DEFINITION_BLANK)),
         ),
         (
             "the ARN of another resource kind",

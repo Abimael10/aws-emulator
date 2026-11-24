@@ -778,38 +778,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service keeps the revision it already runs when the request names none.
         let definition = match input.task_definition.as_deref() {
             Some(reference) => {
+                // A value that is no reference to a revision at all is refused for WHICH
+                // fault it carries ([`crate::state::task_definition_reference_fault`]): the
+                // family left blank — the bad parameter it is, told apart from a value
+                // spelled wrong, which the caller has something else to do about — a family
+                // outside the character set a family name is spelled in, or a well-formed
+                // family that names no revision, which is the revision this update could
+                // not find.
                 let Some((family, revision)) =
                     crate::state::parse_task_definition_reference(reference)
                 else {
-                    return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
-                    })
+                    let fault = crate::state::task_definition_reference_fault(reference)
+                        .unwrap_or(crate::state::TaskDefinitionReferenceFault::FamilyCharacters);
+                    return Err(match fault {
+                        crate::state::TaskDefinitionReferenceFault::FamilyBlank => {
+                            UpdateServiceErrorModeled::InvalidParameterException(
+                                InvalidParameterException {
+                                    message: Some(
+                                        crate::state::TASK_DEFINITION_FAMILY_BLANK_MESSAGE
+                                            .to_string(),
+                                    ),
+                                },
+                            )
+                        }
+                        crate::state::TaskDefinitionReferenceFault::RevisionNumber => {
+                            UpdateServiceErrorModeled::InvalidParameterException(
+                                InvalidParameterException {
+                                    message: Some(
+                                        crate::state::TASK_DEFINITION_REVISION_NUMBER_MESSAGE
+                                            .to_string(),
+                                    ),
+                                },
+                            )
+                        }
+                        crate::state::TaskDefinitionReferenceFault::FamilyCharacters => {
+                            UpdateServiceErrorModeled::ClientException(ClientException {
+                                message: Some(
+                                    crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string(),
+                                ),
+                            })
+                        }
+                    }
                     .into());
                 };
                 let definition = match guard.usable_revision(&region, &family, revision) {
                     Ok(definition) => definition.clone(),
                     Err(refusal) => {
                         // "You can't update an existing service to reference an INACTIVE
-                        // task definition" names a revision this store HOLDS in a status
-                        // this call cannot accept, so it is the bad parameter it is; a
-                        // reference that resolves to nothing names an identifier the
-                        // store knows nothing about, which stays a client fault. The
-                        // service's OWN revision is untouched by this: the `None` arm
-                        // below keeps the key it stored, so a service whose revision was
+                        // task definition": both conditions are faults in the identifier
+                        // this update was pointed at, and Amazon ECS answers this
+                        // operation's refusal of either in the `ClientException` its model
+                        // declares for one — "it might be specifying an identifier that
+                        // isn't valid" — which is the class recorded for an UPDATE, where a
+                        // CREATE answers the same two conditions in its own classes. The
+                        // service's OWN revision is untouched by this: the `None` arm below
+                        // keeps the key it stored, so a service whose revision was
                         // deregistered can still be scaled.
                         let message = Some(refusal.message().to_string());
-                        return Err(match refusal {
-                            crate::state::TaskDefinitionRefusal::Inactive => {
-                                UpdateServiceErrorModeled::InvalidParameterException(
-                                    InvalidParameterException { message },
-                                )
-                            }
-                            crate::state::TaskDefinitionRefusal::NotFound => {
-                                UpdateServiceErrorModeled::ClientException(ClientException {
-                                    message,
-                                })
-                            }
-                        }
+                        return Err(UpdateServiceErrorModeled::ClientException(
+                            ClientException { message },
+                        )
                         .into());
                     }
                 };

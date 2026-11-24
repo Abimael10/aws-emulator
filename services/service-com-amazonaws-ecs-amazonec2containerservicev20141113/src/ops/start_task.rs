@@ -262,12 +262,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A value that is no reference to a revision at all is refused for WHICH fault it
+        // carries ([`crate::state::task_definition_reference_fault`]): the family left blank
+        // and a revision part that names no revision number are each the bad parameter the
+        // request carried, while a family spelled in characters a family name is not spelled
+        // in is an identifier this service can make nothing of.
         let Some((family, requested_revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
-            return Err(StartTaskErrorModeled::ClientException(ClientException {
-                message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
-            })
+            let fault = crate::state::task_definition_reference_fault(&input.task_definition)
+                .unwrap_or(crate::state::TaskDefinitionReferenceFault::FamilyCharacters);
+            return Err(match fault {
+                crate::state::TaskDefinitionReferenceFault::FamilyBlank => {
+                    StartTaskErrorModeled::InvalidParameterException(InvalidParameterException {
+                        message: Some(
+                            crate::state::TASK_DEFINITION_FAMILY_BLANK_MESSAGE.to_string(),
+                        ),
+                    })
+                }
+                crate::state::TaskDefinitionReferenceFault::RevisionNumber => {
+                    StartTaskErrorModeled::InvalidParameterException(InvalidParameterException {
+                        message: Some(
+                            crate::state::TASK_DEFINITION_REVISION_NUMBER_MESSAGE.to_string(),
+                        ),
+                    })
+                }
+                crate::state::TaskDefinitionReferenceFault::FamilyCharacters => {
+                    StartTaskErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
+                    })
+                }
+            }
             .into());
         };
 

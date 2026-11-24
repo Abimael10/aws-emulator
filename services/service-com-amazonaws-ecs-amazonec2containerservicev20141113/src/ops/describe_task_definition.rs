@@ -164,14 +164,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
+        // A value that is no reference to a revision at all is refused for WHICH fault it
+        // carries ([`crate::state::task_definition_reference_fault`]): the member left
+        // blank, a family spelled in characters a family name is not spelled in — the
+        // identifier this service can make nothing of — or a revision part that names no
+        // revision number, which for this READ is the revision it could not find.
         let Some((family, requested_revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
-            return Err(DescribeTaskDefinitionErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
-                },
-            )
+            let fault = crate::state::task_definition_reference_fault(&input.task_definition)
+                .unwrap_or(crate::state::TaskDefinitionReferenceFault::FamilyCharacters);
+            return Err(match fault {
+                crate::state::TaskDefinitionReferenceFault::FamilyBlank => {
+                    DescribeTaskDefinitionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::blank_member_message(
+                                crate::state::TASK_DEFINITION_SUBJECT,
+                            )),
+                        },
+                    )
+                }
+                crate::state::TaskDefinitionReferenceFault::FamilyCharacters => {
+                    DescribeTaskDefinitionErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
+                    })
+                }
+                crate::state::TaskDefinitionReferenceFault::RevisionNumber => {
+                    DescribeTaskDefinitionErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
+                    })
+                }
+            }
             .into());
         };
 

@@ -2883,21 +2883,25 @@ pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive";
 /// Why a `taskDefinition` reference a call would put to WORK cannot be used — the two
 /// conditions `usable_revision` tells apart, each with the sentence it carries.
 ///
-/// They are two DIFFERENT faults, so they are two different modelled errors: a reference
-/// that resolves to nothing names an identifier this store knows nothing about, while one
-/// that resolves to a revision the store HOLDS but may no longer run names an existing
-/// resource in a status this call cannot accept — a parameter whose value is wrong for the
-/// call, not an unknown identifier. A caller branches on the error code to decide what to
-/// do next (register the family, or point the request at a live revision), which is why
-/// the two never collapse onto one code.
+/// They are two DIFFERENT faults: a reference that resolves to nothing names an identifier
+/// this store knows nothing about, while one that resolves to a revision the store HOLDS but
+/// may no longer run names an existing resource in a status this call cannot accept. Each
+/// carries its own sentence, so a caller can tell which of the two it is in (register the
+/// family, or point the request at a live revision).
+///
+/// WHICH modelled error class each condition takes is a property of the OPERATION rather
+/// than of the condition — `ClientException` and `InvalidParameterException` are both
+/// declared by every operation that resolves such a reference — so each operation answers
+/// the class Amazon ECS answers for it: a CREATE reports a revision it may not use as the
+/// bad parameter it was given, while an UPDATE reports both conditions as the identifier
+/// fault they are. The operation picks; this type only says which condition it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskDefinitionRefusal {
-    /// The reference resolves to no stored revision at all: `ClientException`, with
+    /// The reference resolves to no stored revision at all, with
     /// [`TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE`].
     NotFound,
     /// The reference resolves to a stored revision whose status is not
-    /// [`TASK_DEFINITION_ACTIVE`]: `InvalidParameterException`, with
-    /// [`TASK_DEFINITION_INACTIVE_MESSAGE`].
+    /// [`TASK_DEFINITION_ACTIVE`], with [`TASK_DEFINITION_INACTIVE_MESSAGE`].
     Inactive,
 }
 

@@ -186,16 +186,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some((family, revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
-            // The value DOES spell a revision number, so what is left wrong with it is
-            // the reference: a family part outside the character set a family name is
-            // spelled in, or a number outside the positive range a revision counter
-            // takes. That is the one condition every operation resolving a
-            // `taskDefinition` reference reports with the same fixed sentence.
-            return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
-                },
-            )
+            // The value DOES spell a revision number, so what is left wrong with it is the
+            // reference, and WHICH fault it carries is what the refusal states
+            // ([`crate::state::task_definition_reference_fault`]): the family left blank, a
+            // family part outside the character set a family name is spelled in, or a
+            // number outside the positive range a revision counter takes — which names no
+            // revision this account holds rather than a value spelled wrong.
+            let fault = crate::state::task_definition_reference_fault(&input.task_definition)
+                .unwrap_or(crate::state::TaskDefinitionReferenceFault::FamilyCharacters);
+            return Err(match fault {
+                crate::state::TaskDefinitionReferenceFault::FamilyBlank => {
+                    DeregisterTaskDefinitionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::blank_member_message(
+                                crate::state::TASK_DEFINITION_SUBJECT,
+                            )),
+                        },
+                    )
+                }
+                crate::state::TaskDefinitionReferenceFault::FamilyCharacters => {
+                    DeregisterTaskDefinitionErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
+                    })
+                }
+                crate::state::TaskDefinitionReferenceFault::RevisionNumber => {
+                    DeregisterTaskDefinitionErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
+                    })
+                }
+            }
             .into());
         };
 

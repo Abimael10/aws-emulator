@@ -666,14 +666,20 @@ async fn an_inactive_revision_cannot_be_used_to_run_new_work() {
             let case = format!("{operation} on the INACTIVE revision as {reference:?}");
             let (code, message) =
                 refusal(&router, operation, request_for(operation, reference, slot), &case).await;
-            // A reference that RESOLVES to a revision this service holds, in a status
-            // this call may not use, is a parameter whose value is wrong for the call —
-            // not an unknown identifier, which is what the family-with-no-ACTIVE-revision
-            // rows further down report as a ClientException.
+            // A reference that RESOLVES to a revision this service holds, in a status this
+            // call may not use, is answered in the modelled class Amazon ECS answers for
+            // THAT operation: a create reports the parameter whose value is wrong for the
+            // call, while an update reports the identifier fault it is — both are declared
+            // by both operations, and the class each answers is the recorded one. The
+            // family-with-no-ACTIVE-revision rows further down report an unknown identifier
+            // as a ClientException throughout.
+            let want = match operation {
+                "UpdateService" => "ClientException",
+                _ => "InvalidParameterException",
+            };
             assert_eq!(
-                code, "InvalidParameterException",
-                "case {case:?}: expected an InvalidParameterException, got {code} with \
-                 {message:?}"
+                code, want,
+                "case {case:?}: expected a {want}, got {code} with {message:?}"
             );
             refusals.push((case, code, message));
         }
