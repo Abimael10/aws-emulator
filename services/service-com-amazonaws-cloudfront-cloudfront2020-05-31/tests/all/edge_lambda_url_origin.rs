@@ -736,6 +736,35 @@ impl Answered {
         Self { status, raw, body }
     }
 
+    /// Every header the answer carries, as `(lowercased name, value)` in the order the answer
+    /// states them — what a rule about WHICH headers an answer carries at all is read off, an
+    /// absence being a question [`Answered::raw`] cannot be asked with a substring.
+    ///
+    /// `pub(crate)` so a sibling suite with a rule about the headers an answer carries reads
+    /// them off the connection through this one reader rather than another copy of the split.
+    pub(crate) fn stated_headers(&self) -> Vec<(String, String)> {
+        self.raw
+            .split_once("\r\n\r\n")
+            .map_or(self.raw.as_str(), |(head, _body)| head)
+            .split("\r\n")
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect()
+    }
+
+    /// The value the answer carries under the header `name`, or `None` when it carries none
+    /// under that name. A header name is compared without case, as HTTP defines it.
+    ///
+    /// `pub(crate)` for the same reason as [`Answered::stated_headers`].
+    pub(crate) fn stated(&self, name: &str) -> Option<String> {
+        let wanted = name.to_ascii_lowercase();
+        self.stated_headers()
+            .into_iter()
+            .find(|(stated, _value)| *stated == wanted)
+            .map(|(_stated, value)| value)
+    }
+
     /// Whether the answer carries the origin's own bytes.
     pub(crate) fn carries_the_origins_bytes(&self) -> bool {
         self.body.contains(ORIGIN_MARKER)
