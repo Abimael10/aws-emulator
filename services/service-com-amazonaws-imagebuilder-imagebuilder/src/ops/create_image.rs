@@ -338,6 +338,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
         let Some(built) = store.resolve_built_recipe(named_recipe, &region) else {
             return Err(missing(named_recipe));
         };
+        // "Image tests are enabled by default", and of the timeout: "If you don't specify a
+        // value, Image Builder stores and returns 720" — so what the build runs with, and
+        // what is stored, is that configuration with both defaults filled in.
+        let image_tests_configuration = ImageTestsConfiguration {
+            image_tests_enabled: Some(
+                input
+                    .image_tests_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.image_tests_enabled)
+                    .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+            ),
+            timeout_minutes: Some(
+                input
+                    .image_tests_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.timeout_minutes)
+                    .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
+            ),
+        };
+
+        let queued_at = ::std::time::SystemTime::now();
+
+        // What the RUN of this build records about itself, beside the configuration this
+        // request named: the base image it resolved and the operating system that image
+        // carries, the workflows it runs, the role it assumes and the id of the execution
+        // ([`crate::state::ImageBuildRun`]). One reading, shared with the pipeline path.
+        let run = crate::state::ImageBuildRun::observed(
+            &store,
+            &built,
+            &region,
+            input.workflows.as_deref(),
+            input.execution_role.as_deref(),
+            image_tests_configuration
+                .image_tests_enabled
+                .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+            queued_at,
+        );
+
         let crate::state::BuiltRecipe {
             name,
             version,
@@ -345,6 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
             image_recipe_arn,
             container_recipe_arn,
             image_type,
+            parent_image: _,
         } = built;
         let platform = Some(platform);
 
@@ -392,7 +431,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
 
         let request_id = crate::state::new_request_id();
         let client_token = input.client_token.clone();
-        let queued_at = ::std::time::SystemTime::now();
 
         // "The response returns as soon as Image Builder creates the new image resource.
         // The image build process runs asynchronously", so the record is filed now,
@@ -425,8 +463,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
                 // "The array of workflow configuration objects for the build": when a
                 // request names workflows "they replace the default workflows that Image
                 // Builder otherwise runs for the build", so the build records exactly the
-                // ones it was given.
-                workflows: input.workflows.clone(),
+                // ones it was given — and a request that named none records the
+                // service-owned workflows it ran instead ([`crate::state::ImageBuildRun`]).
+                workflows: Some(run.workflows),
                 // "Specifies whether to collect additional information about the image
                 // being created ... Defaults to true."
                 enhanced_image_metadata_enabled: input
@@ -435,23 +474,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
                 // "Image tests are enabled by default", and of the timeout: "If you don't
                 // specify a value, Image Builder stores and returns 720" — so what is
                 // stored is that configuration with both defaults filled in.
-                image_tests_configuration: ImageTestsConfiguration {
-                    image_tests_enabled: Some(
-                        input
-                            .image_tests_configuration
-                            .as_ref()
-                            .and_then(|configuration| configuration.image_tests_enabled)
-                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
-                    ),
-                    timeout_minutes: Some(
-                        input
-                            .image_tests_configuration
-                            .as_ref()
-                            .and_then(|configuration| configuration.timeout_minutes)
-                            .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES),
-                    ),
-                },
-                execution_role: input.execution_role,
+                image_tests_configuration,
+                // "If you don't provide a role, Image Builder uses the Image Builder
+                // service-linked role in your account", so the build records the role it
+                // ASSUMED rather than only one the request named
+                // ([`crate::state::ImageBuildRun`]).
+                execution_role: Some(run.execution_role),
+                // The execution this build ran as, the base image it resolved and the
+                // operating system that image carries, all observed by the run.
+                execution_id: Some(run.execution_id),
+                parent_image: Some(run.resolved_parent_image),
+                os_version: run.os_version,
                 logging_configuration: input.logging_configuration,
                 platform,
                 // "For an image recipe, this is always AMI": the kind of recipe a build

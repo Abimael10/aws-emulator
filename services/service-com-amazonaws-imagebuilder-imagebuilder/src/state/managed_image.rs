@@ -292,6 +292,10 @@ impl ManagedImage {
             execution_role: None,
             workflows: None,
             logging_configuration: None,
+            // "Unique identifier that Image Builder assigns to keep track of runtime
+            // resources each time it runs a workflow": no build of this account ran for a
+            // published image, so there is no execution of one to name.
+            execution_id: None,
         }
     }
 }

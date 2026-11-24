@@ -14,11 +14,9 @@
 //! requirement its value had to satisfy, with the value itself withheld — whether a modelled
 //! constraint, a lookup of the resource the value names, a parse of the document it carries,
 //! or the opaqueness of a token this service issues is what established the value is not
-//! admitted. A refusal of the modelled-constraint class states it as `The value supplied for
-//! parameter '<member>' is not valid. <requirement>`, and the instance-profile lookup — the
-//! service's own refusal rather than the model's — states it as `Invalid parameter value for
-//! <member>: <requirement>`. The refusal names the request it answers in the body's
-//! `requestId`, and nothing of the store changes.
+//! admitted. The sentence is ONE sentence, `The value supplied for parameter '<member>' is not
+//! valid. <requirement>`, whatever established it. The refusal names the request it answers in
+//! the body's `requestId`, and nothing of the store changes.
 //!
 //! `tests/all/parameter_value_refusals.rs` spans the modelled-constraint classes; the rows
 //! here span what the rule generalises over BESIDE them: what established the value is not
@@ -200,17 +198,11 @@ fn configuration_arn(name: &str) -> String {
     format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:infrastructure-configuration/{name}")
 }
 
-/// The sentence this service states for `parameter` when a MODELLED constraint, a parse or a
-/// token it did not issue established the value is not admitted
-/// (`service_common::validation_message::parameter_value_mismatch`).
+/// The sentence this service states for `parameter` when a MODELLED constraint, a parse, a
+/// lookup of the resource the value names or a token it did not issue established the value is
+/// not admitted (`service_common::validation_message::parameter_value_mismatch`).
 fn constraint_message(parameter: &str, requirement: &str) -> String {
     format!("The value supplied for parameter '{parameter}' is not valid. {requirement}")
-}
-
-/// The sentence this service states for `parameter` when the refusal is its OWN — the
-/// instance-profile lookup, whose refusal names the member and then the requirement.
-fn named_parameter_message(parameter: &str, requirement: &str) -> String {
-    format!("Invalid parameter value for {parameter}: {requirement}")
 }
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form an AWS request id carries.
@@ -274,10 +266,7 @@ fn rows() -> Vec<Row> {
                 "instanceProfileName": ABSENT_PROFILE,
                 "clientToken": "wtok-0002",
             })),
-            message: named_parameter_message(
-                "instanceProfileName",
-                &absent_profile_requirement(),
-            ),
+            message: constraint_message("instanceProfileName", &absent_profile_requirement()),
         },
         Row {
             // The SAME refusal from a second operation: one sentence, not one per handler.
@@ -289,10 +278,7 @@ fn rows() -> Vec<Row> {
                 "instanceProfileName": ABSENT_PROFILE,
                 "clientToken": "wtok-0003",
             })),
-            message: named_parameter_message(
-                "instanceProfileName",
-                &absent_profile_requirement(),
-            ),
+            message: constraint_message("instanceProfileName", &absent_profile_requirement()),
         },
         Row {
             // A parse: a resource policy is a JSON document, and this one is not.

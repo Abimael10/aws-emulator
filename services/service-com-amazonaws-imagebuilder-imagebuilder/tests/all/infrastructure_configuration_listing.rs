@@ -351,10 +351,11 @@ async fn an_instance_profile_the_account_does_not_hold_is_refused_as_that_parame
     stage_iam(&router).await;
 
     // The sentence this service states the refusal of an absent instance profile in, as the
-    // recorded refusal words it: the member named, then the requirement its value missed.
-    let expected_refusal = "Invalid parameter value for instanceProfileName: The provided \
-                            instance profile does not exist. Please specify a different \
-                            instance profile and try again.";
+    // recorded refusal words it: the ONE sentence a refused parameter value is stated in —
+    // the member named, then the requirement its value missed.
+    let expected_refusal = "The value supplied for parameter 'instanceProfileName' is not \
+                            valid. The provided instance profile does not exist. Please \
+                            specify a different instance profile and try again.";
 
     for (row, case) in profile_cases().into_iter().enumerate() {
         let token = format!("iptok-{row}");

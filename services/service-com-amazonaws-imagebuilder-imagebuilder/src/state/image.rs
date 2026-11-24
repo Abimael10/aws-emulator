@@ -36,6 +36,18 @@ use super::{
     InfrastructureConfigurationRecord, ARN_SERVICE, IMAGE_ARN_PREFIX, IMAGE_STATUS_AVAILABLE,
 };
 
+/// The base image a read of `record` reports for the recipe it reports: the ONE image version
+/// the build resolved and ran on, when it recorded one, and the recipe's own stored reference
+/// otherwise.
+///
+/// A recipe keeps the reference its create carried, wildcard version nodes included, and a read
+/// of the RECIPE reports that — what is stored. A read of an IMAGE reports what the build did:
+/// "the image recipe that Image Builder used to create the image", resolved at the instant the
+/// build started, so the base image it names is the one image the build built on.
+fn built_on(record: &ImageBuildVersionRecord, stored: Option<String>) -> Option<String> {
+    record.parent_image.clone().or(stored)
+}
+
 impl ImageBuildVersionRecord {
     /// The semantic version this build version reports: its three assigned nodes and the
     /// build number Image Builder assigned as the fourth.
@@ -144,12 +156,11 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             version: Some(record.semantic_version()),
             platform: record.platform.clone(),
             enhanced_image_metadata_enabled: Some(record.enhanced_image_metadata_enabled),
-            // "The operating system version for instances that launch from this image":
-            // nothing this store holds says which OS version a parent image carries (a
-            // recipe's `parentImage` is an AMI id, an ARN or a parameter name), so a build
-            // version reports none rather than naming one nothing observed — the same answer
-            // a listed summary gives ([`ImageBuildVersionRecord::summary`]).
-            os_version: None,
+            // "The operating system version for instances that launch from this image": the
+            // operating system of the base image the build ran against, as the build recorded
+            // it — the same answer a listed summary gives
+            // ([`ImageBuildVersionRecord::summary`]).
+            os_version: record.os_version.clone(),
             // "The state of the image", which is read from the clock against the instant the
             // build is due rather than from anything a call had to materialise.
             state: Some(ImageState {
@@ -160,17 +171,28 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             // "For images that distribute an AMI, this is the image recipe that Image Builder
             // used to create the image. For container images, this is empty" — and the other
             // way around for `containerRecipe`. Which of the two a build recorded is the kind
-            // of recipe it was built from.
+            // of recipe it was built from. The recipe a read of an IMAGE reports carries the
+            // base image that build RESOLVED rather than the reference the recipe was created
+            // with ([`built_on`]): a recipe may name a whole version line, and what the build
+            // ran on was one image version of it.
             image_recipe: record
                 .image_recipe_arn
                 .as_deref()
                 .and_then(|arn| self.image_recipe(arn, &record.region))
-                .map(ImageRecipeRecord::view),
+                .map(ImageRecipeRecord::view)
+                .map(|mut view| {
+                    view.parent_image = built_on(record, view.parent_image);
+                    view
+                }),
             container_recipe: record
                 .container_recipe_arn
                 .as_deref()
                 .and_then(|arn| self.container_recipe(arn, &record.region))
-                .map(ContainerRecipeRecord::view),
+                .map(ContainerRecipeRecord::view)
+                .map(|mut view| {
+                    view.parent_image = built_on(record, view.parent_image);
+                    view
+                }),
             // "The name of the image pipeline that created this image. Image Builder doesn't
             // return this field for new images. Use sourcePipelineArn instead."
             source_pipeline_name: None,
@@ -209,6 +231,7 @@ impl ComAmazonawsImagebuilderImagebuilderState {
             deprecation_time: None,
             lifecycle_execution_id: None,
             execution_role: record.execution_role.clone(),
+            execution_id: record.execution_id.clone(),
             workflows: record.workflows.clone(),
             logging_configuration: record.logging_configuration.clone(),
         }

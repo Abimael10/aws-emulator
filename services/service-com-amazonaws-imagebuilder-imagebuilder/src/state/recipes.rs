@@ -65,6 +65,11 @@ pub struct BuiltRecipe {
     /// Whether the build produces an AMI or a container image, from the kind of recipe it
     /// builds.
     pub image_type: &'static str,
+    /// The base image the recipe names, as the recipe holds it: "the base image for
+    /// customizations specified in the image recipe", which the build RESOLVES when it starts
+    /// ([`super::ImageBuildRun`]) — so the run records one image version of it rather than the
+    /// version line the recipe may name.
+    pub parent_image: String,
 }
 
 impl From<&ImageRecipeRecord> for BuiltRecipe {
@@ -79,6 +84,7 @@ impl From<&ImageRecipeRecord> for BuiltRecipe {
             image_recipe_arn: Some(recipe.arn.clone()),
             container_recipe_arn: None,
             image_type: IMAGE_TYPE_AMI,
+            parent_image: recipe.parent_image.clone(),
         }
     }
 }
@@ -94,6 +100,7 @@ impl From<&ContainerRecipeRecord> for BuiltRecipe {
             // image recipe's is.
             container_recipe_arn: Some(recipe.arn.clone()),
             image_type: IMAGE_TYPE_DOCKER,
+            parent_image: recipe.parent_image.clone(),
         }
     }
 }

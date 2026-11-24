@@ -306,11 +306,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartImagePipelin
         let Some(built) = store.resolve_built_recipe(&reference, &region) else {
             return Err(missing(&reference));
         };
-        let (name, version) = (built.name, built.version);
-        let platform = Some(built.platform);
-        let image_recipe_arn = built.image_recipe_arn;
-        let container_recipe_arn = built.container_recipe_arn;
+        let (name, version) = (built.name.clone(), built.version.clone());
+        let platform = Some(built.platform.clone());
+        let image_recipe_arn = built.image_recipe_arn.clone();
+        let container_recipe_arn = built.container_recipe_arn.clone();
         let image_type = built.image_type;
+
+        let queued_at = ::std::time::SystemTime::now();
+
+        // What the RUN of this build records about itself, beside the configuration the
+        // pipeline holds: the base image it resolved and the operating system that image
+        // carries, the workflows it runs, the role it assumes and the id of the execution
+        // ([`crate::state::ImageBuildRun`]). One reading, shared with the direct build path.
+        let run = crate::state::ImageBuildRun::observed(
+            &store,
+            &built,
+            &region,
+            workflows.as_deref(),
+            execution_role.as_deref(),
+            image_tests_configuration
+                .image_tests_enabled
+                .unwrap_or(crate::state::DEFAULT_IMAGE_TESTS_ENABLED),
+            queued_at,
+        );
 
         // The store is finite: a run that would take it past this emulator's own cap is
         // refused rather than growing it, and nothing is queued.
@@ -336,7 +354,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartImagePipelin
 
         let request_id = crate::state::new_request_id();
         let client_token = input.client_token.clone();
-        let queued_at = ::std::time::SystemTime::now();
 
         // "The response returns as soon as Image Builder creates the new image resource
         // and queues the build", so the record is filed now, carrying the instant its
@@ -356,10 +373,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartImagePipelin
                 infrastructure_configuration_arn,
                 distribution_configuration_arn,
                 image_scanning_configuration,
-                workflows,
+                // The workflows the pipeline named, or the service-owned ones this build ran
+                // when it named none; the role the build ASSUMED, which is this account's
+                // service-linked role when the pipeline named none; and what the run
+                // observed about the base image it built on.
+                workflows: Some(run.workflows),
                 enhanced_image_metadata_enabled,
                 image_tests_configuration,
-                execution_role,
+                execution_role: Some(run.execution_role),
+                execution_id: Some(run.execution_id),
+                parent_image: Some(run.resolved_parent_image),
+                os_version: run.os_version,
                 logging_configuration,
                 platform,
                 image_type: Some(image_type.to_string()),

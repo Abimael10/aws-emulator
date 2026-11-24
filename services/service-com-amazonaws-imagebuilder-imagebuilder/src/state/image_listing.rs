@@ -144,10 +144,9 @@ impl ImageBuildVersionRecord {
             r#type: self.image_type.clone(),
             version: Some(self.listed_version(aggregated_by_name).to_string()),
             platform: self.platform.clone(),
-            // Nothing this store holds says which OS version an image carries, for the
-            // reason [`ImageBuildVersionRecord::summary`] states, so an image an account
-            // built reports none.
-            os_version: None,
+            // The operating system of the base image the build this entry is read from ran
+            // against, as that build recorded it ([`ImageBuildVersionRecord::summary`]).
+            os_version: self.os_version.clone(),
             owner: Some(::engine::EMULATOR_ACCOUNT_ID.to_string()),
             date_created: Some(self.date_created.clone()),
             build_type: self.build_type.clone(),

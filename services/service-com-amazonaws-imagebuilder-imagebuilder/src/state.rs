@@ -181,6 +181,11 @@ mod removals;
 /// rather than items of its own, so there is nothing to re-export from it.
 mod image;
 
+/// What the RUN of an image build records about itself: the base image it resolved, the
+/// operating system that image carries, the workflows it ran and the identity it assumed.
+mod image_build_run;
+pub use image_build_run::*;
+
 /// Which stopped build a retry may RESUME, which is decided by the phase that build stopped
 /// in, and how a build no retry can resume is refused.
 mod image_retry;
@@ -1267,10 +1272,10 @@ pub struct ImageBuildVersionRecord {
     /// pipeline named any: "settings for the vulnerability scans that Amazon Inspector runs
     /// for this image" (`Image`'s `imageScanningConfiguration`).
     pub image_scanning_configuration: Option<ImageScanningConfiguration>,
-    /// The workflow configurations the build ran, when the request or the pipeline named any:
+    /// The workflow configurations the build ran: the ones the request or the pipeline named —
     /// "the build, test, and distribution workflow configurations that are associated with
-    /// the image" (`Image`'s `workflows`). A build that named none ran the default workflows,
-    /// which are not configurations this service holds.
+    /// the image" (`Image`'s `workflows`) — or the service-owned workflows a build that named
+    /// none runs, which are the workflows it then ran ([`ImageBuildRun::workflows`]).
     pub workflows: Option<Vec<WorkflowConfiguration>>,
     /// Whether the build collected the additional image metadata, as the request or the
     /// pipeline that asked for it named it, with the documented default filled in
@@ -1280,10 +1285,25 @@ pub struct ImageBuildVersionRecord {
     /// ([`DEFAULT_IMAGE_TESTS_ENABLED`], [`DEFAULT_IMAGE_TESTS_TIMEOUT_MINUTES`]): "the
     /// image test settings that Image Builder used when it created this image".
     pub image_tests_configuration: ImageTestsConfiguration,
-    /// The role the build's workflow actions ran under, when the request or the pipeline
-    /// named one: "the name or Amazon Resource Name (ARN) for the IAM role you create that
-    /// grants Image Builder access to perform workflow actions".
+    /// The role the build's workflow actions ran under: the one the request or the pipeline
+    /// named — "the name or Amazon Resource Name (ARN) for the IAM role you create that
+    /// grants Image Builder access to perform workflow actions" — or this account's Image
+    /// Builder service-linked role when it named none, which is the role the build then
+    /// assumed ([`ImageBuildRun`]).
     pub execution_role: Option<String>,
+    /// The id of the build execution this build version was produced by, which the wire
+    /// reports on a built image and the on-disk model does not declare ([`ImageBuildRun`]).
+    pub execution_id: Option<String>,
+    /// The ONE base image version the build resolved the recipe's `parentImage` to and ran
+    /// against, which is what a read of this image reports as the recipe's base image
+    /// ([`ImageBuildRun::resolved_parent_image`]). A record filed by nothing that resolved one
+    /// carries none, and a read then reports the recipe's own stored reference.
+    pub parent_image: Option<String>,
+    /// "The operating system version for instances that launch from this image" (`Image`'s
+    /// `osVersion`): the operating system the base image the build ran against carries, when
+    /// this service knows it ([`ImageBuildRun::os_version`]). A build whose base image names a
+    /// catalog nothing here resolves holds none, and reports none.
+    pub os_version: Option<String>,
     /// Where the build's logs were directed: "the logging configuration that's defined for
     /// the image", which for a pipeline's build is that pipeline's `imageLogGroupName`.
     pub logging_configuration: Option<ImageLoggingConfiguration>,
@@ -1384,11 +1404,11 @@ impl ImageBuildVersionRecord {
             r#type: self.image_type.clone(),
             version: Some(self.version.clone()),
             platform: self.platform.clone(),
-            // "The operating system version for instances that launch from this image":
-            // nothing this store holds says which OS version a parent image carries (a
-            // recipe's `parentImage` is an AMI id, an ARN or a parameter name), so a build
-            // version reports none rather than naming one nothing observed.
-            os_version: None,
+            // "The operating system version for instances that launch from this image": the
+            // operating system of the base image the build ran against, as the build recorded
+            // it ([`Self::os_version`]) — none for a build whose base image names a catalog
+            // nothing here resolves.
+            os_version: self.os_version.clone(),
             state: Some(ImageState {
                 status: Some(self.status_at(at).to_string()),
                 reason: None,
@@ -1421,8 +1441,10 @@ impl ImageBuildVersionRecord {
             "version" => Some(self.version.as_str()),
             "platform" => self.platform.as_deref(),
             "type" => self.image_type.as_deref(),
-            // A build version reports no `osVersion` (see [`Self::summary`]), so a filter
-            // on it matches none.
+            // The operating system the build recorded for the base image it ran against, so a
+            // filter on it selects the builds that ran on that operating system and none of
+            // the builds that recorded none ([`Self::summary`]).
+            "osVersion" => self.os_version.as_deref(),
             _ => None,
         }
     }
@@ -3310,14 +3332,22 @@ pub fn iso8601(at: SystemTime) -> String {
 
 /// Mint the `requestId` one response names the request it answers.
 ///
-/// 8-4-4-4-12 lowercase hex, the form an AWS request id takes. The VALUE is per-call
-/// and is not a requirement: nothing can predict it and no caller may depend on a
-/// particular one. What it must do is name ONE response, so it is drawn from a
-/// per-process counter run through [`scramble`] — a bijection, so two responses never
-/// carry the same id — mixed with the instant the response was answered, so two runs
-/// of this emulator do not mint the same sequence.
+/// The id form an AWS request id takes ([`new_uuid`]). The VALUE is per-call and is not a
+/// requirement: nothing can predict it and no caller may depend on a particular one; what it
+/// must do is name ONE response, which that mint guarantees.
 #[must_use]
 pub fn new_request_id() -> String {
+    new_uuid()
+}
+
+/// Mint one id of the 8-4-4-4-12 lowercase-hex form this API's ids take.
+///
+/// The ONE mint of this crate, so every id it reports — a request id, the id of a build
+/// execution — is unique for the same reason: it is drawn from a per-process counter run
+/// through [`scramble`], a bijection, so two ids never collide, mixed with the instant it was
+/// minted, so two runs of this emulator do not mint the same sequence.
+#[must_use]
+pub fn new_uuid() -> String {
     static MINTED: AtomicU64 = AtomicU64::new(0);
 
     let counter = MINTED.fetch_add(1, Ordering::Relaxed);
@@ -4373,34 +4403,18 @@ pub const INSTANCE_PROFILE_NAME_MEMBER: &str = "instanceProfileName";
 /// `instanceProfileName` is "the instance profile to associate with the instance used to
 /// customize your Amazon EC2 AMI" — an IAM resource of the caller's account, which the model
 /// can only constrain the SHAPE of, so whether it exists is resolved against IAM itself
-/// ([`instance_profile_named`]). This refusal is NOT one of the modelled-constraint class the
-/// service states as `The value supplied for parameter '<member>' is not valid. …`
-/// (`service_common::validation_message::parameter_value_mismatch`): a profile that is not
-/// there is reported in the service's own naming form for a refused parameter — the member
-/// unquoted, then a colon, then the requirement — which is how the instance-profile lookup
-/// words it. The requirement clause states that no such profile exists; nothing of the value
-/// is echoed.
+/// ([`instance_profile_named`]). The refusal is stated in the ONE sentence this service
+/// refuses a parameter value in, whatever established the value is not one it admits
+/// (`service_common::validation_message::parameter_value_mismatch`): the member as the API
+/// addresses it, then the requirement — here that an instance profile of that name has to
+/// exist. Nothing of the value is echoed.
 #[must_use]
 pub fn missing_instance_profile_message(member: &str) -> String {
-    invalid_parameter_value_message(
+    ::service_common::validation_message::parameter_value_mismatch(
         member,
         "The provided instance profile does not exist. Please specify a different instance \
          profile and try again.",
     )
-}
-
-/// The sentence this service states a parameter refusal in when the refusal is the service's
-/// own rather than one of the modelled-constraint class: `Invalid parameter value for
-/// <member>: <requirement>`.
-///
-/// The member is named as the API addresses it and the requirement follows the colon, so the
-/// caller is told which parameter was refused and what its value had to satisfy. The value
-/// itself is WITHHELD, exactly as in the constraint-class sentence
-/// (`service_common::validation_message::parameter_value_mismatch`): the requirement is what
-/// the parameter admits, not the one value that missed it.
-#[must_use]
-pub fn invalid_parameter_value_message(member: &str, requirement: &str) -> String {
-    format!("Invalid parameter value for {member}: {requirement}")
 }
 
 /// Why a `CreateComponent` naming neither a document nor a URI, or both, is refused.

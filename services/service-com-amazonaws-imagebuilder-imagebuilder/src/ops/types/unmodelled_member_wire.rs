@@ -42,6 +42,9 @@ macro_rules! ib_shape_type {
     (boolean) => {
         ::aws_smithy_schema::ShapeType::Boolean
     };
+    (timestamp) => {
+        ::aws_smithy_schema::ShapeType::Timestamp
+    };
     (map_of_string) => {
         ::aws_smithy_schema::ShapeType::Map
     };
@@ -107,6 +110,9 @@ macro_rules! ib_write_member {
     ($s:ident, $m:expr, $v:expr, boolean) => {
         $s.write_boolean($m, *$v)?;
     };
+    ($s:ident, $m:expr, $v:expr, timestamp) => {
+        $s.write_timestamp($m, $v)?;
+    };
     // A map writes each key and then its value against the MAP member's own schema, which is
     // where the codec reads the entry layout from.
     ($s:ident, $m:expr, $v:expr, map_of_string) => {
@@ -152,6 +158,9 @@ macro_rules! ib_read_member {
     };
     ($d:ident, $m:expr, boolean) => {
         $d.read_boolean($m)?
+    };
+    ($d:ident, $m:expr, timestamp) => {
+        $d.read_timestamp($m)?
     };
     ($d:ident, $m:expr, map_of_string) => {{
         let mut __out: ::std::collections::HashMap<::std::string::String, ::std::string::String> =

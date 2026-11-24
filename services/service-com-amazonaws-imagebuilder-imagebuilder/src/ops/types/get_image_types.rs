@@ -25,7 +25,15 @@ pub struct GetImageOutput {
     pub latest_version_references: Option<LatestVersionReferences>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.imagebuilder#Image")]
+/// The detailed view of one image a read reports: the members `Image` declares, in the model's
+/// own member order, and `executionId` appended last.
+///
+/// Member set and order from `smithy_query(query="shape", shape="Image")`, plus `executionId` —
+/// a member the real service reports on a read of an image its build executed and the on-disk
+/// model omits, which is why the schema and the codec come from
+/// `types/unmodelled_member_wire.rs` rather than from the derive (see that module's note). The
+/// id is read off the stored build version
+/// (`crate::state::ImageBuildVersionRecord::execution_id`), never fixed here.
 #[derive(Debug, Clone, Default)]
 pub struct Image {
     pub arn: Option<String>,
@@ -55,7 +63,163 @@ pub struct Image {
     pub execution_role: Option<String>,
     pub workflows: Option<Vec<WorkflowConfiguration>>,
     pub logging_configuration: Option<ImageLoggingConfiguration>,
+    pub execution_id: Option<String>,
 }
+
+ib_schema_and_codec!(
+    Image,
+    IMAGE_SCHEMA,
+    "com.amazonaws.imagebuilder#Image",
+    "com.amazonaws.imagebuilder",
+    "Image",
+    (M_ARN, arn, "arn", 0, opt, string),
+    (M_TYPE, r#type, "type", 1, opt, string),
+    (M_NAME, name, "name", 2, opt, string),
+    (M_VERSION, version, "version", 3, opt, string),
+    (M_PLATFORM, platform, "platform", 4, opt, string),
+    (
+        M_ENHANCED_IMAGE_METADATA_ENABLED,
+        enhanced_image_metadata_enabled,
+        "enhancedImageMetadataEnabled",
+        5,
+        opt,
+        boolean
+    ),
+    (M_OS_VERSION, os_version, "osVersion", 6, opt, string),
+    (M_STATE, state, "state", 7, opt, struct_of(ImageState)),
+    (
+        M_IMAGE_RECIPE,
+        image_recipe,
+        "imageRecipe",
+        8,
+        opt,
+        struct_of(ImageRecipe)
+    ),
+    (
+        M_CONTAINER_RECIPE,
+        container_recipe,
+        "containerRecipe",
+        9,
+        opt,
+        struct_of(ContainerRecipe)
+    ),
+    (
+        M_SOURCE_PIPELINE_NAME,
+        source_pipeline_name,
+        "sourcePipelineName",
+        10,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_PIPELINE_ARN,
+        source_pipeline_arn,
+        "sourcePipelineArn",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_INFRASTRUCTURE_CONFIGURATION,
+        infrastructure_configuration,
+        "infrastructureConfiguration",
+        12,
+        opt,
+        struct_of(InfrastructureConfiguration)
+    ),
+    (
+        M_DISTRIBUTION_CONFIGURATION,
+        distribution_configuration,
+        "distributionConfiguration",
+        13,
+        opt,
+        struct_of(DistributionConfiguration)
+    ),
+    (
+        M_IMAGE_TESTS_CONFIGURATION,
+        image_tests_configuration,
+        "imageTestsConfiguration",
+        14,
+        opt,
+        struct_of(ImageTestsConfiguration)
+    ),
+    (M_DATE_CREATED, date_created, "dateCreated", 15, opt, string),
+    (
+        M_OUTPUT_RESOURCES,
+        output_resources,
+        "outputResources",
+        16,
+        opt,
+        struct_of(OutputResources)
+    ),
+    (M_TAGS, tags, "tags", 17, opt, map_of_string),
+    (M_BUILD_TYPE, build_type, "buildType", 18, opt, string),
+    (M_IMAGE_SOURCE, image_source, "imageSource", 19, opt, string),
+    (
+        M_SCAN_STATE,
+        scan_state,
+        "scanState",
+        20,
+        opt,
+        struct_of(ImageScanState)
+    ),
+    (
+        M_IMAGE_SCANNING_CONFIGURATION,
+        image_scanning_configuration,
+        "imageScanningConfiguration",
+        21,
+        opt,
+        struct_of(ImageScanningConfiguration)
+    ),
+    (
+        M_DEPRECATION_TIME,
+        deprecation_time,
+        "deprecationTime",
+        22,
+        opt,
+        timestamp
+    ),
+    (
+        M_LIFECYCLE_EXECUTION_ID,
+        lifecycle_execution_id,
+        "lifecycleExecutionId",
+        23,
+        opt,
+        string
+    ),
+    (
+        M_EXECUTION_ROLE,
+        execution_role,
+        "executionRole",
+        24,
+        opt,
+        string
+    ),
+    (
+        M_WORKFLOWS,
+        workflows,
+        "workflows",
+        25,
+        opt,
+        list_of_struct(WorkflowConfiguration)
+    ),
+    (
+        M_LOGGING_CONFIGURATION,
+        logging_configuration,
+        "loggingConfiguration",
+        26,
+        opt,
+        struct_of(ImageLoggingConfiguration)
+    ),
+    (
+        M_EXECUTION_ID,
+        execution_id,
+        "executionId",
+        27,
+        opt,
+        recorded("com.amazonaws.imagebuilder.recorded", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.imagebuilder#ImageScanState")]
 #[derive(Debug, Clone, Default)]
