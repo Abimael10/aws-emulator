@@ -381,6 +381,39 @@ impl Pricing {
         round_cents(self.cost_before_discounts - self.discounts_total())
     }
 
+    /// Whether a Savings Plans commitment pays for the usage this price prices:
+    /// the price carries the discount that BUYING the recommended commitment
+    /// creates ([`Pricing::purchased_commitment`]), so the commitment — rather
+    /// than On-Demand pricing — is what the usage it covers is paid under. A
+    /// configuration that buys no commitment carries no such discount, so its
+    /// usage is paid for at On-Demand rates.
+    fn commitment_covers_usage(&self) -> bool {
+        self.commitment_purchase_discount > 0.0
+    }
+
+    /// What the Savings Plans commitment of this configuration costs per month:
+    /// the discounted price of the usage that commitment covers, which is the
+    /// whole of what the configuration costs where a commitment covers its
+    /// usage, and nothing at all for a configuration that commits to no plan.
+    pub fn monthly_commitment(&self) -> f64 {
+        if self.commitment_covers_usage() {
+            self.cost_after_discounts()
+        } else {
+            0.0
+        }
+    }
+
+    /// The On-Demand cost still payable once the commitment is in place: what
+    /// the configuration costs per month less the part its commitment charges
+    /// for, so usage a commitment covers leaves no On-Demand cost behind and
+    /// usage no commitment covers stays On-Demand in full. The commitment and
+    /// this remainder are the two parts of the configuration's monthly cost,
+    /// which is what makes the detail agree with the money a recommendation
+    /// reports.
+    pub fn on_demand_cost_after_commitment(&self) -> f64 {
+        round_cents(self.cost_after_discounts() - self.monthly_commitment())
+    }
+
     /// The cost to report under a `savingsEstimationMode`: the configuration's
     /// cost at public pricing, less the discount adopting the recommendation
     /// creates, and — under `AfterDiscounts` only — less the discounts the
@@ -893,12 +926,12 @@ fn resource_details(config: &ResourceConfig, pricing: &Pricing) -> ResourceDetai
                     monthly_savings_plans_eligible_cost: Some(round_cents(
                         pricing.cost_before_discounts,
                     )),
-                    estimated_monthly_commitment: Some(pricing.cost_after_discounts()),
+                    estimated_monthly_commitment: Some(pricing.monthly_commitment()),
                     savings_percentage: Some(percentage_of(
                         pricing.discounts_total(),
                         pricing.cost_before_discounts,
                     )),
-                    estimated_on_demand_cost: Some(round_cents(pricing.cost_before_discounts)),
+                    estimated_on_demand_cost: Some(pricing.on_demand_cost_after_commitment()),
                 }),
             }),
         }),
