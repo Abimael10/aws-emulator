@@ -233,8 +233,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The execution's effective configuration: the task's own, with each member
-        // the caller overrode for this run replacing it.
-        let options = crate::state::overlay_options(&task.options, input.override_options.as_ref());
+        // the caller overrode for this run replacing it, and each metadata option
+        // resolved against what the two locations this run copies between actually
+        // carry — the options the run APPLIES, which is what it reports having applied.
+        let configured =
+            crate::state::overlay_options(&task.options, input.override_options.as_ref());
+        let location_kind = |arn: &str| {
+            store
+                .locations
+                .get(arn)
+                .map(|location| location.config.kind())
+        };
+        let options = match (
+            location_kind(&task.source_location_arn),
+            location_kind(&task.destination_location_arn),
+        ) {
+            (Some(source), Some(destination)) => {
+                crate::state::applied_options(&configured, source, destination)
+            }
+            // A location a task names and this service no longer holds says nothing
+            // about what the run can carry, so the configured options stand.
+            _ => configured,
+        };
         let includes = input.includes.unwrap_or_else(|| task.includes.clone());
         let excludes = input.excludes.unwrap_or_else(|| task.excludes.clone());
         let manifest_config = input

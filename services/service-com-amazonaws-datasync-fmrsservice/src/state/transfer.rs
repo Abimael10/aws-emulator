@@ -59,10 +59,11 @@ const TRANSFER_PHASE: u8 = 1;
 /// up to this many objects rather than without bound.
 const MAX_OBJECTS_PER_SIDE: usize = 1_000;
 
-/// The `ObjectMetadata` and `ObjectTags` value that carries none of the source object's
-/// metadata across. Both members are documented with the same pair of values: `PRESERVE`,
-/// which is the default behaviour, and this one.
-const PRESERVE_NONE: &str = "NONE";
+// The `ObjectMetadata` and `ObjectTags` value that carries none of the source object's
+// metadata across. Both members are documented with the same pair of values: `PRESERVE`,
+// which is the default behaviour, and this one — the value every metadata member of
+// `Options` spells "ignore this" with (`super::PRESERVE_METADATA_NONE`).
+use super::PRESERVE_METADATA_NONE as PRESERVE_NONE;
 
 /// The user-metadata entry a transfer into an object store carries whatever the task's
 /// `ObjectMetadata` says: "even if you specify NONE, metadata for the last modified time

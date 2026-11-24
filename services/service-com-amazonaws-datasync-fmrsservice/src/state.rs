@@ -200,6 +200,35 @@ impl LocationKind {
         }
     }
 
+    /// Whether a location of this kind holds its data as FILES, with the POSIX
+    /// ownership and permissions a file system keeps beside each one.
+    ///
+    /// What a transfer can carry across is bounded by what its two ends hold: an object
+    /// store keeps objects under a key with user metadata, and no object of one has a
+    /// POSIX user id, group id or mode to read or to write. The distinction is what
+    /// [`applied_options`] reads the POSIX metadata options against.
+    pub fn is_file_system(self) -> bool {
+        match self {
+            Self::S3 | Self::AzureBlob | Self::ObjectStorage => false,
+            Self::Efs => true,
+        }
+    }
+
+    /// Whether a location of this kind holds an SMB security descriptor per file — the
+    /// object owner and the NTFS access control lists `Options$SecurityDescriptorCopyFlags`
+    /// selects components of.
+    ///
+    /// That member is documented for exactly two kinds of location: "This value is only
+    /// used for transfers between SMB and Amazon FSx for Windows File Server locations or
+    /// between two FSx for Windows File Server locations". Neither kind is one an
+    /// implemented `CreateLocation*` can mint yet, so no pair of locations this service
+    /// holds carries one; each kind that does will answer `true` here.
+    pub fn carries_smb_security_descriptors(self) -> bool {
+        match self {
+            Self::S3 | Self::AzureBlob | Self::ObjectStorage | Self::Efs => false,
+        }
+    }
+
     /// How a refusal names this kind of location, article included.
     pub fn described(self) -> &'static str {
         match self {
@@ -1239,9 +1268,12 @@ pub struct ObjectStorageLocationMut<'a> {
 /// `POINT_IN_TIME_CONSISTENT` as "the default option for Basic mode tasks".
 /// `BytesPerSecond` is the no-limit sentinel the member's `range` admits (`min: -1`),
 /// and `LogLevel` is `OFF`, the value the model describes as publishing no logs —
-/// which is what a task with no `CloudWatchLogGroupArn` does.
+/// which is what a task with no `CloudWatchLogGroupArn` does. `PreserveNfsAcls` is
+/// `NONE`: copying the NFS access control lists of a transfer's files is something a
+/// caller asks for, so a task that asked for nothing ignores them.
 pub fn default_options(task_mode: &str) -> Options {
     Options {
+        preserve_nfs_acls: Some(PRESERVE_METADATA_NONE.to_string()),
         verify_mode: Some(
             if task_mode == "ENHANCED" {
                 "ONLY_FILES_TRANSFERRED"
@@ -1279,6 +1311,10 @@ pub fn overlay_options(base: &Options, requested: Option<&Options>) -> Options {
         return base.clone();
     };
     Options {
+        preserve_nfs_acls: requested
+            .preserve_nfs_acls
+            .clone()
+            .or_else(|| base.preserve_nfs_acls.clone()),
         verify_mode: requested
             .verify_mode
             .clone()
@@ -1325,6 +1361,55 @@ pub fn overlay_options(base: &Options, requested: Option<&Options>) -> Options {
             .object_metadata
             .clone()
             .or_else(|| base.object_metadata.clone()),
+    }
+}
+
+/// The `Options` value of every metadata member that means the metadata it names is not
+/// carried across: "NONE - Ignores UID and GID", "NONE - Ignores POSIX-style
+/// permissions" (`Options$Uid`, `Options$Gid`, `Options$PosixPermissions`).
+pub const PRESERVE_METADATA_NONE: &str = "NONE";
+
+/// `options` as they were actually IN FORCE for a transfer between a `source` and a
+/// `destination` of these kinds.
+///
+/// A task's `Options` are its configuration; what one execution reports are the options
+/// that run applied, and a run applies a metadata option only where the two ends of the
+/// transfer carry that kind of metadata at all. The metadata each member names says
+/// which:
+///
+/// * `Uid`, `Gid` and `PosixPermissions` are the POSIX owner, group and mode of a FILE
+///   ([`LocationKind::is_file_system`]), so a run between two object stores has none to
+///   read or to write and reports them as [`PRESERVE_METADATA_NONE`].
+/// * `SecurityDescriptorCopyFlags` selects components of an SMB security descriptor,
+///   which the member documents as used only between the two kinds of location that keep
+///   one ([`LocationKind::carries_smb_security_descriptors`]).
+///
+/// Every other member describes something both kinds of location keep — a timestamp, a
+/// tag set, user metadata, how much bandwidth to use, what to verify — so it is in force
+/// however the two ends store their data and is reported as configured.
+pub fn applied_options(
+    options: &Options,
+    source: LocationKind,
+    destination: LocationKind,
+) -> Options {
+    let ignored = || Some(PRESERVE_METADATA_NONE.to_string());
+    let posix = source.is_file_system() || destination.is_file_system();
+    let smb = source.carries_smb_security_descriptors()
+        && destination.carries_smb_security_descriptors();
+    Options {
+        uid: if posix { options.uid.clone() } else { ignored() },
+        gid: if posix { options.gid.clone() } else { ignored() },
+        posix_permissions: if posix {
+            options.posix_permissions.clone()
+        } else {
+            ignored()
+        },
+        security_descriptor_copy_flags: if smb {
+            options.security_descriptor_copy_flags.clone()
+        } else {
+            ignored()
+        },
+        ..options.clone()
     }
 }
 

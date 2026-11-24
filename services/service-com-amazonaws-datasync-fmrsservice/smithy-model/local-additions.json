@@ -1,0 +1,146 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.datasync#Options": {
+      "type": "structure",
+      "members": {
+        "VerifyMode": { "target": "com.amazonaws.datasync#VerifyMode" },
+        "OverwriteMode": { "target": "com.amazonaws.datasync#OverwriteMode" },
+        "Atime": { "target": "com.amazonaws.datasync#Atime" },
+        "Mtime": { "target": "com.amazonaws.datasync#Mtime" },
+        "Uid": { "target": "com.amazonaws.datasync#Uid" },
+        "Gid": { "target": "com.amazonaws.datasync#Gid" },
+        "PreserveDeletedFiles": { "target": "com.amazonaws.datasync#PreserveDeletedFiles" },
+        "PreserveDevices": { "target": "com.amazonaws.datasync#PreserveDevices" },
+        "PosixPermissions": { "target": "com.amazonaws.datasync#PosixPermissions" },
+        "BytesPerSecond": { "target": "com.amazonaws.datasync#BytesPerSecond" },
+        "TaskQueueing": { "target": "com.amazonaws.datasync#TaskQueueing" },
+        "LogLevel": { "target": "com.amazonaws.datasync#LogLevel" },
+        "TransferMode": { "target": "com.amazonaws.datasync#TransferMode" },
+        "SecurityDescriptorCopyFlags": { "target": "com.amazonaws.datasync#SmbSecurityDescriptorCopyFlags" },
+        "ObjectTags": { "target": "com.amazonaws.datasync#ObjectTags" },
+        "ObjectMetadata": { "target": "com.amazonaws.datasync#ObjectMetadata" },
+        "PreserveNfsAcls": { "target": "com.amazonaws.datasync#PreserveNfsAcls" }
+      }
+    },
+    "com.amazonaws.datasync#PreserveNfsAcls": {
+      "type": "string"
+    },
+    "com.amazonaws.datasync#VerifyMode": {
+      "type": "enum",
+      "members": {
+        "POINT_IN_TIME_CONSISTENT": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "POINT_IN_TIME_CONSISTENT" } },
+        "ONLY_FILES_TRANSFERRED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ONLY_FILES_TRANSFERRED" } },
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } }
+      }
+    },
+    "com.amazonaws.datasync#OverwriteMode": {
+      "type": "enum",
+      "members": {
+        "ALWAYS": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ALWAYS" } },
+        "NEVER": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NEVER" } }
+      }
+    },
+    "com.amazonaws.datasync#Atime": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "BEST_EFFORT": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "BEST_EFFORT" } }
+      }
+    },
+    "com.amazonaws.datasync#Mtime": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } }
+      }
+    },
+    "com.amazonaws.datasync#Uid": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "INT_VALUE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "INT_VALUE" } },
+        "NAME": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NAME" } },
+        "BOTH": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "BOTH" } }
+      }
+    },
+    "com.amazonaws.datasync#Gid": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "INT_VALUE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "INT_VALUE" } },
+        "NAME": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NAME" } },
+        "BOTH": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "BOTH" } }
+      }
+    },
+    "com.amazonaws.datasync#PreserveDeletedFiles": {
+      "type": "enum",
+      "members": {
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } },
+        "REMOVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "REMOVE" } }
+      }
+    },
+    "com.amazonaws.datasync#PreserveDevices": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } }
+      }
+    },
+    "com.amazonaws.datasync#PosixPermissions": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } }
+      }
+    },
+    "com.amazonaws.datasync#BytesPerSecond": {
+      "type": "long",
+      "traits": { "smithy.api#range": { "min": -1 } }
+    },
+    "com.amazonaws.datasync#TaskQueueing": {
+      "type": "enum",
+      "members": {
+        "ENABLED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ENABLED" } },
+        "DISABLED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "DISABLED" } }
+      }
+    },
+    "com.amazonaws.datasync#LogLevel": {
+      "type": "enum",
+      "members": {
+        "OFF": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "OFF" } },
+        "BASIC": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "BASIC" } },
+        "TRANSFER": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "TRANSFER" } }
+      }
+    },
+    "com.amazonaws.datasync#TransferMode": {
+      "type": "enum",
+      "members": {
+        "CHANGED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "CHANGED" } },
+        "ALL": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ALL" } }
+      }
+    },
+    "com.amazonaws.datasync#SmbSecurityDescriptorCopyFlags": {
+      "type": "enum",
+      "members": {
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } },
+        "OWNER_DACL": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "OWNER_DACL" } },
+        "OWNER_DACL_SACL": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "OWNER_DACL_SACL" } }
+      }
+    },
+    "com.amazonaws.datasync#ObjectTags": {
+      "type": "enum",
+      "members": {
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } },
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } }
+      }
+    },
+    "com.amazonaws.datasync#ObjectMetadata": {
+      "type": "enum",
+      "members": {
+        "PRESERVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRESERVE" } },
+        "NONE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NONE" } }
+      }
+    }
+  }
+}

@@ -226,13 +226,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_network_interface_arns: None,
             destination_network_interface_arns: None,
             options: Some(task.options.clone()),
-            excludes: (!task.excludes.is_empty()).then(|| task.excludes.clone()),
+            // `Excludes` and `Includes` are lists DataSync always reports: a task
+            // configured with no filter rules of that kind has an EMPTY list of them,
+            // not an absent member, so a caller iterating either one never has to tell
+            // a list apart from nothing at all.
+            excludes: Some(task.excludes.clone()),
             schedule: task.schedule.clone(),
             // `ErrorCode`/`ErrorDetail` describe a task that failed; this task did not.
             error_code: None,
             error_detail: None,
             creation_time: Some(crate::state::as_timestamp(task.creation_time)),
-            includes: (!task.includes.is_empty()).then(|| task.includes.clone()),
+            includes: Some(task.includes.clone()),
             manifest_config: task.manifest_config.clone(),
             task_report_config: task.task_report_config.clone(),
             // `ScheduleDetails` reports when and why a schedule was disabled; no

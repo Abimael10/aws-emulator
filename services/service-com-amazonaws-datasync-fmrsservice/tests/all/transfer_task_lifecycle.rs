@@ -1102,6 +1102,598 @@ async fn task_options_resolve_to_the_modelled_defaults_and_overlays() {
     }
 }
 
+/// A kind of transfer location, as far as the metadata a transfer between two of them
+/// can carry across.
+#[derive(Clone, Copy, Debug)]
+enum Endpoint {
+    /// An Amazon S3 bucket: objects under a key, none of which has a POSIX owner, group
+    /// or mode of its own.
+    S3,
+    /// A self-managed object storage system: objects again.
+    ObjectStorage,
+    /// An Amazon EFS file system: files, each with POSIX ownership and permissions.
+    Efs,
+}
+
+impl Endpoint {
+    /// The `CreateLocation*` operation that mints this kind of location, and a request
+    /// body for the `index`-th location this suite creates — so every row addresses
+    /// storage of its own.
+    fn create_request(self, index: usize) -> (&'static str, serde_json::Value) {
+        // The modelled `EfsFilesystemArn` admits `fs-[0-9a-f]{8,40}`, so the
+        // discriminator every kind's id carries is hexadecimal.
+        let id = format!("{index:08x}");
+        match self {
+            Self::S3 => (
+                "CreateLocationS3",
+                serde_json::json!({
+                    "S3BucketArn": format!("arn:aws:s3:::metadata-{id}"),
+                    "S3Config": {
+                        "BucketAccessRoleArn": "arn:aws:iam::000000000000:role/datasync",
+                    },
+                }),
+            ),
+            Self::ObjectStorage => (
+                "CreateLocationObjectStorage",
+                serde_json::json!({
+                    "ServerHostname": format!("obj-{id}.example.com"),
+                    "BucketName": format!("metadata-{id}"),
+                }),
+            ),
+            Self::Efs => (
+                "CreateLocationEfs",
+                serde_json::json!({
+                    "EfsFilesystemArn": format!(
+                        "arn:aws:elasticfilesystem:{SIGNED_REGION}:{ACCOUNT}:file-system/fs-{id}"
+                    ),
+                    "Ec2Config": {
+                        "SubnetArn": format!(
+                            "arn:aws:ec2:{SIGNED_REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0"
+                        ),
+                        "SecurityGroupArns": [format!(
+                            "arn:aws:ec2:{SIGNED_REGION}:{ACCOUNT}:security-group/sg-0123456789abcdef1"
+                        )],
+                    },
+                }),
+            ),
+        }
+    }
+}
+
+/// One location of `endpoint`'s kind, created and returned by ARN.
+async fn create_endpoint(
+    router: &MultiServiceRouter,
+    endpoint: Endpoint,
+    index: usize,
+    case: &str,
+) -> String {
+    let (operation, request) = endpoint.create_request(index);
+    let created = ok(router, operation, request, case).await;
+    let arn = string(&created, "LocationArn", case);
+    assert_location_arn(&arn, case);
+    arn
+}
+
+/// Poll `DescribeTask` until the task reports the `AVAILABLE` status an execution can
+/// start from.
+///
+/// Leaving `CREATING` is work the clock owes (`state::TRANSITION_SPAN`), so what this
+/// waits for is the CONDITION: it looks again until the task is there, and the deadline
+/// it gives up at is far beyond the span so a loaded machine cannot fail it.
+async fn await_available(router: &MultiServiceRouter, task_arn: &str, case: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let described = ok(
+            router,
+            "DescribeTask",
+            serde_json::json!({ "TaskArn": task_arn }),
+            case,
+        )
+        .await;
+        if string(&described, "Status", case) == "AVAILABLE" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the task never reported AVAILABLE, last read {described}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// An execution reports the options the run it performed APPLIED: the task's options
+/// overlaid with that run's overrides, with every metadata option neither end of the
+/// transfer carries reported as `NONE`. The task itself goes on reporting its own
+/// configuration.
+///
+/// The rows span the kinds of location a transfer can run between — two object stores,
+/// and pairs with a file system on one or both ends — and both configurations of the
+/// POSIX metadata options, so each row differs from the next in what its two ends can
+/// carry rather than in which values were asked for.
+#[tokio::test]
+async fn an_execution_reports_the_metadata_options_its_locations_can_carry() {
+    struct Row {
+        case: &'static str,
+        source: Endpoint,
+        destination: Endpoint,
+        /// The task's `Options`, or `null` to configure none.
+        options: serde_json::Value,
+        /// What `DescribeTask` must report: the configuration, whatever the locations.
+        expected_task: &'static [(&'static str, &'static str)],
+        /// What `DescribeTaskExecution` must report for the run.
+        expected_execution: &'static [(&'static str, &'static str)],
+    }
+
+    let rows = [
+        Row {
+            case: "two object stores, no options configured",
+            source: Endpoint::S3,
+            destination: Endpoint::S3,
+            options: serde_json::json!(null),
+            // The defaults the members' own documentation names.
+            expected_task: &[
+                ("Uid", "INT_VALUE"),
+                ("Gid", "INT_VALUE"),
+                ("PosixPermissions", "PRESERVE"),
+                ("SecurityDescriptorCopyFlags", "OWNER_DACL"),
+                ("PreserveNfsAcls", "NONE"),
+                ("Atime", "BEST_EFFORT"),
+                ("Mtime", "PRESERVE"),
+                ("ObjectTags", "PRESERVE"),
+            ],
+            expected_execution: &[
+                // No object of either end has a POSIX owner, group or mode, and
+                // neither keeps an SMB security descriptor.
+                ("Uid", "NONE"),
+                ("Gid", "NONE"),
+                ("PosixPermissions", "NONE"),
+                ("SecurityDescriptorCopyFlags", "NONE"),
+                ("PreserveNfsAcls", "NONE"),
+                // Both ends keep a modification time, a tag set and user metadata, so
+                // the options that name those are in force as configured.
+                ("Atime", "BEST_EFFORT"),
+                ("Mtime", "PRESERVE"),
+                ("ObjectTags", "PRESERVE"),
+                ("ObjectMetadata", "PRESERVE"),
+            ],
+        },
+        Row {
+            case: "two object stores of different kinds, POSIX metadata asked for",
+            source: Endpoint::S3,
+            destination: Endpoint::ObjectStorage,
+            options: serde_json::json!({
+                "Uid": "INT_VALUE",
+                "Gid": "INT_VALUE",
+                "PosixPermissions": "PRESERVE",
+                "SecurityDescriptorCopyFlags": "OWNER_DACL_SACL",
+                "ObjectTags": "NONE",
+            }),
+            expected_task: &[
+                ("Uid", "INT_VALUE"),
+                ("Gid", "INT_VALUE"),
+                ("PosixPermissions", "PRESERVE"),
+                ("SecurityDescriptorCopyFlags", "OWNER_DACL_SACL"),
+                ("ObjectTags", "NONE"),
+            ],
+            expected_execution: &[
+                // Asked for or not, there is no such metadata at either end to move.
+                ("Uid", "NONE"),
+                ("Gid", "NONE"),
+                ("PosixPermissions", "NONE"),
+                ("SecurityDescriptorCopyFlags", "NONE"),
+                ("ObjectTags", "NONE"),
+            ],
+        },
+        Row {
+            case: "a file system to an object store, no options configured",
+            source: Endpoint::Efs,
+            destination: Endpoint::S3,
+            options: serde_json::json!(null),
+            expected_task: &[("Uid", "INT_VALUE"), ("PosixPermissions", "PRESERVE")],
+            expected_execution: &[
+                // The file-system end owns POSIX metadata, so the run carries it.
+                ("Uid", "INT_VALUE"),
+                ("Gid", "INT_VALUE"),
+                ("PosixPermissions", "PRESERVE"),
+                // Neither end keeps an SMB security descriptor.
+                ("SecurityDescriptorCopyFlags", "NONE"),
+                ("PreserveNfsAcls", "NONE"),
+            ],
+        },
+        Row {
+            case: "an object store to a file system, POSIX metadata asked for",
+            source: Endpoint::ObjectStorage,
+            destination: Endpoint::Efs,
+            options: serde_json::json!({ "PosixPermissions": "PRESERVE", "Uid": "INT_VALUE" }),
+            expected_task: &[("PosixPermissions", "PRESERVE"), ("Uid", "INT_VALUE")],
+            expected_execution: &[
+                ("PosixPermissions", "PRESERVE"),
+                ("Uid", "INT_VALUE"),
+                ("Gid", "INT_VALUE"),
+            ],
+        },
+        Row {
+            case: "two file systems, POSIX metadata declined",
+            source: Endpoint::Efs,
+            destination: Endpoint::Efs,
+            options: serde_json::json!({
+                "Uid": "NONE",
+                "Gid": "NONE",
+                "PosixPermissions": "NONE",
+                "PreserveNfsAcls": "PRESERVE",
+            }),
+            expected_task: &[
+                ("Uid", "NONE"),
+                ("Gid", "NONE"),
+                ("PosixPermissions", "NONE"),
+                ("PreserveNfsAcls", "PRESERVE"),
+            ],
+            expected_execution: &[
+                // In force and declined reads the same way: the run carried none.
+                ("Uid", "NONE"),
+                ("Gid", "NONE"),
+                ("PosixPermissions", "NONE"),
+                ("PreserveNfsAcls", "PRESERVE"),
+            ],
+        },
+    ];
+
+    let router = service();
+    for (index, row) in rows.iter().enumerate() {
+        let source = create_endpoint(&router, row.source, index * 2, row.case).await;
+        let destination = create_endpoint(&router, row.destination, index * 2 + 1, row.case).await;
+        let mut request = serde_json::json!({
+            "SourceLocationArn": source,
+            "DestinationLocationArn": destination,
+            "Name": format!("metadata-row-{index}"),
+        });
+        if !row.options.is_null() {
+            request["Options"] = row.options.clone();
+        }
+        let task_arn = string(
+            &ok(&router, "CreateTask", request, row.case).await,
+            "TaskArn",
+            row.case,
+        );
+
+        let described = ok(
+            &router,
+            "DescribeTask",
+            serde_json::json!({ "TaskArn": task_arn }),
+            row.case,
+        )
+        .await;
+        for (member, expected) in row.expected_task {
+            assert_eq!(
+                described["Options"][member].as_str(),
+                Some(*expected),
+                "case {:?}: a task reports its configured Options.{member}: expected \
+                 {expected:?}, got {described}",
+                row.case
+            );
+        }
+
+        await_available(&router, &task_arn, row.case).await;
+        let execution_arn = string(
+            &ok(
+                &router,
+                "StartTaskExecution",
+                serde_json::json!({ "TaskArn": task_arn }),
+                row.case,
+            )
+            .await,
+            "TaskExecutionArn",
+            row.case,
+        );
+        let execution = ok(
+            &router,
+            "DescribeTaskExecution",
+            serde_json::json!({ "TaskExecutionArn": execution_arn }),
+            row.case,
+        )
+        .await;
+        for (member, expected) in row.expected_execution {
+            assert_eq!(
+                execution["Options"][member].as_str(),
+                Some(*expected),
+                "case {:?}: an execution reports the Options its run applied, so \
+                 Options.{member} must be {expected:?}, got {execution}",
+                row.case
+            );
+        }
+    }
+}
+
+/// `Excludes` and `Includes` are lists a task read and a task-execution read ALWAYS
+/// carry: the empty list when there are no filter rules of that kind, never an absent
+/// member.
+///
+/// The rows span every combination of the two lists a request can configure (the
+/// modelled `FilterList` holds at most one rule), and the last one overrides a list for
+/// one run only — so presence never depends on a list having something in it.
+#[tokio::test]
+async fn task_and_execution_reads_always_carry_their_filter_lists() {
+    struct Row {
+        case: &'static str,
+        /// The task's `Includes`/`Excludes`, or `null` to configure neither.
+        includes: serde_json::Value,
+        excludes: serde_json::Value,
+        /// The `Includes` this run overrides the task's with, or `null` for none.
+        run_includes: serde_json::Value,
+    }
+
+    let rows = [
+        Row {
+            case: "no filter rules at all",
+            includes: serde_json::json!(null),
+            excludes: serde_json::json!(null),
+            run_includes: serde_json::json!(null),
+        },
+        Row {
+            case: "an include rule only",
+            includes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/data" }]),
+            excludes: serde_json::json!(null),
+            run_includes: serde_json::json!(null),
+        },
+        Row {
+            case: "an exclude rule only",
+            includes: serde_json::json!(null),
+            excludes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "*.tmp" }]),
+            run_includes: serde_json::json!(null),
+        },
+        Row {
+            case: "both lists configured",
+            includes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/in|/out" }]),
+            excludes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/scratch" }]),
+            run_includes: serde_json::json!(null),
+        },
+        Row {
+            case: "the run overrides the task's includes",
+            includes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/data" }]),
+            excludes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "*.tmp" }]),
+            run_includes: serde_json::json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/other" }]),
+        },
+    ];
+
+    let router = service();
+    let empty = serde_json::json!([]);
+    for (index, row) in rows.iter().enumerate() {
+        let source = create_bucket_location(
+            &router,
+            &format!("filters-source-{index}"),
+            "/in",
+            row.case,
+        )
+        .await;
+        let destination = create_bucket_location(
+            &router,
+            &format!("filters-destination-{index}"),
+            "/out",
+            row.case,
+        )
+        .await;
+        let mut request = serde_json::json!({
+            "SourceLocationArn": source,
+            "DestinationLocationArn": destination,
+            "Name": format!("filters-row-{index}"),
+        });
+        for (member, configured) in [("Includes", &row.includes), ("Excludes", &row.excludes)] {
+            if !configured.is_null() {
+                request[member] = configured.clone();
+            }
+        }
+        let task_arn = string(
+            &ok(&router, "CreateTask", request, row.case).await,
+            "TaskArn",
+            row.case,
+        );
+
+        let described = ok(
+            &router,
+            "DescribeTask",
+            serde_json::json!({ "TaskArn": task_arn }),
+            row.case,
+        )
+        .await;
+        for (member, configured) in [("Includes", &row.includes), ("Excludes", &row.excludes)] {
+            let expected = if configured.is_null() { &empty } else { configured };
+            assert_eq!(
+                &described[member], expected,
+                "case {:?}: a task read always carries {member} as a list: expected \
+                 {expected}, got {described}",
+                row.case
+            );
+        }
+
+        await_available(&router, &task_arn, row.case).await;
+        let mut start = serde_json::json!({ "TaskArn": task_arn });
+        if !row.run_includes.is_null() {
+            start["Includes"] = row.run_includes.clone();
+        }
+        let execution_arn = string(
+            &ok(&router, "StartTaskExecution", start, row.case).await,
+            "TaskExecutionArn",
+            row.case,
+        );
+        let execution = ok(
+            &router,
+            "DescribeTaskExecution",
+            serde_json::json!({ "TaskExecutionArn": execution_arn }),
+            row.case,
+        )
+        .await;
+        // A run that overrode a list reports its own; a run that overrode none reports
+        // the task's. Either way the member is a list.
+        let expected_includes = [&row.run_includes, &row.includes]
+            .into_iter()
+            .find(|candidate| !candidate.is_null())
+            .unwrap_or(&empty);
+        assert_eq!(
+            &execution["Includes"], expected_includes,
+            "case {:?}: an execution read always carries Includes as a list: expected \
+             {expected_includes}, got {execution}",
+            row.case
+        );
+        let expected_excludes = if row.excludes.is_null() {
+            &empty
+        } else {
+            &row.excludes
+        };
+        assert_eq!(
+            &execution["Excludes"], expected_excludes,
+            "case {:?}: an execution read always carries Excludes as a list: expected \
+             {expected_excludes}, got {execution}",
+            row.case
+        );
+    }
+}
+
+/// The published model snapshot this crate is generated from, embedded at compile time
+/// so the local `Options` declaration is checked against the model rather than against a
+/// copy of it.
+const SNAPSHOT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/smithy-model/com-amazonaws-datasync-fmrsservice.json"
+));
+
+/// The overlay model the local `Options` declaration is generated from, embedded for the
+/// same reason: what it restates of the snapshot must still match it.
+const OVERLAY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/smithy-model/local-additions.json"
+));
+
+/// The shape the local declaration is of.
+const OPTIONS_SHAPE: &str = "com.amazonaws.datasync#Options";
+
+/// The shape the overlay adds, which the snapshot declares nowhere.
+const PRESERVE_NFS_ACLS_SHAPE: &str = "com.amazonaws.datasync#PreserveNfsAcls";
+
+/// The member this crate declares locally, which the snapshot does not.
+const LOCAL_MEMBER: &str = "PreserveNfsAcls";
+
+/// The `shapes` object of one model document.
+fn model_shapes(model: &str) -> serde_json::Value {
+    let parsed: serde_json::Value =
+        serde_json::from_str(model).expect("a model document must be JSON");
+    serde_json::Value::Object(
+        parsed["shapes"]
+            .as_object()
+            .expect("a model document must carry a shapes object")
+            .clone(),
+    )
+}
+
+/// `declaration` with every documentation trait dropped, recursively — and with a traits
+/// object left empty by that dropped too, so a member the snapshot documents and nothing
+/// else compares equal to the same member restated with no traits at all.
+///
+/// Documentation is prose: the overlay restates what codegen READS — targets, types, enum
+/// values and constraint traits — so comparing declarations has to ignore the one trait
+/// that carries no behaviour.
+fn without_docs(declaration: &serde_json::Value) -> serde_json::Value {
+    match declaration {
+        serde_json::Value::Object(members) => serde_json::Value::Object(
+            members
+                .iter()
+                .filter(|(key, _)| key.as_str() != "smithy.api#documentation")
+                .map(|(key, value)| (key.clone(), without_docs(value)))
+                .filter(|(key, value)| {
+                    key.as_str() != "traits"
+                        || !value.as_object().is_some_and(serde_json::Map::is_empty)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(without_docs).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The local `Options` declaration is generated from the overlay model beside the
+/// snapshot (`smithy-model/LOCAL-ADDITIONS.md`), so anything the overlay restates of the
+/// snapshot — a member's target, a shape's type, an enum's value set, a range — must
+/// still BE what the snapshot says, and the only thing it may add is the member AWS
+/// reports and the snapshot does not declare.
+///
+/// A refreshed snapshot that declares that member, adds one the overlay does not restate,
+/// or changes a target, value set or constraint fails here rather than silently narrowing
+/// what this service accepts and reports.
+#[test]
+fn the_options_overlay_restates_the_snapshot_but_for_the_member_it_adds() {
+    let snapshot = model_shapes(SNAPSHOT);
+    let overlay = model_shapes(OVERLAY);
+    let restated = overlay
+        .as_object()
+        .expect("the overlay carries a shapes object");
+
+    for (shape_id, declared) in restated {
+        if shape_id == PRESERVE_NFS_ACLS_SHAPE {
+            assert!(
+                snapshot[shape_id].is_null(),
+                "case {shape_id:?}: the snapshot now declares it, so the local declaration \
+                 should give way to the modelled shape"
+            );
+            continue;
+        }
+        let modelled = &snapshot[shape_id];
+        assert!(
+            !modelled.is_null(),
+            "case {shape_id:?}: the overlay restates a shape the snapshot no longer declares"
+        );
+
+        if shape_id == OPTIONS_SHAPE {
+            // The one shape that differs on purpose: the snapshot's members, restated as
+            // the snapshot declares them, plus the member AWS reports and it does not.
+            let declared_members = declared["members"]
+                .as_object()
+                .expect("the overlay declares the Options members");
+            let modelled_members = modelled["members"]
+                .as_object()
+                .expect("the snapshot declares the Options members");
+            for (member, modelled_member) in modelled_members {
+                assert_eq!(
+                    without_docs(&declared_members[member]),
+                    without_docs(modelled_member),
+                    "case {shape_id:?}: member {member} must be restated as the snapshot \
+                     declares it, got {:?}",
+                    declared_members.get(member)
+                );
+            }
+            let added: Vec<&String> = declared_members
+                .keys()
+                .filter(|member| !modelled_members.contains_key(*member))
+                .collect();
+            assert_eq!(
+                added,
+                vec![LOCAL_MEMBER],
+                "case {shape_id:?}: it may add {LOCAL_MEMBER} and nothing else, added {added:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            without_docs(declared),
+            without_docs(modelled),
+            "case {shape_id:?}: it must be restated exactly as the snapshot declares it"
+        );
+    }
+
+    // And every shape the restated members target is itself restated, so nothing the
+    // local declaration reads comes from outside the overlay.
+    for (member, declared) in restated[OPTIONS_SHAPE]["members"]
+        .as_object()
+        .expect("the overlay declares the Options members")
+    {
+        let target = declared["target"].as_str().unwrap_or_default();
+        assert!(
+            restated.contains_key(target),
+            "case {member:?}: its target {target:?} must be restated in the overlay too"
+        );
+    }
+}
+
 /// An execution's phase, timestamps and per-phase durations all come from the schedule
 /// stored when it started, so they only ever move forward and are the same for every
 /// observer.

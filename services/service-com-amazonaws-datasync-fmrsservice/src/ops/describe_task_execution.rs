@@ -314,8 +314,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             task_execution_arn: Some(execution.arn.clone()),
             status: Some(execution.status.as_str().to_string()),
             options: Some(execution.options.clone()),
-            excludes: (!execution.excludes.is_empty()).then(|| execution.excludes.clone()),
-            includes: (!execution.includes.is_empty()).then(|| execution.includes.clone()),
+            // `Excludes` and `Includes` are lists DataSync always reports: an execution
+            // that ran with no filter rules of that kind has an EMPTY list of them, not
+            // an absent member, so a caller iterating either one never has to tell a
+            // list apart from nothing at all.
+            excludes: Some(execution.excludes.clone()),
+            includes: Some(execution.includes.clone()),
             manifest_config: execution.manifest_config.clone(),
             start_time: Some(crate::state::as_timestamp(execution.start_time)),
             estimated_files_to_transfer: counters.estimated_files_to_transfer,

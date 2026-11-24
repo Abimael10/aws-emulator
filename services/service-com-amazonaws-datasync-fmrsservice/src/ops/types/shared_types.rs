@@ -129,27 +129,6 @@ pub struct S3Config {
     pub bucket_access_role_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.datasync#Options")]
-#[derive(Debug, Clone, Default)]
-pub struct Options {
-    pub verify_mode: Option<String>,
-    pub overwrite_mode: Option<String>,
-    pub atime: Option<String>,
-    pub mtime: Option<String>,
-    pub uid: Option<String>,
-    pub gid: Option<String>,
-    pub preserve_deleted_files: Option<String>,
-    pub preserve_devices: Option<String>,
-    pub posix_permissions: Option<String>,
-    pub bytes_per_second: Option<i64>,
-    pub task_queueing: Option<String>,
-    pub log_level: Option<String>,
-    pub transfer_mode: Option<String>,
-    pub security_descriptor_copy_flags: Option<String>,
-    pub object_tags: Option<String>,
-    pub object_metadata: Option<String>,
-}
-
 #[smithy_macros::smithy(shape = "com.amazonaws.datasync#FilterRule")]
 #[derive(Debug, Clone, Default)]
 pub struct FilterRule {
