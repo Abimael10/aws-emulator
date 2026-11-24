@@ -1956,7 +1956,7 @@ pub enum SecurityGroupRefusal {
     /// [`security_group_not_found_message`] gives the answer that was read.
     NotFound,
     /// The groups the request named cannot govern THIS load balancer's traffic: one of them
-    /// is a group id this account holds no group for, or one that governs traffic in
+    /// is an id EC2 would not resolve for this account, or one that governs traffic in
     /// another VPC than the one the load balancer's network interfaces live in. Either way
     /// the request is a configuration that cannot hold together, which the modelled
     /// `InvalidConfigurationRequest` states in the words Elastic Load Balancing words it
@@ -2004,10 +2004,11 @@ pub fn security_group_id_is_well_formed(id: &str) -> bool {
 /// in the subnets it is placed in and belong to one VPC, so there are two ways a request's
 /// groups can fail and Elastic Load Balancing answers them differently. A value that is not
 /// a security group id at all is no group of ANY account, which is the modelled "the
-/// specified security group does not exist". An id that IS one but names no group of this
-/// account — or names a group governing traffic in another VPC — is a group this load
-/// balancer cannot be given, so the request is a configuration that cannot hold together:
-/// the modelled `InvalidConfigurationRequest`, in the words [`INVALID_SECURITY_GROUPS`].
+/// specified security group does not exist". Every other failure is about a group this load
+/// balancer cannot be GIVEN — an id EC2 would not resolve for this account, or a group
+/// governing traffic in another VPC — so the request is a configuration that cannot hold
+/// together: the modelled `InvalidConfigurationRequest`, in the words
+/// [`INVALID_SECURITY_GROUPS`].
 ///
 /// `named` is what the request listed, judged on its own form; `lookup` is what EC2
 /// answered about those ids. Whether a group exists and which VPC it governs traffic in is
@@ -2032,14 +2033,11 @@ pub fn check_security_groups(
         return Err(SecurityGroupRefusal::NotFound);
     }
     match lookup {
-        // WHICH fault EC2 answered decides the class: a value that is no group id at all
-        // names no group in any account, while an id the account simply holds no group
-        // under is a group this load balancer cannot be given.
-        network::SecurityGroupLookup::Absent(refusal)
-            if refusal.names_no_security_group_id() =>
-        {
-            Err(SecurityGroupRefusal::NotFound)
-        }
+        // A read EC2 REFUSED is a group this load balancer cannot be given, whichever fault
+        // it answered: an id of the form EC2 mints that it will not resolve for this
+        // account names no group that could govern this load balancer's traffic, so the
+        // configuration is what is at fault rather than the request's spelling of an id —
+        // which the reading above has already passed.
         network::SecurityGroupLookup::Absent(_) => Err(SecurityGroupRefusal::Invalid),
         network::SecurityGroupLookup::Unknown => Ok(()),
         network::SecurityGroupLookup::Resolved(groups) => {

@@ -1327,10 +1327,10 @@ impl ComAmazonawsKafkaKafkaState {
     /// A replicator operation that cannot resolve its ARN asks this to tell the
     /// two absences apart, the way the channel surface does
     /// ([`Self::channel_was_held`]): a replicator this region held and released
-    /// is a resource of the service's own that is gone, while an ARN it never
-    /// minted is a reference the request got wrong, and the replicator APIs word
-    /// the two differently. The record it reads is bounded and Region-scoped by
-    /// [`replicator_releases::ReleasedReplicators`].
+    /// is a resource of the service's own that is gone, while an ARN of this
+    /// registry it never minted is a reference the caller may yet create, and the
+    /// replicator APIs word the two differently. The record it reads is bounded
+    /// and Region-scoped by [`replicator_releases::ReleasedReplicators`].
     pub fn replicator_was_held(&self, region: &str, arn: &str) -> bool {
         self.released_replicators.was_held(region, arn)
     }

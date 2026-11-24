@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         // Every repository is reported at the address this emulator answers THIS caller's
-        // registry requests at (`crate::state::registry_address`), which is what its
+        // registry requests at (`crate::state::registry_address`), which is the authority its
         // `repositoryUri` is published on.
         let published_endpoint = crate::state::announced_registry_endpoint(ctx);
         let store = state.lock();

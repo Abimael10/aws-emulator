@@ -210,13 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 std::time::SystemTime::now(),
             );
             let Some(settled) = settled else {
-                // The two absences the registry tells apart: a replicator this
-                // region HELD and released is reported as a fault of the
-                // parameter that still names it, one it never minted with the
-                // service's fixed sentence alone. Both name the input member in
-                // `invalidParameter`, and neither says anything about this
-                // endpoint's own state — which region looked, and what it holds,
-                // is not part of the refusal.
+                // The two absences the registry tells apart: a reference this
+                // service could never have held a replicator under — an ARN
+                // carrying an identity it does not issue, or one this Region HELD
+                // and released — is reported as a fault of the parameter that
+                // still names it, while an ARN of the form it issues that was
+                // never minted gets the service's fixed sentence alone. Both name
+                // the input member in `invalidParameter`, and neither says
+                // anything about this endpoint's own state.
                 let at_fault = crate::state::replicator_reference_at_fault(
                     &state,
                     &region,

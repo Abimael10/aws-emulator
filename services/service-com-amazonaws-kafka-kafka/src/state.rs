@@ -1000,14 +1000,15 @@ pub fn resource_not_found(member: &str) -> crate::ops::types::NotFoundException 
 /// The same refusal for a REPLICATOR reference, which the replicator APIs word
 /// by what the ARN could have denoted at this endpoint.
 ///
-/// `at_fault` says whether the reference is one this endpoint could not act on at
-/// all ([`replicator_reference_at_fault`]): an ARN of another Region, or one this
-/// Region HELD and released. Such a reference is reported as a fault of the
-/// parameter that carries it — the `Invalid parameter <member>` framing the
-/// replicator APIs use, before the same fixed sentence — while an ARN of this
-/// endpoint's own Region that was simply never minted is a resource the caller
-/// may yet create, and is answered with that sentence alone. Both carry the
-/// member at fault in `invalidParameter` and nothing of the request in the text.
+/// `at_fault` says whether the reference is one this service could never have
+/// held a replicator under ([`replicator_reference_at_fault`]): an ARN carrying
+/// an identity it does not issue, or one naming a replicator this Region HELD and
+/// released. Such a reference is reported as a fault of the parameter that carries
+/// it — the `Invalid parameter <member>` framing the replicator APIs use, before
+/// the same fixed sentence — while an ARN of the form this service issues that
+/// was simply never minted is a resource the caller may yet create, and is
+/// answered with that sentence alone. Both carry the member at fault in
+/// `invalidParameter` and nothing of the request in the text.
 ///
 /// Built here, from one place, so every operation that resolves a replicator by
 /// ARN answers one form for one condition instead of describing its own state.
@@ -1024,21 +1025,84 @@ pub fn replicator_resolves_to_nothing(at_fault: bool) -> crate::ops::types::NotF
 /// Whether a replicator reference that resolved to nothing is the PARAMETER's
 /// fault rather than a resource that is merely absent.
 ///
-/// One reading, and not about the request's wording: what this Region HELD. A
-/// replicator it minted and released is a resource of the service's own that is
-/// gone ([`ComAmazonawsKafkaKafkaState::replicator_was_held`]) — the same
-/// distinction the channel surface draws between a channel that went missing and
-/// an ARN that never named one — and the replicator APIs report it as a fault of
-/// the parameter that still names it.
+/// Two readings, both about what this service could ever have HELD under that
+/// ARN:
 ///
-/// An ARN of a replicator this Region never held is the plain not-found: a
-/// resource the caller may yet create.
+/// * the ARN carries an identity this service does not issue
+///   ([`replicator_arn_carries_an_issued_identity`]) — a replicator name the API
+///   would not accept, or an identifier of a form it does not mint. A replicator
+///   is named by the caller and identified by MSK itself, so a value outside
+///   those two forms is a reference no state of this service could ever satisfy;
+/// * the ARN names a replicator this Region HELD and let go
+///   ([`ComAmazonawsKafkaKafkaState::replicator_was_held`]) — a resource of the
+///   service's own that is gone, the same distinction the channel surface draws
+///   between a channel that went missing and an ARN that never named one.
+///
+/// An ARN of the form this service issues that it never minted — including one
+/// naming another Region's registry, which this endpoint does not serve — is the
+/// plain not-found: a resource the caller may yet create, or already has
+/// elsewhere.
 pub fn replicator_reference_at_fault(
     state: &ComAmazonawsKafkaKafkaState,
     endpoint_region: &str,
     arn: &str,
 ) -> bool {
-    state.replicator_was_held(endpoint_region, arn)
+    !replicator_arn_carries_an_issued_identity(arn)
+        || state.replicator_was_held(endpoint_region, arn)
+}
+
+/// Whether the replicator `arn` carries an identity this service ISSUES: a
+/// replicator name the API accepts, then an identifier of the form it mints.
+///
+/// The ARN is read through the crate's one reading of what a replicator ARN names
+/// ([`replicator_arn_identity`]) — `<name>/<uuid>-<ordinal>`, as
+/// `Replicator::provisioned` composes it — and the name is held to
+/// `ReplicatorName`'s modelled `@pattern` (`^[0-9A-Za-z][0-9A-Za-z-]{0,}$`,
+/// `CreateReplicatorRequest$ReplicatorName`), so a value this service would have
+/// refused as a NAME is not one it could be holding under that ARN. A value that
+/// reading says nothing about is left to the lookup, which answers the reference
+/// it cannot resolve.
+fn replicator_arn_carries_an_issued_identity(arn: &str) -> bool {
+    let Some((name, id)) = replicator_arn_identity(arn) else {
+        return true;
+    };
+    replicator_name_is_acceptable(name) && is_issued_resource_id(id)
+}
+
+/// Whether `name` is a name `CreateReplicator` would accept: `ReplicatorName`'s
+/// modelled `@pattern ^[0-9A-Za-z][0-9A-Za-z-]{0,}$` with `@length(1, 128)` —
+/// alphanumerics and hyphens, starting with an alphanumeric.
+fn replicator_name_is_acceptable(name: &str) -> bool {
+    matches!(name.len(), 1..=MAX_REPLICATOR_NAME_CHARS)
+        && name
+            .starts_with(|first: char| first.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|found| found.is_ascii_alphanumeric() || found == '-')
+}
+
+/// The longest `ReplicatorName` the model allows (`@length(min: 1, max: 128)`).
+const MAX_REPLICATOR_NAME_CHARS: usize = 128;
+
+/// Whether `id` is of the form this service mints a resource identifier in: a
+/// UUID, then a hyphen and the ordinal of the resource within this registry
+/// (`<8-4-4-4-12 hex>-<digits>`, as `Replicator::provisioned` composes it from
+/// [`uuid_v4_shaped_from_digest`] and the record's ordinal).
+fn is_issued_resource_id(id: &str) -> bool {
+    let Some((uuid, ordinal)) = id.rsplit_once('-') else {
+        return false;
+    };
+    if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let groups: Vec<&str> = uuid.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(expected, group)| {
+                group.len() == *expected && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 /// The message Amazon MSK answers a request whose value for `member` is not one

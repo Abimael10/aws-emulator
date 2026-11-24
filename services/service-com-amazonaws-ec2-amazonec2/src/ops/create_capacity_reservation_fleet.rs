@@ -208,6 +208,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Fleet's ARN names.
         let region = request_region(ctx.parts());
 
+        // `DryRun` "checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is `DryRunOperation`" (`$DryRun`): the flag
+        // asks about the CALLER, and the request it is set on is not made at all — so the
+        // verdict is answered here, ahead of every check this create makes on the parameters
+        // of the Fleet it would create, and nothing of the store is read or written. The
+        // `UnauthorizedOperation` half of that answer is the authorization gate's, ahead of
+        // this handler (`crate::service`), and a request that carries the flag is never
+        // answered with a success body — not even the one an already-used `ClientToken` would
+        // replay.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
         // A parameter the request did not CARRY is reported missing before the VALUE of any
         // other parameter is judged: the first thing the service has to say about a request
         // is what the request left out, so one that is wrong in both ways is told which
@@ -448,15 +462,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a replayed create reports the state a describe in the same instant reports: each
         // move was due at this instant whether or not anybody called.
         store.materialize_due_transitions();
-
-        // DryRun sits AFTER every parameter has been validated and BEFORE anything is read
-        // back or written: the flag asks whether the request WOULD have succeeded, so one
-        // that would have been refused is refused with that reason instead — and a dry run
-        // is never answered with a success body, not even the one an already-used
-        // `ClientToken` would replay.
-        if input.dry_run == Some(true) {
-            return Err(Scaffolded::dry_run_operation());
-        }
 
         // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
         // idempotency of the request" (`$ClientToken`) — one token names the Fleet it

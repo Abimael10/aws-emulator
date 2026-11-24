@@ -3,10 +3,11 @@
 //! The replicators this registry HELD and holds no longer.
 //!
 //! What it is for: the replicator APIs answer a reference to a replicator the
-//! service knew and released differently from one it never minted, so the two
-//! absences have to be distinguishable after the record itself is gone. This
-//! module is the whole memory of that, which is why it is its own file: a store
-//! that grows on a caller's request needs its bound where a reader can see it.
+//! service knew and released differently from one of its own registry it never
+//! minted, so the two absences have to be distinguishable after the record
+//! itself is gone. This module is the whole memory of that, which is why it is
+//! its own file: a store that grows on a caller's request needs its bound where
+//! a reader can see it.
 //!
 //! The bound: ONE queue for the whole registry, holding at most
 //! [`MAX_RELEASED_REPLICATORS`] entries and forgetting its oldest first. Nothing

@@ -248,7 +248,35 @@ pub(crate) fn parameter_refusal(member: &str, message: &str) -> BadRequestExcept
 /// ARN of this kind is a `BadRequestException`, and a well-formed ARN no live
 /// replicator holds is a `NotFoundException`.
 pub fn is_replicator_arn(value: &str) -> bool {
-    is_kafka_arn_for(value, "replicator")
+    replicator_arn_identity(value).is_some()
+}
+
+/// The replicator NAME and the IDENTIFIER the replicator ARN `value` carries, or
+/// `None` for a value that is not a replicator ARN at all.
+///
+/// Read through [`kafka_arn_resource`], this module's one ARN split, and the
+/// resource type the service mints such an ARN with
+/// ([`REPLICATOR_RESOURCE_TYPE`]) — so the predicate above and every reader of
+/// what a replicator ARN NAMES draw the same line, both around the fields in
+/// front of the resource and around its segments. What those two segments have to
+/// BE for this service to have issued them is a question of its own
+/// (`super::replicator_reference_at_fault`), not this reading's.
+pub(super) fn replicator_arn_identity(value: &str) -> Option<(&str, &str)> {
+    let resource = kafka_arn_resource(value)?;
+    let mut segments = resource.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some(REPLICATOR_RESOURCE_TYPE), Some(name), Some(id), None)
+            if !name.is_empty() && !id.is_empty() =>
+        {
+            Some((name, id))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `value` is an AWS Secrets Manager secret ARN —

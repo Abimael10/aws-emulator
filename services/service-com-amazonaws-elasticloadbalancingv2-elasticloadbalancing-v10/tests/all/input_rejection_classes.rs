@@ -554,6 +554,16 @@ async fn which_refusal_a_security_group_earns_follows_its_form_the_account_and_t
             SecurityGroupLookup::Absent(NetworkRefusal::new("InvalidGroup.NotFound")),
             Err(SecurityGroupRefusal::Invalid),
         ),
+        // The OTHER fault an EC2 read of a well-formed id can come back with: an id of the
+        // form EC2 mints that it will not read as one of its own. The request carried a group
+        // id, so what it names is still a group this load balancer cannot be given.
+        (
+            "an id of EC2's own form that EC2 will not resolve",
+            Some("vpc-1"),
+            ids(&["sg-0123456789abcdef0"]),
+            SecurityGroupLookup::Absent(NetworkRefusal::new("InvalidGroupId.Malformed")),
+            Err(SecurityGroupRefusal::Invalid),
+        ),
         (
             "an id the account holds no group for, with no VPC known either",
             None,
