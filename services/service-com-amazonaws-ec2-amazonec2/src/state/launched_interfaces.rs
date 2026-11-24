@@ -130,6 +130,16 @@ impl ComAmazonawsEc2Amazonec2State {
         instance_id: &str,
         interfaces: &[LaunchedInterface],
     ) -> bool {
+        // "The tags to apply to the resources that are created during instance launch"
+        // (`RunInstancesRequest$TagSpecifications`): the launch's own `network-interface`
+        // entries, which reach the interfaces this CREATES below and no others — an
+        // interface the launch only attaches is a resource it did not create, so its own
+        // tags are left as they are.
+        let interface_tags = self
+            .instances
+            .get(instance_id)
+            .map(|instance| instance.launched_interface_tags.clone())
+            .unwrap_or_default();
         let mut stored_all = true;
         for interface in interfaces {
             let network_interface_id = match interface.network_interface_id.clone() {
@@ -187,7 +197,7 @@ impl ComAmazonawsEc2Amazonec2State {
                         attachment: Some(attachment),
                         // The caller's own instance holds it; no other service manages it.
                         requester: None,
-                        tags: Vec::new(),
+                        tags: interface_tags.clone(),
                         // A launch of this path asks for no IPv6 space, so this interface
                         // holds none.
                         ..Default::default()

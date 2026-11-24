@@ -73,6 +73,11 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         let private_ip = instance.private_ip.clone();
         let named_groups: Vec<(Option<String>, Option<String>)> = instance.security_groups.clone();
+        // "The tags to apply to the resources that are created during instance launch"
+        // (`RunInstancesRequest$TagSpecifications`): the launch's own `network-interface`
+        // entries, which this interface is one of the resources of — carried on the instance
+        // record because the interface is minted here.
+        let interface_tags = instance.launched_interface_tags.clone();
         let Some(subnet) = self.launch_subnet(
             instance.subnet_id.as_deref(),
             instance.placement_az.as_str(),
@@ -165,9 +170,11 @@ impl ComAmazonawsEc2Amazonec2State {
             attachment: Some(attachment),
             // The caller's own instance holds it; no other service manages it.
             requester: None,
-            // A launch tags the interfaces its own `TagSpecifications` name; nothing tags
-            // this record here.
-            tags: Vec::new(),
+            // The tags the launch asked for on the interfaces it creates, which is this one:
+            // the interface's OWN tags from the moment it exists, so its describe, the tag
+            // report and the account's tagged-resource view all report what the launch
+            // tagged.
+            tags: interface_tags,
             // A launch of this path asks for no IPv6 space (the launch's own IPv6 members
             // are read where the launch reads them), so this interface holds none.
             ..Default::default()

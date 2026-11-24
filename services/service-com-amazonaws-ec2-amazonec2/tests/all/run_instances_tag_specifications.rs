@@ -134,8 +134,9 @@ async fn a_documented_resource_type_is_served_and_only_instance_tags_reach_the_i
                 .into_iter()
                 .collect()
         } else {
-            // The launch mints no resource of that type here, so its tags are carried by
-            // nothing — and must not have landed on the instance.
+            // Another type's entries tag the resources of THAT type the launch creates
+            // (see [`super::launch_tags_reach_the_created_resources`]) — never the
+            // instance, which must report no tag at all here.
             BTreeMap::new()
         };
         assert_eq!(

@@ -36,7 +36,7 @@ use super::{
     IMAGE_ROOT_DEVICE_TYPE_EBS, ImageSpec, MAX_BLOCK_DEVICE_MAPPINGS, MAX_STORED_VOLUMES,
     THROUGHPUT_VOLUME_TYPE, TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_ATTACHED, VOLUME_ID_PREFIX,
     VolumeRecord, VolumeView, region_of_zone_name, system_time_to_date_time, unmanaged_operator,
-    zone_id_for_zone_name,
+    volume_payload_bytes, zone_id_for_zone_name,
 };
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -349,6 +349,16 @@ impl ComAmazonawsEc2Amazonec2State {
         if self.volumes.len() >= MAX_STORED_VOLUMES {
             return;
         }
+        // "The tags to apply to the resources that are created during instance launch"
+        // (`RunInstancesRequest$TagSpecifications`): the launch's own `volume` entries, which
+        // EVERY volume it creates is one of the resources of — the root one and each device
+        // its own mapping named — carried on the instance record because the volumes are
+        // minted here.
+        let volume_tags = self
+            .instances
+            .get(instance_id)
+            .map(|instance| instance.launched_volume_tags.clone())
+            .unwrap_or_default();
         let volume_id = self.next_id(VOLUME_ID_PREFIX);
         // The Region the volume's ARN names is the one its Availability Zone belongs to —
         // read off the zone name through the ONE reading of that ([`region_of_zone_name`]),
@@ -363,6 +373,12 @@ impl ComAmazonawsEc2Amazonec2State {
             .clone()
             .unwrap_or_else(|| DEFAULT_VOLUME_TYPE.to_string());
         let now = SystemTime::now();
+        // The caller-chosen bytes THIS record will retain — the tags the launch asked for on
+        // the volumes it creates, and the key its block device named — read before the record
+        // is built, on exactly the terms `CreateVolume` charges them and
+        // [`Self::remove_volume`] gives them back ([`volume_payload_bytes`], the one
+        // definition of that charge).
+        let retained_bytes = volume_payload_bytes(&volume_tags, ebs.kms_key_id.as_deref(), None);
         let view = VolumeView {
             volume_id: Some(volume_id.clone()),
             volume_arn: Some(::engine::emulator_arn(
@@ -396,9 +412,11 @@ impl ComAmazonawsEc2Amazonec2State {
             multi_attach_enabled: Some(false),
             encrypted: Some(ebs.encrypted.unwrap_or(false)),
             kms_key_id: ebs.kms_key_id.clone(),
-            // A launch tags the volumes its own `TagSpecifications` name; nothing tags this
-            // record here.
-            tags: Some(Vec::new()),
+            // The tags the launch asked for on the volumes it creates, which is this one:
+            // they are the volume's OWN tags from the moment it exists, so every reader of
+            // them — the volume's describe, the tag report and the account's tagged-resource
+            // view — reports the resource the launch tagged.
+            tags: Some(volume_tags),
             // "The snapshot from which the volume was created, if applicable"
             // (`Volume$SnapshotId`): the snapshot this device restores, which for the root
             // device is the root device snapshot of the AMI the instance was launched from.
@@ -440,6 +458,10 @@ impl ComAmazonawsEc2Amazonec2State {
             // same way.
             VolumeRecord::created(view, Instant::now() + TRANSITION_DELAY),
         );
+        // Charged on the terms the one definition of a volume's charge takes them on, so a
+        // launch that retains them is bounded by the same ceiling a create is and the
+        // accounting stays symmetric however the volume leaves the store.
+        self.add_stored_bytes(retained_bytes);
     }
 }
 

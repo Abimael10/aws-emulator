@@ -2325,10 +2325,10 @@ pub use launched_root_volumes::{
     block_device_mapping_bytes, root_block_device_bytes, template_block_device_mapping,
 };
 
-/// The instance tags a launch-template VERSION declares (its `instance` tag
-/// specifications) — the reading every launch from that version shares, this service's own
-/// and the one Amazon EC2 Auto Scaling makes for a group. Everything it declares is
-/// re-exported below.
+/// The tags a LAUNCH asks for on the resources it CREATES, read per resource type, and the
+/// instance tags a launch-template VERSION declares — the readings every launch form shares.
+pub mod launch_resource_tags;
+pub use launch_resource_tags::*;
 pub mod launch_template_instance_tags;
 pub use launch_template_instance_tags::*;
 

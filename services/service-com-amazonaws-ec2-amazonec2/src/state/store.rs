@@ -381,9 +381,12 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 ///
 /// From the member's documentation: "You can specify tags for the following
 /// resources only: Instances Volumes Spot Instance requests Network interfaces".
-/// Only the `instance` entry has a resource this slice stores; a specification for
-/// one of the others is accepted — the launch is not refused for naming a type the
-/// operation documents — and its tags are carried by no resource here.
+/// A launch creates a resource of the first, second and fourth of those, and each
+/// carries the tags its own entries name
+/// ([`crate::state::launch_resource_tags`]); this slice stores no Spot Instance
+/// request for a launch, so a specification for one is accepted — the launch is not
+/// refused for naming a type the operation documents — and its tags are carried by
+/// no resource here.
 pub const RUN_INSTANCES_TAGGABLE_RESOURCES: &[&str] = &[
     "instance",
     "volume",
@@ -696,6 +699,31 @@ pub struct InstanceRecord {
     pub data_block_devices: Vec<(String, EbsBlockDevice)>,
     pub disable_api_termination: bool,
     pub tags: BTreeMap<String, String>,
+    /// The tags this launch asks for on the EBS VOLUMES it creates: "the tags to apply to
+    /// the resources that are created during instance launch"
+    /// (`RunInstancesRequest$TagSpecifications`), read for the `volume` resource type
+    /// ([`crate::state::launch_resource_tags`]).
+    ///
+    /// Held on the record for the same reason [`InstanceRecord::root_block_device`] is: the
+    /// volume is minted by the store's one writer of a launched instance
+    /// ([`ComAmazonawsEc2Amazonec2State::mint_launched_root_volume`]), so this is what
+    /// carries the launch's own answer to it. Empty for a launch that named no such
+    /// specification, which is a volume with no tags.
+    pub launched_volume_tags: Vec<Tag>,
+    /// The tags this launch asks for on the NETWORK INTERFACES it creates, read for the
+    /// `network-interface` resource type and held exactly as
+    /// [`InstanceRecord::launched_volume_tags`] is.
+    ///
+    /// They reach the interfaces the launch CREATES and no others: an interface the launch
+    /// only attaches is a resource it did not create, so its own tags are left as they are.
+    ///
+    /// Both lists are what the LAUNCH ASKED FOR, read once by the minting seam above and
+    /// never again: the live tag set of a volume or an interface is the one that resource's
+    /// own record holds, which is what every reader of its tags reports and what a later
+    /// `CreateTags` or `DeleteTags` writes. The caller-chosen bytes they retain are charged
+    /// against the store's ceiling by the launch that stored them, beside the instance's own
+    /// tags (`crate::ops::run_instances`).
+    pub launched_interface_tags: Vec<Tag>,
     pub client_token: Option<String>,
     /// The Spot Instance request this instance was launched to fulfill, for an instance
     /// that was: "if the request is a Spot Instance request, the ID of the request"

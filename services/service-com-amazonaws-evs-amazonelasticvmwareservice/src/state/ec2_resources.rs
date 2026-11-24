@@ -655,6 +655,10 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         disable_api_termination: false,
         // The environment's tags tag the ENVIRONMENT; nothing tags the instance.
         tags: ::std::collections::BTreeMap::new(),
+        // …and nothing tags the resources the launch creates with it either: Amazon EVS
+        // names no tag specification for a host's volumes or interfaces.
+        launched_volume_tags: Vec::new(),
+        launched_interface_tags: Vec::new(),
         client_token: None,
         // Not a Spot Instance: an ESX host is launched on demand.
         spot_instance_request_id: None,

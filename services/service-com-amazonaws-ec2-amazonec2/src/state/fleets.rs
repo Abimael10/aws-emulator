@@ -47,6 +47,12 @@ pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 /// (`CreateFleetRequest$TagSpecifications`).
 pub const RESOURCE_TYPE_INSTANCE: &str = "instance";
 
+/// `ResourceType`'s `volume` member — the resource a launch's `volume` tag specifications
+/// tag: "`volume` to tag the volumes at launch"
+/// (`CreateFleetRequest$TagSpecifications`), which is the EBS volume a launch creates for
+/// its instance.
+pub const RESOURCE_TYPE_VOLUME: &str = "volume";
+
 /// The resource types an `instant` EC2 Fleet's `TagSpecifications` may name, from the
 /// member's own documentation: "If the fleet type is `instant`, specify a resource type of
 /// `fleet` to tag the fleet, `instance` to tag the instances at launch, `volume` to tag the
@@ -54,13 +60,11 @@ pub const RESOURCE_TYPE_INSTANCE: &str = "instance";
 ///
 /// A fleet of any other type may name only [`RESOURCE_TYPE_FLEET`]: "if the fleet type is
 /// `maintain` or `request` … you cannot specify a resource type of `instance`, `volume`, or
-/// `network-interface`". Only the first two have a resource this slice stores: a launched
-/// instance's root volume and primary network interface are derived from the instance
-/// itself, so tags for them are carried by no resource here.
+/// `network-interface`".
 pub const INSTANT_FLEET_TAGGABLE_RESOURCES: &[&str] = &[
     RESOURCE_TYPE_FLEET,
     RESOURCE_TYPE_INSTANCE,
-    "volume",
+    RESOURCE_TYPE_VOLUME,
     RESOURCE_TYPE_NETWORK_INTERFACE,
 ];
 

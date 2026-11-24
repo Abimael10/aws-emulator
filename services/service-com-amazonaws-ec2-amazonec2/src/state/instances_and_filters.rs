@@ -3214,6 +3214,13 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
             .as_ref()
             .map_or(0, String::len)
         + tag_bytes(&record.tags)
+        // The tags the launch asked for on the resources it creates beside the instance are
+        // caller-chosen too, and the record holds them for the store's writers of those
+        // resources to read ([`InstanceRecord::launched_volume_tags`]), so the copy on THIS
+        // record is charged here — each resource's own copy is charged by the writer that
+        // stores it.
+        + tag_list_bytes(&record.launched_volume_tags)
+        + tag_list_bytes(&record.launched_interface_tags)
         + root_block_device_bytes(record.root_block_device.as_ref())
         // The other Amazon EBS devices the launch resolved count the same way: each is a
         // device the REQUEST named, cloned onto every instance the launch mints.

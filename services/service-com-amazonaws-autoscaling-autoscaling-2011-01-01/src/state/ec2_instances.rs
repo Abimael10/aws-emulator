@@ -202,9 +202,10 @@ pub fn launch<Eng: Send + Sync + 'static>(
     // * the reserved tags no source spells: the group the instance belongs to
     //   ([`GROUP_NAME_TAG`]) and, for a launch from a template, the template and the resolved
     //   version the launch read ([`ec2::LAUNCH_TEMPLATE_ID_TAG`]).
-    let mut tags: BTreeMap<String, String> = launched_template
+    let template_data = launched_template
         .as_ref()
-        .and_then(|specification| template_data(&store, specification))
+        .and_then(|specification| template_data(&store, specification));
+    let mut tags: BTreeMap<String, String> = template_data
         .as_ref()
         .map(ec2::launch_template_instance_tags)
         .unwrap_or_default();
@@ -243,6 +244,30 @@ pub fn launch<Eng: Send + Sync + 'static>(
             );
         }
     }
+
+    // The tags the launch-template version names for the resources a launch from it CREATES
+    // beside the instance — "the tags to apply to the resources that are created during
+    // instance launch" (`RequestLaunchTemplateData$TagSpecifications`) — read for each
+    // resource type through the service that owns launch templates
+    // ([`ec2::launch_template_resource_tags`]), so a group's launch tags the volume and the
+    // interface its instances get exactly as a caller's own `RunInstances` does. A group's
+    // own `PropagateAtLaunch` tags are the INSTANCE's ("determines whether the tag is added
+    // to new instances as they are launched in the group", `Tag$PropagateAtLaunch`), so they
+    // are not among these.
+    let launched_volume_tags = ec2::tag_list(
+        &template_data
+            .as_ref()
+            .map(|data| ec2::launch_template_resource_tags(data, ec2::RESOURCE_TYPE_VOLUME))
+            .unwrap_or_default(),
+    );
+    let launched_interface_tags = ec2::tag_list(
+        &template_data
+            .as_ref()
+            .map(|data| {
+                ec2::launch_template_resource_tags(data, ec2::RESOURCE_TYPE_NETWORK_INTERFACE)
+            })
+            .unwrap_or_default(),
+    );
 
     let instance_type = parameters
         .instance_type
@@ -372,6 +397,10 @@ pub fn launch<Eng: Send + Sync + 'static>(
             data_block_devices: Vec::new(),
             disable_api_termination: parameters.disable_api_termination,
             tags: tags.clone(),
+            // The tags the launch-template version names for the resources this launch
+            // CREATES beside the instance, read once above.
+            launched_volume_tags: launched_volume_tags.clone(),
+            launched_interface_tags: launched_interface_tags.clone(),
             // No client token: this launch is not a caller's request to replay.
             client_token: None,
             // An Auto Scaling group's own capacity is on-demand here: no Spot Instance

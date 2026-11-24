@@ -530,6 +530,12 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             disable_api_termination: false,
             tags: spec.tags,
+            // A launch SPECIFICATION carries no `TagSpecifications` member of its own: the
+            // tags a fleet or a Spot Instance request names are read by those operations and
+            // handed here as the INSTANCE's, so the resources this launch creates beside the
+            // instance carry none.
+            launched_volume_tags: Vec::new(),
+            launched_interface_tags: Vec::new(),
             client_token: None,
             spot_instance_request_id: spec.spot_instance_request_id.map(str::to_string),
             // A launch SPECIFICATION carries no `CreditSpecification` member, so a placed

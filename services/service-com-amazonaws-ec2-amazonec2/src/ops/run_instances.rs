@@ -637,6 +637,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )?;
             }
         }
+        // "Each resource can have up to 50 tags" — [`crate::state::MAX_TAGS_PER_RESOURCE`],
+        // the count every create of this crate holds its tag payload to
+        // ([`crate::state::tags_from_specifications`]). A launch's entries are retained by
+        // each resource it creates of their type, so the COUNT per type is bounded here
+        // beside the per-tag lengths above: without it one request could hand a resource
+        // more tags than it may hold, and retain them on every record the launch mints.
+        for resource_type in RUN_INSTANCES_TAGGABLE_RESOURCES {
+            let asked = crate::state::launch_resource_tags(
+                input.tag_specifications.as_deref().unwrap_or_default(),
+                resource_type,
+            )
+            .len();
+            if asked > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(Scaffolded::tag_limit_exceeded(format!(
+                    "The request carries {asked} tags, above the maximum of {max} per resource",
+                    max = crate::state::MAX_TAGS_PER_RESOURCE,
+                )));
+            }
+        }
         // Each member below is CLONED into every instance the request mints, so a
         // count ceiling on `MaxCount` alone does not bound the BYTES one request can
         // retain: each needs a size bound of its own.
@@ -1281,22 +1300,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // "The tags to apply to the resources that are created during instance launch"
         // (`TagSpecifications`): each specification tags the resources of ITS OWN type, so
-        // the instance carries the `instance` entries and nothing else. A specification for
-        // one of the other documented types names a resource this launch does not tag (the
-        // volume and the network interfaces a launch creates are tagged by nothing here, and
-        // this slice stores no Spot Instance request for a launch), so its tags are carried
-        // by no resource here — they must not land on the instance, which would report a tag
-        // the caller set on something else.
-        let mut tags = ::std::collections::BTreeMap::new();
-        for specification in input.tag_specifications.iter().flatten() {
-            if specification.resource_type.as_deref() != Some("instance") {
-                continue;
-            }
-            for tag in specification.tags.iter().flatten() {
-                let Some(key) = tag.key.clone() else { continue };
-                tags.insert(key, tag.value.clone().unwrap_or_default());
-            }
-        }
+        // the instance carries the `instance` entries, the EBS volume this launch creates
+        // the `volume` entries and the network interfaces it creates the
+        // `network-interface` ones — one reading per type
+        // ([`crate::state::launch_resource_tags`]), so no entry lands on a resource it does
+        // not name. A `spot-instances-request` entry names a resource this slice stores none
+        // of for a launch, so its tags are carried by nothing here.
+        let specifications = input.tag_specifications.as_deref().unwrap_or_default();
+        let mut tags = crate::state::launch_resource_tags(
+            specifications,
+            crate::state::RESOURCE_TYPE_INSTANCE,
+        );
+        let launched_volume_tags = crate::state::tag_list(&crate::state::launch_resource_tags(
+            specifications,
+            crate::state::RESOURCE_TYPE_VOLUME,
+        ));
+        let launched_interface_tags = crate::state::tag_list(&crate::state::launch_resource_tags(
+            specifications,
+            crate::state::RESOURCE_TYPE_NETWORK_INTERFACE,
+        ));
         // A launch that READ A LAUNCH TEMPLATE adds the two system tags Amazon EC2 puts on an
         // instance launched from one, naming the template and the version it read
         // ([`crate::state::LAUNCH_TEMPLATE_ID_TAG`]): they are the service's own, so they are
@@ -1342,6 +1364,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
             })
             + crate::state::tag_bytes(&tags)
+            // The tags the launch asks for on the resources it CREATES beside the instance
+            // are retained once per such RECORD, not once per launch: one volume per device
+            // this launch creates (the root one and each device its own mapping names) and
+            // one interface per interface it creates — plus the copy the instance record
+            // itself keeps for those seams to read
+            // ([`crate::state::instance_payload_bytes`] charges that one). So the charge
+            // counts the PRODUCT of the list's size and the records that hold it, rather
+            // than one factor of it.
+            + crate::state::tag_list_bytes(&launched_volume_tags).saturating_mul(
+                data_block_devices.len().saturating_add(2),
+            )
+            + crate::state::tag_list_bytes(&launched_interface_tags).saturating_mul(
+                planned_interfaces
+                    .iter()
+                    .filter(|interface| interface.request.network_interface_id.is_none())
+                    .count()
+                    .max(1)
+                    .saturating_add(1),
+            )
             // The root block device this launch resolved is kept on every instance it mints,
             // charged by the one definition of that charge.
             + crate::state::root_block_device_bytes(root_block_device.as_ref())
@@ -1689,6 +1730,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 data_block_devices: data_block_devices.clone(),
                 disable_api_termination: input.disable_api_termination.unwrap_or(false),
                 tags: tags.clone(),
+                // The tags this launch asks for on the resources it CREATES beside the
+                // instance: the EBS volume and the network interfaces the store mints with
+                // the instance carry them from the moment they exist.
+                launched_volume_tags: launched_volume_tags.clone(),
+                launched_interface_tags: launched_interface_tags.clone(),
                 client_token: input.client_token.clone(),
                 // An on-demand launch fulfills no Spot Instance request, so the instance
                 // carries neither a request id nor the `spot` lifecycle.
