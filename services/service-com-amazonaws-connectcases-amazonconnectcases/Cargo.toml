@@ -33,6 +33,11 @@ hex = { workspace = true }
 # an ARN is (see `state::tags`).
 service-common = { path = "../common" }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the integration-test target
+# picks a new suite up as a new file and nothing else.
+automod = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

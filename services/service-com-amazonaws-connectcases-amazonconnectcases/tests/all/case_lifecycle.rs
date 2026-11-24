@@ -1483,7 +1483,10 @@ async fn a_case_must_provide_a_value_for_every_field_its_template_requires() {
 // ---------------------------------------------------------------------------
 
 /// `CreateCaseRule` for `rule`, as the `(caseRuleId, caseRuleArn)` it minted.
-async fn create_case_rule(
+///
+/// `pub(crate)` so a sibling suite that needs a case rule to enumerate reaches
+/// this create rather than growing a second copy of it.
+pub(crate) async fn create_case_rule(
     emulator: &Emulator,
     case: &str,
     domain_id: &str,
