@@ -1,0 +1,2 @@
+# Scratch suites a diagnosis leaves behind are not part of this crate's tests.
+scratch_*.rs

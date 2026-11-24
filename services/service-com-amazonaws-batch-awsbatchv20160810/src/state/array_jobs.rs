@@ -58,7 +58,8 @@ pub fn job_id_reference_name(job_id: &str) -> &str {
 /// * "You can specify a SEQUENTIAL type dependency without specifying a job ID for array
 ///   jobs so that each child array job completes sequentially, starting at index 0" — so
 ///   the child at `index` waits for the child at `index - 1` of its OWN array, and the
-///   child at index 0 waits for nothing.
+///   child at index 0 waits for nothing. The TYPE is what says so, so an entry carrying a
+///   job id as well orders the children just the same.
 /// * "You can also specify an N_TO_N type dependency with a job ID for array jobs. In that
 ///   case, each index child of this job must wait for the corresponding index child of each
 ///   dependency" — so the entry is re-pointed at the dependency's child of the SAME index,
@@ -66,37 +67,65 @@ pub fn job_id_reference_name(job_id: &str) -> &str {
 ///
 /// Every other entry is inherited as written: a dependency on a plain job holds the whole
 /// array back, which is what a job id with no array form means.
+///
+/// WHICH array form an entry is, is decided by its TYPE and nothing else: a `SEQUENTIAL`
+/// entry orders the array's own children whether or not it also carries a job id, because
+/// ordering them is what the type means — "each child array job completes sequentially,
+/// starting at index 0" — while a job id is what the OTHER form pairs by index ("you can
+/// also specify an `N_TO_N` type dependency WITH A JOB ID for array jobs"). A job id such an
+/// entry carries beside its ordering is still a job the whole array waits for, so it is
+/// inherited as well.
+///
+/// An entry naming the array's OWN PARENT (or the child itself) is inherited by nothing: a
+/// parent runs no container of its own and reaches a terminal status only once every child
+/// has ([`ComAmazonawsBatchAwsbatchv20160810State::advance_array_parents`]), so a child held
+/// on it could never run — and neither could the parent, which is waiting for that child.
 pub fn array_child_dependencies(
     parent_dependencies: Option<&Vec<JobDependency>>,
     parent_id: &str,
     index: i32,
     holds: impl Fn(&str) -> bool,
 ) -> Option<Vec<JobDependency>> {
+    let own_id = array_child_job_id(parent_id, index);
     let mapped: Vec<JobDependency> = parent_dependencies
         .into_iter()
         .flatten()
-        .filter_map(|dependency| {
+        .flat_map(|dependency| {
             let kind = dependency.r#type.as_deref();
-            match (kind, dependency.job_id.as_deref()) {
-                (Some(ARRAY_DEPENDENCY_N_TO_N), Some(depended_on)) => {
-                    let matching = array_child_job_id(depended_on, index);
-                    let job_id = if holds(&matching) {
-                        matching
-                    } else {
-                        depended_on.to_string()
-                    };
-                    Some(JobDependency {
-                        job_id: Some(job_id),
-                        r#type: dependency.r#type.clone(),
-                    })
-                }
-                (Some(ARRAY_DEPENDENCY_SEQUENTIAL), None) => (index > 0).then(|| JobDependency {
+            // A dependency on the array this child belongs to — its parent, or the child
+            // itself — is one nothing could ever satisfy, so it holds the child for nothing.
+            let named = dependency
+                .job_id
+                .as_deref()
+                .filter(|id| *id != parent_id && *id != own_id.as_str());
+            let mut entries: Vec<JobDependency> = Vec::new();
+            // The ORDERING a `SEQUENTIAL` entry asks for: the child before this one.
+            if kind == Some(ARRAY_DEPENDENCY_SEQUENTIAL) && index > 0 {
+                entries.push(JobDependency {
                     job_id: Some(array_child_job_id(parent_id, index - 1)),
                     r#type: dependency.r#type.clone(),
-                }),
-                (_, Some(_)) => Some(dependency.clone()),
-                (_, None) => None,
+                });
             }
+            if let Some(depended_on) = named {
+                let job_id = match kind {
+                    // `N_TO_N` pairs by index: the dependency's child of the SAME index,
+                    // when the store holds one.
+                    Some(ARRAY_DEPENDENCY_N_TO_N) => {
+                        let matching = array_child_job_id(depended_on, index);
+                        if holds(&matching) {
+                            matching
+                        } else {
+                            depended_on.to_string()
+                        }
+                    }
+                    _ => depended_on.to_string(),
+                };
+                entries.push(JobDependency {
+                    job_id: Some(job_id),
+                    r#type: dependency.r#type.clone(),
+                });
+            }
+            entries
         })
         .collect();
     (!mapped.is_empty()).then_some(mapped)

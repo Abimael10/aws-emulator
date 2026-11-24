@@ -7,12 +7,14 @@
 //!
 //! Results are built from the persisted jobs, newest first by `createdAt`, and
 //! paginated through `maxResults`/`nextToken`. Filtering follows the model's own docs:
-//! with no `filters`, `jobStatus` selects the status and only `RUNNING` jobs are returned
-//! when it is absent; with a `filters` entry, `jobStatus` is ignored except alongside
-//! `SHARE_IDENTIFIER`, only one filter may be used at a time, and the documented filter
-//! names are `JOB_NAME` (case-insensitive, `*` suffix matches a prefix), `JOB_DEFINITION`
-//! (name — any revision — or exact ARN, case-sensitive, `*` suffix matches a prefix),
-//! `BEFORE_CREATED_AT`, `AFTER_CREATED_AT` and `SHARE_IDENTIFIER`.
+//! with no `filters`, `jobStatus` selects the status, and a listing of a QUEUE that names
+//! none returns only `RUNNING` jobs while a listing of an array / multi-node PARENT returns
+//! all of its children whatever status each is in (`arrayJobId` "lists all child jobs from
+//! within the specified array"); with a `filters` entry, `jobStatus` is ignored except
+//! alongside `SHARE_IDENTIFIER`, only one filter may be used at a time, and the documented
+//! filter names are `JOB_NAME` (case-insensitive, `*` suffix matches a prefix),
+//! `JOB_DEFINITION` (name — any revision — or exact ARN, case-sensitive, `*` suffix matches
+//! a prefix), `BEFORE_CREATED_AT`, `AFTER_CREATED_AT` and `SHARE_IDENTIFIER`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -210,6 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListJobsErrorModeled::ServerException(batch::unreachable_state()).into());
         };
         let now = batch::now_millis();
+        // WHICH of the three selectors the request named decides whether the implicit
+        // `RUNNING` status applies at all (see below, where the statuses are selected).
+        let selected_by_queue = input.job_queue.is_some();
         // The store's lock lives in THIS block and no longer, so nothing holds it while
         // the transitions it materialised are published below (that call reaches another
         // service in-process).
@@ -358,10 +363,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if status_filter_applies {
-            // The model's own doc for `jobStatus`: "If you don't specify a status, only
-            // RUNNING jobs are returned."
-            let status = input.job_status.as_deref().unwrap_or(batch::JOB_RUNNING);
-            jobs.retain(|job| job.status == status);
+            // WHICH listing the implicit status belongs to is what the model's own docs
+            // decide. `jobStatus` is "the job status used to filter jobs in the specified
+            // QUEUE ... If you don't specify a status, only RUNNING jobs are returned", so
+            // that default is the queue listing's. A listing selected by a PARENT job id is
+            // a different selection: `arrayJobId` "lists ALL CHILD JOBS from within the
+            // specified array" and `multiNodeJobId` "lists all nodes that are associated
+            // with the specified job" — unconditionally — so a caller that names no status
+            // is answered with every child of that parent, whatever status each one is in.
+            // That is what lets a client enumerate the children of an array job whose
+            // children run one at a time: at most one of them is ever `RUNNING`.
+            //
+            // A status the caller DID name selects in either listing, because selecting is
+            // what the member is for.
+            match (input.job_status.as_deref(), selected_by_queue) {
+                (Some(status), _) => jobs.retain(|job| job.status == status),
+                (None, true) => jobs.retain(|job| job.status == batch::JOB_RUNNING),
+                (None, false) => {}
+            }
         }
 
         jobs.sort_by(|left, right| {

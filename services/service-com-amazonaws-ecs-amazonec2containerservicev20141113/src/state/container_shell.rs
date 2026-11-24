@@ -1584,6 +1584,14 @@ impl ContainerShell {
     /// ([`Self::apply_redirect`]) is a form it does not perform, and the command is then not
     /// run.
     ///
+    /// WHERE the word stands decides whether it is an assignment at all: "assignment to a
+    /// variable shall occur only in the command prefix", so a word of the `NAME=VALUE` form
+    /// standing AFTER the command name is one of the command's own arguments and nothing
+    /// else — `echo IDX=1` writes `IDX=1` and sets no variable. The grammar reports such a
+    /// word as an assignment word wherever it stands, because that is the form the utilities
+    /// taking one read their operands in (`export NAME=VALUE`), so a suffix item of that kind
+    /// reaches the command as the WORD it was written as.
+    ///
     /// The files the redirections name are OPENED before the command is resolved, which is
     /// the order a shell opens them in: a file the container's filesystem refuses to open —
     /// a write through a read-only mount, a path whose directory is missing — is reported in
@@ -1616,15 +1624,18 @@ impl ContainerShell {
             let mut words: Vec<String> = Vec::new();
             let mut redirections = Redirections::default();
             // The prefix's items and the suffix's are read in the order they were written,
-            // gathered first so the walk over them has one type.
-            let mut items: Vec<&::brush_parser::ast::CommandPrefixOrSuffixItem> = Vec::new();
+            // gathered first so the walk over them has one type — each carrying WHERE it
+            // stands, because that is what decides whether a `NAME=VALUE` word assigns
+            // anything (see this method's own documentation).
+            let mut items: Vec<(bool, &::brush_parser::ast::CommandPrefixOrSuffixItem)> =
+                Vec::new();
             if let Some(prefix) = simple.prefix.as_ref() {
-                items.extend(prefix.0.iter());
+                items.extend(prefix.0.iter().map(|item| (true, item)));
             }
             if let Some(suffix) = simple.suffix.as_ref() {
-                items.extend(suffix.0.iter());
+                items.extend(suffix.0.iter().map(|item| (false, item)));
             }
-            for item in items {
+            for (in_prefix, item) in items {
                 match item {
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word) => {
                         let Some(expanded) = self.expand_word(&word.value).await else {
@@ -1634,8 +1645,17 @@ impl ContainerShell {
                     }
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::AssignmentWord(
                         assignment,
-                        _,
+                        word,
                     ) => {
+                        if !in_prefix {
+                            // After the command name it is an ARGUMENT: the word itself,
+                            // expanded like any other.
+                            let Some(expanded) = self.expand_word(&word.value).await else {
+                                return self.word_failure().await;
+                            };
+                            words.push(expanded);
+                            continue;
+                        }
                         let Some(pair) = self.assignment_of(assignment).await else {
                             return self.word_failure().await;
                         };
