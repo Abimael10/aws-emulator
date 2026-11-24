@@ -10,6 +10,10 @@ use super::*;
 // out so each file stays readable; re-exported, so this module is the one path to them.
 mod compute_and_developer_tools;
 mod certificates_and_dns;
+// The DNS validation records CloudFormation publishes for a declared certificate, which are
+// this group's one piece of per-type work in ANOTHER service's zones. Reached by its own
+// path, so what is published and what is withdrawn names the concern it belongs to.
+mod certificate_validation_records;
 pub(crate) use certificates_and_dns::*;
 pub(crate) use compute_and_developer_tools::*;
 
@@ -2474,12 +2478,18 @@ pub(super) const ACM_DOMAIN_VALIDATION_OPTION_MEMBERS: &[(&str, &str)] = &[
     ("ValidationDomain", "ValidationDomain"),
 ];
 
-/// The property of a `DomainValidationOptions` entry this provisioner does not map onto the
-/// create's request: `HostedZoneId` is not a member of ACM's `DomainValidationOption` at
-/// all — it names the Route 53 hosted zone CloudFormation itself publishes the validation
-/// record into, which this emulator does not do — so a declaration that states one is
-/// refused rather than deployed as a certificate whose validation record nothing publishes.
+/// The property of a `DomainValidationOptions` entry that is no member of ACM's
+/// `DomainValidationOption` at all: `HostedZoneId` names the Route 53 hosted zone
+/// CloudFormation itself publishes that name's validation record into
+/// ([`certificate_validation_records`]), so it is not sent with the request and is acted on by
+/// this provider instead.
 pub(super) const ACM_HOSTED_ZONE_ID: &str = "HostedZoneId";
+
+/// Every property one entry of the type's `DomainValidationOptions` may state: the two that
+/// are ACM's own members and the one that is CloudFormation's. An entry stating anything else
+/// describes something no call carries, so it is refused rather than dropped.
+pub(super) const ACM_DOMAIN_VALIDATION_OPTION_PROPERTIES: &[&str] =
+    &["DomainName", "ValidationDomain", ACM_HOSTED_ZONE_ID];
 
 /// The type's one property that is a member of the create's `Options` rather than of the
 /// request itself (`CertificateOptions$CertificateTransparencyLoggingPreference`).
@@ -2499,8 +2509,19 @@ pub(super) const CERTIFICATE_ISSUED: &str = "ISSUED";
 /// one by one ([`ACM_CERTIFICATE_MEMBERS`] for the ones named identically, `Tags` as ACM's
 /// own tag list, `CertificateTransparencyLoggingPreference` into the create's `Options`,
 /// and each `DomainValidationOptions` entry onto ACM's `DomainValidationOption`), and a
-/// property with no member at all is refused ([`ACM_HOSTED_ZONE_ID`]) rather than dropped.
-/// Nothing the declaration does not state is sent.
+/// property of such an entry that is a member of neither side is refused
+/// ([`ACM_DOMAIN_VALIDATION_OPTION_PROPERTIES`]) rather than dropped. Nothing the declaration
+/// does not state is sent.
+///
+/// ACM's `DomainValidationOption` carries the mail suffix a name is validated through, and
+/// its `ValidationDomain` is REQUIRED
+/// (`smithy_query(shape="com.amazonaws.acm#DomainValidationOption")`), so an entry naming a
+/// HOSTED ZONE and no mail suffix is CloudFormation's own instruction to publish that name's
+/// challenge record there ([`certificate_validation_records`]) and no member of this request
+/// carries it; a declaration whose every entry is of that kind sends the member not at all,
+/// that list being `@length(min: 1)`. Every other entry travels as the declaration wrote it,
+/// so an entry that states neither member is one ACM refuses for the member its own model
+/// requires rather than one this provider drops.
 ///
 /// The certificate's identifier is ACM's OWN to mint — the create takes no identifier and
 /// answers with `CertificateArn`, and "Ref returns the certificate ARN" — so that answer is
@@ -2522,19 +2543,35 @@ pub(super) async fn request_certificate(
     if let Some(Value::Array(options)) = properties.get("DomainValidationOptions") {
         let mut mapped: Vec<Value> = Vec::with_capacity(options.len());
         for option in options {
-            if option.get(ACM_HOSTED_ZONE_ID).is_some() {
-                return Err(Refusal {
-                    code: NOT_IMPLEMENTED.to_string(),
-                    message: format!(
-                        "this emulator does not implement the {ACM_HOSTED_ZONE_ID} property of \
-                         {}'s DomainValidationOptions",
-                        resource.resource_type
-                    ),
-                });
+            if let Some(declared) = option.as_object() {
+                if let Some(property) =
+                    unmapped_property(declared, ACM_DOMAIN_VALIDATION_OPTION_PROPERTIES)
+                {
+                    return Err(Refusal {
+                        code: NOT_IMPLEMENTED.to_string(),
+                        message: format!(
+                            "this emulator does not apply the {property} property of {}'s \
+                             DomainValidationOptions",
+                            resource.resource_type
+                        ),
+                    });
+                }
+            }
+            // An entry that names a HOSTED ZONE is this provider's own work and no member of
+            // the request carries it, so it is not sent; an entry that states the mail suffix
+            // ACM validates the name through is ACM's, and one that states NEITHER is sent as
+            // the declaration wrote it — ACM refuses it for the member its own model requires
+            // rather than this provider dropping an entry nothing would act on.
+            if option.get(ACM_HOSTED_ZONE_ID).is_some()
+                && option.get("ValidationDomain").is_none()
+            {
+                continue;
             }
             mapped.push(mapped_members(option, ACM_DOMAIN_VALIDATION_OPTION_MEMBERS));
         }
-        request.insert("DomainValidationOptions".to_string(), Value::Array(mapped));
+        if !mapped.is_empty() {
+            request.insert("DomainValidationOptions".to_string(), Value::Array(mapped));
+        }
     }
     if let Some(preference) = properties.get(ACM_TRANSPARENCY_LOGGING) {
         let mut options = Map::new();
@@ -2569,22 +2606,20 @@ pub(super) async fn request_certificate(
     })
 }
 
-/// Whether ACM has issued the certificate a stack requested.
+/// The certificate ACM reports for `physical_resource_id` — its whole `CertificateDetail` —
+/// or `None` where ACM no longer holds a certificate for that ARN
+/// (`ResourceNotFoundException`).
 ///
-/// "A certificate enters status PENDING_VALIDATION upon being requested"
-/// (`CertificateDetail$Status`) and the certificate cannot serve traffic until ACM issues
-/// it, so `ISSUED` is the state the resource's creation is finished in, `PENDING_VALIDATION`
-/// is the state it is still coming up in, and every other status is one no wait will bring
-/// out of: a validation that timed out, a request ACM failed, a revoked or expired
-/// certificate. A certificate ACM no longer holds is in the same position — nothing is going
-/// to issue it.
-pub(super) async fn certificate_readiness(
+/// The ONE read of a certificate for the arms beside it: whether the resource has come up,
+/// what its validation asks a client to publish and what it looks like for drift are three
+/// questions about one document, so they cannot come to read it differently.
+pub(super) async fn certificate_detail(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
-) -> Result<Readiness, Refusal> {
+) -> Result<Option<Value>, Refusal> {
     let request = serde_json::json!({ "CertificateArn": physical_resource_id });
-    let reported = match call_json_rpc(
+    match call_json_rpc(
         ctx,
         ACM_SIGNING_NAME,
         region,
@@ -2594,19 +2629,69 @@ pub(super) async fn certificate_readiness(
     )
     .await
     {
-        Ok(reported) => reported,
-        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => {
-            return Ok(Readiness::Failed(format!(
-                "ACM holds no certificate for {physical_resource_id}"
-            )))
-        }
-        Err(refusal) => return Err(refusal),
+        Ok(reported) => Ok(Some(
+            reported.get("Certificate").cloned().unwrap_or(Value::Null),
+        )),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether ACM has issued the certificate a stack requested, and the validation records the
+/// declaration asks CloudFormation to publish for it.
+///
+/// "A certificate enters status PENDING_VALIDATION upon being requested"
+/// (`CertificateDetail$Status`) and the certificate cannot serve traffic until ACM issues
+/// it, so `ISSUED` is the state the resource's creation is finished in, `PENDING_VALIDATION`
+/// is the state it is still coming up in, and every other status is one no wait will bring
+/// out of: a validation that timed out, a request ACM failed, a revoked or expired
+/// certificate. A certificate ACM no longer holds is in the same position — nothing is going
+/// to issue it.
+///
+/// A request still WAITING on proof of domain control is where the challenge records a
+/// declaration names hosted zones for are published
+/// ([`certificate_validation_records::publish_validation_records`]): that record is no member
+/// of the create, ACM hands it out on the certificate the create minted, and it proves the
+/// name only while the request is pending — so it is written here, on the identity the create
+/// already answered with, rather than dropped. A record no zone could be made to hold fails
+/// the resource, and a batch Route 53 REFUSES fails it in that service's own words
+/// ([`Readiness::Refused`]); either way the certificate ACM minted stays, under the
+/// identifier the stack already published for it.
+pub(super) async fn certificate_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+    declared: Option<&Value>,
+) -> Result<Readiness, Refusal> {
+    let Some(detail) = certificate_detail(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "ACM holds no certificate for {physical_resource_id}"
+        )));
     };
-    let detail = reported.get("Certificate");
     let status = detail
-        .and_then(|detail| detail.get("Status"))
+        .get("Status")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if status == CERTIFICATE_PENDING_VALIDATION {
+        let wanted = declared
+            .map(certificate_validation_records::declared_validation_zones)
+            .unwrap_or_default();
+        if !wanted.is_empty() {
+            match certificate_validation_records::publish_validation_records(
+                ctx,
+                region,
+                physical_resource_id,
+                Some(&detail),
+                &wanted,
+            )
+            .await
+            {
+                Ok(None) => {}
+                Ok(Some(reason)) => return Ok(Readiness::Failed(reason)),
+                Err(refusal) => return Ok(Readiness::Refused(refusal)),
+            }
+        }
+    }
     match status {
         CERTIFICATE_ISSUED => Ok(Readiness::Ready),
         CERTIFICATE_PENDING_VALIDATION => Ok(Readiness::Pending(
@@ -2616,7 +2701,7 @@ pub(super) async fn certificate_readiness(
             // `FailureReason` "exists only when the certificate status is FAILED", so it is
             // reported where ACM gave one and the status speaks for itself otherwise.
             let reason = detail
-                .and_then(|detail| detail.get("FailureReason"))
+                .get("FailureReason")
                 .and_then(Value::as_str);
             Ok(Readiness::Failed(match reason {
                 Some(reason) => format!(
@@ -2628,7 +2713,14 @@ pub(super) async fn certificate_readiness(
     }
 }
 
-/// Delete the certificate a stack requested.
+/// Delete the certificate a stack requested, and withdraw the validation records this
+/// provider published for it.
+///
+/// The records come first and are read off the certificate while ACM still reports it
+/// ([`certificate_validation_records::withdraw_validation_records`]): they are this provider's
+/// own writing in another service's zone, so a zone the same stack declares is left able to be
+/// deleted after them. A declaration that named no hosted zone had none published, so nothing
+/// is read for it.
 ///
 /// A certificate ACM no longer holds (`ResourceNotFoundException`) is already in the state
 /// the delete asks for, so that answer is a success. Every other refusal is ACM's own and
@@ -2637,8 +2729,21 @@ pub(super) async fn certificate_readiness(
 pub(super) async fn delete_certificate(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    physical_resource_id: &str,
+    resource: &StoredResource,
 ) -> Result<(), Refusal> {
+    let physical_resource_id = &resource.physical_resource_id;
+    let published =
+        certificate_validation_records::declared_validation_zones(&resource.properties);
+    if !published.is_empty() {
+        let detail = certificate_detail(ctx, region, physical_resource_id).await?;
+        certificate_validation_records::withdraw_validation_records(
+            ctx,
+            region,
+            detail.as_ref(),
+            &published,
+        )
+        .await?;
+    }
     let request = serde_json::json!({ "CertificateArn": physical_resource_id });
     match call_json_rpc(
         ctx,
@@ -2672,26 +2777,16 @@ pub(super) async fn describe_certificate(
     region: &str,
     physical_resource_id: &str,
 ) -> Result<Option<Value>, Refusal> {
-    let request = serde_json::json!({ "CertificateArn": physical_resource_id });
-    let reported = match call_json_rpc(
-        ctx,
-        ACM_SIGNING_NAME,
-        region,
-        AWS_JSON_1_1,
-        &format!("{ACM_TARGET_PREFIX}.DescribeCertificate"),
-        &request,
-    )
-    .await
-    {
-        Ok(reported) => reported,
-        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
-        Err(refusal) => return Err(refusal),
+    let Some(reported) = certificate_detail(ctx, region, physical_resource_id).await? else {
+        return Ok(None);
     };
-    let Some(detail) = reported.get("Certificate") else {
+    // The read answered without the detail its output models: a document carrying none of the
+    // properties, which is no evidence about any of them.
+    if reported.is_null() {
         return Ok(Some(Value::Object(Map::new())));
-    };
+    }
     Ok(Some(reported_as_properties(
-        detail,
+        &reported,
         &[
             ("DomainName", "DomainName"),
             ("KeyAlgorithm", "KeyAlgorithm"),

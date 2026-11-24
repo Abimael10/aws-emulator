@@ -439,13 +439,16 @@
 //! stack's own tags without the three ([`Provisioner::applicable_tags`]).
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
-//! request, and what the owning service answers is what the stack records. A property an
-//! arm does not map onto the create's request at all is REFUSED rather than dropped, so a
-//! stack never reports a resource configured differently from its declaration — the FIS
-//! arm's `ExperimentReportConfiguration` and the ACM certificate arm's
-//! `DomainValidationOptions.HostedZoneId` are the two such properties today. Inside a
-//! nested structure the member tables are the type's published members, so a member not in
-//! one is not a member of the type.
+//! request, and what the owning service answers is what the stack records. A property that
+//! is no member of the create's request at all is the PROVIDER's own work where this
+//! provisioner does that work — the ACM certificate arm's
+//! `DomainValidationOptions.HostedZoneId` names the Route 53 zone CloudFormation itself
+//! publishes the certificate's validation record in
+//! ([`certificate_validation_records`]) — and is REFUSED rather than dropped where nothing
+//! acts on it, so a stack never reports a resource configured differently from its
+//! declaration: the FIS arm's `ExperimentReportConfiguration` is the one such property
+//! today. Inside a nested structure the member tables are the type's published members, so
+//! a member not in one is not a member of the type.
 
 use std::collections::BTreeMap;
 
@@ -2582,7 +2585,10 @@ impl Provisioner {
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
-            Self::AcmCertificate => delete_certificate(ctx, region, physical_resource_id).await,
+            // The delete withdraws the validation records this provider published into the
+            // hosted zones the declaration named before it deletes the certificate, so it
+            // takes the whole record rather than the ARN alone.
+            Self::AcmCertificate => delete_certificate(ctx, region, resource).await,
             Self::AcmPcaCertificateAuthority => {
                 delete_certificate_authority(ctx, region, physical_resource_id).await
             }

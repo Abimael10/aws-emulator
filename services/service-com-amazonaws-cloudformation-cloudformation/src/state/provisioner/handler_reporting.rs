@@ -173,6 +173,21 @@ impl Provisioner {
         {
             return super::provisioning::HANDLER_ERROR_INTERNAL_FAILURE;
         }
+        // The `AWS::CertificateManager::Certificate` provider maps none of Amazon Route 53's
+        // refusals of the change batch it publishes the certificate's DNS validation record
+        // with: that batch is another service's call, and the plugin reports an exception it
+        // has no mapping for under its class for a service that failed. Recorded behaviour,
+        // read from the reason of the failed certificate of a stack whose
+        // `DomainValidationOptions` names a zone that is not authoritative for the domain (in
+        // the behavioral corpus `simparity-behavioral-aws-v1`, check `acm__cloudformation__\
+        // route53.cfn-certificate-hostedzoneid-not-covering-domain-rejected`, whose reason
+        // closes `HandlerErrorCode: GeneralServiceException`), and decided — as everywhere
+        // here — by the CODE that service answered rather than by its message, so every
+        // refusal of that batch is reported this way whichever zone it named. ACM's own
+        // refusals keep the class their own codes fall in.
+        if matches!(self, Self::AcmCertificate) && code.contains(INVALID_CHANGE_BATCH) {
+            return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
+        }
         let references_another_resource = match self {
             // A record set is written INSIDE a hosted zone its declaration names
             // (`HostedZoneId`/`HostedZoneName`), and the record set itself is the resource
@@ -182,6 +197,11 @@ impl Provisioner {
             Self::Route53RecordSet | Self::Route53RecordSetGroup => {
                 code.contains(NO_SUCH_HOSTED_ZONE)
             }
+            // A certificate's validation record is written inside the zone its
+            // `DomainValidationOptions` names, while the resource this handler manages is the
+            // CERTIFICATE: a zone Route 53 does not hold is the same declaration naming a
+            // zone that is not there, so it reads the same way here.
+            Self::AcmCertificate => code.contains(NO_SUCH_HOSTED_ZONE),
             _ => false,
         };
         if references_another_resource {

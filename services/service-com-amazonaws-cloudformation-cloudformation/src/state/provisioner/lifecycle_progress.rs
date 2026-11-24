@@ -41,8 +41,12 @@ impl Provisioner {
         match self {
             // "A certificate enters status PENDING_VALIDATION upon being requested"
             // (`CertificateDetail$Status`) and is usable once ACM has issued it, so the
-            // resource's creation is finished when ACM reports it `ISSUED`.
-            Self::AcmCertificate => certificate_readiness(ctx, region, physical_resource_id).await,
+            // resource's creation is finished when ACM reports it `ISSUED` — and the
+            // validation records the declaration names hosted zones for are published while
+            // it is still waiting on them, which is why this arm reads the declaration.
+            Self::AcmCertificate => {
+                certificate_readiness(ctx, region, physical_resource_id, declared).await
+            }
             // "Private CA is pending creation" is the status a created CA is reported in
             // (`CertificateAuthorityStatus$CREATING`), and its certificate signing request
             // is not available in it, so the resource's creation is finished once that

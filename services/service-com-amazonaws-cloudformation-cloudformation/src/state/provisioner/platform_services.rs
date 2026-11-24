@@ -794,6 +794,12 @@ pub(super) const ROUTE53_XML_NAMESPACE: &str = "https://route53.amazonaws.com/do
 /// exists with the ID that you specified" (`NoSuchHostedZone`).
 pub(super) const NO_SUCH_HOSTED_ZONE: &str = "NoSuchHostedZone";
 
+/// The error code Route 53 answers for a change batch it will not apply: "this exception
+/// contains a list of messages that might contain one or more error messages"
+/// (`InvalidChangeBatch`) — a record set whose name the zone is not authoritative for being
+/// one of them.
+pub(super) const INVALID_CHANGE_BATCH: &str = "InvalidChangeBatch";
+
 /// The prefix Route 53 wraps a hosted zone id in where it reports one
 /// (`HostedZone$Id` comes back as `/hostedzone/Z…`), and which every operation that TAKES a
 /// zone id accepts beside the bare form.
@@ -809,11 +815,18 @@ pub(super) const HEALTH_CHECK_TAG_RESOURCE_TYPE: &str = "healthcheck";
 /// `@length(min: 1, max: 10)`, so a larger set is applied in that many calls.
 pub(super) const MAX_TAGS_PER_TAG_CHANGE: usize = 10;
 
-/// The two change-batch actions this module asks for: "CREATE: Creates a resource record
-/// set that has the specified values" and "DELETE: Deletes a existing resource record set"
-/// (`Change$Action`).
+/// The change-batch actions the arms of this provisioner ask for: "CREATE: Creates a resource
+/// record set that has the specified values", "DELETE: Deletes a existing resource record
+/// set" and "UPSERT: If a resource set doesn't exist, Route 53 creates it. If a resource set
+/// exists, Route 53 updates it with the values in the request" (`Change$Action`).
+///
+/// All three here, whichever arm asks for one: a declared record set is created and deleted
+/// ([`change_record_set`]), and a certificate's validation record is published with the
+/// action that leaves the zone holding exactly one record set for the name however often it
+/// is applied ([`super::network_and_delivery::certificate_validation_records`]).
 pub(super) const RECORD_SET_CREATE: &str = "CREATE";
 pub(super) const RECORD_SET_DELETE: &str = "DELETE";
+pub(super) const RECORD_SET_UPSERT: &str = "UPSERT";
 
 /// The properties of `AWS::Route53::HostedZone` this arm maps onto `CreateHostedZone` and
 /// the calls beside it.
