@@ -141,8 +141,18 @@ impl NativeHandler for ApiDataPlaneAddress {
                 return;
             };
             let readdress: Readdress = Arc::new(published_target);
-            super::websocket::endpoint_http::serve_readdressed(callback, conn, Some(readdress))
-                .await;
+            super::websocket::endpoint_http::serve_readdressed(
+                callback,
+                conn,
+                Some(readdress),
+                // Every request this address serves is an invoke of an api of this account:
+                // the path names the api ([`published_target`]) and anything else is refused
+                // above, so a request a browser sent from another site is served here and
+                // recorded as having been, and the api's own `CorsConfiguration` decides the
+                // decoration of the answer.
+                super::websocket::endpoint_http::Arrival::ApiDataPlane,
+            )
+            .await;
         })
     }
 }
@@ -155,8 +165,14 @@ impl NativeHandler for ApiDataPlaneAddress {
 /// Refused here, and nothing else is: a path that addresses no api of this plane at all, and
 /// one carrying a dot segment, which could resolve out of the path an api is published at — and
 /// that path is the only thing that says which api must answer. The `Host` allowlist (the
-/// DNS-rebinding guard) and the browser check are the shared endpoint's, applied to every
-/// request it serves as sent.
+/// DNS-rebinding guard) is the shared endpoint's, applied to every request it serves as sent.
+/// A request a browser sent from ANOTHER SITE is served on this address rather than refused,
+/// and recorded as having been, because what is refused here leaves nothing it carries but an
+/// invoke of an api of this account
+/// ([`super::websocket::endpoint_http::Arrival::ApiDataPlane`], where the whole rule is
+/// stated): the api's own `CorsConfiguration` decides the decoration of the answer, and the
+/// router this endpoint hands the request to still refuses such a request for every request
+/// that names an operation there.
 fn published_target(parts: &::http::request::Parts) -> Addressed {
     let path = parts.uri.path();
     if ::service_common::data_plane_addressing::carries_a_dot_segment(path)

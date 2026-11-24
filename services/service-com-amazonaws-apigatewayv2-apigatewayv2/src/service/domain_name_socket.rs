@@ -227,6 +227,13 @@ impl NativeHandler for DomainNameSocket {
                 callback,
                 conn,
                 Some(readdress),
+                // Every request this address serves is an invoke of an api of this account:
+                // the api mapping the request's base path matches names the api and the stage
+                // ([`invoke_target`]) and a path no mapping answers is refused above, so a
+                // request a browser sent from another site is served here and recorded as
+                // having been, and the api's own `CorsConfiguration` decides the decoration of
+                // the answer.
+                super::websocket::endpoint_http::Arrival::ApiDataPlane,
             )
             .await;
         })

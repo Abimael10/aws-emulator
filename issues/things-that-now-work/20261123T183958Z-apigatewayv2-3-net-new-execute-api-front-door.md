@@ -76,3 +76,50 @@ Cause 3:
 4. Fire ~24 requests at each route strictly interleaved: expect >=1 HTTP 429 with the 'Too Many Requests' envelope (and no marker) on 'GET /limited', 200+marker for the rest, and zero 429 on 'GET /twin'.
 5. DeleteRouteSettings(ApiId, StageName='$default', RouteKey='GET /limited'); repeat the burst and expect no 429 on either route.
 6. Re-replay apigatewayv2.route-throttling-returns-429-while-twin-route-serves.
+
+## Resolution
+
+Cause 2: FIXED. The address an HTTP api publishes is a SOCKET of this service's own, and the
+endpoint that serves it re-applied the core's browser (`Origin` / `Sec-Fetch-Site`) reading to
+every request on it and answered `403` with the plain-text body `cross-site origin` itself —
+before any record of the api was read. That is why this check never saw the api answer at all:
+its very first `GET` of the invoke URL carries an `Origin` the api's `CorsConfiguration` admits
+(the replay's first divergence after the gate was lifted was `GET / with an allowed Origin
+answered 403 'cross-site origin'`). That reading is now scoped by what the socket being served
+STANDS FOR (`src/service/websocket/endpoint_http.rs`'s `Arrival`): it is still applied, exactly
+as a core HTTP listener applies it, wherever the address may be addressed at something other
+than an api's own data plane — a WEBSOCKET api's endpoint, which also publishes the
+`@connections` space, and a published portal's website — and it is not applied where the
+socket's own record has already resolved the request to an invoke of an api of this account
+(the published `ApiEndpoint`, whose path names the api, and a custom domain name, whose api
+mapping names the api and the stage). That is the one class this emulator's front door already
+serves cross-site, and the class an api's `CorsConfiguration` exists for: CORS governs what a
+browser may do with an ANSWER, so the api's records decide the answer and the configuration
+decides only its `Access-Control-*` decoration. The router every request from that endpoint is
+handed still reads those fields itself for every request it NAMES AN OPERATION for, so a
+`@connections` call or any other modelled operation reached through any of these addresses is
+refused as cross-site exactly as at the front door, and the `Host` allowlist (the
+DNS-rebinding guard) is untouched. With that, the whole check passes: the stack's api serves
+its Lambda through the published URL, and the deleted api's URL answers `404`
+`{"message":"Not Found"}`.
+
+Causes 1 and 3: DECLINED — the divergences they state do not exist in this tree, and neither
+check is graded (both still end as `Check timed out after 60.0s` with no verdict and no frame,
+so the replay is evidence either way for nothing). What this tree answers for every leg either
+cause names is now driven at the ADDRESS the control plane publishes, over a real connection to
+it, with the route's function actually running, by
+`tests/all/published_invoke_socket_front_door.rs`: an api whose `DisableExecuteApiEndpoint` is
+set answers `404` `{"message":"Not Found"}` on every form of its own published URL with nothing
+of the integration in it, the twin api over the same function is served by it in the same
+instant, clearing the member restores serving on the same address, and a DELETED api's address
+answers `404` `{"message":"Not Found"}`; a route the serving stage's `RouteSettings` throttle
+sheds `429` `{"message":"Too Many Requests"}` without reaching its integration while the twin
+route of the same stage on the stage's `DefaultRouteSettings` sheds nothing, and
+`DeleteRouteSettings` returns the route to those defaults. The hypotheses both causes offer — a
+`403` `{"message":"Forbidden"}` gate for the disabled endpoint, and an `AWS_PROXY` route that
+cannot reach a settled `200` — are false here; the whole suite runs in under two seconds, so
+speed is not what the checks' polls run out of. The same two checks were investigated the same
+way by the fix for
+`issues/things-that-now-work/20261114T024946Z-apigatewayv2-3-net-new-causes-a-disabled-execute.md`,
+which reached the same conclusion. A later reader should treat them as ungraded rather than as
+passing.

@@ -221,50 +221,24 @@ impl Answer {
 
 /// Send one `GET path` to the published address and read the whole answer.
 ///
-/// The address is a core-owned listener that negotiates encryption in band, so a client that
-/// opens in the clear is served in the clear — which is what this case does, one request per
-/// connection (`Connection: close`), so the read ends with the answer.
-///
 /// `host` is the `Host` the client sends: the published address itself, or the custom DOMAIN
-/// NAME a caller pointed at that address, which is what a real client of the domain sends.
+/// NAME a caller pointed at that address, which is what a real client of the domain sends. The
+/// wire work is the ONE raw HTTP/1.1 client the suites that drive this service's core-owned
+/// addresses share (`published_invoke_socket_front_door::request`), so none of them can read
+/// an answer differently from another.
 pub(crate) async fn request_as(case: &str, authority: &str, path: &str, host: &str) -> Answer {
-    let port = authority
-        .parse::<std::net::SocketAddr>()
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: the published address {authority:?} is no address: {error}")
-        })
-        .port();
-    let mut stream = tokio::time::timeout(
-        ANSWER_DEADLINE,
-        TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    let answered = crate::published_invoke_socket_front_door::request(
+        case,
+        authority,
+        "GET",
+        path,
+        host,
+        &[],
     )
-    .await
-    .unwrap_or_else(|_| panic!("case {case:?}: {authority} did not accept a connection in time"))
-    .unwrap_or_else(|error| panic!("case {case:?}: {authority} refused a connection: {error}"));
-    let wire =
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    tokio::time::timeout(ANSWER_DEADLINE, stream.write_all(wire.as_bytes()))
-        .await
-        .unwrap_or_else(|_| panic!("case {case:?}: the request was not written in time"))
-        .unwrap_or_else(|error| panic!("case {case:?}: the request was not written: {error}"));
-    let mut raw = Vec::new();
-    tokio::time::timeout(ANSWER_DEADLINE, stream.read_to_end(&mut raw))
-        .await
-        .unwrap_or_else(|_| panic!("case {case:?}: {authority} did not answer in time"))
-        .unwrap_or_else(|error| panic!("case {case:?}: the answer was not read: {error}"));
-    let answered = String::from_utf8_lossy(&raw).to_string();
-    let (head, body) = answered
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("case {case:?}: expected an HTTP answer, got {answered:?}"));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: expected a status line, got {head:?}"));
+    .await;
     Answer {
-        status,
-        body: body.to_string(),
+        status: answered.status,
+        body: answered.body,
     }
 }
 

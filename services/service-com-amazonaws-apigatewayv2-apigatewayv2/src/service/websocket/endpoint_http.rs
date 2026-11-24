@@ -53,9 +53,11 @@
 //!
 //! Before the dispatch, the transport-safety decisions the core makes for its own HTTP
 //! listeners are applied from the core's own predicates — the `Host` allowlist that guards
-//! against DNS rebinding and the browser (`Origin` / `Sec-Fetch-Site`) check — and the
-//! request is read under one deadline, one in-flight cap and one body ceiling, all the
-//! core's, so a slow or oversized caller cannot hold a connection permit open.
+//! against DNS rebinding, and the browser (`Origin` / `Sec-Fetch-Site`) reading, which is made
+//! for every request and refuses one a browser sent from another site wherever the address may
+//! be addressed at something other than an api's own data plane ([`Arrival`]) — and the request
+//! is read under one deadline, one in-flight cap and one body ceiling, all the core's, so a
+//! slow or oversized caller cannot hold a connection permit open.
 //!
 //! And every answer written here names its fields in the CANONICAL HTTP spelling (see
 //! [`serve_readdressed`]), because every address served here is one a client dials rather than
@@ -74,6 +76,42 @@ use aws_smithy_runtime_api::client::http::HttpConnector;
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use aws_smithy_types::body::SdkBody;
 
+/// WHAT the socket this endpoint is serving stands for, which is what decides what a request
+/// a browser sent from ANOTHER SITE is answered here — the one thing this reading governs. The
+/// reading itself is made for every request, with the core's own predicate, and every request
+/// is read for it again by the router this endpoint hands it to, for every request that names
+/// an operation there.
+///
+/// The core refuses such a request on its own HTTP listeners, and so does that router. One
+/// class of request is deliberately exempt from the refusal at this emulator's front door, and
+/// it is the only class some of these addresses carry: an invoke of an HTTP api's stage, which
+/// `crate::service` leaves unnamed for exactly such a request and answers from its routing
+/// seam, where the api's own `CorsConfiguration` decorates whatever the gateway answers. CORS
+/// governs what a BROWSER may do with an ANSWER, not which requests a gateway accepts, so an
+/// address that carries nothing else must not turn such a request away itself: doing so answers
+/// a refusal no api's configuration had any say in, and makes every leg of that configuration —
+/// the grant, its absence, the preflight, the body the route's function returns — unreachable.
+/// Such a request is never served SILENTLY: the record of it names the reading that would
+/// otherwise have refused it ([`refused_before_dispatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// Every request this address carries is an invoke of an api of this account, because the
+    /// socket's own record has already resolved it to one — the published `ApiEndpoint`, whose
+    /// path names the api ([`crate::service::invoke_plane_socket`]), and a custom domain name,
+    /// whose api mapping names the api and the stage
+    /// ([`crate::service::domain_name_socket`]); anything else is refused by that record
+    /// before this point. So a request a browser sent from another site is SERVED here, and
+    /// recorded as having been — the api's records answer it and the api's
+    /// `CorsConfiguration` decides the decoration of the answer.
+    ApiDataPlane,
+    /// Whatever the client addressed may arrive, modelled operations included — the
+    /// `@connections` space of ApiGatewayManagementApi is published on a WEBSOCKET api's own
+    /// endpoint ([`super::transport`]), and a published portal serves a website
+    /// ([`crate::service::portal_socket`]) — so a request a browser sent from another site is
+    /// refused here as it is on a core HTTP listener.
+    WhateverIsAddressed,
+}
+
 /// Speak HTTP/1.1 on one accepted connection until the client closes it, answering each
 /// request from this emulator's router — each handed on exactly as it arrived.
 ///
@@ -87,7 +125,7 @@ use aws_smithy_types::body::SdkBody;
 /// client that opens a connection and dribbles a request line cannot hold the connection
 /// permit the core issued for it.
 pub async fn serve(callback: EmbeddedEmulator, conn: ListenerConn) {
-    serve_readdressed(callback, conn, None).await;
+    serve_readdressed(callback, conn, None, Arrival::WhateverIsAddressed).await;
 }
 
 /// Where one request this endpoint accepted is handed to the router.
@@ -109,11 +147,13 @@ pub(crate) enum Addressed {
 /// request, so a record written after the connection was opened still decides it.
 pub(crate) type Readdress = Arc<dyn Fn(&::http::request::Parts) -> Addressed + Send + Sync>;
 
-/// [`serve`], with each request re-addressed by `readdress` before the router is asked.
+/// [`serve`], with each request re-addressed by `readdress` before the router is asked, and
+/// `arrival` saying what the socket being served stands for.
 pub(crate) async fn serve_readdressed(
     callback: EmbeddedEmulator,
     conn: ListenerConn,
     readdress: Option<Readdress>,
+    arrival: Arrival,
 ) {
     let io = ::hyper_util::rt::TokioIo::new(conn);
     let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
@@ -128,8 +168,11 @@ pub(crate) async fn serve_readdressed(
             // served normally.
             let facts = ::emulator_server::RequestFacts::from_request(&request);
             Ok::<_, ::std::convert::Infallible>(
-                ::emulator_server::contain_panics(facts, answer(callback, readdress, request))
-                    .await,
+                ::emulator_server::contain_panics(
+                    facts,
+                    answer(callback, readdress, arrival, request),
+                )
+                .await,
             )
         }
     });
@@ -187,6 +230,7 @@ fn body_ceiling() -> usize {
 async fn answer(
     callback: EmbeddedEmulator,
     readdress: Option<Readdress>,
+    arrival: Arrival,
     request: ::http::Request<::hyper::body::Incoming>,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
@@ -198,7 +242,7 @@ async fn answer(
         Some(addressed) => addressed,
         None => Addressed::AsSent,
     };
-    if let Some(refused) = refused_before_dispatch(&parts, &addressed) {
+    if let Some(refused) = refused_before_dispatch(&parts, &addressed, arrival) {
         return refused;
     }
     // One permit per request IN FLIGHT, taken before a byte of the body is read: what the
@@ -317,8 +361,22 @@ const HEADERS_NOT_FORWARDED: [&str; 3] = ["host", "content-length", "transfer-en
 /// address STANDS FOR a name of the customer's own ([`Addressed::At`], a custom domain name) is
 /// dialled under that name: its `Host` is the domain a caller pointed at the address, which no
 /// allowlist of this emulator's addresses can hold, and what decided the request is the
-/// RECORD that socket serves rather than the host field. The browser check still applies to
-/// both.
+/// RECORD that socket serves rather than the host field.
+///
+/// The BROWSER reading is made for EVERY request here, with the core's own predicate, and what
+/// differs is what is done with a verdict that says a browser sent the request from another
+/// site. Where the address may be addressed at something other than an api's own data plane
+/// ([`Arrival::WhateverIsAddressed`]) — a `@connections` call, a portal's website — such a
+/// request is refused, exactly as a core HTTP listener refuses it. Where the socket's own record
+/// has already resolved the request to an invoke of an api of this account
+/// ([`Arrival::ApiDataPlane`]) it is SERVED and SAID SO at a level a developer running this
+/// emulator sees, naming the reading that would otherwise have refused it: that class is the
+/// one this emulator's front door already serves the same way, and the one an api's
+/// `CorsConfiguration` exists for, so refusing it here would answer a refusal no api's
+/// configuration had any say in; [`Arrival`] states the whole rule. Either way the router this
+/// endpoint hands the request to makes the same reading itself for every request that NAMES AN
+/// OPERATION there, so a modelled operation reached through any of these addresses is refused
+/// exactly as it is at the front door.
 ///
 /// The WebSocket refusal those listeners carry has no place here: an upgrade request on
 /// this socket is the handshake it serves ([`super::transport`]), and it never reaches this
@@ -326,6 +384,7 @@ const HEADERS_NOT_FORWARDED: [&str; 3] = ["host", "content-length", "transfer-en
 fn refused_before_dispatch(
     parts: &::http::request::Parts,
     addressed: &Addressed,
+    arrival: Arrival,
 ) -> Option<::http::Response<Full<Bytes>>> {
     let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
 
@@ -348,6 +407,21 @@ fn refused_before_dispatch(
         &RemoteOrigins::SameOriginOnly,
         false,
     ) {
+        if arrival == Arrival::ApiDataPlane {
+            // Served rather than refused — and never silently: this address carries nothing
+            // but an invoke of an api of this account, whose own `CorsConfiguration` is what
+            // decides the answer's `Access-Control-*` decoration, so the record says what was
+            // read and what was done with it.
+            ::tracing::info!(
+                %reason,
+                method = %parts.method,
+                target = %parts.uri,
+                "serving a request a browser sent from another site: this address carries only \
+                 an api's own data plane, so the api's records answer it and its CORS \
+                 configuration decides what decorates the answer"
+            );
+            return None;
+        }
         return Some(plain(FORBIDDEN, reason));
     }
     None

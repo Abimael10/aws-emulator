@@ -152,8 +152,16 @@ impl NativeHandler for PortalSocket {
             let readdress: Readdress = Arc::new(move |parts: &::http::request::Parts| {
                 site_target(&state, &portal_id, parts)
             });
-            super::websocket::endpoint_http::serve_readdressed(callback, conn, Some(readdress))
-                .await;
+            super::websocket::endpoint_http::serve_readdressed(
+                callback,
+                conn,
+                Some(readdress),
+                // A portal's address serves the published WEBSITE and nothing of an api's data
+                // plane, so a request here is read for the browser-set fields a core HTTP
+                // listener reads it for.
+                super::websocket::endpoint_http::Arrival::WhateverIsAddressed,
+            )
+            .await;
         })
     }
 }
