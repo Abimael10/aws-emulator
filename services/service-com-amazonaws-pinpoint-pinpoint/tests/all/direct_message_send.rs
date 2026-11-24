@@ -21,6 +21,9 @@
 //!   gone from it after `DeleteBaiduChannel`;
 //! * a message id is minted only for an accepted delivery, is unique per delivery, and
 //!   every accepted send is recorded in the application's bounded send log.
+//!
+//! The push provider's own verdict on a destination of an ENABLED push channel is the
+//! subject of `push_provider_delivery`, whose assertion of it this suite reuses.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,6 +31,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::push_provider_delivery::assert_provider_rejection;
 
 /// The region every case in this suite signs for; the suite asserts delivery
 /// behaviour, not ARNs.
@@ -334,8 +339,10 @@ async fn the_baidu_channels_state_transitions_change_the_same_sends_outcome() {
         404,
     );
 
-    // Configured and enabled: the same send is accepted, and the channel is readable
-    // back member for member.
+    // Configured and enabled: the same send is no longer this service's own
+    // channel-not-found verdict — the notification now reaches the channel's push
+    // provider, which refuses a token it holds no registration for. The channel is
+    // readable back member for member.
     let (status, channel) = emulator
         .update_baidu_channel(
             &app,
@@ -380,9 +387,10 @@ async fn the_baidu_channels_state_transitions_change_the_same_sends_outcome() {
     assert_outcome(
         "enabled",
         &result_for(&body, address),
-        "SUCCESSFUL",
-        200,
+        "PERMANENT_FAILURE",
+        400,
     );
+    assert_provider_rejection("enabled", &result_for(&body, address), "BAIDU");
 
     // Disabled again, with the credentials still stored: not deliverable over.
     let (status, channel) = emulator
@@ -429,7 +437,13 @@ async fn the_baidu_channels_state_transitions_change_the_same_sends_outcome() {
         "a later write keeps the creation date and replaces the credential, got {re_enabled:?}"
     );
     let (_, body) = emulator.send_messages(&app, send.clone()).await;
-    assert_outcome("re-enabled", &result_for(&body, address), "SUCCESSFUL", 200);
+    assert_outcome(
+        "re-enabled",
+        &result_for(&body, address),
+        "PERMANENT_FAILURE",
+        400,
+    );
+    assert_provider_rejection("re-enabled", &result_for(&body, address), "BAIDU");
 
     // Deleted: the settings are gone, so the channel reads as absent and the send is
     // refused again.
@@ -803,6 +817,21 @@ async fn every_accepted_send_is_recorded_and_its_message_ids_are_unique() {
     // the accepted one only.
     for round in 0..3 {
         let address = format!("token-{round}");
+        // The Baidu destination's token is registered as an endpoint of the
+        // application, so the enabled channel's provider has a registration to
+        // deliver it to; the GCM one is over a channel this application never
+        // enabled, so it is refused whatever its token.
+        let (status, body) = emulator
+            .update_endpoint(
+                &app,
+                &format!("endpoint-{round}"),
+                json!({"Address": address.clone(), "ChannelType": "BAIDU"}),
+            )
+            .await;
+        assert_eq!(
+            status, 202,
+            "round {round}: UpdateEndpoint must answer 202, got {body:?}"
+        );
         let (status, body) = emulator
             .send_messages(
                 &app,

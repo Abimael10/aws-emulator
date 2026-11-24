@@ -184,6 +184,30 @@ pub fn channel_not_found_message(channel_type: &str, application_id: &str) -> St
     )
 }
 
+/// The `errorMessage` the push notification provider a channel is configured with
+/// refuses a notification with when the device token it is addressed to is not one
+/// that provider holds a registration for.
+pub const PUSH_PROVIDER_INVALID_NOTIFICATION: &str = "Invalid notification";
+
+/// The push provider's refusal of one notification, as the destination's
+/// `StatusMessage` reports it.
+///
+/// Delivery over a push channel is performed by the provider the channel is
+/// configured with and not by this service, so a destination that provider refuses
+/// reports the provider's OWN response — a document carrying its `errorMessage` and
+/// the `channelType` the notification was addressed over — rather than a sentence of
+/// this service's. That is what separates it from [`channel_not_found_message`],
+/// which is this service's own verdict on a channel it never handed the notification
+/// to, and `MessageResult$StatusCode` carries the provider's status beside it ("the
+/// downstream service status code for delivering the message").
+pub fn push_provider_rejection_message(channel_type: &str) -> String {
+    ::serde_json::json!({
+        "errorMessage": PUSH_PROVIDER_INVALID_NOTIFICATION,
+        "channelType": channel_type,
+    })
+    .to_string()
+}
+
 /// The service's text for a request that names an application this service does not
 /// hold — the `NotFoundException` message of an operation addressed at the APPLICATION
 /// itself.

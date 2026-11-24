@@ -5,7 +5,9 @@
 //! against the application's stored endpoints and channels and the message
 //! configuration the request carries, and each one's `DeliveryStatus` is computed from
 //! that state — so the same send lands differently before and after a write that
-//! enables, disables or changes one of them. An unknown application is a
+//! enables, disables or changes one of them. Past this service's own checks a push
+//! channel's notification is the provider's to deliver, and that provider's verdict on
+//! the token is what the destination reports. An unknown application is a
 //! `NotFoundException`; a request naming no destination at all is a
 //! `BadRequestException`.
 //!
@@ -536,6 +538,21 @@ impl Target {
                 format!("MessageConfiguration carries no message for the {channel} channel"),
             );
         }
+        // Past this service's own checks the notification is handed to the channel's
+        // downstream provider, and over a push channel that provider accepts only a
+        // device token it issued and still holds a registration for — so enabling such
+        // a channel moves a destination from this service's channel verdict to the
+        // provider's own, not to a delivery. What this service holds as a registration
+        // of a token is an endpoint of the application carrying that address for that
+        // channel; a notification addressed at any other token is one the provider
+        // refuses, reported with the provider's downstream status and its own refusal.
+        if is_provider_push_channel(channel) && !registers_push_token(app, address, channel) {
+            return Verdict::new(
+                DELIVERY_PERMANENT_FAILURE,
+                STATUS_REFUSED,
+                crate::state::push_provider_rejection_message(channel),
+            );
+        }
         Verdict::new(
             DELIVERY_SUCCESSFUL,
             STATUS_OK,
@@ -589,6 +606,32 @@ fn is_configurable_channel(channel: &str) -> bool {
             | "SMS"
             | "VOICE"
     )
+}
+
+/// Whether `app` holds a registration of `address` as a device token of `channel`: an
+/// endpoint of the application that carries that address for that channel and is the
+/// one its address is reachable through. An address no such endpoint registers is, as
+/// far as this service can tell, a token the channel's push provider never issued.
+fn registers_push_token(app: &crate::state::App, address: &str, channel: &str) -> bool {
+    app.endpoints.values().any(|endpoint| {
+        endpoint.address.as_deref() == Some(address)
+            && endpoint
+                .channel_type
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(channel))
+            && is_active(endpoint.endpoint_status.as_deref())
+    })
+}
+
+/// Whether delivery over `channel` is performed by a third-party push provider the
+/// channel is configured with the credentials of (Baidu Cloud Push, FCM, APNs, Amazon
+/// Device Messaging): a push channel of the application that the API configures as a
+/// channel resource. The destination of one of those is a device token that provider
+/// itself issues, which is what separates it from `SMS`, `VOICE` and `EMAIL`, whose
+/// destinations are addresses a caller names, and from the push `ChannelType` values
+/// with no channel resource and so no provider to configure.
+fn is_provider_push_channel(channel: &str) -> bool {
+    is_push_channel(channel) && is_configurable_channel(channel)
 }
 
 /// Whether `channel` is one of the push notification channels, which is what decides

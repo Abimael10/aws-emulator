@@ -523,7 +523,9 @@ async fn a_send_over_a_channel_the_application_has_not_enabled_reports_that_mess
         "case \"configured but disabled\": expected StatusMessage {expected:?}, got {outcome:?}"
     );
 
-    // And a send over an enabled channel is not refused with that text at all.
+    // And a send over an enabled channel is not refused with that text at all: the
+    // notification reaches the channel's push provider, so what a token the provider
+    // holds no registration for reports is the provider's own refusal instead.
     let (status, _) = emulator
         .update_baidu_channel(
             &app,
@@ -546,7 +548,13 @@ async fn a_send_over_a_channel_the_application_has_not_enabled_reports_that_mess
             outcome["DeliveryStatus"].as_str(),
             outcome["StatusCode"].as_i64(),
         ),
-        (Some("SUCCESSFUL"), Some(200)),
-        "case \"enabled\": the same send is accepted once the channel is enabled, got {outcome:?}"
+        (Some("PERMANENT_FAILURE"), Some(400)),
+        "case \"enabled\": the enabled channel's provider answers for the same send, got {outcome:?}"
+    );
+    assert_ne!(
+        outcome["StatusMessage"].as_str(),
+        Some(expected.as_str()),
+        "case \"enabled\": the channel-not-found text is for a channel this service never \
+         handed the notification to, got {outcome:?}"
     );
 }
