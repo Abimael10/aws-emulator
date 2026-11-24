@@ -509,10 +509,27 @@ pub const MAX_DETAILS_TEXT_LEN: usize = 64 * 1024;
 /// an `AssociateBenefitApplicationResource` agree on how many resources one application can
 /// be linked to, and a stored record never holds more than the read can report.
 /// `AssociateBenefitApplicationResourceInput` binds one `ResourceArn` and carries no length
-/// of its own, so this is also the bound that keeps repeated associations from growing one
-/// record without limit; an association past it is refused with the modelled
-/// `ValidationException` and persists nothing.
+/// on how MANY resources a record may hold, so this is also the bound that keeps repeated
+/// associations from growing one record without limit; an association past it is refused
+/// with the modelled `ValidationException` and persists nothing. How LONG one of those ARNs
+/// may be is [`MAX_ASSOCIATED_RESOURCE_ARN_LEN`].
 pub const MAX_ASSOCIATED_RESOURCES_PER_APPLICATION: usize = 10;
+
+/// The longest resource ARN one benefit application may be linked to, in CHARACTERS — the
+/// unit [`length_clause`] counts every length this service enforces in.
+///
+/// It is the model's own published bound on this value: `ResourceArn` is
+/// `length {min: 0, max: 1600}` on both operations that name one resource —
+/// `AssociateBenefitApplicationResourceInput` and
+/// `DisassociateBenefitApplicationResourceInput`
+/// (`smithy_query(query="operation",operation="AssociateBenefitApplicationResource")`) — so
+/// the centralized walk is the enforcement point there. The `Arns` list a create supplies
+/// the same value through, and a read reports it with, bounds its ELEMENTS not at all
+/// (`smithy_query(query="shape",shape="Arns")`), so that handler applies this bound itself
+/// with [`length_clause`] (see [`associated_resources_refusal`]): one stored member has one
+/// acceptance rule whichever write sets it, and no read can report an ARN another write
+/// path would refuse.
+pub const MAX_ASSOCIATED_RESOURCE_ARN_LEN: usize = 1600;
 
 /// The most tags one resource of this service holds.
 ///
@@ -1194,7 +1211,9 @@ pub struct BenefitApplication {
     /// in the order it was first stored, whether by the create (see [`distinct_values`])
     /// or by `AssociateBenefitApplicationResource`. At most
     /// [`MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] of them, which is therefore a count of
-    /// distinct resources.
+    /// distinct resources, and each at most [`MAX_ASSOCIATED_RESOURCE_ARN_LEN`] characters
+    /// — the length the model publishes for this value — whichever write stored it (see
+    /// [`associated_resources_refusal`]).
     pub associated_resources: Vec<String>,
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
@@ -1595,9 +1614,10 @@ pub const ALLOCATION_RESOURCE: &str = "benefit-allocation";
 /// `arns` and `client_tokens` carry at most one entry per stored application, one
 /// application records at most [`MAX_APPLIED_WRITE_HISTORY`] applied writes, and a catalog holds
 /// at most [`MAX_ALLOCATIONS_PER_CATALOG`] allocations, and every caller string a record
-/// holds carries a length — the model's own where it states one, and this service's where
-/// it states none ([`unconstrained_members_refusal`], [`details_requirement`]) — so no
-/// caller can grow this store without limit.
+/// holds carries a length — the model's own where it states one, on whichever path writes
+/// the value ([`associated_resources_refusal`]), and this service's where it states none
+/// ([`unconstrained_members_refusal`], [`details_requirement`]) — so no caller can grow
+/// this store without limit.
 #[derive(Debug)]
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Every catalog, keyed by the `Catalog` input string.
@@ -2907,6 +2927,41 @@ pub fn unconstrained_members_refusal(
     Some(member_validation_exception(
         &member,
         &requirement,
+        VALIDATION_REASON_FIELD,
+    ))
+}
+
+/// The input member a benefit application's resource links arrive on when one request
+/// supplies the whole list, as the wire spells it
+/// (`smithy_query(query="operation",operation="CreateBenefitApplication")`).
+pub const ASSOCIATED_RESOURCES_MEMBER: &str = "AssociatedResources";
+
+/// The refusal a request supplying a list of resource ARNs to link is answered with when
+/// one of the ARNs it would persist is longer than this value's published bound
+/// ([`MAX_ASSOCIATED_RESOURCE_ARN_LEN`]), or `None` when every supplied ARN can be stored.
+///
+/// The ELEMENTS of the modelled `Arns` list carry no length of their own, while the member
+/// that names one such resource on the association operations carries the model's own
+/// bound on the value, so this is where that bound is applied to the list form of the same
+/// write — the same reason [`length_clause`] applies a `StatusReason`'s published bound on
+/// the operation whose own input the model leaves unconstrained.
+///
+/// The refusal is stated at the POSITION the offending ARN sits at, the way the centralized
+/// walk states a violation of an element that IS the collection's own element: collapsed
+/// onto the collection member, carrying the element's requirement set
+/// ([`crate::service::element_requirement`]) — and built by the one construction every
+/// member refusal of this crate goes through ([`member_validation_exception`]), so nothing
+/// of the ARN the caller sent is echoed.
+pub fn associated_resources_refusal(
+    resources: Option<&[String]>,
+) -> Option<crate::ops::types::ValidationException> {
+    let requirement = resources
+        .unwrap_or_default()
+        .iter()
+        .find_map(|arn| length_clause(arn, 0, MAX_ASSOCIATED_RESOURCE_ARN_LEN))?;
+    Some(member_validation_exception(
+        ASSOCIATED_RESOURCES_MEMBER,
+        &crate::service::element_requirement(&requirement),
         VALIDATION_REASON_FIELD,
     ))
 }

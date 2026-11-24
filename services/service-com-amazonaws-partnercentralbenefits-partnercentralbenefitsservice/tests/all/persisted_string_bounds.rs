@@ -13,22 +13,30 @@
 //! constraint in the model.
 //!
 //! The rows span what the rule generalises over: which string (the reason that becomes
-//! `StatusReason`, the `ClientToken` the record keeps), which operation writes it
-//! (`RecallBenefitApplication`, whose members the model leaves unconstrained, and
-//! `CancelBenefitApplication`, whose `Reason` the model bounds), the position relative to
-//! each published bound (at the maximum, one past it, at the minimum and below it) and the
-//! character width of the value (ASCII and multi-byte, since a `@length` counts
-//! characters).
+//! `StatusReason`, the `ClientToken` the record keeps, the resource ARN an application's
+//! `AssociatedResources` holds), which operation writes it (`RecallBenefitApplication`,
+//! whose members the model leaves unconstrained, and `CancelBenefitApplication`, whose
+//! `Reason` the model bounds; `CreateBenefitApplication`, whose `Arns` elements carry no
+//! length, and `AssociateBenefitApplicationResource`, whose `ResourceArn` carries the
+//! model's own), the position relative to each published bound (at the maximum, one past
+//! it, at the minimum and below it), the character width of the value (ASCII and
+//! multi-byte, since a `@length` counts characters) and — for a value supplied as a list
+//! element — which element of the list carries it.
+
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    member_validation_exception, MAX_CLIENT_TOKEN_LEN, MAX_STATUS_REASON_LEN,
-    MIN_STATUS_REASON_LEN, STATUS_IN_REVIEW, STATUS_PENDING_SUBMISSION, VALIDATION_REASON_FIELD,
+    member_validation_exception, MAX_ASSOCIATED_RESOURCE_ARN_LEN, MAX_CLIENT_TOKEN_LEN,
+    MAX_STATUS_REASON_LEN, MIN_STATUS_REASON_LEN, STATUS_IN_REVIEW, STATUS_PENDING_SUBMISSION,
+    VALIDATION_REASON_FIELD,
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
+use crate::disassociate_benefit_application_resource::{associated, body as resource_body};
 use crate::recall_benefit_application::{recall_body, seed, submit};
-use crate::service_error_rules::{assert_validation_invariants, message_of};
+use crate::reserved_tag_keys::element_requirement;
+use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
 /// The requirement a value longer than `max` fails, as this service words a length.
 fn too_long(max: usize) -> String {
@@ -474,6 +482,270 @@ async fn a_persisted_client_token_is_bounded_like_every_other_client_token() {
             json!(STATUS_PENDING_SUBMISSION),
             "case {case:?}: the application must still be recallable after the refusal, \
              got {recalled:?}"
+        );
+    }
+}
+
+/// The ARN prefix every row below builds a resource ARN on: a service, a region and an
+/// account, spelled as the modelled `Arn` pattern spells them
+/// (`^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`,
+/// `smithy_query(query="shape",shape="Arn")`).
+const ARN_PREFIX: &str = "arn:aws:s3:us-east-1:123456789012:";
+
+/// An ARN of exactly `chars` CHARACTERS that satisfies the modelled `Arn` pattern, its
+/// resource tail built from `unit`.
+///
+/// The pattern's resource tail is `(.+)`, which bounds nothing, so the length under test is
+/// reached by padding that tail — in `unit`, so a row names a length in characters whatever
+/// the width of the character it is written with.
+fn arn_of(unit: &str, chars: usize) -> String {
+    let pad = chars.saturating_sub(ARN_PREFIX.chars().count());
+    format!("{ARN_PREFIX}{}", unit.repeat(pad))
+}
+
+/// One `CreateBenefitApplication` body supplying `resources` as its `AssociatedResources`,
+/// which is the one request that supplies the whole list of a new record's resource ARNs.
+fn create_with_resources(benefit_id: &str, token: &str, resources: &[String]) -> Value {
+    json!({
+        "Catalog": CATALOG,
+        "ClientToken": token,
+        "BenefitIdentifier": benefit_id,
+        "Name": "associated-resource-arn-bounds",
+        "AssociatedResources": resources,
+    })
+}
+
+/// The ids `ListBenefitApplications` reports for [`CATALOG`], as a set — what a refused
+/// create must leave exactly as it was.
+async fn listed_ids(harness: &Harness, case: &str) -> BTreeSet<String> {
+    let out = harness
+        .ok(case, "ListBenefitApplications", &json!({ "Catalog": CATALOG }))
+        .await;
+    out["BenefitApplicationSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a summary list, got {out:?}"))
+        .iter()
+        .map(|summary| text(case, summary, "Id"))
+        .collect()
+}
+
+/// Assert `out` is the refusal a write supplying an over-long ARN as an ELEMENT of a list
+/// is answered with: 400 `ValidationException`, naming the collection member and carrying
+/// the element's requirement set — the way the centralized walk states a violation on a
+/// list's own element — with the published length as the requirement.
+fn assert_element_refusal(case: &str, status: u16, out: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 past the published ARN bound, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(out),
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {out:?}"
+    );
+    let message = message_of(out)
+        .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no Message: {out:?}"));
+    assert_validation_invariants(case, &message);
+    let expected = one(&clause(
+        "associatedResources",
+        &element_requirement(&too_long(MAX_ASSOCIATED_RESOURCE_ARN_LEN)),
+    ));
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?}"
+    );
+    assert_eq!(
+        out["Reason"],
+        json!(VALIDATION_REASON_FIELD),
+        "case {case:?}: expected the field-validation reason, got {out:?}"
+    );
+}
+
+/// Every path that writes a resource ARN onto an application applies the SAME published
+/// bound to it: an ARN up to [`MAX_ASSOCIATED_RESOURCE_ARN_LEN`] characters is stored and
+/// reported back by the create (whose `Arns` elements carry no length of their own) and by
+/// the association (whose `ResourceArn` carries the model's own length), and one past it is
+/// refused 400 `ValidationException` by both, with nothing stored.
+#[tokio::test]
+async fn an_associated_resource_arn_is_bounded_by_the_length_the_model_publishes_for_it() {
+    let harness = Harness::new();
+    let benefit_id = text("seed", &harness.active_benefit().await, "Id");
+    let max = MAX_ASSOCIATED_RESOURCE_ARN_LEN;
+
+    // (case, the character the ARN's resource tail is built from, how many characters the
+    // whole ARN carries, whether that is inside the published bound) — well inside, at the
+    // bound in each character width, one past it in each width, and far past it.
+    let rows: Vec<(&str, &str, usize, bool)> = vec![
+        ("an ARN well inside the bound", "a", 64, true),
+        ("an ascii ARN at the published bound", "a", max, true),
+        ("a multi-byte ARN at the published bound", "é", max, true),
+        (
+            "an ascii ARN one character past the bound",
+            "a",
+            max + 1,
+            false,
+        ),
+        (
+            "a multi-byte ARN one character past the bound",
+            "é",
+            max + 1,
+            false,
+        ),
+        ("an ARN far past the bound", "a", 10 * max, false),
+    ];
+
+    for (row, (case, unit, chars, inside)) in rows.iter().enumerate() {
+        let arn = arn_of(unit, *chars);
+        let counted = arn.chars().count();
+        assert_eq!(
+            counted, *chars,
+            "case {case:?}: expected an ARN of {chars} characters, got {counted}"
+        );
+
+        // 1. the create, which supplies the whole list of a new record's ARNs.
+        let listed_before = listed_ids(&harness, case).await;
+        let (status, out) = harness
+            .call(
+                "CreateBenefitApplication",
+                &create_with_resources(
+                    &benefit_id,
+                    &format!("tok-arn-create-{row}"),
+                    std::slice::from_ref(&arn),
+                ),
+            )
+            .await;
+        if *inside {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: an ARN inside the bound must be created, got {status} {out:?}"
+            );
+            let stored = harness.get(case, &text(case, &out, "Id")).await;
+            assert_eq!(
+                associated(&stored),
+                vec![arn.clone()],
+                "case {case:?}: the created ARN must round-trip, got {stored:?}"
+            );
+        } else {
+            assert_element_refusal(case, status, &out);
+            assert_eq!(
+                listed_ids(&harness, case).await,
+                listed_before,
+                "case {case:?}: a refused create must store no application"
+            );
+        }
+
+        // 2. the association, which names ONE resource on a record that already exists:
+        // the member the model publishes the bound on, so the same value is accepted and
+        // refused there on the same line.
+        let created = harness
+            .create(
+                case,
+                &create_with_resources(&benefit_id, &format!("tok-arn-assoc-{row}"), &[]),
+            )
+            .await;
+        let id = text(case, &created, "Id");
+        let before = harness.get(case, &id).await;
+        let (status, out) = harness
+            .call(
+                "AssociateBenefitApplicationResource",
+                &resource_body(CATALOG, &id, &arn),
+            )
+            .await;
+        if *inside {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: an ARN inside the bound must be associated, got {status} {out:?}"
+            );
+            let stored = harness.get(case, &id).await;
+            assert_eq!(
+                associated(&stored),
+                vec![arn.clone()],
+                "case {case:?}: the associated ARN must round-trip, got {stored:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400 past the published ARN bound, got {status} {out:?}"
+            );
+            assert_eq!(
+                error_code(&out),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {out:?}"
+            );
+            let message = message_of(&out).unwrap_or_else(|| {
+                panic!("case {case:?}: the refusal carries no Message: {out:?}")
+            });
+            assert_validation_invariants(case, &message);
+            // The SAME requirement the create states for the same value, so one bound is
+            // applied however the ARN was supplied.
+            assert!(
+                message.contains(&too_long(max)),
+                "case {case:?}: expected the clause {:?}, got {message:?}",
+                too_long(max)
+            );
+            let after = harness.get(case, &id).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: a refused association must persist nothing, got {after:?}"
+            );
+        }
+    }
+}
+
+/// The refusal of an over-long ARN supplied in a list names the COLLECTION member whichever
+/// element carries it, no application is created — and a list whose every ARN is inside the
+/// bound is stored in full, so the rows pin a bound rather than a blanket refusal.
+#[tokio::test]
+async fn the_refusal_of_an_over_long_arn_names_the_collection_member() {
+    let harness = Harness::new();
+    let benefit_id = text("seed", &harness.active_benefit().await, "Id");
+    let max = MAX_ASSOCIATED_RESOURCE_ARN_LEN;
+
+    let ok = arn_of("b", 48);
+    let at_bound = arn_of("c", max);
+    let over = arn_of("d", max + 1);
+
+    // (case, the ARNs the create supplies) — the only element, the second of two, the
+    // first of two, and the last of three.
+    let rows: Vec<(&str, Vec<String>)> = vec![
+        ("the only resource", vec![over.clone()]),
+        ("the second of two resources", vec![ok.clone(), over.clone()]),
+        ("the first of two resources", vec![over.clone(), ok.clone()]),
+        (
+            "the third of three resources",
+            vec![ok.clone(), at_bound.clone(), over.clone()],
+        ),
+    ];
+
+    for (row, (case, resources)) in rows.iter().enumerate() {
+        let token = format!("tok-arn-element-{row}");
+        let listed_before = listed_ids(&harness, case).await;
+        let (status, out) = harness
+            .call(
+                "CreateBenefitApplication",
+                &create_with_resources(&benefit_id, &token, resources),
+            )
+            .await;
+        assert_element_refusal(case, status, &out);
+        assert_eq!(
+            listed_ids(&harness, case).await,
+            listed_before,
+            "case {case:?}: a refused create must store no application"
+        );
+
+        // The refusal spent nothing: the same token, with every ARN inside the bound,
+        // creates the application it would have created and stores both ARNs.
+        let created = harness
+            .create(
+                case,
+                &create_with_resources(&benefit_id, &token, &[ok.clone(), at_bound.clone()]),
+            )
+            .await;
+        let stored = harness.get(case, &text(case, &created, "Id")).await;
+        assert_eq!(
+            associated(&stored),
+            vec![ok.clone(), at_bound.clone()],
+            "case {case:?}: every ARN inside the bound must be stored, got {stored:?}"
         );
     }
 }

@@ -28,7 +28,13 @@
 //! of a supplied contact, the `BusinessUseCase` of a supplied attachment — carries this
 //! service's own bound on such a value, so one past it is refused with the modelled
 //! `ValidationException` (HTTP 400) and nothing is created, exactly as the update and the
-//! amendment refuse it: see [`crate::state::unconstrained_members_refusal`].
+//! amendment refuse it: see [`crate::state::unconstrained_members_refusal`]. A caller
+//! string it persists that the model bounds on ANOTHER path that writes the same stored
+//! member carries that published bound here too — the ARNs of `AssociatedResources`, whose
+//! `Arns` elements carry no length while the `ResourceArn` of an association carries
+//! `length {min: 0, max: 1600}` — so an ARN past it is refused the same way and nothing is
+//! created: see [`crate::state::associated_resources_refusal`] and
+//! [`crate::state::MAX_ASSOCIATED_RESOURCE_ARN_LEN`].
 //!
 //! The create's own `Tags` are caller-supplied tag keys, so they go through the same
 //! reserved-namespace rule the tagging operations apply: a key in the AWS-reserved `aws:`
@@ -261,7 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are unconstrained strings (see
         // [`crate::state::unconstrained_members_refusal`]) — each refused in the same
         // envelope the walk's own refusals carry, and each the same rule the amendment
-        // that writes those members applies.
+        // that writes those members applies. An `AssociatedResources` ARN is the third
+        // such value: the elements of the modelled `Arns` carry no length of their own,
+        // while the member an association names one resource on carries the model's own
+        // bound on it, so this handler applies that published bound to the list form of
+        // the same write (see [`crate::state::associated_resources_refusal`]).
         if let Some(refusal) = crate::state::details_refusal(
             crate::state::DETAILS_MEMBER,
             input.benefit_application_details.as_ref(),
@@ -274,6 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.partner_contacts.as_deref(),
             input.file_details.as_deref(),
         ) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        if let Some(refusal) =
+            crate::state::associated_resources_refusal(input.associated_resources.as_deref())
+        {
             return Err(
                 CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
             );

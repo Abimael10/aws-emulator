@@ -23,6 +23,14 @@
 //! the resource on — the only member of this request such a refusal can be about, since the
 //! bounded list is a member of the create's input and the get's output and not of this one.
 //!
+//! How LONG one resource ARN may be is published on this request's OWN member
+//! (`ResourceArn` is `length {min: 0, max: 1600}` —
+//! [`crate::state::MAX_ASSOCIATED_RESOURCE_ARN_LEN`]), so the centralized walk refuses an
+//! ARN past it before this handler runs. The create, whose `Arns` elements carry no length
+//! of their own, applies that same published bound itself
+//! ([`crate::state::associated_resources_refusal`]), so the stored list never holds an ARN
+//! one write path would store and another refuse.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
