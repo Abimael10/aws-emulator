@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTrustStoreCaCertificatesBundle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTrustStoreCaCertificatesBundle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTrustStoreCaCertificatesBundle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers WHERE a trust store's CA certificates bundle is fetched from: the Amazon S3
+//! object the create named and the modification rotates, addressed as a pre-signed `GET` of
+//! this emulator's own object store
+//! ([`crate::state::ca_certificates_bundle_uri`]) — so a client that follows the
+//! address is served the very bundle the caller staged.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTrustStoreCaCertificatesBundle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTrustStoreCaCertificatesBundleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTrustStoreCaCertificatesBundle"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("GetTrustStoreCaCertificatesBundle")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Reporting only: the one write here materializes the `CREATING` -> `ACTIVE`
+        // move the clock already owed every stored trust store.
+        guard.settle(now);
+
+        // The read is ABOUT one trust store, so a `TrustStoreArn` this store holds none
+        // under is the modelled refusal — worded as every refusal about a trust store
+        // addressed by ARN is.
+        let Some(record) = guard.trust_stores.get(&input.trust_store_arn) else {
+            return Err(
+                GetTrustStoreCaCertificatesBundleErrorModeled::TrustStoreNotFoundException(
+                    TrustStoreNotFoundException {
+                        message: Some(crate::state::trust_store_arn_not_found_message(
+                            &input.trust_store_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let bundle = record.ca_certificates_bundle.clone();
+        // The lock is released before the address is signed: signing reads this emulator's
+        // endpoint and its own credentials, nothing of this store.
+        drop(guard);
+
+        Ok(GetTrustStoreCaCertificatesBundleOutput {
+            // The bundle's ADDRESS is what the record holds, so the location reported is the
+            // object this trust store was really built from. A record carrying no address —
+            // which no call of this API writes — is reported with no `Location` rather than
+            // with an address nothing is stored at.
+            location: bundle
+                .as_ref()
+                .map(|location| crate::state::ca_certificates_bundle_uri(ctx, location)),
+        })
     }
 }

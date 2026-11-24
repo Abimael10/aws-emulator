@@ -162,7 +162,10 @@ pub(crate) async fn emulator_with_bundles() -> Emulator {
 /// Each certificate is GENERATED here (`rcgen`), so every count asserted below is the
 /// number of certificates a parser produced rather than a number this suite and the
 /// handler both guessed.
-fn ca_bundle(count: usize) -> String {
+/// `pub(crate)`: the CA-bundle read suite beside this one
+/// (`crate::trust_store_ca_bundle_reads`) stages the bundles it reads back through the same
+/// generator, so every count and every byte it asserts on comes from one place.
+pub(crate) fn ca_bundle(count: usize) -> String {
     (0..count)
         .map(|index| {
             let key = rcgen::KeyPair::generate().expect("a key pair");
@@ -189,7 +192,10 @@ struct Create {
 }
 
 /// `CreateTrustStore` for `bucket`/`key`, with the extra fields `extra`.
-async fn create_trust_store(
+///
+/// `pub(crate)`: the CA-bundle read suite reads back the bundle a create was pointed at, so
+/// it mints its trust stores through this one request builder.
+pub(crate) async fn create_trust_store(
     emulator: &Emulator,
     name: &str,
     bucket: &str,
@@ -205,7 +211,9 @@ async fn create_trust_store(
 }
 
 /// `ModifyTrustStore` pointing `trust_store` at `bucket`/`key`.
-async fn modify_trust_store(
+///
+/// `pub(crate)`: the CA-bundle read suite rotates a bundle through the same request.
+pub(crate) async fn modify_trust_store(
     emulator: &Emulator,
     trust_store: &str,
     bucket: &str,
@@ -219,7 +227,13 @@ async fn modify_trust_store(
 }
 
 /// `DescribeTrustStores` with the extra form fields `fields`.
-async fn describe_trust_stores(emulator: &Emulator, fields: &[(String, String)]) -> Reply {
+///
+/// `pub(crate)`: the CA-bundle read suite reads a trust store back through it, so what a
+/// read of the bundle left untouched is checked with the crate's one describe.
+pub(crate) async fn describe_trust_stores(
+    emulator: &Emulator,
+    fields: &[(String, String)],
+) -> Reply {
     let mut form = action("DescribeTrustStores");
     form.extend_from_slice(fields);
     call(&emulator.router, &form).await
@@ -238,14 +252,20 @@ async fn describe_associations(
 }
 
 /// `DeleteTrustStore` for `trust_store`.
-async fn delete_trust_store(emulator: &Emulator, trust_store: &str) -> Reply {
+///
+/// `pub(crate)`: the CA-bundle read suite releases a trust store to read its bundle after,
+/// which is one of the ARNs no trust store is held under.
+pub(crate) async fn delete_trust_store(emulator: &Emulator, trust_store: &str) -> Reply {
     let mut form = action("DeleteTrustStore");
     form.push(p("TrustStoreArn", trust_store));
     call(&emulator.router, &form).await
 }
 
 /// The one trust store the reply reports, or a panic naming the case.
-fn only_trust_store(reply: &Reply, case: &str) -> String {
+///
+/// `pub(crate)`: shared with the CA-bundle read suite, so both read a described trust store
+/// the same way.
+pub(crate) fn only_trust_store(reply: &Reply, case: &str) -> String {
     let found = members(&reply.body, "TrustStores");
     assert_eq!(
         found.len(),
@@ -268,12 +288,15 @@ fn reported_associations(reply: &Reply) -> Vec<String> {
 /// The `<Message>` of an error envelope, with the XML entities the serializer writes
 /// resolved, so an assertion compares the VALUE rather than its encoding (the ONE reader
 /// the crate's suites share).
-fn message(reply: &Reply) -> String {
+pub(crate) fn message(reply: &Reply) -> String {
     unescaped(&reply.text("Message").unwrap_or_default())
 }
 
 /// An ARN of a trust store this account holds none under, named after `label`.
-fn absent_trust_store_arn(label: &str) -> String {
+///
+/// `pub(crate)`: the CA-bundle read suite refuses the same fabricated ARNs, so the not-found
+/// family is probed with one spelling of "an ARN nothing is held under".
+pub(crate) fn absent_trust_store_arn(label: &str) -> String {
     format!(
         "arn:aws:elasticloadbalancing:{REGION}:{}:truststore/{label}/0123456789abcdef",
         account()

@@ -164,6 +164,25 @@ pub async fn counted_ca_certificates(
     }
 }
 
+/// The address the CA certificates bundle at `location` is fetched from: the pre-signed
+/// `GET` every read of a trust store's own objects answers with
+/// ([`super::trust_store_object_addresses::trust_store_object_uri`]).
+///
+/// The object is the one the create or the modification read in this emulator's own Amazon
+/// S3, so a client that follows the address is routed back into this emulator and served the
+/// very bundle the caller staged — which is what makes a bundle round trip.
+pub fn ca_certificates_bundle_uri(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    location: &CaCertificatesBundleLocation,
+) -> String {
+    super::trust_store_object_addresses::trust_store_object_uri(
+        ctx,
+        &location.bucket,
+        &location.key,
+        location.version.as_deref(),
+    )
+}
+
 /// How many CA certificates the bundle `body` holds: every PEM certificate block whose
 /// contents decode as an X.509 certificate.
 ///

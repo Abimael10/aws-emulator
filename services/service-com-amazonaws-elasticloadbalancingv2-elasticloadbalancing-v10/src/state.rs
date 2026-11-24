@@ -175,9 +175,18 @@ pub use trust_store_revocations::{
 pub mod ca_certificates_bundle;
 
 pub use ca_certificates_bundle::{
-    ca_certificates_in, counted_ca_certificates, resolve_ca_certificates_bundle,
-    CaCertificatesBundle, CaCertificatesBundleLocation, CaCertificatesBundleRefusal,
-    CA_CERTIFICATES_BUNDLE_NOT_FOUND_MESSAGE, INVALID_CA_CERTIFICATES_BUNDLE_MESSAGE,
+    ca_certificates_bundle_uri, ca_certificates_in, counted_ca_certificates,
+    resolve_ca_certificates_bundle, CaCertificatesBundle, CaCertificatesBundleLocation,
+    CaCertificatesBundleRefusal, CA_CERTIFICATES_BUNDLE_NOT_FOUND_MESSAGE,
+    INVALID_CA_CERTIFICATES_BUNDLE_MESSAGE,
+};
+
+/// The pre-signed address a read of one of a trust store's own Amazon S3 objects answers
+/// with, signed once for the CA certificates bundle and for a revocation file alike.
+pub mod trust_store_object_addresses;
+
+pub use trust_store_object_addresses::{
+    trust_store_object_uri, TRUST_STORE_OBJECT_URI_VALIDITY,
 };
 
 /// Whether the two members that TIME a target group's health check fit together, read

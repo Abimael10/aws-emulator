@@ -256,7 +256,11 @@ async fn describe_trust_store(emulator: &Emulator, trust_store_arn: &str) -> Rep
 /// Follow a location this service published, the way a client follows one it was handed:
 /// the address exactly as reported, the `Host` it names, and NO credential of the client's
 /// own — a pre-signed address carries its own authentication in the query.
-async fn fetch(router: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
+///
+/// `pub(crate)`: the CA-bundle read suite (`crate::trust_store_ca_bundle_reads`) follows the
+/// address its own read reports, and both reads publish the same kind of address, so there
+/// is ONE way this crate's suites follow one.
+pub(crate) async fn fetch(router: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
     let host = uri
         .split_once("://")
         .and_then(|(_scheme, rest)| rest.split('/').next())

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a RESOLVED action/version pair reaches on the shared Elastic Load Balancing
-//! endpoint: the ELBv2 model's own validation, its own handlers' state, and its scaffolds.
+//! endpoint: the ELBv2 model's own validation and its own handlers' state.
 //!
 //! The routing rule itself — which of the two models an awsQuery envelope's `Version`
 //! names, and the `400 InvalidAction` for a pair neither resolves — is pinned by
@@ -15,8 +15,8 @@
 //!   other, and persists what a later read reports;
 //! * a value outside a member's modelled bound is refused as a validation failure, not as
 //!   an unknown action;
-//! * an operation it declares but has not implemented answers its scaffold's `501
-//!   NotImplemented` — reached, and still not `InvalidAction`.
+//! * an operation that addresses a resource this account holds none of answers its
+//!   handler's own modelled refusal — reached, and still not `InvalidAction`.
 //!
 //! Every request goes through this crate's service alone, signed for the shared
 //! `elasticloadbalancing` name at `Version=2015-12-01`: the production path for an AWS SDK
@@ -278,10 +278,6 @@ async fn a_value_outside_a_modelled_bound_is_a_validation_failure_not_an_unknown
 /// available that the action was REACHED rather than refused as unknown.
 #[derive(Debug, Clone, Copy)]
 enum Reached {
-    /// The operation still carries the scaffold header in
-    /// `services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/src/ops/`,
-    /// so it answers `501 NotImplemented`.
-    Scaffolded,
     /// The operation is implemented and the row carries everything it needs, so it serves
     /// its document.
     Served,
@@ -303,18 +299,19 @@ struct Declared {
 ///
 /// `400 InvalidAction` says "this API has no such action", which is false for every row
 /// below, so that is what each row rules out first. Each row then pins the ELBv2 model's
-/// OWN answer for the input it carries ([`Reached`]): the scaffold's `501 NotImplemented`
-/// for an operation nobody has written yet, a served `200` for a read that needs no further
-/// input, and the handler's own modelled refusal for a call addressing a trust store this
-/// account holds none under — a 400 from the handler proves the action was reached just as
-/// a 501 from the scaffold does. When a scaffolded row is implemented, its expectation moves
-/// to the answer its handler gives rather than the row being dropped.
+/// OWN answer for the input it carries ([`Reached`]): a served `200` for a read that needs
+/// no further input, and the handler's own modelled refusal for a call addressing a trust
+/// store this account holds none under — a 400 from the handler proves the action was
+/// reached just as a 501 from a scaffold does. A row whose operation was still a scaffold
+/// moves to the answer its handler gives once it is implemented, rather than being dropped;
+/// every operation of the ELBv2 model these rows name is implemented now, so no row expects
+/// the scaffold's `501 NotImplemented` any more.
 #[tokio::test]
 async fn a_declared_elbv2_action_is_reached_not_refused_as_unknown() {
     let router = emulator();
 
     /// A trust store ARN this account holds none under, which every trust-store row below
-    /// addresses: an implemented handler refuses it, and a scaffold never reads it.
+    /// addresses: an implemented handler resolves it and refuses it.
     const ABSENT_TRUST_STORE: &str =
         "arn:aws:elasticloadbalancing:us-west-2:000000000000:truststore/t/0";
     /// The code every trust-store operation of the ELBv2 model refuses such an ARN with
@@ -335,18 +332,17 @@ async fn a_declared_elbv2_action_is_reached_not_refused_as_unknown() {
             fields: &[],
             expected: Reached::Served,
         },
-        // The read of a named resource that is still a scaffold: `DescribeTrustStores` was
-        // this row until it was implemented, `DescribeTrustStoreAssociations` and then
-        // `DescribeTrustStoreRevocations` stood in for it until their own stub issues were
-        // closed, and the CA-bundle retrieval is the stub that stands in for the same shape
-        // of answer now.
+        // The read of a named resource: `DescribeTrustStores` was this row until it was
+        // implemented, `DescribeTrustStoreAssociations`, `DescribeTrustStoreRevocations` and
+        // then the CA-bundle retrieval stood in for it while each was still a scaffold. The
+        // CA-bundle retrieval is implemented too now, so what it pins is its handler's own
+        // refusal of a trust store this account does not hold.
         Declared {
             action: "GetTrustStoreCaCertificatesBundle",
             fields: &[("TrustStoreArn", ABSENT_TRUST_STORE)],
-            expected: Reached::Scaffolded,
+            expected: Reached::Refused(TRUST_STORE_NOT_FOUND),
         },
-        // The same shape of answer, from an IMPLEMENTED read: its handler resolves the ARN
-        // and refuses it.
+        // The same shape of answer, from another implemented read.
         Declared {
             action: "DescribeTrustStoreRevocations",
             fields: &[("TrustStoreArn", ABSENT_TRUST_STORE)],
@@ -383,12 +379,6 @@ async fn a_declared_elbv2_action_is_reached_not_refused_as_unknown() {
              rather than refused as unknown, got {status} with {body}"
         );
         match expected {
-            Reached::Scaffolded => assert_eq!(
-                (status, code.as_str()),
-                (501, "NotImplemented"),
-                "case {action:?}: expected the scaffold's 501 NotImplemented, got {status} \
-                 with {body}"
-            ),
             Reached::Served => {
                 assert_eq!(
                     (status, code.as_str()),

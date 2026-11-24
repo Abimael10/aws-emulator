@@ -32,8 +32,6 @@
 //! DER inside one as the RFC 5280 `CertificateList` — so what is counted is entries a parser
 //! produced, never occurrences of a marker in the text.
 
-use ::std::time::Duration;
-
 use ::x509_cert::der::Decode;
 
 /// How many revocation files one trust store holds before an add refuses with the modelled
@@ -64,17 +62,6 @@ pub const MAX_REVOCATION_CONTENT_BYTES: usize = 4_194_304;
 /// `RevocationType` enum (`crate::ops::types::REVOCATION_TYPE_VALUES`), and what a
 /// `RevocationContent` naming no type is.
 pub const REVOCATION_TYPE_CRL: &str = "CRL";
-
-/// How long the pre-signed address a revocation-file read answers with stays valid: "This
-/// action returns a pre-signed S3 URI which is active for ten minutes"
-/// (`GetTrustStoreRevocationContent`'s own model documentation).
-pub const REVOCATION_CONTENT_URI_VALIDITY: Duration = Duration::from_secs(10 * 60);
-
-/// The signing name of the store a revocation file lives in, which is the store a fetch of
-/// a reported address has to reach: the object is the one a caller staged in this emulator's
-/// own Amazon S3 and the add read over the in-process callback, so the signed address names
-/// that very service.
-const OBJECT_STORE_SIGNING_NAME: &str = "s3";
 
 /// The message a call whose revocation file nothing can be fetched at is refused with, under
 /// the modelled `RevocationContentNotFound`.
@@ -373,51 +360,23 @@ impl RevocationList {
     }
 }
 
-/// The address the revocation file at `location` is fetched from: a `GET` of that object,
-/// pre-signed for [`REVOCATION_CONTENT_URI_VALIDITY`] against the endpoint this emulator is
-/// reached on.
+/// The address the revocation file at `location` is fetched from: the pre-signed `GET` every
+/// read of a trust store's own objects answers with
+/// ([`super::trust_store_object_addresses::trust_store_object_uri`]).
 ///
 /// The object is the one the add read in this emulator's own Amazon S3, so a client that
 /// follows the address is routed back into this emulator and served the very bytes the
-/// caller staged. A versioned object keeps its version in the address, so the file reported
-/// is the one the add was pointed at rather than whatever is current.
+/// caller staged.
 pub fn revocation_content_uri(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     location: &RevocationContentLocation,
 ) -> String {
-    let path = format!("/{}/{}", location.bucket, location.key);
-    let mut request = ::smithy_server_runtime::SignedUrlRequest::new(
-        ::smithy_server_runtime::http::Method::GET,
-        OBJECT_STORE_SIGNING_NAME,
-        &path,
-    );
-    if let Some(version) = location
-        .version
-        .as_deref()
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-    {
-        request = request.query("versionId", version);
-    }
-    match ctx
-        .url_signer()
-        .sign(request, REVOCATION_CONTENT_URI_VALIDITY)
-    {
-        Ok(signed) => signed.as_str().to_string(),
-        // Nothing about a stored bucket name, a stored key or this emulator's own endpoint
-        // makes a `GET` unsignable, so this is unreachable in practice. The object IS at that
-        // address either way, so the address is what is reported rather than no location at
-        // all. The endpoint is `scheme://host[:port]` with no path of its own, and a trailing
-        // separator is dropped so the object's path is the only one the address carries.
-        Err(error) => {
-            ::tracing::warn!(
-                %error,
-                path = %path,
-                "a revocation file's address could not be signed"
-            );
-            format!("{}{path}", ctx.endpoint().as_str().trim_end_matches('/'))
-        }
-    }
+    super::trust_store_object_addresses::trust_store_object_uri(
+        ctx,
+        &location.bucket,
+        &location.key,
+        location.version.as_deref(),
+    )
 }
 
 #[cfg(test)]
