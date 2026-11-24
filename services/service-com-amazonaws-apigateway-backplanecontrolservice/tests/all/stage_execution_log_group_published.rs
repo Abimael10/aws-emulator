@@ -32,7 +32,7 @@ use serde_json::json;
 use crate::account_logging_role::{create_role, replace_role, role_arn, trusting};
 use crate::execute_api_data_plane::{deploy, json_template, mock_resource};
 use crate::rest_api_lifecycle::{create_api, gateway_with_iam_and_logs, Gateway};
-use crate::stage_access_logging::delivered;
+use crate::stage_access_logging::{delivered, execution_log_group};
 
 /// The stage every api below is deployed to, the path part of its one resource and the verb it
 /// carries — the method a single-scope setting is written for.
@@ -48,11 +48,6 @@ const BODY: &str = r#"{"pong":true}"#;
 const ROLE_NAME: &str = "apigw-execution-log-group";
 const ROLE_PATH: &str = "/service-role/";
 const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
-
-/// The group API Gateway publishes for the stage `stage` of the api `api`.
-fn execution_log_group(api: &str, stage: &str) -> String {
-    format!("API-Gateway-Execution-Logs_{api}/{stage}")
-}
 
 /// One row: the method-setting patch a stage is configured with, and whether that
 /// configuration is execution logging turned ON.

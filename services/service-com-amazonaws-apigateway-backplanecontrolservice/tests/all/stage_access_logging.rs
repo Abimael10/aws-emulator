@@ -294,6 +294,17 @@ pub(crate) fn traced_line(request_id: &str, line: &str) -> String {
     format!("({request_id}) {line}")
 }
 
+/// The group API Gateway publishes for the execution log of the stage `stage` of the api
+/// `api`: the one group that stage's trace is delivered into.
+///
+/// `pub(crate)` for the reason [`emulator`] gives: every suite that reads a stage's execution
+/// log names the same group ([`crate::stage_execution_log_group_published`],
+/// [`crate::stage_execution_log_per_stage_scope`]), and one formatter is what keeps two suites
+/// from disagreeing about where API Gateway publishes it.
+pub(crate) fn execution_log_group(api: &str, stage: &str) -> String {
+    format!("API-Gateway-Execution-Logs_{api}/{stage}")
+}
+
 /// The ARN of the log group `name`, as a stage's `destinationArn` names one.
 fn group_arn(name: &str) -> String {
     format!(
