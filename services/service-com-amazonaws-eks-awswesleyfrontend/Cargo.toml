@@ -111,6 +111,12 @@ http-body-util = { version = "0.1", default-features = false }
 # endpoint beside it. `tokio-rustls` drives that handshake on the core's connection.
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# The account's Amazon EC2 records in that same shared engine: a cluster's pods
+# are addressed out of the VPC its nodes run in — a pod's address is a secondary
+# private address of its node's own elastic network interface — so the interface,
+# the subnet and the address pool it comes out of are read and written where they
+# live, through Amazon EC2's own writers (`src/state/kubernetes_pod_addressing.rs`).
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The Amazon ECR registry in that same shared engine: a node's kubelet pulls the
 # image a pod's container runs before it starts that container, and an image held
 # in this account's private registry is pulled AS THE NODE'S IAM ROLE — so that

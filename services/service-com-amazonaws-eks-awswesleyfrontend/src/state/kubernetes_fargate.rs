@@ -153,6 +153,11 @@ impl FargateNode {
         ClusterNode {
             name: self.name.clone(),
             joined_at: self.joined_at,
+            // No Amazon EC2 instance is behind Fargate capacity — which is why the
+            // node reports no `providerID` either — so there is no instance
+            // interface for a pod placed here to be addressed on
+            // ([`super::kubernetes_pod_addressing`]).
+            instance_id: String::new(),
             node_role: self.pod_execution_role.clone(),
             taints: vec![NodeTaint {
                 key: FARGATE_COMPUTE_TYPE_LABEL.to_string(),

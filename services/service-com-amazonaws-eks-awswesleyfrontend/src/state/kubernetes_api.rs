@@ -100,6 +100,7 @@ use super::kubernetes_objects::{
 };
 use super::kubernetes_objects::{ApiRefusal, ClusterObjects};
 use super::kubernetes_openapi;
+use super::kubernetes_pod_addressing;
 use super::kubernetes_protobuf;
 use super::kubernetes_rbac::{self as rbac, RbacResource};
 use super::kubernetes_self_subject_review as self_review;
@@ -178,6 +179,11 @@ pub struct KubernetesApiPlane {
     /// pod's images from, as the stores that decide a pull
     /// ([`kubernetes_image_pull::settle_due_pulls`]).
     registry: kubernetes_image_pull::PullRegistries,
+    /// The Amazon EC2 records this cluster's networking plugin addresses its pods
+    /// out of: a pod's address is a secondary private address of its node's own
+    /// elastic network interface
+    /// ([`kubernetes_pod_addressing::settle_due_pod_addresses`]).
+    addressing: kubernetes_pod_addressing::PodAddressPlane,
     /// The TLS server this address answers a `https://` client with: the
     /// certificate the cluster's own certificate authority issued, and its key.
     /// `None` when the material could not be loaded, in which case a client that
@@ -295,6 +301,9 @@ pub async fn publish<Eng: Send + Sync + 'static>(
         // call of this service goes over.
         audit: Some(ClusterAuditLog::new(callback, &key.0, &key.1)),
         registry: kubernetes_image_pull::PullRegistries::of(engine),
+        // The records the cluster's networking plugin takes a pod's address out
+        // of, taken over the same seam and held for the same reason.
+        addressing: kubernetes_pod_addressing::PodAddressPlane::of(engine),
         tls,
         _listener: listener,
     };
@@ -660,10 +669,16 @@ pub fn serve(
         store
             .kubernetes_api
             .get(key)
-            .map(|plane| plane.registry.clone())
+            .map(|plane| (plane.registry.clone(), plane.addressing.clone()))
     };
-    if let Some(registry) = registry {
+    if let Some((registry, addressing)) = registry {
         kubernetes_image_pull::settle_due_pulls(state, &registry, key, received_at);
+        // The addresses the cluster's networking plugin owes the pods it has
+        // placed, and the ones it has to give back: taken on the node's own
+        // elastic network interface, with no store of this service held, for the
+        // same reason the pulls above are
+        // ([`kubernetes_pod_addressing::settle_due_pod_addresses`]).
+        kubernetes_pod_addressing::settle_due_pod_addresses(state, &addressing, key);
     }
     // The plane's own handles, read and RELEASED: resolving the credential asks the
     // other services' stores, which is never done with this one's lock held.

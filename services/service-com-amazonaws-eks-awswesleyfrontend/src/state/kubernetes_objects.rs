@@ -34,6 +34,7 @@ use super::kubernetes_image_pull::{
 };
 use super::kubernetes_lists::{listed, ListRequest};
 use super::kubernetes_metadata::ObjectMetadata;
+use super::kubernetes_pod_addressing::PodAddress;
 use super::kubernetes_pod_spec::admitted_pod_spec;
 use super::kubernetes_resource_versions::ResourceVersions;
 use super::*;
@@ -115,6 +116,13 @@ pub struct ClusterObjects {
     /// ([`super::kubernetes_rbac`]). Bounded by
     /// [`super::kubernetes_rbac::MAX_RBAC_OBJECTS_PER_SCOPE`] per resource.
     pub cluster_rbac: RbacScope,
+    /// The pod addresses this cluster's networking plugin has to GIVE BACK: what a
+    /// pod that left its node held ([`PodObject::unbind`], and the pods a workload
+    /// no longer runs), until the next pass releases each one in the subnet it came
+    /// out of ([`super::kubernetes_pod_addressing::settle_due_pod_addresses`]).
+    /// Empty whenever that pass has run, and empty for a cluster whose pods were
+    /// never addressed at all.
+    pub released_addresses: Vec<PodAddress>,
     /// The AWS Fargate capacity this cluster has provisioned, by the name each
     /// node registered under: one node per pod a Fargate profile selected
     /// ([`super::kubernetes_fargate`]), released again once the cluster holds no
@@ -350,6 +358,12 @@ pub struct PodObject {
     /// so it does not reach the phase a pod whose containers were started and
     /// terminated reports.
     pub pull: Option<ImagePullRecord>,
+    /// The address the cluster's networking plugin gave this pod on the node it
+    /// was placed on, which is a secondary private address of that node's own
+    /// elastic network interface
+    /// ([`super::kubernetes_pod_addressing::settle_due_pod_addresses`]); `None`
+    /// for a pod no node has taken, and until the plugin has addressed it.
+    pub address: Option<PodAddress>,
 }
 
 impl PodObject {
@@ -373,7 +387,12 @@ impl PodObject {
     /// Nothing of its stay on that node is history to keep: no container of it
     /// ever ran there ([`POD_PHASE_FAILED`]), so the pod is one waiting for
     /// capacity again rather than a workload on capacity that is gone.
-    pub fn unbind(&mut self) {
+    ///
+    /// The ADDRESS the plugin of that node gave it is answered back, for the
+    /// caller to give to the subnet it came out of: an address is held for exactly
+    /// as long as the pod holds the node it was taken on
+    /// ([`super::kubernetes_pod_addressing`]).
+    pub fn unbind(&mut self) -> Option<PodAddress> {
         if let Some(spec) = self.spec.as_object_mut() {
             spec.remove("nodeName");
         }
@@ -384,6 +403,7 @@ impl PodObject {
         // The pull was the kubelet's of THAT node; the pod is one waiting for
         // capacity again, and whichever node takes it next pulls its images.
         self.pull = None;
+        self.address.take()
     }
 
     /// Materialise the phase move the clock already owes at `now`.
@@ -587,6 +607,17 @@ impl PodObject {
         if let Some(started_at) = self.started_at {
             status["startTime"] = ::serde_json::json!(rfc3339_seconds(started_at));
         }
+        // "IP address allocated to the pod. Routable at least within the cluster"
+        // (`PodStatus.podIP`): the address the plugin of the pod's node gave it,
+        // which is an address of that node's subnet
+        // ([`super::kubernetes_pod_addressing`]). `podIPs` is the list form of the
+        // same member — "the first entry must match the podIP field" — so one
+        // address is reported in both readings, and a pod that holds none reports
+        // neither rather than an empty value.
+        if let Some(held) = &self.address {
+            status["podIP"] = ::serde_json::json!(held.address);
+            status["podIPs"] = ::serde_json::json!([{ "ip": held.address }]);
+        }
         // What a pod ENDED on, which is the pod-level reading of what its
         // containers report ([`POD_PHASE_FAILED`]).
         if concluded {
@@ -623,6 +654,10 @@ impl ClusterObjects {
         // namespaces are no longer borrowed for the walk.
         let mut scheduled: Vec<(String, EventObject)> = Vec::new();
         let mut provisioned: Vec<FargateNode> = Vec::new();
+        // The addresses of the pods this pass UNBOUND, for the same reason: they go
+        // back to the subnets they came out of
+        // ([`super::kubernetes_pod_addressing`]).
+        let mut freed: Vec<PodAddress> = Vec::new();
         for (namespace, held) in &mut self.namespaces {
             for (pod_name, pod) in &mut held.pods {
                 let was_bound = pod.node_name.is_some();
@@ -634,7 +669,7 @@ impl ClusterObjects {
                     // Bound to a node the cluster still holds: nothing to do.
                     Some(true) => {}
                     // Bound to a node that is gone.
-                    Some(false) => pod.unbind(),
+                    Some(false) => freed.extend(pod.unbind()),
                     // Not bound at all: placed now, if there is capacity for it.
                     // Fargate first, because a pod a profile SELECTS runs on
                     // Fargate — that is what a profile says about it — and only a
@@ -671,6 +706,7 @@ impl ClusterObjects {
         for (namespace, event) in scheduled {
             self.record_event(&namespace, event);
         }
+        self.released_addresses.extend(freed);
     }
 
     /// The objects a brand new cluster's API server holds: the namespaces
@@ -693,6 +729,7 @@ impl ClusterObjects {
         Self {
             namespaces,
             cluster_rbac: BTreeMap::new(),
+            released_addresses: Vec::new(),
             fargate_nodes: BTreeMap::new(),
             versions,
         }
@@ -907,6 +944,9 @@ impl ClusterObjects {
                 concludes_at: None,
                 started_at: None,
                 pull: None,
+                // Addressed by the node's networking plugin once the cluster has
+                // placed it ([`super::kubernetes_pod_addressing`]).
+                address: None,
             },
         );
         // Scheduling: the pod is placed on capacity of this CLUSTER, which is what

@@ -433,6 +433,13 @@ pub const NODE_FIELD_SELECTORS: &[(&str, &str)] = &[
 pub struct ClusterNode {
     pub name: String,
     pub joined_at: SystemTime,
+    /// The Amazon EC2 instance this node IS, as the services that launched it
+    /// reported it ([`NodeInstance::instance_id`]) — the instance whose own
+    /// elastic network interface the addresses of the pods placed here are
+    /// secondary addresses of
+    /// ([`super::kubernetes_pod_addressing::settle_due_pod_addresses`]). Empty for
+    /// a node whose instance no Amazon EC2 service reported.
+    pub instance_id: String,
     /// The IAM role the node runs under: the `nodeRole` of the node group that
     /// launched it ("the IAM role associated with your node group"), which is the
     /// principal the node's kubelet makes its AWS calls as — the image pull of a
@@ -540,6 +547,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                     // The instant the node joined the cluster, which is what the
                     // node itself reports as its `creationTimestamp`.
                     joined_at: nodegroup.created_at,
+                    // The instance the node is, which the node's own
+                    // `spec.providerID` names too.
+                    instance_id: node.instance_id.clone(),
                     // The role the node group launched its instances under, which
                     // is what the node's kubelet acts as.
                     node_role: nodegroup.node_role.clone(),

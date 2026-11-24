@@ -675,6 +675,10 @@ impl ClusterObjects {
 
     /// Remove one pod of one workload: the pod leaves the namespace and the
     /// workload no longer runs it.
+    ///
+    /// The ADDRESS it held goes on this cluster's release list: a pod that is gone
+    /// holds no address, so the next pass gives it back to the subnet it came out
+    /// of ([`super::kubernetes_pod_addressing`]).
     fn remove_workload_pod(
         &mut self,
         resource: WorkloadResource,
@@ -682,12 +686,14 @@ impl ClusterObjects {
         name: &str,
         pod: &str,
     ) {
+        let mut released = None;
         if let Some(held) = self.namespaces.get_mut(namespace) {
-            held.pods.remove(pod);
+            released = held.pods.remove(pod).and_then(|removed| removed.address);
             if let Some(workload) = held.workloads.get_mut(&(resource, name.to_string())) {
                 workload.pods.remove(pod);
             }
         }
+        self.released_addresses.extend(released);
     }
 
     /// Remove one workload and the pods it runs.
