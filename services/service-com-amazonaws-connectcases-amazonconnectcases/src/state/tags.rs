@@ -6,8 +6,8 @@
 //! Tags are NOT a collection of their own — every resource this service holds
 //! already owns its `tags` map, which is what [`tags_output`] reports on a read
 //! of the resource ([`Domain`], [`Field`], [`Template`], [`Layout`], [`Case`],
-//! [`RelatedItem`]), present whatever it holds, so deleting a resource takes its
-//! tags with it and no second
+//! [`CaseRule`], [`RelatedItem`]), present whatever it holds, so deleting a
+//! resource takes its tags with it and no second
 //! copy of a tag set can drift from the first. What the tagging operations
 //! share, and what lives here, is the RESOLUTION step: an `Arn` names one
 //! resource of one kind, and only a record this store actually holds is
@@ -34,8 +34,8 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 ///
 /// The variants are exactly the resources this service mints an ARN for
 /// ([`domain_arn`], [`field_arn`], [`template_arn`], [`layout_arn`],
-/// [`case_arn`], [`related_item_arn`]), so an ARN of a kind this store has no
-/// record for does not parse into one.
+/// [`case_arn`], [`case_rule_arn`], [`related_item_arn`]), so an ARN of a kind
+/// this store has no record for does not parse into one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedResource<'a> {
     Domain {
@@ -57,6 +57,10 @@ pub enum TaggedResource<'a> {
         domain_id: &'a str,
         case_id: &'a str,
     },
+    CaseRule {
+        domain_id: &'a str,
+        case_rule_id: &'a str,
+    },
     RelatedItem {
         domain_id: &'a str,
         case_id: &'a str,
@@ -74,6 +78,7 @@ impl TaggedResource<'_> {
             Self::Template { .. } => ResourceKind::Template,
             Self::Layout { .. } => ResourceKind::Layout,
             Self::Case { .. } => ResourceKind::Case,
+            Self::CaseRule { .. } => ResourceKind::CaseRule,
             Self::RelatedItem { .. } => ResourceKind::RelatedItem,
         }
     }
@@ -113,6 +118,10 @@ pub fn tagged_resource(arn: &str) -> Option<TaggedResource<'_>> {
         ["domain", domain_id, "case", case_id] => {
             Some(TaggedResource::Case { domain_id, case_id })
         }
+        ["domain", domain_id, "case-rule", case_rule_id] => Some(TaggedResource::CaseRule {
+            domain_id,
+            case_rule_id,
+        }),
         ["domain", domain_id, "case", case_id, "related-item", related_item_id] => {
             Some(TaggedResource::RelatedItem {
                 domain_id,
@@ -181,12 +190,12 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
     /// and account segments count, so a resource created in one region is not
     /// addressable through another region's ARN.
     ///
-    /// A SOFT-deleted field, template or layout is still REPORTED by this
-    /// service — `BatchGetField`, `GetTemplate` and `GetLayout` all answer a
-    /// deleted record, tags included — so a read of its tag set resolves it too,
-    /// and the tags a resource carried stay readable for exactly as long as the
-    /// resource itself does. A WRITE through a tombstone is what the service
-    /// refuses ([`Self::resource_tags_mut`]).
+    /// A SOFT-deleted field, template, layout or case rule is still REPORTED by
+    /// this service — `BatchGetField`, `GetTemplate`, `GetLayout` and
+    /// `BatchGetCaseRule` all answer a deleted record, tags included — so a read
+    /// of its tag set resolves it too, and the tags a resource carried stay
+    /// readable for exactly as long as the resource itself does. A WRITE through
+    /// a tombstone is what the service refuses ([`Self::resource_tags_mut`]).
     pub fn resource_tags(&self, arn: &str) -> Option<&HashMap<String, String>> {
         match tagged_resource(arn)? {
             TaggedResource::Domain { domain_id } => self
@@ -231,6 +240,16 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
                 .get(case_id)
                 .filter(|case| case.case_arn == arn)
                 .map(|case| &case.tags),
+            TaggedResource::CaseRule {
+                domain_id,
+                case_rule_id,
+            } => self
+                .domains
+                .get(domain_id)?
+                .case_rules
+                .get(case_rule_id)
+                .filter(|rule| rule.case_rule_arn == arn)
+                .map(|rule| &rule.tags),
             TaggedResource::RelatedItem {
                 domain_id,
                 case_id,
@@ -251,11 +270,13 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
     /// when this store holds no such resource a write can go through.
     ///
     /// Resolves as [`Self::resource_tags`] does, with one difference: a
-    /// SOFT-deleted field, template or layout is a tombstone rather than a
-    /// resource a caller can take a new reference to, and every other write of
-    /// this service refuses one ([`Domain::field_mut`], [`Domain::template`] —
-    /// `UpdateField`, `UpdateTemplate` and `UpdateLayout` all go through them),
-    /// so a tag write through one is refused too.
+    /// SOFT-deleted field, template, layout or case rule is a tombstone rather
+    /// than a resource a caller can take a new reference to, and every other
+    /// write of this service refuses one ([`Domain::field_mut`],
+    /// [`Domain::template`] — `UpdateField`, `UpdateTemplate` and `UpdateLayout`
+    /// all go through them; [`Domain::unknown_case_rule_ids`], which is how a
+    /// template's reference to a rule resolves), so a tag write through one is
+    /// refused too.
     pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
         match tagged_resource(arn)? {
             TaggedResource::Domain { domain_id } => self
@@ -300,6 +321,16 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
                 .get_mut(case_id)
                 .filter(|case| case.case_arn == arn)
                 .map(|case| &mut case.tags),
+            TaggedResource::CaseRule {
+                domain_id,
+                case_rule_id,
+            } => self
+                .domains
+                .get_mut(domain_id)?
+                .case_rules
+                .get_mut(case_rule_id)
+                .filter(|rule| !rule.deleted && rule.case_rule_arn == arn)
+                .map(|rule| &mut rule.tags),
             TaggedResource::RelatedItem {
                 domain_id,
                 case_id,

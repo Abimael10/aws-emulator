@@ -14,6 +14,7 @@
 //! each one carries an explicit ceiling: [`MAX_DOMAINS`],
 //! [`MAX_FIELDS_PER_DOMAIN`], [`MAX_TEMPLATES_PER_DOMAIN`],
 //! [`MAX_LAYOUTS_PER_DOMAIN`], [`MAX_CASES_PER_DOMAIN`],
+//! [`MAX_CASE_RULES_PER_DOMAIN`],
 //! [`MAX_RELATED_ITEMS_PER_CASE`], [`MAX_AUDIT_EVENTS_PER_CASE`],
 //! [`MAX_TAGS_PER_RESOURCE`] and
 //! [`MAX_IDEMPOTENCY_TOKENS`]. Creating past a
@@ -26,7 +27,10 @@
 //! [`MAX_BATCH_FIELD_IDS`], [`MAX_CUSTOM_RELATED_ITEM_FIELDS`],
 //! [`MAX_EVENT_INCLUDED_FIELD_IDS`], [`MAX_SEARCH_CASE_FIELD_IDS`],
 //! [`MAX_SEARCH_SORTS`] and [`MAX_CASE_FILTER_CLAUSES`] are re-checked
-//! in the handler ([`list_too_long`]),
+//! in the handler ([`list_too_long`]), as are
+//! [`MAX_BATCH_CASE_RULE_IDS`], [`MAX_TEMPLATE_CASE_RULES`] and the
+//! bounds a case rule's condition tree is walked under
+//! ([`case_rule_conditions_too_complex`]),
 //! the scans below are linear in the list length, and a refusal names at most
 //! [`MAX_IDS_NAMED_IN_A_REFUSAL`] ids. A list that carries the same id twice is
 //! refused on the WRITE paths only ([`duplicate_ids`]), where two values for one
@@ -38,6 +42,9 @@
 //! an opaque `nextToken` for the rest, so no single response grows with the
 //! store.
 
+// The case rules a domain holds: the record a create mints, the bounded walk
+// over the conditions it carries, and what a read of one reports.
+mod case_rules;
 // Comparing a stored field value against one of the model's `FieldFilter`
 // comparisons: what every search in this service narrows with.
 mod field_filters;
@@ -48,6 +55,7 @@ mod related_items;
 // carries: what every tagging operation reads and writes.
 mod tags;
 
+pub use case_rules::*;
 pub use field_filters::*;
 pub use related_items::*;
 pub use tags::*;
@@ -373,6 +381,10 @@ pub struct Domain {
     pub templates: HashMap<String, Template>,
     pub layouts: HashMap<String, Layout>,
     pub cases: HashMap<String, Case>,
+    /// The domain's case rules, keyed by `caseRuleId`. Bounded by
+    /// [`MAX_CASE_RULES_PER_DOMAIN`]. They are scoped to the domain exactly as
+    /// its fields and templates are, so deleting the domain takes them with it.
+    pub case_rules: HashMap<String, CaseRule>,
     pub event_bridge: Option<EventBridgeConfiguration>,
 }
 
@@ -415,10 +427,9 @@ pub struct Template {
     pub layout_configuration: Option<LayoutConfiguration>,
     pub required_fields: Vec<RequiredField>,
     /// The case rules the template carries, as its create and its update write
-    /// them. Empty for every template this store can hold while
-    /// `CreateCaseRule` is a stub: both writes refuse a request that names a
-    /// case rule, so nothing can put an entry here yet, and a read reports the
-    /// empty list the record holds.
+    /// them: each association names a rule of the SAME domain, resolved against
+    /// [`Domain::case_rules`] before it is stored, so a read never hands back a
+    /// reference that cannot be followed.
     pub rules: Vec<TemplateRule>,
     pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
     /// One of `TEMPLATE_STATUS_VALUES`.
@@ -1926,6 +1937,7 @@ pub enum ResourceKind {
     Template,
     Layout,
     Case,
+    CaseRule,
     RelatedItem,
 }
 
@@ -1938,6 +1950,11 @@ impl ResourceKind {
             Self::Template => ("Template", "template"),
             Self::Layout => ("Layout", "layout"),
             Self::Case => ("Case", "case"),
+            // A case rule's word is two, as a related item's is: the service
+            // writes it as ONE token wherever it names the kind itself — the
+            // `case-rule` segment of the rule's ARN — so that is the token, and
+            // the leading form is for a sentence.
+            Self::CaseRule => ("Case rule", "case-rule"),
             // A related item is the one kind whose word is two: the service
             // writes it as ONE token wherever it names the kind itself — the
             // `related-item` segment of the item's ARN — so that is the token,

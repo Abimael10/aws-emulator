@@ -245,28 +245,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `rules` names case rules, which this emulator has no resource for yet
-        // — `CreateCaseRule` is still a scaffolded 501 — so a template cannot
-        // record a reference to one. The refusal says exactly that rather than
-        // claiming a lookup it did not perform; when that create lands it
-        // becomes a lookup against the domain's own rules, as the
-        // `layoutConfiguration.defaultLayout` lookup below now is.
+        // `rules` names case rules of this domain, and a template rule's
+        // `fieldId` the field that rule acts upon, so both are resolved against
+        // the domain's own records before anything is stored: a template never
+        // records a reference that cannot be followed, exactly as
+        // `requiredFields` and `layoutConfiguration.defaultLayout` are resolved.
         let rules = input.rules.unwrap_or_default();
-        let rule_ids: Vec<String> = rules
-            .iter()
-            .map(|rule| rule.case_rule_id.clone())
-            .collect();
-        if !rule_ids.is_empty() {
+        if let Some(message) = crate::state::list_too_long(
+            "rules",
+            rules.len(),
+            crate::state::MAX_TEMPLATE_CASE_RULES,
+        ) {
             return Err(
-                CreateTemplateErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "rules names case rule ids, and this emulator supports no case rules \
-                         yet, so none can be referenced: {}",
-                        crate::state::name_ids(&rule_ids)
-                    ),
-                })
-                .into(),
+                CreateTemplateErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
             );
+        }
+        let unknown_rules =
+            domain.unknown_case_rule_ids(rules.iter().map(|rule| rule.case_rule_id.as_str()));
+        if !unknown_rules.is_empty() {
+            return Err(CreateTemplateErrorModeled::ValidationException(
+                crate::state::unknown_case_rules_in("rules", &unknown_rules),
+            )
+            .into());
+        }
+        let rule_field_ids = crate::state::template_rule_field_ids(&rules);
+        let unknown_rule_fields =
+            domain.unknown_field_ids(rule_field_ids.iter().map(::std::string::String::as_str));
+        if !unknown_rule_fields.is_empty() {
+            return Err(CreateTemplateErrorModeled::ValidationException(
+                crate::state::unknown_fields_in("rules", &unknown_rule_fields),
+            )
+            .into());
         }
         // `layoutConfiguration.defaultLayout` names a layout of this domain, so
         // it is resolved against the domain's stored layouts before anything is
@@ -302,8 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description,
                 layout_configuration: input.layout_configuration,
                 required_fields,
-                // The list the request carried, which the refusal above holds
-                // to the empty one while no case rule can exist.
+                // The associations the request carried, each naming a case rule
+                // of this domain that the lookup above resolved.
                 rules,
                 tag_propagation_configurations: input
                     .tag_propagation_configurations

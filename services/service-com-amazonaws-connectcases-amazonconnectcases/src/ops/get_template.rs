@@ -232,8 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The stored list whatever it holds: a template that carries no case
             // rule reports `[]` rather than leaving the member out, so a caller
             // that iterates it never has to tell an empty list from an absent
-            // one. Nothing can put an entry here while `CreateCaseRule` is a
-            // stub, which is what both writes of a template refuse.
+            // one. Each entry is an association a write of the template stored
+            // after resolving the case rule it names against the domain.
             rules: template.rules.clone(),
             // The stored list whatever it holds: the service reports the member
             // on every read of a template, as `[]` for one that propagates no

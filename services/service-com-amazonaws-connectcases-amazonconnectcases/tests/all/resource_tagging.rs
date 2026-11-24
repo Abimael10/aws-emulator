@@ -765,11 +765,23 @@ async fn an_arn_that_addresses_no_stored_resource_is_refused_and_writes_nothing(
             "domain",
         ),
         (
+            "an unknown case rule of a live domain",
+            arn_in(
+                HOME_REGION,
+                ACCOUNT,
+                &format!("domain/{domain_id}/case-rule/no-such-case-rule"),
+            ),
+            "case-rule",
+        ),
+        (
             "a resource kind this service does not address",
             arn_in(
                 HOME_REGION,
                 ACCOUNT,
-                &format!("domain/{domain_id}/case-rule/a-rule"),
+                // A domain's case event publishing configuration is a PROPERTY
+                // of the domain rather than a resource of its own, so this
+                // service mints no ARN for it and addresses no such kind.
+                &format!("domain/{domain_id}/case-event-configuration"),
             ),
             UNNAMED_KIND,
         ),

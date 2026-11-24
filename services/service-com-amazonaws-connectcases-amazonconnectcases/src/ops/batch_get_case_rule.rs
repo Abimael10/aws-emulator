@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCaseRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCaseRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCaseRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports each requested case rule of a domain from [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCaseRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCaseRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetCaseRuleErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        // A read: it resolves each requested rule and reports it, and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCaseRule"))
+        // Bound the caller-chosen work BEFORE the store lock is taken: the
+        // response carries one entry per requested id, so the list is held to
+        // `MAX_BATCH_CASE_RULE_IDS` here as well as at the boundary. A repeated
+        // id is answered once per occurrence rather than refused, as on
+        // `BatchGetField`: the model declares no distinctness constraint and the
+        // cap already bounds the response.
+        if let Some(message) = crate::state::list_too_long(
+            "caseRules",
+            input.case_rules.len(),
+            crate::state::MAX_BATCH_CASE_RULE_IDS,
+        ) {
+            return Err(
+                BatchGetCaseRuleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(BatchGetCaseRuleErrorModeled::ResourceNotFoundException)?;
+
+        // A batch read reports per-id failure in its own `errors` list rather than
+        // failing the whole call, so one unknown id does not hide the rest.
+        let mut case_rules: Vec<GetCaseRuleResponse> = Vec::with_capacity(input.case_rules.len());
+        let mut errors: Vec<CaseRuleError> = Vec::new();
+        for requested in &input.case_rules {
+            // The RECORD, live or deleted: `GetCaseRuleResponse` carries a
+            // `deleted` member, so a rule that has been deleted is reported
+            // here with that flag set rather than as a per-item failure. Only an
+            // id the domain holds no record for at all fails.
+            match domain.case_rule_record(&requested.id) {
+                Some(rule) => case_rules.push(crate::state::case_rule_output(rule)),
+                None => errors.push(CaseRuleError {
+                    id: requested.id.clone(),
+                    // The per-item code is the service's own per-item
+                    // vocabulary, not the name of the modelled exception shape
+                    // a whole call would fail with: see
+                    // `state::BATCH_ITEM_NOT_FOUND_CODE`.
+                    error_code: crate::state::BATCH_ITEM_NOT_FOUND_CODE.to_string(),
+                    // Fixed text, interpolating nothing: the id that failed is
+                    // reported through the entry's own `id` member above (see
+                    // `state::BATCH_ITEM_NOT_FOUND_MESSAGE`).
+                    message: Some(crate::state::BATCH_ITEM_NOT_FOUND_MESSAGE.to_string()),
+                }),
+            }
+        }
+
+        Ok(BatchGetCaseRuleOutput {
+            case_rules,
+            errors,
+            // Every requested id was either resolved or reported in `errors`, so
+            // none was left unprocessed. The member is optional in the model,
+            // unlike the two above, so nothing is reported for it.
+            unprocessed_case_rules: None,
+        })
     }
 }

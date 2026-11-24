@@ -611,8 +611,8 @@ async fn an_update_the_store_cannot_satisfy_is_refused_with_the_modeled_error() 
             "ValidationException",
         ),
         (
-            // This emulator has no case-rule resource yet (`CreateCaseRule` is
-            // still a scaffolded 501), so no template can reference one.
+            // The domain holds no case rule under that id, and a template may
+            // only reference a rule of its own domain.
             "rules naming a case rule".to_string(),
             path.clone(),
             json!({ "rules": [{ "caseRuleId": "no-such-case-rule" }] }),

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCaseRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCaseRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCaseRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports a page of a domain's stored case rules from [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCaseRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCaseRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCaseRules"))
+        // A read (`@readonly` in the model): it reports the domain's stored case
+        // rules and writes nothing, so a later caller sees exactly what it would
+        // have seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCaseRulesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(ListCaseRulesErrorModeled::ResourceNotFoundException)?;
+
+        // Every live case rule of the domain, in the creation order the store
+        // orders a listing by, each summarised from the stored record. The
+        // listing takes no filters, so its page scope narrows nothing beyond the
+        // domain.
+        let listed: Vec<(String, CaseRuleSummary)> = domain
+            .live_case_rules()
+            .into_iter()
+            .map(|(key, rule)| (key, crate::state::case_rule_summary(rule)))
+            .collect();
+
+        // The cursor is scoped to this listing and this domain, so a token from
+        // another read is refused rather than resumed at a key it never ordered,
+        // and a `maxResults` outside the modelled range is refused rather than
+        // quietly clamped.
+        let page = crate::state::page(
+            &crate::state::page_scope(Self::NAME, &input.domain_id, &[]),
+            listed,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            ListCaseRulesErrorModeled::ValidationException(crate::state::page_validation_exception(
+                &error,
+            ))
+        })?;
+
+        Ok(ListCaseRulesOutput {
+            case_rules: page.items,
+            next_token: page.next_token,
+        })
     }
 }

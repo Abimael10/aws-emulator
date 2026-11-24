@@ -275,26 +275,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `rules` names case rules, which this emulator has no resource for yet —
-        // `CreateCaseRule` is still a scaffolded 501 — so a template cannot record
-        // a reference to one. The refusal says exactly that rather than claiming a
-        // lookup it did not perform, as `CreateTemplate` does.
-        let rule_ids: Vec<String> = input
-            .rules
-            .as_ref()
-            .map(|rules| rules.iter().map(|rule| rule.case_rule_id.clone()).collect())
-            .unwrap_or_default();
-        if !rule_ids.is_empty() {
-            return Err(
-                UpdateTemplateErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "rules names case rule ids, and this emulator supports no case rules \
-                         yet, so none can be referenced: {}",
-                        crate::state::name_ids(&rule_ids)
-                    ),
-                })
-                .into(),
-            );
+        // `rules` names case rules of this domain, and a template's `fieldId`
+        // entry the field each rule acts upon, so both are resolved against the
+        // domain's own records before anything is written — as `requiredFields`
+        // above is, and as `CreateTemplate` resolves them.
+        if let Some(rules) = input.rules.as_ref() {
+            if let Some(message) = crate::state::list_too_long(
+                "rules",
+                rules.len(),
+                crate::state::MAX_TEMPLATE_CASE_RULES,
+            ) {
+                return Err(
+                    UpdateTemplateErrorModeled::ValidationException(ValidationException { message })
+                        .into(),
+                );
+            }
+            let unknown_rules =
+                domain.unknown_case_rule_ids(rules.iter().map(|rule| rule.case_rule_id.as_str()));
+            if !unknown_rules.is_empty() {
+                return Err(UpdateTemplateErrorModeled::ValidationException(
+                    crate::state::unknown_case_rules_in("rules", &unknown_rules),
+                )
+                .into());
+            }
+            let rule_field_ids = crate::state::template_rule_field_ids(rules);
+            let unknown_fields = domain
+                .unknown_field_ids(rule_field_ids.iter().map(::std::string::String::as_str));
+            if !unknown_fields.is_empty() {
+                return Err(UpdateTemplateErrorModeled::ValidationException(
+                    crate::state::unknown_fields_in("rules", &unknown_fields),
+                )
+                .into());
+            }
         }
 
         // `layoutConfiguration.defaultLayout` names a layout of this domain, so it
