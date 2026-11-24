@@ -253,15 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `KafkaVersions` enumerates the Apache Kafka versions this configuration
-        // may be applied to, so every entry has to be one of the versions this
-        // service TAKES for a configuration — a narrower set than the catalogue
-        // `ListKafkaVersions` publishes, which goes on publishing a version the
-        // service no longer takes for a new resource. Checked before the lock, and
-        // so before anything is stored: a list carrying an entry outside that
-        // offering registers no configuration at all, whichever position it is in.
-        // The FIRST offending entry is the one the refusal names, followed by the
-        // versions the service does offer — the actionable half of the sentence,
-        // and the very set this gate admits.
+        // may be APPLIED to, so every entry has to name a version this service
+        // publishes a catalogue row for — a configuration is declared for the
+        // versions clusters run, deprecated ones included, so the gate is the
+        // catalogue `ListKafkaVersions` serves rather than the narrower list this
+        // refusal advertises. Checked before the lock, and so before anything is
+        // stored: a list carrying an entry outside the catalogue registers no
+        // configuration at all, whichever position it is in. The FIRST offending
+        // entry is the one the refusal names, followed by the versions the service
+        // names as valid — the actionable half of the sentence.
         let unknown = input
             .kafka_versions
             .iter()

@@ -13,20 +13,23 @@
 //!    service publishes a row for (the `.tiered` storage line, the `.kraft`
 //!    metadata-mode lines, the `link` line) and a version's second, other-status
 //!    row included.
-//! 2. Which versions an operation TAKES for a new resource is a SEPARATE and
-//!    narrower fact, recorded per operation: a configuration's versions are the
-//!    very list that create's refusal advertises, and a provisioned cluster's are
-//!    its broker category's offering. So a row the catalogue publishes is
-//!    published and nothing more — it never widens a create gate — and no
-//!    offering ever names a version the catalogue does not publish.
+//! 2. Which versions an operation TAKES for a NEW RESOURCE is a SEPARATE and
+//!    narrower fact: a provisioned cluster's versions are its broker category's
+//!    offering, which the refusal of a version outside it advertises, so a row the
+//!    catalogue publishes is published and nothing more — it never widens that
+//!    gate — and no offering ever names a version the catalogue does not publish.
+//!    A CONFIGURATION is not such a resource: it declares which versions a
+//!    `server.properties` body may be APPLIED to, so it may name every version the
+//!    catalogue publishes, while the valid-value list its refusal advertises stays
+//!    the service's own narrower sentence.
 //!
 //! Each suite asserts that over a TABLE whose rows differ along what the rule
 //! generalises over: the FORM of the published version string (a three-component
 //! release, a four-component one, the `.x` patch name, the `.tiered` and `.kraft`
 //! and `link` variant lines), how many rows the catalogue publishes for the
-//! version, and — for the second half — the four combinations of published
-//! against admitted (published and taken everywhere, published and taken by a
-//! configuration only, published and taken by nothing, not published at all).
+//! version, and — for the second half — the combinations of published against
+//! admitted (published and taken everywhere, published and admitted by a
+//! configuration only, published and built on by nothing, not published at all).
 //! The expected rows are hand-written from the catalogue the service publishes
 //! (the Amazon MSK Developer Guide's "Supported Apache Kafka versions" list) and
 //! every expectation is read off the WIRE, so neither half is asserted against
@@ -224,12 +227,12 @@ async fn the_listing_serves_every_published_row_including_the_variant_lines() {
     }
 }
 
-/// RULE (second half): being published is not being admitted. For each row of the
+/// RULE (second half): being published is not being built on. For each row of the
 /// table, the catalogue publishes the version exactly when the row says so, a
-/// configuration takes it exactly when the advertised configuration offering
-/// names it, and a new Standard-broker cluster takes it exactly when that
-/// category's advertised offering names it — each refusal naming the version
-/// verbatim beside the offering the same gate admits, and storing nothing.
+/// configuration may name it exactly when the catalogue publishes it, and a new
+/// Standard-broker cluster takes it exactly when that category's advertised
+/// offering names it — each refusal naming the version verbatim beside the
+/// versions that operation names as valid, and storing nothing.
 #[tokio::test]
 async fn a_published_row_is_not_a_version_an_operation_admits() {
     let emulator = Emulator::new();
@@ -240,8 +243,8 @@ async fn a_published_row_is_not_a_version_an_operation_admits() {
     let for_configurations = configuration_offering(&emulator).await;
     let for_clusters = standard_cluster_offering(&emulator).await;
 
-    // Rows: the four combinations of published against admitted, plus a second
-    // published-and-admitted-nowhere spelling, so the rule is checked on more
+    // Rows: the combinations of published against admitted, plus a second
+    // published-and-built-on-by-nothing spelling, so the rule is checked on more
     // than the one row the catalogue gained.
     let table: &[(&str, &str, bool)] = &[
         // Published and taken by both operations.
@@ -252,7 +255,9 @@ async fn a_published_row_is_not_a_version_an_operation_admits() {
         // clusters are still running it.
         ("deprecated-but-named-by-a-configuration", "1.1.1", true),
         ("deprecated-variant-line", "2.8.2.tiered", true),
-        // Published, taken by nothing: the `link` line.
+        // Published, built on by nothing, and named by no advertised list: the
+        // `link` line. A configuration may still name it — the catalogue publishes
+        // it, so a client can only have learnt it from this service.
         ("published-only", "3.8.link", true),
         // Not published at all.
         ("never-published", "9.9.9", false),
@@ -279,16 +284,16 @@ async fn a_published_row_is_not_a_version_an_operation_admits() {
             }
         }
 
-        // CreateConfiguration admits exactly the versions its own refusal
-        // advertises.
-        let takes_configuration = for_configurations.iter().any(|name| name == version);
+        // CreateConfiguration admits exactly the versions the catalogue
+        // publishes: a configuration is declared for the versions clusters run.
+        let takes_configuration = *is_published;
         let name = format!("cfg-{case}");
         let reply = create_configuration(&emulator, &name, &[version]).await;
         if takes_configuration {
             assert_eq!(
                 (reply.status, reply.error_code()),
                 (200, ""),
-                "case {case} ({version}): an advertised version must be accepted, got {} {}",
+                "case {case} ({version}): a published version must be accepted, got {} {}",
                 reply.status,
                 reply.body
             );
@@ -309,7 +314,8 @@ async fn a_published_row_is_not_a_version_an_operation_admits() {
             assert_eq!(
                 (reply.status, reply.error_code()),
                 (400, "BadRequestException"),
-                "case {case} ({version}): a version outside the offering must be refused, got {} {}",
+                "case {case} ({version}): a version the catalogue does not publish must be \
+                 refused, got {} {}",
                 reply.status,
                 reply.body
             );

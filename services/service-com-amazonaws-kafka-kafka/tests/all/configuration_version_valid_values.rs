@@ -5,23 +5,23 @@
 //! serves from (the shared [`crate::kafka_harness`]).
 //!
 //! The RULE under test: when a request names an Apache Kafka version the service
-//! does not take for a configuration, the refusal reports which versions ARE
-//! valid as the set the same gate admits — the versions the service takes,
-//! each named ONCE, and nothing outside it — rendered in the one fixed order the
-//! service names that list in, which is neither sorted by release nor the order
-//! the catalogue pages its rows in. That set is a SUBSET of the catalogue
-//! `ListKafkaVersions` publishes: the catalogue goes on publishing a version the
-//! service no longer takes for a new configuration, so a published row is not by
-//! itself a value this create accepts.
+//! publishes no catalogue row for, the refusal reports which versions the service
+//! names as valid — its own recorded list, each version named ONCE, every one of
+//! them a version the same create is then accepted with — rendered in the one
+//! fixed order the service names that list in, which is neither sorted by release
+//! nor the order the catalogue pages its rows in. That list is a PROPER SUBSET of
+//! the catalogue `ListKafkaVersions` publishes, and so of the gate this create is
+//! admitted on: a published row the sentence does not name is still a version a
+//! configuration may name, because a configuration declares which versions it may
+//! be applied to.
 //!
 //! Each suite asserts that over a TABLE whose rows differ along what the rule
 //! generalises over: the FORM of the rejected value (a release newer than every
 //! published one, a name that never existed, a truncated and an extended release,
 //! a padded and an empty entry, a variant spelling of a published release that
-//! the service does not publish, a case-folded one, a row the catalogue does
-//! publish but this operation does not take), its POSITION in the submitted
-//! list, and how many entries the list carries. The second suite walks the
-//! advertised list EXHAUSTIVELY — every version it names — because the rule
+//! the service does not publish, a case-folded one), its POSITION in the
+//! submitted list, and how many entries the list carries. The second suite walks
+//! the advertised list EXHAUSTIVELY — every version it names — because the rule
 //! there is an invariant: a version the refusal advertises as retryable is one
 //! the same request is then accepted with.
 //!
@@ -41,11 +41,11 @@ use crate::kafka_harness::{pct, ConfigurationRequest, Emulator, Reply};
 /// in.
 ///
 /// Source: the list the service itself renders in this refusal, which is both the
-/// versions it takes for a configuration and the order it names them in. Written
-/// out here rather than read from the service's own table, so this suite pins the
-/// list instead of the code under test pinning it; it is cross-checked below
-/// against the list the refusal advertises and against the catalogue
-/// `ListKafkaVersions` publishes, which CONTAINS it.
+/// versions it names as valid and the order it names them in. Written out here
+/// rather than read from the service's own table, so this suite pins the list
+/// instead of the code under test pinning it; it is cross-checked below against
+/// the list the refusal advertises and against the catalogue `ListKafkaVersions`
+/// publishes, which CONTAINS it.
 const VALID_VALUE_ORDER: &[&str] = &[
     "4.2.x.kraft",
     "4.1.x.kraft",
@@ -155,11 +155,11 @@ fn as_set(values: &[String]) -> Vec<String> {
     sorted
 }
 
-/// RULE: a `KafkaVersions` entry the service does not take for a configuration is
+/// RULE: a `KafkaVersions` entry the service publishes no catalogue row for is
 /// refused HTTP 400 `BadRequestException` naming `kafkaVersions`, and the refusal
-/// reports the FIRST such entry verbatim together with the versions that are
-/// valid: the versions it does take, each once, in the one fixed order the
-/// service names that list in.
+/// reports the FIRST such entry verbatim together with the versions the service
+/// names as valid: its own recorded list, each version once, in the one fixed
+/// order the service names that list in.
 #[tokio::test]
 async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
     let emulator = Emulator::new();
@@ -186,10 +186,12 @@ async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
         );
     }
     // And the containment is strict: the catalogue publishes at least one version
-    // this operation does not take, so the two lists are not the same fact.
+    // this sentence does not name, so the two lists are not the same fact — and
+    // such a version is still one a create is admitted with, which the second
+    // suite walks.
     assert!(
         published.iter().any(|version| !ordered.contains(version)),
-        "case \"the published catalogue\": it must publish a version the offering omits, \
+        "case \"the published catalogue\": it must publish a version the advertised list omits, \
          got {published:?}"
     );
 
@@ -215,15 +217,13 @@ async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
         ("unpublished-variant", vec!["3.8.kraft"], "3.8.kraft"),
         ("unpublished-tiered", vec!["3.8.x.tiered"], "3.8.x.tiered"),
         ("unpublished-kraft", vec!["4.3.x.kraft"], "4.3.x.kraft"),
-        // A row the catalogue PUBLISHES and this operation does not take: being
-        // published is not being admitted.
-        ("published-but-not-taken", vec!["3.8.link"], "3.8.link"),
-        // Position among entries that ARE taken: first, middle, last.
+        ("unpublished-link", vec!["3.8.x.link"], "3.8.x.link"),
+        // Position among entries that ARE published: first, middle, last.
         ("first-of-three", vec!["9.9.9", "2.8.1", "3.6.0"], "9.9.9"),
         (
             "middle-of-three",
-            vec!["2.8.1", "3.8.link", "3.6.0"],
-            "3.8.link",
+            vec!["2.8.1", "3.9.link", "3.6.0"],
+            "3.9.link",
         ),
         ("last-of-three", vec!["2.8.1", "3.6.0", "nope"], "nope"),
         // Two uncatalogued entries: the FIRST of them is the one named.
@@ -282,14 +282,15 @@ async fn the_refusal_lists_the_published_versions_in_the_services_own_order() {
     );
 }
 
-/// RULE: the valid-value list and the gate that produced it are the SAME set, so
-/// every version the refusal advertises is one the very same create is accepted
-/// with — and stores that version verbatim — while a version outside that list is
-/// advertised by no refusal and accepted by no create, whether the published
-/// catalogue holds a row for it or not.
+/// RULE: every version the refusal advertises is one the very same create is
+/// accepted with — and stores verbatim — and so is every OTHER version the
+/// catalogue publishes, including the published rows the sentence does not name,
+/// because a configuration declares the versions it may be applied to. A version
+/// the catalogue publishes no row for is advertised by no refusal and accepted by
+/// no create.
 ///
-/// Walked EXHAUSTIVELY over the advertised list, which is the whole input space
-/// of the invariant.
+/// Walked EXHAUSTIVELY over the published catalogue, which is the whole input
+/// space of the invariant.
 #[tokio::test]
 async fn every_advertised_version_is_one_a_create_accepts() {
     let emulator = Emulator::new();
@@ -309,8 +310,7 @@ async fn every_advertised_version_is_one_a_create_accepts() {
     );
 
     // The advertised set is a subset of the catalogue's, each version named once,
-    // and a proper one: the catalogue publishes a row this operation does not
-    // take.
+    // and a proper one: the catalogue publishes a row the sentence does not name.
     let published = published_versions(&emulator).await;
     for version in &listed {
         assert!(
@@ -320,8 +320,8 @@ async fn every_advertised_version_is_one_a_create_accepts() {
     }
     assert!(
         published.iter().any(|version| !listed.contains(version)),
-        "case \"advertised-probe\": the catalogue must publish a version the offering omits, \
-         got {published:?}"
+        "case \"advertised-probe\": the catalogue must publish a version the advertised list \
+         omits, got {published:?}"
     );
     let mut distinct = as_set(&listed);
     distinct.dedup();
@@ -331,15 +331,19 @@ async fn every_advertised_version_is_one_a_create_accepts() {
         "case \"advertised-probe\": each version is named once, got {listed:?}"
     );
 
-    // Every advertised version is retryable: the same create naming it succeeds
-    // and the stored configuration reports it back.
-    for version in &listed {
-        let name = format!("advertised-{}", version.replace('.', "-"));
+    // Every version the catalogue publishes is retryable: the same create naming
+    // it succeeds and the stored configuration reports it back. Walked over the
+    // whole published catalogue, which is the gate — so it covers every version
+    // the refusal advertises AND the published rows it does not name.
+    for version in &published {
+        let advertised_here = listed.contains(version);
+        let name = format!("published-{}", version.replace('.', "-"));
         let reply = create(&emulator, &name, &[version.as_str()]).await;
         assert_eq!(
             (reply.status, reply.error_code()),
             (200, ""),
-            "case version={version:?}: an advertised version must be accepted, got {} {}",
+            "case version={version:?} (advertised={advertised_here}): a published version must \
+             be accepted, got {} {}",
             reply.status,
             reply.body
         );
@@ -364,14 +368,18 @@ async fn every_advertised_version_is_one_a_create_accepts() {
         );
     }
 
-    // And a version outside the advertised list is advertised by nothing and
-    // accepted by nothing — a variant spelling of a release the catalogue does
-    // publish, which names a build of its own, and a row the catalogue publishes
-    // that this operation does not take.
-    for version in ["3.8.link", "3.8.x.tiered", "3.9.x.kraft.link", "9.9.9", "3.9"] {
+    // And a version the catalogue publishes no row for is advertised by nothing
+    // and accepted by nothing — variant spellings of releases the catalogue does
+    // publish, each naming a build of its own, a truncated patch name and a
+    // release newer than everything published.
+    for version in ["3.8.x.link", "3.8.x.tiered", "3.9.x.kraft.link", "9.9.9", "3.9"] {
+        assert!(
+            !published.iter().any(|entry| entry == version),
+            "case version={version:?}: it must not be published, got {published:?}"
+        );
         assert!(
             !listed.iter().any(|entry| entry == version),
-            "case version={version:?}: a version outside the offering must not be advertised, \
+            "case version={version:?}: an unpublished version must not be advertised, \
              got {listed:?}"
         );
         let name = format!("unpublished-{}", version.replace('.', "-"));
@@ -379,7 +387,7 @@ async fn every_advertised_version_is_one_a_create_accepts() {
         assert_eq!(
             (reply.status, reply.error_code()),
             (400, "BadRequestException"),
-            "case version={version:?}: a version outside the offering must be refused, got {} {}",
+            "case version={version:?}: an unpublished version must be refused, got {} {}",
             reply.status,
             reply.body
         );
