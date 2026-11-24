@@ -21,7 +21,10 @@
 //! there is refused with the same `ValidationException` a mistyped `components`
 //! gets ([`validate_report_members`]) — a value of the wrong type cannot carry
 //! the scan's own data beside it, and a report that wrote the scan's data in its
-//! place would state the caller sent something it did not.
+//! place would state the caller sent something it did not. The members the scan
+//! reads a VALUE off are refused by the same rule ([`submitted_string`]): one of
+//! the wrong type is not a value that member can hold, and reading it as absent
+//! would resolve a component on a coordinate the caller never submitted.
 //!
 //! ## Reaching this service's state
 //!
@@ -839,6 +842,35 @@ fn submitted_services(tools: &Map<String, Value>) -> Result<Option<&Vec<Value>>,
     }
 }
 
+/// The string a submitted member carries, `None` when the object states none,
+/// or a refusal when the member is present and is not a string.
+///
+/// CycloneDX types every member this scan reads a VALUE off a string —
+/// `bomFormat`, `specVersion` and `serialNumber` on the document, and `type`,
+/// `name`, `version`, `purl` and `bom-ref` on a component — so a value of
+/// another JSON type is not a value that member can hold, and the document is
+/// refused for the member it is, exactly as a mistyped `components` already is
+/// ([`nested_components`]). Read as ABSENT instead, such a member would decide
+/// the scan on a coordinate the caller never submitted: an unreadable `purl`
+/// would resolve the component under no ecosystem and an unreadable `version`
+/// under no release, so a package the advisory data does hold a rule for would
+/// be answered 200 — reported clean, or annotated as having no supported rules —
+/// and an unreadable `bom-ref` would escape the uniqueness rule the
+/// specification states for it.
+///
+/// A member present as `null` states no value, which is read as absent exactly
+/// as an absent member is.
+fn submitted_string<'o>(
+    object: &'o Map<String, Value>,
+    member: &'static str,
+) -> Result<Option<&'o str>, ScanSbomError> {
+    match object.get(member) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue(member))),
+    }
+}
+
 /// The submitted `serialNumber`, `None` when the document carries none, or a
 /// refusal when the member is present and is not a string.
 ///
@@ -846,11 +878,7 @@ fn submitted_services(tools: &Map<String, Value>) -> Result<Option<&Vec<Value>>,
 /// the report stamps its own only on a document that names none, so a value of
 /// another type left to fall through would be replaced by the scan's URN.
 fn submitted_serial_number(document: &Map<String, Value>) -> Result<Option<&str>, ScanSbomError> {
-    match document.get("serialNumber") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(serial)) => Ok(Some(serial.as_str())),
-        Some(_) => Err(invalid(SbomDefect::InvalidValue("serialNumber"))),
-    }
+    submitted_string(document, "serialNumber")
 }
 
 /// Refuse a submitted document that carries one of the members the report is
@@ -877,7 +905,8 @@ fn validate_report_members(document: &Map<String, Value>) -> Result<(), ScanSbom
 }
 
 /// The `bom-ref` a component submitted, `None` when it carries none, or a
-/// refusal when the one it carries is longer than [`MAX_BOM_REF_LEN`].
+/// refusal when the one it carries is not a string ([`submitted_string`]) or is
+/// longer than [`MAX_BOM_REF_LEN`].
 ///
 /// The LENGTH bound is what keeps the ref a bounded cost: every submitted ref
 /// is retained for the uniqueness check above, once per component of the
@@ -886,11 +915,7 @@ fn validate_report_members(document: &Map<String, Value>) -> Result<(), ScanSbom
 /// it, is what makes neither the component count nor the nesting depth the only
 /// limit on what one request can allocate.
 fn submitted_bom_ref(object: &Map<String, Value>) -> Result<Option<&str>, ScanSbomError> {
-    let Some(submitted) = object
-        .get("bom-ref")
-        .and_then(Value::as_str)
-        .filter(|r| !r.is_empty())
-    else {
+    let Some(submitted) = submitted_string(object, "bom-ref")?.filter(|r| !r.is_empty()) else {
         return Ok(None);
     };
     if submitted.chars().count() > MAX_BOM_REF_LEN {
@@ -935,12 +960,9 @@ fn resolve_component_tree(
     for entry in entries {
         let object = component_object(entry)?;
 
-        let name = object.get("name").and_then(Value::as_str).unwrap_or_default();
-        let declared_version = object
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let purl = object.get("purl").and_then(Value::as_str);
+        let name = submitted_string(object, "name")?.unwrap_or_default();
+        let declared_version = submitted_string(object, "version")?.unwrap_or_default();
+        let purl = submitted_string(object, "purl")?;
 
         // CycloneDX 1.5 makes `type` and `name` REQUIRED on a component, and
         // constrains `type` to its `classification` enumeration, so a document
@@ -948,7 +970,7 @@ fn resolve_component_tree(
         // than scanned. `version` is NOT required (it stopped being so after
         // 1.3), so an entry without one is resolved and simply matches no
         // advisory — see below.
-        match object.get("type").and_then(Value::as_str) {
+        match submitted_string(object, "type")? {
             Some(declared) if CYCLONEDX_COMPONENT_TYPES.contains(&declared) => {}
             // Absent, or not one of the specification's component types.
             _ => return Err(invalid(SbomDefect::InvalidValue("type"))),
@@ -980,8 +1002,9 @@ fn resolve_component_tree(
                     parsed.namespace.clone(),
                 )
             }
-            // No purl: the entry names no ecosystem, so it is scanned under its
-            // own name and matches only an advisory recorded without one.
+            // No purl member at all (or one present as `null`): the entry names
+            // no ecosystem, so it is scanned under its own name and matches only
+            // an advisory recorded without one.
             None => (
                 String::new(),
                 name.to_string(),
@@ -1042,13 +1065,13 @@ fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
         .as_object()
         .ok_or_else(|| invalid(SbomDefect::CannotParse))?;
 
-    match object.get("bomFormat").and_then(Value::as_str) {
+    match submitted_string(object, "bomFormat")? {
         Some(CYCLONEDX_BOM_FORMAT) => {}
         // Absent, or naming a format that is not CycloneDX at all.
         _ => return Err(invalid(SbomDefect::InvalidValue("bomFormat"))),
     }
 
-    match object.get("specVersion").and_then(Value::as_str) {
+    match submitted_string(object, "specVersion")? {
         Some(CYCLONEDX_SPEC_VERSION) => {}
         // Absent, or a CycloneDX revision other than the one a scan reads.
         _ => return Err(invalid(SbomDefect::InvalidValue("specVersion"))),

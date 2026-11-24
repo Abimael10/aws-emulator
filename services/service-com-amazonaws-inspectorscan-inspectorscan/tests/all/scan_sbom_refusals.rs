@@ -802,3 +802,239 @@ async fn the_types_cyclonedx_allows_at_those_members_are_still_scanned() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// A member CycloneDX types as a string, carrying another JSON type
+// ---------------------------------------------------------------------------
+//
+// The same class once more, at the members a scan reads a VALUE off instead of
+// carrying over: a component's `type`, `name`, `version`, `purl` and `bom-ref`,
+// and the document's `bomFormat`, `specVersion` and `serialNumber`. CycloneDX
+// types every one of them a string, so a value of another JSON type is not a
+// value that member can hold and the document is refused naming it.
+//
+// Read as ABSENT instead, such a member decides the scan on a coordinate the
+// caller never submitted: an unreadable `purl` resolves the component under no
+// ecosystem and an unreadable `version` under no release, so a package the
+// advisory data does rule on is answered 200 — reported clean, or annotated as
+// having no supported rules — and an unreadable `bom-ref` escapes the
+// uniqueness rule the specification states for it.
+//
+// The rows differ along the member, the JSON type sent for it, the nesting
+// level (the top level and inside an assembly) and the site (a component's
+// member and the document's own). Each one keeps every OTHER member readable on
+// a release the advisory data holds a rule for, so a row that fell through
+// would be a finding the scan failed to report.
+
+/// One row: a document carrying one string-typed member sent as another JSON
+/// type, and the member the refusal clause must name.
+#[derive(Debug)]
+struct MistypedStringCase {
+    what: String,
+    sbom: Value,
+    member: &'static str,
+}
+
+/// Every JSON type that is not a string, excluding `null` — which states no
+/// value and is read as absent, as the accepted side below pins.
+fn non_string_values() -> Vec<(&'static str, Value)> {
+    vec![
+        ("a number", json!(42)),
+        ("a boolean", json!(true)),
+        ("an array", json!(["lodash"])),
+        ("an object", json!({ "value": "lodash" })),
+    ]
+}
+
+/// A component whose every member is readable, naming `lodash@4.17.20` — the
+/// release `src/state.rs::seed_vulnerability_db` records CVE-2021-23337 for.
+fn vulnerable_component() -> Value {
+    component("ref-lodash", "lodash", "4.17.20", "pkg:npm/lodash@4.17.20")
+}
+
+/// [`vulnerable_component`] with `member` replaced by `value`.
+fn vulnerable_component_with(member: &str, value: Value) -> Value {
+    let mut entry = vulnerable_component();
+    entry[member] = value;
+    entry
+}
+
+/// A document whose only component is [`vulnerable_component_with`].
+fn component_with(member: &str, value: Value) -> Value {
+    bom(vec![vulnerable_component_with(member, value)])
+}
+
+/// The same, one level down inside an assembly: a component's members are read
+/// at every level of the tree, so what is refused does not depend on the depth.
+fn nested_component_with(member: &str, value: Value) -> Value {
+    let child = vulnerable_component_with(member, value);
+    bom(vec![json!({
+        "type": "application",
+        "bom-ref": "ref-assembly",
+        "name": "app",
+        "version": "1.0.0",
+        "components": [child],
+    })])
+}
+
+/// A document whose only component is [`vulnerable_component`] carrying no
+/// `member` at all.
+fn component_without(member: &str) -> Value {
+    let mut entry = vulnerable_component();
+    entry
+        .as_object_mut()
+        .expect("the component helper builds a JSON object")
+        .remove(member);
+    bom(vec![entry])
+}
+
+fn mistyped_string_cases() -> Vec<MistypedStringCase> {
+    let mut cases = Vec::new();
+
+    // A component's own string-typed members, at the top level and nested.
+    for member in ["type", "name", "version", "purl", "bom-ref"] {
+        for (shape, value) in non_string_values() {
+            cases.push(MistypedStringCase {
+                what: format!("a component's {member} sent as {shape}"),
+                sbom: component_with(member, value.clone()),
+                member,
+            });
+            cases.push(MistypedStringCase {
+                what: format!("a nested component's {member} sent as {shape}"),
+                sbom: nested_component_with(member, value),
+                member,
+            });
+        }
+    }
+
+    // The document's own string-typed members.
+    for member in ["bomFormat", "specVersion", "serialNumber"] {
+        for (shape, value) in non_string_values() {
+            let mut sbom = bom(vec![vulnerable_component()]);
+            sbom[member] = value;
+            cases.push(MistypedStringCase {
+                what: format!("a document's {member} sent as {shape}"),
+                sbom,
+                member,
+            });
+        }
+    }
+
+    // A `version` that is not a string, on a `purl` that names no version
+    // either: nothing is left to resolve the release from, so falling through
+    // would compare a vulnerable component against no version at all.
+    let mut unversioned = vulnerable_component();
+    unversioned["purl"] = json!("pkg:npm/lodash");
+    unversioned["version"] = json!(4.17);
+    cases.push(MistypedStringCase {
+        what: "a component's version sent as a number, with a purl naming none".to_string(),
+        sbom: bom(vec![unversioned]),
+        member: "version",
+    });
+
+    // Two components whose refs are both unreadable: the uniqueness rule cannot
+    // be applied to a ref that is not a string, so the member is refused first.
+    cases.push(MistypedStringCase {
+        what: "two components whose bom-ref is the same non-string value".to_string(),
+        sbom: bom(vec![
+            vulnerable_component_with("bom-ref", json!(5)),
+            {
+                let mut other =
+                    component("ref-minimist", "minimist", "1.2.5", "pkg:npm/minimist@1.2.5");
+                other["bom-ref"] = json!(5);
+                other
+            },
+        ]),
+        member: "bom-ref",
+    });
+
+    cases
+}
+
+#[tokio::test]
+async fn a_string_typed_member_carrying_another_json_type_is_refused_naming_it() {
+    let (_engine, router) = emulator();
+    for case in mistyped_string_cases() {
+        let (status, response) = post_scan(&router, &json!({ "sbom": case.sbom.clone() })).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected HTTP 400, got {status}: {response}",
+            case.what
+        );
+        assert_eq!(
+            response["__type"].as_str(),
+            Some("ValidationException"),
+            "case {:?}: expected the ValidationException error code, got {response}",
+            case.what
+        );
+        let expected = invalid_value(case.member);
+        assert_eq!(
+            response["message"].as_str(),
+            Some(expected.as_str()),
+            "case {:?}: expected message {expected:?}, got {response}",
+            case.what
+        );
+        assert!(
+            response.get("sbom").is_none(),
+            "case {:?}: a refused call carries no report, got {response}",
+            case.what
+        );
+    }
+}
+
+/// The ACCEPTED side of that rule: the same members carrying the string
+/// CycloneDX types them as, absent, or present as `null` — which states no
+/// value — are all scanned, so the refusals above are the type check and not a
+/// refusal of the members themselves.
+#[tokio::test]
+async fn the_string_typed_members_are_read_when_they_carry_a_string() {
+    let accepted = vec![
+        ("every member readable", bom(vec![vulnerable_component()])),
+        (
+            "a component nested inside an assembly",
+            nested_component_with("name", json!("lodash")),
+        ),
+        ("no version", component_without("version")),
+        ("a null version", component_with("version", Value::Null)),
+        ("no purl", component_without("purl")),
+        ("a null purl", component_with("purl", Value::Null)),
+        ("no bom-ref", component_without("bom-ref")),
+        ("a null bom-ref", component_with("bom-ref", Value::Null)),
+    ];
+
+    let (_engine, router) = emulator();
+    for (what, sbom) in accepted {
+        let (status, response) = post_scan(&router, &json!({ "sbom": sbom })).await;
+        assert_eq!(
+            status, 200,
+            "case {what:?}: expected HTTP 200, got {status}: {response}"
+        );
+        assert!(
+            response["sbom"].is_object(),
+            "case {what:?}: expected a report, got {response}"
+        );
+    }
+}
+
+/// And the component those rows are written around IS one the advisory data
+/// rules on: with every member readable the scan reports the finding, so a row
+/// refused above is a finding that silently went missing before.
+#[tokio::test]
+async fn a_readable_component_is_ruled_on_rather_than_reported_clean() {
+    let (_engine, router) = emulator();
+    let (status, response) =
+        post_scan(&router, &json!({ "sbom": bom(vec![vulnerable_component()]) })).await;
+    assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
+    let ids: Vec<String> = response["sbom"]["vulnerabilities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|finding| finding["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["CVE-2021-23337".to_string()],
+        "a readable lodash@4.17.20 is ruled on by the stored advisory, got {response}"
+    );
+}
