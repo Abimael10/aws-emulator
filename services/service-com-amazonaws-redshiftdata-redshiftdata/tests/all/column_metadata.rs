@@ -6,14 +6,17 @@
 //!
 //! The RULE under test: a column is described from its TYPE and from its
 //! ORIGIN, and the same description serves a result set (`GetStatementResult`)
-//! and a table of the catalog (`DescribeTable`).
+//! and a table of the catalog (`DescribeTable`) — except for `length`, which
+//! the catalogue surface populates and the result-set surface does not.
 //!
 //! * `precision` is "the precision value of a decimal number column, or the
 //!   column length for a non-numeric column": the size the column's type
 //!   declares, that type's documented default size when the declaration named
 //!   none, and the width of the type's widest value for a type that declares no
 //!   size at all. A computed column's type is the one the statement CASTS it to.
-//! * `length` carries nothing — the width is reported in `precision`.
+//! * `length`, "the length of the column", is the column's declared width — the
+//!   same width `precision` carries — on the catalogue surface, and 0 on the
+//!   data-path surface, which describes whatever a statement produced.
 //! * `scale` is the declared number of decimal places of an exact-numeric
 //!   column, and the fractional-seconds precision of a datetime one.
 //! * `nullable` is 0 for a column its relation declares `NOT NULL` and 1 for
@@ -86,8 +89,10 @@ fn cluster() -> Value {
     json!({"ClusterIdentifier": "my-cluster", "Database": "dev", "DbUser": "awsuser"})
 }
 
-/// Assert the type facts of one column.
-fn assert_type(case: &str, column: &Value, precision: i64, scale: i64) {
+/// Assert the type facts of one column, with the `length` the surface it was
+/// read from reports: the declared width on the catalogue surface, and 0 on the
+/// data-path one.
+fn assert_type(case: &str, column: &Value, precision: i64, scale: i64, length: i64) {
     assert_eq!(
         number(column, "precision"),
         precision,
@@ -100,8 +105,8 @@ fn assert_type(case: &str, column: &Value, precision: i64, scale: i64) {
     );
     assert_eq!(
         number(column, "length"),
-        0,
-        "case {case}: a column's width is reported in precision, so length carries 0, got {column}"
+        length,
+        "case {case}: expected length {length}, got {column}"
     );
 }
 
@@ -125,7 +130,7 @@ async fn a_stored_column_reports_the_size_its_declaration_calls_for() {
             1,
             "case {case}: expected one described column, got {fetched}"
         );
-        assert_type(case, &columns[0], row.precision, row.scale);
+        assert_type(case, &columns[0], row.precision, row.scale, 0);
 
         let mut request = cluster();
         request["Table"] = json!("t");
@@ -136,11 +141,15 @@ async fn a_stored_column_reports_the_size_its_declaration_calls_for() {
             1,
             "case {case}: expected one catalogued column, got {described}"
         );
-        assert_type(case, &catalogued[0], row.precision, row.scale);
+        assert_type(case, &catalogued[0], row.precision, row.scale, row.precision);
+        // The two surfaces describe the column identically but for `length`,
+        // which only the catalogue read carries.
+        let mut data_path = catalogued[0].clone();
+        data_path["length"] = json!(0);
         assert_eq!(
-            catalogued[0], columns[0],
-            "case {case}: the result set and the catalog describe the column the same way, got \
-             {described}"
+            data_path, columns[0],
+            "case {case}: the catalog and the result set describe the column the same way apart \
+             from its length, got {described}"
         );
     }
 }
@@ -165,14 +174,14 @@ async fn a_cast_column_reports_the_size_of_the_type_it_is_cast_to() {
             1,
             "case {case}: expected one described column, got {fetched}"
         );
-        assert_type(case, &columns[0], row.precision, row.scale);
+        assert_type(case, &columns[0], row.precision, row.scale, 0);
     }
 
     // And the `::` spelling of the same cast is the same cast.
     let id = emulator.run("SELECT 'x'::VARCHAR(8) AS col").await;
     let fetched = emulator.ok("GetStatementResult", &json!({"Id": id})).await;
     let columns = list(&fetched, "ColumnMetadata");
-    assert_type("'x'::VARCHAR(8)", &columns[0], 8, 0);
+    assert_type("'x'::VARCHAR(8)", &columns[0], 8, 0, 0);
 }
 
 /// One row of the origin table: a statement, and for each of its result columns

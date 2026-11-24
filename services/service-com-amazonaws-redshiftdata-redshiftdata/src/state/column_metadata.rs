@@ -9,6 +9,11 @@
 //! the precision, the scale and the signedness that type carries) and from its
 //! ORIGIN (the relation it is read from, and the nullability that relation
 //! declares for it), whichever operation is reporting it.
+//!
+//! The two surfaces differ in ONE member. `length`, "the length of the column",
+//! is a fact of a column's DECLARATION, so the catalogue read reports it
+//! ([`catalogue_column_metadata`]) and the result-set read — which describes
+//! whatever a statement produced, declaration or not — does not.
 
 use super::*;
 
@@ -392,9 +397,11 @@ pub(super) fn column_metadata(
         name: Some(name.to_string()),
         precision: column_type.map_or(0, precision_of),
         scale: column_type.map_or(0, scale_of),
-        // A column's width is what `precision` carries — "the precision value
-        // of a decimal number column, or the column length for a non-numeric
-        // column" — so it is reported there and `length` carries nothing.
+        // "The length of the column" is reported on the CATALOGUE surface
+        // only ([`catalogue_column_metadata`]): a column of a result set is
+        // described from what the statement produced rather than from a
+        // relation's declaration, so no declared length is reported for it and
+        // its width is carried by `precision` alone.
         length: 0,
         type_name,
         // "The name of the schema that contains the table that includes the
@@ -409,6 +416,32 @@ pub(super) fn column_metadata(
         // declares as its `DEFAULT`, and nothing for a column that declares
         // none or belongs to no relation.
         column_default: origin.and_then(|origin| origin.declared.column_default.clone()),
+    }
+}
+
+/// Build the modelled `ColumnMetadata` for one column of the database's
+/// CATALOGUE, which carries one fact more than the result-set projection does:
+/// `length`, "the length of the column".
+///
+/// A catalogue read describes a column the database DECLARES, so that column's
+/// declared width is known and reported — the same width `precision` carries
+/// for it, "the precision value of a decimal number column, or the column
+/// length for a non-numeric column": the size its declaration names, that
+/// type's default size when the declaration named none, and the width of the
+/// type's widest value for a type that declares no size of its own
+/// ([`precision_of`]). A column no type was resolved for declares no width and
+/// reports none.
+///
+/// Everything else a column reports is the one projection both surfaces share
+/// ([`column_metadata`]), so the two answers differ in this member alone.
+pub(super) fn catalogue_column_metadata(
+    name: &str,
+    column_type: Option<&ColumnType>,
+    origin: Option<&ColumnOrigin>,
+) -> ColumnMetadata {
+    ColumnMetadata {
+        length: column_type.map_or(0, precision_of),
+        ..column_metadata(name, column_type, origin)
     }
 }
 
@@ -589,7 +622,7 @@ fn read_catalog(
                         .cloned()
                         .unwrap_or_default(),
                 };
-                column_metadata(column.name(), column_type.as_ref(), Some(&origin))
+                catalogue_column_metadata(column.name(), column_type.as_ref(), Some(&origin))
             })
             .collect();
         described.push(TableColumns {
