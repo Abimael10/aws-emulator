@@ -55,7 +55,10 @@ const TRUST_STORE_NOT_FOUND: &str = "TrustStoreNotFound";
 const OTHER_ACCOUNT: &str = "210987654321";
 
 /// `GetTrustStoreCaCertificatesBundle` for `trust_store_arn`.
-async fn get_ca_bundle(emulator: &Emulator, trust_store_arn: &str) -> Reply {
+///
+/// `pub(crate)`: the suite beside this one (`crate::trust_store_ca_bundle_versions`) reads a
+/// bundle back through the same request, so neither can drift on how the read is addressed.
+pub(crate) async fn get_ca_bundle(emulator: &Emulator, trust_store_arn: &str) -> Reply {
     let mut form = action("GetTrustStoreCaCertificatesBundle");
     form.push(p("TrustStoreArn", trust_store_arn));
     call(&emulator.router, &form).await
@@ -64,7 +67,10 @@ async fn get_ca_bundle(emulator: &Emulator, trust_store_arn: &str) -> Reply {
 /// The `Location` a read reported, with the XML entities the serializer writes resolved — a
 /// pre-signed address carries `&` between its query fields, so the assertion compares the
 /// VALUE rather than its encoding.
-fn reported_location(reply: &Reply, case: &str) -> String {
+///
+/// `pub(crate)`: shared with `crate::trust_store_ca_bundle_versions`, so both suites read a
+/// reported address the same way.
+pub(crate) fn reported_location(reply: &Reply, case: &str) -> String {
     unescaped(
         &first_text(&reply.body, "Location")
             .unwrap_or_else(|| panic!("case {case:?}: no Location in {}", reply.body)),
@@ -73,7 +79,10 @@ fn reported_location(reply: &Reply, case: &str) -> String {
 
 /// Assert that `location` is a pre-signed address of the object `key` under
 /// [`BUNDLE_BUCKET`], valid for the window the model documents.
-fn assert_presigned(case: &str, location: &str, key: &str) {
+///
+/// `pub(crate)`: shared with `crate::trust_store_ca_bundle_versions`, so what makes an
+/// address pre-signed is asserted in ONE place.
+pub(crate) fn assert_presigned(case: &str, location: &str, key: &str) {
     assert!(
         location.contains(&format!("/{BUNDLE_BUCKET}/")),
         "case {case:?}: expected an address of an object under {BUNDLE_BUCKET}, \
@@ -93,7 +102,10 @@ fn assert_presigned(case: &str, location: &str, key: &str) {
 }
 
 /// How many certificates the trust store `arn` reports, read back through the describe.
-async fn reported_certificates(emulator: &Emulator, arn: &str, case: &str) -> i64 {
+///
+/// `pub(crate)`: shared with `crate::trust_store_ca_bundle_versions`, which checks the count
+/// against the bundle VERSION the trust store was pointed at.
+pub(crate) async fn reported_certificates(emulator: &Emulator, arn: &str, case: &str) -> i64 {
     let described = describe_trust_stores(emulator, &[p("TrustStoreArns.member.1", arn)]).await;
     let trust_store = only_trust_store(&described, case);
     first_text(&trust_store, "NumberOfCaCertificates")
