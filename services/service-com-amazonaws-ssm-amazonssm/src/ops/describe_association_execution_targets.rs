@@ -6,8 +6,10 @@
 //! an execution are the managed nodes State Manager dispatched that run to, resolved when it
 //! was dispatched and held with it ([`crate::state::association_executions`]), so this read
 //! reports what the dispatch persisted and writes nothing. An id that names no association
-//! of the Region the request was signed for is `AssociationDoesNotExist`, and one that names
-//! no execution of that association is `AssociationExecutionDoesNotExist`.
+//! of the Region the request was signed for is `AssociationDoesNotExist`; an `ExecutionId`
+//! that names no execution of a KNOWN association selects no target, which is an empty page
+//! rather than a refusal, the way every selecting read of this service answers one that
+//! matches nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -195,7 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The specified association doesn't exist (`AssociationDoesNotExist`): an
         // association is reachable through the Region it was created in, by the id that
-        // create minted, and the refusal NAMES the id that resolved to none.
+        // create minted, and the refusal NAMES the id that resolved to none. The not-found
+        // refusal of this read is scoped to the ASSOCIATION: an id resolving to no
+        // association is all this operation refuses.
         let Some(association) = store.association(&region, &input.association_id) else {
             return Err(
                 DescribeAssociationExecutionTargetsErrorModeled::AssociationDoesNotExist(
@@ -208,20 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // "The specified execution ID doesn't exist" (`AssociationExecutionDoesNotExist`):
-        // the execution has to be one of the runs this association has had.
+        // An `ExecutionId` this association has had no run under names no target of it, and
+        // a read that selects nothing is an empty PAGE rather than a failure: a caller
+        // polling for the targets of a run it has not observed yet is told there are none,
+        // the way every other selecting read of this service answers one that matches
+        // nothing. So the execution is resolved to the run it names, or to no targets at all.
         let Some(execution) = association.execution(&input.execution_id) else {
-            return Err(
-                DescribeAssociationExecutionTargetsErrorModeled::AssociationExecutionDoesNotExist(
-                    AssociationExecutionDoesNotExist {
-                        message: Some(
-                            association_executions::ASSOCIATION_EXECUTION_DOES_NOT_EXIST
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Ok(DescribeAssociationExecutionTargetsOutput {
+                association_execution_targets: Some(Vec::new()),
+                next_token: None,
+            });
         };
 
         // The targets are the nodes the run was dispatched to, in the ascending node-id

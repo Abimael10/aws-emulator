@@ -2220,6 +2220,17 @@ pub fn invalid_next_token_message(token: &str) -> String {
 /// prefix (`OPERATIONS.md`, "Wire protocol").
 pub const SDK_ENVELOPE_SERVICE: &str = "AmazonSSM";
 
+/// Where the envelope that trails such a refusal opens, naming the service that answered.
+const SDK_ENVELOPE_OPENING: &str = " (Service: ";
+
+/// The field of that envelope naming the request the response answers, which is the one
+/// field read back out of a rendered message ([`sdk_envelope_request_id`]).
+const SDK_ENVELOPE_REQUEST_ID: &str = "; Request ID: ";
+
+/// Where that envelope closes: the proxy field, which an in-process answer came through
+/// none of.
+const SDK_ENVELOPE_CLOSING: &str = "; Proxy: null)";
+
 /// `body` followed by the envelope that trails a refusal of this service worded by its own
 /// validation: ` (Service: AmazonSSM; Status Code: <status>; Error Code: <code>; Request
 /// ID: <id>; Proxy: null)`.
@@ -2235,10 +2246,35 @@ pub const SDK_ENVELOPE_SERVICE: &str = "AmazonSSM";
 /// One function, so every refusal worded this way carries the envelope in the same shape.
 pub fn with_sdk_error_envelope(body: &str, status_code: u16, error_code: &str) -> String {
     format!(
-        "{body} (Service: {SDK_ENVELOPE_SERVICE}; Status Code: {status_code}; \
-         Error Code: {error_code}; Request ID: {}; Proxy: null)",
+        "{body}{SDK_ENVELOPE_OPENING}{SDK_ENVELOPE_SERVICE}; Status Code: {status_code}; Error \
+         Code: {error_code}{SDK_ENVELOPE_REQUEST_ID}{}{SDK_ENVELOPE_CLOSING}",
         ::service_common::query_error_envelope::new_request_id()
     )
+}
+
+/// The request id a message stated in that envelope, or `None` for a message that states
+/// none.
+///
+/// The envelope above names the request the response answers INSIDE the message, so the
+/// response has to report that same id in the header a client correlates on
+/// ([`crate::service`] does, through this reading): a message naming one request and a
+/// header naming another would be two ids for one call. Read off the rendered answer, from
+/// the two markers the writer above puts the field between, so the writer and the reader
+/// cannot drift apart.
+///
+/// Only a well-formed id of the form this emulator mints is reported
+/// (`service_common::query_error_envelope::is_request_id`), and only one stated inside a
+/// complete envelope: the reading is textual, and the body of a message is the one part of
+/// a refusal a request can influence.
+pub fn sdk_envelope_request_id(message: &str) -> Option<&str> {
+    let closing = message.rfind(SDK_ENVELOPE_CLOSING)?;
+    let stated = &message[..closing];
+    let field = stated.rfind(SDK_ENVELOPE_REQUEST_ID)?;
+    if !stated[..field].contains(SDK_ENVELOPE_OPENING) {
+        return None;
+    }
+    let request_id = &stated[field + SDK_ENVELOPE_REQUEST_ID.len()..];
+    ::service_common::query_error_envelope::is_request_id(request_id).then_some(request_id)
 }
 
 /// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
@@ -3645,6 +3681,27 @@ impl ManagedNodeRecord {
 /// an expiration date, the activation code expires in 24 hours"
 /// (`CreateActivationRequest$ExpirationDate`).
 pub const DEFAULT_ACTIVATION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How far ahead of now an activation may be asked to expire: "You can specify a date up
+/// to 30 days in advance" (`CreateActivationRequest$ExpirationDate`).
+pub const MAX_ACTIVATION_LEAD: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How Systems Manager refuses an `ExpirationDate` outside that window — entirely fixed
+/// text, naming neither the date the request asked for nor the bound it broke. The bound
+/// the sentence states is [`MAX_ACTIVATION_LEAD`].
+pub const ACTIVATION_EXPIRATION_OUT_OF_WINDOW: &str =
+    "expirationDate must be greater than now and lesser than 30 days.";
+
+/// Whether `requested` is a date an activation cannot be asked to expire at, as of `now`.
+///
+/// The window is the documented one, open at both ends: an expiry already reached (or
+/// reached exactly now) would mint an activation no node could ever register with, and one
+/// further ahead than [`MAX_ACTIVATION_LEAD`] is past "a date up to 30 days in advance".
+/// A request naming no date at all is not held to it — the service picks that date itself
+/// ([`DEFAULT_ACTIVATION_LIFETIME`]), inside the window by construction.
+pub fn activation_expiration_out_of_window(requested: SystemTime, now: SystemTime) -> bool {
+    requested <= now || requested > now + MAX_ACTIVATION_LEAD
+}
 
 /// How many nodes an activation may register when the request names no limit: "The
 /// default value is 1" (`CreateActivationRequest$RegistrationLimit`).

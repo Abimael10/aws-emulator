@@ -40,8 +40,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssm_amazonssm::state::{
-    association_executions, associations, ComAmazonawsSsmAmazonssmState, ManagedNodeRecord,
-    RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_MANAGED_INSTANCE,
+    associations, ComAmazonawsSsmAmazonssmState, ManagedNodeRecord, RESOURCE_TYPE_EC2_INSTANCE,
+    RESOURCE_TYPE_MANAGED_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1076,8 +1076,9 @@ async fn a_resume_token_naming_nothing_the_report_holds_is_refused() {
 
 /// RULE: an association id that names none of the Region's associations is
 /// `AssociationDoesNotExist` — whose message, on every operation that resolves an association
-/// by the id its request carries, NAMES the association asked about — and an execution id that
-/// names none of the association's executions is `AssociationExecutionDoesNotExist`.
+/// by the id its request carries, NAMES the association asked about, in the words the plane
+/// that answers it uses — and an execution id that names none of a KNOWN association's
+/// executions selects no target, which is an empty page rather than a refusal.
 #[tokio::test]
 async fn an_id_that_resolves_to_nothing_is_refused() {
     let case = "an id that resolves to nothing";
@@ -1092,24 +1093,40 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
 
     // One row per operation that resolves an association by the id its request carries —
     // the reads of it and the writes that dispatch or change it: every one of them refuses
-    // an id that resolves to nothing the same way, and names it.
-    let addressed_by_id = |asked_about: &str| -> Vec<(&'static str, Value)> {
+    // an id that resolves to nothing, and names it. Which SENTENCE it names it in is that
+    // operation's own fact, recorded per API (`state::associations`).
+    let addressed_by_id = |asked_about: &str| -> Vec<(&'static str, Value, String)> {
         vec![
             (
                 "DescribeAssociationExecutions",
                 json!({"AssociationId": asked_about}),
+                associations::association_does_not_exist(asked_about),
             ),
             (
                 "DescribeAssociationExecutionTargets",
                 json!({"AssociationId": asked_about, "ExecutionId": execution_id}),
+                associations::association_does_not_exist(asked_about),
             ),
-            ("DescribeAssociation", json!({"AssociationId": asked_about})),
+            (
+                "DescribeAssociation",
+                json!({"AssociationId": asked_about}),
+                associations::association_does_not_exist(asked_about),
+            ),
             (
                 "StartAssociationsOnce",
                 json!({"AssociationIds": [asked_about]}),
+                associations::association_id_does_not_exist(asked_about),
             ),
-            ("UpdateAssociation", json!({"AssociationId": asked_about})),
-            ("DeleteAssociation", json!({"AssociationId": asked_about})),
+            (
+                "UpdateAssociation",
+                json!({"AssociationId": asked_about}),
+                associations::association_does_not_exist(asked_about),
+            ),
+            (
+                "DeleteAssociation",
+                json!({"AssociationId": asked_about}),
+                associations::association_does_not_exist(asked_about),
+            ),
         ]
     };
     // The two ways an id resolves to no association of the endpoint it is asked through: one
@@ -1123,7 +1140,7 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
         ("another Region's view of an id", OTHER_REGION, id.clone()),
     ];
     for (row, region, asked_about) in rows {
-        for (operation, body) in addressed_by_id(&asked_about) {
+        for (operation, body, expected) in addressed_by_id(&asked_about) {
             let (status, parsed) = call_in_region(&router, region, operation, &body).await;
             assert_eq!(
                 (status, error_code(&parsed).as_str()),
@@ -1133,7 +1150,7 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
             );
             assert_eq!(
                 error_message(&parsed),
-                associations::association_does_not_exist(&asked_about),
+                expected,
                 "case {row:?} on {operation}: expected the refusal to name the association \
                  asked about, got {parsed:?}"
             );
@@ -1146,19 +1163,14 @@ async fn an_id_that_resolves_to_nothing_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 400,
-        "case {case:?}: expected HTTP 400 for an execution the association never had, got \
-         {status} with {parsed:?}"
+        status, 200,
+        "case {case:?}: an execution the association never had selects no target, which is an \
+         empty page, got {status} with {parsed:?}"
     );
     assert_eq!(
-        error_code(&parsed),
-        "AssociationExecutionDoesNotExist",
-        "case {case:?}: expected the execution refusal, got {parsed:?}"
-    );
-    assert_eq!(
-        error_message(&parsed),
-        association_executions::ASSOCIATION_EXECUTION_DOES_NOT_EXIST,
-        "case {case:?}: expected the wording of the execution refusal, got {parsed:?}"
+        parsed["AssociationExecutionTargets"],
+        json!([]),
+        "case {case:?}: expected an empty target list, got {parsed:?}"
     );
 }
 
@@ -1229,7 +1241,7 @@ async fn a_dispatch_that_reached_no_node_reports_no_result() {
 
 /// RULE: an association holds at most [`associations::MAX_ASSOCIATION_EXECUTIONS`] executions —
 /// the store's own ceiling — so a dispatch past it drops the association's OLDEST execution,
-/// which then resolves to none, while the dispatch itself still succeeds.
+/// which then selects no target, while the dispatch itself still succeeds.
 #[tokio::test]
 async fn an_association_holds_at_most_the_executions_the_store_keeps() {
     let case = "more dispatches than the store keeps executions of one association";
@@ -1266,9 +1278,9 @@ async fn an_association_holds_at_most_the_executions_the_store_keeps() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&parsed).as_str()),
-        (400, "AssociationExecutionDoesNotExist"),
-        "case {case:?}: an execution the store no longer holds resolves to none, got {status} \
+        (status, parsed["AssociationExecutionTargets"].clone()),
+        (200, json!([])),
+        "case {case:?}: an execution the store no longer holds selects no target, got {status} \
          with {parsed:?}"
     );
 

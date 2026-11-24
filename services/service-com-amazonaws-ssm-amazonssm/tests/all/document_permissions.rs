@@ -450,8 +450,8 @@ async fn a_removal_outranks_an_add_and_clears_only_what_it_names() {
     );
     assert_eq!(
         error_code(&response),
-        "ValidationException",
-        "case neither list: expected a ValidationException, got {response}"
+        "InvalidParameterException",
+        "case neither list: expected an InvalidParameterException, got {response}"
     );
     let mut reported = account_ids(&permissions_of(&router, "neither list", name).await);
     reported.sort();

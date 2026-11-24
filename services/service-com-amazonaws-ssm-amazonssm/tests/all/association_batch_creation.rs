@@ -8,8 +8,9 @@
 //! the parameters held to the ones that version declares — reporting every association it
 //! persisted in `Successful` and every entry it could not create in `Failed` with that
 //! entry, a description of the failure and its source, while a fault of the REQUEST as a
-//! whole (a managed node named by more than one entry, a batch that would take the Region
-//! past the documented association limit) refuses the call and persists nothing.
+//! whole (an entry naming a document this endpoint holds none of, a managed node named by
+//! more than one entry, a batch that would take the Region past the documented association
+//! limit) refuses the call and persists nothing.
 //!
 //! Every case goes through the front door a client uses, over the dispatch
 //! [`crate::state_manager_associations`] publishes, so this suite shares one calling
@@ -263,15 +264,12 @@ struct FailureRow {
 }
 
 /// The table of refusals: one row per class of failure an entry can run into.
+///
+/// A document the endpoint holds none of is NOT one of them: the batch is all-or-nothing
+/// about the documents its entries name, so that one refuses the whole call
+/// (`all/association_batch_document_refusal.rs`) rather than being reported per entry.
 fn failure_rows() -> Vec<FailureRow> {
     vec![
-        FailureRow {
-            case: "a document that doesn't exist",
-            prepared: None,
-            entry: json!({"Name": "no-such-document"}),
-            message: "Document does not exist: no-such-document".to_string(),
-            code: "InvalidDocument",
-        },
         FailureRow {
             case: "a version the document doesn't carry",
             prepared: None,

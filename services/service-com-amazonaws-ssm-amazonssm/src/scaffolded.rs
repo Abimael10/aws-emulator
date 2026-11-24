@@ -498,16 +498,78 @@ pub static MALFORMED_RESOURCE_POLICY_DOCUMENT_SCHEMA: Schema = Schema::new_struc
     &[&MALFORMED_RESOURCE_POLICY_DOCUMENT_MESSAGE],
 );
 
-/// The payload of a refusal this service's resource-policy plane words in a lowercase
-/// `message`: the modelled error code it answers with, the synthetic shape carrying that
-/// member, and the diagnostic itself.
+/// The `Message` member of a synthetic error shape this service words a refusal with under
+/// a code its own model does not declare.
 ///
-/// One payload for both such refusals rather than a copy each: they differ only in the
-/// error code and the shape id, and nothing else about rendering them.
+/// Spelled with a capital `M`, the way this service's error shapes that DO declare a message
+/// member spell it (`InvalidInstanceId$Message`, `InvalidNextToken$Message`), so a client
+/// reading one of these refusals finds the text where it finds every other.
+macro_rules! capital_message_member {
+    ($shape:literal) => {
+        Schema::new_member(
+            ShapeId::from_static(
+                concat!("smithy.framework#", $shape, "$Message"),
+                "smithy.framework",
+                "Message",
+            ),
+            ShapeType::String,
+            "Message",
+            0,
+        )
+        .with_xml_name("Message")
+        .with_json_name("Message")
+    };
+}
+
+/// See [`INVALID_PARAMETER_SCHEMA`].
+static INVALID_PARAMETER_MESSAGE: Schema = capital_message_member!("InvalidParameterException");
+
+/// Schema for the synthetic `InvalidParameterException` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the shapes above: this
+/// service's model declares no shape of that name at all, yet the service answers under that
+/// code — a request supplying neither of two members one of which it must is an
+/// `InvalidParameterException`, not a constraint violation of any member. The wire `__type`
+/// comes from [`OperationError::shape_name`] below.
+pub static INVALID_PARAMETER_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterException",
+        "smithy.framework",
+        "InvalidParameterException",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_MESSAGE],
+);
+
+/// See [`OPS_CENTER_INVALID_ARGUMENT_SCHEMA`].
+static OPS_CENTER_INVALID_ARGUMENT_MESSAGE: Schema =
+    capital_message_member!("OpsCenterInvalidArgumentException");
+
+/// Schema for the synthetic `OpsCenterInvalidArgumentException` error shape — the same case
+/// as [`INVALID_PARAMETER_SCHEMA`], for the code OpsCenter answers an argument it will not
+/// take under, which this service's model declares no shape of either.
+pub static OPS_CENTER_INVALID_ARGUMENT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#OpsCenterInvalidArgumentException",
+        "smithy.framework",
+        "OpsCenterInvalidArgumentException",
+    ),
+    ShapeType::Structure,
+    &[&OPS_CENTER_INVALID_ARGUMENT_MESSAGE],
+);
+
+/// The payload of a refusal this service words under a code of its own: the error code it
+/// answers with, the synthetic shape carrying the member the text travels in, that member,
+/// and the diagnostic itself.
+///
+/// One payload for every such refusal rather than a copy each: they differ only in the error
+/// code, the shape id and which member the text travels in, and in nothing else about
+/// rendering them.
 #[derive(Debug, Clone)]
-pub struct ResourcePolicyRefusal {
-    /// The wire error code: the MODELLED error's own name, which is the class a client
-    /// matches on.
+pub struct WordedRefusal {
+    /// The wire error code: the class a client matches on — a MODELLED error's own name
+    /// where the model declares one, and the name the service answers under where it does
+    /// not.
     code: &'static str,
     /// The synthetic shape whose one member carries [`Self::message`].
     shape: &'static Schema,
@@ -517,15 +579,15 @@ pub struct ResourcePolicyRefusal {
     pub message: String,
 }
 
-impl std::fmt::Display for ResourcePolicyRefusal {
+impl std::fmt::Display for WordedRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for ResourcePolicyRefusal {}
+impl std::error::Error for WordedRefusal {}
 
-impl SerializableStruct for ResourcePolicyRefusal {
+impl SerializableStruct for WordedRefusal {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(self.member, self.message.as_str())?;
         Ok(())
@@ -573,14 +635,18 @@ pub enum Scaffolded<E> {
     /// Run Command words this refusal. Answer it only where the operation models
     /// `InvalidCommandId`.
     InvalidCommandId(InvalidCommandIdMessage),
-    /// A refusal of this service's resource-policy plane, rendered as HTTP 400 with the
-    /// modelled error code it carries and the diagnostic in a lowercase `message`.
+    /// A refusal this service words under a code of its own, rendered as HTTP 400 with that
+    /// code and the diagnostic in the member the service puts it in.
     ///
-    /// The modelled shapes declare `Message`, and that plane words these two refusals in
-    /// `message`, which a handler cannot reach through the modelled shape. Answer one only
-    /// where the operation models the error code it carries ([`Scaffolded::resource_policy_not_found`],
-    /// [`Scaffolded::malformed_resource_policy_document`]).
-    ResourcePolicyRefusal(ResourcePolicyRefusal),
+    /// Two kinds reach it. A MODELLED error whose shape declares a member the handler cannot
+    /// reach through it — the two refusals of the resource-policy plane, worded in a
+    /// lowercase `message` ([`Scaffolded::resource_policy_not_found`],
+    /// [`Scaffolded::malformed_resource_policy_document`]) — and a code this service's model
+    /// declares NO shape for, which the service nonetheless answers under
+    /// ([`Scaffolded::invalid_parameter`], [`Scaffolded::ops_center_invalid_argument`]).
+    /// Answer one of the first kind only where the operation models the error code it
+    /// carries.
+    Worded(WordedRefusal),
     /// A resource type this service does not support. Renders as HTTP 400 with the error
     /// code `InvalidResourceType` and a `Message` saying which type was rejected.
     ///
@@ -661,7 +727,7 @@ impl<E> Scaffolded<E> {
     /// `ResourcePolicyNotFoundException`: the error code is that modelled refusal's, and
     /// only the member its text travels in is synthetic.
     pub fn resource_policy_not_found(message: impl Into<String>) -> Self {
-        Self::ResourcePolicyRefusal(ResourcePolicyRefusal {
+        Self::Worded(WordedRefusal {
             code: "ResourcePolicyNotFoundException",
             shape: &RESOURCE_POLICY_NOT_FOUND_SCHEMA,
             member: &RESOURCE_POLICY_NOT_FOUND_MESSAGE,
@@ -673,10 +739,42 @@ impl<E> Scaffolded<E> {
     /// `MalformedResourcePolicyDocumentException` carrying `message` in a lowercase
     /// `message` member. Same scope as [`Self::resource_policy_not_found`].
     pub fn malformed_resource_policy_document(message: impl Into<String>) -> Self {
-        Self::ResourcePolicyRefusal(ResourcePolicyRefusal {
+        Self::Worded(WordedRefusal {
             code: "MalformedResourcePolicyDocumentException",
             shape: &MALFORMED_RESOURCE_POLICY_DOCUMENT_SCHEMA,
             member: &MALFORMED_RESOURCE_POLICY_DOCUMENT_MESSAGE,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse a call whose arguments this service will not take, with HTTP 400
+    /// `InvalidParameterException` carrying `message` in a `Message` member.
+    ///
+    /// The class Systems Manager answers for an argument fault that is no constraint
+    /// violation of a single member — a call supplying neither of two optional members one of
+    /// which it must. This service's model declares no shape of that name, so the code and
+    /// the member it travels in are the service's own ([`INVALID_PARAMETER_SCHEMA`]);
+    /// `message` is the sentence the service words such a refusal with.
+    pub fn invalid_parameter(message: impl Into<String>) -> Self {
+        Self::Worded(WordedRefusal {
+            code: "InvalidParameterException",
+            shape: &INVALID_PARAMETER_SCHEMA,
+            member: &INVALID_PARAMETER_MESSAGE,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse an OpsCenter call whose argument that plane will not take, with HTTP 400
+    /// `OpsCenterInvalidArgumentException` carrying `message` in a `Message` member.
+    ///
+    /// Same case as [`Self::invalid_parameter`]: the code is one this service's model
+    /// declares no shape for and OpsCenter answers under
+    /// ([`OPS_CENTER_INVALID_ARGUMENT_SCHEMA`]).
+    pub fn ops_center_invalid_argument(message: impl Into<String>) -> Self {
+        Self::Worded(WordedRefusal {
+            code: "OpsCenterInvalidArgumentException",
+            shape: &OPS_CENTER_INVALID_ARGUMENT_SCHEMA,
+            member: &OPS_CENTER_INVALID_ARGUMENT_MESSAGE,
             message: message.into(),
         })
     }
@@ -691,7 +789,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::InvalidFilterKey(e) => write!(f, "{e}"),
             Self::InvocationDoesNotExist(e) => write!(f, "{e}"),
             Self::InvalidCommandId(e) => write!(f, "{e}"),
-            Self::ResourcePolicyRefusal(e) => write!(f, "{e}"),
+            Self::Worded(e) => write!(f, "{e}"),
             Self::InvalidResourceType(e) => write!(f, "{e}"),
         }
     }
@@ -708,7 +806,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::InvalidFilterKey(e) => e.source(),
             Self::InvocationDoesNotExist(e) => e.source(),
             Self::InvalidCommandId(e) => e.source(),
-            Self::ResourcePolicyRefusal(e) => e.source(),
+            Self::Worded(e) => e.source(),
             Self::InvalidResourceType(e) => e.source(),
         }
     }
@@ -727,7 +825,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidFilterKey(e) => e,
             Self::InvocationDoesNotExist(e) => e,
             Self::InvalidCommandId(e) => e,
-            Self::ResourcePolicyRefusal(e) => e,
+            Self::Worded(e) => e,
             Self::InvalidResourceType(e) => e,
         }
     }
@@ -740,7 +838,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidFilterKey(_) => &INVALID_FILTER_KEY_SCHEMA,
             Self::InvocationDoesNotExist(_) => &INVOCATION_DOES_NOT_EXIST_SCHEMA,
             Self::InvalidCommandId(_) => &INVALID_COMMAND_ID_SCHEMA,
-            Self::ResourcePolicyRefusal(e) => e.shape,
+            Self::Worded(e) => e.shape,
             Self::InvalidResourceType(_) => &INVALID_RESOURCE_TYPE_SCHEMA,
         }
     }
@@ -757,7 +855,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::InvalidFilterKey(_) => "InvalidFilterKey",
             Self::InvocationDoesNotExist(_) => "InvocationDoesNotExist",
             Self::InvalidCommandId(_) => "InvalidCommandId",
-            Self::ResourcePolicyRefusal(e) => e.code,
+            Self::Worded(e) => e.code,
             Self::InvalidResourceType(_) => "InvalidResourceType",
         }
     }
@@ -774,7 +872,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             | Self::InvalidFilterKey(_)
             | Self::InvocationDoesNotExist(_)
             | Self::InvalidCommandId(_)
-            | Self::ResourcePolicyRefusal(_)
+            | Self::Worded(_)
             | Self::InvalidResourceType(_) => 400,
         }
     }
@@ -791,7 +889,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             | Self::InvalidFilterKey(_)
             | Self::InvocationDoesNotExist(_)
             | Self::InvalidCommandId(_)
-            | Self::ResourcePolicyRefusal(_)
+            | Self::Worded(_)
             | Self::InvalidResourceType(_) => None,
         }
     }

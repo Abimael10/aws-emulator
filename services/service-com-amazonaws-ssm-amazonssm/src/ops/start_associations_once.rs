@@ -169,12 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every id has to name an association of this Region before anything is dispatched:
         // "The specified association doesn't exist" (`AssociationDoesNotExist`), worded with
         // the id the call carried, so a caller naming several associations can tell which of
-        // them is gone ([`crate::state::associations::association_does_not_exist`]).
+        // them is gone ([`crate::state::associations::association_id_does_not_exist`]).
         for association_id in &input.association_ids {
             if store.association(&region, association_id).is_none() {
                 return Err(StartAssociationsOnceErrorModeled::AssociationDoesNotExist(
                     AssociationDoesNotExist {
-                        message: Some(crate::state::associations::association_does_not_exist(
+                        message: Some(crate::state::associations::association_id_does_not_exist(
                             association_id,
                         )),
                     },

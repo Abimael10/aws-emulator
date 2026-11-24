@@ -177,11 +177,16 @@ pub fn public_share_limit_message() -> String {
     format!("You can publicly share up to {MAX_PUBLICLY_SHARED_DOCUMENTS} documents")
 }
 
-/// What a share call naming neither account list is refused with: "You must specify a value
-/// for this parameter or the AccountIdsToRemove parameter" (`AccountIdsToAdd`), so a call
-/// that names no account at all asks for no change this operation can make.
-pub const NO_ACCOUNTS_TO_MODIFY: &str = "You must specify a value for the AccountIdsToAdd \
-                                         parameter or the AccountIdsToRemove parameter";
+/// What a share call naming neither account list is refused with.
+///
+/// "You must specify a value for this parameter or the AccountIdsToRemove parameter"
+/// (`AccountIdsToAdd`) is the rule; the sentence the service states it in is this one,
+/// entirely fixed text naming both members — and the class it answers under is
+/// `InvalidParameterException` ([`crate::scaffolded::Scaffolded::invalid_parameter`]) rather
+/// than a constraint violation, because neither member on its own is outside anything the
+/// model declares: the fault is the pair.
+pub const NO_ACCOUNTS_TO_MODIFY: &str =
+    "Either AccountIdsToAdd or AccountIdsToRemove must be specified for API operation";
 
 /// What a delete of a document that is still shared is refused with: the sentence
 /// `InvalidDocumentOperation` states that rule in.

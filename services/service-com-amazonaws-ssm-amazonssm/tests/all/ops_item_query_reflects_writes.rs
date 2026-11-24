@@ -169,12 +169,12 @@ async fn an_edit_moves_the_ops_item_between_the_queries_it_satisfies() {
             after: filter("Priority", "Equal", &["4"]),
         },
         EditCase {
-            case: "the priority compared as a number, under the ordering operators",
+            case: "the priority a write raises, read under the operator that key accepts",
             title: "latency regression in checkout",
             created: json!({ "Priority": 2 }),
             edit: json!({ "Priority": 5 }),
-            before: filter("Priority", "LessThan", &["3"]),
-            after: filter("Priority", "GreaterThan", &["4"]),
+            before: filter("Priority", "Equal", &["2"]),
+            after: filter("Priority", "Equal", &["5"]),
         },
         EditCase {
             case: "the severity a write lowers",

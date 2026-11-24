@@ -17,12 +17,15 @@
 //! `AssociationAlreadyExists`, modelled for the single create, is not one of this
 //! operation's errors. Both lists are reported even when one of them is empty.
 //!
-//! The two refusals that are properties of the REQUEST rather than of one entry are
-//! answered as modelled errors instead, before anything is persisted: a managed node named
-//! by more than one entry ("You can't specify a managed node ID in more than one
-//! association", `DuplicateInstanceId`) and a Region that already holds the documented
-//! maximum, so that no entry of the batch could be created ("You can have at most 2,000
-//! active associations", `AssociationLimitExceeded`).
+//! The refusals that are properties of the REQUEST rather than of one entry are answered as
+//! modelled errors instead, before anything is persisted: an entry naming a document this
+//! endpoint holds none of ("the specified SSM document doesn't exist", `InvalidDocument`),
+//! a managed node named by more than one entry ("You can't specify a managed node ID in more
+//! than one association", `DuplicateInstanceId`) and a Region that already holds the
+//! documented maximum, so that no entry of the batch could be created ("You can have at most
+//! 2,000 active associations", `AssociationLimitExceeded`). A document the batch cannot
+//! resolve is one of them: the batch is all-or-nothing about the documents its entries name,
+//! so none of them is created and a caller is never left holding half a batch.
 //!
 //! `Entries` is modelled with a minimum and no maximum, so how many associations one call
 //! asks this process to make is bounded here rather than by the model
@@ -283,6 +286,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::validation(rejection.message()));
             }
             None => {}
+        }
+
+        // Every entry's document has to be one this endpoint holds BEFORE any association
+        // is created: a batch naming a document that does not exist is refused in whole
+        // with `InvalidDocument` ("the specified SSM document doesn't exist"), so the call
+        // is all-or-nothing about the documents it names and a caller reading a 200 never
+        // has to clean up associations the refusal left behind. The entry-level `Failed`
+        // report below is for what is wrong with an ENTRY against a document that does
+        // exist.
+        for entry in &input.entries {
+            if store
+                .resolve_document_for_request(&entry.name, &region, now)
+                .is_none()
+            {
+                return Err(CreateAssociationBatchErrorModeled::InvalidDocument(
+                    InvalidDocument {
+                        message: Some(
+                            crate::state::association_create::association_document_not_found(
+                                &entry.name,
+                            ),
+                        ),
+                    },
+                )
+                .into());
+            }
         }
 
         let mut successful: Vec<AssociationDescription> = Vec::new();

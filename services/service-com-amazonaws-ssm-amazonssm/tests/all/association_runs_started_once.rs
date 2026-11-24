@@ -70,10 +70,10 @@ const UNMINTED: [&str; 2] = [
 ];
 
 /// How `AssociationDoesNotExist` is worded where the request carries the id it could not
-/// resolve: "Association <AssociationId> does not exist." — fixed text around that id, so a
+/// resolve: "Association id <AssociationId> does not exist" — fixed text around that id, so a
 /// call naming several associations says which of them is gone.
 fn does_not_exist(association_id: &str) -> String {
-    format!("Association {association_id} does not exist.")
+    format!("Association id {association_id} does not exist")
 }
 
 /// Register a node of `region` the way its own registration would, carrying `tag_value` under

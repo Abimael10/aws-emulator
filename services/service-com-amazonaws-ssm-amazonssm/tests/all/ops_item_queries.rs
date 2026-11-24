@@ -17,8 +17,10 @@
 //! cannot pass.
 //!
 //! The tables are rows along what the rule generalises over: the filter KEY (text, number,
-//! time, operational data), the OPERATOR (each of the four the model declares), how many values
-//! one filter offers, how many filters narrow together, the page size, and the Region.
+//! time, operational data), the OPERATOR (each of the four the model declares, where the key
+//! accepts it — which operators a key accepts is published per key, and a pair outside that
+//! is refused rather than queried: `all/ops_item_filter_operators.rs`), how many values one
+//! filter offers, how many filters narrow together, the page size, and the Region.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -249,23 +251,6 @@ async fn a_filter_selects_the_ops_items_whose_property_holds_against_it() {
             operator: "Equal",
             values: &["/aws/insight"],
             selects: &["duplicate work items about one node"],
-        },
-        Row {
-            case: "a priority compared as a number, not as text",
-            key: "Priority",
-            operator: "GreaterThan",
-            values: &["3"],
-            selects: &[
-                "duplicate work items about one node",
-                "latency regression in checkout",
-            ],
-        },
-        Row {
-            case: "a priority below a bound",
-            key: "Priority",
-            operator: "LessThan",
-            values: &["3"],
-            selects: &["disk is filling up"],
         },
         Row {
             case: "a priority exactly",

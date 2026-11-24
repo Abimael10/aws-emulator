@@ -3,11 +3,16 @@
 //! How a write of a State Manager association words `AssociationDoesNotExist`.
 //!
 //! One rule spans the operations that resolve an association: a refusal NAMES the
-//! association the request asked about — "Association <AssociationId> does not exist.",
-//! fixed text around the id the request carried — wherever the request carries an id to
-//! name, and answers the error's own documented sentence, which names none, only where it
-//! does not: a call addressed by the document and the node a create paired. A caller tearing
-//! down several associations can then tell WHICH one is gone.
+//! association the request asked about — fixed text around the id the request carried —
+//! wherever the request carries an id to name, and answers the error's own documented
+//! sentence, which names none, only where it does not: a call addressed by the document and
+//! the node a create paired. A caller tearing down several associations can then tell WHICH
+//! one is gone.
+//!
+//! WHICH sentence an operation states it in is that operation's own fact, recorded per API:
+//! the dispatch of named associations states "Association id <AssociationId> does not
+//! exist", and every other association lookup states "Association <AssociationId> does not
+//! exist." (`state::associations`). Both are fixed text around the same id.
 //!
 //! Every case goes through the front door a client uses — `POST /` with
 //! `X-Amz-Target: AmazonSSM.<Operation>` and an `awsJson1_1` body, dispatched by the
@@ -34,9 +39,16 @@ const NODE: &str = "i-0123456789abcdef0";
 /// created at.
 const OTHER_REGION: &str = "us-east-1";
 
-/// How the refusal is worded where the request carries the id it could not resolve.
+/// How the refusal is worded where the request carries the id it could not resolve, for the
+/// reads, the writes and the version listing.
 fn does_not_exist(association_id: &str) -> String {
     format!("Association {association_id} does not exist.")
+}
+
+/// How it is worded by the dispatch of named associations — the one operation recorded with
+/// that sentence.
+fn id_does_not_exist(association_id: &str) -> String {
+    format!("Association id {association_id} does not exist")
 }
 
 /// The sentence the refusal carries where the request named no id at all:
@@ -124,23 +136,32 @@ async fn a_write_addressed_by_an_id_names_it() {
     ];
 
     for (case, association_id) in rows {
-        let expected = does_not_exist(association_id);
-        for (operation, body) in [
+        // Each operation states the sentence IT is recorded with, over the same id.
+        for (operation, body, expected) in [
             (
                 "DeleteAssociation",
                 json!({ "AssociationId": association_id }),
+                does_not_exist(association_id),
             ),
             (
                 "UpdateAssociation",
                 json!({ "AssociationId": association_id }),
+                does_not_exist(association_id),
+            ),
+            (
+                "ListAssociationVersions",
+                json!({ "AssociationId": association_id }),
+                does_not_exist(association_id),
             ),
             (
                 "StartAssociationsOnce",
                 json!({ "AssociationIds": [association_id] }),
+                id_does_not_exist(association_id),
             ),
             (
                 "DescribeAssociation",
                 json!({ "AssociationId": association_id }),
+                does_not_exist(association_id),
             ),
         ] {
             refused(&router, case, operation, &body, &expected).await;

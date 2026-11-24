@@ -140,6 +140,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::ops_item_queries::ops_item_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // Which operators a filter key accepts is published per key, and the modelled enums
+        // cannot say so: a filter pairing a key with an operator that key does not accept is
+        // refused here, before anything is selected, so no caller is handed results for a
+        // query the service will not run
+        // ([`crate::state::ops_item_queries::filter_rejection`]).
+        let filters = input.ops_item_filters.as_deref().unwrap_or_default();
+        if let Some(why) = crate::state::ops_item_queries::filter_rejection(filters) {
+            return Err(crate::scaffolded::Scaffolded::ops_center_invalid_argument(
+                why,
+            ));
+        }
+
         // The token this operation hands out is the id of the OpsItem the next page starts
         // at, so a token that is not shaped like an OpsItem id was never one of ours.
         let resume_from = match input.next_token.as_deref() {
@@ -164,9 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // OpsItem it removed is gone before this query resolves anything.
         store.materialize_due(now);
 
-        let filters = input.ops_item_filters.as_deref().unwrap_or_default();
+        // The OpsItems this Region holds that satisfy every filter, selected under the
+        // filters judged above.
         let selected = store.queried_ops_items(&region, filters);
-
         let start = match resume_from.as_deref() {
             None => 0,
             Some(token) => {

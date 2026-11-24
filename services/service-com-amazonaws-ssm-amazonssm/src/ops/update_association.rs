@@ -346,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The refusal NAMES the association the request asked about, which this call always
-        // addresses by its `AssociationId`
+        // addresses by its `AssociationId`, in the sentence this write words it with
         // ([`crate::state::associations::association_does_not_exist`]).
         let does_not_exist = || {
             UpdateAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {

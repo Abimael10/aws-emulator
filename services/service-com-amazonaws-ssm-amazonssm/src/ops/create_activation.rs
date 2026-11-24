@@ -18,11 +18,12 @@
 //! withholds the assume from this service, is refused and no activation is created
 //! ([`crate::state::activation_role`]).
 //!
-//! The `ExpirationDate` a request names is stored as it was asked for, including one
-//! already past (the activation then reports `Expired`) and one beyond the documented
-//! "up to 30 days in advance": this operation models no error for either bound, so there
-//! is no refusal of them to reproduce, and storing the date the caller asked for is
-//! preferred over inventing one.
+//! The `ExpirationDate` a request names has to fall in the window the documented date
+//! admits — ahead of now, and no further ahead than "a date up to 30 days in advance" — so
+//! an activation already expired, or one expiring past that window, is refused and nothing
+//! is minted ([`crate::state::activation_expiration_out_of_window`]). Inside the window the
+//! date is stored exactly as it was asked for; a request naming none gets the documented
+//! 24-hour default.
 //!
 //! ## Shape of an operation
 //!
@@ -236,6 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?,
             None => now + crate::state::DEFAULT_ACTIVATION_LIFETIME,
         };
+        // The window that date has to fall in — ahead of now, and no further ahead than
+        // "a date up to 30 days in advance" — is a rule this operation models no error for,
+        // so it is refused as a bad request
+        // ([`crate::state::activation_expiration_out_of_window`]). It is judged before
+        // anything is minted: an activation already expired, or one expiring past the
+        // window, is an activation no node could register with, so none is created.
+        if crate::state::activation_expiration_out_of_window(expiration_date, now) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ACTIVATION_EXPIRATION_OUT_OF_WINDOW,
+            ));
+        }
 
         let record = crate::state::ActivationRecord {
             id: crate::state::new_activation_id(),

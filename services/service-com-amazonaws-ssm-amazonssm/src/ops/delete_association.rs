@@ -180,13 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        // The refusal NAMES the association the request asked about
-        // ([`crate::state::associations::association_does_not_exist`]), the way every read
-        // addressed by an `AssociationId` words it: the id is the one variable part of that
-        // sentence, so a caller tearing several associations down can tell WHICH one is
-        // gone. A request that addressed the association by the document and the node a
-        // create paired carried no id to name, so it is refused with the sentence that
-        // names none.
+        // The refusal NAMES the association the request asked about, in the sentence this
+        // write words it with
+        // ([`crate::state::associations::association_does_not_exist`]): the id is the one
+        // variable part of that sentence, so a caller tearing several associations down can
+        // tell WHICH one is gone. A request that addressed the association by the document
+        // and the node a create paired carried no id to name, so it is refused with the
+        // sentence that names none.
         let does_not_exist = |association_id: Option<&str>| {
             DeleteAssociationErrorModeled::AssociationDoesNotExist(AssociationDoesNotExist {
                 message: Some(association_id.map_or_else(

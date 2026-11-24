@@ -1082,13 +1082,12 @@ fn parameter_mismatch<'a>(
             return Some(ParameterMismatch::Undeclared(name.as_str()));
         }
     }
-    let missing: Vec<&str> = declared
+    let missing = declared
         .iter()
         .filter(|parameter| parameter.default_value.is_none())
         .filter_map(|parameter| parameter.name.as_deref())
-        .filter(|name| !supplied.contains_key(*name))
-        .collect();
-    if !missing.is_empty() {
+        .find(|name| !supplied.contains_key(*name));
+    if let Some(missing) = missing {
         return Some(ParameterMismatch::Missing(missing));
     }
     for constraints in &document.parameter_constraints {
@@ -1159,8 +1158,10 @@ fn values_a_parameter_admits(
 enum ParameterMismatch<'a> {
     /// A value was supplied for a parameter the document declares none of.
     Undeclared(&'a str),
-    /// A parameter the document declares no default for was left without a value.
-    Missing(Vec<&'a str>),
+    /// A parameter the document declares no default for was left without a value — the
+    /// FIRST such parameter in the order the document declares them, which is the one a
+    /// refusal names.
+    Missing(&'a str),
     /// A declared parameter was supplied values its own declaration does not admit.
     Value(&'a str),
 }
@@ -1172,6 +1173,11 @@ enum ParameterMismatch<'a> {
 /// Read by the operations whose own error class words such a refusal that way; the ones that
 /// answer `InvalidParameters` answer [`INVALID_PARAMETERS`] instead, on the same reading
 /// ([`parameters_are_rejected`]).
+///
+/// A required parameter left without a value is stated as the Automation plane states it —
+/// "Missing required parameter: <name> in user inputs.", fixed text around the name of the
+/// parameter that was omitted — and names ONE parameter, because the sentence is about one:
+/// the first the document declares that the call left out.
 pub fn parameter_rejection(
     document_name: &str,
     document: &super::ParsedDocumentContent,
@@ -1181,9 +1187,9 @@ pub fn parameter_rejection(
         ParameterMismatch::Undeclared(name) => Some(format!(
             "Document {document_name} doesn't support a parameter named {name}"
         )),
-        ParameterMismatch::Missing(missing) => {
-            Some(format!("Missing required parameters: {}", missing.join(", ")))
-        }
+        ParameterMismatch::Missing(name) => Some(format!(
+            "Missing required parameter: {name} in user inputs."
+        )),
         ParameterMismatch::Value(name) => Some(format!(
             "Document {document_name} doesn't support the values supplied for parameter {name}"
         )),

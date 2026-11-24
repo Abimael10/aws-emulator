@@ -82,6 +82,21 @@
 //! ([`recorded_response_members`]): a member the model does not declare cannot be a field of
 //! a generated shape, so it cannot be written by the handler or by the shape's own
 //! projection. Nothing else about an answer is touched here.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header this
+//! protocol reports that id in (`x-amzn-RequestId`) — on a success and on a failure alike.
+//! It is a property of the RESPONSE, not of any modelled shape: no output or error shape of
+//! this model declares it, so no handler can set it.
+//!
+//! That rule is `service_common::query_error_envelope`'s for every emulated service, and
+//! this file only chooses the report ([`reporting_the_request`]) and wires it at the layers
+//! every response of this service passes through: [`StatedPerOperation`], which covers
+//! everything an operation answers and every refusal this service words ahead of one;
+//! [`RequestIdEnvelopeDefinition`], which covers a response NO operation produced (a routing
+//! failure, a transport failure, a pre-dispatch refusal); and the two responses the snapshot
+//! plane renders itself.
 
 mod recorded_response_members;
 mod refusal;
@@ -90,9 +105,12 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse,
 use aws_smithy_schema_server::constraints::Violation;
 use aws_smithy_schema_server::ProtocolError;
 use aws_smithy_types::body::SdkBody;
+use service_common::query_error_envelope::{
+    with_request_id_header, with_stated_request_id_header, RequestIdEnvelopeDefinition,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
-    Refused, ServerHttpProtocol, Service,
+    http, BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation, OperationContext,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -102,7 +120,9 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its framework-level error renderers wrapped so a response
+    /// no operation produced still names the request it answers ([`reporting_the_request`]).
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request is worded the way this service words it.
     /// Keyed by the routing key the protocol resolves — the key the generated table uses —
@@ -306,10 +326,46 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             snapshots: Snapshots {
                 engine: Arc::clone(&engine),
             },
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(engine),
+                reporting_the_request,
+            ),
             stated,
         }
     }
+}
+
+/// How every response of this service names the request it answers: the header AWS reports
+/// that id in, on a success and on a failure alike.
+///
+/// The rule is not stated here — `service_common::query_error_envelope` owns it for every
+/// emulated service — and this service chooses two things about it: the report its protocol
+/// takes (the header alone: `awsJson1_1` has no envelope element for the id), and WHICH id
+/// that header names. A refusal this service words itself states the request it answers
+/// INSIDE its message ([`crate::state::with_sdk_error_envelope`]), so a response carrying
+/// such a message is reported under THAT id rather than under a second one: the id a client
+/// reads out of the message and the id it correlates on are then one value for one call.
+/// Every other response names a freshly minted id, because nothing else holds one.
+///
+/// Nothing else about a response changes: the status, the other headers and every byte of
+/// the body stay as the renderer wrote them, and a response that already names its request
+/// keeps the id it has.
+fn reporting_the_request(resp: RtResponse) -> RtResponse {
+    match stated_request_id(&resp) {
+        Some(stated) => with_stated_request_id_header(resp, &stated),
+        None => with_request_id_header(resp),
+    }
+}
+
+/// The request id the response's own body already states, read out of the envelope this
+/// service's self-worded refusals carry ([`crate::state::sdk_envelope_request_id`]).
+///
+/// `None` for every other answer — a success, a modelled error worded without that envelope,
+/// a streamed body — which is what [`reporting_the_request`] mints an id for.
+fn stated_request_id(resp: &RtResponse) -> Option<String> {
+    // An error body is built in memory by its renderer, so the bytes are readable here.
+    let text = std::str::from_utf8(resp.body().bytes()?).ok()?;
+    crate::state::sdk_envelope_request_id(text).map(str::to_string)
 }
 
 /// One modelled operation, served so that a request refused before its handler runs is
@@ -432,15 +488,17 @@ where
                     .definition()
                     .refusal_response(ProtocolError::Invalid(violations), Some(stated), req);
                 record_refusal(ctx, O::NAME, &code, &response, started.elapsed());
-                return response;
+                return reporting_the_request(response);
             }
             // A read that reports STEP EXECUTIONS also carries the member the live wire
             // renders on each of them, which the model declares none of (see
-            // [`recorded_response_members`]); every other answer passes through.
-            recorded_response_members::with_served_success_body(
+            // [`recorded_response_members`]); every other answer passes through. Whatever
+            // the operation answered, the response names the request it answered
+            // ([`reporting_the_request`]).
+            reporting_the_request(recorded_response_members::with_served_success_body(
                 O::NAME,
                 self.operation.run(svc, req, ctx).await,
-            )
+            ))
         })
     }
 
@@ -566,7 +624,9 @@ fn snapshot_response(bytes: &[u8], with_body: bool) -> RtResponse {
     response
         .headers_mut()
         .insert("content-length", bytes.len().to_string());
-    response
+    // Rendered by this file rather than by a protocol renderer, so it names the request it
+    // answers here (see [`reporting_the_request`]).
+    reporting_the_request(response)
 }
 
 /// One refusal of a snapshot request, in this service's own JSON error envelope: the path is
@@ -580,7 +640,8 @@ fn snapshot_error(code: u16, error_code: &str, message: &str) -> RtResponse {
     response
         .headers_mut()
         .insert("x-amzn-errortype", error_code.to_string());
-    response
+    // Rendered by this file, so it names the request it answers here too.
+    reporting_the_request(response)
 }
 
 /// A status that plane answers with. Every call site passes a constant, so the conversion

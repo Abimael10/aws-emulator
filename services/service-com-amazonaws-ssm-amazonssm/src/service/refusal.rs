@@ -25,7 +25,10 @@
 //!    this service's types, two of which the model declares in another order
 //!    (`InventoryQueryOperatorType`, declared `Equal, NotEqual, BeginWith, LessThan,
 //!    GreaterThan, Exists`, is listed `NotEqual, BeginWith, Equal, LessThan, GreaterThan,
-//!    Exists`).
+//!    Exists`). A type whose listing the service PUBLISHES in an order that derivation does
+//!    not produce is stated as the data it is ([`LISTED_VALUE_ORDERS`]), for the same reason
+//!    rule 2 states a value set as data: the sequence is fixed text of the message, and it
+//!    belongs to the type, so one row covers every member and every operation carrying it.
 //! 2. WHICH VALUES that set holds. The set a refusal lists is the set the live service
 //!    ACCEPTS, which for three of this service's filter-key types is larger than this
 //!    checkout's model declares — the model is behind the service, and a caller reads that
@@ -73,6 +76,13 @@
 //! at a collection member quotes ([`Submitted`], collected once per refused request). The
 //! refusal path that has no modelled operation to read the request against states the same
 //! sets over the value each violation itself carries.
+//!
+//! One refusal does not come from that envelope at all: an operation that validates a
+//! member ITSELF, ahead of the schema's own clause, answers its own sentence for it
+//! ([`service_worded_refusal`]). `CreateAssociationBatch` is the one such operation
+//! recorded here — a batch entry's document NAME is judged by State Manager rather than
+//! reported as a shape-level constraint failure — so the whole refusal is that sentence,
+//! never half in one voice and half in the other.
 
 mod stated_constraints;
 mod unapplied_patterns;
@@ -83,11 +93,11 @@ use std::collections::HashMap;
 
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
 use ::aws_smithy_schema::Schema;
-use ::aws_smithy_schema_server::constraints::Violation;
+use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use ::service_common::validation::SubmittedEcho;
 use ::service_common::validation_message::{
     aws_validation_refusal_over_elements_stating, in_hashed_enum_order, in_stated_enum_order,
-    quoting_the_submitted_collection, StatedEnumValueSets,
+    quoting_the_submitted_collection, stated_enum_value_set, StatedEnumValueSets,
 };
 use ::smithy_server_runtime::{
     DeserializableStruct, Operation, Refusal, Refused, ServerHttpProtocol,
@@ -246,6 +256,65 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
     (OPS_ITEM_FILTER_KEY_DECLARED, OPS_ITEM_FILTER_KEY_ACCEPTED),
 ];
 
+/// `com.amazonaws.ssm#OperatingSystem` as this checkout's model declares it
+/// (`smithy_query(query="shape",shape="OperatingSystem")`): 15 values.
+const OPERATING_SYSTEM_DECLARED: &[&str] = &[
+    "WINDOWS",
+    "AMAZON_LINUX",
+    "AMAZON_LINUX_2",
+    "AMAZON_LINUX_2022",
+    "UBUNTU",
+    "REDHAT_ENTERPRISE_LINUX",
+    "SUSE",
+    "CENTOS",
+    "ORACLE_LINUX",
+    "DEBIAN",
+    "MACOS",
+    "RASPBIAN",
+    "ROCKY_LINUX",
+    "ALMA_LINUX",
+    "AMAZON_LINUX_2023",
+];
+
+/// The order the live service LISTS those 15 values in when it refuses a value outside the
+/// type (recorded behaviour of every patch-baseline operation carrying an
+/// `OperatingSystem`): the sequence is fixed text of the message, so it is stated here as
+/// the data it is rather than derived.
+///
+/// The derivation rule 1 applies to every other enumerated type of this service agrees with
+/// this sequence on 13 of the 15 and transposes the two values whose string hashes share a
+/// bucket, which no derivation from the values themselves can settle — the chain order of a
+/// collision is a property of the table the service built, not of the values — so the
+/// published sequence is what a caller is handed.
+const OPERATING_SYSTEM_LISTED: &[&str] = &[
+    "RASPBIAN",
+    "WINDOWS",
+    "AMAZON_LINUX_2022",
+    "AMAZON_LINUX_2023",
+    "UBUNTU",
+    "ROCKY_LINUX",
+    "REDHAT_ENTERPRISE_LINUX",
+    "CENTOS",
+    "AMAZON_LINUX_2",
+    "MACOS",
+    "ORACLE_LINUX",
+    "SUSE",
+    "ALMA_LINUX",
+    "DEBIAN",
+    "AMAZON_LINUX",
+];
+
+/// Every enumerated type of this service whose LISTING ORDER is published rather than
+/// derived: the values as the model declares them, and the values in the order a refusal
+/// lists them.
+///
+/// A row is found by the value set the violation carries, matched as a SET (the same
+/// reading [`ACCEPTED_VALUE_SETS`] rows are found by), so one row covers every member of
+/// every operation that targets that type. A type with no row is listed in the order
+/// rule 1 derives ([`in_hashed_enum_order`]), which is every other type of this model.
+const LISTED_VALUE_ORDERS: &StatedEnumValueSets<'static> =
+    &[(OPERATING_SYSTEM_DECLARED, OPERATING_SYSTEM_LISTED)];
+
 /// The OPERATIONS whose boundary refusal states NO value — the member it was about and the
 /// requirement it broke, and nothing of what the caller sent.
 ///
@@ -320,7 +389,7 @@ fn states_no_value(operation: Option<&str>) -> bool {
 /// ([`stated_constraints::quoted_pattern`]), so one reading of an anchor serves every clause.
 fn stated(violation: &Violation, valueless: bool) -> Violation {
     let accepted = in_stated_enum_order(violation, ACCEPTED_VALUE_SETS);
-    let listed = in_hashed_enum_order(&accepted);
+    let listed = in_listed_enum_order(&accepted);
     if valueless {
         return Violation {
             value: None,
@@ -329,6 +398,22 @@ fn stated(violation: &Violation, valueless: bool) -> Violation {
         };
     }
     listed
+}
+
+/// `violation` with an enumerated type's value set in the order a refusal LISTS it: the
+/// order the service publishes for the types that have a row ([`LISTED_VALUE_ORDERS`]), and
+/// the order rule 1 derives for every other type.
+///
+/// One decision, so a type is listed one way wherever it is carried: the row is found by the
+/// value set itself, which belongs to the TYPE rather than to a member, an operation or a
+/// depth.
+fn in_listed_enum_order(violation: &Violation) -> Violation {
+    if let ViolationKind::EnumValue(values) = &violation.kind {
+        if stated_enum_value_set(values, LISTED_VALUE_ORDERS).is_some() {
+            return in_stated_enum_order(violation, LISTED_VALUE_ORDERS);
+        }
+    }
+    in_hashed_enum_order(violation)
 }
 
 /// What the REQUEST itself answers about a refusal of it — the two things no violation
@@ -429,6 +514,66 @@ pub(super) fn validation_refusal(
     )
 }
 
+/// The error code this service answers a refused request with, whichever layer worded it:
+/// the code the shared envelope travels with
+/// (`service_common::validation_message::aws_validation_refusal_over_elements_stating`) and
+/// the one the framework's own default picks for a broken constraint, restated here because
+/// a refusal this module words itself carries its own code.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The operation that judges a member ITSELF, ahead of the schema clause that would
+/// otherwise report it.
+const CREATE_ASSOCIATION_BATCH: &str = "CreateAssociationBatch";
+
+/// Whether `path` names the document NAME of one entry of a batch create — `entries.<n>`,
+/// the list position the validating walk reports an element at, then that element's `name`.
+///
+/// Matched as the member it is rather than by its last segment: a path's last segment alone
+/// does not say which modelled member it belongs to.
+fn names_a_batch_entry_document(path: &str) -> bool {
+    path.strip_prefix("entries.")
+        .and_then(|rest| rest.strip_suffix(".member.name"))
+        .is_some_and(|position| {
+            !position.is_empty() && position.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// Whether `kind` is a requirement on the SHAPE of a name — the expression it must match or
+/// the length it must have — as opposed to a requirement about its presence.
+fn states_a_name_requirement(kind: &ViolationKind) -> bool {
+    matches!(
+        kind,
+        ViolationKind::Pattern(_) | ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    )
+}
+
+/// The refusal the OPERATION words itself for one of `violations`, or `None` when the
+/// envelope of clauses states the whole refusal.
+///
+/// State Manager validates the document NAME of each entry of a batch create itself, so a
+/// name outside the expression a document name must match is refused with its own sentence —
+/// "Invalid document name: <the name the entry carried>", fixed text followed by that name —
+/// rather than as the shape-level constraint clause the schema would report. A client keying
+/// on the message, or on the member path a clause names, is reading a service-level name
+/// validation in both cases.
+///
+/// The sentence is the WHOLE message when it applies, so a refusal is never half in this
+/// voice and half in the clause envelope's; the code is the one every refusal of this
+/// service travels with ([`VALIDATION_EXCEPTION`]).
+fn service_worded_refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
+    if operation != CREATE_ASSOCIATION_BATCH {
+        return None;
+    }
+    let refused = violations.iter().find(|violation| {
+        names_a_batch_entry_document(&violation.path) && states_a_name_requirement(&violation.kind)
+    })?;
+    let name = refused.value.as_deref()?;
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: format!("Invalid document name: {name}"),
+    })
+}
+
 /// How this service states a set of broken constraints with the REQUEST in hand: the clause
 /// stated at a COLLECTION member quotes the collection the caller submitted, where the
 /// framework's walk stored its own summary of one, and every other clause is exactly
@@ -443,6 +588,11 @@ pub(super) fn validation_refusal_quoting_collections(
         .into_iter()
         .map(|(violation, echo)| quoting_the_submitted_collection(violation, echo))
         .collect();
+    // A member the OPERATION validates itself is refused in that operation's own words,
+    // ahead of the clause envelope ([`service_worded_refusal`]).
+    if let Some(stated) = service_worded_refusal(operation, &quoting) {
+        return Some(stated);
+    }
     validation_refusal(Some(operation), &quoting, submitted)
 }
 

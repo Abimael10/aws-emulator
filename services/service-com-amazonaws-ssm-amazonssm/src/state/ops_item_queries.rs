@@ -18,7 +18,10 @@
 //! The comparison reads both sides under the TYPE the key names: a time key compares instants,
 //! `Priority` compares numbers, and every other key compares text, so a value that is no
 //! instant (or no number) for such a key selects nothing instead of being compared as a
-//! string. The four operators are the modelled `OpsItemFilterOperator` values.
+//! string. The four operators are the modelled `OpsItemFilterOperator` values, and which of
+//! them a given key accepts is published per key ([`PUBLISHED_KEY_OPERATORS`]): a filter
+//! pairing a key with an operator that key does not accept is refused before anything is
+//! selected ([`filter_rejection`]).
 //!
 //! The work one query does is bounded by the store's own bound on how many OpsItems it holds
 //! ([`super::ops_items::MAX_OPS_ITEMS`]) times the filters the request carries, which the
@@ -110,6 +113,74 @@ const KEY_ACCOUNT_ID: &str = "AccountId";
 const DATA_PAIR_KEY_MEMBER: &str = "key";
 /// See [`DATA_PAIR_KEY_MEMBER`].
 const DATA_PAIR_VALUE_MEMBER: &str = "value";
+
+/// Which operators each filter key accepts, for the keys whose operators are PUBLISHED.
+///
+/// `DescribeOpsItems` documents the query surface as one list of "Key: … Operations: …"
+/// pairs (`smithy_query(query="doc",shape="DescribeOpsItemsRequest",member="OpsItemFilters")`),
+/// which is a per-KEY restriction: `OpsItemFilterOperator` declares four operators, and a
+/// key admits only the ones its own row lists — `Priority` compares for equality alone,
+/// `CreatedTime` orders and never equates, `ResourceId` only contains. The rows below are
+/// that list, with the documented "Equals" read as the enumerated type's own spelling
+/// ([`OPERATOR_EQUAL`]).
+///
+/// A key the list does not name has no row and is held to nothing here: the published
+/// surface says what each of these keys takes and says nothing about the others (the
+/// change-request, access-request and insight keys among them), and a filter is not refused
+/// on a restriction no documentation states. The documented `LastModifiedBy` names no value
+/// of the modelled `OpsItemFilterKey`, so no row can be reached for it.
+const PUBLISHED_KEY_OPERATORS: &[(&str, &[&str])] = &[
+    (KEY_CREATED_TIME, &[OPERATOR_GREATER_THAN, OPERATOR_LESS_THAN]),
+    (
+        KEY_LAST_MODIFIED_TIME,
+        &[OPERATOR_GREATER_THAN, OPERATOR_LESS_THAN],
+    ),
+    (KEY_PRIORITY, &[OPERATOR_EQUAL]),
+    (KEY_SOURCE, &[OPERATOR_CONTAINS, OPERATOR_EQUAL]),
+    (KEY_STATUS, &[OPERATOR_EQUAL]),
+    (KEY_TITLE, &[OPERATOR_EQUAL, OPERATOR_CONTAINS]),
+    (KEY_OPERATIONAL_DATA, &[OPERATOR_EQUAL]),
+    (KEY_OPERATIONAL_DATA_KEY, &[OPERATOR_EQUAL]),
+    (
+        KEY_OPERATIONAL_DATA_VALUE,
+        &[OPERATOR_EQUAL, OPERATOR_CONTAINS],
+    ),
+    (KEY_OPS_ITEM_ID, &[OPERATOR_EQUAL]),
+    (KEY_RESOURCE_ID, &[OPERATOR_CONTAINS]),
+    (KEY_AUTOMATION_ID, &[OPERATOR_EQUAL]),
+    (KEY_ACCOUNT_ID, &[OPERATOR_EQUAL]),
+];
+
+/// How OpsCenter states a filter it will not query on: one fixed word, naming neither the
+/// key nor the operator that was refused.
+///
+/// The class it answers under is `OpsCenterInvalidArgumentException`
+/// ([`crate::scaffolded::Scaffolded::ops_center_invalid_argument`]): the operator is a value
+/// its enumerated type declares, so the fault is the PAIR the filter names rather than
+/// either value on its own.
+pub const INVALID_FILTER: &str = "InvalidFilter";
+
+/// Whether `filter` pairs a key with an operator that key does not accept
+/// ([`PUBLISHED_KEY_OPERATORS`]).
+fn pairs_an_unaccepted_operator(filter: &OpsItemFilter) -> bool {
+    PUBLISHED_KEY_OPERATORS
+        .iter()
+        .find(|(key, _)| *key == filter.key)
+        .is_some_and(|(_, accepted)| !accepted.contains(&filter.operator.as_str()))
+}
+
+/// Why `filters` are not filters a query can be run on, or `None` when every one of them
+/// is.
+///
+/// Read BEFORE any OpsItem is selected, so a query carrying such a filter answers the
+/// refusal rather than results the live service would never have returned: a client reading
+/// a 200 for it would be reading results for a query AWS rejects.
+pub fn filter_rejection(filters: &[OpsItemFilter]) -> Option<&'static str> {
+    filters
+        .iter()
+        .any(pairs_an_unaccepted_operator)
+        .then_some(INVALID_FILTER)
+}
 
 /// What a filter compares one OpsItem against: the value(s) the record holds for the filter's
 /// key, under the type the comparison reads them as.

@@ -186,15 +186,25 @@ pub const INVALID_SCHEDULE: &str =
 pub const TARGETS_AND_TARGET_MAPS: &str = "Both Targets and TargetMaps can't be specified together";
 
 /// How this service states that an id names no association of the endpoint a call was asked
-/// through: `AssociationDoesNotExist` NAMES the association the request asked about —
-/// "Association <AssociationId> does not exist." — where the fixed text is
-/// "Association … does not exist." and the variable part is the id the request carried, so a
-/// caller reading the refusal can tell which association is gone.
+/// through, for the operation whose recorded refusal NAMES the id that way:
+/// `AssociationDoesNotExist` carrying "Association id <AssociationId> does not exist" — the
+/// fixed text "Association id " + " does not exist" around the id the request carried.
 ///
-/// THE ONE wording of that refusal for every operation that resolves an association by an id
-/// its request carries: the reads (`DescribeAssociation` and the two reads of an
-/// association's executions) and the writes (`DeleteAssociation`, `UpdateAssociation` and the
-/// dispatch of named associations).
+/// `StartAssociationsOnce` is the operation recorded with this sentence, and the one whose
+/// request carries SEVERAL ids (up to ten), so a caller dispatching a batch of them can tell
+/// WHICH id was rejected. Every other association lookup is recorded with the sentence
+/// [`association_does_not_exist`] states; which of the two an operation answers is that
+/// operation's own fact, so the two cannot be derived from one another.
+pub fn association_id_does_not_exist(association_id: &str) -> String {
+    format!("Association id {association_id} does not exist")
+}
+
+/// The sentence every OTHER association lookup states for that refusal —
+/// "Association <AssociationId> does not exist." — which is what the read of one association
+/// (`DescribeAssociation`), the writes (`UpdateAssociation`, `DeleteAssociation`), the
+/// version listing (`ListAssociationVersions`) and the association-execution reads
+/// (`DescribeAssociationExecutions`, `DescribeAssociationExecutionTargets`) answer. Fixed
+/// text around the id the request carried, exactly as [`association_id_does_not_exist`] is.
 pub fn association_does_not_exist(association_id: &str) -> String {
     format!("Association {association_id} does not exist.")
 }

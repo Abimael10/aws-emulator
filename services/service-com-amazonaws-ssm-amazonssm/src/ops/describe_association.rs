@@ -189,7 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current run was dispatched, which its overview reports.
         store.materialize_due(now);
 
-        // The refusal NAMES the association the request asked about
+        // The refusal NAMES the association the request asked about, in the sentence this
+        // read words it with
         // ([`crate::state::associations::association_does_not_exist`]); a request that
         // addressed the association by the document and the node a create paired carried no
         // id to name, so it is refused with the sentence that names none.

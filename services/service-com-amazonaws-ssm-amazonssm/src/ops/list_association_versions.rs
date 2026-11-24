@@ -168,9 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // An association id names ONE association of the endpoint the call was signed for;
-        // the refusal NAMES the association the request asked about
-        // ([`crate::state::associations::association_does_not_exist`]), the way every read
-        // that resolves an association by an id its request carries words it.
+        // the refusal NAMES the association the request asked about, in the sentence this
+        // listing words it with
+        // ([`crate::state::associations::association_does_not_exist`]).
         let Some(held) = store.association(&region, &input.association_id) else {
             return Err(ListAssociationVersionsErrorModeled::AssociationDoesNotExist(
                 AssociationDoesNotExist {

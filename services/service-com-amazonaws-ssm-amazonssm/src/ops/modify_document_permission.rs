@@ -191,11 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must specify a value for this parameter or the AccountIdsToRemove
         // parameter": a call that names no account in either list asks for no change at
-        // all, which is a request this operation cannot carry out rather than a no-op.
+        // all, which is a request this operation cannot carry out rather than a no-op. The
+        // fault is the PAIR rather than either member, so it is answered under the class
+        // Systems Manager answers an argument fault with
+        // (`InvalidParameterException`) rather than as a constraint violation.
         let accounts_to_add = input.account_ids_to_add.as_deref().unwrap_or_default();
         let accounts_to_remove = input.account_ids_to_remove.as_deref().unwrap_or_default();
         if accounts_to_add.is_empty() && accounts_to_remove.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter(
                 permissions::NO_ACCOUNTS_TO_MODIFY,
             ));
         }
