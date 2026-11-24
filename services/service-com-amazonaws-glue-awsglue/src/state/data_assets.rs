@@ -624,6 +624,41 @@ impl AssetEntry {
         }
     }
 
+    /// Apply an `UpdateAsset` request to this record, as served at `now`.
+    ///
+    /// "Updates the name and description of an existing asset in Glue Data Catalog. Only the
+    /// fields that you provide are updated": both updatable members are optional on the
+    /// request, so the ones it NAMES replace what is stored and the ones it omits are left
+    /// where the last write that named them put them — the one way this surface applies an
+    /// update, exactly as a glossary's and a glossary term's own do
+    /// ([`GlossaryEntry::apply_update`], [`GlossaryTermEntry::apply_update`]).
+    ///
+    /// Every other member of the asset is no member of this request and so cannot move: the
+    /// identifier that addresses it, the asset type it is an instance of, its forms, its
+    /// attachments, its glossary terms and [`Self::created_at`] are each left exactly as the
+    /// write that owns them left them, so an update of an asset's name or description is not
+    /// a put of the asset.
+    ///
+    /// [`Self::updated_at`] moves to `now` when the request named a member and stays where it
+    /// is for one that named none: it reports when this asset last CHANGED.
+    ///
+    /// [`Self::client_token`] keeps the PUT's token, which is what a retry of that put is
+    /// recognised by and not something an update of the asset restates.
+    pub fn apply_update(&mut self, input: &UpdateAssetInput, now: SystemTime) {
+        let mut changed = false;
+        if let Some(name) = input.name.clone() {
+            self.name = name;
+            changed = true;
+        }
+        if let Some(description) = input.description.clone() {
+            self.description = Some(description);
+            changed = true;
+        }
+        if changed {
+            self.updated_at = now;
+        }
+    }
+
     /// This record's glossary terms as the modelled `GlossaryTermIdList`, which is what
     /// every operation that reports an asset's associations answers with.
     ///

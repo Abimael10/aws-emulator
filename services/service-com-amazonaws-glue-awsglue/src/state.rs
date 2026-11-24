@@ -449,6 +449,7 @@ use crate::ops::types::{
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
+    UpdateAssetInput,
     UpdateClassifierInput, UpdateColumnStatisticsTaskSettingsInput, UpdateCrawlerInput,
     UpdateDataQualityRulesetInput, UpdateGlossaryInput, UpdateGlossaryTermInput,
     UpdateMLTransformInput,

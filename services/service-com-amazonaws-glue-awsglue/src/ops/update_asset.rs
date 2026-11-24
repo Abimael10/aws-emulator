@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the asset its `Identifier` names in this account's asset namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::assets`]): the operation "updates the
+//! name and description of an existing asset in Glue Data Catalog. Only the fields that you
+//! provide are updated", so the request's `Name` and `Description` replace what is stored
+//! and the members it omits are left where the last write that named them put them
+//! ([`crate::state::AssetEntry::apply_update`]). Everything else the asset carries - the
+//! asset type it is an instance of, its forms, its attachments, its glossary terms and the
+//! instant it was created at - is no member of this request and is left as stored, so a
+//! `GetAsset` after an update reports the renamed asset with the forms its put stored. "An
+//! existing asset" is one this account holds, so an identifier no `PutAsset` stored an asset
+//! under is refused with the modelled `EntityNotFoundException` rather than written - the
+//! same namespace and the same refusal the attachment write resolves its target through
+//! (`src/ops/put_attachment.rs`), because the name and description of a Data Catalog entity
+//! the business catalog projects as an asset are that entity's own members, written through
+//! that entity's own surface.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +164,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Assets live in one per-account namespace, so nothing here depends on the
+        // request's Region - exactly as `PutAsset`, `GetAsset` and `DeleteAsset` read it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(UpdateAssetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue asset store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "The unique identifier of the asset to update" is the whole address of an asset,
+        // so an identifier this account holds no stored asset under updates nothing and is
+        // refused with the modelled miss, worded the one way the catalog's asset surface
+        // words one (`crate::state::asset_not_found_message`) with the identifier that
+        // resolved to nothing as its variable part. Judged before anything is written, so a
+        // refused update leaves the store as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAsset"))
+        // Modelled constraints - the required `Identifier` with its length and pattern, and
+        // the `ClientToken` length and pattern - are refused before this handler runs, so
+        // the only thing left is to write the members the request named.
+        let Some(asset) = store.asset_mut(&input.identifier) else {
+            return Err(UpdateAssetErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::asset_not_found_message(&input.identifier)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        asset.apply_update(&input, now);
+        let stored = asset.clone();
+        ::tracing::info!(
+            operation = "UpdateAsset",
+            asset = %stored.id,
+            forms = stored.forms.len(),
+            "updated a Glue asset"
+        );
+
+        // Every member comes from the record just written, so the update reports what a
+        // later `GetAsset` of this identifier reports for the members both answer: the
+        // identifier that addressed the asset, the name and description it now carries and
+        // the instant it was last changed at.
+        Ok(UpdateAssetOutput {
+            id: stored.id,
+            name: Some(stored.name),
+            description: stored.description,
+            updated_at: Some(crate::state::to_date_time(stored.updated_at)),
+        })
     }
 }
