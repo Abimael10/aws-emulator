@@ -16,10 +16,16 @@
 //! a type is deprecated before it can be deleted ([`DEPRECATION_DELETION_WAIT`]), and the
 //! wait is measured from the recorded deprecation instant against the clock, so nothing is
 //! slept for and a reader of the type observes the same record throughout.
+//!
+//! Those preconditions are all about a type the registry HOLDS. A name it holds none under
+//! is not refused at all: the delete states the END state — the account holds no thing type
+//! under that name — so a name that is already absent is a successful no-op
+//! ([`ThingTypeDeletion::AlreadyAbsent`]) and a caller may delete the same type twice, or
+//! one it never created, without having to tell the two apart.
 
 use std::time::{Duration, SystemTime};
 
-use super::{not_found, ComAmazonawsIotAwsiotserviceState};
+use super::ComAmazonawsIotAwsiotserviceState;
 
 /// How long after a thing type is DEPRECATED it may be deleted.
 ///
@@ -29,16 +35,30 @@ use super::{not_found, ComAmazonawsIotAwsiotserviceState};
 /// from this constant so the two cannot drift.
 pub const DEPRECATION_DELETION_WAIT: Duration = Duration::from_secs(5 * 60);
 
+/// What a delete the registry ACCEPTED did to it: either the record left the registry, or
+/// there was no record to remove because the name is already absent.
+///
+/// Both are the same answer on the wire — the delete succeeded — and the distinction is for
+/// the attribution record the handler writes, which states what the call changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThingTypeDeletion {
+    /// The record the name addressed left the registry.
+    Removed,
+    /// `thingTypeName` named no thing type this account holds, so the end state the call
+    /// asks for already held and nothing was written.
+    AlreadyAbsent,
+}
+
 /// Why a thing type cannot be deleted — what
 /// [`ComAmazonawsIotAwsiotserviceState::delete_thing_type`] answers instead of removing the
 /// record.
 ///
 /// It is the registry's reason, not a wire error: the handler maps it onto the error its own
-/// model declares, and the wording lives here so one rule is stated once.
+/// model declares, and the wording lives here so one rule is stated once. Every one of them
+/// is about a type the registry HOLDS; a name it holds none under is no refusal
+/// ([`ThingTypeDeletion::AlreadyAbsent`]).
 #[derive(Debug, Clone)]
 pub enum ThingTypeDeletionRefusal {
-    /// `thingTypeName` names no thing type this account holds.
-    NotRegistered(String),
     /// The type was never deprecated (or its deprecation was undone), so the first step of
     /// the documented procedure has not been taken.
     NotDeprecated(String),
@@ -53,9 +73,6 @@ impl ThingTypeDeletionRefusal {
     /// What the refusal reports, in the wording AWS IoT states each of these in.
     pub fn message(&self) -> String {
         match self {
-            Self::NotRegistered(thing_type_name) => {
-                not_found::missing_thing_type_message(thing_type_name)
-            }
             Self::NotDeprecated(thing_type_name) => {
                 format!("Cannot delete non deprecated thing type {thing_type_name}")
             }
@@ -102,21 +119,23 @@ impl ComAmazonawsIotAwsiotserviceState {
     /// that makes a thing type stop existing.
     ///
     /// Every precondition of the documented procedure is read first, so a refused delete
-    /// writes nothing: the type has to be one the account holds, it has to have been
-    /// deprecated, that deprecation has to be at least [`DEPRECATION_DELETION_WAIT`] old,
-    /// and no thing may still be associated with it. The removal is the record leaving the
-    /// registry, which is what makes every later reader of it — the describe path, the
-    /// listings, and `CreateThing`'s own resolution of a `thingTypeName` — stop reporting
-    /// it.
+    /// writes nothing: the type has to have been deprecated, that deprecation has to be at
+    /// least [`DEPRECATION_DELETION_WAIT`] old, and no thing may still be associated with
+    /// it. The removal is the record leaving the registry, which is what makes every later
+    /// reader of it — the describe path, the listings, and `CreateThing`'s own resolution of
+    /// a `thingTypeName` — stop reporting it.
+    ///
+    /// A name the registry holds no record under is NOT one of those preconditions: the end
+    /// state the call asks for already holds, so the delete succeeds having written nothing
+    /// ([`ThingTypeDeletion::AlreadyAbsent`]) and the procedure's steps are asked only of a
+    /// type that is there to delete.
     pub fn delete_thing_type(
         &mut self,
         thing_type_name: &str,
         now: SystemTime,
-    ) -> Result<(), ThingTypeDeletionRefusal> {
+    ) -> Result<ThingTypeDeletion, ThingTypeDeletionRefusal> {
         let Some(thing_type) = self.thing_types.get(thing_type_name) else {
-            return Err(ThingTypeDeletionRefusal::NotRegistered(
-                thing_type_name.to_string(),
-            ));
+            return Ok(ThingTypeDeletion::AlreadyAbsent);
         };
         let Some(deprecated_at) = thing_type.deprecation_date else {
             return Err(ThingTypeDeletionRefusal::NotDeprecated(
@@ -140,6 +159,6 @@ impl ComAmazonawsIotAwsiotserviceState {
             ));
         }
         self.thing_types.remove(thing_type_name);
-        Ok(())
+        Ok(ThingTypeDeletion::Removed)
     }
 }

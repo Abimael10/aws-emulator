@@ -17,7 +17,8 @@
 //!   deprecation has to be at least the service's published wait old. Each step that has
 //!   not been taken is the modelled `InvalidRequestException` (400) stating that step, and
 //!   the type survives the refusal exactly as it was; a name the account holds no type
-//!   under is the modelled `ResourceNotFoundException` (404). A delete that goes through is
+//!   under is no refusal at all — the delete states the end state, so it answers the empty
+//!   200 a removal answers and writes nothing. A delete that goes through is
 //!   observable: the reader of the type answers 404 and a `CreateThing` naming it no longer
 //!   resolves.
 //! * `ThingTypeMetadata$deprecated` is "If true, no new things could be associated with
@@ -332,6 +333,13 @@ async fn a_thing_type_is_deleted_only_after_a_deprecation_the_wait_has_passed() 
             Some(NOT_FOUND),
             "case {case:?}: expected ResourceNotFoundException, got {gone:?}"
         );
+        // The READER of a type still states the registry family's account-qualified
+        // sentence: only the DELETE treats an absent name as the state it asks for.
+        assert_eq!(
+            gone.message(),
+            Some(format!("Thing Type {ACCOUNT_ID}:{thing_type_name} not found.")),
+            "case {case:?}: expected the registry family's not-found sentence, got {gone:?}"
+        );
         let orphan = emulator
             .create_thing("thing-after-delete", Some(&thing_type_name))
             .await;
@@ -431,10 +439,10 @@ async fn a_thing_type_things_are_associated_with_is_not_deleted() {
     }
 }
 
-/// RULE: a name the account holds no thing type under is the registry family's not-found,
-/// which states the account the lookup was scoped to.
+/// RULE: the delete states the END state, so a name the account holds no thing type under
+/// is a successful no-op rather than a refusal — the delete is idempotent.
 #[tokio::test]
-async fn deleting_a_thing_type_the_account_does_not_hold_is_a_not_found() {
+async fn deleting_a_thing_type_the_account_does_not_hold_succeeds() {
     let emulator = Emulator::new();
     // One type exists, so a row that differs from it only by case or by a suffix is still
     // a miss: the lookup is by the exact name.
@@ -451,21 +459,26 @@ async fn deleting_a_thing_type_the_account_does_not_hold_is_a_not_found() {
         ("a single-character name", "z".to_string()),
         ("a name at the modelled maximum length", "m".repeat(128)),
     ] {
-        let refused = emulator.delete_type(&thing_type_name).await;
+        let deleted = emulator.delete_type(&thing_type_name).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case:?}: deleting a type the account does not hold must be refused 404, \
-             got {refused:?}"
+            deleted.status, 200,
+            "case {case:?}: deleting a type the account does not hold must succeed, got \
+             {deleted:?}"
         );
         assert_eq!(
-            refused.error_code.as_deref(),
-            Some(NOT_FOUND),
-            "case {case:?}: expected ResourceNotFoundException, got {refused:?}"
+            deleted.error_code, None,
+            "case {case:?}: an idempotent delete carries no error type, got {deleted:?}"
         );
+        assert!(
+            deleted.body.as_object().is_none_or(serde_json::Map::is_empty),
+            "case {case:?}: the delete reports an empty body, got {deleted:?}"
+        );
+        // The no-op wrote nothing: the type that DOES exist is untouched.
+        let survived = emulator.describe_type("sensor-type").await;
         assert_eq!(
-            refused.message(),
-            Some(format!("Thing Type {ACCOUNT_ID}:{thing_type_name} not found.")),
-            "case {case:?}: expected the registry family's not-found sentence, got {refused:?}"
+            survived.status, 200,
+            "case {case:?}: the delete of an absent name must leave the registry alone, got \
+             {survived:?}"
         );
     }
 }

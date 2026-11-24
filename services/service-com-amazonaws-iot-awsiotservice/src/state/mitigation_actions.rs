@@ -81,13 +81,18 @@ pub fn missing_mitigation_action_message(action_name: &str) -> String {
 /// How `UpdateMitigationAction` states that same miss.
 ///
 /// The WRITE path words it as the RESOURCE it could not resolve rather than as the action
-/// it could not read: the fixed text names the member the update resolves the action by,
-/// `findingActionName`, and the variable part is the name the request carried. Two
-/// sentences for one miss because AWS states them differently on the two paths, and a
+/// it could not read: the Device Defender configuration families' sentence
+/// ([`super::unresolved_resource_message`]), naming the member the update resolves the
+/// action by, `findingActionName`, with the name the request carried as its variable part.
+/// Two sentences for one miss because AWS states them differently on the two paths, and a
 /// caller reading either reads the one AWS sends.
 pub fn unresolved_mitigation_action_message(action_name: &str) -> String {
-    format!("Resource findingActionName={action_name} was not found")
+    super::unresolved_resource_message(FINDING_ACTION_NAME_MEMBER, action_name)
 }
+
+/// The input member `UpdateMitigationAction` resolves a mitigation action by, as its
+/// not-found sentence names it.
+const FINDING_ACTION_NAME_MEMBER: &str = "findingActionName";
 
 /// The `MitigationActionType`s `params` defines — one per member it sets, in the order the
 /// model declares them.

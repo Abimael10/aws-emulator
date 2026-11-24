@@ -3475,7 +3475,8 @@ pub use not_found::{
     missing_thing_group_message, missing_thing_message, missing_thing_type_message,
     tagged_thing_group_not_found_message, thing_write_not_found_message,
     unauthorized_topic_rule_message,
-    unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    unrecognized_index_name_message, unresolved_resource_message,
+    MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource
@@ -3579,7 +3580,9 @@ pub use thing_group_hierarchy::{over_deep_hierarchy_message, MAX_THING_GROUP_HIE
 // WHEN a thing type may be DELETED — the steps of the documented delete procedure and the
 // wait a deprecation owes — lives in `state/thing_type_deletion.rs`.
 pub mod thing_type_deletion;
-pub use thing_type_deletion::{ThingTypeDeletionRefusal, DEPRECATION_DELETION_WAIT};
+pub use thing_type_deletion::{
+    ThingTypeDeletion, ThingTypeDeletionRefusal, DEPRECATION_DELETION_WAIT,
+};
 
 // What a thing type's PROPERTIES may carry, and how a write of them changes a registered
 // type — the bound both writers of a type enforce and the one update write — lives in

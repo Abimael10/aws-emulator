@@ -9,10 +9,16 @@
 //!
 //! The operation's own documentation states the procedure a caller has to have followed,
 //! and each step of it is a precondition read before anything is removed — the type has to
-//! exist, it has to have been deprecated, the deprecation has to have had time to take
-//! effect, and no thing may still be associated with it. The rules and their wording live
-//! in [`crate::state::thing_type_deletion`], beside the record they are about; a refused
+//! have been deprecated, the deprecation has to have had time to take effect, and no thing
+//! may still be associated with it. The rules and their wording live in
+//! [`crate::state::thing_type_deletion`], beside the record they are about; a refused
 //! delete writes nothing, so the type survives still (un)deprecated.
+//!
+//! The delete states the END state — this account holds no thing type under that name — so
+//! a name the registry holds nothing under is NOT refused: it answers the empty 200 a
+//! removal answers, having written nothing. Deleting the same type twice, or one that was
+//! never created, therefore succeeds, and the modelled `ResourceNotFoundException` is for
+//! the readers of a type rather than for this delete.
 //!
 //! ## Shape of an operation
 //!
@@ -192,29 +198,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
 
         match outcome {
-            Ok(()) => {
-                audit(ctx, &input.thing_type_name, "deleted");
+            Ok(deletion) => {
+                audit(
+                    ctx,
+                    &input.thing_type_name,
+                    match deletion {
+                        crate::state::ThingTypeDeletion::Removed => "deleted",
+                        crate::state::ThingTypeDeletion::AlreadyAbsent => "already-absent",
+                    },
+                );
                 // `DeleteThingType` models no output members at all, so a successful delete
                 // is an empty 200; that the type is gone is read back through
-                // `DescribeThingType`.
+                // `DescribeThingType`. A name the registry held nothing under answers the
+                // same way: the end state the call asks for already holds, so the delete is
+                // idempotent rather than a refusal a retry could never get past.
                 Ok(DeleteThingTypeOutput {})
             }
             Err(refusal) => {
                 let message = Some(refusal.message());
                 Err(match refusal {
-                    // A name the account holds no thing type under is "The specified
-                    // resource does not exist" (HTTP 404) — the modelled error for a
-                    // lookup miss, which this delete is not documented idempotent against.
-                    crate::state::ThingTypeDeletionRefusal::NotRegistered(name) => {
-                        audit(ctx, &name, "no-such-thing-type");
-                        DeleteThingTypeErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException { message },
-                        )
-                    }
-                    // Every other refusal is about a type that EXISTS and may not be
+                    // Every refusal is about a type that EXISTS and may not be
                     // deleted yet, which `InvalidRequestException` ("The request is not
                     // valid", HTTP 400) is the modelled error for; the record is left for
-                    // the caller to deprecate, wait out or detach.
+                    // the caller to deprecate, wait out or detach, and each one is a
+                    // condition a retry CAN get past.
                     crate::state::ThingTypeDeletionRefusal::NotDeprecated(name) => {
                         audit(ctx, &name, "not-deprecated");
                         DeleteThingTypeErrorModeled::InvalidRequestException(

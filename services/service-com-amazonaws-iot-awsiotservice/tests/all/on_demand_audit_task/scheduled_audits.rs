@@ -196,9 +196,11 @@ fn already_exists_message(scheduled_audit_name: &str) -> String {
     )
 }
 
-/// How this service states that a name names no scheduled audit this account holds.
+/// How this service states that a name names no scheduled audit this account holds: the
+/// Device Defender configuration families' sentence, which names the input member the
+/// request carried the name at.
 fn not_found_message(scheduled_audit_name: &str) -> String {
-    format!("Scheduled audit {scheduled_audit_name} does not exist.")
+    format!("Resource scheduledAuditName={scheduled_audit_name} was not found")
 }
 
 impl Row {

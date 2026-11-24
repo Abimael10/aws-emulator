@@ -63,6 +63,13 @@ pub const AUDIT_FREQUENCY_BIWEEKLY: &str = "BIWEEKLY";
 /// month it runs on.
 pub const AUDIT_FREQUENCY_MONTHLY: &str = "MONTHLY";
 
+/// The input member every single-audit operation carries a scheduled audit's name at —
+/// `smithy_query(query="operation",operation="DescribeScheduledAudit")`:
+/// `scheduledAuditName`, `@required`, `@httpLabel` of
+/// `/audit/scheduledaudits/{scheduledAuditName}` — which is what this family's not-found
+/// sentence names.
+pub const SCHEDULED_AUDIT_NAME_MEMBER: &str = "scheduledAuditName";
+
 /// The ARN of a scheduled audit:
 /// `arn:aws:iot:<region>:<account>:scheduledaudit/<scheduledAuditName>`.
 ///
@@ -81,10 +88,12 @@ pub fn scheduled_audit_arn(region: &str, scheduled_audit_name: &str) -> String {
 /// How this service states that a `scheduledAuditName` names no scheduled audit this
 /// account holds — for a reader of one, a writer of one and a delete of one.
 ///
-/// The DEVICE DEFENDER family states the miss of the resource the request named, so the
-/// fixed text is this family's own and the only variable part is the name asked about.
+/// The DEVICE DEFENDER configuration families state the MEMBER the request carried the
+/// name at ([`super::unresolved_resource_message`]), so the fixed text is
+/// `Resource scheduledAuditName=` and ` was not found` and the only variable part is the
+/// name asked about — with neither the account nor a terminating period in it.
 pub fn missing_scheduled_audit_message(scheduled_audit_name: &str) -> String {
-    format!("Scheduled audit {scheduled_audit_name} does not exist.")
+    super::unresolved_resource_message(SCHEDULED_AUDIT_NAME_MEMBER, scheduled_audit_name)
 }
 
 /// Why a writer refused a scheduled audit's SCHEDULE, mapped to the operation's modelled

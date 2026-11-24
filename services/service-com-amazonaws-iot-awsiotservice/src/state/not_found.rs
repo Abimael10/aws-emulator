@@ -16,6 +16,10 @@
 //! * The AUTHORIZER family words it `Authorizer <name> not found`.
 //! * The DEVICE DEFENDER audit-task family words it
 //!   `Audit task with TaskId=<id> was not found` ([`missing_audit_task_message`]).
+//! * The DEVICE DEFENDER CONFIGURATION families — a scheduled audit, and the write path of a
+//!   mitigation action — word it by naming the INPUT MEMBER the request carried the name at:
+//!   `Resource <member>=<name> was not found` ([`unresolved_resource_message`]), with no
+//!   account qualifier and no terminating period.
 //! * The BULK THING REGISTRATION task family words it with a sentence that carries no
 //!   variable part at all ([`MISSING_THING_REGISTRATION_TASK_MESSAGE`]): the task id is
 //!   not interpolated.
@@ -63,6 +67,17 @@ fn registry_not_found(family: &str, name: &str) -> String {
 /// noun, the id the request asked about, and the fixed clause ` cannot be found.`
 fn plane_not_found(family: &str, id: &str) -> String {
     format!("{family} {id} cannot be found.")
+}
+
+/// The sentence the DEVICE DEFENDER configuration families state a missing resource with:
+/// the fixed word `Resource`, the name of the INPUT MEMBER the request carried the
+/// resource's name at, `=`, that name, and the fixed clause ` was not found`.
+///
+/// Neither the account nor a terminating period is part of it, unlike the registry
+/// families' sentence ([`registry_not_found`]): this one states the member the service
+/// could not resolve, so a caller is told which part of the request named nothing.
+pub fn unresolved_resource_message(member: &str, name: &str) -> String {
+    format!("Resource {member}={name} was not found")
 }
 
 /// How this service states that a `thingName` names no thing in the registry to a READ of
