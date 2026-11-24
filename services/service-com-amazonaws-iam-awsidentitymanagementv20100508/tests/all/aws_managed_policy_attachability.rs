@@ -439,7 +439,7 @@ async fn a_policy_aws_reserves_is_refused_by_every_use() {
         "the catalog must carry a reserved policy for this suite to span anything"
     );
     for arn in [
-        "arn:aws:iam::aws:policy/aws-service-role/AWSLambdaRole",
+        "arn:aws:iam::aws:policy/aws-service-role/AWSRoboMakerServicePolicy",
         "arn:aws:iam::aws:policy/aws-service-role/elasticbeanstalk/ServicePolicy",
     ] {
         policies.push((format!("an uncarried {arn}"), arn.to_string()));

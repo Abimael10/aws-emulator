@@ -794,7 +794,7 @@ async fn a_policy_aws_reserves_is_refused_by_every_way_of_putting_it_on_an_ident
     // reservation is about the path, not about which entries it holds.
     let reserved = [
         format!(
-            "arn:aws:iam::aws:policy{}AWSLambdaRole",
+            "arn:aws:iam::aws:policy{}AWSRoboMakerServicePolicy",
             state::SERVICE_LINKED_ROLE_PATH_PREFIX
         ),
         format!(

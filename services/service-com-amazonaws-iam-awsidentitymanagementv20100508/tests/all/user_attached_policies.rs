@@ -509,7 +509,7 @@ async fn attaching_a_service_role_policy_to_a_user_is_refused() {
     // Rows spanning the service the policy belongs to and the depth below the
     // reserved path.
     let service_role_policies = [
-        "arn:aws:iam::aws:policy/aws-service-role/AWSLambdaRole",
+        "arn:aws:iam::aws:policy/aws-service-role/AWSRoboMakerServicePolicy",
         "arn:aws:iam::aws:policy/aws-service-role/AmazonEKSServiceRolePolicy",
         "arn:aws:iam::aws:policy/aws-service-role/elasticbeanstalk/ServicePolicy",
     ];

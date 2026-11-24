@@ -385,7 +385,10 @@ struct Allowed {
 /// An AWS-managed policy that grants `lambda:InvokeFunction` and whose document this emulator's
 /// managed-policy catalog does not carry — the catalog is a subset of AWS's, so an ARN under a
 /// name it does not hold is taken as published and attaches, and what it grants cannot be read.
-const UNCARRIED_INVOKE_POLICY: &str = "arn:aws:iam::aws:policy/AWSLambdaRole";
+///
+/// SOURCE: the AWS Managed Policy Reference, which publishes `AWSLambda_FullAccess` at the
+/// account root and includes `lambda:InvokeFunction` in it.
+const UNCARRIED_INVOKE_POLICY: &str = "arn:aws:iam::aws:policy/AWSLambda_FullAccess";
 
 const ALLOWED: &[Allowed] = &[
     Allowed {
