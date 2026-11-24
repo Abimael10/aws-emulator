@@ -428,7 +428,11 @@ pub(crate) fn element(body: &str, tag: &str) -> Option<String> {
 
 /// The `(name, status)` of each lifecycle event a target reports, in the order it
 /// reports them.
-fn events_of(target: &Value) -> Vec<(String, String)> {
+///
+/// Visible to the crate's other suites:
+/// `server_platform_appspec_install_and_hook_on_the_host.rs` reads the same member of the
+/// same target, so one place says how it is read.
+pub(crate) fn events_of(target: &Value) -> Vec<(String, String)> {
     target["lifecycleEvents"]
         .as_array()
         .map(|events| {
