@@ -4,16 +4,21 @@
 //! can be read at, and the granularities it accepts.
 //!
 //! The rule under test: **a `Period` outside the granularities a metric is stored at is refused
-//! `InvalidParameterValue` against the requirement its own span broke — a period SHORTER than a
-//! minute against the set of sub-minute granularities there are, and a period of a minute or
-//! more against the multiple of a minute it has to be — with nothing of the submitted value in
-//! the sentence**, while every documented granularity (the sub-minute divisions of a minute, and
-//! any multiple of 60) is accepted. `GetMetricStatisticsInput$Period` and `MetricStat$Period`
+//! against the requirement its own span broke — a period SHORTER than a minute against the set of
+//! sub-minute granularities there are, and a period of a minute or more against the multiple of a
+//! minute it has to be — with nothing of the submitted value in the sentence**, while every
+//! documented granularity (the sub-minute divisions of a minute, and any multiple of 60) is
+//! accepted. `GetMetricStatisticsInput$Period` and `MetricStat$Period`
 //! document the same set ("For metrics with regular resolution, a period can be as short as one
 //! minute (60 seconds) and must be a multiple of 60. For high-resolution metrics […] the period
-//! can be 1, 5, 10, 20, 30, 60, or any multiple of 60"), so both readers answer alike: below a
-//! minute the only granularities there are are the enumerated ones, and from a minute up every
-//! granularity is a whole number of minutes.
+//! can be 1, 5, 10, 20, 30, 60, or any multiple of 60"), so both readers answer the same
+//! requirement: below a minute the only granularities there are are the enumerated ones, and from
+//! a minute up every granularity is a whole number of minutes.
+//!
+//! WHICH CLASS states it is a property of the reader: the aggregating read declares this
+//! service's parameter faults and answers `InvalidParameterValue`, while the retrieving read
+//! declares none of them and keeps the request-validation class — naming the member path the
+//! period arrived on and ending in that layer's terminator.
 //!
 //! The rows differ along the period itself — each published sub-minute granularity, values on
 //! either side of them, a value just under and just over a minute, and one between two
@@ -97,27 +102,49 @@ async fn a_period_outside_the_readable_granularities_is_refused_with_the_require
     ];
 
     for (period, expected) in periods {
-        for (reader, request) in [
-            ("GetMetricStatistics", statistics_request(period)),
-            ("GetMetricData", data_request(period)),
-        ] {
-            let (status, body) = call(&router, reader, &request).await;
-            assert_eq!(
-                status, 400,
-                "case period {period} on {reader}: expected HTTP 400, got {status} with {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                REFUSAL_CODE,
-                "case period {period} on {reader}: expected {REFUSAL_CODE}, got {body}"
-            );
-            let message = error_message(&body);
-            assert_eq!(
-                message, expected,
-                "case period {period} on {reader}: expected the fixed refusal {expected:?}, got \
-                 {message:?}"
-            );
-        }
+        let (status, body) = call(&router, "GetMetricStatistics", &statistics_request(period)).await;
+        assert_eq!(
+            status, 400,
+            "case period {period} on GetMetricStatistics: expected HTTP 400, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            REFUSAL_CODE,
+            "case period {period} on GetMetricStatistics: expected {REFUSAL_CODE}, got {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case period {period} on GetMetricStatistics: expected the fixed refusal \
+             {expected:?}, got {message:?}"
+        );
+
+        // The retrieving read states the SAME requirement, in the class and the words of the
+        // layer that states it there: it declares none of this service's parameter faults, so
+        // every refusal about its input is the request-validation class's — naming the member
+        // path the period arrived on, since one request carries a period per query, with that
+        // layer's padded brackets and its terminator (`crate::metric_data` tables the class).
+        let (status, body) = call(&router, "GetMetricData", &data_request(period)).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, DATA_REFUSAL_CODE),
+            "case period {period} on GetMetricData: expected {DATA_REFUSAL_CODE}, got {status} \
+             with {body}"
+        );
+        let stated = error_message(&body);
+        let expected = if period < ONE_MINUTE {
+            format!(
+                "The parameter {DATA_PERIOD_PATH} must be a value in the set [ 1, 5, 10, 20, 30 \
+                 ].\n"
+            )
+        } else {
+            format!("The parameter {DATA_PERIOD_PATH} must be a multiple of 60.\n")
+        };
+        assert_eq!(
+            stated, expected,
+            "case period {period} on GetMetricData: expected {expected:?}, got {stated:?}"
+        );
     }
 
     // A period far above a minute that is not a whole number of them is told the same
@@ -131,6 +158,15 @@ async fn a_period_outside_the_readable_granularities_is_refused_with_the_require
         );
     }
 }
+
+/// The class the RETRIEVING read states that requirement in: it declares none of this service's
+/// parameter faults (`GetMetricData` models `InvalidNextToken` alone), so every refusal about its
+/// input keeps the request-validation class, whose shape an awsJson body names.
+const DATA_REFUSAL_CODE: &str = "ValidationException";
+
+/// The member path such a refusal names: the period of the first query's `MetricStat`, which is
+/// where [`data_request`] puts it.
+const DATA_PERIOD_PATH: &str = "MetricDataQueries.member.1.MetricStat.Period";
 
 #[tokio::test]
 async fn every_documented_granularity_is_read_rather_than_refused() {

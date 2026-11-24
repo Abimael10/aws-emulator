@@ -611,8 +611,8 @@ async fn every_query_answers_under_its_own_id_unless_it_asks_not_to_be_returned(
     );
 
     // A query whose data is not returned spends none of the `MaxDatapoints` budget either:
-    // the budget bounds what a caller receives. The hidden query here carries three
-    // datapoints, so a budget of two would be exhausted by it if it counted.
+    // the budget is spent on the `Period` slots the RETURNED queries answer. The hidden query
+    // here carries three datapoints, so a budget of two would be exhausted by it if it counted.
     publish(
         &router,
         "Hidden",
@@ -637,7 +637,7 @@ async fn every_query_answers_under_its_own_id_unless_it_asks_not_to_be_returned(
         &router,
         "GetMetricData",
         &json!({
-            "MetricDataQueries": [hidden, metric_stat_query("errors", "Errors", 60, "Sum")],
+            "MetricDataQueries": [hidden.clone(), metric_stat_query("errors", "Errors", 60, "Sum")],
             "StartTime": base,
             "EndTime": base + 3.0 * MINUTE,
             "ScanBy": "TimestampAscending",
@@ -651,14 +651,44 @@ async fn every_query_answers_under_its_own_id_unless_it_asks_not_to_be_returned(
         vec![(base, 2.0), (base + MINUTE, 3.0)],
         "case a hidden query beside a returned one: the budget is spent on the returned data only, got {body}"
     );
-    assert!(
-        body.get("NextToken").and_then(Value::as_str).is_none(),
-        "case a hidden query beside a returned one: nothing was cut short, so no NextToken, got {body}"
-    );
+    // The budget bought the first two of the range's three minute slots, so the third — which
+    // holds no datapoint at all — is what the next page answers: an empty slot spends the budget
+    // like any other, so the range is not exhausted until a page reaches its end.
+    let token = body
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case a hidden query beside a returned one: the range's last slot is left, so a token, got {body}")
+        })
+        .to_string();
     assert_eq!(
         text(&result, "StatusCode"),
-        "Complete",
-        "case a hidden query beside a returned one: the returned series is complete, got {result}"
+        "PartialData",
+        "case a hidden query beside a returned one: a query with range left is partial, got {result}"
+    );
+    let last = ok(
+        &router,
+        "GetMetricData",
+        &json!({
+            "MetricDataQueries": [hidden, metric_stat_query("errors", "Errors", 60, "Sum")],
+            "StartTime": base,
+            "EndTime": base + 3.0 * MINUTE,
+            "ScanBy": "TimestampAscending",
+            "MaxDatapoints": 2,
+            "NextToken": token,
+        }),
+    )
+    .await;
+    let result = single_result(&last);
+    assert_eq!(
+        pairs(&result),
+        Vec::<(f64, f64)>::new(),
+        "case the range's last slot: it holds no datapoint, got {last}"
+    );
+    assert_eq!(
+        (text(&result, "StatusCode"), last.get("NextToken")),
+        ("Complete".to_string(), None),
+        "case the range's last slot: the page that reaches the end of the range is complete, got {last}"
     );
 }
 
@@ -703,8 +733,14 @@ async fn reading_the_data_changes_nothing_a_later_caller_sees() {
     );
 }
 
-/// A bad request is refused with the parameter fault it names, and nothing is reported for
-/// it: the rows differ along which member is at fault.
+/// A bad request is refused in the class this operation refuses its input in, and nothing is
+/// reported for it: the rows differ along which member is at fault.
+///
+/// `GetMetricData` declares none of this service's parameter faults
+/// (`smithy_query(query="operation",operation="GetMetricData")` lists `InvalidNextToken` alone),
+/// so every refusal about its input — whichever layer judges it — is the request-validation
+/// class's (`crate::metric_read_refusal_classes` and `crate::unit_read_identity` table that rule
+/// against the aggregating read, whose model DOES declare them).
 #[tokio::test]
 async fn a_request_outside_the_contract_is_refused() {
     let router = build_router();
@@ -716,7 +752,7 @@ async fn a_request_outside_the_contract_is_refused() {
         (
             "no query at all",
             json!({"MetricDataQueries": [], "StartTime": base, "EndTime": base + MINUTE}),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             // The ids of a query array are the SHAPE of the request, so an array that uses one
@@ -745,7 +781,7 @@ async fn a_request_outside_the_contract_is_refused() {
                 "StartTime": base,
                 "EndTime": base - MINUTE,
             }),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             // `ScanBy` is a modelled enum, so the boundary validator refuses a value outside
@@ -770,7 +806,7 @@ async fn a_request_outside_the_contract_is_refused() {
                 "EndTime": base + MINUTE,
                 "MaxDatapoints": 0,
             }),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             "a Period that is neither a documented sub-minute value nor a multiple of 60",
@@ -779,7 +815,7 @@ async fn a_request_outside_the_contract_is_refused() {
                 "StartTime": base,
                 "EndTime": base + MINUTE,
             }),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             "a NextToken this operation never minted",
@@ -805,7 +841,7 @@ async fn a_request_outside_the_contract_is_refused() {
                 "StartTime": base,
                 "EndTime": base + MINUTE,
             }),
-            "InvalidParameterCombinationException",
+            "ValidationException",
         ),
     ];
     for (case, request, expected) in rows {
@@ -843,16 +879,19 @@ async fn a_request_outside_the_contract_is_refused() {
     }
 }
 
-/// `StatusCode` reports the PAGE a result came back on: a page that hands back a `NextToken`
-/// reports every result as `PartialData`, and only the page that exhausts the request's
-/// datapoints reports `Complete`.
+/// `StatusCode` reports the progress of the RESULT's own query through the requested range: a
+/// query with range left is `PartialData` on that page, the page that reaches the end of its
+/// range reports it `Complete`, and the pages after that one leave it out while the other
+/// queries carry on.
 ///
 /// "PartialData means that an incomplete set of data points were returned. You can use the
 /// NextToken value that was returned and repeat your request to get more data points."
-/// (`MetricDataResult$StatusCode`) — so a client that stops paginating when it sees
-/// `Complete`, which is what the member documents it to mean, cannot truncate the series.
+/// (`MetricDataResult$StatusCode`) — so a client that stops paginating when a result says
+/// `Complete`, which is what the member documents it to mean, cannot truncate that series; and
+/// because one `MaxDatapoints` budget is spent across the request's queries in order, the
+/// queries of one request reach the end of the range on different pages.
 #[tokio::test]
-async fn every_result_of_a_cut_page_is_partial_until_the_last_page() {
+async fn each_result_reports_its_own_querys_progress_through_the_range() {
     let router = build_router();
     let base = base_time();
     publish(
@@ -865,14 +904,38 @@ async fn every_result_of_a_cut_page_is_partial_until_the_last_page() {
     )
     .await;
 
+    let queries = json!([
+        metric_stat_query("m1", "Paged", 60, "Sum"),
+        metric_stat_query("m2", "Paged", 60, "Maximum"),
+    ]);
+    // What the same request answers UNPAGINATED, which the pages below have to reassemble into.
+    let whole = ok(
+        &router,
+        "GetMetricData",
+        &json!({
+            "MetricDataQueries": queries,
+            "StartTime": base,
+            "EndTime": base + 4.0 * MINUTE,
+            "ScanBy": "TimestampAscending",
+        }),
+    )
+    .await;
+    let unpaginated: Vec<(String, Vec<f64>)> = results(&whole)
+        .iter()
+        .map(|result| {
+            (
+                text(result, "Id"),
+                pairs(result).into_iter().map(|(_, value)| value).collect(),
+            )
+        })
+        .collect();
+
+    // One page's results as `(Id, StatusCode, values)`, in the order the answer listed them.
+    let mut pages: Vec<Vec<(String, String, Vec<f64>)>> = Vec::new();
     let mut token: Option<String> = None;
-    let mut pages: Vec<(Vec<String>, bool)> = Vec::new();
     for _ in 0..8 {
         let mut request = json!({
-            "MetricDataQueries": [
-                metric_stat_query("m1", "Paged", 60, "Sum"),
-                metric_stat_query("m2", "Paged", 60, "Maximum"),
-            ],
+            "MetricDataQueries": queries,
             "StartTime": base,
             "EndTime": base + 4.0 * MINUTE,
             "ScanBy": "TimestampAscending",
@@ -882,36 +945,71 @@ async fn every_result_of_a_cut_page_is_partial_until_the_last_page() {
             request["NextToken"] = json!(carried);
         }
         let page = ok(&router, "GetMetricData", &request).await;
-        let statuses: Vec<String> = results(&page)
-            .iter()
-            .map(|result| text(result, "StatusCode"))
-            .collect();
+        pages.push(
+            results(&page)
+                .iter()
+                .map(|result| {
+                    (
+                        text(result, "Id"),
+                        text(result, "StatusCode"),
+                        pairs(result).into_iter().map(|(_, value)| value).collect(),
+                    )
+                })
+                .collect(),
+        );
         token = page
             .get("NextToken")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        pages.push((statuses, token.is_some()));
         if token.is_none() {
             break;
         }
     }
 
     assert!(
-        pages.len() > 1,
-        "case eight datapoints at MaxDatapoints=3: expected several pages, got {pages:?}"
+        pages.len() > 1 && token.is_none(),
+        "case four minute slots at MaxDatapoints=3: expected several pages ending without a \
+         token, got {pages:?}"
     );
-    for (index, (statuses, more)) in pages.iter().enumerate() {
-        let expected = if *more { "PartialData" } else { "Complete" };
-        assert!(
-            !statuses.is_empty() && statuses.iter().all(|status| status == expected),
-            "case page {index} (more to come: {more}): expected every result {expected}, got \
+    // Every query of the request: the pages it appears on, in order, with its status and values.
+    for (id, expected) in &unpaginated {
+        let seen: Vec<(usize, &String, &Vec<f64>)> = pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, results)| {
+                results
+                    .iter()
+                    .find(|(answered, _, _)| answered == id)
+                    .map(|(_, status, values)| (index, status, values))
+            })
+            .collect();
+        let reassembled: Vec<f64> = seen
+            .iter()
+            .flat_map(|(_, _, values)| values.iter().copied())
+            .collect();
+        assert_eq!(
+            &reassembled, expected,
+            "case query {id:?}: the pages reassemble the unpaginated series, got {seen:?}"
+        );
+        // It is on consecutive pages from the first, and the one that finishes it is the last it
+        // is on: a query that reached the end of the range is left out of the pages after it.
+        let positions: Vec<usize> = seen.iter().map(|(index, _, _)| *index).collect();
+        let expected_positions: Vec<usize> = (0..positions.len()).collect();
+        assert_eq!(
+            positions, expected_positions,
+            "case query {id:?}: it pages from the first page until it completes, got {seen:?}"
+        );
+        let statuses: Vec<&str> = seen.iter().map(|(_, status, _)| status.as_str()).collect();
+        let (last, earlier) = statuses
+            .split_last()
+            .unwrap_or_else(|| panic!("case query {id:?}: expected it on at least one page"));
+        assert_eq!(
+            (*last, earlier.iter().all(|status| *status == "PartialData")),
+            ("Complete", true),
+            "case query {id:?}: partial until the page that reaches the end of its range, got \
              {statuses:?}"
         );
     }
-    assert!(
-        pages.last().is_some_and(|(_, more)| !more),
-        "case the last page: expected no NextToken, got {pages:?}"
-    );
 }
 
 /// A `NextToken` is a position within ONE enumeration: replayed against a request that asks

@@ -578,6 +578,36 @@ pub fn equal_range_message() -> String {
     ))
 }
 
+/// How the REQUEST-VALIDATION layer states a read whose range runs BACKWARDS: the member that
+/// has to come later and the member it has to come after, and nothing of the instants submitted.
+///
+/// The same requirement [`range_order_message`] states, worded from the END's side and carrying
+/// the terminator of the layer that states it ([`request_validation_message`]) — which is the
+/// layer a read whose model declares none of this service's parameter faults answers EVERY input
+/// refusal in (`crate::ops::get_metric_data`). Shared, so the two readings of one requirement
+/// cannot drift.
+pub fn end_after_start_message() -> String {
+    request_validation_message(&format!(
+        "The parameter {END_TIME} must be greater than {START_TIME}."
+    ))
+}
+
+/// How CloudWatch states a parameter that may not carry one particular value: the parameter and
+/// the value it may not be, and nothing else of the request.
+///
+/// The sibling of [`greater_than_bound_message`] for the one value a bound's own edge excludes: a
+/// count that must be positive is refused against the BOUND when it is below it and against this
+/// value when it IS it, which is why the two sentences are two.
+pub fn must_not_equal_message(parameter: &str, value: &str) -> String {
+    format!("The parameter {parameter} must not equal {value}.")
+}
+
+/// How CloudWatch states a parameter that has to be ABOVE a bound: the parameter and the bound,
+/// and nothing of the value submitted.
+pub fn greater_than_bound_message(parameter: &str, bound: &str) -> String {
+    format!("The parameter {parameter} must be greater than {bound}.")
+}
+
 /// The member a read's range starts at, as that sentence names it.
 pub const START_TIME: &str = "StartTime";
 
@@ -959,26 +989,87 @@ fn upper_camel(segment: &str) -> String {
 /// is stated against the bound it broke ([`non_positive_period_message`]) rather than against a
 /// set or a step it could never have belonged to.
 pub fn period_error(period: i32) -> Option<String> {
+    period_requirement(period).map(|requirement| {
+        period_sentence(
+            PERIOD_PARAMETER,
+            requirement,
+            &announced_set(&sub_minute_periods()),
+        )
+    })
+}
+
+/// The same requirement as the REQUEST-VALIDATION layer in front of the service states it: the
+/// member PATH the period arrived on, the sub-minute set inside that layer's padded brackets, and
+/// the terminator every sentence it renders ends with ([`request_validation_message`]).
+///
+/// The requirement itself is the one shared rule's ([`period_error`]) — what differs is the layer
+/// stating it, which is a property of the OPERATION: a read whose model declares none of this
+/// service's parameter faults answers every input refusal in this class
+/// (`crate::ops::get_metric_data`), and names the member by the request path it arrived on
+/// because one request may carry a period per query.
+pub fn period_validation_error(parameter: &str, period: i32) -> Option<String> {
+    period_requirement(period).map(|requirement| {
+        request_validation_message(&period_sentence(
+            parameter,
+            requirement,
+            &padded_set(&sub_minute_periods()),
+        ))
+    })
+}
+
+/// Which of the three requirements `period` broke, or `None` when it broke none.
+#[derive(Debug, Clone, Copy)]
+enum PeriodRequirement {
+    /// A span of seconds is a POSITIVE number of them.
+    APositiveSpan,
+    /// Below a minute, the granularities there are are the enumerated ones.
+    OneOfTheSubMinuteGranularities,
+    /// From a minute up, a granularity is a whole number of minutes.
+    AWholeNumberOfMinutes,
+}
+
+/// Why `period` is not a granularity a metric can be read at, as the REQUIREMENT it broke.
+fn period_requirement(period: i32) -> Option<PeriodRequirement> {
     let documented = period >= SHORTEST_PERIOD_SECS
         && (SUB_MINUTE_PERIODS.contains(&period) || period % REGULAR_PERIOD_SECS == 0);
     if documented {
         return None;
     }
     if period < SHORTEST_PERIOD_SECS {
-        return Some(non_positive_period_message());
+        return Some(PeriodRequirement::APositiveSpan);
     }
     if period < REGULAR_PERIOD_SECS {
-        return Some(value_in_set_message(
-            PERIOD_PARAMETER,
-            &SUB_MINUTE_PERIODS
-                .iter()
-                .map(i32::to_string)
-                .collect::<Vec<String>>(),
-        ));
+        return Some(PeriodRequirement::OneOfTheSubMinuteGranularities);
     }
-    Some(format!(
-        "The parameter {PERIOD_PARAMETER} must be a multiple of {REGULAR_PERIOD_SECS}."
-    ))
+    Some(PeriodRequirement::AWholeNumberOfMinutes)
+}
+
+/// One of those requirements as a sentence about the member at `parameter`, with the sub-minute
+/// set spelled as `set` — the bracket form belongs to the layer stating the sentence, not to the
+/// requirement.
+fn period_sentence(parameter: &str, requirement: PeriodRequirement, set: &str) -> String {
+    match requirement {
+        PeriodRequirement::APositiveSpan => {
+            greater_than_bound_message(parameter, &NO_SPAN_AT_ALL.to_string())
+        }
+        PeriodRequirement::OneOfTheSubMinuteGranularities => {
+            format!("The parameter {parameter} must be a value in the set {set}.")
+        }
+        PeriodRequirement::AWholeNumberOfMinutes => {
+            format!("The parameter {parameter} must be a multiple of {REGULAR_PERIOD_SECS}.")
+        }
+    }
+}
+
+/// The sub-minute granularities as a refusal lists them ([`SUB_MINUTE_PERIODS`]).
+fn sub_minute_periods() -> Vec<String> {
+    SUB_MINUTE_PERIODS.iter().map(i32::to_string).collect()
+}
+
+/// `values` inside PADDED brackets: the bracket form the request-validation layer announces a set
+/// in, beside the bare one the parameter faults announce ([`announced_set`]).
+fn padded_set(values: &[String]) -> String {
+    format!("[ {} ]", values.join(", "))
 }
 
 /// The granularity every regular-resolution metric is stored at, in seconds — a minute, which is
@@ -996,7 +1087,7 @@ const SHORTEST_PERIOD_SECS: i32 = 1;
 /// whatever its value — and the member is the one every operation that takes a period spells it
 /// with ([`PERIOD_PARAMETER`]).
 pub fn non_positive_period_message() -> String {
-    format!("The parameter {PERIOD_PARAMETER} must be greater than {NO_SPAN_AT_ALL}.")
+    greater_than_bound_message(PERIOD_PARAMETER, &NO_SPAN_AT_ALL.to_string())
 }
 
 /// The bound that sentence states: a span of seconds is a positive number of them.
@@ -2555,6 +2646,37 @@ pub fn names_default_dataset(identifier: &str, region: &str) -> bool {
 
 /// What a dataset is called in the `ResourceType` member of a refusal that names one.
 pub const DATASET_RESOURCE_TYPE: &str = "Dataset";
+
+/// Whether a query naming the account `account` asks for metrics of an account this endpoint can
+/// answer from.
+///
+/// "The ID of the account where the metrics are located. If you are performing a
+/// `GetMetricData` operation in a monitoring account, use this to specify which account to
+/// retrieve this metric from." (`MetricDataQuery$AccountId`) — a monitoring account reads a
+/// SOURCE account's metrics only where the two accounts are LINKED, so a query naming an
+/// unlinked account asks for data the caller may not see. This emulator holds the metrics of the
+/// one account it serves (`emulator_server::emulator_account_id`, which every datapoint
+/// `PutMetricData` writes belongs to) and that account is linked to no other, so the caller's own
+/// account — named or left out — is the only one a read here can answer from.
+///
+/// The ONE place a query's account becomes part of the identity a metric read resolves, so every
+/// reader of a `MetricDataQuery` array scopes it the same way.
+pub fn reads_metrics_of_own_account(account: Option<&str>) -> bool {
+    account.is_none_or(|named| {
+        named.is_empty() || named == ::emulator_server::emulator_account_id()
+    })
+}
+
+/// How CloudWatch reports, on the RESULT of the query that asked for it, metric data of an
+/// account the caller's account is not linked to.
+///
+/// A fixed sentence carrying nothing of the request: what a client repairs is the LINK between
+/// the two accounts, and the account it named is already in the query it sent back as the
+/// result's `Id`. Reported per result rather than refusing the request, because the other
+/// queries of the same request are answered ("A list of messages with additional information
+/// about the data returned", `MetricDataResult$Messages`).
+pub const UNLINKED_METRIC_ACCOUNT_MESSAGE: &str = "Access denied when getting data - please \
+     check that this account and the requested metric account are linked";
 
 /// The ARN namespace of this service's own IAM actions, as an authorization failure names the
 /// action it refused (`cloudwatch:GetDataset`).

@@ -17,8 +17,9 @@
 //! * the two readers of a metric's datapoints refuse a `Period` that names no span of time as
 //!   that same parameter-value fault, against the bound a span has to be above;
 //! * a read whose range begins exactly where it ends is refused by the request-validation layer
-//!   (the class the whole SHAPE of a request is judged under), while one whose range runs
-//!   backwards is a parameter VALUE;
+//!   (the class the whole SHAPE of a request is judged under), and so is one whose range runs
+//!   backwards on the reader that declares no parameter fault — stated as the order the two
+//!   members have to be in, where the reader that declares one answers that fault instead;
 //! * the ALARM-HISTORY read refuses a date range that runs backwards as the parameter-value
 //!   fault, naming both instants the request carried;
 //! * the metric DATA read's refusals are the request-validation layer's throughout, so a
@@ -315,16 +316,23 @@ async fn a_range_that_begins_where_it_ends_is_refused_by_the_shape_of_the_reques
             );
         }
 
-        // A window that runs BACKWARDS is the other class: a parameter value the read cannot
-        // use, stated as the order the two members have to be in.
-        for (reader, request) in [
+        // A window that runs BACKWARDS is the other sentence: the order the two members have to
+        // be in. WHICH CLASS states it is a property of the reader — the aggregating read
+        // declares this service's parameter faults and answers one of them, while the retrieving
+        // read declares none (`GetMetricData` models `InvalidNextToken` alone) and keeps the
+        // request-validation class for every refusal about its input, terminator and all.
+        for (reader, request, code, message) in [
             (
                 "GetMetricStatistics",
                 window_statistics_request(instant, instant - 60.0),
+                PARAMETER_VALUE,
+                "The parameter StartTime must be less than the parameter EndTime.",
             ),
             (
                 "GetMetricData",
                 window_data_request(instant, instant - 60.0),
+                VALIDATION,
+                "The parameter EndTime must be greater than StartTime.\n",
             ),
         ] {
             let (status, body) = call(&router, reader, &request).await;
@@ -332,16 +340,16 @@ async fn a_range_that_begins_where_it_ends_is_refused_by_the_shape_of_the_reques
                 status, 400,
                 "case {case:?} on {reader}: expected HTTP 400, got {status} with {body}"
             );
-            let code = error_code(&body);
+            let answered = error_code(&body);
             assert_eq!(
-                code, PARAMETER_VALUE,
-                "case {case:?} on {reader}: expected {PARAMETER_VALUE}, got {code:?} in {body}"
+                answered, code,
+                "case {case:?} on {reader}: expected {code}, got {answered:?} in {body}"
             );
-            let message = error_message(&body);
+            let stated = error_message(&body);
             assert_eq!(
-                message, "The parameter StartTime must be less than the parameter EndTime.",
+                stated, message,
                 "case {case:?} on {reader}: expected the order of the two members, got \
-                 {message:?}"
+                 {stated:?}"
             );
         }
     }

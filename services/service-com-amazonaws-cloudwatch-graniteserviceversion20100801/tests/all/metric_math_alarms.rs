@@ -531,7 +531,7 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
                 .collect(),
         ),
         3.0 * period,
-        "one call can include up to 500",
+        "must not have a size greater than 500",
     )];
     for (case, queries, span, says) in refused {
         let (status, body) = call(
@@ -548,11 +548,12 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
+        // This read declares none of this service's parameter faults, so every refusal about
+        // its input is the request-validation class's (`crate::metric_data` tables that rule).
         let code = error_code(&body);
-        assert!(
-            code == "InvalidParameterValueException"
-                || code == "InvalidParameterCombinationException",
-            "case {case:?}: expected a parameter refusal, got {body}"
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected the request-validation class, got {body}"
         );
         let message = error_message(&body);
         assert!(
@@ -598,20 +599,32 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
             body.get("NextToken").and_then(Value::as_str).is_some(),
             "case {case:?}: a range wider than one page must hand back a token, got {body}"
         );
-        let status = body
+        // One datapoint budget is spent across the request's queries IN ORDER, and each result
+        // reports its own query's progress — so the statuses, read in query order, are the
+        // queries the budget finished (`Complete`) followed by the ones it did not reach yet
+        // (`PartialData`), and a page that hands back a token has at least one of the latter.
+        let statuses: Vec<String> = body
             .get("MetricDataResults")
             .and_then(Value::as_array)
-            .and_then(|results| results.first().cloned())
-            .and_then(|result| {
+            .unwrap_or_else(|| panic!("case {case:?}: expected results, got {body}"))
+            .iter()
+            .map(|result| {
                 result
                     .get("StatusCode")
                     .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            });
-        assert_eq!(
-            status.as_deref(),
-            Some("PartialData"),
-            "case {case:?}: every result of a cut page is partial, got {body}"
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let finished = statuses
+            .iter()
+            .take_while(|status| *status == "Complete")
+            .count();
+        let left: Vec<&String> = statuses.iter().skip(finished).collect();
+        assert!(
+            !left.is_empty() && left.iter().all(|status| *status == "PartialData"),
+            "case {case:?}: the queries the budget has not reached are partial, got {statuses:?} \
+             in {body}"
         );
     }
 

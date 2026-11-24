@@ -50,6 +50,39 @@ use super::{BasicStatistics, ComAmazonawsCloudwatchGraniteserviceversion20100801
 /// expression ([`super::metric_math::is_metrics_insights_query`]).
 const SELECT_KEYWORD: &str = "SELECT";
 
+/// How many Metrics Insights queries ONE request may carry: "If you include a Metrics Insights
+/// query, each `GetMetricData` operation can include only one query. But the same
+/// `GetMetricData` operation can also retrieve other metrics." (`GetMetricData`) — so the limit
+/// is on the SELECT statements of a request, not on its queries.
+pub const MAX_QUERIES_PER_REQUEST: usize = 1;
+
+/// How CloudWatch refuses a request carrying more Metrics Insights queries than that: the
+/// published limit, and nothing of the request. The limit is the only variable part, so the
+/// sentence and the number it states cannot drift.
+pub fn too_many_queries_message() -> String {
+    format!("Maximum number of queries ({MAX_QUERIES_PER_REQUEST}) exceeded")
+}
+
+/// How far back a Metrics Insights query can read: "Metrics Insights queries can query the most
+/// recent two weeks of metric data." (`GetMetricData`)
+pub const RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
+
+/// Whether a query over a range beginning at `requested_start` reaches further back than one can
+/// read at the instant `now` ([`RETENTION_SECS`]).
+pub fn exceeds_retention(requested_start: f64, now: f64) -> bool {
+    requested_start < now - RETENTION_SECS
+}
+
+/// The code the message reporting such a window carries.
+pub const MAX_QUERY_TIME_RANGE_CODE: &str = "MaxQueryTimeRangeExceeded";
+
+/// What that message says. Fixed text: the window a query may read is published, so the message
+/// reports that the request's own reached past it rather than restating either instant. The row
+/// is still answered — with the part of the range that can be read — so this is a message about
+/// the operation rather than a refusal of it ("A message appears here only if it is related to
+/// the global `GetMetricData` operation", `GetMetricDataOutput$Messages`).
+pub const MAX_QUERY_TIME_RANGE_MESSAGE: &str = "Max time window exceeded for query";
+
 /// How many series ONE query selects at most: "A GetMetricData operation that does not include a
 /// query can retrieve as many as 500 different metrics in a single request." (`GetMetricData`) —
 /// the same ceiling the server-side search of this service answers under, so neither discovers

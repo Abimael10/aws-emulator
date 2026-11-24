@@ -497,15 +497,29 @@ async fn a_read_names_an_instant_inside_the_span_the_service_reads() {
                      with {body}"
                 ),
                 Some(parameter) => {
+                    // WHICH class states it is a property of the reader: the aggregating read
+                    // declares this service's parameter faults and answers one of them, while
+                    // the retrieving read declares none and keeps the request-validation class
+                    // — with that layer's own terminator on the sentence
+                    // (`crate::metric_read_refusal_classes` tables that rule).
+                    let (code, stated) = match reader {
+                        "GetMetricData" => (
+                            "ValidationException",
+                            format!("The parameter {parameter} {SPAN}\n"),
+                        ),
+                        _ => (
+                            "InvalidParameterValueException",
+                            format!("The parameter {parameter} {SPAN}"),
+                        ),
+                    };
                     assert_eq!(
                         (status, error_code(&body).as_str()),
-                        (400, "InvalidParameterValueException"),
-                        "case {case:?} on {reader}: expected the parameter-value fault, got \
-                         {status} {body}"
+                        (400, code),
+                        "case {case:?} on {reader}: expected {code}, got {status} {body}"
                     );
                     assert_eq!(
                         error_message(&body),
-                        format!("The parameter {parameter} {SPAN}"),
+                        stated,
                         "case {case:?} on {reader}: expected the span named for {parameter}, got \
                          {body}"
                     );

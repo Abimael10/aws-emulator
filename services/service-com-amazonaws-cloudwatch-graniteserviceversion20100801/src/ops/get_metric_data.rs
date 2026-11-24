@@ -18,9 +18,27 @@
 //! computed. A `Stat` outside the statistic grammar is not a statistic at all, so the request
 //! is refused for its SHAPE, naming the query it arrived on.
 //!
+//! A query carrying a Metrics Insights `SELECT` is answered by the one reader of that language
+//! ([`crate::state::metrics_insights`]), which selects its series out of the same store and folds
+//! them into one series per group of the statement's `GROUP BY`; a request may carry one such
+//! query beside any number of retrieving and metric-math ones, and a window reaching further back
+//! than that language reads is REPORTED on the answer rather than refused.
+//!
+//! A query naming another account's metrics is answered on its own result: this endpoint holds the
+//! metrics of the one account it serves, which is linked to no other, so such a query is
+//! `Forbidden` with no values while the rest of the request is answered.
+//!
 //! A range and a granularity that together span more datapoints than one page carries are NOT
-//! refused: the request is answered one slice of its range at a time, each page reporting its
-//! results `PartialData` and handing back the token the next slice resumes at.
+//! refused: `MaxDatapoints` is spent on the `Period` SLOTS of the requested range — every slot,
+//! whether or not a datapoint was published in it — across the request's queries in order
+//! ([`query_pages`]), up to the datapoints one page answers with ([`MAX_PAGE_DATAPOINTS`]), so
+//! each page answers the next slots of the range, a result reports its own query's progress
+//! through it, and the page that leaves any of the range unanswered hands back the token the next
+//! one resumes at.
+//!
+//! Every refusal about this request's INPUT is the request-validation layer's ([`refused`]): the
+//! operation declares none of this service's parameter faults, so a client of it branches on one
+//! class whichever layer judged the request.
 //!
 //! ## Shape of an operation
 //!
@@ -167,23 +185,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.cloudwatch#GetMetricData",
-    // Widened in with `extra_errors`: this SERVICE models all three, the operation shape
-    // lists only `InvalidNextToken`. `InternalServiceFault` is the only honest answer when
-    // the shared store cannot be reached, and the two parameter faults are what every other
-    // metric-reading operation of this service refuses a bad `MetricDataQueries` /
-    // `StartTime` / `EndTime` with.
-    extra_errors = [
-        "InternalServiceFault",
-        "InvalidParameterValueException",
-        "InvalidParameterCombinationException"
-    ]
+    // Widened in with `extra_errors`: `InternalServiceFault` is the only honest answer when the
+    // shared store cannot be reached, and this SERVICE models it. The two PARAMETER faults are
+    // deliberately NOT widened in: this operation declares neither, so every refusal about its
+    // input is answered in the request-validation class instead ([`refused`]).
+    extra_errors = ["InternalServiceFault"]
 )]
 #[derive(Debug)]
 pub enum GetMetricDataErrorModeled {
     InvalidNextToken(InvalidNextToken),
     InternalServiceFault(InternalServiceFault),
-    InvalidParameterValueException(InvalidParameterValueException),
-    InvalidParameterCombinationException(InvalidParameterCombinationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -248,17 +259,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // "A single GetMetricData call can include up to 500 MetricDataQuery structures."
+        // `MetricDataQueries` is `@required`, and an array carrying no query asks for nothing at
+        // all: the layer in front of the service states a member it was given no value for in its
+        // own sentence ([`crate::state::parameter_required_message`]).
         if input.metric_data_queries.is_empty() {
-            return Err(invalid_value(
-                "MetricDataQueries must name at least one query".to_string(),
-            ));
-        }
-        if input.metric_data_queries.len() > MAX_QUERIES {
-            return Err(invalid_value(format!(
-                "MetricDataQueries carries {} queries; one call can include up to {MAX_QUERIES}",
-                input.metric_data_queries.len()
+            return Err(refused(crate::state::request_validation_message(
+                &crate::state::parameter_required_message(QUERIES),
             )));
+        }
+        // "A single GetMetricData call can include up to 500 MetricDataQuery structures."
+        // (`MetricDataQuery`) — a bound this service enforces rather than one the member
+        // declares, so it is stated here, in the words CloudWatch states a collection over its
+        // cap in ([`crate::state::collection_too_large_message`]).
+        if input.metric_data_queries.len() > MAX_QUERIES {
+            return Err(refused(crate::state::request_validation_message(
+                &crate::state::collection_too_large_message(QUERIES, MAX_QUERIES),
+            )));
+        }
+        // "If you include a Metrics Insights query, each GetMetricData operation can include
+        // only one query. But the same GetMetricData operation can also retrieve other metrics."
+        // (`GetMetricData`) — the limit is on the SELECT statements of a request, so a request
+        // carrying one beside any number of retrieving and metric-math queries is answered and
+        // one carrying two SELECTs is refused, in the words the published limit is stated in
+        // ([`crate::state::metrics_insights::too_many_queries_message`]).
+        if insights_queries(&input) > crate::state::metrics_insights::MAX_QUERIES_PER_REQUEST {
+            return Err(refused(
+                crate::state::metrics_insights::too_many_queries_message(),
+            ));
         }
         // "A short name used to tie this object to the results in the response. This name must
         // be unique within a single call to GetMetricData. […] The valid characters are
@@ -270,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::metric_query::query_id_refusal(&input.metric_data_queries, QUERIES)
         {
-            return Err(GetMetricDataError::validation_error(message));
+            return Err(refused(message));
         }
         for (index, query) in input.metric_data_queries.iter().enumerate() {
             // "Within one MetricDataQuery object, you must specify either Expression or
@@ -283,14 +310,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let path = crate::state::list_element_path(QUERIES, index + 1);
             match (query.expression.is_some(), query.metric_stat.is_some()) {
                 (true, true) => {
-                    return Err(GetMetricDataError::validation_error(
-                        crate::state::request_validation_message(
-                            &crate::state::mutually_exclusive_message(
-                                &format!("{path}.Expression"),
-                                &format!("{path}.MetricStat"),
-                            ),
+                    return Err(refused(crate::state::request_validation_message(
+                        &crate::state::mutually_exclusive_message(
+                            &format!("{path}.Expression"),
+                            &format!("{path}.MetricStat"),
                         ),
-                    ))
+                    )))
                 }
                 // A query that names NEITHER asks for nothing at all: no series to retrieve
                 // and no expression to evaluate. The member the request-validation layer
@@ -298,15 +323,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // query returns, which an `Expression` is the alternative to rather than a
                 // second way of satisfying.
                 (false, false) => {
-                    return Err(GetMetricDataError::validation_error(
-                        crate::state::request_validation_message(
-                            &crate::state::parameter_required_message(&format!(
-                                "{path}.MetricStat"
-                            )),
-                        ),
-                    ))
+                    return Err(refused(crate::state::request_validation_message(
+                        &crate::state::parameter_required_message(&format!("{path}.MetricStat")),
+                    )))
                 }
                 _ => {}
+            }
+            // "The granularity, in seconds, of the returned data points" — every `Period` the
+            // request carries has to name a granularity a metric can be read at, by the one
+            // shared rule ([`crate::state::period_validation_error`]), and the refusal names the
+            // member path THIS period arrived on: one request carries a period per query, and on
+            // its own `Period` member as well as on its `MetricStat`'s.
+            for (member, period) in [
+                (format!("{path}.Period"), query.period),
+                (
+                    format!("{path}.MetricStat.Period"),
+                    query.metric_stat.as_ref().map(|stat| stat.period),
+                ),
+            ] {
+                let Some(period) = period else {
+                    continue;
+                };
+                if let Some(message) = crate::state::period_validation_error(&member, period) {
+                    return Err(refused(message));
+                }
             }
             // "The statistic to return. It can include any CloudWatch statistic or extended
             // statistic." (`MetricStat$Stat`) — an unconstrained string in the model, so no
@@ -317,11 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of this request is read or folded first.
             if let Some(stat) = query.metric_stat.as_ref() {
                 if !crate::state::is_cloudwatch_statistic(&stat.stat) {
-                    return Err(GetMetricDataError::validation_error(
-                        crate::state::not_a_valid_statistic_message(&format!(
-                            "{path}.MetricStat.Stat"
-                        )),
-                    ));
+                    return Err(refused(crate::state::not_a_valid_statistic_message(
+                        &format!("{path}.MetricStat.Stat"),
+                    )));
                 }
             }
         }
@@ -331,33 +369,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let descending = match input.scan_by.as_deref() {
             None | Some(SCAN_BY_DESCENDING) => true,
             Some(SCAN_BY_ASCENDING) => false,
-            Some(other) => {
-                return Err(invalid_value(format!(
-                    "ScanBy {other} is not supported; the supported values are \
-                     {SCAN_BY_ASCENDING} | {SCAN_BY_DESCENDING}"
+            // `ScanBy` is a modelled enum, so the layer in front of the service refuses a value
+            // outside it before this handler runs; the same class states it here, so the two
+            // layers cannot answer one value differently.
+            Some(_) => {
+                return Err(refused(crate::state::request_validation_message(
+                    &crate::state::value_in_set_message(
+                        SCAN_BY,
+                        &[
+                            SCAN_BY_DESCENDING.to_string(),
+                            SCAN_BY_ASCENDING.to_string(),
+                        ],
+                    ),
                 )))
             }
         };
 
         // "The maximum number of data points the request should return before paginating. If
-        // you omit this, the default of 100,800 is used."
+        // you omit this, the default of 100,800 is used." — a budget of datapoints is a count of
+        // them, so zero is refused against the one value it may not be and a negative one
+        // against the bound a count has to be above: two faults, two sentences. A budget ABOVE
+        // the datapoints one call answers with ("a total of as many as 100,800 data points",
+        // `GetMetricData` — [`MAX_PAGE_DATAPOINTS`], which is also the default) is not refused:
+        // it asks for more than a page carries, so the page carries a page.
         let max_datapoints = match input.max_datapoints {
             None => DEFAULT_MAX_DATAPOINTS,
-            Some(requested) if requested >= 1 => usize::try_from(requested).unwrap_or(usize::MAX),
-            Some(requested) => {
-                return Err(invalid_value(format!(
-                    "MaxDatapoints must be at least 1; got {requested}"
+            Some(0) => {
+                return Err(refused(crate::state::request_validation_message(
+                    &crate::state::must_not_equal_message(MAX_DATAPOINTS, NO_DATAPOINTS_AT_ALL),
                 )))
             }
+            Some(requested) if requested < 0 => {
+                return Err(refused(crate::state::request_validation_message(
+                    &crate::state::greater_than_bound_message(
+                        MAX_DATAPOINTS,
+                        NO_DATAPOINTS_AT_ALL,
+                    ),
+                )))
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MAX_PAGE_DATAPOINTS)
+                .min(MAX_PAGE_DATAPOINTS),
         };
 
         // "Include this value, if it was returned by the previous GetMetricData operation, to
         // get the next set of data points": the cursor this operation mints carries WHERE in
-        // this request the earlier pages stopped — how much of the requested range they covered
-        // and how many datapoints of the current slice they returned — together with the
-        // identity of the request it was minted for, so anything else is not a token this
-        // service handed out, and a token replayed against a different request is refused
-        // rather than silently skipping or repeating datapoints.
+        // this request the earlier pages stopped — how many `Period` slots of it they budgeted in
+        // all — together with the identity of the request it was minted for, so anything else is
+        // not a token this service handed out, and a token replayed against a different request
+        // is refused rather than silently skipping or repeating datapoints. `MaxDatapoints` is
+        // NOT part of that identity: it is the SIZE of the page a token is resumed with, so the
+        // same token read with a larger budget answers a longer page from the same position.
         let identity = request_identity(&input);
         let resumed = match crate::state::requested_page(input.next_token.as_deref()) {
             None => Position::default(),
@@ -369,7 +431,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 position
             }
         };
-        let already_returned = resumed.returned;
 
         let requested_start = crate::state::from_timestamp(&input.start_time);
         let end = crate::state::from_timestamp(&input.end_time);
@@ -381,29 +442,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (crate::state::END_TIME, end),
         ] {
             if let Some(message) = crate::state::instant_range_error(parameter, instant) {
-                return Err(invalid_value(message));
+                return Err(refused(crate::state::request_validation_message(&message)));
             }
         }
         // A range is read forwards from its start, so a request whose end does not come after
-        // its start names no window — and WHICH of the two it is decides the class: a range that
-        // begins exactly where it ends is the SHAPE of the request, refused by the layer in
-        // front of the service ([`crate::state::equal_range_message`]), while one that runs
-        // backwards is a parameter value this read cannot use.
+        // its start names no window — and WHICH of the two it is decides the sentence: a range
+        // that begins exactly where it ends is stated as the two members being one instant
+        // ([`crate::state::equal_range_message`]), while one that runs backwards is stated as
+        // the order the two have to be in ([`crate::state::end_after_start_message`]).
         if end == requested_start {
-            return Err(GetMetricDataError::validation_error(
-                crate::state::equal_range_message(),
-            ));
+            return Err(refused(crate::state::equal_range_message()));
         }
         if end < requested_start {
-            return Err(invalid_value(crate::state::range_order_message()));
+            return Err(refused(crate::state::end_after_start_message()));
         }
         let now = crate::state::now_secs();
-        // How much of the requested range THIS page answers. A range and a granularity that
-        // together span more datapoints than one page carries is not a request this operation
-        // refuses — it is a request that takes several pages: the page covers as much of the
-        // range as fits, reports its results as partial and hands back a token that resumes at
-        // the slice boundary ([`page_slice`]).
-        let slice = page_slice(&input.metric_data_queries, requested_start, end, resumed.covered, descending);
+        // How much of the requested range THIS page answers, query by query: the budget is spent
+        // on the `Period` slots of the range, empty ones included, in query order
+        // ([`query_pages`]).
+        let pages = query_pages(
+            &input.metric_data_queries,
+            requested_start,
+            end,
+            resumed.slots,
+            max_datapoints,
+            descending,
+        );
 
         // Every query is resolved under its OWN short acquisition of the store, and the walk
         // yields between queries: one call can carry up to [`MAX_QUERIES`] of them, so neither
@@ -416,6 +480,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation keeps is the walk, the locking and the refusals it answers with.
         let mut resolution = crate::state::metric_query::Resolution::default();
         for (index, query) in input.metric_data_queries.iter().enumerate() {
+            let Some(page) = pages.get(index) else {
+                continue;
+            };
+            // A query whose account this read cannot answer from reads NOTHING of this store,
+            // and a query the earlier pages already covered the whole range for is not on this
+            // page at all.
+            if page.forbidden || page.done {
+                continue;
+            }
             // A Metrics Insights query reads the store the way a query naming a metric does —
             // it SELECTS series rather than computing over the values of other queries — so it
             // is resolved in this pass, before any expression is evaluated: a math expression
@@ -429,11 +502,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let (value, datapoints) = {
                     let store = state.lock();
                     crate::state::metric_query::insights_series(
-                        &store,
-                        query,
-                        slice.start,
-                        slice.end,
-                        now,
+                        &store, query, page.start, page.end, now,
                     )
                 }
                 .map_err(refusal)?;
@@ -451,12 +520,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let series = {
                 let store = state.lock();
                 crate::state::metric_query::retrieved_series(
-                    &store,
-                    query,
-                    stat,
-                    slice.start,
-                    slice.end,
-                    now,
+                    &store, query, stat, page.start, page.end, now,
                 )
             }
             .map_err(refusal)?;
@@ -477,21 +541,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(tree) = parsed.get(id) else {
                 continue;
             };
-            let Some(query) = input
+            let Some((at, query)) = input
                 .metric_data_queries
                 .iter()
-                .find(|query| query.id == *id)
+                .enumerate()
+                .find(|(_, query)| query.id == *id)
             else {
                 continue;
             };
+            let Some(page) = pages.get(at) else {
+                continue;
+            };
+            if page.forbidden || page.done {
+                continue;
+            }
             // "The granularity, in seconds, of the returned data points"
             // (`MetricDataQuery$Period`): an expression's own period is what a constructed
             // series is spaced at, and the default is the one minute every regular-resolution
-            // metric is stored at. It is a granularity like any other, so the one shared rule
-            // judges it.
-            if let Some(period) = query.period {
-                check_period(period)?;
-            }
+            // metric is stored at.
             let period = query
                 .period
                 .map_or(crate::state::metric_query::DEFAULT_EXPRESSION_PERIOD, f64::from);
@@ -502,11 +569,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tree,
                     &crate::state::metric_query::StoreSeriesSource {
                         store: &store,
-                        requested_start: slice.start,
-                        end: slice.end,
+                        requested_start: page.start,
+                        end: page.end,
                         now,
                     },
-                    (slice.start, slice.end),
+                    (page.start, page.end),
                     period,
                 )
             }
@@ -517,24 +584,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let answers = answers(&resolution, &input, slice.start).await?;
+        let answers = answers(&resolution, &input, &pages).await?;
 
-        // One datapoint budget is spent across every result, in query order, and the cursor
-        // the response hands back is how many of them this and the earlier pages returned —
-        // so paging through a request's results never repeats or skips a datapoint.
-        let mut skipped = 0usize;
-        let mut returned = 0usize;
-        let mut truncated = false;
+        // Each result reports the slice ITS query answered: "Complete indicates that all data
+        // points in the requested time range were returned. PartialData means that an incomplete
+        // set of data points were returned. You can use the NextToken value that was returned
+        // and repeat your request to get more data points." — so the status is a property of the
+        // QUERY's own progress through the requested range, and a query that reached the end of
+        // it on an earlier page is not on this one.
         let mut results: Vec<MetricDataResult> = Vec::with_capacity(answers.len());
+        let mut more = false;
         for (index, answer) in answers.into_iter().enumerate() {
             // "If you are performing this call just to do math expressions and do not also
             // need the raw data returned, you can specify false. If you omit this, the
             // default of true is used." A query whose data is not returned contributes no
-            // result AND spends none of the datapoint budget: a page is cut short only by
-            // data a caller actually receives.
+            // result, and no page is handed out for range only IT has left.
             if !answer.return_data {
                 continue;
             }
+            // A query naming an account this read may not answer from is reported as that
+            // refusal — on the result, beside the answers of the request's other queries.
+            if answer.forbidden {
+                results.push(forbidden_result(&answer.id, &answer.label));
+                continue;
+            }
+            more |= answer.more;
 
             for series in answer.series {
                 let mut points: Vec<(f64, f64)> = series.points;
@@ -543,21 +617,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if descending {
                     points.reverse();
                 }
-
-                let mut timestamps = Vec::new();
-                let mut values = Vec::new();
+                let mut timestamps = Vec::with_capacity(points.len());
+                let mut values = Vec::with_capacity(points.len());
                 for (timestamp, value) in points {
-                    if skipped < already_returned {
-                        skipped += 1;
-                        continue;
-                    }
-                    if returned >= max_datapoints {
-                        truncated = true;
-                        break;
-                    }
                     timestamps.push(crate::state::to_timestamp(timestamp));
                     values.push(value);
-                    returned += 1;
                 }
 
                 results.push(MetricDataResult {
@@ -565,9 +629,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     label: Some(series.label),
                     timestamps: Some(timestamps),
                     values: Some(values),
-                    // Filled in below, once it is known whether this page exhausted the
-                    // request's datapoints.
-                    status_code: None,
+                    status_code: Some(
+                        if answer.more {
+                            STATUS_PARTIAL_DATA
+                        } else {
+                            STATUS_COMPLETE
+                        }
+                        .to_string(),
+                    ),
                     // "Any message about a specific metric returned by the operation appears
                     // in the MetricDataResult object returned for that metric": the points an
                     // expression's arithmetic could not produce a number for are reported
@@ -582,44 +651,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "Complete indicates that all data points in the requested time range were returned.
-        // PartialData means that an incomplete set of data points were returned. You can use
-        // the NextToken value that was returned and repeat your request to get more data
-        // points." — so the status is a property of the PAGE: a page that hands back a token
-        // reports every result as partial, and only the page that returns the rest of the
-        // requested range reports them complete. Either half cuts a page short: the datapoint
-        // budget inside this slice, and the range still left beyond the slice — which is why a
-        // slice holding no datapoint at all is still partial when more of the range remains.
-        let next = if truncated {
-            Some(Position {
-                covered: resumed.covered,
-                returned: already_returned.saturating_add(returned),
-            })
-        } else if slice.more {
-            Some(Position {
-                covered: resumed.covered + (slice.end - slice.start),
-                returned: 0,
-            })
-        } else {
-            None
-        };
-        let status = if next.is_some() {
-            STATUS_PARTIAL_DATA
-        } else {
-            STATUS_COMPLETE
-        };
-        for result in &mut results {
-            result.status_code = Some(status.to_string());
-        }
-
         Ok(GetMetricDataOutput {
             metric_data_results: Some(results),
             // "A token that marks the next batch of returned results", minted only when this
             // page left some of the request unanswered, and only for THIS request.
-            next_token: next.map(|position| encode_cursor(&position, &identity)),
+            next_token: more.then(|| {
+                encode_cursor(
+                    &Position {
+                        slots: resumed.slots.saturating_add(max_datapoints as u64),
+                    },
+                    &identity,
+                )
+            }),
             // "A message appears here only if it is related to the global GetMetricData
             // operation."
-            messages: Some(Vec::new()),
+            messages: Some(operation_messages(&input, requested_start, now)),
         })
     }
 }
@@ -638,6 +684,14 @@ const MAX_QUERIES: usize = crate::state::metric_query::MAX_RESOLVED_QUERIES;
 /// omit this, the default of 100,800 is used." (`GetMetricDataInput$MaxDatapoints`)
 const DEFAULT_MAX_DATAPOINTS: usize = 100_800;
 
+/// "a total of as many as 100,800 data points" (`GetMetricData`) — the datapoints of a request's
+/// range ONE page answers with, whatever the caller asked for: the budget is spent on the
+/// `Period` slots of the range ([`query_pages`]), so this is what bounds the slots one page
+/// materialises for the whole request, and a caller naming more than it gets a page. It is the
+/// same number as the default a request naming none takes ([`DEFAULT_MAX_DATAPOINTS`]) — the
+/// documented total is both.
+const MAX_PAGE_DATAPOINTS: usize = DEFAULT_MAX_DATAPOINTS;
+
 /// `TimestampAscending`, one of the two values the `ScanBy` enum carries.
 const SCAN_BY_ASCENDING: &str = "TimestampAscending";
 
@@ -652,6 +706,22 @@ const STATUS_COMPLETE: &str = "Complete";
 /// were returned".
 const STATUS_PARTIAL_DATA: &str = "PartialData";
 
+/// `Forbidden`, one of the modelled `StatusCode` values: the data a query asked for is in an
+/// account the caller's own is not linked to read.
+const STATUS_FORBIDDEN: &str = "Forbidden";
+
+/// The request member the scan order arrives on, as a refusal names it
+/// (`GetMetricDataInput$ScanBy`).
+const SCAN_BY: &str = "ScanBy";
+
+/// The request member the page budget arrives on, as a refusal names it
+/// (`GetMetricDataInput$MaxDatapoints`).
+const MAX_DATAPOINTS: &str = "MaxDatapoints";
+
+/// The budget a request may not ask for and the bound it has to be above: a page carrying no
+/// datapoint at all is no page.
+const NO_DATAPOINTS_AT_ALL: &str = "0";
+
 /// How many queries the walk folds between yields, so a cancelled or timed-out request has
 /// somewhere to land instead of folding every query of the request first.
 const QUERY_YIELD_INTERVAL: usize = 16;
@@ -663,21 +733,33 @@ const QUERY_YIELD_INTERVAL: usize = 16;
 struct QueryAnswer {
     /// The `Id` every result of this query is reported under.
     id: String,
+    /// The label a result carries when the query reports no series of its own — a query answered
+    /// with a refusal rather than with data.
+    label: String,
     /// Whether the caller asked for this query's data.
     return_data: bool,
     /// How many points this query's arithmetic could not produce a number for.
     dropped: usize,
+    /// Whether the requested range extends past the slice this page answered for the query.
+    more: bool,
+    /// Whether the account the query named is one this read may answer from.
+    forbidden: bool,
     /// The series to report, each with its label and its points oldest first.
     series: Vec<crate::state::metric_math::MathSeries>,
 }
 
-/// Refuse an out-of-range input value — "The value of an input parameter is bad or
-/// out-of-range."
-fn invalid_value(message: String) -> GetMetricDataError {
-    GetMetricDataErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
-        message: Some(message),
-    })
-    .into()
+/// Refuse an input of this read, in the class CloudWatch answers one in: HTTP 400 with the wire
+/// error code `ValidationError`.
+///
+/// WHICH class an input refusal carries is a property of the OPERATION, and this one declares
+/// none of this service's parameter faults (`smithy_query(query="operation",
+/// operation="GetMetricData")` lists `InvalidNextToken` alone) — so every refusal about its
+/// input, whichever layer judges it, is the request-validation layer's, exactly as the boundary
+/// refusals of this operation already are (`crate::service`). The SENTENCE is the one AWS states
+/// for the fault; the layer's own terminator is applied where that layer's sentences are rendered
+/// ([`crate::state::request_validation_message`]).
+fn refused(message: String) -> GetMetricDataError {
+    GetMetricDataError::validation_error(message)
 }
 
 /// Refuse a `NextToken` that is not one of this operation's, or is one of another request's.
@@ -693,6 +775,64 @@ fn invalid_next_token() -> GetMetricDataError {
     .into()
 }
 
+/// How many Metrics Insights queries the request carries.
+fn insights_queries(input: &GetMetricDataInput) -> usize {
+    input
+        .metric_data_queries
+        .iter()
+        .filter(|query| {
+            query
+                .expression
+                .as_deref()
+                .is_some_and(crate::state::metric_math::is_metrics_insights_query)
+        })
+        .count()
+}
+
+/// The messages about the OPERATION itself: "A message appears here only if it is related to the
+/// global GetMetricData operation." (`GetMetricDataOutput$Messages`)
+///
+/// The one such message this read states is the window a Metrics Insights query may read
+/// ([`crate::state::metrics_insights::RETENTION_SECS`]): a request whose SELECT reaches further
+/// back is still answered — with the part of the range that can be read — and told that its
+/// window went past what one query covers. A request carrying no Insights query states nothing
+/// here, whatever its range: the window is that language's own.
+fn operation_messages(
+    input: &GetMetricDataInput,
+    requested_start: f64,
+    now: f64,
+) -> Vec<MessageData> {
+    if insights_queries(input) == 0
+        || !crate::state::metrics_insights::exceeds_retention(requested_start, now)
+    {
+        return Vec::new();
+    }
+    vec![MessageData {
+        code: Some(crate::state::metrics_insights::MAX_QUERY_TIME_RANGE_CODE.to_string()),
+        value: Some(crate::state::metrics_insights::MAX_QUERY_TIME_RANGE_MESSAGE.to_string()),
+    }]
+}
+
+/// The result a query naming an account this read may not answer from comes back as.
+///
+/// "MetricDataResult.StatusCode […] Forbidden" with the per-result message AWS states a read of
+/// an unlinked account's metrics in ([`crate::state::UNLINKED_METRIC_ACCOUNT_MESSAGE`]): the
+/// request itself is answered — every other query of it is resolved — and THIS query reports the
+/// refusal, with no values at all beside it.
+fn forbidden_result(id: &str, label: &str) -> MetricDataResult {
+    MetricDataResult {
+        id: Some(id.to_string()),
+        label: Some(label.to_string()),
+        timestamps: Some(Vec::new()),
+        values: Some(Vec::new()),
+        status_code: Some(STATUS_FORBIDDEN.to_string()),
+        messages: Some(vec![MessageData {
+            code: Some(STATUS_FORBIDDEN.to_string()),
+            value: Some(crate::state::UNLINKED_METRIC_ACCOUNT_MESSAGE.to_string()),
+        }]),
+    }
+}
+
 /// The kind tag this operation's pagination cursor carries, so a token minted by another
 /// paginated operation is refused rather than misread.
 const CURSOR_KIND: &str = "GetMetricData";
@@ -702,6 +842,10 @@ const CURSOR_KIND: &str = "GetMetricData";
 /// only a POSITION within one such enumeration, so a continuation whose request differs is
 /// refused — and because the identity is hashed, a 500-query call's token is as small as a
 /// one-query call's.
+///
+/// `MaxDatapoints` is NOT part of it: the budget is the SIZE of the page read at a position
+/// rather than part of the enumeration, so the same token read with a larger budget answers a
+/// longer page from the same position.
 fn request_identity(input: &GetMetricDataInput) -> String {
     let queries: Vec<::serde_json::Value> = input
         .metric_data_queries
@@ -712,6 +856,7 @@ fn request_identity(input: &GetMetricDataInput) -> String {
                 "Period": query.period,
                 "ReturnData": query.return_data,
                 "Expression": query.expression,
+                "AccountId": query.account_id,
                 "MetricStat": query.metric_stat.as_ref().map(|stat| ::serde_json::json!({
                     "Namespace": stat.metric.namespace,
                     "MetricName": stat.metric.metric_name,
@@ -727,26 +872,24 @@ fn request_identity(input: &GetMetricDataInput) -> String {
         "StartTime": crate::state::from_timestamp(&input.start_time),
         "EndTime": crate::state::from_timestamp(&input.end_time),
         "ScanBy": input.scan_by,
-        "MaxDatapoints": input.max_datapoints,
         "Queries": queries,
     })
     .to_string();
     ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(identity.as_bytes()))
 }
 
-/// WHERE in a request the next page resumes: how much of the requested range the earlier pages
-/// already covered, and how many datapoints of the slice they returned out of it.
+/// WHERE in a request the next page resumes: how many `Period` slots of it the earlier pages
+/// budgeted in all.
 ///
-/// A page is cut short by either half, so a cursor has to carry both: the datapoint budget
-/// (`MaxDatapoints`) stops a page inside one slice of the range, and the slice itself stops it
-/// at the boundary of what one page may cover.
+/// One number answers for every query, whatever their periods: the budget is spent in QUERY
+/// ORDER ([`query_pages`]), so how far each query got follows from the total and from the slots
+/// the queries before it have in the requested range. Counting SLOTS rather than seconds is what
+/// lets the next page be read with a different `MaxDatapoints` and still resume exactly where
+/// this one stopped.
 #[derive(Debug, Default, Clone, Copy)]
 struct Position {
-    /// The seconds of the requested range the earlier pages covered, measured from the edge the
-    /// scan order starts at.
-    covered: f64,
-    /// How many datapoints of the CURRENT slice those pages already returned.
-    returned: usize,
+    /// How many `Period` slots of the request the earlier pages budgeted in all.
+    slots: u64,
 }
 
 /// Encode the cursor the next page resumes from: the position inside this request, and the
@@ -755,8 +898,7 @@ fn encode_cursor(position: &Position, identity: &str) -> String {
     crate::state::encode_page_token(
         &::serde_json::json!({
             "kind": CURSOR_KIND,
-            "covered": position.covered,
-            "returned": position.returned,
+            "slots": position.slots,
             "identity": identity,
         })
         .to_string(),
@@ -770,129 +912,187 @@ fn decode_cursor(token: &str) -> Option<(Position, String)> {
     if value.get("kind")?.as_str()? != CURSOR_KIND {
         return None;
     }
-    let covered = value.get("covered")?.as_f64()?;
-    if !covered.is_finite() || covered < 0.0 {
-        return None;
-    }
-    let returned = usize::try_from(value.get("returned")?.as_u64()?).ok()?;
-    let position = Position { covered, returned };
+    let position = Position {
+        slots: value.get("slots")?.as_u64()?,
+    };
     Some((position, value.get("identity")?.as_str()?.to_string()))
 }
 
-/// The slice of the requested range ONE page answers from, and whether any of the range is left
-/// beyond it.
+/// What ONE query of the request answers on THIS page: the slice of the requested range it reads,
+/// whether the range extends past that slice, whether the earlier pages already covered all of
+/// it, and whether it names an account this read may answer from at all.
 #[derive(Debug, Clone, Copy)]
-struct PageSlice {
-    /// The first instant this page covers.
+struct QueryPage {
+    /// The first instant this page reads for the query.
     start: f64,
     /// The instant it stops before.
     end: f64,
-    /// Whether the request's range extends past this slice in the scan direction, so a further
-    /// page has data to report.
+    /// Whether the requested range extends past this slice in the scan direction, so a further
+    /// page has more of it to answer.
     more: bool,
+    /// Whether the earlier pages already covered the whole requested range for this query, so it
+    /// is not on this page at all.
+    done: bool,
+    /// Whether the account the query named is one this read may answer from.
+    forbidden: bool,
 }
 
-/// The slice of `[requested_start, end)` this page answers, `covered` seconds into the scan.
+/// What each query of the array answers on THIS page: the slices one datapoint budget of
+/// `budget` reaches, `slots` slots into the request.
 ///
-/// "A GetMetricData operation that does not include a query can retrieve as many as 500
-/// different metrics in a single request, with a total of as many as 100,800 data points."
-/// (`GetMetricData`) — the datapoints a request asks for are its range over each retrieving
-/// query's `Period`, summed over those queries, and that total is what one page carries up to.
-/// A request asking for more is not refused: it is answered one slice of its range at a time,
-/// each slice narrow enough to span at most that many datapoints, which is what the
-/// continuation token of a partial page resumes. The slice grows from the edge the scan order
-/// starts at — the newest instant for `TimestampDescending`, the oldest for
-/// `TimestampAscending` — so the page a caller reads first is the one it asked for first.
-fn page_slice(
+/// "The maximum number of data points the request should return before paginating."
+/// (`GetMetricDataInput$MaxDatapoints`) — the datapoints a query asks for are the `Period` SLOTS
+/// of the requested range, one per slot whether or not a datapoint was published in it, so the
+/// budget is spent on slots rather than on the values a page happens to hold: a slot nothing was
+/// published in costs the same as one that carries a value.
+///
+/// ONE budget answers for the whole request, spent in QUERY ORDER: the first query takes as many
+/// of the page's slots as it still has range for, the next takes what is left, and a query the
+/// budget does not reach on this page reports no datapoint while the range it has left keeps the
+/// request paging. So a query that reaches the end of its range is `Complete` on the page that
+/// got it there and is absent from the pages after it, while the queries behind it carry on — and
+/// the slices of a request's queries never add up to more datapoints than the caller asked one
+/// page for.
+///
+/// Each slice grows from the edge the scan order starts at — the newest instant for
+/// `TimestampDescending`, the oldest for `TimestampAscending` — so the page a caller reads first
+/// is the one it asked for first. A period is at least one second and a budget at least one slot,
+/// so every page covers ground and paging terminates.
+///
+/// Two kinds of query are outside that accounting. A query naming an account this read may not
+/// answer from reads nothing at all ([`crate::state::reads_metrics_of_own_account`]) and reports
+/// its refusal on every page. A query whose data is not returned ("If you are performing this
+/// call just to do math expressions and do not also need the raw data returned, you can specify
+/// false", `MetricDataQuery$ReturnData`) returns no datapoint, so it spends none of a budget
+/// counted in datapoints: it is resolved over the window this page covers, which is what the
+/// expressions that read it are evaluated over.
+fn query_pages(
     queries: &[MetricDataQuery],
     requested_start: f64,
     end: f64,
-    covered: f64,
+    slots: u64,
+    budget: usize,
     descending: bool,
-) -> PageSlice {
-    let span = match page_span(queries, requested_start, end) {
-        None => {
-            return PageSlice {
+) -> Vec<QueryPage> {
+    let span = (end - requested_start).max(0.0);
+    // How many of the request's slots the queries BEFORE this one take out of the budget the
+    // earlier pages granted, and how much of this page's budget is left for it.
+    let mut taken_before = 0u64;
+    let mut left = budget as u64;
+    let mut pages: Vec<QueryPage> = Vec::with_capacity(queries.len());
+    for query in queries {
+        if !crate::state::reads_metrics_of_own_account(query.account_id.as_deref()) {
+            pages.push(QueryPage {
                 start: requested_start,
                 end,
                 more: false,
-            }
+                done: false,
+                forbidden: true,
+            });
+            continue;
         }
-        Some(span) => span,
-    };
-    if descending {
-        let slice_end = (end - covered).max(requested_start);
-        let slice_start = (slice_end - span).max(requested_start);
-        PageSlice {
-            start: slice_start,
-            end: slice_end,
-            more: slice_start > requested_start,
+        if !query.return_data.unwrap_or(true) {
+            // The window is the page's own, filled in once every budgeted slice is known.
+            pages.push(QueryPage {
+                start: requested_start,
+                end,
+                more: false,
+                done: false,
+                forbidden: false,
+            });
+            continue;
         }
-    } else {
-        let slice_start = (requested_start + covered).min(end);
-        let slice_end = (slice_start + span).min(end);
-        PageSlice {
-            start: slice_start,
-            end: slice_end,
-            more: slice_end < end,
+        let period = crate::state::metric_query::query_period(query).max(1.0);
+        let in_range = slots_in_range(span, period);
+        let consumed = slots.saturating_sub(taken_before).min(in_range);
+        taken_before = taken_before.saturating_add(in_range);
+        let granted = left.min(in_range - consumed);
+        left -= granted;
+        pages.push(slice_of_slots(
+            requested_start,
+            end,
+            period,
+            consumed,
+            granted,
+            in_range,
+            descending,
+        ));
+    }
+    let covered = page_window(queries, &pages, requested_start);
+    for (page, query) in pages.iter_mut().zip(queries) {
+        if !page.forbidden && !query.return_data.unwrap_or(true) {
+            page.start = covered.0;
+            page.end = covered.1;
         }
     }
+    pages
 }
 
-/// How many SECONDS of a range one page may cover, or `None` when the whole range already fits
-/// in one page.
-///
-/// EVERY query of the array reports one datapoint per `Period` of the range — a retrieving query
-/// at its `MetricStat`'s granularity, an expression at its own ([`DEFAULT_EXPRESSION_PERIOD`]
-/// when it names none) — so the datapoints one second of the range asks for is the sum of the
-/// reciprocals of those periods, and the seconds one page covers is the page's datapoint total
-/// over that sum. Counting the expressions too is what bounds the series a page MATERIALISES
-/// rather than merely the datapoints it emits: an array of nothing but expressions constructs
-/// its series from the range and its own period, and would otherwise be answered over the whole
-/// range however wide the caller made it.
-///
-/// A period is at least one second and a request carries at most [`MAX_QUERIES`] queries, so the
-/// quotient is always at least one second: every page covers ground, and paging terminates.
-fn page_span(queries: &[MetricDataQuery], requested_start: f64, end: f64) -> Option<f64> {
-    let per_second: f64 = queries
-        .iter()
-        .map(|query| 1.0 / crate::state::metric_query::query_period(query).max(1.0))
-        .sum();
-    if per_second <= 0.0 || !per_second.is_finite() {
-        return None;
+/// How many `Period` slots a range of `span` seconds holds at the granularity `period`: the last
+/// slot of a range that is no whole number of periods is the part of it inside the range, and is
+/// a slot like any other.
+fn slots_in_range(span: f64, period: f64) -> u64 {
+    let slots = (span / period).ceil();
+    if !slots.is_finite() || slots <= 0.0 {
+        return 0;
     }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bounded = slots.min(u64::MAX as f64) as u64;
+    bounded
+}
+
+/// The slice of `[requested_start, end)` that the `granted` slots after the `consumed` already
+/// answered cover, measured in `period`-wide slots from the edge the scan order starts at.
+fn slice_of_slots(
+    requested_start: f64,
+    end: f64,
+    period: f64,
+    consumed: u64,
+    granted: u64,
+    in_range: u64,
+    descending: bool,
+) -> QueryPage {
     #[allow(clippy::cast_precision_loss)]
-    let page = MAX_PAGE_DATAPOINTS as f64;
-    if (end - requested_start).max(0.0) * per_second <= page {
-        return None;
+    let behind = period * consumed as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let width = period * granted as f64;
+    let (start, slice_end) = if descending {
+        let slice_end = (end - behind).max(requested_start);
+        ((slice_end - width).max(requested_start), slice_end)
+    } else {
+        let slice_start = (requested_start + behind).min(end);
+        (slice_start, (slice_start + width).min(end))
+    };
+    QueryPage {
+        start,
+        end: slice_end,
+        more: consumed.saturating_add(granted) < in_range,
+        done: consumed >= in_range,
+        forbidden: false,
     }
-    let seconds = (page / per_second).floor();
-    (seconds >= 1.0).then_some(seconds)
 }
 
-/// "a total of as many as 100,800 data points" (`GetMetricData`) — the datapoints of a request's
-/// range one page covers, which is also the default the caller's own `MaxDatapoints` takes
-/// ([`DEFAULT_MAX_DATAPOINTS`]).
-const MAX_PAGE_DATAPOINTS: usize = DEFAULT_MAX_DATAPOINTS;
-
-/// Refuse members that cannot be used together — "Parameters were used together that cannot
-/// be used together."
-fn invalid_combination(message: String) -> GetMetricDataError {
-    GetMetricDataErrorModeled::InvalidParameterCombinationException(
-        InvalidParameterCombinationException {
-            message: Some(message),
-        },
-    )
-    .into()
-}
-
-/// Refuse a `Period` the member does not document, in the words the one shared rule
-/// ([`crate::state::period_error`]) states it in.
-fn check_period(period: i32) -> Result<(), GetMetricDataError> {
-    match crate::state::period_error(period) {
-        Some(message) => Err(invalid_value(message)),
-        None => Ok(()),
+/// The window THIS page covers: the widest span its budgeted slices reach between them, and an
+/// empty window at `requested_start` when the budget reached none of them.
+///
+/// What a query whose data is not returned is resolved over: its values exist to be read by the
+/// expressions of the same request, and those are evaluated over the slices above.
+fn page_window(
+    queries: &[MetricDataQuery],
+    pages: &[QueryPage],
+    requested_start: f64,
+) -> (f64, f64) {
+    let mut window: Option<(f64, f64)> = None;
+    for (page, query) in pages.iter().zip(queries) {
+        if page.forbidden || page.done || !query.return_data.unwrap_or(true) {
+            continue;
+        }
+        window = Some(match window {
+            None => (page.start, page.end),
+            Some((start, end)) => (start.min(page.start), end.max(page.end)),
+        });
     }
+    window.unwrap_or((requested_start, requested_start))
 }
 
 /// The refusal CloudWatch answers this request with for a query array that does not resolve
@@ -901,24 +1101,35 @@ fn check_period(period: i32) -> Result<(), GetMetricDataError> {
 /// The one place this operation's error channel is reached from the shared resolution, so a
 /// parameter fault, an expression refusal and a Metrics Insights query are each reported the
 /// way this operation reports them and the resolution itself names no operation.
-fn refusal(refused: crate::state::metric_query::QueryRefusal) -> GetMetricDataError {
+fn refusal(refused_query: crate::state::metric_query::QueryRefusal) -> GetMetricDataError {
     use crate::state::metric_query::QueryRefusal;
 
-    match refused {
-        QueryRefusal::InvalidValue(message) => invalid_value(message),
-        QueryRefusal::InvalidCombination(message) => invalid_combination(message),
+    match refused_query {
+        QueryRefusal::InvalidValue(message) | QueryRefusal::InvalidCombination(message) => {
+            refused(message)
+        }
         QueryRefusal::Expression { id, detail } => expression_refusal(&id, &detail),
-        QueryRefusal::Circular(cycle) => crate::scaffolded::Scaffolded::validation_error(format!(
+        QueryRefusal::Circular(cycle) => refused(format!(
             "Circular dependency between expressions: {}",
             cycle.join(" -> ")
         )),
-        QueryRefusal::MetricsInsights => crate::scaffolded::Scaffolded::not_implemented(
-            "GetMetricData over a Metrics Insights query",
-        ),
+        // A Metrics Insights query IS answered by this read ([`crate::state::metrics_insights`]),
+        // so the resolution never hands it back as a refusal here: the variant belongs to the
+        // readers of a query array that do not run one. Reaching it would mean this operation
+        // contradicted itself, which is the one thing a server fault is the honest answer to.
+        QueryRefusal::MetricsInsights => {
+            GetMetricDataErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch metric store did not resolve a Metrics Insights query".into(),
+                ),
+            })
+            .into()
+        }
     }
 }
 
-/// The answer of every query of the request, in request order.
+/// The answer of every query of the request, in request order — leaving out the queries an
+/// earlier page already answered the whole requested range for.
 ///
 /// `async`, and yielding every [`QUERY_YIELD_INTERVAL`] queries like every other per-query
 /// walk of this handler: labelling a result is caller-driven work (one pass over the label and,
@@ -927,7 +1138,7 @@ fn refusal(refused: crate::state::metric_query::QueryRefusal) -> GetMetricDataEr
 async fn answers(
     resolution: &crate::state::metric_query::Resolution,
     input: &GetMetricDataInput,
-    requested_start: f64,
+    pages: &[QueryPage],
 ) -> Result<Vec<QueryAnswer>, GetMetricDataError> {
     let mut answers = Vec::with_capacity(input.metric_data_queries.len());
     // "The time zone to use for metric data return in this operation."
@@ -937,11 +1148,33 @@ async fn answers(
         .as_ref()
         .and_then(|options| options.timezone.as_deref());
     for (index, query) in input.metric_data_queries.iter().enumerate() {
+        let Some(page) = pages.get(index) else {
+            continue;
+        };
+        // "PartialData means that an incomplete set of data points were returned. You can use
+        // the NextToken value that was returned and repeat your request to get more data
+        // points." — a query whose whole range the earlier pages already returned has nothing
+        // left to report, so it is not on this page at all.
+        if page.done {
+            continue;
+        }
+        let return_data = query.return_data.unwrap_or(true);
+        if page.forbidden {
+            answers.push(QueryAnswer {
+                id: query.id.clone(),
+                label: refused_label(query),
+                return_data,
+                dropped: 0,
+                more: false,
+                forbidden: true,
+                series: Vec::new(),
+            });
+            continue;
+        }
         let value = resolution
             .value(&query.id)
             .cloned()
             .unwrap_or_else(|| MathValue::Series(MathSeries::default()));
-        let return_data = query.return_data.unwrap_or(true);
         // A result is a time series ("The timestamps for the data points […] The number of
         // timestamps always matches the number of values", `MetricDataResult`), so an
         // expression whose value is one NUMBER cannot be one: it is a term another
@@ -955,15 +1188,34 @@ async fn answers(
         }
         answers.push(QueryAnswer {
             id: query.id.clone(),
+            label: refused_label(query),
             return_data,
             dropped: resolution.dropped(&query.id),
-            series: reported_series(value, query, requested_start, timezone),
+            more: page.more,
+            forbidden: false,
+            series: reported_series(value, query, page.start, timezone),
         });
         if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
             ::tokio::task::yield_now().await;
         }
     }
     Ok(answers)
+}
+
+/// The label a result carries when the query answers no series at all: the label the request
+/// asked for, else the metric the query names — the default a retrieved series would have been
+/// reported under — else the query's own `Id`, the default an expression's result takes.
+fn refused_label(query: &MetricDataQuery) -> String {
+    query
+        .label
+        .clone()
+        .or_else(|| {
+            query
+                .metric_stat
+                .as_ref()
+                .and_then(|stat| stat.metric.metric_name.clone())
+        })
+        .unwrap_or_else(|| query.id.clone())
 }
 
 /// Why an expression whose value is a single number is not a result this operation can return:
