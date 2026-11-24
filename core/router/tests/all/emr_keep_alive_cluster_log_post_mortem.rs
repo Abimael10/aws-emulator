@@ -13,9 +13,10 @@
 //! `KeepJobFlowAliveWhenNoSteps` parameter is set to TRUE, the cluster transitions to the
 //! `WAITING` state rather than shutting down after the steps have completed", `RunJobFlow`
 //! doc) and `TerminateJobFlows` drives it to `TERMINATED` — and the log files written under
-//! `<LogUri>/<cluster-id>/` are objects of the OBJECT STORE: they belong to the bucket rather
-//! than to the cluster, so they are there, and keep answering the same listing, for a client
-//! that only reads Amazon S3 from the moment the cluster is gone.**
+//! `<LogUri>/<cluster-id>/` — one directory per step that ran, beside the file each of the
+//! cluster's nodes leaves of its own — are objects of the OBJECT STORE: they belong to the
+//! bucket rather than to the cluster, so they are there, and keep answering the same listing,
+//! for a client that only reads Amazon S3 from the moment the cluster is gone.**
 //!
 //! Only a cross-service suite can pin this: IAM holds the service role and the instance
 //! profile the launch names, Amazon EC2 owns the VPC and the subnet the launch is placed in,
@@ -88,8 +89,14 @@ const GIVING_UP_STATUS: i32 = 4;
 /// service crate so a wrong constant in the implementation cannot make a case below pass.
 const STEP_LOG_FILES: [&str; 3] = ["controller.gz", "stderr.gz", "stdout.gz"];
 
-/// The key segment under a cluster's own log prefix that keys the directories by step.
+/// The key segment under a cluster's own log prefix that keys the directories by step, and the
+/// one that keys the files a cluster's NODES leave by node.
 const STEPS_SEGMENT: &str = "steps";
+const NODE_SEGMENT: &str = "node";
+
+/// How many nodes each row's launch asks for: one primary, so each cluster leaves ONE node's
+/// own log file beside its steps' directories.
+const NODES: usize = 1;
 
 /// The states a step never leaves (`com.amazonaws.emr#StepState`).
 const TERMINAL_STEP: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
@@ -561,9 +568,13 @@ async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> BT
     elements(&listing, "Key").into_iter().collect()
 }
 
-/// Poll `ListObjectsV2` until the cluster's log destination holds EXACTLY the files `expected`
-/// names — making NO Amazon EMR call while it waits, which is what a client that has shut its
+/// Poll `ListObjectsV2` until the cluster's log destination holds EXACTLY the step files
+/// `expected` names, beside the one file each of the cluster's `nodes` nodes leaves of its own
+/// — making NO Amazon EMR call while it waits, which is what a client that has shut its
 /// cluster down does.
+///
+/// A node's own file carries the instant it reports in its NAME, so the node files are counted
+/// under their own key segment rather than spelled out; the step directories are exact.
 ///
 /// The wait is for the whole directory rather than for the first file to appear: one step's
 /// files are written one object at a time, so a listing taken mid-delivery holds some of them,
@@ -574,16 +585,24 @@ async fn delivered_keys(
     case: &str,
     prefix: &str,
     expected: &BTreeSet<String>,
+    nodes: usize,
 ) -> BTreeSet<String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let keys = keys_under(router, case, prefix).await;
-        if &keys == expected {
+        let steps: BTreeSet<String> = keys
+            .iter()
+            .filter(|key| !key.contains(&format!("/{NODE_SEGMENT}/")))
+            .cloned()
+            .collect();
+        let node_files = keys.len() - steps.len();
+        if &steps == expected && node_files == nodes {
             return keys;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected exactly {expected:?} under {prefix}, got {keys:?}"
+            "case {case:?}: expected exactly {expected:?} and one file per node for {nodes} \
+             node(s) under {prefix}, got {keys:?}"
         );
         tokio::time::sleep(POLL).await;
     }
@@ -662,7 +681,7 @@ async fn a_terminated_keep_alive_clusters_logs_are_read_out_of_amazon_s3() {
                 expected.insert(format!("{prefix}{STEPS_SEGMENT}/{step_id}/{name}"));
             }
         }
-        let delivered = delivered_keys(&router, case, &prefix, &expected).await;
+        let delivered = delivered_keys(&router, case, &prefix, &expected, NODES).await;
         for round in 0..PERSISTENCE_REREADS {
             let after = keys_under(&router, case, &prefix).await;
             assert_eq!(

@@ -121,6 +121,10 @@ pub struct ClusterInstanceRecord {
     /// Amazon EC2 itself minted, which is what makes `Instance$EbsVolumes` a list of volumes
     /// that exist.
     pub ebs_volumes: Vec<InstanceEbsVolume>,
+    /// Whether the log file this NODE is owed under its cluster's `LogUri` has been written
+    /// ([`super::node_logs`]), which is what keeps one node's file written once however many
+    /// callers report its cluster afterwards.
+    pub node_log_delivered: bool,
 }
 
 impl ClusterInstanceRecord {
@@ -146,6 +150,7 @@ impl ClusterInstanceRecord {
             state: instance_state::PROVISIONING.to_string(),
             state_change_reason: None,
             ebs_volumes: launched.ebs_volumes,
+            node_log_delivered: false,
         }
     }
 

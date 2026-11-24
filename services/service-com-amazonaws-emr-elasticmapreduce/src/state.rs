@@ -76,6 +76,11 @@ pub use step_sql_cli::*;
 mod step_sql_engine;
 pub use step_sql_engine::*;
 
+/// The SESSION CONFIGURATION that client holds — the properties its own `set` command reads
+/// and writes — split out of this root as its own concern and re-exported the same way.
+mod step_session_config;
+pub use step_session_config::*;
+
 /// Announcing a cluster's state changes on the account's default event bus, split out of
 /// this root as its own concern and re-exported the same way.
 mod cluster_events;
@@ -330,6 +335,12 @@ pub use session_credentials::*;
 /// and re-exported the same way.
 mod step_logs;
 pub use step_logs::*;
+
+/// The gzipped LOG FILES a cluster's NODES leave under the same `LogUri` — the directory of
+/// each bootstrap action a node ran and the node's own instance-state file — split out and
+/// re-exported the same way.
+mod node_logs;
+pub use node_logs::*;
 
 /// The SPARK release family of the release catalog — the labels an Amazon EMR Spark
 /// release carries and what one bundles — split out and re-exported the same way.

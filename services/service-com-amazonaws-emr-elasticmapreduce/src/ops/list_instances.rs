@@ -190,6 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .await;
+        // Reporting only, and before this service's store is taken: a node that has come up is
+        // OWED its own gzipped log files under its cluster's `LogUri`
+        // (`crate::state::node_logs`), owed from the instant it had them to push whether or not
+        // anybody listed its cluster's instances; the Amazon S3 write they are made by may not
+        // happen under this service's lock.
+        crate::state::deliver_due_node_logs(&*self.engine, ctx, &region, &input.cluster_id, now)
+            .await;
         let mut store = state.lock();
 
         // A listing reports instance state, so every transition the clock already made due

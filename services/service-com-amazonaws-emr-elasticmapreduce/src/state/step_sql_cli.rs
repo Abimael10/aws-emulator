@@ -27,6 +27,13 @@
 //! [`SQL_CLIENT_FAILURE_STATUS`] when one of them was refused, carrying the driver's own
 //! error.
 //!
+//! Not everything an invocation carries is a statement for the metastore: `set` is a command
+//! of the CLIENT, which it answers out of the configuration its own session holds
+//! ([`super::step_session_config`]) — the cluster's recorded configuration, with whatever this
+//! invocation set over it. Such a command reads and changes nothing of the metastore, so an
+//! invocation carrying only those runs on a cluster whose metastore this emulator does not
+//! hold too, and what the client printed for it is what the step's log files carry.
+//!
 //! # What it performs nothing of
 //!
 //! An invocation carrying a statement of no class this emulator can account for (one that
@@ -116,6 +123,10 @@ pub struct StepSqlCli {
     catalog: Option<::engine::ServiceState<glue_state::ComAmazonawsGlueAwsglueState>>,
     /// What the relations' data is read out of.
     objects: Option<StepObjectCli>,
+    /// The CLUSTER's own configuration, which is what a session of this client starts with
+    /// ([`SessionConfiguration::of_cluster`]): one session per invocation, so nothing a
+    /// command set outlives it.
+    configuration: ::std::collections::BTreeMap<String, String>,
     /// The driver error the last refused statement of this command answered, shared with the
     /// caller that reports the step: a step whose command line's client was refused reports
     /// that error rather than only the status the command exited with.
@@ -136,18 +147,22 @@ impl ::std::fmt::Debug for StepSqlCli {
 /// `metastore_is_the_catalog` is whether the cluster's configuration selects the AWS Glue
 /// Data Catalog as its Hive metastore ([`uses_glue_data_catalog`]): a cluster whose metastore
 /// is its own master node's has one this emulator does not run, so its client performs
-/// nothing and the step reports that its work was not run.
+/// nothing of a statement for that metastore and the step reports that its work was not run.
+/// `configuration` is what that cluster's launch recorded as its configuration
+/// ([`configuration_properties`]), which is what the client's own `set` command reads.
 #[must_use]
 pub fn step_sql_cli<Eng: Send + Sync + 'static>(
     engine: &Eng,
     metastore_is_the_catalog: bool,
     objects: Option<StepObjectCli>,
+    configuration: ::std::collections::BTreeMap<String, String>,
 ) -> StepSqlCli {
     StepSqlCli {
         catalog: metastore_is_the_catalog
             .then(|| glue_state::service_state(engine))
             .flatten(),
         objects,
+        configuration,
         failure: Arc::new(Mutex::new(None)),
     }
 }
@@ -207,34 +222,65 @@ impl EnvironmentPrograms for StepSqlCli {
         if !names_sql_client(name) {
             return None;
         }
-        // The metastore is what every statement is resolved and applied against, so a client
-        // on a cluster whose metastore this emulator does not hold performs nothing.
-        let catalog = self.catalog.as_ref()?;
         let invocation = invocation(arguments, files)?;
-        let statements = parse_statements(&invocation.text)?;
-        if statements.is_empty() || statements.len() > MAX_STATEMENTS_PER_INVOCATION {
+        let commands = client_commands(&invocation.text)?;
+        if commands.is_empty() || commands.len() > MAX_STATEMENTS_PER_INVOCATION {
             return None;
         }
         // EVERY statement has to be one this emulator can account for before any of them is
         // performed: a statement whose effect is one nothing here applies makes the whole
         // invocation one the session reports it could not run, and nothing of it is applied.
-        if !statements.iter().all(accountable) {
+        if !commands.iter().all(|command| match command {
+            // The client's own session-configuration command is always performed by the
+            // client itself.
+            ClientCommand::Setting(_) => true,
+            ClientCommand::Sql(statement) => accountable(statement),
+        }) {
             return None;
         }
+        // The metastore is what every STATEMENT is resolved and applied against, so a client
+        // asked for one on a cluster whose metastore this emulator does not hold performs
+        // nothing. An invocation that is nothing but the client's own session-configuration
+        // commands asks for no metastore at all and runs on any cluster.
+        let catalog = match self.catalog.as_ref() {
+            Some(catalog) => Some(catalog),
+            None if commands
+                .iter()
+                .all(|command| matches!(command, ClientCommand::Setting(_))) =>
+            {
+                None
+            }
+            None => return None,
+        };
         let mut database = invocation
             .database
             .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
         let mut output: Vec<String> = Vec::new();
+        // The configuration of THIS invocation's session: what the cluster's launch recorded,
+        // which a `set` of this command line reads and writes over.
+        let mut configuration = SessionConfiguration::of_cluster(self.configuration.clone());
         // Whether a statement of this invocation has already CHANGED the metastore, which is
         // what makes a later statement nothing performed a failure of this client rather than
         // a command nothing ran.
         let mut changed_the_metastore = false;
         let now = SystemTime::now();
-        for statement in &statements {
+        for command in &commands {
+            let statement = match command {
+                ClientCommand::Setting(setting) => {
+                    output.extend(configuration.perform(setting));
+                    continue;
+                }
+                ClientCommand::Sql(statement) => statement,
+            };
             if let Some(named) = database_used(statement) {
                 database = named;
                 continue;
             }
+            let Some(catalog) = catalog else {
+                // Unreachable: a command list carrying a statement was refused above when this
+                // cluster's metastore is not one this emulator holds.
+                return None;
+            };
             match step_sql_engine::run_statement(
                 catalog,
                 self.objects.as_ref(),
@@ -292,6 +338,67 @@ fn accountable(statement: &Statement) -> bool {
     database_used(statement).is_some()
         || reads_only(statement)
         || metastore_change(statement, DEFAULT_DATABASE).is_some()
+}
+
+/// ONE command of a client invocation's input.
+///
+/// The statement a parse answers with is a large value and a session setting a small one, so the
+/// statement is held behind an indirection rather than making every command of a list that size.
+#[derive(Debug, Clone)]
+enum ClientCommand {
+    /// The client's own session-configuration command, which it performs itself
+    /// ([`super::step_session_config`]).
+    Setting(SessionSetting),
+    /// A statement, which the driver submits to the metastore.
+    Sql(Box<Statement>),
+}
+
+/// The commands the text of one invocation carries, in the order the client reads them, or
+/// `None` when it is in a form this program reads nothing out of.
+///
+/// A text that is a STATEMENT LIST is read as one by the SQL grammar, which is what a text
+/// carrying only statements is — including the assignment form of the client's own `set`
+/// command, which that grammar accepts and which is recognised as the command it is
+/// ([`statement_setting`]).
+///
+/// A text the grammar does not read as one list is read COMMAND BY COMMAND, as the client's
+/// own reader reads it: its commands are separated by `;`, split with the workspace's one
+/// quote- and comment-aware reading of a client's own text
+/// ([`::service_common::sql_wire_planes::sql_engine::statements`], asked in the wire whose
+/// lexing is Hive's — backtick-quoted identifiers, `--` and `#` line comments, block comments,
+/// doubled quotes and a backslash escape inside a string). A `set` is then the client's own
+/// command and every other command is a statement the grammar reads on its own, which is what
+/// lets the reporting forms of `set` — which no SQL grammar accepts — run beside statements in
+/// one invocation.
+fn client_commands(text: &str) -> Option<Vec<ClientCommand>> {
+    if let Some(statements) = parse_statements(text) {
+        return Some(statements.into_iter().map(client_command).collect());
+    }
+    let texts = ::service_common::sql_wire_planes::sql_engine::statements(
+        ::service_common::sql_wire_planes::EngineWire::MySql,
+        text,
+    );
+    if texts.is_empty() || texts.len() > MAX_STATEMENTS_PER_INVOCATION {
+        return None;
+    }
+    let mut commands: Vec<ClientCommand> = Vec::new();
+    for command in texts {
+        if let Some(setting) = session_setting(&command) {
+            commands.push(ClientCommand::Setting(setting));
+            continue;
+        }
+        commands.extend(parse_statements(&command)?.into_iter().map(client_command));
+    }
+    Some(commands)
+}
+
+/// The command one parsed statement is: the client's own session-configuration command where
+/// the grammar read one, and otherwise a statement for the metastore.
+fn client_command(statement: Statement) -> ClientCommand {
+    match statement_setting(&statement) {
+        Some(setting) => ClientCommand::Setting(setting),
+        None => ClientCommand::Sql(Box::new(statement)),
+    }
 }
 
 /// The invocation `arguments` are, or `None` when they are in a form this program reads

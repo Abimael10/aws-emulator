@@ -117,6 +117,11 @@ pub struct StepWork {
     pub accountable: bool,
     pub tables: Vec<TableReference>,
     pub changes: Vec<MetastoreChange>,
+    /// How many of those statements are the SQL CLIENT's own session-configuration command
+    /// ([`super::step_session_config`]) rather than work submitted to the metastore: such a
+    /// command is performed by the client itself, out of the configuration its session holds,
+    /// so a command carrying one submits no work THIS runner resolves ([`read_step_work`]).
+    pub settings: usize,
 }
 
 /// What a step's work ANSWERED: the state the step ends in, the failure that answer is when
@@ -198,6 +203,15 @@ pub fn read_step_work(jar: &str, args: &[String]) -> Option<StepWork> {
         work.tables.clear();
         work.changes.clear();
     }
+    // A command carrying the client's OWN session-configuration command is the client's to
+    // perform: what `set` reads and writes is the configuration of the session it runs in
+    // ([`super::step_session_config`]), not the metastore, and the client prints what it
+    // answered. So no work is read off such a command at all — the step performs its command
+    // line with that client as one of the session's programs ([`super::step_sql_cli`]), which
+    // is where the configuration lives and where what it printed is kept.
+    if work.settings > 0 {
+        return None;
+    }
     (work.statements > 0).then_some(work)
 }
 
@@ -219,6 +233,12 @@ fn collect_statements(
                 for statement in &statements {
                     if let Some(named) = database_used(statement) {
                         *database = named;
+                        continue;
+                    }
+                    // The client's own session-configuration command, which it performs
+                    // itself: see [`read_step_work`].
+                    if statement_setting(statement).is_some() {
+                        work.settings += 1;
                         continue;
                     }
                     if reads_only(statement) {
@@ -448,6 +468,41 @@ pub fn configuration_property<'a>(
         }
     }
     None
+}
+
+/// Every property a configuration tree CARRIES, by the name it carries it under: the
+/// configuration a cluster's engines run with, as the session of its SQL client reads it
+/// ([`super::step_session_config`]).
+///
+/// The whole tree is walked, so a property a cluster states inside an engine's own
+/// configuration structure is one of the cluster's properties too, and the first value walked
+/// for a name is the one kept. What ONE reading costs is bounded exactly as a single lookup is
+/// ([`configuration_property`]): every structure and every property entry counts against
+/// [`MAX_CONFIGURATIONS_WALKED`].
+#[must_use]
+pub fn configuration_properties(configurations: &[Configuration]) -> BTreeMap<String, String> {
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut pending: Vec<&Configuration> = configurations.iter().collect();
+    let mut walked = 0usize;
+    while let Some(configuration) = pending.pop() {
+        walked += 1;
+        if walked > MAX_CONFIGURATIONS_WALKED {
+            return held;
+        }
+        if let Some(properties) = configuration.properties.as_ref() {
+            for (key, value) in properties {
+                walked += 1;
+                if walked > MAX_CONFIGURATIONS_WALKED {
+                    return held;
+                }
+                held.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        if let Some(children) = configuration.configurations.as_deref() {
+            pending.extend(children.iter());
+        }
+    }
+    held
 }
 
 /// Resolve what the work of every step of the cluster `cluster_id` names ANSWERS, and run

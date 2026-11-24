@@ -120,6 +120,18 @@ pub const BOOTSTRAP_CALL_CEILING: Duration = Duration::from_secs(8);
 /// ([`performed_on_its_own_thread`]).
 const BOOTSTRAP_THREAD_NAME: &str = "emr-bootstrap-action";
 
+/// How much of what a bootstrap action's script WROTE the session keeps.
+///
+/// CHOSEN, the sibling of the step command's own limits
+/// ([`super::step_command_status`]): the two console streams of a script reach the log files
+/// the run leaves on its node, gzipped under its cluster's `LogUri` ([`super::node_logs`]),
+/// and nothing else — so what is kept is bounded here as well as where the file is written.
+const BOOTSTRAP_OUTPUT_LIMITS: ::service_common::posix_shell_session::OutputLimits =
+    ::service_common::posix_shell_session::OutputLimits {
+        lines: 256,
+        line_bytes: 4 * 1024,
+    };
+
 /// What ONE bootstrap action of a cluster came to, on ONE of its nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapActionAnswer {
@@ -147,6 +159,17 @@ pub struct BootstrapActionRun {
     pub node: String,
     /// What it came to.
     pub answer: BootstrapActionAnswer,
+    /// WHEN it was answered for, which is the instant its own log lines carry
+    /// ([`super::node_logs`]).
+    pub at: SystemTime,
+    /// What the script WROTE to its output streams while it ran, and the status it exited
+    /// with — the text of the log files this run is owed under its cluster's `LogUri`
+    /// ([`super::node_logs`]). `None` for a run nothing performed: there was no process, so
+    /// there is no stream and no status.
+    pub log: Option<StepRunLog>,
+    /// Whether those files have been written, which is what keeps one run's directory
+    /// written once however many callers report its cluster afterwards.
+    pub log_delivered: bool,
 }
 
 impl BootstrapActionRun {
@@ -481,14 +504,16 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
                     .map(|cluster| cluster.node_disk(&node))
                     .unwrap_or_default()
             };
-            let answer =
+            let performed =
                 performed_bootstrap_action(engine, ctx, region, &plan, &credentials, claim, disk)
                     .await;
-            let Some((answer, kept)) = answer else {
+            let Some(performed) = performed else {
                 // Nothing answered: the run stays owed, so a later call performs it rather than
                 // this one recording an answer nothing produced.
                 continue;
             };
+            let answer = performed.answer;
+            let kept = performed.kept;
             let settled = answer != BootstrapActionAnswer::Exited(0);
             {
                 let mut store = state.lock();
@@ -501,6 +526,9 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
                         path: plan.path.clone(),
                         node,
                         answer,
+                        at: now,
+                        log: performed.log,
+                        log_delivered: false,
                     });
                     // The cluster can now reach what that answer leads to — ready once every
                     // action has succeeded on every node, or the shutdown a failure brings.
@@ -520,8 +548,21 @@ pub async fn run_due_bootstrap_actions<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Perform ONE owed bootstrap action and answer what it came to, and what the node's local disk
-/// holds afterwards — or `None` when nothing answered for it at all.
+/// What performing ONE bootstrap action came to: what the action answered, what its script
+/// wrote while it ran, and what its node's local disk holds afterwards.
+#[derive(Debug, Clone)]
+struct PerformedBootstrapAction {
+    /// What the action came to ([`BootstrapActionAnswer`]).
+    answer: BootstrapActionAnswer,
+    /// The two console streams of the run and the status it exited with, for the log files the
+    /// run leaves on its node ([`super::node_logs`]) — `None` for a run nothing performed.
+    log: Option<StepRunLog>,
+    /// What the node's local disk holds once the run is over, which is the node's from then on.
+    kept: Vec<(String, String)>,
+}
+
+/// Perform ONE owed bootstrap action and answer what it came to, what its script wrote and what
+/// the node's local disk holds afterwards — or `None` when nothing answered for it at all.
 async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -530,12 +571,18 @@ async fn performed_bootstrap_action<Eng: Send + Sync + 'static>(
     credentials: &StepCredentials,
     claim: InFlight,
     disk: Vec<(String, String)>,
-) -> Option<(BootstrapActionAnswer, Vec<(String, String)>)> {
+) -> Option<PerformedBootstrapAction> {
     let script = match read_bootstrap_script(ctx, region, &plan.path).await {
         Ok(script) => script,
         // There is nothing to run: the node could not fetch the script the action names, which
         // is a failure of the action itself — and its disk is as it was, because nothing ran.
-        Err(detail) => return Some((BootstrapActionAnswer::Unfetched(detail), disk)),
+        Err(detail) => {
+            return Some(PerformedBootstrapAction {
+                answer: BootstrapActionAnswer::Unfetched(detail),
+                log: None,
+                kept: disk,
+            })
+        }
     };
     // The CLI this script's environment provides, built per run so each gets its own transfer
     // budget, and presenting on every call it makes what the cluster's instances obtained from
@@ -598,7 +645,8 @@ async fn read_bootstrap_script(
     String::from_utf8(body.to_vec()).map_err(|_| "the script is not text".to_string())
 }
 
-/// What the session came to for `script`, performed as a program OF `node`.
+/// What the session came to for `script`, performed as a program OF `node`, and what the
+/// script wrote while it ran.
 ///
 /// The session holds the parse, the allow-list of session-local utilities, the two environment
 /// programs this module's header states, and nothing else: no process is started here. It is
@@ -612,17 +660,25 @@ async fn read_bootstrap_script(
 /// could not find, which is what the session answers for a script it performed nothing of —
 /// unless the script ENDED the session itself, which is a status it really asked for. Such a
 /// run is reported as performed by nothing ([`BootstrapActionAnswer::NotPerformed`]), never as
-/// a status the script exited with: nothing ran, so there is no status.
+/// a status the script exited with: nothing ran, so there is no status — and no stream and no
+/// status are kept for it either.
 fn performed_script(
     script: &str,
     node: &BootstrapNode,
     cli: Option<StepObjectCli>,
     disk: Vec<(String, String)>,
-) -> (BootstrapActionAnswer, Vec<(String, String)>) {
+) -> PerformedBootstrapAction {
     // A script is written against storage, so the session is given a working tree of its own:
     // its redirections leave files the CLI then carries, and the grammar's control flow and the
     // file utilities a script uses are commands it performs.
-    let config = SessionConfig::default();
+    //
+    // What the script WRITES is kept, because the log files it leaves on its node are what a
+    // client reads it out of; the two streams are reported apart, so each file carries the
+    // stream it is of.
+    let config = SessionConfig {
+        output: Some(BOOTSTRAP_OUTPUT_LIMITS),
+        ..SessionConfig::default()
+    };
     // The programs of the NODE the script runs on — its metadata client — beside the CLI its
     // environment provides, asked in that order, so the node's own program answers for a name
     // they would both carry.
@@ -647,9 +703,24 @@ fn performed_script(
     // the writes happened.
     let kept = kept_node_disk(&session);
     if status == config.statuses.could_not_run && session.exit_status().is_none() {
-        return (BootstrapActionAnswer::NotPerformed, kept);
+        return PerformedBootstrapAction {
+            answer: BootstrapActionAnswer::NotPerformed,
+            log: None,
+            kept,
+        };
     }
-    (BootstrapActionAnswer::Exited(status), kept)
+    PerformedBootstrapAction {
+        answer: BootstrapActionAnswer::Exited(status),
+        log: Some(
+            StepRunLog {
+                stdout: ::service_common::posix_shell_session::stream_text(session.output()),
+                stderr: ::service_common::posix_shell_session::stream_text(session.errors()),
+                exit_status: Some(status),
+            }
+            .bounded(),
+        ),
+        kept,
+    }
 }
 
 /// The state a cluster whose shutdown is due reaches, which follows from WHY it shut down.

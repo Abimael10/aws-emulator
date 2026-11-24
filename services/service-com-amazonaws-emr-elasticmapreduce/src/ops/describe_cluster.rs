@@ -216,6 +216,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
+        // And the ones its NODES leave: a node that has come up is owed its own gzipped files
+        // under the same `LogUri` (`crate::state::node_logs`) — the directory of each bootstrap
+        // action it ran and its own instance-state file — owed from the instant the node had
+        // them to push whether or not anybody read the cluster. The write is an Amazon S3 call,
+        // so it is made here rather than under this service's lock, and one node's files are
+        // written once however many calls report it afterwards.
+        crate::state::deliver_due_node_logs(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &input.cluster_id,
+            now,
+        )
+        .await;
+
         // The store is taken and RELEASED inside this block: the publication below reaches
         // EventBridge's own handler, which may call back into this service, so this
         // service's lock is never held across it.

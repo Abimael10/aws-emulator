@@ -132,12 +132,19 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         }
     };
     // Whether the cluster's Hive metastore is the one this emulator holds, which is what the
-    // SQL client of its command lines runs its statements against ([`step_sql_cli`]).
-    let metastore_is_the_catalog = state
-        .lock()
-        .clusters
-        .get(cluster_id)
-        .is_some_and(uses_glue_data_catalog);
+    // SQL client of its command lines runs its statements against ([`step_sql_cli`]), and the
+    // CONFIGURATION that cluster's launch recorded, which is what that client's own `set`
+    // command reads ([`step_session_config`]). Both are read once for this call.
+    let (metastore_is_the_catalog, configuration) = {
+        let store = state.lock();
+        match store.clusters.get(cluster_id) {
+            Some(cluster) => (
+                uses_glue_data_catalog(cluster),
+                configuration_properties(&cluster.configurations),
+            ),
+            None => return,
+        }
+    };
     // What the cluster's Amazon EC2 instances obtain from their instance profile, resolved
     // once for this call: the credential a step carrying no runtime role of its own presents,
     // which is nothing at all where that profile carries no role those instances may assume.
@@ -184,7 +191,12 @@ pub async fn resolve_due_step_commands<Eng: Send + Sync + 'static>(
         // The cluster's SQL client, built per command for the same reason: the statements it
         // runs read the relations' data through that same program, so one command's reads and
         // writes share its budget and its credential.
-        let sql = step_sql_cli(engine, metastore_is_the_catalog, cli.clone());
+        let sql = step_sql_cli(
+            engine,
+            metastore_is_the_catalog,
+            cli.clone(),
+            configuration.clone(),
+        );
         // The NODE the command line runs on: its local disk, which the session starts with and
         // is left holding what the command wrote, and the programs the cluster's applications
         // installed on it. Read under the guard, because both are the cluster's own state; the
