@@ -21,8 +21,10 @@
 //!    publish keeps one `Type` across them (a re-wording is not a change of the kind of
 //!    data), and the two versions are not one catalog entry under two names.
 //! 2. The curated view's column set: each column it carries over from the viewed table is
-//!    published and reports the viewed table's own `Type` and `Description`, while a
-//!    column it renames into an aggregate of its own is described in its own words.
+//!    published under the viewed name and `Type`, at the `Description` the VIEW's own
+//!    dictionary publishes for it — the viewed dictionary's text where the two agree, the
+//!    view's own where it words that entry itself — while a column it renames into an
+//!    aggregate of its own is described in its own words.
 //! 3. The published `Description` of columns spanning every table of the catalog and the
 //!    families the issue that prompted this suite cited, including columns it did not
 //!    cite, and the semantic invariant that distinguishes the recommendations table's
@@ -68,13 +70,13 @@ pub(crate) const RECOMMENDATIONS: &str = "COST_OPTIMIZATION_RECOMMENDATIONS";
 pub(crate) const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 
 /// `(column, the FOCUS 1.0 text, the FOCUS 1.2 text)` for every column the 1.2
-/// specification re-words over 1.0 and whose 1.2 text is known (AWS Data Exports table
-/// dictionary, as recorded for `GetTable` on each table). The rows span the families the
-/// revision touches: a period's limits become its BOUNDS, the commitment-discount family
-/// drops "-based", the SKU a charge is measured against becomes a METERED SKU, and the
-/// charge classifications and the effective cost are re-defined. A re-worded column whose
-/// 1.2 text the recording does not publish is in
-/// [`REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED`] instead.
+/// specification re-words over 1.0 (AWS Data Exports table dictionary, as recorded for
+/// `GetTable` on each table). The rows span the families the revision touches: a period's
+/// limits become its BOUNDS, the commitment-discount family drops "-based", the SKU a
+/// charge is measured against becomes a METERED SKU, a SKU identifier becomes a
+/// PROVIDER-SPECIFIED unique identifier, and the charge classifications and the effective
+/// cost are re-defined. An AWS extension both schemas publish and 1.2 words itself is in
+/// [`EXTENSION_REVISED_BY_FOCUS_1_2`] instead.
 const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     (
         "BillingPeriodEnd",
@@ -151,33 +153,47 @@ const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
         "Cost inclusive of the impacts of all reduced rates and discounts, augmented with the amortization of relevant purchases (one-time or recurring) paid to cover future eligible charges.",
         "The amortized cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge.",
     ),
-];
-
-/// `(column, the FOCUS 1.0 text)` for a column the 1.2 specification re-words whose 1.2
-/// text is NOT yet known: the recording for the 1.2 table shows the catalog's current
-/// string for it is not what that specification publishes, and it does not publish the
-/// string itself (replaying the 1.0 text for it diverges too). So the rule is asserted here
-/// as far as the evidence reaches — the 1.0 schemas publish THIS text and the 1.2 schema
-/// publishes something else — without pinning a 1.2 string known to be wrong.
-const REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED: &[(&str, &str)] = &[
     (
         "SkuId",
         "A unique identifier that defines a provider-supported construct for organizing properties that are common across one or more SKU Prices.",
+        "Provider-specified unique identifier that represents a specific SKU (e.g., a quantifiable good or service offering).",
     ),
     (
         "SkuPriceId",
         "A unique identifier that defines the unit price used to calculate the charge.",
+        "A provider-specified unique identifier that represents a specific SKU Price associated with a resource or service used or purchased.",
     ),
 ];
 
+/// `(column, the FOCUS 1.0 text, the FOCUS 1.2 text)` for an AWS `x_` extension BOTH FOCUS
+/// schemas publish and the 1.2 schema publishes its own text for (AWS Data Exports table
+/// dictionary, as recorded for `GetTable` on each table): the 1.2 schema publishes the cost
+/// and usage dictionary's own entry for the line-item column the extension exposes, where
+/// 1.0 publishes the shorter entry it was published with. An extension is not a
+/// specification column, so it is listed apart from [`REVISED_BY_FOCUS_1_2`].
+const EXTENSION_REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[(
+    "x_Discounts",
+    "Key-value pairs for any discounts you are receiving.",
+    "A map column containing key-value pairs of any specific discounts that apply to this line item.",
+)];
+
 /// The columns the cost and usage dashboard carries over from the cost and usage table
-/// under that table's own name (AWS Data Exports table dictionary): a column the view
-/// publishes and the catalog used to omit, so a client could not discover or request it.
-const VIEWED_BY_THE_DASHBOARD: &[&str] = &[
+/// under that table's own name AND at that table's own published text (AWS Data Exports
+/// table dictionary): a column the view publishes and the catalog used to omit, so a client
+/// could not discover or request it. A carried-over column the DASHBOARD dictionary words
+/// itself is in [`VIEWED_WITH_THE_VIEWS_OWN_TEXT`] instead.
+const VIEWED_BY_THE_DASHBOARD: &[&str] = &["product_from_location", "product_to_location"];
+
+/// `(column, the text the DASHBOARD dictionary publishes for it, the text the viewed cost
+/// and usage dictionary publishes)` for a column the view carries over and its own
+/// dictionary words itself (AWS Data Exports table dictionary, as recorded for `GetTable` on
+/// both tables): the dashboard publishes the pricing unit without the example sentence the
+/// cost and usage dictionary closes that entry with.
+const VIEWED_WITH_THE_VIEWS_OWN_TEXT: &[(&str, &str, &str)] = &[(
     "pricing_unit",
-    "product_from_location",
-    "product_to_location",
-];
+    "The pricing unit that AWS used for calculating your usage cost.",
+    "The pricing unit that AWS used for calculating your usage cost. For example, the pricing unit for Amazon EC2 instance usage is in hours.",
+)];
 
 /// `(the view's aggregate column, the cost and usage column it aggregates)`: a column the
 /// view RENAMES is its own, so it is described in the view's words rather than reported
@@ -247,11 +263,13 @@ pub(crate) const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
         "estimated_monthly_cost_after_discount",
         "The estimated monthly cost of the current resource after discounts. For Reserved Instances and Savings Plans, it refers to the cost for eligible usage.",
     ),
-    // The view, which reports a carried-over column as the viewed table does.
+    // The view, which reports a carried-over column as the viewed table does — and reports
+    // the pricing unit at its own dictionary's text for it (see
+    // `VIEWED_WITH_THE_VIEWS_OWN_TEXT`).
     (
         DASHBOARD,
         "pricing_unit",
-        "The pricing unit that AWS used for calculating your usage cost. For example, the pricing unit for Amazon EC2 instance usage is in hours.",
+        "The pricing unit that AWS used for calculating your usage cost.",
     ),
     (
         DASHBOARD,
@@ -360,7 +378,10 @@ async fn each_focus_version_reports_its_own_specifications_text() {
     let preview = schema_of(&client, FOCUS_1_0_PREVIEW).await;
     let focus_1_2 = schema_of(&client, FOCUS_1_2).await;
 
-    for (column, text_1_0, text_1_2) in REVISED_BY_FOCUS_1_2 {
+    for (column, text_1_0, text_1_2) in REVISED_BY_FOCUS_1_2
+        .iter()
+        .chain(EXTENSION_REVISED_BY_FOCUS_1_2)
+    {
         assert_ne!(
             text_1_0, text_1_2,
             "case {column:?}: the two specifications word this column differently, which is what this rule is about"
@@ -384,31 +405,6 @@ async fn each_focus_version_reports_its_own_specifications_text() {
                 "case {case:?}: the other version's text must not leak into this one"
             );
         }
-    }
-
-    // The columns the 1.2 specification re-words whose 1.2 text is not yet known: the rule
-    // holds as far as the evidence reaches — the 1.0 schemas publish their own text and the
-    // 1.2 schema publishes something else.
-    for (column, text_1_0) in REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED {
-        for (schema, table) in [(&focus_1_0, FOCUS_1_0), (&preview, FOCUS_1_0_PREVIEW)] {
-            let case = format!("{table}.{column}");
-            let reported = schema
-                .get(*column)
-                .unwrap_or_else(|| panic!("case {case:?}: the schema must publish the column"));
-            assert_eq!(
-                reported.description, *text_1_0,
-                "case {case:?}: expected this version's own published text {text_1_0:?}, got {:?}",
-                reported.description
-            );
-        }
-        let case = format!("{FOCUS_1_2}.{column}");
-        let reported = focus_1_2
-            .get(*column)
-            .unwrap_or_else(|| panic!("case {case:?}: the schema must publish the column"));
-        assert_ne!(
-            reported.description, *text_1_0,
-            "case {case:?}: the 1.2 specification re-words this column, so the 1.0 text must not leak into it"
-        );
     }
 
     // Over the WHOLE shared column set: a column both versions publish keeps one `Type`
@@ -441,7 +437,7 @@ async fn each_focus_version_reports_its_own_specifications_text() {
         .collect();
     assert_eq!(
         differing.len(),
-        REVISED_BY_FOCUS_1_2.len() + REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED.len(),
+        REVISED_BY_FOCUS_1_2.len() + EXTENSION_REVISED_BY_FOCUS_1_2.len(),
         "case \"FOCUS versions\": expected exactly the revised columns to differ, got {differing:?}"
     );
 
@@ -476,6 +472,38 @@ async fn a_view_publishes_every_column_the_dictionary_lists_for_it() {
         assert_eq!(
             reported, source,
             "case {case:?}: expected the viewed table's own column {source:?}, got {reported:?}"
+        );
+    }
+
+    // A column the view carries over and its OWN dictionary words itself is published under
+    // the viewed name and kind of data, at this dictionary's text — and the viewed table
+    // keeps the text ITS dictionary publishes, so neither entry leaks into the other.
+    for (name, views_own, viewed_text) in VIEWED_WITH_THE_VIEWS_OWN_TEXT {
+        assert_ne!(
+            views_own, viewed_text,
+            "case {name:?}: the two dictionaries word this column differently, which is what this rule is about"
+        );
+        let case = format!("{DASHBOARD}.{name}");
+        let reported = dashboard
+            .get(*name)
+            .unwrap_or_else(|| panic!("case {case:?}: the view publishes this column"));
+        let source = viewed
+            .get(*name)
+            .unwrap_or_else(|| panic!("case {case:?}: the viewed table must publish the column"));
+        assert_eq!(
+            reported.description, *views_own,
+            "case {case:?}: expected this dictionary's own published text {views_own:?}, got {:?}",
+            reported.description
+        );
+        assert_eq!(
+            source.description, *viewed_text,
+            "case \"{COST_AND_USAGE_REPORT}.{name}\": expected the viewed dictionary's own text {viewed_text:?}, got {:?}",
+            source.description
+        );
+        assert_eq!(
+            reported.data_type, source.data_type,
+            "case {case:?}: a carried-over column keeps the viewed kind of data, got {:?} and {:?}",
+            reported.data_type, source.data_type
         );
     }
 

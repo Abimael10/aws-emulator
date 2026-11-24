@@ -35,8 +35,8 @@
 //!    dictionary publishes with it (the key and value types of a key-value column), so a
 //!    client can tell what the column holds and what to cast it to. Asserted per column
 //!    over a table spanning every schema and its column families, and as invariants over
-//!    EVERY column of EVERY table — no description in the catalog's own "a map column
-//!    containing …" voice, no upper-cased storage-engine token.
+//!    EVERY column of EVERY table — a key-value column published as what it holds in its
+//!    own dictionary's words, no upper-cased storage-engine token.
 //! 5. Carried over whole includes the dictionary's PARAGRAPH BREAKS: an entry published as
 //!    several paragraphs keeps the blank line between them, and no published description
 //!    carries a line break that is not part of such a break.
@@ -44,7 +44,9 @@
 //!    for every configuration of its table that does not gate it, and a column a schema
 //!    reports is one a submitted query may name.
 //! 7. Where the dictionary publishes ONE entry for a column of several tables or schema
-//!    versions, every one of them reports that entry.
+//!    versions, every one of them reports that entry — and where two dictionaries word the
+//!    same fact themselves, each table reports its OWN dictionary's entry rather than the
+//!    other's.
 //!
 //! Every literal expectation below cites its source: the AWS Data Exports table
 //! dictionary, as recorded on the wire for `GetTable` / `ListTables`. The router, the
@@ -626,7 +628,7 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         CARBON_EMISSIONS,
         "model_version",
-        "The version of the model that was used to generate the carbon footprint value.",
+        "The version of the methodology the carbon footprint data was calculated with. For example, v2.0.0.",
     ),
     (
         CARBON_EMISSIONS,
@@ -682,8 +684,9 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
         "line_item_usage_end_date",
         "The end date and time for the line item in UTC, exclusive. The format is YYYY-MM-DDTHH:mm:ssZ.",
     ),
-    // … the service abbreviation, the public On-Demand pair with the clause that says which
-    // rate is used, and the key-value columns as the pairs they carry.
+    // … the service abbreviation, the place attributes of the product measured — which this
+    // dictionary words source and destination differently rather than symmetrically — and
+    // the fee columns.
     (
         COST_AND_USAGE_REPORT,
         "product_servicecode",
@@ -691,62 +694,60 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     ),
     (
         COST_AND_USAGE_REPORT,
-        "pricing_public_on_demand_cost",
-        "The total cost for the line item based on public On-Demand Instance rates. If you have SKUs with multiple On-Demand public costs, the maximum rate is used.",
+        "product_location",
+        "Describes the location that your resource resides in.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "pricing_public_on_demand_rate",
-        "The public On-Demand Instance rate in this billing period for the specific line item of usage. If you have SKUs with multiple On-Demand public rates, the maximum rate is used.",
+        "product_location_type",
+        "Describes the location type of your task.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "cost_category",
-        "Key-value pairs of the cost categories and their values for a given line item.",
+        "product_from_location",
+        "Describes the location where the usage originated from.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "discount",
-        "Key-value pairs for any discounts you are receiving.",
+        "product_from_region_code",
+        "Describes the source Region code for the AWS service.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "product",
-        "Key-value pairs of the product attributes and their values for a given line item.",
+        "product_to_location_type",
+        "Describes the destination location of the service usage.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "resource_tags",
-        "Key-value pairs of the AWS generated and user-defined tags and their values for a given line item.",
+        "product_fee_code",
+        "The code that refers to the fee.",
     ),
     (
         COST_AND_USAGE_REPORT,
-        "tags",
-        "Key-value pairs of the user-defined tags and their values for a given line item.",
+        "product_fee_description",
+        "The description for the product fee.",
     ),
-    // … the Region a resource resides in, published with the dictionary's whole
-    // Region/Availability-Zone explanation, and the reservation family in the
+    // … the Region a resource resides in, published with THIS dictionary's whole
+    // Region/Availability-Zone explanation (the carbon emissions dictionary words the same
+    // fact itself — see [`ENTRY_PER_DICTIONARY`]), and the reservation family in the
     // dictionary's own abbreviation for a Reserved Instance.
     (
         COST_AND_USAGE_REPORT,
         "product_region_code",
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolates, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available.",
     ),
     (
         COST_AND_USAGE_REPORT,
         "reservation_unused_quantity",
         "The number of RI hours that you didn't use during this billing period.",
     ),
-    (
-        COST_AND_USAGE_REPORT,
-        "reservation_net_effective_cost",
-        "The after-discount effective cost for the RI.",
-    ),
-    (
-        COST_AND_USAGE_REPORT,
-        "savings_plan_used_commitment",
-        "The total dollar amount of the Savings Plan commitment used (SavingsPlanRate multiplied by usage).",
-    ),
+    // NOT a row yet: this table's `cost_category`, `discount`, `product`, `resource_tags`,
+    // `tags`, `pricing_public_on_demand_cost`, `pricing_public_on_demand_rate`,
+    // `pricing_rate_code`, the `reservation_*` and `savings_plan_*` families, and
+    // `product_instance_family`, `product_instancesku` and `product_to_region_code`. The
+    // recording shows the catalog's text for them is NOT what the dictionary publishes, but
+    // does not publish the text itself, so a row here would pin a value already known to be
+    // wrong. They stay without an expectation until the published text for them is in hand.
     // The dashboard view: its own account dimensions, the service abbreviation, the place
     // the usage happened, and the service name with the clause that says what to use the
     // column for.
@@ -785,11 +786,33 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
         "product_name",
         "The full name of the AWS service. Use this column to filter AWS usage by AWS service.",
     ),
-    // A measure the view RENAMES is published in the view's own column names.
+    // A measure the view RENAMES is published in the view's own column names, at its own
+    // dictionary's wording — typo and all — and its aggregate dimensions and commitment
+    // measures are published in that dictionary's one terse sentence each.
     (
         DASHBOARD,
         "unblended_cost",
-        "The unblended rate multiplied by the usage quantity.",
+        "he UnblendedCost is the UnblendedRate multiplied by the UsageAmount.",
+    ),
+    (
+        DASHBOARD,
+        "current_generation",
+        "Describes the current generation of the resource.",
+    ),
+    (
+        DASHBOARD,
+        "amortized_cost",
+        "The amortized cost of the resource.",
+    ),
+    (
+        DASHBOARD,
+        "ri_sp_trueup",
+        "The true-up fee for a reservation of savings plan.",
+    ),
+    (
+        DASHBOARD,
+        "ri_sp_upfront_fees",
+        "Any upfront fee from your purchase of a reservation of savings plan.",
     ),
     // The recommendations table: the resource the recommendation is for and the one it
     // recommends, the action it asks for, the savings percentages — which word the discount
@@ -959,21 +982,21 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     ),
     (
         FOCUS_1_2,
+        "SkuMeter",
+        "Describes the functionality being metered or measured by a particular SKU in a charge.",
+    ),
+    (
+        FOCUS_1_2,
         "SkuPriceDetails",
-        "Key-value pairs of the provider-specified details that define the SKU Price used to calculate the charge.",
+        "A set of properties of a SKU Price ID which are meaningful and common to all instances of that SKU Price ID.",
     ),
     (
         FOCUS_1_2,
         "SubAccountType",
-        "A provider-assigned name to identify the type of a sub account.",
+        "A provider-assigned name to identify the type of sub account.",
     ),
-    // NOT a row yet: the FOCUS 1.2 `SkuId`, `SkuPriceId` and `x_Discounts` entries, and the
-    // dashboard view's own `pricing_unit`, `unblended_cost`, `amortized_cost`,
-    // `current_generation` and `ri_sp_*` entries. The recording the rest of this table is
-    // taken from shows that the catalog's text for them is NOT what the dictionary publishes,
-    // but does not publish the text itself, so a row here would pin a value already known to
-    // be wrong. They stay without an expectation until the published text for them is in
-    // hand.
+    // The 1.2 `SkuId`, `SkuPriceId` and `x_Discounts` entries are asserted from the version
+    // suite's tables, which word each one against the 1.0 entry it revises.
 ];
 
 /// The emissions the carbon dictionary publishes a measure for, with the words its text
@@ -1012,25 +1035,22 @@ const EMISSIONS_MEASURE_WORDS: &[(&str, &[&str], bool)] = &[
 /// measure that totals every scope (AWS Data Exports table dictionary).
 const SUPPORTED_EMISSIONS_UNIT: &str = "metric tons of carbon dioxide-equivalent (MTCO2e)";
 
-/// Wording that belongs to a description OF the catalog rather than to the dictionary's
-/// published text: a sentence about how the column is STORED ("a map column containing …")
-/// in place of what the column holds.
-const SELF_DESCRIBING_WORDING: &[&str] = &["A map column containing", "a map column containing"];
-
-/// How the dictionary publishes a key-value column: as the PAIRS the column carries.
-const KEY_VALUE_WORDING: &str = "Key-value pairs";
-
-/// `(table, column, the words the dictionary publishes that column's tags with)` for the
-/// key-value columns whose published text words the TAGS the column assigns rather than
-/// the pairs it carries: the FOCUS specification's tag column and the recommendations
-/// dictionary's (AWS Data Exports table dictionary). Every other key-value column of the
-/// catalog is published as the pairs it carries.
-const TAG_WORDED_COLUMNS: &[(&str, &str, &str)] = &[
+/// `(table, column, the words the dictionary publishes that column's contents with)` for
+/// the key-value columns the dictionary does NOT publish as the pairs they carry: the FOCUS
+/// specification's tag column, the recommendations dictionary's, and the FOCUS 1.2 SKU price
+/// details, published as the SET OF PROPERTIES it is (AWS Data Exports table dictionary).
+/// Every other key-value column of the catalog names the key-value pairs it carries.
+const OTHERWISE_WORDED_KEY_VALUE_COLUMNS: &[(&str, &str, &str)] = &[
     (FOCUS_1_0, "Tags", "tags assigned to"),
     (FOCUS_1_0_PREVIEW, "Tags", "tags assigned to"),
     (FOCUS_1_2, "Tags", "tags assigned to"),
     (RECOMMENDATIONS, "tags", "tags associated with"),
+    (FOCUS_1_2, "SkuPriceDetails", "A set of properties"),
 ];
+
+/// How the dictionary publishes the contents of every other key-value column: as the PAIRS
+/// the column carries, whether or not its entry opens on the map column containing them.
+const KEY_VALUE_WORDING: &str = "key-value pairs";
 
 /// The `Type` token a schema publishes for a key-value column whose key and value types it
 /// names (AWS Data Exports table dictionary, recommendations table).
@@ -1091,32 +1111,29 @@ async fn every_published_column_carries_the_dictionarys_own_sentence() {
 }
 
 /// RULE, over EVERY column of EVERY table rather than a list written here: a published
-/// description states what the column HOLDS, in the dictionary's words, never how the
-/// catalog stores it — so a key-value column is published as the pairs it carries (or as
-/// the tags it assigns).
+/// description states what the column HOLDS, in the dictionary's words for that column — so
+/// a key-value column names the pairs it carries, or the tags it assigns, or the set of
+/// properties it is, as ITS dictionary words it, and none of those forms is normalised onto
+/// another.
 #[tokio::test]
-async fn no_column_is_described_by_how_the_catalog_stores_it() {
+async fn a_key_value_column_is_published_as_what_it_holds() {
     let client = Client::new();
     let mut key_value_columns = 0usize;
 
     for table in published_table_names(&client).await {
         for (name, column) in schema_of(&client, &table).await {
             let case = format!("{table}.{name}");
-            for wording in SELF_DESCRIBING_WORDING {
-                assert!(
-                    !column.description.contains(wording),
-                    "case {case:?}: expected the dictionary's text for the column, got the catalog's own {wording:?} wording: {:?}",
-                    column.description
-                );
-            }
             if column.data_type.starts_with("Map") {
                 key_value_columns += 1;
-                let expected = TAG_WORDED_COLUMNS
+                let expected = OTHERWISE_WORDED_KEY_VALUE_COLUMNS
                     .iter()
-                    .find(|(tagged_table, tagged, _)| *tagged_table == table && *tagged == name)
+                    .find(|(worded_table, worded, _)| *worded_table == table && *worded == name)
                     .map_or(KEY_VALUE_WORDING, |(_, _, wording)| *wording);
                 assert!(
-                    column.description.contains(expected),
+                    column
+                        .description
+                        .to_lowercase()
+                        .contains(&expected.to_lowercase()),
                     "case {case:?}: a key-value column is published naming {expected:?}, got {:?}",
                     column.description
                 );
@@ -1453,17 +1470,10 @@ async fn a_published_column_is_reported_for_every_configuration_that_does_not_ga
 /// `(the dictionary entry, the (table, column) pairs that publish it)`: one entry of the
 /// dictionary published by more than one table or schema version (AWS Data Exports table
 /// dictionary, as recorded for `GetTable`). Rows span an entry two different dictionaries
-/// publish (the Region code), an AWS extension that exposes a line-item column across both
-/// FOCUS versions and the superseded preview table, and two entries the curated view shares
-/// with the table it views.
+/// publish word for word (the product code), an AWS extension that exposes a line-item
+/// column across both FOCUS versions and the superseded preview table, and two entries the
+/// curated view shares with the table it views.
 const SHARED_DICTIONARY_ENTRIES: &[(&str, &[(&str, &str)])] = &[
-    (
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
-        &[
-            (CARBON_EMISSIONS, "region_code"),
-            (COST_AND_USAGE_REPORT, "product_region_code"),
-        ],
-    ),
     (
         "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.",
         &[
@@ -1510,6 +1520,106 @@ async fn one_dictionary_entry_is_published_by_every_table_that_carries_it() {
             assert_eq!(
                 reported, published,
                 "case {case:?}: expected the dictionary's one entry {published:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// One side of a fact two dictionaries of the catalog both publish: the table, the column it
+/// publishes the fact under, and the entry THAT table's dictionary publishes for it.
+type Side = (&'static str, &'static str, &'static str);
+
+/// `(the fact, one dictionary's side, the other's)`: a fact two dictionaries of the catalog
+/// both publish and each one WORDS ITSELF (AWS Data Exports table dictionary, as recorded for
+/// `GetTable` on each table). The converse of [`SHARED_DICTIONARY_ENTRIES`], whose rows are
+/// the facts one entry is published for by several tables.
+///
+/// Rows span the ways two of the catalog's dictionaries meet: two unrelated tables (the
+/// carbon emissions table and the cost and usage table, which explain a Region in their own
+/// words — one closing on an example Region code and spelling the Availability-Zone clause
+/// "multiple, isolated, …", the other closing on where the service is available and spelling
+/// it "multiple, isolates, …"), and a curated VIEW and the table it views (which publish the
+/// pricing unit with and without the example sentence, and the unblended cost under two
+/// column names, the view's entry opening on the typo "he UnblendedCost").
+const ENTRY_PER_DICTIONARY: &[(&str, Side, Side)] = &[
+    (
+        "the Region/Availability-Zone explanation",
+        (
+            CARBON_EMISSIONS,
+            "region_code",
+            "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
+        ),
+        (
+            COST_AND_USAGE_REPORT,
+            "product_region_code",
+            "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolates, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available.",
+        ),
+    ),
+    (
+        "the pricing unit a usage cost is calculated in",
+        (
+            COST_AND_USAGE_REPORT,
+            "pricing_unit",
+            "The pricing unit that AWS used for calculating your usage cost. For example, the pricing unit for Amazon EC2 instance usage is in hours.",
+        ),
+        (
+            DASHBOARD,
+            "pricing_unit",
+            "The pricing unit that AWS used for calculating your usage cost.",
+        ),
+    ),
+    (
+        "the unblended cost of a line item",
+        (
+            COST_AND_USAGE_REPORT,
+            "line_item_unblended_cost",
+            "The UnblendedCost is the UnblendedRate multiplied by the UsageAmount.",
+        ),
+        (
+            DASHBOARD,
+            "unblended_cost",
+            "he UnblendedCost is the UnblendedRate multiplied by the UsageAmount.",
+        ),
+    ),
+];
+
+/// RULE, the converse of the one above: where two of the catalog's dictionaries word the same
+/// fact THEMSELVES, each table reports its own dictionary's entry as published — so neither
+/// dictionary's wording is served for the other's column, and an entry keeps the quirks (a
+/// typo, a spelling, a missing example) it was published with. Substituting one dictionary's
+/// semantics for the other's is what makes two dictionaries indistinguishable to a client
+/// reading the catalog to tell them apart.
+#[tokio::test]
+async fn a_fact_two_dictionaries_word_themselves_reports_each_dictionarys_own_entry() {
+    let client = Client::new();
+
+    let mut schemas: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+    for (fact, one, other) in ENTRY_PER_DICTIONARY {
+        assert_ne!(
+            one.2, other.2,
+            "case {fact:?}: the two dictionaries word this fact differently, which is what this rule is about"
+        );
+        for (table, column, published) in [one, other] {
+            if !schemas.contains_key(table) {
+                schemas.insert(table, descriptions_of(&client, table).await);
+            }
+            let case = format!("{fact} — {table}.{column}");
+            let reported = schemas[table]
+                .get(*column)
+                .unwrap_or_else(|| panic!("case {case:?}: the table must publish the column"));
+            assert_eq!(
+                reported, published,
+                "case {case:?}: expected this dictionary's own entry {published:?}, got {reported:?}"
+            );
+        }
+        // And neither entry is served where the other belongs: that substitution is the
+        // defect, and it reads as a success on both sides without this pair of checks.
+        for (reported_side, foreign) in [(one, other.2), (other, one.2)] {
+            let (table, column, _) = reported_side;
+            let case = format!("{fact} — {table}.{column}");
+            assert_ne!(
+                schemas[table][*column], foreign,
+                "case {case:?}: the other dictionary's entry {foreign:?} must not be served here"
             );
         }
     }

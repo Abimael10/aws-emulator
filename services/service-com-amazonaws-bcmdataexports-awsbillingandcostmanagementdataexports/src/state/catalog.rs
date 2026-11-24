@@ -23,6 +23,12 @@
 //! dictionary's PUBLISHED text for that column or property, carried over as published,
 //! rather than a shorter re-wording of it: a paraphrase is a different value on the wire.
 //!
+//! An entry the recorded response shows the catalog does NOT yet publish correctly, and
+//! whose published text the recording withholds, is left as it stands under a comment
+//! saying so, rather than replaced with a plausible sentence: a sentence invented to look
+//! published is another paraphrase, and the comment is what tells the next reader the entry
+//! is still owed.
+//!
 //! The column TYPE vocabulary is the dictionary's: a column's `Type` names the KIND of
 //! data the column stores ("The kind of data a column stores" — smithy_query shape
 //! `Column`, member `Type`) in the dictionary's own mixed-case words — `String`,
@@ -46,7 +52,9 @@
 //! A table that is a VIEW over another publishes its own curated columns AND the columns
 //! it carries over from the viewed table under the viewed table's names: see
 //! [`ColumnGroup::View`]. A column the viewing table carries over is named out of the
-//! viewed group rather than copied, so one column is described once. A column the
+//! viewed group rather than copied, so the two tables report one column rather than two —
+//! at the text the VIEWING table's dictionary publishes for it, which is the viewed
+//! dictionary's own text except where the viewing one words that entry itself. A column the
 //! dictionary publishes for a table and the catalog omits is a column a client cannot
 //! discover or ask for in an export definition, so the column SET is part of the
 //! published data just as the text is.
@@ -274,16 +282,25 @@ const fn col_when(
 }
 
 /// One group of columns a table's schema is built from.
+///
+/// [`Self::View`] and [`Self::Revised`] both carry columns over from another schema's group
+/// at this schema's own text, through the one [`revised_description`] lookup, and differ in
+/// WHICH columns they carry: a view publishes a SELECTION of the viewed group, named in its
+/// own order and with the viewed gating dropped (a viewing table publishes none of the
+/// viewed table's properties), while a superseding version carries the whole group forward
+/// in its order, gating included. Collapsing them would make a schema that carries a group
+/// forward state the names of every column in it, which is the list a revision must NOT have
+/// to restate.
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnGroup {
     /// Columns this schema describes itself.
     Own(&'static [ColumnSpec]),
     /// Columns this schema takes OVER from another table's group, named in the order this
     /// schema publishes them: a table that is a VIEW over another reports the viewed
-    /// column exactly as the viewed table does — one name, one kind of data, one
-    /// description — so the two readers cannot drift apart. A table property of the
-    /// viewed table gates nothing here, because the viewing table publishes no such
-    /// property: a viewed column is part of every schema of the viewing table.
+    /// column under the viewed table's name and kind of data, so the two readers cannot
+    /// drift apart on the column's identity. A table property of the viewed table gates
+    /// nothing here, because the viewing table publishes no such property: a viewed column
+    /// is part of every schema of the viewing table.
     View {
         /// The group the columns are taken from.
         of: &'static [ColumnSpec],
@@ -291,6 +308,13 @@ pub enum ColumnGroup {
         /// group does not describe contributes no column — [`crate::state`]'s tests pin
         /// the resulting schema, so a name that resolves to nothing fails them.
         columns: &'static [&'static str],
+        /// `(column name, the description THIS schema publishes for it)` for a carried-over
+        /// column whose own dictionary words it differently from the viewed table's: the
+        /// viewing table's dictionary is its own, so where it publishes its own entry for a
+        /// column it carries over, that entry belongs to this schema and the viewed table
+        /// keeps the entry IT publishes. A name not listed here is reported exactly as the
+        /// viewed table reports it — one column, one description.
+        revisions: &'static [(&'static str, &'static str)],
     },
     /// Every column of another schema's group, with the DESCRIPTIONS this schema's own
     /// specification revises applied over them. A later version of a specification
@@ -312,29 +336,40 @@ impl ColumnGroup {
     fn resolve(&self) -> Vec<ColumnSpec> {
         match *self {
             Self::Own(columns) => columns.to_vec(),
-            Self::View { of, columns } => columns
+            Self::View {
+                of,
+                columns,
+                revisions,
+            } => columns
                 .iter()
                 .filter_map(|name| of.iter().find(|column| column.name == *name))
                 .map(|column| ColumnSpec {
                     requires: None,
+                    description: revised_description(revisions, column),
                     ..*column
                 })
                 .collect(),
             Self::Revised { of, revisions } => of
                 .iter()
-                .map(|column| match revisions
-                    .iter()
-                    .find(|(name, _)| *name == column.name)
-                {
-                    Some((_, description)) => ColumnSpec {
-                        description,
-                        ..*column
-                    },
-                    None => *column,
+                .map(|column| ColumnSpec {
+                    description: revised_description(revisions, column),
+                    ..*column
                 })
                 .collect(),
         }
     }
+}
+
+/// `column`'s description as `revisions` publishes it, or the one the column carries when
+/// this schema revises nothing for it.
+fn revised_description(
+    revisions: &'static [(&'static str, &'static str)],
+    column: &ColumnSpec,
+) -> &'static str {
+    revisions
+        .iter()
+        .find(|(name, _)| *name == column.name)
+        .map_or(column.description, |(_, description)| *description)
 }
 
 /// One table in the catalog: the name a request names it by, its description, the table
@@ -652,9 +687,20 @@ const TIME_GRANULARITY_PROPERTY: TablePropertySpec = TablePropertySpec {
 
 /// The text the dictionary publishes for a REGION CODE column: what a Region is, that the
 /// code is the name of an AWS Region, and an example of one. Both the carbon emissions and
-/// the cost and usage dictionaries publish this entry for their Region code column, so it
-/// is written once and named by each.
-const REGION_CODE_DESCRIPTION: &str = "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.";
+/// the carbon emissions dictionary publishes this entry, with its example code, for the
+/// Region the usage originated in.
+///
+/// The cost and usage dictionary publishes its OWN entry for the Region a resource resides
+/// in — see [`COST_AND_USAGE_REGION_CODE_DESCRIPTION`]: the two dictionaries explain the
+/// same fact in their own words, so neither entry is written once and shared.
+const CARBON_REGION_CODE_DESCRIPTION: &str = "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.";
+
+/// The text the COST AND USAGE dictionary publishes for the Region a resource resides in:
+/// the same Region/Availability-Zone explanation the carbon emissions dictionary publishes
+/// ([`CARBON_REGION_CODE_DESCRIPTION`]), in this dictionary's own wording — it spells the
+/// Availability-Zone clause "multiple, isolates, and physically separate AZs" and closes on
+/// where the service is available, with no example code after it.
+const COST_AND_USAGE_REGION_CODE_DESCRIPTION: &str = "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolates, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available.";
 
 /// The text the dictionary publishes for the code of the PRODUCT a row measures, with its
 /// example. The carbon emissions dictionary publishes it for its product code column and
@@ -702,7 +748,7 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "model_version",
         STRING,
-        "The version of the model that was used to generate the carbon footprint value.",
+        "The version of the methodology the carbon footprint data was calculated with. For example, v2.0.0.",
     ),
     col("product_code", STRING, PRODUCT_CODE_DESCRIPTION),
     // The Region the usage originated in, published as a code and — in `location` — as the
@@ -711,7 +757,7 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "region_code",
         STRING,
-        REGION_CODE_DESCRIPTION,
+        CARBON_REGION_CODE_DESCRIPTION,
     ),
     col(
         "location",
@@ -837,10 +883,10 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The account name of the paying account. For an organization in AWS Organizations, this is the name of the management account.",
     ),
-    // The key-value columns of this schema are published as the PAIRS they carry —
-    // "Key-value pairs of …" — rather than as "a map column containing" them: the
-    // dictionary states what the column HOLDS, and the kind of data it stores is the
-    // column's `Type`.
+    // The key-value columns of this schema, published as the pairs they carry. The text
+    // these five entries are published with is NOT in hand: the recorded response shows each
+    // of them diverging from the strings below and does not publish what it expects, so they
+    // are left as they were rather than replaced with a guess — see this module's header.
     col(
         "cost_category",
         MAP,
@@ -1066,7 +1112,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_fee_description",
         STRING,
-        "Describes the fee for the product.",
+        "The description for the product fee.",
     ),
     col(
         "product_from_location",
@@ -1081,7 +1127,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_from_region_code",
         STRING,
-        "Describes the Region code of the location where the usage originated from.",
+        "Describes the source Region code for the AWS service.",
     ),
     col(
         "product_instance_family",
@@ -1101,12 +1147,12 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_location",
         STRING,
-        "Describes the location of the Region that your resource resides in.",
+        "Describes the location that your resource resides in.",
     ),
     col(
         "product_location_type",
         STRING,
-        "Describes the location type of the Region that your resource resides in.",
+        "Describes the location type of your task.",
     ),
     col(
         "product_operation",
@@ -1123,10 +1169,14 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The category for the type of product.",
     ),
-    // The Region a resource resides in, published with the dictionary's whole
-    // Region/Availability-Zone explanation — the same explanation the carbon emissions
-    // dictionary publishes its Region code with.
-    col("product_region_code", STRING, REGION_CODE_DESCRIPTION),
+    // The Region a resource resides in, published with this dictionary's whole
+    // Region/Availability-Zone explanation — the carbon emissions dictionary explains the
+    // same fact in its own words (see `COST_AND_USAGE_REGION_CODE_DESCRIPTION`).
+    col(
+        "product_region_code",
+        STRING,
+        COST_AND_USAGE_REGION_CODE_DESCRIPTION,
+    ),
     col(
         "product_servicecode",
         STRING,
@@ -1140,12 +1190,12 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_to_location",
         STRING,
-        "Describes the location where the usage is sent to.",
+        "Describes the location usage destination.",
     ),
     col(
         "product_to_location_type",
         STRING,
-        "Describes the location type of the Region where the usage is sent to.",
+        "Describes the destination location of the service usage.",
     ),
     col(
         "product_to_region_code",
@@ -1848,9 +1898,9 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
 ///   for the contracted unit price, which excludes those discounts by name;
 /// * the SKU a charge is measured against is a METERED SKU, for the consumed quantity and
 ///   the unit it is measured in; and
-/// * a SKU identifier is published as an identifier the PROVIDER assigns, as this
-///   specification publishes its other provider-assigned identifiers, rather than as the
-///   construct it organises.
+/// * a SKU identifier and a SKU price identifier are published as a PROVIDER-SPECIFIED
+///   unique identifier that represents the thing identified — a SKU, a SKU Price — rather
+///   than as a unique identifier that defines a construct.
 const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
     (
         "BillingPeriodEnd",
@@ -1912,10 +1962,13 @@ const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
         "EffectiveCost",
         "The amortized cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge.",
     ),
-    ("SkuId", "The identifier assigned to a SKU by the provider."),
+    (
+        "SkuId",
+        "Provider-specified unique identifier that represents a specific SKU (e.g., a quantifiable good or service offering).",
+    ),
     (
         "SkuPriceId",
-        "The identifier assigned to a SKU Price by the provider.",
+        "A provider-specified unique identifier that represents a specific SKU Price associated with a resource or service used or purchased.",
     ),
 ];
 
@@ -1981,24 +2034,25 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "SkuMeter",
         STRING,
-        "Provider-specified description of the functionality or capability that a SKU measures.",
+        "Describes the functionality being metered or measured by a particular SKU in a charge.",
     ),
     col(
         "SkuPriceDetails",
         MAP,
-        "Key-value pairs of the provider-specified details that define the SKU Price used to calculate the charge.",
+        "A set of properties of a SKU Price ID which are meaningful and common to all instances of that SKU Price ID.",
     ),
     col(
         "SubAccountType",
         STRING,
-        "A provider-assigned name to identify the type of a sub account.",
+        "A provider-assigned name to identify the type of sub account.",
     ),
 ];
 
 /// The `x_`-prefixed provider extensions Amazon Web Services publishes beside the FOCUS
-/// 1.0 columns, in the dictionary's order. An extension carries the AWS cost and usage
-/// dictionary's own text for the line-item column it exposes — including its examples —
-/// because that is the column it is an extension FOR.
+/// 1.0 columns, in the dictionary's order. An extension is published with the text THIS
+/// specification publishes for it, which for most of them is the AWS cost and usage
+/// dictionary's own text for the line-item column the extension exposes — examples included
+/// — because that is the column it is an extension FOR.
 const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
     col(
         "x_CostCategories",
@@ -2026,9 +2080,20 @@ const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
 /// The `x_`-prefixed provider extensions the FOCUS 1.2 schema publishes. FOCUS 1.2 does
 /// NOT carry the cost-category and usage-type extensions of FOCUS 1.0: the columns the
 /// 1.2 specification standardises cover them, so the 1.2 schema publishes only the
-/// extensions it still needs. Named out of the FOCUS 1.0 group rather than copied, so
-/// one extension column is described once.
+/// extensions it still needs. Named out of the FOCUS 1.0 group rather than copied, so the
+/// two schemas publish one extension column rather than two — at each schema's own text for
+/// it (see [`FOCUS_1_2_AWS_EXTENSION_REVISIONS`]).
 const FOCUS_1_2_AWS_EXTENSION_COLUMNS: &[&str] = &["x_Discounts", "x_Operation", "x_ServiceCode"];
+
+/// The text the FOCUS 1.2 schema publishes for an extension it carries over from the FOCUS
+/// 1.0 group: 1.2 publishes its own entry for the discount extension, which opens on the MAP
+/// COLUMN containing the pairs — part of the published entry rather than a description of the
+/// catalog — where 1.0 publishes the shorter entry that specification was published with. The
+/// extensions not listed here read the same in both schemas.
+const FOCUS_1_2_AWS_EXTENSION_REVISIONS: &[(&str, &str)] = &[(
+    "x_Discounts",
+    "A map column containing key-value pairs of any specific discounts that apply to this line item.",
+)];
 
 /// The description every FOCUS table carries: the specification the schema implements.
 const FOCUS_DESCRIPTION: &str = "FinOps Open Cost & Usage Specification";
@@ -2168,7 +2233,7 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "current_generation",
         STRING,
-        "Indicates whether the instance type is of the current generation of its instance family.",
+        "Describes the current generation of the resource.",
     ),
     col(
         "platform",
@@ -2210,18 +2275,24 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     ),
     // A measure the view RENAMES is published in the view's own column names — its
     // unblended rate and its usage quantity — rather than in the cost and usage
-    // dictionary's, whose column names this table does not publish.
+    // dictionary's, whose column names this table does not publish. The dashboard
+    // dictionary's entry for the unblended cost opens on "he UnblendedCost": the published
+    // text carries the dictionary's own typo, and tidying it would be a different value on
+    // the wire.
     col(
         "unblended_cost",
         NUMBER,
-        "The unblended rate multiplied by the usage quantity.",
+        "he UnblendedCost is the UnblendedRate multiplied by the UsageAmount.",
     ),
     // The commitment a line item benefited from is a "Reservation" in this dictionary's
-    // words — the cost and usage dictionary's "Reserved Instance" is that dictionary's.
+    // words — the cost and usage dictionary's "Reserved Instance" is that dictionary's —
+    // and this dictionary publishes its aggregate measures in one terse sentence, down to
+    // the "a reservation of savings plan" its true-up and upfront-fee entries word the pair
+    // with.
     col(
         "amortized_cost",
         NUMBER,
-        "The upfront and recurring costs of a Reservation or Savings Plan, distributed across the billing periods of the term that they apply to.",
+        "The amortized cost of the resource.",
     ),
     col(
         "public_cost",
@@ -2236,25 +2307,37 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "ri_sp_trueup",
         NUMBER,
-        "The true-up charge for the Reservation or Savings Plan that this line item benefited from, for the billing period.",
+        "The true-up fee for a reservation of savings plan.",
     ),
     col(
         "ri_sp_upfront_fees",
         NUMBER,
-        "The upfront fees for the Reservation or Savings Plan that this line item benefited from, for the billing period.",
+        "Any upfront fee from your purchase of a reservation of savings plan.",
     ),
 ];
 
-/// The columns `COST_AND_USAGE_DASHBOARD` carries over from the cost and usage table
-/// UNCHANGED, in the order the dictionary publishes them: the pricing unit the view's
-/// usage quantity is measured in, and the two ends of a data transfer. They keep the
-/// cost and usage name, so the view reports them exactly as the viewed table does rather
-/// than with a second description of the same column — see [`ColumnGroup::View`].
+/// The columns `COST_AND_USAGE_DASHBOARD` carries over from the cost and usage table, in
+/// the order the dictionary publishes them: the pricing unit the view's usage quantity is
+/// measured in, and the two ends of a data transfer. They keep the cost and usage name and
+/// kind of data, so the view reports the same column rather than a second one — see
+/// [`ColumnGroup::View`] — at the text the DASHBOARD dictionary publishes for it, which for
+/// most of them is the viewed dictionary's own (see
+/// [`COST_AND_USAGE_DASHBOARD_VIEWED_REVISIONS`]).
 const COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS: &[&str] = &[
     "pricing_unit",
     "product_from_location",
     "product_to_location",
 ];
+
+/// The text the DASHBOARD dictionary publishes for a column it carries over from the cost
+/// and usage table, where that text is its own rather than the viewed dictionary's: it
+/// publishes the pricing unit without the example sentence the cost and usage dictionary
+/// closes that entry with. The columns not listed here are published as the viewed
+/// dictionary publishes them.
+const COST_AND_USAGE_DASHBOARD_VIEWED_REVISIONS: &[(&str, &str)] = &[(
+    "pricing_unit",
+    "The pricing unit that AWS used for calculating your usage cost.",
+)];
 
 /// Every table data exports publishes, ordered by name — the one catalog `GetTable`
 /// reports an entry of and `ListTables` lists.
@@ -2277,6 +2360,7 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
             ColumnGroup::View {
                 of: COST_AND_USAGE_REPORT_COLUMNS,
                 columns: COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS,
+                revisions: COST_AND_USAGE_DASHBOARD_VIEWED_REVISIONS,
             },
         ],
     },
@@ -2328,6 +2412,7 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
             ColumnGroup::View {
                 of: FOCUS_AWS_EXTENSION_COLUMNS,
                 columns: FOCUS_1_2_AWS_EXTENSION_COLUMNS,
+                revisions: FOCUS_1_2_AWS_EXTENSION_REVISIONS,
             },
         ],
     },
