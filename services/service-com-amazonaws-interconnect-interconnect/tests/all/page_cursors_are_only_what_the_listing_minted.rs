@@ -11,11 +11,18 @@
 //!
 //! The rule driven here, over all three paginated operations of this service: a
 //! `nextToken` is accepted only when it is one THAT listing minted — authenticated under
-//! the secret the store drew and never reveals, over the scope that decides the sequence
-//! walked (the operation, the Region whose endpoint answered, and the Environment an
-//! attach-point listing was scoped by) — and every other value is refused with HTTP 400
+//! the secret the store drew and never reveals, over the scope that names every input
+//! deciding the sequence walked (the operation, the Region whose endpoint answered, the
+//! Environment an attach-point listing was scoped by, and the filters a listing was
+//! narrowed by) — and every other value is refused with HTTP 400
 //! `InterconnectValidationException` and this service's one wording for a cursor it did
 //! not issue, never with a page.
+//!
+//! The last two suites drive the FILTERS of that scope: a cursor of one filtered listing
+//! offered to another, across the filter selections of `ListConnections` and the
+//! `provider` of `ListEnvironments`, beside the inputs that window a page rather than
+//! deciding a sequence (`maxResults`, and the `location` distinguisher that narrows
+//! nothing), which scope no cursor.
 //!
 //! The table's rows differ along what the rule generalises over: the operation, the
 //! sequence walked, the Region, the form of the forged token (no cursor shape at all,
@@ -30,6 +37,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
+use service_com_amazonaws_interconnect_interconnect::ops::types::{AttachPoint, Provider};
 use service_com_amazonaws_interconnect_interconnect::state::{
     attach_point_cursor_scope, connection_cursor_scope, cursor_not_issued_message,
     encode_cursor, environment_cursor_scope, service_state, PageTokenKey,
@@ -199,15 +207,15 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             items_member: "connections",
             key_member: "id",
             tag: CONNECTION_CURSOR_TAG,
-            scope: connection_cursor_scope(region),
+            scope: connection_cursor_scope(region, None, None, None, None),
             foreign_scopes: vec![
                 (
                     "another Region's endpoint".to_string(),
-                    connection_cursor_scope(OTHER_REGION),
+                    connection_cursor_scope(OTHER_REGION, None, None, None, None),
                 ),
                 (
                     "the Environment listing".to_string(),
-                    environment_cursor_scope(region),
+                    environment_cursor_scope(region, None),
                 ),
                 (
                     "an attach-point listing".to_string(),
@@ -223,15 +231,15 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
             items_member: "environments",
             key_member: "environmentId",
             tag: ENVIRONMENT_CURSOR_TAG,
-            scope: environment_cursor_scope(region),
+            scope: environment_cursor_scope(region, None),
             foreign_scopes: vec![
                 (
                     "another Region's endpoint".to_string(),
-                    environment_cursor_scope(OTHER_REGION),
+                    environment_cursor_scope(OTHER_REGION, None),
                 ),
                 (
                     "the connection listing".to_string(),
-                    connection_cursor_scope(region),
+                    connection_cursor_scope(region, None, None, None, None),
                 ),
                 (
                     "an attach-point listing".to_string(),
@@ -259,11 +267,11 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
                 ),
                 (
                     "the connection listing".to_string(),
-                    connection_cursor_scope(region),
+                    connection_cursor_scope(region, None, None, None, None),
                 ),
                 (
                     "the Environment listing".to_string(),
-                    environment_cursor_scope(region),
+                    environment_cursor_scope(region, None),
                 ),
             ],
             keys: Vec::new(),
@@ -546,4 +554,657 @@ async fn an_issued_cursor_walks_the_sequence_once_and_stays_usable() {
             );
         }
     }
+}
+
+/// A `ConnectionState` none of the connections the rows below create is in: the rows
+/// settle every one of them first, so this filter selects none of them. One of the values
+/// the model gives the enum
+/// (`smithy_query(query="shape",shape="ConnectionState")` -> available, requested,
+/// pending, down, deleting, deleted, failed, updating).
+const UNMATCHED_CONNECTION_STATE: &str = "requested";
+
+/// How many filter selections the connection table spans, so a row quietly dropping out
+/// of it fails here rather than passing vacuously.
+const FILTER_SELECTIONS: usize = 10;
+
+/// One filter selection of `ListConnections`: the four members that decide WHICH
+/// connections the listing walks, held once and rendered both as the request carries them
+/// and as the scope its cursors are minted under, so the two cannot drift.
+#[derive(Debug)]
+struct FilterSelection {
+    /// What the case is called in an assertion.
+    label: String,
+    /// `state`, as the request carries it.
+    state: Option<String>,
+    /// `environmentId`, as the request carries it.
+    environment_id: Option<String>,
+    /// `provider`, as the request carries it.
+    provider: Option<Provider>,
+    /// `attachPoint`, as the request carries it.
+    attach_point: Option<AttachPoint>,
+    /// The connection ids this selection's listing reports, in the order it reports
+    /// them — read off the live listing rather than written here.
+    ids: Vec<String>,
+}
+
+impl FilterSelection {
+    /// The filter members a request carries for this selection, built from the same
+    /// values its scope is, so a row cannot send one selection and expect another's
+    /// scope.
+    fn filters(&self) -> Map<String, Value> {
+        let mut request = Map::new();
+        if let Some(state) = &self.state {
+            request.insert("state".to_string(), json!(state));
+        }
+        if let Some(environment_id) = &self.environment_id {
+            request.insert("environmentId".to_string(), json!(environment_id));
+        }
+        if let Some(provider) = &self.provider {
+            request.insert("provider".to_string(), provider_request_member(provider));
+        }
+        if let Some(attach_point) = &self.attach_point {
+            request.insert(
+                "attachPoint".to_string(),
+                attach_point_request_member(attach_point),
+            );
+        }
+        request
+    }
+
+    /// The scope a cursor of this selection is authenticated under, from the crate's own
+    /// rule for it.
+    fn scope(&self, region: &str) -> String {
+        connection_cursor_scope(
+            region,
+            self.state.as_deref(),
+            self.environment_id.as_deref(),
+            self.provider.as_ref(),
+            self.attach_point.as_ref(),
+        )
+    }
+}
+
+/// One filter selection, before its sequence is read.
+fn selection(
+    label: &str,
+    state: Option<&str>,
+    environment_id: Option<&str>,
+    provider: Option<Provider>,
+    attach_point: Option<AttachPoint>,
+) -> FilterSelection {
+    FilterSelection {
+        label: label.to_string(),
+        state: state.map(str::to_string),
+        environment_id: environment_id.map(str::to_string),
+        provider,
+        attach_point,
+        ids: Vec::new(),
+    }
+}
+
+/// The request member a `provider` filter is sent as.
+fn provider_request_member(provider: &Provider) -> Value {
+    match provider {
+        Provider::cloudServiceProvider(name) => json!({ "cloudServiceProvider": name }),
+        Provider::lastMileProvider(name) => json!({ "lastMileProvider": name }),
+    }
+}
+
+/// The request member an `attachPoint` filter is sent as.
+fn attach_point_request_member(attach_point: &AttachPoint) -> Value {
+    match attach_point {
+        AttachPoint::directConnectGateway(identifier) => {
+            json!({ "directConnectGateway": identifier })
+        }
+        AttachPoint::Arn(arn) => json!({ "arn": arn }),
+    }
+}
+
+/// The `Provider` a listed record names, read OFF the record so no row writes a partner
+/// name of its own.
+fn provider_of(value: &Value) -> Provider {
+    let provider = &value["provider"];
+    if let Some(name) = provider["cloudServiceProvider"].as_str() {
+        Provider::cloudServiceProvider(name.to_string())
+    } else if let Some(name) = provider["lastMileProvider"].as_str() {
+        Provider::lastMileProvider(name.to_string())
+    } else {
+        panic!("case \"provider\": expected one side of the Provider union, got {provider:?}")
+    }
+}
+
+/// The `AttachPoint` a listed connection is attached to, read off the record.
+fn attach_point_union_of(connection: &Value) -> AttachPoint {
+    let attach_point = &connection["attachPoint"];
+    if let Some(identifier) = attach_point["directConnectGateway"].as_str() {
+        AttachPoint::directConnectGateway(identifier.to_string())
+    } else if let Some(arn) = attach_point["arn"].as_str() {
+        AttachPoint::Arn(arn.to_string())
+    } else {
+        panic!(
+            "case \"attachPoint\": expected one side of the AttachPoint union, got {attach_point:?}"
+        )
+    }
+}
+
+/// The same partner name on the OTHER side of the `Provider` union: a different filter,
+/// because this filter selects on the member as well as on the name.
+fn other_side_of(provider: &Provider) -> Provider {
+    match provider {
+        Provider::cloudServiceProvider(name) => Provider::lastMileProvider(name.clone()),
+        Provider::lastMileProvider(name) => Provider::cloudServiceProvider(name.clone()),
+    }
+}
+
+/// One `ListConnections` page under `selection`, optionally resuming from `token` and
+/// windowed by `max_results`.
+async fn filtered_page(
+    emulator: &Emulator,
+    region: &str,
+    selection: &FilterSelection,
+    token: Option<&str>,
+    max_results: Option<i64>,
+) -> (u16, Value) {
+    let mut request = selection.filters();
+    if let Some(token) = token {
+        request.insert("nextToken".to_string(), json!(token));
+    }
+    if let Some(max) = max_results {
+        request.insert("maxResults".to_string(), json!(max));
+    }
+    emulator
+        .ic_in(region, "ListConnections", Value::Object(request))
+        .await
+}
+
+/// The connection ids a page reports, in the order it reports them.
+fn ids_of(body: &Value) -> Vec<String> {
+    body["connections"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|connection| text(connection, "id"))
+        .collect()
+}
+
+/// The `ListConnections` filter selections the rows below mint and replay cursors
+/// across, built from LIVE records: several connections created on one Environment and
+/// settled, so a filter on each of the four members selects a non-empty sequence, beside
+/// selections on values the store carries for nothing, which select none.
+async fn filter_selections(emulator: &Emulator) -> Vec<FilterSelection> {
+    let region = DEFAULT_SIGNING_REGION;
+    let placements = placements_in(emulator, region).await;
+    let placement = placements[0].clone();
+    let mut settled = Vec::new();
+    for seed in 0..CONNECTIONS_CREATED {
+        let created = create_with_tags_in(emulator, region, &placement, seed, &BTreeMap::new()).await;
+        // Waited for by state, never by a span: the filter on `state` has to select a
+        // state the clock has already carried every one of them to.
+        settled.push(
+            emulator
+                .provisioned_connection(region, &text(&created, "id"))
+                .await,
+        );
+    }
+    let first = settled
+        .first()
+        .expect("the rows create at least one connection")
+        .clone();
+    let live_state = text(&first, "state");
+    let environment = text(&first, "environmentId");
+    let provider = provider_of(&first);
+    let attach_point = attach_point_union_of(&first);
+    // An `environmentId` of ANOTHER Region's catalog: a well-formed id this Region holds
+    // no connection on, which this filter answers with an empty page rather than a
+    // refusal.
+    let other_catalog = emulator.environments_in(OTHER_REGION).await;
+    let other_environment = text(
+        other_catalog
+            .first()
+            .expect("the other Region publishes a catalog"),
+        "environmentId",
+    );
+
+    // The rows differ along what the rule generalises over: which of the four filters is
+    // supplied, which member of a filter's union carries the value, whether the value is
+    // one the store carries, and how many filters are combined at once.
+    let mut rows = vec![
+        selection("no filter at all", None, None, None, None),
+        selection(
+            "the state the connections settled in",
+            Some(&live_state),
+            None,
+            None,
+            None,
+        ),
+        selection(
+            "a state none of them is in",
+            Some(UNMATCHED_CONNECTION_STATE),
+            None,
+            None,
+            None,
+        ),
+        selection(
+            "the Environment they are on",
+            None,
+            Some(&environment),
+            None,
+            None,
+        ),
+        selection(
+            "an Environment of another Region's catalog",
+            None,
+            Some(&other_environment),
+            None,
+            None,
+        ),
+        selection(
+            "the provider they carry",
+            None,
+            None,
+            Some(provider.clone()),
+            None,
+        ),
+        selection(
+            "the same partner on the other side of the union",
+            None,
+            None,
+            Some(other_side_of(&provider)),
+            None,
+        ),
+        selection(
+            "the attach point they are attached to",
+            None,
+            None,
+            None,
+            Some(attach_point),
+        ),
+        selection(
+            "a connection ARN as the attach point",
+            None,
+            None,
+            None,
+            Some(AttachPoint::Arn(text(&first, "arn"))),
+        ),
+        selection(
+            "the state and the Environment together",
+            Some(&live_state),
+            Some(&environment),
+            None,
+            None,
+        ),
+    ];
+    assert_eq!(
+        rows.len(),
+        FILTER_SELECTIONS,
+        "case \"the filter table\": expected the table to span every filter of this listing, got {} rows",
+        rows.len()
+    );
+    for row in &mut rows {
+        let (status, body) = filtered_page(emulator, region, row, None, None).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the unwindowed filtered listing to succeed, got {status} with {body:?}",
+            row.label
+        );
+        row.ids = ids_of(&body);
+    }
+    rows
+}
+
+/// RULE: the scope a page cursor is authenticated under names every input that decided
+/// the sequence the cursor is a position in, so a `ListConnections` cursor is served only
+/// by a listing carrying the same filters and refused with HTTP 400 by one carrying any
+/// other — while `maxResults`, which windows a page rather than deciding the sequence,
+/// scopes nothing.
+#[tokio::test]
+async fn a_connection_cursor_is_served_only_by_the_filters_that_minted_it() {
+    let (emulator, store_key) = emulator_with_store_key();
+    let region = DEFAULT_SIGNING_REGION;
+    let table = filter_selections(&emulator).await;
+
+    // No two rows are the same selection, so every "foreign" pair below really is one.
+    for (position, left) in table.iter().enumerate() {
+        for right in &table[position + 1..] {
+            assert_ne!(
+                left.scope(region),
+                right.scope(region),
+                "case {:?} against {:?}: expected two filter selections to name two scopes",
+                left.label,
+                right.label
+            );
+        }
+    }
+
+    let mut pairs_driven = 0_usize;
+    for minting in &table {
+        // A sequence that fits in one page hands no cursor back, so only the selections
+        // that really page can mint one here.
+        if minting.ids.len() < 2 {
+            continue;
+        }
+        let (status, first) = filtered_page(&emulator, region, minting, None, Some(1)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected the first page to succeed, got {status} with {first:?}",
+            minting.label
+        );
+        let token = text(&first, "nextToken");
+        assert_eq!(
+            token,
+            encode_cursor(&store_key, &minting.scope(region), &minting.ids[0]),
+            "case {:?}: expected the cursor minted over the scope of the filters that decided this sequence, got {:?}",
+            minting.label,
+            first["nextToken"]
+        );
+
+        // The window is no part of the scope: the same cursor, offered to the same
+        // selection with a wider `maxResults`, is served.
+        let (status, wider) = filtered_page(&emulator, region, minting, Some(&token), Some(2)).await;
+        let rest: Vec<String> = minting.ids[1..].to_vec();
+        assert_eq!(
+            status, 200,
+            "case {:?} resumed with a wider window: expected HTTP 200, got {status} with {wider:?}",
+            minting.label
+        );
+        assert_eq!(
+            ids_of(&wider),
+            rest.iter().take(2).cloned().collect::<Vec<String>>(),
+            "case {:?} resumed with a wider window: expected the next items of this sequence, got {wider:?}",
+            minting.label
+        );
+
+        for resuming in &table {
+            pairs_driven += 1;
+            let case = format!(
+                "a cursor of {:?} offered to {:?}",
+                minting.label, resuming.label
+            );
+            let (status, body) = filtered_page(&emulator, region, resuming, Some(&token), None).await;
+            if resuming.label == minting.label {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a listing to serve its OWN cursor, got {status} with {body:?}"
+                );
+                assert_eq!(
+                    ids_of(&body),
+                    rest,
+                    "case {case:?}: expected the rest of this sequence, got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400 for a cursor this listing did not issue, got {status} with {body:?}"
+                );
+                assert!(
+                    code(&body).contains(VALIDATION_CODE),
+                    "case {case:?}: expected {VALIDATION_CODE}, got {:?}",
+                    code(&body)
+                );
+                assert_eq!(
+                    message(&body),
+                    cursor_not_issued_message("ListConnections"),
+                    "case {case:?}: expected this service's one wording for a cursor it did not issue, got {:?}",
+                    message(&body)
+                );
+                assert!(
+                    body["connections"].as_array().is_none(),
+                    "case {case:?}: expected no page at all, got {:?}",
+                    body["connections"]
+                );
+            }
+        }
+    }
+
+    assert!(
+        pairs_driven >= FILTER_SELECTIONS * 4,
+        "case \"the filter table\": expected the rule to be driven across the filter selections of this listing, got {pairs_driven} pairs"
+    );
+}
+
+/// The environment ids a page reports, in the order it reports them.
+fn environment_ids(body: &Value) -> Vec<String> {
+    body["environments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|environment| text(environment, "environmentId"))
+        .collect()
+}
+
+/// RULE: the same for the Environment listing — the `provider` filter decides which
+/// entries of the catalog the sequence holds, so it scopes the cursors that listing
+/// mints, while the `location` distinguisher, which narrows the catalog not at all,
+/// decides no sequence and scopes nothing.
+#[tokio::test]
+async fn an_environment_cursor_is_served_only_by_the_provider_that_minted_it() {
+    let (emulator, store_key) = emulator_with_store_key();
+    let region = DEFAULT_SIGNING_REGION;
+    let catalog = emulator.environments_in(region).await;
+    let published = catalog
+        .first()
+        .expect("the Region publishes a catalog")
+        .clone();
+    let provider = provider_of(&published);
+    // A key of the sequence this listing really walks: the id of a published entry.
+    let key = text(&published, "environmentId");
+
+    let selections: Vec<(&str, Option<Provider>)> = vec![
+        ("no provider filter at all", None),
+        ("the provider the catalog publishes", Some(provider.clone())),
+        (
+            "the same partner on the other side of the union",
+            Some(other_side_of(&provider)),
+        ),
+    ];
+
+    // Each selection's whole sequence, read off the live listing, so the served case can
+    // assert the page a cursor really resumes to rather than only its status.
+    let mut sequences: Vec<Vec<String>> = Vec::new();
+    for (label, provider) in &selections {
+        let mut request = Map::new();
+        if let Some(provider) = provider {
+            request.insert("provider".to_string(), provider_request_member(provider));
+        }
+        let (status, body) = emulator
+            .ic_in(region, "ListEnvironments", Value::Object(request))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected the unwindowed listing to succeed, got {status} with {body:?}"
+        );
+        sequences.push(environment_ids(&body));
+    }
+
+    let mut pairs_driven = 0_usize;
+    for (minted_label, minted) in &selections {
+        // The cursor that selection's listing mints, minted the one way the store mints
+        // one: under its own secret, over the scope of the inputs that decided its
+        // sequence.
+        let token = encode_cursor(
+            &store_key,
+            &environment_cursor_scope(region, minted.as_ref()),
+            &key,
+        );
+        for (position, (label, resuming)) in selections.iter().enumerate() {
+            pairs_driven += 1;
+            let mut request = Map::new();
+            if let Some(provider) = resuming {
+                request.insert("provider".to_string(), provider_request_member(provider));
+            }
+            request.insert("nextToken".to_string(), json!(token));
+            let (status, body) = emulator
+                .ic_in(region, "ListEnvironments", Value::Object(request))
+                .await;
+            let case = format!("an Environment cursor of {minted_label:?} offered to {label:?}");
+            if label == minted_label {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a listing to serve its OWN cursor, got {status} with {body:?}"
+                );
+                // A cursor names a POSITION, so the page it is served is this selection's
+                // own sequence from the first key past the one the cursor carries.
+                let expected: Vec<String> = sequences[position]
+                    .iter()
+                    .filter(|id| id.as_str() > key.as_str())
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    environment_ids(&body),
+                    expected,
+                    "case {case:?}: expected this sequence resumed after {key:?}, got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400 for a cursor this listing did not issue, got {status} with {body:?}"
+                );
+                assert!(
+                    code(&body).contains(VALIDATION_CODE),
+                    "case {case:?}: expected {VALIDATION_CODE}, got {:?}",
+                    code(&body)
+                );
+                assert_eq!(
+                    message(&body),
+                    cursor_not_issued_message("ListEnvironments"),
+                    "case {case:?}: expected this service's one wording for a cursor it did not issue, got {:?}",
+                    message(&body)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        pairs_driven,
+        selections.len() * selections.len(),
+        "case \"the Environment provider table\": expected every pair of provider selections to be driven, got {pairs_driven}"
+    );
+
+    // The distinguisher narrows nothing here, so it decides no sequence: a cursor of the
+    // unnarrowed listing is served whatever `location` the call that resumes carries.
+    let token = encode_cursor(&store_key, &environment_cursor_scope(region, None), &key);
+    for distinguisher in [
+        text(&published, "location"),
+        "a distinguisher no Environment publishes".to_string(),
+    ] {
+        let (status, body) = emulator
+            .ic_in(
+                region,
+                "ListEnvironments",
+                json!({ "location": distinguisher, "nextToken": token }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {distinguisher:?}: expected a location distinguisher to scope no cursor, got {status} with {body:?}"
+        );
+    }
+}
+
+/// The character the fields of a cursor scope are divided by, which the values a caller
+/// sends can carry: `EnvironmentId` and both `Provider` members are held to a `@length`
+/// and to NO `@pattern`
+/// (`smithy_query(query="shape",shape="EnvironmentId,CloudServiceProvider,LastMileProvider")`),
+/// so a filter value may spell any text at all.
+const SCOPE_FIELD_SEPARATOR: char = '\u{1f}';
+
+/// A key for a hand-minted cursor: a position in a sequence, spelled the way a
+/// `ConnectionId` is.
+const CRAFTED_CURSOR_KEY: &str = "mcc-00000001";
+
+/// RULE: a cursor scope names exactly ONE selection of inputs whatever those inputs
+/// spell, so a filter value carrying the character the scope's own fields are divided by
+/// cannot spell another selection's scope and inherit its cursors.
+#[tokio::test]
+async fn a_filter_value_carrying_the_scope_separator_spells_no_other_selection() {
+    let (emulator, store_key) = emulator_with_store_key();
+    let region = DEFAULT_SIGNING_REGION;
+    let environment = format!("mce-aws-gcp{SCOPE_FIELD_SEPARATOR}-");
+    let provider = format!("gcp{SCOPE_FIELD_SEPARATOR}-");
+
+    // Selections whose values carry the separator where a field, an absent field or a
+    // union member would otherwise be read, beside the plain selection each one is built
+    // from — distinct selections every one, so none may serve another's cursor.
+    let table = vec![
+        selection("a plain Environment filter", None, Some("mce-aws-gcp"), None, None),
+        selection(
+            "the separator inside the Environment id",
+            None,
+            Some(&environment),
+            None,
+            None,
+        ),
+        selection(
+            "the separator twice inside the Environment id",
+            None,
+            Some(&format!("{environment}{SCOPE_FIELD_SEPARATOR}-")),
+            None,
+            None,
+        ),
+        selection(
+            "an Environment id that is the separator alone",
+            None,
+            Some(&SCOPE_FIELD_SEPARATOR.to_string()),
+            None,
+            None,
+        ),
+        selection(
+            "the separator inside a partner name",
+            None,
+            Some("mce-aws-gcp"),
+            Some(Provider::cloudServiceProvider(provider.clone())),
+            None,
+        ),
+        selection(
+            "the separator inside a partner name on the other side of the union",
+            None,
+            Some("mce-aws-gcp"),
+            Some(Provider::lastMileProvider(provider)),
+            None,
+        ),
+    ];
+
+    let mut pairs_driven = 0_usize;
+    for minting in &table {
+        // Minted the one way the store mints a cursor — its own secret over the scope of
+        // the inputs that decided the sequence — because a crafted filter value selects
+        // no stored connection, so no page of it hands one back.
+        let token = encode_cursor(&store_key, &minting.scope(region), CRAFTED_CURSOR_KEY);
+        for resuming in &table {
+            pairs_driven += 1;
+            let case = format!(
+                "a cursor of {:?} offered to {:?}",
+                minting.label, resuming.label
+            );
+            let (status, body) = filtered_page(&emulator, region, resuming, Some(&token), None).await;
+            if resuming.label == minting.label {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a listing to serve its OWN cursor, got {status} with {body:?}"
+                );
+                assert_eq!(
+                    ids_of(&body),
+                    Vec::<String>::new(),
+                    "case {case:?}: expected the page of a selection nothing matches to be empty, got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400 for a cursor this listing did not issue, got {status} with {body:?}"
+                );
+                assert_eq!(
+                    message(&body),
+                    cursor_not_issued_message("ListConnections"),
+                    "case {case:?}: expected this service's one wording for a cursor it did not issue, got {:?}",
+                    message(&body)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        pairs_driven,
+        table.len() * table.len(),
+        "case \"the separator-bearing table\": expected every pair of crafted selections to be driven, got {pairs_driven}"
+    );
 }

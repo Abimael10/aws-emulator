@@ -640,10 +640,7 @@ pub const PROVIDER_NAME_MAX_LENGTH: usize = 32;
 /// hold (the one [`remote_account_violation`] words), naming the member and the length
 /// rather than echoing the value back.
 pub fn provider_violation(provider: &Provider) -> Option<String> {
-    let (member, name) = match provider {
-        Provider::cloudServiceProvider(name) => ("cloudServiceProvider", name),
-        Provider::lastMileProvider(name) => ("lastMileProvider", name),
-    };
+    let (member, name) = provider_member(provider);
     // `@length` on a string counts characters, not bytes, so the name is measured the
     // way the model measures it.
     let length = name.chars().count();
@@ -652,6 +649,27 @@ pub fn provider_violation(provider: &Provider) -> Option<String> {
             "{REFUSAL_ENVELOPE}provider.{member} must be at most {PROVIDER_NAME_MAX_LENGTH} characters long, and one of length {length} is not"
         )
     })
+}
+
+/// Which member of the `Provider` union a value arrived in, and the name it carries.
+///
+/// The two things that identify a provider: what [`provider_eq`] compares, what a refusal
+/// about the value names, and what a cursor scope narrowed by this filter records — so the
+/// member is spelled in ONE place rather than once per reader.
+fn provider_member(provider: &Provider) -> (&'static str, &str) {
+    match provider {
+        Provider::cloudServiceProvider(name) => ("cloudServiceProvider", name),
+        Provider::lastMileProvider(name) => ("lastMileProvider", name),
+    }
+}
+
+/// The same for the `AttachPoint` union: the member an identifier arrived in, and the
+/// identifier — what [`attach_point_eq`] compares.
+fn attach_point_member(attach_point: &AttachPoint) -> (&'static str, &str) {
+    match attach_point {
+        AttachPoint::directConnectGateway(identifier) => ("directConnectGateway", identifier),
+        AttachPoint::Arn(arn) => ("arn", arn),
+    }
 }
 
 /// Two `AttachPoint` values identify the same attach point, which is what the
@@ -2005,26 +2023,115 @@ pub const ATTACH_POINT_CURSOR_TAG: &str = "ap:";
 /// Separator between the fields of the payload a cursor authenticates: the scope of the
 /// listing that issued it, then the key the page it ended ran to.
 ///
-/// A unit separator appears in none of those fields — a Region id, an `environmentId`, a
-/// `ConnectionId` and a gateway identifier are all written in identifier characters — so
-/// the payload is read back field for field exactly as it was minted, and a key carrying
-/// one is refused rather than split.
+/// The key a page ran to is a `ConnectionId`, an `environmentId` of this service's own
+/// catalog or an attach-point identifier, all written in identifier characters, so one
+/// carrying a unit separator is refused rather than split ([`decode_cursor`]); the
+/// scope's own fields come off the REQUEST and are counted ([`cursor_scope_field`]), so
+/// the payload names exactly one scope and one key whatever a caller sends.
 const CURSOR_FIELD_SEPARATOR: char = '\u{1f}';
 
-/// The scope a `ListConnections` cursor is issued under: this operation's tag and the
-/// regional endpoint that served the page.
+/// Separator between the character count of a scope field and the value it counts.
+const CURSOR_SCOPE_COUNT_SEPARATOR: char = ':';
+
+/// The field an input a listing was NOT narrowed by renders as in a cursor scope.
 ///
-/// A cursor names the last key of ONE walked sequence, and the sequence this listing
-/// walks is the connections of the Region the request was signed for, so a cursor issued
-/// by another Region's endpoint names a position in a sequence this one never walked.
-pub fn connection_cursor_scope(region: &str) -> String {
-    format!("{CONNECTION_CURSOR_TAG}{region}")
+/// Distinct from every value a field of a supplied input renders as, each of which begins
+/// with a digit ([`cursor_scope_field`]) or with the name of the union member that carried
+/// it: a filter the request omitted constrains the sequence not at all, which is a
+/// different sequence from the one any value of that filter selects.
+const ABSENT_CURSOR_SCOPE_FIELD: &str = "-";
+
+/// One field of a cursor scope whose value comes off the REQUEST: the value's character
+/// count, then the value.
+///
+/// The members a scope is built from (a Region id, an `environmentId`, a partner name)
+/// are held to a `@length` in the model and to no `@pattern` at all, so nothing stops one
+/// of them carrying the [`CURSOR_FIELD_SEPARATOR`] that divides the scope's own fields.
+/// Counted, a scope string names exactly one selection of inputs whatever those values
+/// are, so no listing can spell the scope of another and inherit its cursors.
+fn cursor_scope_field(value: &str) -> String {
+    format!(
+        "{}{CURSOR_SCOPE_COUNT_SEPARATOR}{value}",
+        value.chars().count()
+    )
 }
 
-/// The scope a `ListEnvironments` cursor is issued under: this operation's tag and the
-/// regional endpoint that served the page, whose catalog is the sequence it walked.
-pub fn environment_cursor_scope(region: &str) -> String {
-    format!("{ENVIRONMENT_CURSOR_TAG}{region}")
+/// The same for an input the request may omit.
+fn optional_cursor_scope_field(value: Option<&str>) -> String {
+    value.map_or_else(
+        || ABSENT_CURSOR_SCOPE_FIELD.to_string(),
+        cursor_scope_field,
+    )
+}
+
+/// The cursor-scope field a `provider` filter renders as: which member of the union the
+/// request carried, then the value it carried — the two things [`provider_eq`] compares,
+/// so two listings render the same field exactly when this filter selects the same
+/// records for both.
+fn provider_cursor_scope_field(provider: Option<&Provider>) -> String {
+    provider.map_or_else(
+        || ABSENT_CURSOR_SCOPE_FIELD.to_string(),
+        |provider| {
+            let (member, name) = provider_member(provider);
+            format!("{member}{}", cursor_scope_field(name))
+        },
+    )
+}
+
+/// The cursor-scope field an `attachPoint` filter renders as, member and value, for the
+/// reason [`provider_cursor_scope_field`] renders both: that is what [`attach_point_eq`]
+/// compares, which is what decides the records the filter selects.
+fn attach_point_cursor_scope_field(attach_point: Option<&AttachPoint>) -> String {
+    attach_point.map_or_else(
+        || ABSENT_CURSOR_SCOPE_FIELD.to_string(),
+        |attach_point| {
+            let (member, identifier) = attach_point_member(attach_point);
+            format!("{member}{}", cursor_scope_field(identifier))
+        },
+    )
+}
+
+/// The scope a `ListConnections` cursor is issued under: this operation's tag, the
+/// regional endpoint that served the page, and the four filters the request narrowed the
+/// listing by (`state`, `environmentId`, `provider`, `attachPoint`).
+///
+/// A cursor names the last key of ONE walked sequence, and the sequence this listing
+/// walks is the connections of the Region the request was signed for that match every
+/// filter it carried — "Only Connection objects matching all filters will be returned".
+/// So a cursor another Region's endpoint issued, and one a differently filtered listing
+/// issued, both name a position in a sequence this call never walked: resuming after that
+/// position would skip every record of THIS sequence sorting at or below it, which a
+/// caller cannot tell from "no more results".
+pub fn connection_cursor_scope(
+    region: &str,
+    state: Option<&str>,
+    environment_id: Option<&str>,
+    provider: Option<&Provider>,
+    attach_point: Option<&AttachPoint>,
+) -> String {
+    let region = cursor_scope_field(region);
+    let state = optional_cursor_scope_field(state);
+    let environment_id = optional_cursor_scope_field(environment_id);
+    let provider = provider_cursor_scope_field(provider);
+    let attach_point = attach_point_cursor_scope_field(attach_point);
+    format!(
+        "{CONNECTION_CURSOR_TAG}{region}{CURSOR_FIELD_SEPARATOR}{state}{CURSOR_FIELD_SEPARATOR}\
+         {environment_id}{CURSOR_FIELD_SEPARATOR}{provider}{CURSOR_FIELD_SEPARATOR}{attach_point}"
+    )
+}
+
+/// The scope a `ListEnvironments` cursor is issued under: this operation's tag, the
+/// regional endpoint that served the page, whose catalog is the sequence it walked, and
+/// the `provider` the request narrowed that catalog by.
+///
+/// `location` is not in it, and nothing else about the request is: the scope names the
+/// inputs that DECIDE the sequence, and this listing's `location` narrows the catalog not
+/// at all (see the handler), so a cursor is a cursor of the same sequence whatever
+/// distinguisher the call that resumes carries.
+pub fn environment_cursor_scope(region: &str, provider: Option<&Provider>) -> String {
+    let region = cursor_scope_field(region);
+    let provider = provider_cursor_scope_field(provider);
+    format!("{ENVIRONMENT_CURSOR_TAG}{region}{CURSOR_FIELD_SEPARATOR}{provider}")
 }
 
 /// The scope a `ListAttachPoints` cursor is issued under: this operation's tag, the
@@ -2032,6 +2139,8 @@ pub fn environment_cursor_scope(region: &str) -> String {
 /// by — the attach points of one Environment are the sequence it walked, so a cursor
 /// from a listing of another Environment is not one this listing issued.
 pub fn attach_point_cursor_scope(region: &str, environment_id: &str) -> String {
+    let region = cursor_scope_field(region);
+    let environment_id = cursor_scope_field(environment_id);
     format!("{ATTACH_POINT_CURSOR_TAG}{region}{CURSOR_FIELD_SEPARATOR}{environment_id}")
 }
 
@@ -2055,8 +2164,9 @@ pub fn encode_cursor(token_key: &PageTokenKey, scope: &str, last_key: &str) -> S
 /// token that is not hex, one too short to carry an authenticator, one whose
 /// authenticator THIS store's secret does not verify (a hand-made token included,
 /// however exactly it has an issued token's shape), one minted under another scope — a
-/// sibling listing's, another Region's endpoint's, another Environment's — and one whose
-/// key is empty or carries the field separator.
+/// sibling listing's, another Region's endpoint's, another Environment's, one of a
+/// listing the request's own filters narrowed differently — and one whose key is empty or
+/// carries the field separator.
 ///
 /// A token naming a key the sequence no longer holds IS one this listing issued, and
 /// resumes after that key: a record deleted between two pages must not break the page

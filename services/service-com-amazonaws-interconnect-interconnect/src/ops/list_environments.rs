@@ -227,10 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // silently restarted walk. That verdict is the one every listing of this service
         // shares (`crate::state::judge_cursor`), which also decides the class and the
         // wording it travels in, so this handler supplies only the scope the cursors of
-        // this sequence are minted under: this operation AND the Region it answered in,
-        // because the sequence a cursor names a position in is this Region's own catalog
-        // — a cursor another Region's endpoint issued is not one this one did.
-        let scope = crate::state::environment_cursor_scope(&region);
+        // this sequence are minted under: this operation, the Region it answered in and
+        // the `provider` the catalog was narrowed by, because those decide the sequence a
+        // cursor names a position in — a cursor another Region's endpoint issued is not
+        // one this one did, and neither is one a differently narrowed listing issued. The
+        // `location` distinguisher narrows nothing here, so it names no sequence of its
+        // own and is no part of the scope.
+        let scope = crate::state::environment_cursor_scope(&region, input.provider.as_ref());
         let cursor = crate::state::judge_cursor::<ListEnvironmentsError>(
             &token_key,
             input.next_token.as_deref(),

@@ -243,15 +243,15 @@ async fn listings(router: &MultiServiceRouter) -> Vec<Listing> {
             items_member: "connections",
             key_member: "id",
             tag: CONNECTION_CURSOR_TAG,
-            scope: connection_cursor_scope(REGION),
+            scope: connection_cursor_scope(REGION, None, None, None, None),
             foreign_scopes: vec![
                 (
                     "another Region's endpoint".to_string(),
-                    connection_cursor_scope(OTHER_REGION),
+                    connection_cursor_scope(OTHER_REGION, None, None, None, None),
                 ),
                 (
                     "the Environment listing".to_string(),
-                    environment_cursor_scope(REGION),
+                    environment_cursor_scope(REGION, None),
                 ),
                 (
                     "an attach-point listing".to_string(),
@@ -265,15 +265,15 @@ async fn listings(router: &MultiServiceRouter) -> Vec<Listing> {
             items_member: "environments",
             key_member: "environmentId",
             tag: ENVIRONMENT_CURSOR_TAG,
-            scope: environment_cursor_scope(REGION),
+            scope: environment_cursor_scope(REGION, None),
             foreign_scopes: vec![
                 (
                     "another Region's endpoint".to_string(),
-                    environment_cursor_scope(OTHER_REGION),
+                    environment_cursor_scope(OTHER_REGION, None),
                 ),
                 (
                     "the connection listing".to_string(),
-                    connection_cursor_scope(REGION),
+                    connection_cursor_scope(REGION, None, None, None, None),
                 ),
                 (
                     "an attach-point listing".to_string(),
@@ -299,11 +299,11 @@ async fn listings(router: &MultiServiceRouter) -> Vec<Listing> {
                 ),
                 (
                     "the connection listing".to_string(),
-                    connection_cursor_scope(REGION),
+                    connection_cursor_scope(REGION, None, None, None, None),
                 ),
                 (
                     "the Environment listing".to_string(),
-                    environment_cursor_scope(REGION),
+                    environment_cursor_scope(REGION, None),
                 ),
             ],
         },

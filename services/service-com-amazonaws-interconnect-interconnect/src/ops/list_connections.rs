@@ -259,9 +259,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // silently restarted walk. That verdict is the one every listing of this service
         // shares (`crate::state::judge_cursor`), which also decides the class and the
         // wording it travels in, so this handler supplies only the scope the cursors of
-        // this sequence are minted under: this operation and the Region whose endpoint
-        // answered.
-        let scope = crate::state::connection_cursor_scope(&region);
+        // this sequence are minted under: this operation, the Region whose endpoint
+        // answered AND the four filters above, because those decide the sequence a cursor
+        // names a position in — a cursor of one filtered listing, resumed on another,
+        // would skip every record of this sequence sorting at or below a key this
+        // sequence never ran to.
+        let scope = crate::state::connection_cursor_scope(
+            &region,
+            input.state.as_deref(),
+            input.environment_id.as_deref(),
+            input.provider.as_ref(),
+            input.attach_point.as_ref(),
+        );
         let cursor = crate::state::judge_cursor::<ListConnectionsError>(
             &token_key,
             input.next_token.as_deref(),
