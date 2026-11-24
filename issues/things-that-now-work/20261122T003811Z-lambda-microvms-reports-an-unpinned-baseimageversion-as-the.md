@@ -86,3 +86,37 @@ Code sightings (orientation only): src/state/regions.rs:248-261 (resolve_base_im
 5. Cause 3: UpdateMicrovmImage(imageIdentifier=<imageArn>, baseImageArn=base, buildRoleArn=..., codeArtifact={'uri': 's3://<unique>/code2.zip'}) with NO baseImageVersion — the 200 reports '1' instead of the resolved dotted label. (Pass baseImageVersion explicitly and the emulator does echo it, which isolates the resolution rather than the handler.)
 6. Cause 2: UpdateMicrovmImageVersion(imageIdentifier=<imageArn>, imageVersion='1.0', status='INACTIVE') — the 200 echoes baseImageVersion '1' from the stored record.
 7. Re-replay to confirm: lambdamicrovms-customer-image-lifecycle step task#7, and lambdamicrovms-image-version-status-and-update steps task#4, task#5 and task#7 — each must report baseImageVersion as the version resolved from the named base image, in the dotted label form the catalogue publishes.
+
+## Fix status
+
+The one fault all four causes share — an unpinned `baseImageVersion` resolved to the integer
+GENERATION counter the AWS-managed catalogue addresses a published generation by — is SERVED on this
+checkout. `resolve_base_image_version` (`src/state/regions.rs`) answers the `major.minor` RELEASE the
+named base image publishes: the version an account's own image is serving, and for a managed
+reference the release the newest generation of its catalogue entry ships
+(`latest_managed_base_image_version_label`, read off the one catalogue table whose rows now carry
+both the counter a client pins and the release that generation ships, `src/state.rs`). A pinned value
+is still recorded verbatim, and every projection of the version record reports the stored value
+unchanged.
+
+- Cause 2 (`UpdateMicrovmImageVersion` $.baseImageVersion), Cause 3 (`UpdateMicrovmImage`
+  $.baseImageVersion) and Cause 4 (`ListMicrovmImageVersions` $.items[*]) are FIXED: re-replay of
+  `lambdamicrovms-image-version-status-and-update` (task#4, task#5, task#7) passes on every step.
+- Cause 1 (`ListMicrovmImageVersions` $.items[*].baseImageVersion at
+  `lambdamicrovms-customer-image-lifecycle`#task#7) is DECLINED on its remaining VALUE difference, for
+  the reason already recorded on `20261102T072953Z-lambda-microvms-image-version-records-are-written-from.md`
+  and `20261103T192714Z-lambda-microvms-getmicrovmimageversion-reports-a-failed-build-as.md`: the row
+  now reports a dotted release resolved from the base image the create named, and what is left is the
+  LABEL AWS's own catalogue happened to publish at recording time. The corpus answers two different
+  ones for the same unpinned request against the same managed base-image ARN ('2.0' in this fixture,
+  the `major.minor` initial version in `lambdamicrovms-image-version-status-and-update`, whose version
+  row carries the same `baseImageArn`), so the value is per-run; it already has the modelled type,
+  form and invariants, the issue's own text forbids hard-coding it, and serving this fixture's literal
+  would re-break the other fixture.
+
+The rule is pinned end to end by `tests/all/image_version_pedigree.rs`, whose
+`a_resolved_pedigree_is_a_published_release_and_never_an_addressed_generation` drives the create, the
+version read, the listing row, the status publication and the configuration update over a table
+spanning both base-image namespaces and a pinned generation, asserting against the generation set the
+catalogue publishes over the wire that a RESOLVED pedigree is a `major.minor` release and never one of
+those counters.
