@@ -59,6 +59,12 @@ mod update;
 #[path = "notify_code_configuration_lifecycle/identifier_and_template_gates.rs"]
 mod identifier_and_template_gates;
 
+// How an UPDATE outside a modelled `@range` of this surface is WORDED — the envelope and
+// the `fieldList` such a refusal carries: another child module of this suite, declared
+// the same way.
+#[path = "notify_code_configuration_lifecycle/refusal_bodies.rs"]
+mod refusal_bodies;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 
@@ -216,6 +222,18 @@ impl Emulator {
             "GET",
             &format!("/v1/notify-code-configurations/{id_or_arn}"),
             None,
+        )
+        .await
+    }
+
+    /// `UpdateNotifyCodeConfiguration`: a `PUT` on the configuration the identifier
+    /// names. Here beside `create` and `get` so the child suites of this one share a
+    /// single definition of it.
+    async fn update(&self, id_or_arn: &str, body: Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/v1/notify-code-configurations/{id_or_arn}"),
+            Some(body),
         )
         .await
     }
