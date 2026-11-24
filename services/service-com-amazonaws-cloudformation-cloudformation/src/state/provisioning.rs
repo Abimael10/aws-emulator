@@ -311,6 +311,11 @@ pub(in crate::state) mod efs_resources;
 /// ([`ec2_vpc_network::set_entry`]) is what resolves an AWS-specifically typed parameter's
 /// value too ([`super::parameter_constraints::aws_specific_types`]).
 pub(super) mod ec2_vpc_network;
+/// `AWS::ECR::PullThroughCacheRule`: the pull through cache rule a stack wires, registered in
+/// the private Amazon ECR registry itself. Visible to the rest of this service's state because
+/// the type's own NAME lives here, beside the arm that provisions it
+/// ([`ecr_pull_through_cache_rule`]).
+pub(in crate::state) mod ecr_pull_through_cache_rule;
 /// `AWS::ECS::TaskDefinition`: the revision a stack declares, registered in Amazon ECS
 /// itself ([`ecs_task_definition`]).
 mod ecs_task_definition;
@@ -1356,6 +1361,11 @@ pub(super) enum Owner {
     /// CloudFormation itself, so a nested stack is created by the same `CreateStack` a
     /// client calls.
     NestedStack,
+    /// `AWS::ECR::PullThroughCacheRule`, whose arms are [`ecr_pull_through_cache_rule`]'s: the
+    /// rule Amazon ECR's own `CreatePullThroughCacheRule` registers under the prefix the stack
+    /// decided — the prefix this type's `Ref` returns — and `DeletePullThroughCacheRule` takes
+    /// off, with `UpdatePullThroughCacheRule` applying the two properties a rule may take anew.
+    EcrPullThroughCacheRule,
     /// `AWS::SecretsManager::RotationSchedule`, whose arms are
     /// [`secretsmanager_rotation_schedule`]'s.
     SecretsManagerRotationSchedule,
@@ -1517,6 +1527,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == nested_stack::CLOUDFORMATION_STACK {
         return Some(Owner::NestedStack);
+    }
+    if resource_type == ecr_pull_through_cache_rule::ECR_PULL_THROUGH_CACHE_RULE {
+        return Some(Owner::EcrPullThroughCacheRule);
     }
     if resource_type == secretsmanager_rotation_schedule::SECRETSMANAGER_ROTATION_SCHEDULE {
         return Some(Owner::SecretsManagerRotationSchedule);
@@ -2585,10 +2598,9 @@ pub async fn reconcile(
             outcome.resources.push(resource);
             continue;
         }
-        if let Some(existing) = previous
-            .iter()
-            .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
-        {
+        if let Some(existing) = previous.iter().find(|existing| {
+            already_deployed(existing) && is_the_declared_resource(existing, &resource)
+        }) {
             // The stack already has exactly this resource and the deployment did not change
             // its identity, so nothing is created again; what the owning service reported
             // about it, and the configuration it really has, are carried forward.
@@ -3889,6 +3901,30 @@ pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
         && left.resource_type == right.resource_type
         && left.physical_resource_id == right.physical_resource_id
         && super::physical_name::scope_of(left) == super::physical_name::scope_of(right)
+}
+
+/// Whether the record `existing` is the resource `declared` ASKS FOR: the same identity
+/// ([`is_same_resource`]) and, for a type whose identifier its OWNING SERVICE assigns, a
+/// declaration that still asks for the resource that identifier names.
+///
+/// Such an identifier is one no deployment recomputes, so the record carries the one in force
+/// forward ([`super::StoredStack::deploy_template`]) — and an identifier that carries no trace
+/// of the properties the resource was created with stands still while the declaration asks for
+/// something the resource cannot become. An Amazon ECS task-definition revision is exactly
+/// that: it is immutable, every property of the type carries "Update requires: `Replacement`"
+/// ([`super::template::replacement_properties`]), and its ARN is its family and a number. A
+/// declaration that restates one of those properties therefore asks for a DIFFERENT resource,
+/// which this deployment CREATES — the same reading the rename pass makes of a replacement
+/// ([`super::stack::declares_the_same_replacing_properties`], read here rather than asked
+/// again, so the two cannot disagree about what a replacement is).
+///
+/// For every other type the question is already settled before this: a replacement moves the
+/// name such a resource is created under, and with it the identifier
+/// ([`super::replacing_update::rename_replacements`]), so the identity test above answers it.
+fn is_the_declared_resource(existing: &StoredResource, declared: &StoredResource) -> bool {
+    is_same_resource(existing, declared)
+        && (!super::template::identity_is_service_assigned(&declared.resource_type)
+            || super::stack::declares_the_same_replacing_properties(existing, declared))
 }
 
 /// Whether a record of the set a deployment reconciles against is a resource the stack has

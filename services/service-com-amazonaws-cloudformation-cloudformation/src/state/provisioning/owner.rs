@@ -132,6 +132,12 @@ impl Owner {
             Self::SecretsManagerRotationSchedule => {
                 secretsmanager_rotation_schedule::create(ctx, region, resource).await
             }
+            // A pull through cache rule carries no tags at all: Amazon ECR's
+            // `CreatePullThroughCacheRule` takes none and the type publishes no `Tags`
+            // property, so CloudFormation propagates none to it.
+            Self::EcrPullThroughCacheRule => {
+                ecr_pull_through_cache_rule::create(ctx, region, resource).await
+            }
             // A resource policy carries no tags of its own either: it is not a resource of
             // the owning service, but the POLICY of the secret it names, so CloudFormation
             // propagates none to it.
@@ -416,6 +422,7 @@ impl Owner {
                     .await
             }
             Self::SecretsManagerSecret => Ok(secretsmanager_secret::readiness()),
+            Self::EcrPullThroughCacheRule => Ok(ecr_pull_through_cache_rule::readiness()),
             Self::SecretsManagerResourcePolicy => {
                 Ok(secretsmanager_resource_policy::readiness())
             }
@@ -651,6 +658,9 @@ impl Owner {
             // A rotation schedule's `Id` is the ARN of the secret it was configured on, which
             // its own create answered, so there is nothing left to read once it is up.
             Self::SecretsManagerRotationSchedule => Ok(BTreeMap::new()),
+            // A pull through cache rule publishes no `Fn::GetAtt` attribute at all, so there
+            // is nothing to read once it is up.
+            Self::EcrPullThroughCacheRule => Ok(BTreeMap::new()),
             // A resource policy's `Id` is the ARN of the secret it was attached to, which its
             // own create answered, so there is nothing left to read once it is up.
             Self::SecretsManagerResourcePolicy => Ok(BTreeMap::new()),
@@ -806,6 +816,7 @@ impl Owner {
             Self::SecretsManagerRotationSchedule => {
                 Ok(secretsmanager_rotation_schedule::removal())
             }
+            Self::EcrPullThroughCacheRule => Ok(ecr_pull_through_cache_rule::removal()),
             Self::SecretsManagerResourcePolicy => {
                 Ok(secretsmanager_resource_policy::removal())
             }
@@ -1045,6 +1056,9 @@ impl Owner {
             Self::SecretsManagerRotationSchedule => {
                 secretsmanager_rotation_schedule::update(ctx, region, resource, declared).await
             }
+            Self::EcrPullThroughCacheRule => {
+                ecr_pull_through_cache_rule::update(ctx, region, resource, declared).await
+            }
             Self::SecretsManagerResourcePolicy => {
                 secretsmanager_resource_policy::update(ctx, region, resource, declared).await
             }
@@ -1261,6 +1275,9 @@ impl Owner {
             // them.
             // A rotation schedule is not taggable at all, so nothing is asked about its tags.
             Self::SecretsManagerRotationSchedule => Ok(()),
+            // A pull through cache rule is not taggable at all, so nothing is asked about its
+            // tags.
+            Self::EcrPullThroughCacheRule => Ok(()),
             // A resource policy is not taggable either, so nothing is asked about its tags.
             Self::SecretsManagerResourcePolicy => Ok(()),
             Self::SecretsManagerSecret | Self::StepFunctionsStateMachine => Ok(()),
@@ -1451,6 +1468,12 @@ impl Owner {
             // rotation off with no snapshot invented for it.
             Self::SecretsManagerRotationSchedule => {
                 secretsmanager_rotation_schedule::delete(ctx, region, resource).await
+            }
+            // Amazon ECR takes no snapshot of a pull through cache rule on the way out: there
+            // is no such call, so a `Snapshot` deletion policy on this type takes the rule off
+            // with no snapshot invented for it.
+            Self::EcrPullThroughCacheRule => {
+                ecr_pull_through_cache_rule::delete(ctx, region, resource).await
             }
             // Nor of a resource policy: there is no such call, so a `Snapshot` deletion
             // policy on this type takes the document off with no snapshot invented for it.
@@ -1669,6 +1692,9 @@ impl Owner {
                 secretsmanager_rotation_schedule::actual_configuration(ctx, region, resource)
                     .await?
             }
+            Self::EcrPullThroughCacheRule => {
+                ecr_pull_through_cache_rule::actual_configuration(ctx, region, resource).await?
+            }
             Self::SecretsManagerResourcePolicy => {
                 secretsmanager_resource_policy::actual_configuration(ctx, region, resource)
                     .await?
@@ -1820,6 +1846,8 @@ impl Owner {
             // provider wording to add: what CloudFormation answered about the child is the
             // account of why the stack was not created, and it stands as it came.
             Self::NestedStack => message.to_string(),
+            // Amazon ECR's provider reports that registry's own message as it came.
+            Self::EcrPullThroughCacheRule => message.to_string(),
             // AWS Secrets Manager's and AWS Step Functions' do the same.
             Self::SecretsManagerRotationSchedule
             | Self::SecretsManagerResourcePolicy

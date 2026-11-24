@@ -2069,6 +2069,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // Nothing has pulled the image or started a managed agent of the
                     // container either, so the agent has reported neither.
                     image_digest: None,
+                    // And nothing has resolved the image's registry yet, so whether the
+                    // repository it names caches an upstream image is not known either.
+                    cached_image_source: None,
                     managed_agents: Vec::new(),
                     // `ContainerDefinition$essential`: "If this parameter is omitted, a
                     // container is assumed to be essential."

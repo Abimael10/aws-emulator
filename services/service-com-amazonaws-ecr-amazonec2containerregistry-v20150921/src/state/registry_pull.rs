@@ -964,6 +964,37 @@ fn upstream_reference(rule: &PullThroughCacheRule, repository_name: &str, tag: &
     format!("{host}/{upstream_prefix}{path}:{tag}")
 }
 
+/// The UPSTREAM reference a pull of `reference` is served from, for a reference into a
+/// repository of this registry that a pull through cache rule covers — and `None` for every
+/// other reference, which names an image this registry holds as its own.
+///
+/// "A pull through cache rule provides a way to cache images from an upstream registry source
+/// in your Amazon ECR private registry" (`CreatePullThroughCacheRule`), so the cache
+/// repository under a rule's `ecrRepositoryPrefix` holds the upstream image itself: a
+/// reference into it NAMES that image. A caller that reads anything off the image it pulled —
+/// a container runtime reading the command the image declares for a container whose definition
+/// names none — therefore has to read it off the upstream reference, which is what this
+/// answers. The walk is the one the import itself resolves the upstream with
+/// ([`import_covered_image`]), so one reference resolves to one upstream however it is asked
+/// for.
+///
+/// A reference addressing a DIGEST is not answered: only a tag is cached, so a digest names
+/// content of this registry rather than a release of an upstream repository.
+///
+/// A READ: the rules and nothing else decide it, and nothing is written — asking cannot change
+/// what a later caller sees. Called with no guard of this store held: it takes the lock itself.
+#[must_use]
+pub fn cached_upstream_reference<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    reference: &RegistryReference,
+) -> Option<String> {
+    let tag = reference.tag.as_deref()?;
+    let state = service_state(engine)?;
+    let store = state.lock();
+    let rule = covering_cache_rule(&store, &reference.repository_name)?;
+    Some(upstream_reference(&rule, &reference.repository_name, tag))
+}
+
 /// What an import stores for the cached image: the manifest this registry writes for it and
 /// the bytes of each blob that manifest references.
 struct ImportedImage {

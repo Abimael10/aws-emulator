@@ -55,6 +55,20 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // name of its own, so [`name_is_create_only`] has nothing to catch here.)
         APPLICATION_INSIGHTS_APPLICATION => &["ResourceGroupName"],
         IAM_ACCESS_KEY => &["Serial", "UserName"],
+        // A pull through cache rule keeps the UPSTREAM it caches from: `upstreamRegistry`,
+        // `upstreamRegistryUrl` and `upstreamRepositoryPrefix` are members of
+        // `CreatePullThroughCacheRule` and of no member of `UpdatePullThroughCacheRule` — which
+        // takes a rule's prefix with a new credential secret and custom role and nothing else —
+        // so a declaration restating any of them asks for a DIFFERENT rule, which
+        // CloudFormation replaces. (Its prefix is in that position through
+        // [`name_is_create_only`].)
+        crate::state::provisioning::ecr_pull_through_cache_rule::ECR_PULL_THROUGH_CACHE_RULE => {
+            &[
+                "UpstreamRegistry",
+                "UpstreamRegistryUrl",
+                "UpstreamRepositoryPrefix",
+            ]
+        }
         // A published state machine VERSION keeps everything it was published with: it is the
         // snapshot `PublishStateMachineVersion` took of the machine, and Step Functions
         // publishes no call that edits one — so a declaration restating any property asks for a

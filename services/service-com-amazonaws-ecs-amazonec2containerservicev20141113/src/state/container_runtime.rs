@@ -410,10 +410,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // ([`super::container_servers::image_declared_command`]). An image this
                 // emulator holds none of leaves such a container no program at all, exactly as
                 // it did before.
+                // A container whose revision overrides NEITHER the entry point nor the command
+                // runs the command its IMAGE declares — the "default command from the Docker
+                // image" that same member's own documentation names
+                // ([`super::container_servers::image_declared_command`]). An image this
+                // emulator holds none of leaves such a container no program at all, exactly as
+                // it did before. WHICH image that is comes off the container
+                // ([`ContainerRecord::running_image`]): a reference into a repository that
+                // caches an upstream image names that upstream image, so what the image
+                // declares is the upstream one's.
+                let running_image = container.running_image().map(str::to_string);
                 let declared = (stored.entry_point.is_none() && command.is_none())
                     .then(|| {
-                        stored
-                            .image
+                        running_image
                             .as_deref()
                             .and_then(super::container_servers::image_declared_command)
                     })
@@ -429,7 +438,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .entry_point
                     .is_none()
                     .then(|| {
-                        stored.image.as_deref().and_then(
+                        running_image.as_deref().and_then(
                             super::container_image_entry_points::image_declared_entry_point,
                         )
                     })
@@ -519,8 +528,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // program runs: a container's own layer sits over the image's filesystem,
                     // and for an image of this emulator's own catalog part of that filesystem
                     // is documented ([`super::container_servers::image_shipped_files`]).
-                    shipped_files: stored
-                        .image
+                    shipped_files: running_image
                         .as_deref()
                         .map(super::container_servers::image_shipped_files)
                         .unwrap_or_default(),

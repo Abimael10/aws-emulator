@@ -988,6 +988,16 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         | crate::state::provisioning::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION => {
             Some("DomainName")
         }
+        // Amazon ECR registers a pull through cache rule UNDER its prefix: "the repository name
+        // prefix to use when caching images from the source registry"
+        // (`CreatePullThroughCacheRule$ecrRepositoryPrefix`) is what every call on a rule
+        // addresses it by, and "Ref returns the EcrRepositoryPrefix" — so the declared prefix is
+        // this resource's physical id. The type's last segment is `PullThroughCacheRule`, so
+        // neither `PullThroughCacheRuleName` nor `Name` finds it, and a generated
+        // `<stack>-<logical id>-<unique id>` would name a prefix no image reference carries.
+        crate::state::provisioning::ecr_pull_through_cache_rule::ECR_PULL_THROUGH_CACHE_RULE => {
+            Some("EcrRepositoryPrefix")
+        }
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
         // An AWS Elemental MediaConvert certificate association IS the certificate it trusts:
         // `AssociateCertificate` and `DisassociateCertificate` each take that `Arn` and no

@@ -45,6 +45,17 @@ pub struct ContainerRecord {
     /// the agent has pulled the image and reported it
     /// (`ContainerStateChange$imageDigest`), so absent until then.
     pub image_digest: Option<String>,
+    /// The UPSTREAM image reference the registry that served the pull resolved this
+    /// container's own to, for an image held in a repository that caches one — an Amazon ECR
+    /// repository a pull through cache rule covers
+    /// ([`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull::cached_upstream_reference`]).
+    /// `None` until the image has been pulled, and for every image whose repository holds one
+    /// of its own rather than a cached copy: the reference the definition carries then names
+    /// the image itself ([`Self::running_image`]).
+    ///
+    /// Not a member of `Container`: it is what the pull resolved, which the modelled container
+    /// reports as its `imageDigest` and its `image`.
+    pub cached_image_source: Option<String>,
     /// `Container$managedAgents`: "The details of any Amazon ECS managed agents associated
     /// with the container", each in the state the agent last reported for it
     /// (`SubmitTaskStateChange$managedAgents`). Empty until the agent reports one.
@@ -134,6 +145,19 @@ impl ContainerRecord {
             ),
             ..Container::default()
         }
+    }
+
+    /// The image this container really RUNS: the upstream reference the repository its own
+    /// names holds a cached copy of ([`Self::cached_image_source`]), and the reference its
+    /// definition carries otherwise.
+    ///
+    /// What anything read OFF the image has to be read off — the command the image declares,
+    /// its entry point and the files it ships — because a cache repository holds the upstream
+    /// image rather than an image of its own, so the two references name ONE image.
+    pub fn running_image(&self) -> Option<&str> {
+        self.cached_image_source
+            .as_deref()
+            .or(self.image.as_deref())
     }
 
     /// The `healthStatus` this container reports.

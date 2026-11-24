@@ -432,6 +432,7 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
                 verdict.failure = Some(reason);
             }
             verdict.image_digests = fetched.digests;
+            verdict.cached_image_sources = fetched.cached_sources;
         }
     }
     // The SECRETS the agent fetches for the task's containers, in the same step and as the
@@ -476,6 +477,12 @@ pub struct ImagePullVerdict {
     /// emulator holds served: `Container$imageDigest` is "The container image manifest
     /// digest", and the registry that served the pull is what states it.
     pub image_digests: Vec<(String, String)>,
+    /// `(image reference, upstream reference)` for each of the task's images whose repository
+    /// holds a CACHED COPY of an upstream one: such a container runs the upstream image, so
+    /// that is the reference what runs in it is read off
+    /// ([`ContainerRecord::running_image`]). Empty for a task every image of which names a
+    /// repository that holds an image of its own.
+    pub cached_image_sources: Vec<(String, String)>,
     /// Whether the failure is one the fetch WAITED for rather than one it was answered: a
     /// placement with no path to the registry answers nothing, so the attempt ends in a
     /// connection timeout ([`FAILED_IMAGE_FETCH_TIMEOUT`]), while a registry that refused the
@@ -502,6 +509,7 @@ impl ImagePullVerdict {
             failure,
             failed_image,
             image_digests: Vec::new(),
+            cached_image_sources: Vec::new(),
         }
     }
 
@@ -628,12 +636,19 @@ fn fetch_launch_images<Eng: Send + Sync + 'static>(
     now: SystemTime,
 ) -> LaunchFetch {
     let mut digests: Vec<(String, String)> = Vec::new();
+    let mut cached_sources: Vec<(String, String)> = Vec::new();
     for image in &launch.images {
         match fetch_image(engine, launch, image, now) {
             ImageFetch::Undecided => {}
-            ImageFetch::Served(digest) => {
+            ImageFetch::Served {
+                digest,
+                cached_from,
+            } => {
                 if let Some(digest) = digest {
                     digests.push((image.clone(), digest));
+                }
+                if let Some(cached_from) = cached_from {
+                    cached_sources.push((image.clone(), cached_from));
                 }
             }
             // The first image that cannot be fetched is what stops the task: its containers
@@ -642,6 +657,7 @@ fn fetch_launch_images<Eng: Send + Sync + 'static>(
                 return LaunchFetch {
                     refused: Some((image.clone(), reason)),
                     digests,
+                    cached_sources,
                 }
             }
         }
@@ -649,6 +665,7 @@ fn fetch_launch_images<Eng: Send + Sync + 'static>(
     LaunchFetch {
         refused: None,
         digests,
+        cached_sources,
     }
 }
 
@@ -659,13 +676,24 @@ struct LaunchFetch {
     refused: Option<(String, String)>,
     /// `(image reference, manifest digest)` for each image such a registry served.
     digests: Vec<(String, String)>,
+    /// `(image reference, upstream reference)` for each image the repository it names holds
+    /// as a CACHED COPY of an upstream one ([`ImageFetch::Served`]).
+    cached_sources: Vec<(String, String)>,
 }
 
 /// What the fetch of ONE image reference answered.
 enum ImageFetch {
-    /// A registry this emulator holds served the reference, under the manifest digest it
-    /// resolved it to — `None` where that registry states no digest for it.
-    Served(Option<String>),
+    /// A registry this emulator holds served the reference.
+    Served {
+        /// The manifest digest it resolved the reference to, and `None` where that registry
+        /// states no digest for it.
+        digest: Option<String>,
+        /// The UPSTREAM reference the repository it resolved holds a cached copy of, for a
+        /// repository an Amazon ECR pull through cache rule covers
+        /// ([`registry_pull::cached_upstream_reference`]) — and `None` for a repository that
+        /// holds an image of its own registry, which is what the reference already names.
+        cached_from: Option<String>,
+    },
     /// The reference names no registry this emulator holds, so nothing is decided about it.
     Undecided,
     /// A registry this emulator holds would not serve it: the `stoppedReason` of the stop
@@ -697,7 +725,17 @@ fn fetch_image<Eng: Send + Sync + 'static>(
         now,
     ) {
         return match served {
-            Ok(digest) => ImageFetch::Served(digest),
+            Ok(digest) => ImageFetch::Served {
+                digest,
+                // The repository the reference resolved may be a pull through CACHE
+                // repository, which holds the upstream image the rule covering it caches: the
+                // image this container runs is then that upstream one, so the reference it
+                // resolves to is recorded beside the digest
+                // ([`registry_pull::cached_upstream_reference`]).
+                cached_from: registry_pull::parse_registry_reference(&addressed).and_then(
+                    |(_, reference)| registry_pull::cached_upstream_reference(engine, &reference),
+                ),
+            },
             // The registry refused the manifest request the fetch makes, which the runtime
             // reports as the status it got back: the request is the one the registry's own
             // reading of the reference names.
@@ -722,7 +760,10 @@ fn fetch_image<Eng: Send + Sync + 'static>(
         return match mirrored_image_reference(image)
             .and_then(|(path, tag)| published_images::official_image(&path, &tag))
         {
-            Some(published_images::PublishedImage::Published) => ImageFetch::Served(None),
+            Some(published_images::PublishedImage::Published) => ImageFetch::Served {
+                digest: None,
+                cached_from: None,
+            },
             Some(published_images::PublishedImage::NotPublished) => {
                 ImageFetch::Refused(image_not_found_message(image))
             }
@@ -731,7 +772,10 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     };
     if gallery_pull::serves_registry_alias(engine, &reference.registry_alias) {
         return match gallery_pull::serve_pull(engine, &reference) {
-            Ok(digest) => ImageFetch::Served(digest),
+            Ok(digest) => ImageFetch::Served {
+                digest,
+                cached_from: None,
+            },
             Err(gallery_pull::GalleryPullRefusal::NotFound { .. }) => {
                 ImageFetch::Refused(image_not_found_message(image))
             }
@@ -742,7 +786,10 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     // to no image ([`published_images`]). No digest is stated for such an image: the
     // repository's published tags name releases, not the content a digest addresses.
     match published_images::published_image(&reference) {
-        Some(published_images::PublishedImage::Published) => ImageFetch::Served(None),
+        Some(published_images::PublishedImage::Published) => ImageFetch::Served {
+            digest: None,
+            cached_from: None,
+        },
         Some(published_images::PublishedImage::NotPublished) => {
             ImageFetch::Refused(image_not_found_message(image))
         }
@@ -1173,6 +1220,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         .find(|(image, _)| Some(image.as_str()) == container.image.as_deref())
                     {
                         container.image_digest = Some(digest.clone());
+                    }
+                    // And the UPSTREAM image a repository that caches one served it, which is
+                    // the image this container really runs
+                    // ([`ContainerRecord::running_image`]).
+                    if let Some((_, cached_from)) = verdict
+                        .cached_image_sources
+                        .iter()
+                        .find(|(image, _)| Some(image.as_str()) == container.image.as_deref())
+                    {
+                        container.cached_image_source = Some(cached_from.clone());
                     }
                 }
                 if task.launch_failure.is_none() && task.is_pending() {
