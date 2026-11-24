@@ -55,3 +55,57 @@ Source of the behavior, for reference (ECS crate `services/service-com-amazonaws
 6. Read `tasks[0]["containers"][0]`.
    Observed: the dict has no `exitCode` key (`KeyError: 'exitCode'`).
    Expected: `exitCode` present, value 0 for this script.
+
+## Resolution note (added by the fix that closed this report)
+
+STATUS: cause 1 is SERVED, and this report's recorded check CANNOT be verified by replay — it
+is cut at the harness's 60 s cap before any assertion of it runs, for the budget reason
+measured below.
+
+The mechanism this report names is gone: the container's session performs the redirections,
+the command substitutions and the file utilities that program is written out of, so the run
+ENDS with a status instead of being abandoned, and that status is the container's `exitCode`.
+Driven end to end over the calls the check makes — an Amazon EFS file system, a mount target
+in the task's subnet and an access point rooted at `/data`, each polled to `available`; a
+`FARGATE`/`awsvpc` revision with the `efsVolumeConfiguration` volume mounted at `/mnt/shared`
+and an `awslogs` logConfiguration; `RunTask` with the recorded container override; then
+`DescribeTasks` and `GetLogEvents` — this checkout answers:
+
+* `lastStatus` `STOPPED` with `stopCode` `EssentialContainerExited` and `stoppedReason`
+  `Essential container in task exited`;
+* `containers[0]` carrying `exitCode` 0 on the record of the FIRST read that reports
+  `STOPPED`, which is the read the check captures and the member its `KeyError` was raised
+  for;
+* the container's own lines in `<prefix>/app/<taskId>` (`A-SIZE=<marker bytes + 1>`,
+  `A-MODE=-rw-r--r--`, `A-DONE`), so the container demonstrably ran — the premise this
+  report's rule is about;
+* the read-only revision's write refused with `Read-only file system` while its read still
+  answers, with that arm's container reporting its own `exitCode` too.
+
+Why the replay verdict stays `failed`: the key it now reports for this check is
+`_poll_until#5|Timeout|return last` — the check is killed inside a poll rather than on a
+comparison — which is the key the open report
+20261124T061319Z-ecs-efs-logs-the-shared-efs-fargate-volume.md owns. Where those 60 s go was
+measured by the earlier report of this same check
+(20261104T054216Z-ecs-efs-logs-the-shared-efs-fargate-scenario.md, now closed): the check's
+own source polls with `interval_s=10`, so the file system, the mount target, the access point
+and each task arm each cost one look plus one 10 s sleep, and the VPC, subnet, gateway and
+roles it builds before `CreateCluster` come on top — six sequential sleeps meet the cap
+whatever the emulator answers, and that report records that collapsing every clock-owed span
+of the ECS and Amazon EFS crates to 1 ms leaves the same verdict. This fix re-measured it
+rather than assuming it: cutting the span a standalone task's work is reported running for
+(`state::CONTAINER_WORK_SPAN`, 3 s) to one transition span — 2.5 s off every arm, and the
+whole scenario to 13.6 s of emulator-owed time — left the replay line byte-identical, so the
+span was left as it was.
+
+What this fix adds, since the behaviour is already served, is the one assertion no suite made
+and the one this report's client needs:
+`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/tests/all/stopped_task_carries_its_containers_exit_status.rs`
+pins, over a table of programs, that the record a task is read as at the FIRST read reporting
+`lastStatus` `STOPPED` already carries its container's `exitCode` — the suites that poll until
+a status has arrived would pass just as well if a polling client had to keep reading for the
+verdict. The EFS and `awslogs` halves of the recorded scenario stay pinned by
+`core/router/tests/all/ecs_efs_volume_mounts.rs`,
+`core/router/tests/all/ecs_efs_shared_volume_handover.rs` (whose four arms are the recorded
+arms, each asserting its container's `exitCode`) and
+`core/router/tests/all/ecs_read_only_mount_write_refusal.rs`.
