@@ -299,6 +299,11 @@ pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 pub const RESOURCE_TYPE_WORKER: &str = "worker";
 /// `resourceType` this service reports for a job in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_JOB: &str = "job";
+/// `resourceType` this service reports for a step in `ResourceNotFoundException`. The model
+/// documents the member only as "the type of the resource that couldn't be found" and
+/// enumerates no values, so a resource type is spelled the way the API path spells that
+/// resource — the segment `/steps/` names it `step`.
+pub const RESOURCE_TYPE_STEP: &str = "step";
 /// `resourceType` this service reports for a queue-fleet association in
 /// `ResourceNotFoundException`. The model documents the member only as "the type of the
 /// resource that couldn't be found" and enumerates no values, so a resource type is
