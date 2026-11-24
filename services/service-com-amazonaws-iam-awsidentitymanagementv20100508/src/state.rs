@@ -2014,6 +2014,11 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     // `src/ops/update_compute_environment.rs`: "the AWSServiceRoleForBatch
     // service-linked role".
     ("batch.amazonaws.com", "AWSServiceRoleForBatch"),
+    // Amazon Braket: "Using service-linked roles for Amazon Braket" names the role the
+    // service creates to run quantum tasks and hybrid jobs on a caller's behalf,
+    // AWSServiceRoleForAmazonBraket — the service's own name in mixed case behind the
+    // prefix, which the principal's single label (`braket`) is no transformation of.
+    ("braket.amazonaws.com", "AWSServiceRoleForAmazonBraket"),
     (
         "cassandra.application-autoscaling.amazonaws.com",
         "AWSServiceRoleForApplicationAutoScaling_CassandraTable",
@@ -2088,6 +2093,14 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
         "elasticmapreduce.application-autoscaling.amazonaws.com",
         "AWSServiceRoleForApplicationAutoScaling_EMRInstanceGroup",
     ),
+    // Amazon OpenSearch Service answers to BOTH of its principals — `es.amazonaws.com`,
+    // the one its Elasticsearch-era endpoint prefix carries, and
+    // `opensearchservice.amazonaws.com` below — and each links a role of its own:
+    // "Using service-linked roles for Amazon OpenSearch Service" names
+    // AWSServiceRoleForAmazonElasticsearchService for the former, the role a domain
+    // reached through the legacy principal places in a VPC, and
+    // AWSServiceRoleForAmazonOpenSearchService for the latter.
+    ("es.amazonaws.com", "AWSServiceRoleForAmazonElasticsearchService"),
     // [model] service-com-amazonaws-fms-awsfms-20180101
     // `src/ops/put_notification_channel.rs`: "a role other than the
     // AWSServiceRoleForFMS".
@@ -2110,7 +2123,31 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
         "AWSServiceRoleForApplicationAutoScaling_LambdaConcurrency",
     ),
     ("lex.amazonaws.com", "AWSServiceRoleForLexBots"),
+    // AWS License Manager and its two subscription features, each reached through its own
+    // principal and each linking a role AWS names for the FEATURE rather than for the
+    // principal's label, which carries the hyphenated endpoint spelling: "Using
+    // service-linked roles for License Manager" names
+    // AWSServiceRoleForAWSLicenseManagerRole for the service itself, and the
+    // Linux-subscriptions and user-based-subscriptions pages name the roles those
+    // features create to discover subscriptions and to associate users.
+    (
+        "license-manager-linux-subscriptions.amazonaws.com",
+        "AWSServiceRoleForAWSLicenseManagerLinuxSubscriptions",
+    ),
+    (
+        "license-manager-user-subscriptions.amazonaws.com",
+        "AWSServiceRoleForAWSLicenseManagerUserSubscriptions",
+    ),
+    ("license-manager.amazonaws.com", "AWSServiceRoleForAWSLicenseManagerRole"),
     ("macie.amazonaws.com", "AWSServiceRoleForAmazonMacie"),
+    // The Amazon Chime SDK's media-pipeline feature, whose principal carries the feature
+    // ahead of the service (`mediapipelines.chime`): "Using service-linked roles for the
+    // Amazon Chime SDK" names AWSServiceRoleForAmazonChimeSDKMediaPipelines, the role
+    // media pipelines and Kinesis Video Stream pools are created through.
+    (
+        "mediapipelines.chime.amazonaws.com",
+        "AWSServiceRoleForAmazonChimeSDKMediaPipelines",
+    ),
     // [model] service-com-amazonaws-mgn-applicationmigrationservice
     // `src/state/account_initialization.rs`: an account initialization establishes
     // this service's own service-linked role for the principal `mgn.amazonaws.com`
@@ -2145,6 +2182,20 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
         "neptune.application-autoscaling.amazonaws.com",
         "AWSServiceRoleForApplicationAutoScaling_NeptuneCluster",
     ),
+    // Amazon OpenSearch Serverless: its role is assumed through a principal that carries
+    // the feature ahead of the service's API label (`observability.aoss`), and "Using
+    // service-linked roles for Amazon OpenSearch Serverless" names the role the service
+    // creates for a collection, AWSServiceRoleForAmazonOpenSearchServerless.
+    (
+        "observability.aoss.amazonaws.com",
+        "AWSServiceRoleForAmazonOpenSearchServerless",
+    ),
+    // Amazon CloudWatch Observability Admin, which links one role for the service and a
+    // second, SUFFIXED one for its telemetry-enablement feature (below) — the two
+    // principals this repository's own Config surface already carries
+    // (service-com-amazonaws-configservice-starlingdoveservice `src/state.rs`, the
+    // principals a service-linked configuration recorder is created for).
+    ("observabilityadmin.amazonaws.com", "AWSServiceRoleForObservabilityAdmin"),
     (
         "opensearchservice.amazonaws.com",
         "AWSServiceRoleForAmazonOpenSearchService",
@@ -2190,6 +2241,10 @@ pub const PUBLISHED_SERVICE_LINKED_ROLE_NAMES: &[(&str, &str)] = &[
     ("ssm.amazonaws.com", "AWSServiceRoleForAmazonSSM"),
     ("sso.amazonaws.com", "AWSServiceRoleForSSO"),
     ("support.amazonaws.com", "AWSServiceRoleForSupport"),
+    (
+        "telemetry-enablement.observabilityadmin.amazonaws.com",
+        "AWSServiceRoleForObservabilityAdmin_TelemetryEnablement",
+    ),
     ("trustedadvisor.amazonaws.com", "AWSServiceRoleForTrustedAdvisor"),
     // Amazon WorkSpaces Instances: the role the service requires in the account before
     // it will launch an instance, so the name every client reads back as that
