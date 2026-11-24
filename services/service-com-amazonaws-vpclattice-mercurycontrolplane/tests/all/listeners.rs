@@ -974,7 +974,7 @@ fn target_package() -> Vec<u8> {
 /// Create the target function through LAMBDA's own API and answer its ARN, with the activation
 /// span Lambda owes it placed in the past rather than slept for — the same reading every suite
 /// that invokes a freshly created function uses.
-async fn a_target_function(
+pub(crate) async fn a_target_function(
     lattice: &Lattice,
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     name: &str,
@@ -1015,7 +1015,7 @@ async fn a_target_function(
 /// Every status this waits out is a stored due instant the clock owes
 /// (`crate::state::CREATE_TRANSITION`), so nothing is slept for and no assertion is made about
 /// how long it took.
-async fn settled_active(lattice: &Lattice, case: &str, path: &str) {
+pub(crate) async fn settled_active(lattice: &Lattice, case: &str, path: &str) {
     let deadline = std::time::Instant::now() + DATA_PLANE_DEADLINE;
     loop {
         let read = lattice.call("GET", path, None).await;

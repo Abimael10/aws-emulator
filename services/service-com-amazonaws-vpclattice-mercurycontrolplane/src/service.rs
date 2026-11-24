@@ -44,9 +44,14 @@
 //! service's OWN TRAFFIC, sent to one of the names a lattice service answers at. That is the
 //! DATA plane ([`data_plane`]), claimed in [`EmulatedService::can_handle`] and served from
 //! [`EmulatedService::override_operation`], which is what hands it the in-process transport a
-//! `forward` to a `LAMBDA` target group invokes the function over ([`lambda_target`]).
+//! `forward` to a `LAMBDA` target group invokes the function over ([`lambda_target`]). That
+//! plane is mounted ONCE PER KIND OF CALLER — a request presenting a SigV4 credential and one
+//! presenting none — because whether the emulator AUTHENTICATES a request is carried by the
+//! auth schemes the serving operation declares, and the service's own auth policy decides
+//! about the principal the emulator authenticated ([`data_plane_authorization`]).
 
 pub mod data_plane;
+mod data_plane_authorization;
 mod lambda_target;
 
 use smithy_server_runtime::{
@@ -112,8 +117,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The shared engine, for the one request this service serves that names no modelled
     /// operation: a lattice service's own traffic ([`data_plane`]).
     engine: Arc<Eng>,
-    /// That traffic's plane, mounted as the operation it is served by.
-    data_plane: data_plane::DataPlane<Eng>,
+    /// That traffic's plane, mounted as the operation it is served by: this one serves a
+    /// request that presents NO credential, which nothing authenticated (see [`data_plane`]).
+    data_plane_unsigned: data_plane::DataPlane<Eng>,
+    /// See [`Self::data_plane_unsigned`]: the mounting that serves a request presenting a
+    /// SigV4 credential, whose signature the emulator verifies before the plane runs.
+    data_plane_signed: data_plane::DataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -123,7 +132,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            data_plane: data_plane::DataPlane::new(Arc::clone(&engine)),
+            data_plane_unsigned: data_plane::DataPlane::unsigned(Arc::clone(&engine)),
+            data_plane_signed: data_plane::DataPlane::signed(Arc::clone(&engine)),
             engine,
         }
     }
@@ -171,8 +181,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // own request path. It is decided by the SAME rule the claim above used
         // ([`data_plane::DataPlane::claims`]), so the claim and the serving cannot disagree,
         // and every other request resolves through the generated routing table.
-        if self.data_plane.claims(req) {
-            return Some(&self.data_plane as _);
+        //
+        // WHICH mounting serves it is the kind of caller the request is
+        // ([`data_plane::DataPlane::serves`]): a request presenting a SigV4 credential is
+        // served by the mounting that declares that scheme, so the emulator verifies it before
+        // the plane runs, and one presenting none by the mounting that declares no scheme at
+        // all. Naming the mounting is what keeps that verification in front of this plane.
+        if self.data_plane_unsigned.claims(req) {
+            for mounting in [&self.data_plane_signed, &self.data_plane_unsigned] {
+                if mounting.serves(req) {
+                    return Some(mounting as _);
+                }
+            }
         }
         None
     }

@@ -162,4 +162,55 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         record.last_updated_at = now;
         record
     }
+
+    /// The auth policy attached to `kind`/`id` while it is ACTIVE — the one state in which
+    /// the document decides anything ([`Self::auth_policy_state`]) — and `None` for a
+    /// resource carrying none or carrying one its auth type leaves inactive.
+    ///
+    /// Read on every call rather than materialised, so a later `UpdateServiceNetwork` that
+    /// flips the auth type, and a later put that replaces the document, are both in force for
+    /// the next request with nothing to migrate.
+    pub fn active_auth_policy(&self, kind: ResourceKind, id: &str) -> Option<&str> {
+        if self.auth_policy_state(kind, id) != AUTH_POLICY_STATE_ACTIVE {
+            return None;
+        }
+        self.auth_policies
+            .get(id)
+            .map(|record| record.policy.as_str())
+    }
+
+    /// Every ACTIVE auth policy a request to the service `service_id` travels through: the
+    /// service's own, then the one on each service network the service is associated with.
+    ///
+    /// A client reaches a service THROUGH a service network it is associated with
+    /// (`CreateServiceNetworkVpcAssociation`'s own documentation), and an auth policy may be
+    /// attached to either kind ("Creates or updates the auth policy", `PutAuthPolicy`, whose
+    /// `resourceIdentifier` names a service network or a service), so both documents are in
+    /// force on such a request — each only while its own resource authenticates with IAM. The
+    /// service's own comes first, so a reader that reports one document reports the service's.
+    ///
+    /// A pure READ, returning the documents as stored: nothing is written, so asking changes
+    /// nothing a later caller sees.
+    pub fn active_auth_policies_reaching_service(&self, service_id: &str) -> Vec<String> {
+        let mut documents: Vec<String> = self
+            .active_auth_policy(ResourceKind::Service, service_id)
+            .map(ToString::to_string)
+            .into_iter()
+            .collect();
+        let mut networks: Vec<&str> = self
+            .service_associations
+            .values()
+            .filter(|association| association.service_id == service_id)
+            .map(|association| association.service_network_id.as_str())
+            .collect();
+        networks.sort_unstable();
+        networks.dedup();
+        for network_id in networks {
+            if let Some(document) = self.active_auth_policy(ResourceKind::ServiceNetwork, network_id)
+            {
+                documents.push(document.to_string());
+            }
+        }
+        documents
+    }
 }

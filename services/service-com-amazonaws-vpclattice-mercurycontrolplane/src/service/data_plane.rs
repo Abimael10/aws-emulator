@@ -51,6 +51,11 @@
 //! Every status, header and byte is computed from what a create or an update persisted, and
 //! serving traffic moves no status, consumes no quota and bumps no counter.
 //!
+//! Before anything behind the listener is reached, the AUTH POLICY in force on the service
+//! decides the request ([`super::data_plane_authorization`]): a request an active policy
+//! refuses is answered HTTP 403 `AccessDeniedException` and no rule's action is performed for
+//! it — no target is reached and no function is invoked.
+//!
 //! The LISTENER the request reached is the one on the port the client addressed, and — for a
 //! client that reached this emulator's own endpoint, whose port is not the service's — the
 //! lowest-numbered listener of the service that carries HTTP requests ([`SERVED_PROTOCOLS`]).
@@ -465,11 +470,15 @@ enum Chosen {
 ///
 /// `ctx` is what a `forward` to a `LAMBDA` target group needs: the in-process transport the
 /// function is invoked over ([`super::lambda_target`]). The store's guard is RELEASED before
-/// that invocation, so one client's handler cannot stall another client's request.
+/// that invocation, so one client's handler cannot stall another client's request — and
+/// before the AUTH POLICY decides, which is read under the caller's own stores' locks
+/// ([`super::data_plane_authorization`]). `admits` is which kind of caller the mounting
+/// serving this request admits, which is what says whether the emulator authenticated it.
 pub async fn serve<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
     ctx: &OperationContext<'_>,
+    admits: Admits,
 ) -> RtResponse {
     let uri = parsed_uri(req.uri());
     let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
@@ -482,7 +491,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     let now = SystemTime::now();
     // What the records decide, under a lock that is released before anything else is asked.
     // Read, never written: this plane moves no status.
-    let chosen = {
+    let (chosen, in_force) = {
         let mut store = state.lock();
         // A target group whose asynchronous deletion has fallen due is gone for every caller,
         // which was owed at the same instant whether or not anybody called.
@@ -502,8 +511,17 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         let Some(action) = matched_action(store, listener, &request) else {
             return rendered(&Served::status(NOT_SERVING_STATUS));
         };
-        chosen(store, service, listener, &action, now)
+        (
+            chosen(store, service, listener, &action, now),
+            super::data_plane_authorization::InForce::of(store, service, &request.path),
+        )
     };
+    // The AUTH POLICY decides before the chosen action is performed: a request it refuses is
+    // answered the authorization layer's own 403 and NOTHING behind the listener runs — no
+    // function is invoked and no target is reached ([`super::data_plane_authorization`]).
+    if let Err(denial) = super::data_plane_authorization::decided(engine, ctx, admits, &in_force) {
+        return rendered(&super::data_plane_authorization::refusal(&denial));
+    }
     let served = match chosen {
         Chosen::Fixed(status) => Served::status(status),
         Chosen::Lambda(target) => super::lambda_target::served(ctx, &target, &request).await,
@@ -795,27 +813,82 @@ fn rendered(served: &Served) -> RtResponse {
 /// routing key names it — so it is claimed by `Service::can_handle` ([`claims_parts`]) and
 /// served here.
 ///
-/// It declares NO auth scheme, because a client of the name a service publishes carries no AWS
-/// credential and has none to sign with; it still claims only a request addressed to a service
-/// this store holds. Being an operation is what hands the plane the in-process transport a
-/// `forward` to a `LAMBDA` target group invokes the function over
-/// ([`super::lambda_target`]).
+/// Mounted ONCE PER KIND OF CALLER ([`Admits`]), because whether the emulator AUTHENTICATES a
+/// request is carried by the auth schemes the serving operation declares — the emulator
+/// verifies every request signature and a service never verifies one itself. A client of the
+/// name a service publishes may present no AWS credential at all, and then nothing
+/// authenticated it and it speaks for nobody; one that signs for this plane offered an
+/// identity, and the emulator holds it to it before the plane runs, which is what lets the
+/// service's auth policy decide about a principal rather than about a header
+/// ([`super::data_plane_authorization`]).
+///
+/// Being an operation is what hands the plane the in-process transport a `forward` to a
+/// `LAMBDA` target group invokes the function over ([`super::lambda_target`]).
 pub struct DataPlane<Eng> {
     /// The ONE shared engine this service's operations read and write, so a request served
     /// here sees exactly the configuration the control plane persisted.
     engine: ::std::sync::Arc<Eng>,
+    /// Which callers this mounting serves.
+    admits: Admits,
 }
 
+/// Which callers one mounting of this plane serves — and therefore whether the request it
+/// serves was authenticated by the emulator at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admits {
+    /// A request presenting NO SigV4 credential: the mounting declares no auth scheme, so
+    /// nothing authenticated the request and it speaks for nobody.
+    Unsigned,
+    /// A request presenting one: the mounting declares the SigV4 scheme, so the emulator
+    /// verifies the signature — a credential it does not accept is refused before this plane
+    /// runs — and the request speaks for the principal that credential speaks for.
+    Signed,
+}
+
+/// The SigV4 auth scheme, as the model's own `@auth` trait names it: what the mounting serving
+/// a signed request declares so the emulator verifies that signature.
+const SIGV4_SCHEME: &str = "aws.auth#sigv4";
+
 impl<Eng: Send + Sync + 'static> DataPlane<Eng> {
-    /// Mount the plane over the shared engine.
-    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
-        Self { engine }
+    /// The mounting serving a request that presents no credential.
+    pub fn unsigned(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self {
+            engine,
+            admits: Admits::Unsigned,
+        }
+    }
+
+    /// The mounting serving a request that presents one, whose signature the emulator
+    /// verifies because this mounting declares that scheme.
+    pub fn signed(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self {
+            engine,
+            admits: Admits::Signed,
+        }
     }
 
     /// Whether this plane serves `req`, by the one rule the claim uses
     /// ([`claims_request`]).
     pub fn claims(&self, req: &RtRequest) -> bool {
         claims_request(&*self.engine, req)
+    }
+
+    /// Whether THIS mounting is the one that serves `req`: the one whose kind of caller the
+    /// request is.
+    ///
+    /// Which kind it is, is read through the tree's one reading of whether a request PRESENTS
+    /// a SigV4 credential ([`::service_common::sigv4_presentation`]) — a ROUTING choice, not a
+    /// decision about what that credential may do, which stays with the schemes the chosen
+    /// mounting declares and the policy the plane reads.
+    pub fn serves(&self, req: &RtRequest) -> bool {
+        let presented = ::service_common::sigv4_presentation::presents_a_credential(
+            req.headers().get(::http::header::AUTHORIZATION.as_str()),
+            parsed_uri(req.uri()).query(),
+        );
+        match self.admits {
+            Admits::Signed => presented,
+            Admits::Unsigned => !presented,
+        }
     }
 }
 
@@ -826,13 +899,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for DataPlane<Eng> {
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move { serve(&*self.engine, req, ctx).await })
+        Box::pin(async move { serve(&*self.engine, req, ctx, self.admits).await })
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // A client that sends traffic to the name a service published presents no AWS
-        // credential: this plane serves the request however it arrived.
-        Some(&[])
+        match self.admits {
+            // A client that sends traffic to the name a service published may present no AWS
+            // credential: this mounting serves the request however it arrived.
+            Admits::Unsigned => Some(&[]),
+            // One that DID present a credential offered an identity, and the emulator holds it
+            // to it: the signature is verified before this plane runs.
+            Admits::Signed => Some(&[SIGV4_SCHEME]),
+        }
     }
 }
 

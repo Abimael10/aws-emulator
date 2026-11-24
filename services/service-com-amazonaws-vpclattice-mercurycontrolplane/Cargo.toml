@@ -42,6 +42,12 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # The `application/x-www-form-urlencoded` query string a data-plane request carries, read into
 # the query-string parameters the Lambda event states.
 form_urlencoded = "1"
+# The STS store, for the principal the credential a data-plane request signed with speaks for:
+# the identity `sts:GetCallerIdentity` answers for it, which is what the service's auth policy
+# decides about (`src/service/data_plane_authorization.rs`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [dev-dependencies]
 # Declares one suite module per `tests/all/<name>.rs`, so the single integration-test target
