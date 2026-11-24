@@ -752,14 +752,14 @@ pub struct ComAmazonawsXrayAwsxrayState {
     /// when they arrived, held while each one is in flight
     /// ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`]).
     ///
-    /// A create that arrives while another create of its name is still being
-    /// served was sent before any answer could have told its caller the name was
-    /// taken, so it is one of a RACE for that name — which is what decides which
-    /// of the two refusals a duplicate name is answered with
-    /// ([`SamplingRuleNameOnArrival`]), and the arrival instants are what the
-    /// span between a create's read of the name and its write runs from
-    /// ([`SAMPLING_RULE_CREATE_SPAN`]). A name with no create in flight carries
-    /// no entry, so a settled store holds nothing here.
+    /// The arrival instants are what the span between a create's read of a free
+    /// name and its write runs from ([`SAMPLING_RULE_CREATE_SPAN`]), each
+    /// arrival pushing it out, so the creates a client dispatches together for
+    /// one unused name all take their read before any of them writes — which is
+    /// what makes a loser of that race one the store's uniqueness constraint
+    /// refuses ([`sampling_rule_exists_message`]) rather than one the name read
+    /// turns away. A name with no create in flight carries no entry, so a
+    /// settled store holds nothing here.
     pub sampling_rule_creates_in_flight: BTreeMap<String, SamplingRuleCreatesInFlight>,
     /// Started trace retrievals, keyed by the `RetrievalToken` that was minted
     /// for them, at most [`MAX_TRACE_RETRIEVALS`] of them.

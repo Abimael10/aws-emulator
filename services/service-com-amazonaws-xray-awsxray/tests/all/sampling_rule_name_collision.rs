@@ -7,14 +7,16 @@
 //! steps — the read of the name and the insert — and each refusal is worded by
 //! the step that caught it, both as `InvalidRequestException` at HTTP 400:
 //!
-//! * a name already HELD and settled there before the request arrived is refused
-//!   by the read — whatever rule that create submits, since what the read reads
-//!   is the NAME — with the service's fixed sentence for that condition, which
-//!   interpolates nothing from the request and nothing from the service's state,
-//!   so neither the name asked for nor any identifier of the rule in the way
-//!   appears in it, and the same sentence answers whichever held rule is in the
-//!   way, in whichever Region, however many callers ask one after another, and
-//!   whether or not the name was held by an earlier rule since deleted;
+//! * a name the account already HELD when the request arrived is refused by its
+//!   read of the name — whatever rule that create submits, since what the read
+//!   reads is the NAME, and whatever else is being served for that name, since a
+//!   create that read the name as taken never reaches the insert — with the
+//!   service's fixed sentence for that condition, which interpolates nothing from
+//!   the request and nothing from the service's state, so neither the name asked
+//!   for nor any identifier of the rule in the way appears in it, and the same
+//!   sentence answers whichever held rule is in the way, in whichever Region,
+//!   however many callers ask one after another, and whether or not the name was
+//!   held by an earlier rule since deleted;
 //! * a create that read passes — one that read the name as FREE and then lost
 //!   the insert to another create IN FLIGHT beside it — reaches the insert and is
 //!   refused by the uniqueness constraint of the store the rule is written
@@ -33,9 +35,11 @@
 //! along the priority the losing create carries, along WHICH member of the rule
 //! the losing create states differently (and along stating none of them
 //! differently, i.e. restating the stored rule exactly), along how many callers
-//! ask for one name, and along whether those callers are sequential or in flight
+//! ask for one name, along whether those callers are sequential or in flight
 //! together — joined by one task, and DISPATCHED TOGETHER from separate tasks,
-//! which is the shape a client with a thread per caller sends them in.
+//! which is the shape a client with a thread per caller sends them in — and,
+//! for a name already held, along how many creates of that name are being served
+//! beside the one refused.
 //!
 //! Nothing here asserts on elapsed time, and no case is decided by how fast the
 //! host runs: a row either awaits the answers it is about, asks again only once
@@ -571,12 +575,11 @@ async fn dispatched_together(
 }
 
 /// RULE: which of the two refusals a duplicate `RuleName` is answered with turns
-/// on whether the caller could have been TOLD the name was taken before it sent
-/// the request — so every create a client dispatched before any answer about the
-/// name existed takes its read while the name is free and is refused by the
-/// store's uniqueness constraint, naming the one resource that won it, while a
-/// caller that waits for an answer and only then asks again reads the name as
-/// held.
+/// on what the create's OWN read of the name found — so every create a client
+/// dispatched for an unused name before any answer about it existed takes its
+/// read while the name is free and, losing the insert, is refused by the store's
+/// uniqueness constraint, naming the one resource that won it, while a caller
+/// whose read found the name already held reads the service's fixed sentence.
 ///
 /// The rows differ along how many callers race, along whether the racers state
 /// one rule or each its own, and along whether the name they race for was ever
@@ -800,72 +803,98 @@ async fn the_name_is_not_written_while_the_create_that_read_it_is_being_served()
     );
 }
 
-/// RULE, read off the store rather than off any clock: WHICH of the two refusals
-/// answers a create of a held name is decided by whether a create of that name
-/// is still BEING SERVED — one is refused by the store's uniqueness constraint,
-/// naming the resource that holds the name by the internal id the store holds it
-/// under, and once that create has been answered the next one is refused by the
-/// service's own read of the name.
+/// RULE, read off the store rather than off any clock: what decides the refusal
+/// a create of a duplicate `RuleName` is answered with is the create's OWN read
+/// of the name — a name the account already holds is refused by that read, in the
+/// service's fixed sentence, whatever else is being served for the name, because
+/// such a create never read the name as free and so can never reach the write
+/// the store's uniqueness constraint refuses.
 ///
-/// The create still in flight is registered through the service's own report of
-/// an arrival, so this case states nothing about timing at all: it holds the one
-/// condition the selection turns on and asks what each answer is. The rows differ
-/// along what holds the name — a rule the account created, and the
-/// service-managed rule that holds its name without being created — and along
-/// the priority the colliding create carries.
+/// The creates still in flight are registered through the service's own report
+/// of an arrival, so this case states nothing about timing at all: it holds the
+/// one condition under test and asks what the answer is. The rows differ along
+/// what holds the name — a rule the account created, a rule re-created under a
+/// freed name, and the service-managed rule that holds its name without being
+/// created — along how many creates of that name are in flight beside the
+/// colliding one (none, one, several), and along the priority it carries.
 #[tokio::test]
-async fn the_refusal_follows_whether_a_create_of_the_name_is_still_being_served() {
+async fn a_create_that_read_the_name_as_held_reads_the_fixed_sentence() {
     use service_com_amazonaws_xray_awsxray::state::ComAmazonawsXrayAwsxrayState;
 
     let (xray, engine) = Xray::with_engine();
     let store = engine.state::<ComAmazonawsXrayAwsxrayState>();
 
-    // A rule the account created, and the service-managed rule, which holds its
-    // name without a record ever being stored for it.
-    let created = xray
-        .call("/CreateSamplingRule", &rule_body("marble-sampler", 450))
+    // A rule the account created, a name a deleted rule had held and a new rule
+    // was created under — a DIFFERENT resource holding the same name — and the
+    // service-managed rule, which holds its name without a record ever being
+    // stored for it.
+    for name in ["marble-sampler", "recreated-sampler"] {
+        let created = xray.call("/CreateSamplingRule", &rule_body(name, 450)).await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the rule under test must be created, got {created:?}"
+        );
+    }
+    let deleted = xray
+        .call(
+            "/DeleteSamplingRule",
+            &json!({ "RuleName": "recreated-sampler" }),
+        )
         .await;
     assert_eq!(
-        created.status, 200,
-        "the rule under test must be created, got {created:?}"
+        deleted.status, 200,
+        "the rule to be re-created must be deletable, got {deleted:?}"
     );
-    let rows: Vec<(&str, &str, i64)> = vec![
-        ("a rule the account created", "marble-sampler", 451),
-        (
-            "the service-managed rule",
-            DEFAULT_SAMPLING_RULE_NAME,
-            452,
-        ),
+    let recreated = xray
+        .call("/CreateSamplingRule", &rule_body("recreated-sampler", 455))
+        .await;
+    assert_eq!(
+        recreated.status, 200,
+        "the freed name must be creatable again, got {recreated:?}"
+    );
+
+    let holders: Vec<(&str, &str)> = vec![
+        ("a rule the account created", "marble-sampler"),
+        ("a rule re-created under a freed name", "recreated-sampler"),
+        ("the service-managed rule", DEFAULT_SAMPLING_RULE_NAME),
     ];
 
-    for (case, name, priority) in rows {
-        // The internal id the store holds the name under: what the constraint's
-        // refusal has to name, read from the state rather than written out here.
-        let holder = store
+    for (holder, name) in holders {
+        // The name is held, which is what the colliding create's read finds —
+        // read from the state rather than written out here.
+        assert!(
+            store.lock().holds_sampling_rule_name(name),
+            "case {holder:?}: the name {name:?} must be held"
+        );
+        // And the id the store holds that resource under, which the refusal of a
+        // create the read turns away may not carry.
+        let internal_id = store
             .lock()
             .sampling_rule_internal_id_in_use(name)
-            .unwrap_or_else(|| panic!("case {case:?}: the name {name:?} must be held"));
+            .unwrap_or_else(|| panic!("case {holder:?}: the name {name:?} must be held"));
 
-        // One create of that name reported as arrived and not yet answered —
-        // the service's own report, which is what a create being served leaves
-        // behind.
-        store.lock().sampling_rule_create_arrived(name);
-        let raced = xray
-            .call("/CreateSamplingRule", &rule_body(name, priority))
-            .await;
-        let named = refused_for_the_resource_that_won(case, &raced);
-        assert_eq!(
-            named, holder,
-            "case {case:?}: the refusal must name the resource holding the name, got {named:?} \
-             against {holder:?}"
-        );
-
-        // That create answered, nothing of the name is in flight: the next one
-        // is refused by the read of the name instead, in its fixed sentence.
-        store.lock().sampling_rule_create_finished(name);
-        let late = xray
-            .call("/CreateSamplingRule", &rule_body(name, priority + 1))
-            .await;
-        refused_as_already_existing(&format!("{case}, once nothing is in flight"), &late);
+        for (beside, priority) in [(0_usize, 461), (1, 462), (3, 463)] {
+            let case = format!("{holder}, with {beside} create(s) of the name in flight");
+            // Creates of that name reported as arrived and not yet answered —
+            // the service's own report, which is what a create being served
+            // leaves behind. They change nothing: this caller's read of the name
+            // still finds it held.
+            for _ in 0..beside {
+                store.lock().sampling_rule_create_arrived(name);
+            }
+            let answer = xray
+                .call("/CreateSamplingRule", &rule_body(name, priority))
+                .await;
+            refused_as_already_existing(&case, &answer);
+            assert!(
+                !said(&answer).contains(&internal_id),
+                "case {case:?}: the refusal of a create the name read turned away must carry no \
+                 identifier of the rule in the way ({internal_id:?}), got {:?}",
+                said(&answer)
+            );
+            for _ in 0..beside {
+                store.lock().sampling_rule_create_finished(name);
+            }
+        }
     }
 }

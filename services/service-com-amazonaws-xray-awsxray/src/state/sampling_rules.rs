@@ -253,8 +253,8 @@ pub const DEFAULT_SAMPLING_RULE_NAME: &str = "Default";
 /// nor the reserved name itself — whichever of the two selectors named it.
 pub const DEFAULT_SAMPLING_RULE_UNDELETABLE_MESSAGE: &str = "Cannot delete default sampling rule";
 
-/// What X-Ray answers a `CreateSamplingRule` whose `RuleName` is held by a
-/// DIFFERENT sampling rule, settled there before the request arrived.
+/// What X-Ray answers a `CreateSamplingRule` whose `RuleName` was ALREADY HELD
+/// by a sampling rule of the account when the request arrived.
 ///
 /// FIXED text, as the service words it: the create is refused by the service's
 /// own read of the name, for the CONDITION that read found — the name is taken
@@ -264,19 +264,19 @@ pub const DEFAULT_SAMPLING_RULE_UNDELETABLE_MESSAGE: &str = "Cannot delete defau
 ///
 /// This is one of the TWO wordings a duplicate name is refused with, and which
 /// one answers is decided by what that read could refuse
-/// ([`sampling_rule_refused_by_the_name_read`]): only a create the read let
-/// through — one that raced the create which took the name — is refused by the
-/// uniqueness constraint of the store the rule is written through, which words
-/// [`sampling_rule_exists_message`] instead. Both are recorded service
+/// ([`sampling_rule_refused_by_the_name_read`]): only a create whose read found
+/// the name FREE — one that then raced the create which took it — is refused by
+/// the uniqueness constraint of the store the rule is written through, which
+/// words [`sampling_rule_exists_message`] instead. Both are recorded service
 /// behaviour, and together they are what lets a caller tell a name collision
 /// from the operation's other `InvalidRequestException`s — a rejected priority,
 /// resource ARN or attribute map — which carry the same status and the same
 /// code.
 pub const SAMPLING_RULE_EXISTS_MESSAGE: &str = "Sampling rule already exists";
 
-/// The fixed text of the refusal a create the service's own name read LET
-/// THROUGH is answered with, which the id of the resource holding the name is
-/// appended to ([`sampling_rule_exists_message`]).
+/// The fixed text of the refusal a create whose read found the name FREE is
+/// answered with when it then loses the write, which the id of the resource
+/// holding the name is appended to ([`sampling_rule_exists_message`]).
 ///
 /// Such a create reached the write, so what refuses it is the uniqueness
 /// constraint of the store the accepted rule is written through, which speaks of
@@ -303,15 +303,14 @@ pub fn sampling_rule_exists_message(internal_id: &str) -> String {
 /// X-Ray answers a duplicate `RuleName` from two layers, as a service that reads
 /// a name and then writes through a store with a uniqueness constraint does. The
 /// read refuses every create whose name it can SEE taken, whatever rule that
-/// create submits: what it reads is the NAME, which is the rule's identity, so a
-/// create restating the rule already stored under the name is as much a second
-/// create of a held name as one stating a different rule. `on_arrival` has to
-/// report the name as held and settled — a create that read the name as free, or
-/// that arrived while another create of that name was still being served, got
-/// past the read before the name was there to see
-/// ([`SamplingRuleNameOnArrival`]).
+/// create submits and whatever else is being served for that name: what it reads
+/// is the NAME, which is the rule's identity, so a create restating the rule
+/// already stored under the name is as much a second create of a held name as
+/// one stating a different rule. `on_arrival` has to report the name as held —
+/// only a create that read the name as FREE got past the read before the name
+/// was there to see ([`SamplingRuleNameOnArrival`]).
 ///
-/// Only that race collides at the write instead, and is refused by the
+/// Only such a create can collide at the write instead, and is refused by the
 /// constraint, which reports that the resource holding the name is a different
 /// resource from the one being stored ([`sampling_rule_exists_message`]) — the
 /// distinction a caller reads to tell a late duplicate from a collision of two
@@ -327,31 +326,31 @@ pub fn sampling_rule_refused_by_the_name_read(on_arrival: SamplingRuleNameOnArri
 ///
 /// X-Ray answers a duplicate name from two layers, as a service that reads a
 /// name and then writes through a store with a uniqueness constraint does: the
-/// read refuses a name the account HELD AND SETTLED before the request arrived
-/// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and a create that RACED another create of
-/// the same name is refused by that constraint, which names the resource now
-/// holding the name ([`sampling_rule_exists_message`]). So the handler reports
-/// its arrival here ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`])
-/// and hands back what that arrival found.
+/// read refuses a name the account already HELD when the request arrived
+/// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and a create that read the name as free
+/// and then lost it to another create is refused by that constraint, which names
+/// the resource now holding the name ([`sampling_rule_exists_message`]). So the
+/// handler reports its arrival here
+/// ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`]) and hands
+/// back what that arrival found.
 ///
-/// What separates the two is whether the caller could have been TOLD the name
-/// was taken before it sent this request, which is a question about time: the
-/// read and the write of one create are separated by the span the service spends
-/// serving it ([`SAMPLING_RULE_CREATE_SPAN`]), and every create of the name that
-/// arrives inside that span is one a caller sent while no answer about the name
-/// existed yet.
+/// What separates the two is therefore the read, not the clock: a caller whose
+/// read found the name taken is answered for that, however many creates of the
+/// name are being served beside it. The creates a client dispatches together for
+/// a FREE name are what the other wording is for, and they all take their read
+/// before any of them writes because the write waits out the span the service
+/// spends serving a create ([`SAMPLING_RULE_CREATE_SPAN`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplingRuleNameOnArrival {
-    /// This create RACED another create of the name: either the account held no
-    /// rule of that name when the request arrived — so a collision at the write
-    /// is a race this request lost — or a create of that very name was still
-    /// being served beside it, so the caller sent this one before any answer
-    /// could have told it the name was taken. Either way the write is refused by
-    /// the store's uniqueness constraint.
+    /// The account held no rule of that name when the request arrived, so this
+    /// create's read let it through to the write: a collision there is a race
+    /// this request lost to another create, and the store's uniqueness
+    /// constraint is what refuses it.
     Free,
-    /// A rule of that name was already held when the request arrived, by a
-    /// create that had been answered: nothing of that name was in flight beside
-    /// this request, so what refuses it is the service's own read of the name.
+    /// A rule of that name was already held when the request arrived, so the
+    /// service's own read of the name is what refuses this create — whatever
+    /// else is in flight for that name, since this request never read the name
+    /// as free.
     Held,
 }
 
@@ -371,25 +370,23 @@ pub fn sampling_rule_internal_id(rule_name: &str, sequence: u64) -> String {
 
 /// How long the span between a `CreateSamplingRule`'s read of the `RuleName` and
 /// its write of the rule under that name lasts: the window in which a create of
-/// the same name that arrives beside it is RACING it
-/// ([`SamplingRuleNameOnArrival`]) rather than reading a name settled before its
-/// caller sent it.
+/// the same FREE name that arrives beside it takes its own read before either of
+/// them has written ([`SamplingRuleNameOnArrival`]).
 ///
 /// CHOSEN rather than documented — what it stands in for is the time the service
 /// itself spends between those two steps, which is what makes the creates a
-/// client dispatches together overlap one another. It is what the distinction
-/// between the two duplicate-name refusals rests on: a store that committed in
+/// client dispatches together overlap one another. It is what makes the
+/// uniqueness constraint's refusal reachable at all: a store that committed in
 /// the same instant it read would have written the name before any other
-/// caller's request could be taken in, so every loser would be answered as a
-/// late duplicate and the uniqueness constraint's refusal
-/// ([`sampling_rule_exists_message`]) would be unreachable. A caller that waits
-/// for its answer before asking again is never inside the span, because the
-/// answer is only sent once the span has elapsed, so sequential callers still
-/// read the name as held ([`SAMPLING_RULE_EXISTS_MESSAGE`]).
+/// caller's request could be taken in, so every loser would read the name as
+/// held and [`sampling_rule_exists_message`] would never answer. A caller that
+/// waits for its answer before asking again is never inside the span, because
+/// the answer is only sent once the span has elapsed, so sequential callers read
+/// the name as held ([`SAMPLING_RULE_EXISTS_MESSAGE`]).
 ///
 /// Short enough that it costs a create about as much as one network round trip,
 /// and it is spent only by a create that may still take the name: a create whose
-/// name is already held and settled is refused by the read straight away.
+/// name is already held is refused by the read straight away.
 pub const SAMPLING_RULE_CREATE_SPAN: Duration = Duration::from_millis(100);
 
 /// The longest a create can be held in that span, however many creates of its
@@ -402,8 +399,8 @@ pub const SAMPLING_RULE_CREATE_SPAN: Duration = Duration::from_millis(100);
 pub const MAX_SAMPLING_RULE_CREATE_SPAN: Duration = Duration::from_secs(2);
 
 /// The `CreateSamplingRule` requests BEING SERVED for one `RuleName`, and when
-/// they arrived — what the two duplicate-name refusals are selected by
-/// ([`SamplingRuleNameOnArrival`]).
+/// they arrived — what holds the span between a create's read of a free name and
+/// its write open ([`SAMPLING_RULE_CREATE_SPAN`]).
 ///
 /// The arrivals are instants of the RUNTIME's clock, which is the clock the span
 /// between a create's read and its write is spent on, so a test can drive that
@@ -535,12 +532,11 @@ impl ComAmazonawsXrayAwsxrayState {
     /// winner's record already present. WHICH refusal a loser is answered with is
     /// decided in one place
     /// ([`sampling_rule_refused_by_the_name_read`]), from `on_arrival` — what the
-    /// request found of the name when it arrived: the service's own read of
-    /// the name refuses a create whose name it can see taken
-    /// ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and every create that read lets
-    /// through is refused by the uniqueness constraint of the store it writes
-    /// through, which names the resource holding the name by its internal id
-    /// ([`sampling_rule_exists_message`]).
+    /// request's own read of the name found: the service's read refuses a create
+    /// whose name it saw taken ([`SAMPLING_RULE_EXISTS_MESSAGE`]), and a create
+    /// whose read found the name free is refused by the uniqueness constraint of
+    /// the store it writes through, which names the resource holding the name by
+    /// its internal id ([`sampling_rule_exists_message`]).
     pub fn insert_sampling_rule(
         &mut self,
         region: &str,
@@ -651,11 +647,17 @@ impl ComAmazonawsXrayAwsxrayState {
     /// ([`SamplingRuleNameOnArrival`]).
     ///
     /// One step on the locked store, so two creates that arrive together each
-    /// see the other in flight. The name counts as HELD only when a create that
-    /// stored it had already been ANSWERED — a name held while another create of
-    /// it is still being served is a name the caller of this request cannot have
-    /// been told about, so this create is one of a race rather than a late
-    /// duplicate.
+    /// see the other in flight. What the arrival ANSWERS is the read of the name
+    /// itself: a name this account already holds is HELD however many creates of
+    /// it are being served beside this one, because this request never read the
+    /// name as free and so can only be refused by that read. Only a create that
+    /// found the name FREE can go on to lose the write to another create, which
+    /// is the collision the store's uniqueness constraint reports.
+    ///
+    /// Registering the arrival is also what holds the name's commit span open
+    /// ([`SamplingRuleCreatesInFlight::commit_due`]): each arrival pushes it out,
+    /// so creates a caller dispatched together for a free name all take their
+    /// read before any of them writes.
     ///
     /// Every registered create has to be reported finished again
     /// ([`sampling_rule_create_finished`](Self::sampling_rule_create_finished)),
@@ -667,15 +669,9 @@ impl ComAmazonawsXrayAwsxrayState {
         let arrived_at = Instant::now();
         let held = self.holds_sampling_rule_name(rule_name);
         match self.sampling_rule_creates_in_flight.get_mut(rule_name) {
-            // A create of this name is still being served beside this one, so
-            // this caller cannot have been told the name was taken, whatever the
-            // store holds under it: the two are racing, and the arrival pushes
-            // the span out so the create already waiting cannot commit before
-            // this one's read ([`SamplingRuleCreatesInFlight::commit_due`]).
             Some(in_flight) => {
                 in_flight.count += 1;
                 in_flight.last_arrival = arrived_at;
-                SamplingRuleNameOnArrival::Free
             }
             None => {
                 self.sampling_rule_creates_in_flight.insert(
@@ -686,12 +682,12 @@ impl ComAmazonawsXrayAwsxrayState {
                         last_arrival: arrived_at,
                     },
                 );
-                if held {
-                    SamplingRuleNameOnArrival::Held
-                } else {
-                    SamplingRuleNameOnArrival::Free
-                }
             }
+        }
+        if held {
+            SamplingRuleNameOnArrival::Held
+        } else {
+            SamplingRuleNameOnArrival::Free
         }
     }
 

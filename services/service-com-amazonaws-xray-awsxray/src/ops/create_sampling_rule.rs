@@ -8,8 +8,8 @@
 //!
 //! The read of the name and the insert are the service's own two steps, so a
 //! duplicate `RuleName` is refused by whichever of them catches it, in that
-//! layer's own words: a name already held when the request arrived is refused by
-//! the read, with X-Ray's fixed sentence for that condition
+//! layer's own words: a name the account already held when the request arrived
+//! is refused by the read, with X-Ray's fixed sentence for that condition
 //! ([`crate::state::SAMPLING_RULE_EXISTS_MESSAGE`]); a create that read the name
 //! as free and then lost the insert to another create in flight is refused by
 //! the uniqueness constraint of the store it writes through, which names the
@@ -18,23 +18,22 @@
 //! `InvalidRequestException` (400), and the insert itself is ONE step on the
 //! locked store, so N callers racing for one name have exactly one winner.
 //!
-//! WHICH of the two a loser is answered with follows from whether it RACED the
-//! create that took the name: a create that arrives while another create of the
-//! same name is still being served, or that read the name as free and then lost
-//! the insert, was sent before any answer could have told its caller the name
-//! was taken, so the constraint's sentence answers it; a create that arrives
-//! when the name is held by a create already answered, with none of that name in
-//! flight beside it, takes the read's sentence.
+//! WHICH of the two a loser is answered with follows from its OWN read of the
+//! name ([`crate::state::SamplingRuleNameOnArrival`]), taken as the request
+//! arrives: a create that found the name taken is answered for that, however
+//! many creates of the name are being served beside it, since it never read the
+//! name as free; only a create that found the name free can go on to lose the
+//! insert, and the constraint's sentence answers that one.
 //!
 //! So those two steps are separated in TIME, by the span the service spends
 //! serving one create ([`crate::state::SAMPLING_RULE_CREATE_SPAN`]): a create
 //! that read the name as free spends what is left of that span before it writes,
 //! and every create of the name that arrives meanwhile pushes the span out from
 //! its own arrival. That is what makes the creates a client dispatches together
-//! — none of which could have had an answer about the name — all read the name
-//! before any of them takes it, while a caller that waits for its answer before
-//! asking again is never inside the span and so reads the name as held. A store
-//! already holding
+//! for a free name — none of which could have had an answer about the name — all
+//! read the name before any of them takes it, while a caller that waits for its
+//! answer before asking again is never inside the span and so reads the name as
+//! held. A store already holding
 //! [`crate::state::MAX_SAMPLING_RULES`] rules answers the modelled
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
@@ -203,12 +202,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The service's OWN read of the name, taken as the request arrives and
         // before any of the work below: a duplicate name is refused by one of
-        // two layers, and what this arrival finds is what decides which
+        // two layers, and what this read finds is what decides which
         // (`crate::state::SamplingRuleNameOnArrival`). The arrival also counts
-        // this create as in flight for the name it asks for, so a create that
-        // arrives beside it sees that it is racing rather than reading a name
-        // whose holder had been answered; the guard below reports this one
-        // finished however the request ends.
+        // this create as in flight for the name it asks for, which holds open
+        // the span a create of a free name spends before it writes; the guard
+        // below reports this one finished however the request ends.
         let name_in_flight = crate::state::sampling_rule_name(&input.sampling_rule)
             .ok()
             .map(str::to_string);
@@ -217,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match name_in_flight.as_deref() {
                 Some(name) => store.sampling_rule_create_arrived(name),
                 // The rule names nothing a rule could be stored under, so there
-                // is no name to race for: `insert_sampling_rule` refuses it for
+                // is no name to read: `insert_sampling_rule` refuses it for
                 // what it says.
                 None => crate::state::SamplingRuleNameOnArrival::Free,
             }
@@ -341,10 +339,12 @@ fn invalid(message: impl Into<String>) -> CreateSamplingRuleError {
 ///
 /// Held for the whole of `handle` and reported finished when it is dropped, so
 /// every way the request can end — the stored rule, any of the refusals, a
-/// panic — leaves the count where it was. What it is for: a create that arrives
-/// while another create of its name is still being served is one of a RACE for
-/// that name, and which of X-Ray's two duplicate-name refusals answers a loser
-/// turns on exactly that (`crate::state::SamplingRuleNameOnArrival`).
+/// panic — leaves the count where it was. What it is for: it holds open the span
+/// between a create's read of a FREE name and its write
+/// (`crate::state::SAMPLING_RULE_CREATE_SPAN`), so the creates a client
+/// dispatches together for one unused name all take their read before any of
+/// them writes — which is what makes a loser of that race one the store's
+/// uniqueness constraint refuses.
 struct InFlightCreate {
     /// The store the count lives in.
     state: ::engine::ServiceState<crate::state::ComAmazonawsXrayAwsxrayState>,
