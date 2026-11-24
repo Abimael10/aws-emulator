@@ -62,6 +62,12 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-glue-awsglue = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# A CloudWatch Logs log group (and the other resources that service holds a tag set for)
+# carries the tag set this API reads and writes for the `logs` namespace:
+# `TagResource`/`UntagResource` there and `TagResources`/`UntagResources` here edit ONE
+# set, which is why a group tagged through this API reports that tag from CloudWatch Logs'
+# own `ListTagsForResource` and is discoverable through `GetResources`.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }

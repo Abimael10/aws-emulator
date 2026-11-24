@@ -273,10 +273,10 @@ async fn a_value_past_the_published_maximum_is_not_refused_by_the_arn_template()
 async fn a_parseable_element_at_each_length_extreme_is_tagged_and_read_back() {
     let router = emulator();
 
-    let shortest = "arn:aws:logs:::b".to_string();
+    let shortest = "arn:aws:lex:::b".to_string();
     let longest = format!(
-        "arn:aws:logs:::{}",
-        "b".repeat(RESOURCE_ARN_MAX_LENGTH - "arn:aws:logs:::".len())
+        "arn:aws:lex:::{}",
+        "b".repeat(RESOURCE_ARN_MAX_LENGTH - "arn:aws:lex:::".len())
     );
     let served: &[(&str, &String)] = &[
         ("the shortest parseable ARN", &shortest),

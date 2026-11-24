@@ -20003,6 +20003,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
+ "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-connecthealth-connecthealth",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-ec2-amazonec2",

@@ -810,7 +810,7 @@ mod derived_from_the_accounts_resources {
     const INSTANCE: &str = "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0";
     const VOLUME: &str = "arn:aws:ec2:us-east-1:000000000000:volume/vol-0123456789abcdef0";
     const ALARM: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/derived-probe";
-    const LOG_GROUP: &str = "arn:aws:logs:us-east-1:000000000000:log-group:/derived/probe";
+    const DB_INSTANCE: &str = "arn:aws:rds:us-east-1:000000000000:db:derived-probe";
 
     /// The types those ARNs name, from the AWS CloudFormation resource and property
     /// types reference — the vocabulary `ResourceIdentifier$ResourceType` is
@@ -818,7 +818,7 @@ mod derived_from_the_accounts_resources {
     const INSTANCE_TYPE: &str = "AWS::EC2::Instance";
     const VOLUME_TYPE: &str = "AWS::EC2::Volume";
     const ALARM_TYPE: &str = "AWS::CloudWatch::Alarm";
-    const LOG_GROUP_TYPE: &str = "AWS::Logs::LogGroup";
+    const DB_INSTANCE_TYPE: &str = "AWS::RDS::DBInstance";
 
     /// A supported type nothing in the account below is.
     const TABLE_TYPE: &str = "AWS::DynamoDB::Table";
@@ -841,7 +841,7 @@ mod derived_from_the_accounts_resources {
             };
             for (arns, tags) in [
                 (
-                    vec![INSTANCE, LOG_GROUP],
+                    vec![INSTANCE, DB_INSTANCE],
                     json!({ "marker": "probe", "Stage": "Test" }),
                 ),
                 (vec![VOLUME, ALARM], json!({ "marker": "other" })),
@@ -935,11 +935,11 @@ mod derived_from_the_accounts_resources {
             ),
             (
                 json!({ "TagFilters": [{ "Key": "marker", "Values": ["probe"] }] }),
-                sorted([INSTANCE, LOG_GROUP]),
+                sorted([INSTANCE, DB_INSTANCE]),
             ),
             (
                 json!({ "TagFilters": [{ "Key": "marker", "Values": ["probe", "other"] }] }),
-                sorted([INSTANCE, LOG_GROUP, VOLUME, ALARM]),
+                sorted([INSTANCE, DB_INSTANCE, VOLUME, ALARM]),
             ),
             (
                 json!({
@@ -948,11 +948,11 @@ mod derived_from_the_accounts_resources {
                         { "Key": "Stage", "Values": ["Test"] }
                     ]
                 }),
-                sorted([INSTANCE, LOG_GROUP]),
+                sorted([INSTANCE, DB_INSTANCE]),
             ),
             (
                 json!({ "TagFilters": [{ "Key": "Stage" }] }),
-                sorted([INSTANCE, LOG_GROUP]),
+                sorted([INSTANCE, DB_INSTANCE]),
             ),
             (
                 json!({
@@ -963,10 +963,10 @@ mod derived_from_the_accounts_resources {
             ),
             (
                 json!({
-                    "ResourceTypeFilters": [LOG_GROUP_TYPE],
+                    "ResourceTypeFilters": [DB_INSTANCE_TYPE],
                     "TagFilters": [{ "Key": "marker" }]
                 }),
-                vec![LOG_GROUP.to_string()],
+                vec![DB_INSTANCE.to_string()],
             ),
             (
                 json!({
@@ -1050,7 +1050,7 @@ mod derived_from_the_accounts_resources {
             );
         }
 
-        for unadmitted in [vec![LOG_GROUP_TYPE], vec![TABLE_TYPE, LOG_GROUP_TYPE]] {
+        for unadmitted in [vec![DB_INSTANCE_TYPE], vec![TABLE_TYPE, DB_INSTANCE_TYPE]] {
             let case = format!("unadmitted Filters={unadmitted:?}");
             let (status, body) = account
                 .call(

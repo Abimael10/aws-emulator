@@ -3233,6 +3233,26 @@ pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
     None
 }
 
+/// The member every tagging operation of this service names the resource's ARN with
+/// (`TagResource$resourceArn`, `UntagResource$resourceArn`,
+/// `ListTagsForResource$resourceArn`), so a refusal of the VALUE states the member it
+/// could not take.
+pub const TAGGING_RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// Whether `value` is one those members admit at all.
+///
+/// Each of them targets `AmazonResourceName`, `@pattern ^[\w+=/:,.@-]*$`
+/// (`smithy_query(query="shape",shape="AmazonResourceName")`), whose character class holds
+/// no `*` — so the wildcard-suffixed log-group ARN form (`LogGroup$arn`, which names the
+/// group together with everything under it) and any other pattern is a value this service
+/// refuses before it resolves a resource, however well-formed the rest of it is.
+pub fn is_tagging_resource_arn_value(value: &str) -> bool {
+    value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '+' | '=' | '/' | ':' | ',' | '.' | '@' | '-')
+    })
+}
+
 /// The refusal for a `resourceArn` that is a well-formed ARN but names no resource this
 /// service can tag, stated as `TagResource` states the rule: "Currently, the only CloudWatch
 /// Logs resources that can be tagged are log groups and destinations." A value that is not

@@ -460,6 +460,23 @@ pub fn too_many_tags_failure(arn: &str, would_hold: usize) -> FailureInfo {
     }
 }
 
+/// The per-resource failure the tagging API reports for an ARN the OWNING service's
+/// own tagging member will not take as a value at all — one carrying a character that
+/// member's constraint does not admit, such as the `*` of a wildcard pattern.
+///
+/// A per-resource entry rather than a request-level refusal, so the other ARNs of the
+/// same batch are still written, and a VALIDATION failure: nothing was resolved, because
+/// the value never reached the owning service's resolution. The message names the member
+/// that service takes the ARN in, as the owning service names it, which is what tells a
+/// caller which ARN form to use.
+pub fn invalid_member_failure(member: &str) -> FailureInfo {
+    FailureInfo {
+        status_code: 400,
+        error_code: Some("ValidationException".to_string()),
+        error_message: Some(format!("Invalid {member}")),
+    }
+}
+
 /// The per-resource failure `TagResources` reports for a NEW ARN once the store
 /// already holds [`MAX_TAGGED_RESOURCES`].
 ///

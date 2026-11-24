@@ -189,9 +189,9 @@ const ARN_FORMS: &[(&str, &str, Option<&str>)] = &[
     ),
     // `resource-type:resource-id`.
     (
-        "arn:aws:logs:us-east-1:123456789012:log-group:packer",
-        "logs",
-        Some("logs:log-group"),
+        "arn:aws:lex:us-east-1:123456789012:bot:packer",
+        "lex",
+        Some("lex:bot"),
     ),
     // A global resource: no region segment at all.
     (
@@ -344,7 +344,7 @@ async fn resource_type_filters_match_the_service_and_resource_type_of_the_arn() 
 async fn tag_filters_and_across_keys_and_or_within_one_filters_values() {
     let router = emulator();
     // Three resources whose tag sets differ in value, in key set, and in count.
-    let alpha = "arn:aws:logs:us-east-1:123456789012:log-group:alpha";
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
     let beta = "arn:aws:codecommit:us-east-1:123456789012:beta";
     let gamma = "arn:aws:ec2:us-east-1:123456789012:instance/gamma";
     tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
@@ -404,7 +404,7 @@ async fn tag_filters_and_across_keys_and_or_within_one_filters_values() {
 #[tokio::test]
 async fn tag_resources_upserts_and_untag_resources_removes_only_the_named_keys() {
     let router = emulator();
-    let arn = "arn:aws:logs:us-east-1:123456789012:log-group:group-a";
+    let arn = "arn:aws:lex:us-east-1:123456789012:bot:group-a";
     let other = "arn:aws:codecommit:us-east-1:123456789012:repo-a";
     tag(&router, &[arn, other], &[("Env", "prod"), ("Team", "core")]).await;
 
@@ -513,7 +513,7 @@ async fn tag_resources_upserts_and_untag_resources_removes_only_the_named_keys()
         &router,
         "UntagResources",
         serde_json::json!({
-            "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:never-tagged"],
+            "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:never-tagged"],
             "TagKeys": ["Env"]
         }),
     )
@@ -529,7 +529,7 @@ async fn tag_resources_upserts_and_untag_resources_removes_only_the_named_keys()
 #[tokio::test]
 async fn get_tag_keys_and_values_are_projections_of_the_store() {
     let router = emulator();
-    let alpha = "arn:aws:logs:us-east-1:123456789012:log-group:alpha";
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
     let beta = "arn:aws:codecommit:us-east-1:123456789012:beta";
     tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
     tag(&router, &[beta], &[("Env", "dev"), ("Zone", "a")]).await;
@@ -594,7 +594,7 @@ async fn get_tag_keys_and_values_are_projections_of_the_store() {
 async fn resources_per_page_walks_every_resource_exactly_once() {
     let router = emulator();
     let arns: Vec<String> = (0..7)
-        .map(|n| format!("arn:aws:logs:us-east-1:123456789012:log-group:group-{n}"))
+        .map(|n| format!("arn:aws:lex:us-east-1:123456789012:bot:group-{n}"))
         .collect();
     let borrowed: Vec<&str> = arns.iter().map(String::as_str).collect();
     tag(&router, &borrowed, &[("Env", "prod")]).await;
@@ -653,7 +653,7 @@ async fn tags_per_page_caps_a_page_without_splitting_a_resource() {
     // 11 resources with 10 tags each: 110 tag pairs against the smallest
     // documented TagsPerPage budget of 100.
     let arns: Vec<String> = (0..11)
-        .map(|n| format!("arn:aws:logs:us-east-1:123456789012:log-group:group-{n:02}"))
+        .map(|n| format!("arn:aws:lex:us-east-1:123456789012:bot:group-{n:02}"))
         .collect();
     let borrowed: Vec<&str> = arns.iter().map(String::as_str).collect();
     let keys: Vec<String> = (0..10).map(|n| format!("Key{n}")).collect();
@@ -712,7 +712,7 @@ async fn get_tag_keys_and_values_resume_from_their_own_token() {
     // More distinct keys and values than the page size, so both reads truncate.
     // Spread across three resources, since one resource holds at most 50 tags.
     for chunk in 0..3 {
-        let arn = format!("arn:aws:logs:us-east-1:123456789012:log-group:group-{chunk}");
+        let arn = format!("arn:aws:lex:us-east-1:123456789012:bot:group-{chunk}");
         let keys: Vec<String> = (0..50).map(|n| format!("Key{:03}", chunk * 50 + n)).collect();
         let tags: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "shared")).collect();
         tag(&router, &[arn.as_str()], &tags).await;
@@ -769,7 +769,7 @@ async fn get_tag_keys_and_values_resume_from_their_own_token() {
 async fn a_token_this_service_never_minted_is_a_malformed_parameter() {
     let router = emulator();
     let arns: Vec<String> = (0..3)
-        .map(|n| format!("arn:aws:logs:us-east-1:123456789012:log-group:group-{n}"))
+        .map(|n| format!("arn:aws:lex:us-east-1:123456789012:bot:group-{n}"))
         .collect();
     let borrowed: Vec<&str> = arns.iter().map(String::as_str).collect();
     tag(&router, &borrowed, &[("Env", "prod")]).await;
@@ -805,7 +805,7 @@ async fn a_token_this_service_never_minted_is_a_malformed_parameter() {
         (
             "made-up digest",
             serde_json::json!({
-                "PaginationToken": "deadbeefdeadbeef:4000000000:arn:aws:logs:us-east-1:123456789012:log-group:group-0"
+                "PaginationToken": "deadbeefdeadbeef:4000000000:arn:aws:lex:us-east-1:123456789012:bot:group-0"
             }),
         ),
         (
@@ -853,7 +853,7 @@ async fn get_resources_refuses_the_documented_parameter_combinations() {
     let router = emulator();
     tag(
         &router,
-        &["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+        &["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
         &[("Env", "prod")],
     )
     .await;
@@ -864,35 +864,35 @@ async fn get_resources_refuses_the_documented_parameter_combinations() {
         (
             "TagFilters",
             serde_json::json!({
-                "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
                 "TagFilters": [{ "Key": "Env" }]
             }),
         ),
         (
             "ResourceTypeFilters",
             serde_json::json!({
-                "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
                 "ResourceTypeFilters": ["s3"]
             }),
         ),
         (
             "ResourcesPerPage",
             serde_json::json!({
-                "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
                 "ResourcesPerPage": 1
             }),
         ),
         (
             "TagsPerPage",
             serde_json::json!({
-                "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
                 "TagsPerPage": 100
             }),
         ),
         (
             "PaginationToken",
             serde_json::json!({
-                "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:group-a"],
+                "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:group-a"],
                 "PaginationToken": "anything"
             }),
         ),
@@ -958,7 +958,7 @@ async fn get_resources_refuses_the_documented_parameter_combinations() {
 #[tokio::test]
 async fn compliance_details_are_refused_rather_than_invented() {
     let router = emulator();
-    let arn = "arn:aws:logs:us-east-1:123456789012:log-group:group-a";
+    let arn = "arn:aws:lex:us-east-1:123456789012:bot:group-a";
     tag(&router, &[arn], &[("Env", "prod")]).await;
 
     // A normal read carries no ComplianceDetails at all.
@@ -1020,7 +1020,7 @@ async fn the_store_refuses_to_grow_without_bound() {
     // AWS limit: "Each resource can have up to 50 tags" (TagResources doc).
     // Rows: exactly at the limit is accepted, one past it is refused, and the
     // refusal leaves the stored tag map untouched.
-    let arn = "arn:aws:logs:us-east-1:123456789012:log-group:group-a";
+    let arn = "arn:aws:lex:us-east-1:123456789012:bot:group-a";
     let keys: Vec<String> = (0..50).map(|n| format!("Key{n:02}")).collect();
     for chunk in keys.chunks(25) {
         let tags: Vec<(&str, &str)> = chunk.iter().map(|key| (key.as_str(), "v")).collect();
@@ -1070,7 +1070,7 @@ async fn the_store_refuses_to_grow_without_bound() {
     // Emulator bound: the store holds at most MAX_TAGGED_RESOURCES resources, so
     // a client looping with fresh ARNs is refused rather than growing it for ever.
     // 1 resource is already stored, so 999 more fill it.
-    let filler: Vec<String> = (0..999).map(|n| format!("arn:aws:logs:us-east-1:123456789012:log-group:q{n:04}")).collect();
+    let filler: Vec<String> = (0..999).map(|n| format!("arn:aws:lex:us-east-1:123456789012:bot:q{n:04}")).collect();
     for chunk in filler.chunks(20) {
         let arns: Vec<&str> = chunk.iter().map(String::as_str).collect();
         tag(&router, &arns, &[("Env", "prod")]).await;
@@ -1084,14 +1084,14 @@ async fn the_store_refuses_to_grow_without_bound() {
         &router,
         "TagResources",
         serde_json::json!({
-            "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:one-too-many", filler[1].clone()],
+            "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:one-too-many", filler[1].clone()],
             "Tags": { "Env": "prod" }
         }),
     )
     .await;
     assert_eq!(status, 200, "case store at capacity: expected HTTP 200, got {body}");
     assert_eq!(
-        body["FailedResourcesMap"]["arn:aws:logs:us-east-1:123456789012:log-group:one-too-many"]["ErrorCode"],
+        body["FailedResourcesMap"]["arn:aws:lex:us-east-1:123456789012:bot:one-too-many"]["ErrorCode"],
         serde_json::json!("InvalidParameterException"),
         "case store at capacity: the new ARN must be refused, got {body}"
     );
@@ -1104,7 +1104,7 @@ async fn the_store_refuses_to_grow_without_bound() {
     let (_, read) = call(
         &router,
         "GetResources",
-        serde_json::json!({ "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:one-too-many"] }),
+        serde_json::json!({ "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:one-too-many"] }),
     )
     .await;
     assert!(
@@ -1537,7 +1537,7 @@ struct FramingCase {
 #[tokio::test]
 async fn both_framings_of_this_endpoint_answer_one_query_the_same_way() {
     let router = emulator();
-    let alpha = "arn:aws:logs:us-east-1:123456789012:log-group:alpha";
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
     let beta = "arn:aws:codecommit:us-east-1:123456789012:beta";
     tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
     tag(&router, &[beta], &[("Env", "dev")]).await;
@@ -1549,7 +1549,7 @@ async fn both_framings_of_this_endpoint_answer_one_query_the_same_way() {
             operation: "GetResources",
             input: serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
             member: "ResourceTagMappingList",
-            expected: vec!["arn:aws:logs:us-east-1:123456789012:log-group:alpha"],
+            expected: vec!["arn:aws:lex:us-east-1:123456789012:bot:alpha"],
             truncated: false,
             lengths: Lengths::Declared,
         },
@@ -1584,7 +1584,7 @@ async fn both_framings_of_this_endpoint_answer_one_query_the_same_way() {
             member: "ResourceTagMappingList",
             expected: vec![
                 "arn:aws:codecommit:us-east-1:123456789012:beta",
-                "arn:aws:logs:us-east-1:123456789012:log-group:alpha",
+                "arn:aws:lex:us-east-1:123456789012:bot:alpha",
             ],
             truncated: false,
             lengths: Lengths::Indefinite,
@@ -1685,7 +1685,7 @@ async fn both_framings_of_this_endpoint_answer_one_query_the_same_way() {
 #[tokio::test]
 async fn one_store_is_read_and_written_through_either_framing() {
     let router = emulator();
-    let alpha = "arn:aws:logs:us-east-1:123456789012:log-group:alpha";
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
     let gamma = "arn:aws:ec2:us-east-1:123456789012:instance/gamma";
     tag(&router, &[alpha], &[("Env", "prod")]).await;
 
@@ -1768,7 +1768,7 @@ async fn one_store_is_read_and_written_through_either_framing() {
 #[tokio::test]
 async fn a_failure_of_a_cbor_framed_request_is_answered_in_that_framing() {
     let router = emulator();
-    tag(&router, &["arn:aws:logs:us-east-1:123456789012:log-group:alpha"], &[("Env", "prod")]).await;
+    tag(&router, &["arn:aws:lex:us-east-1:123456789012:bot:alpha"], &[("Env", "prod")]).await;
 
     // A modelled refusal of the operation ("You can't specify both
     // ResourceARNList and ResourceTypeFilters / TagFilters / ResourcesPerPage /
@@ -1776,7 +1776,7 @@ async fn a_failure_of_a_cbor_framed_request_is_answered_in_that_framing() {
     // errors GetResources declares (`smithy_query(query="operation",
     // operation="GetResources")` -> errors InvalidParameterException 400).
     let refused = serde_json::json!({
-        "ResourceARNList": ["arn:aws:logs:us-east-1:123456789012:log-group:alpha"],
+        "ResourceARNList": ["arn:aws:lex:us-east-1:123456789012:bot:alpha"],
         "TagFilters": [{ "Key": "Env" }]
     });
     let as_json = framed_call(

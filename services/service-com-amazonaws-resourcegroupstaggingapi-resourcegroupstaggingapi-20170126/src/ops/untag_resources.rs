@@ -15,7 +15,8 @@
 //! (a value that is not an ARN, an ARN outside this endpoint's partition or
 //! Region, a reserved `aws:` key) refuses the whole call with
 //! `InvalidParameterException`, while a well-formed ARN the owning service holds
-//! no resource for is that ARN's own `FailedResourcesMap` entry.
+//! no resource for — or one that service's own tagging member will not take as a
+//! value at all — is that ARN's own `FailedResourcesMap` entry.
 //!
 //! ## Shape of an operation
 //!

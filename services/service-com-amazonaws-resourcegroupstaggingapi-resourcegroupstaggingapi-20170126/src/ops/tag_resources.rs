@@ -16,9 +16,10 @@
 //! * A PER-RESOURCE failure is an entry in `FailedResourcesMap` with HTTP 200
 //!   overall, because the other ARNs in the same request were tagged: a
 //!   well-formed ARN the owning service holds no resource for (carrying that
-//!   service's own not-found code), a write that would push one resource past the
-//!   documented 50-tag limit, or a NEW ARN once the store is already holding this
-//!   emulator's maximum (see `crate::state::MAX_TAGGED_RESOURCES`).
+//!   service's own not-found code), an ARN that service's own tagging member
+//!   will not take as a value at all, a write that would push one resource past
+//!   the documented 50-tag limit, or a NEW ARN once the store is already holding
+//!   this emulator's maximum (see `crate::state::MAX_TAGGED_RESOURCES`).
 //!
 //! Resolution reaches as far as this crate links: an ARN in a namespace
 //! `crate::state::owners` does not own is neither confirmed nor denied, and its

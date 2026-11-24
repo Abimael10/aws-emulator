@@ -60,6 +60,7 @@ use std::time::SystemTime;
 // declared `{ workspace = true }` in this crate's `Cargo.toml`, so the path the
 // workspace resolves them at stays in one place.
 use service_com_amazonaws_apigateway_backplanecontrolservice as owner_apigateway;
+use service_com_amazonaws_cloudwatchlogs_logs_20140328 as owner_logs;
 use service_com_amazonaws_connecthealth_connecthealth as owner_connecthealth;
 use service_com_amazonaws_dynamodb_dynamodb_20120810 as owner_dynamodb;
 use service_com_amazonaws_ec2_amazonec2 as owner_ec2;
@@ -264,6 +265,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "glue" => glue(engine, arn, change),
         "kms" => kms(engine, arn, change),
         "lambda" => lambda(engine, arn, change),
+        "logs" => logs(engine, arn, change),
         "s3" => s3(engine, arn, change),
         "secretsmanager" => secretsmanager(engine, arn, change),
         "sns" => sns(engine, arn, change),
@@ -453,6 +455,34 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
         for config in state.code_signing_configs.values() {
             record(config.arn.clone(), config.tags.clone());
+        }
+    }
+    if let Some(state) = owner_logs::state::service_state(engine) {
+        // Every resource that service holds a tag set for, each under the ARN it minted
+        // for it — for a log group the BARE form (`LogGroup$logGroupArn`), because the
+        // trailing `:*` of the other form names the group together with everything under
+        // it rather than the resource, and is not a value that service's own tagging
+        // member admits. A record of that service carries the Region it was created in
+        // inside its ARN, so the caller's Region filter applies to these rows exactly as
+        // it does to any other owner's.
+        let state = state.lock();
+        for group in state.log_groups.values() {
+            record(group.log_group_arn.clone(), group.tags.clone());
+        }
+        for destination in state.destinations.values() {
+            record(destination.arn.clone(), destination.tags.clone());
+        }
+        for delivery in state.deliveries.values() {
+            record(delivery.arn.clone(), delivery.tags.clone());
+        }
+        for source in state.delivery_sources.values() {
+            record(source.arn.clone(), source.tags.clone());
+        }
+        for destination in state.delivery_destinations.values() {
+            record(destination.arn.clone(), destination.tags.clone());
+        }
+        for table in state.lookup_tables.values() {
+            record(table.arn.clone(), table.tags.clone());
         }
     }
     if let Some(state) = owner_secretsmanager::state::service_state(engine) {
@@ -1287,6 +1317,66 @@ fn kms<Eng: Send + Sync + 'static>(
     }
     Resolution::Present {
         tags: Some(key.tags.clone()),
+    }
+}
+
+/// Amazon CloudWatch Logs: the resources that service holds a tag set for — a log group,
+/// a logical destination, a delivery and the delivery source and delivery destination it
+/// pairs, and a lookup table — whose tags are the resource's own.
+///
+/// The ARN is read by the SAME resolution that service's own tagging operations read a
+/// `resourceArn` with (its `tagged_resource`, then the one tag set that resource's record
+/// holds), so there is ONE tag set per resource: a tag written here is what its
+/// `ListTagsForResource` reports, and a tag written there is what `GetResources`
+/// discovers.
+///
+/// A `logs` ARN naming a kind that service holds no tag set for — a log stream, the
+/// account's stored query results — is that ARN's own per-resource failure carrying that
+/// service's refusal for a `resourceArn` it cannot make a tagging target of, and a value
+/// its tagging member does not admit at all is that ARN's own validation failure.
+fn logs<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_logs::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    // That service's tagging operations name the ARN in a member whose own constraint
+    // admits no `*`, so a value carrying one — the wildcard-suffixed log-group ARN form
+    // its `DescribeLogGroups` reports, which names the group together with everything
+    // under it rather than one resource — is refused as the value it is, before any
+    // resource is resolved: a VALIDATION failure for that ARN alone, naming the member
+    // that service takes an ARN in.
+    if !owner_logs::state::is_tagging_resource_arn_value(&arn.arn) {
+        return Resolution::Absent(crate::state::invalid_member_failure(
+            owner_logs::state::TAGGING_RESOURCE_ARN_MEMBER,
+        ));
+    }
+    let Some(resource) = owner_logs::state::tagged_resource(&arn.arn) else {
+        return absent(
+            "InvalidParameterException",
+            owner_logs::state::UNTAGGABLE_RESOURCE_ARN.to_string(),
+        );
+    };
+    let mut state = state.lock();
+    // The Region comes off the ARN, which is the Region the call was made in:
+    // `addressable_arn` has already refused an ARN of any other, and that service holds
+    // its Region-scoped resources (the delivery family) under the Region they were
+    // created in.
+    let Some(tags) = state.resource_tags_mut(&arn.region, &resource) else {
+        return absent(
+            "ResourceNotFoundException",
+            owner_logs::state::resource_not_found_message(resource.kind()),
+        );
+    };
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(tags) {
+            return Resolution::TooManyTags(would_hold);
+        }
+    }
+    Resolution::Present {
+        tags: Some(tags.clone()),
     }
 }
 
