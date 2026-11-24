@@ -1509,3 +1509,327 @@ async fn each_endpoint_group_kind_is_reached_only_through_its_own_operations() {
         );
     }
 }
+
+/// `DeleteCustomRoutingEndpointGroup` for one ARN.
+async fn delete_endpoint_group(
+    router: &MultiServiceRouter,
+    endpoint_group_arn: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "DeleteCustomRoutingEndpointGroup",
+        json!({ "EndpointGroupArn": endpoint_group_arn }),
+    )
+    .await
+}
+
+/// RULE: a delete removes exactly the custom routing endpoint group its ARN names — from
+/// the store and from its parent listener's child list — so every later read of that ARN
+/// is the absent-resource refusal, while its siblings and its parent listener are reported
+/// unchanged and the Region and the idempotency token the group held are free again.
+#[tokio::test]
+async fn deleting_a_custom_routing_endpoint_group_removes_only_that_group() {
+    // The rows differ along what the rule generalises over: how many groups the listener
+    // holds, and which one of them the delete names — a collection of one, and the first,
+    // a middle and the last entry of a larger one.
+    let rows: [(&str, usize, usize); 5] = [
+        ("the only group", 1, 0),
+        ("the first of three", 3, 0),
+        ("the middle of three", 3, 1),
+        ("the last of three", 3, 2),
+        ("one of four", 4, 2),
+    ];
+
+    for (case, held, target) in rows {
+        let router = emulator();
+        let (_, listener_arn) = custom_routing_listener(&router, "egdel").await;
+        // One group per Region: "An Amazon Web Services Region can have only one endpoint
+        // group for a specific listener" (`CustomRoutingEndpointGroup` doc).
+        let mut groups: Vec<String> = Vec::new();
+        for (index, region) in REGIONS.iter().enumerate().take(held) {
+            groups.push(endpoint_group_arn_of(
+                &created_endpoint_group(
+                    &router,
+                    &listener_arn,
+                    &format!("egdel-{index}"),
+                    region,
+                    destinations_over(80..81),
+                )
+                .await,
+            ));
+        }
+        let deleted = groups[target].clone();
+
+        let (status, body) = delete_endpoint_group(&router, &deleted).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete of {deleted} to succeed, got {status} \
+             with {body}"
+        );
+
+        // The group is gone: the read of its ARN, and a second delete of it, both state
+        // the absent-resource refusal naming the ARN the request carried.
+        for (leg, answered) in [
+            ("read", describe_endpoint_group(&router, &deleted).await),
+            ("second delete", delete_endpoint_group(&router, &deleted).await),
+        ] {
+            let (status, body) = answered;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "EndpointGroupNotFoundException"),
+                "case {case:?} {leg}: expected the deleted group to be absent, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                format!("EndpointGroup {deleted} does not exist."),
+                "case {case:?} {leg}: expected the absent-resource wording for {deleted}, \
+                 got {body}"
+            );
+        }
+
+        // Nothing else moved: every sibling still reports its own ARN and Region, and the
+        // parent listener is still there.
+        for (index, sibling) in groups.iter().enumerate() {
+            if index == target {
+                continue;
+            }
+            let (status, body) = describe_endpoint_group(&router, sibling).await;
+            assert_eq!(
+                (
+                    status,
+                    body["EndpointGroup"]["EndpointGroupArn"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    body["EndpointGroup"]["EndpointGroupRegion"]
+                        .as_str()
+                        .unwrap_or_default(),
+                ),
+                (200, sibling.as_str(), REGIONS[index]),
+                "case {case:?}: expected sibling {sibling} to survive the delete, got \
+                 {status} with {body}"
+            );
+        }
+        let (status, body) = describe_listener(&router, &listener_arn).await;
+        assert_eq!(
+            (
+                status,
+                body["Listener"]["ListenerArn"].as_str().unwrap_or_default()
+            ),
+            (200, listener_arn.as_str()),
+            "case {case:?}: expected the parent listener to survive the delete, got \
+             {status} with {body}"
+        );
+
+        // The parent no longer counts the deleted group: its Region is free for a new
+        // group, and the token that minted it has nothing left to replay, so the same
+        // token mints a second, distinct group rather than answering the deleted one.
+        let remade = endpoint_group_arn_of(
+            &created_endpoint_group(
+                &router,
+                &listener_arn,
+                &format!("egdel-{target}"),
+                REGIONS[target],
+                destinations_over(443..444),
+            )
+            .await,
+        );
+        assert_ne!(
+            remade, deleted,
+            "case {case:?}: expected the re-create to mint a fresh ARN, got {remade}"
+        );
+        let (status, body) = describe_endpoint_group(&router, &remade).await;
+        assert_eq!(
+            (
+                status,
+                body["EndpointGroup"]["EndpointGroupRegion"]
+                    .as_str()
+                    .unwrap_or_default()
+            ),
+            (200, REGIONS[target]),
+            "case {case:?}: expected the re-created group to read back, got {status} \
+             with {body}"
+        );
+    }
+}
+
+/// RULE: a delete resolves its `EndpointGroupArn` only against endpoint groups of its own
+/// family — an ARN that names a group of the OTHER family is refused as the family
+/// crossing it is and that group survives, and an ARN that names no group at all keeps the
+/// absent-resource wording — which holds for both deletes, each way round.
+#[tokio::test]
+async fn each_endpoint_group_kind_is_deleted_only_through_its_own_operation() {
+    let router = emulator();
+    let (_, custom_listener) = custom_routing_listener(&router, "egdelkinds").await;
+    let standard_accelerator =
+        arn_of(&create_accelerator(&router, "std-egdelkinds", "std-dk").await);
+    let standard_listener = ok(
+        &router,
+        "CreateListener",
+        json!({
+            "AcceleratorArn": standard_accelerator,
+            "PortRanges": [{ "FromPort": 80, "ToPort": 80 }],
+            "Protocol": "TCP",
+            "IdempotencyToken": "std-dk-lis",
+        }),
+    )
+    .await["Listener"]["ListenerArn"]
+        .as_str()
+        .expect("the create answers a ListenerArn")
+        .to_string();
+
+    let custom_group = endpoint_group_arn_of(
+        &created_endpoint_group(
+            &router,
+            &custom_listener,
+            "delkind-custom",
+            REGIONS[0],
+            destinations_over(80..81),
+        )
+        .await,
+    );
+    let standard_group = ok(
+        &router,
+        "CreateEndpointGroup",
+        json!({
+            "ListenerArn": standard_listener,
+            "EndpointGroupRegion": REGIONS[0],
+            "IdempotencyToken": "delkind-standard",
+        }),
+    )
+    .await["EndpointGroup"]["EndpointGroupArn"]
+        .as_str()
+        .expect("the create answers an EndpointGroupArn")
+        .to_string();
+    // An ARN of the right shape under a real listener of each family, and one under an
+    // accelerator of neither: nothing minted any of them.
+    let unminted_custom = format!("{custom_listener}/endpoint-group/feedfacefeed");
+    let unminted_standard = format!("{standard_listener}/endpoint-group/d00dd00dd00d");
+    let unminted_anywhere = "arn:aws:globalaccelerator::000000000000:accelerator/\
+         00000000-0000-4000-8000-000000000000/listener/deadbeef/endpoint-group/0b0b0b0b0b0b"
+        .to_string();
+
+    // (case, the delete called, the ARN it carries, the wording it owes)
+    let cases: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "standard group via DeleteCustomRoutingEndpointGroup",
+            "DeleteCustomRoutingEndpointGroup",
+            &standard_group,
+            format!(
+                "Only Custom Routing resources are supported by this custom routing API; \
+                 got standard accelerator: {standard_group}"
+            ),
+        ),
+        (
+            "custom group via DeleteEndpointGroup",
+            "DeleteEndpointGroup",
+            &custom_group,
+            format!(
+                "Custom Routing resources must use the Custom Routing APIs; got custom \
+                 routing resource: {custom_group}"
+            ),
+        ),
+        (
+            "unminted under a custom routing listener",
+            "DeleteCustomRoutingEndpointGroup",
+            &unminted_custom,
+            format!("EndpointGroup {unminted_custom} does not exist."),
+        ),
+        (
+            "unminted under a standard listener",
+            "DeleteCustomRoutingEndpointGroup",
+            &unminted_standard,
+            format!("EndpointGroup {unminted_standard} does not exist."),
+        ),
+        (
+            "unminted under an accelerator of neither family",
+            "DeleteCustomRoutingEndpointGroup",
+            &unminted_anywhere,
+            format!("EndpointGroup {unminted_anywhere} does not exist."),
+        ),
+    ];
+    for (case, operation, endpoint_group_arn, expected) in cases {
+        let (status, body) = call(
+            &router,
+            operation,
+            json!({ "EndpointGroupArn": endpoint_group_arn }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "EndpointGroupNotFoundException"),
+            "case {case}: expected this delete not to serve the ARN, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected the refusal to name the ARN the request carried, got {body}"
+        );
+    }
+
+    // A refused delete deleted nothing: each group still reads back through its own
+    // family's describe.
+    let (status, body) = describe_endpoint_group(&router, &custom_group).await;
+    assert_eq!(
+        (
+            status,
+            body["EndpointGroup"]["EndpointGroupArn"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        (200, custom_group.as_str()),
+        "case custom survives: expected {custom_group} to be untouched, got {status} \
+         with {body}"
+    );
+    let read_standard = ok(
+        &router,
+        "DescribeEndpointGroup",
+        json!({ "EndpointGroupArn": standard_group }),
+    )
+    .await;
+    assert_eq!(
+        read_standard["EndpointGroup"]["EndpointGroupArn"],
+        json!(standard_group),
+        "case standard survives: expected {standard_group} to be untouched, got \
+         {read_standard}"
+    );
+
+    // And each delete DOES serve its own family's group, which is then absent.
+    ok(
+        &router,
+        "DeleteCustomRoutingEndpointGroup",
+        json!({ "EndpointGroupArn": custom_group }),
+    )
+    .await;
+    ok(
+        &router,
+        "DeleteEndpointGroup",
+        json!({ "EndpointGroupArn": standard_group }),
+    )
+    .await;
+    for (case, operation, endpoint_group_arn) in [
+        (
+            "custom deleted",
+            "DescribeCustomRoutingEndpointGroup",
+            &custom_group,
+        ),
+        ("standard deleted", "DescribeEndpointGroup", &standard_group),
+    ] {
+        let (status, body) = call(
+            &router,
+            operation,
+            json!({ "EndpointGroupArn": endpoint_group_arn }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "EndpointGroupNotFoundException"),
+            "case {case}: expected the deleted group to be absent, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("EndpointGroup {endpoint_group_arn} does not exist."),
+            "case {case}: expected the absent-resource wording, got {body}"
+        );
+    }
+}
