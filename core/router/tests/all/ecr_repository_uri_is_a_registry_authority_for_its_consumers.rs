@@ -3,20 +3,20 @@
 //! The address Amazon ECR publishes for a repository is one a consumer can DIAL — wherever a
 //! client picks that address up, including off an artifact another service derived from it.
 //!
-//! The rule under test: **the URI Amazon ECR reports for a repository is the address this
-//! emulator is SERVED at — host and port — followed by the repository's own name as the path;
-//! which registry HOLDS the repository is reported BESIDE that address, by `registryId` and
-//! the repository's ARN; and every value another service derives from the URI carries the same
-//! authority.** `Repository$repositoryUri` is "The URI for the repository. You can use this
-//! URI for container image `push` and `pull` operations", so a container client splits it on
-//! the first `/` and dials what is ahead of that `/`: the authority has to be an address this
-//! process answers on. The host AWS serves its own registries at
-//! (`<account>.dkr.ecr.<region>.amazonaws.com`) resolves at genuine AWS infrastructure, and so
-//! does any other name this process is not reached at, which is why no address this emulator
-//! announces carries one — a client handed one leaves the emulated environment entirely,
-//! carrying the credential its `docker login` was issued. A client that needs the account or
-//! the Region reads the members that carry that identity instead. That is the rule the owning
-//! crate states and its own suites pin
+//! The rule under test: **the URI Amazon ECR reports for a repository is a registry HOST of
+//! the registry that HOLDS it — the owning account, the two fixed registry labels and that
+//! Region — in the zone and on the port this emulator is SERVED at, followed by the
+//! repository's own name as the path; and every value another service derives from the URI
+//! carries the same authority.** `Repository$repositoryUri` is "The URI for the repository.
+//! You can use this URI for container image `push` and `pull` operations", so a container
+//! client splits it on the first `/` and dials what is ahead of that `/` — and parses it,
+//! because a repository URI's authority is a registry host, which is where a client recovers
+//! the account and the Region from. So the labels are the holding registry's, read off the
+//! stored record, and the zone and the port are this process's own: the zone AWS serves its
+//! registries in (`<account>.dkr.ecr.<region>.amazonaws.com`) resolves at genuine AWS
+//! infrastructure, and so does any other name this process is not reached at, so a client
+//! handed one leaves the emulated environment entirely, carrying the credential its `docker
+//! login` was issued. That is the rule the owning crate states and its own suites pin
 //! (`services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`:
 //! `src/state/registry_address.rs`, `tests/all/repository_registry_uri.rs`,
 //! `tests/all/published_registry_address.rs`), and this suite reads it where three crates
@@ -31,13 +31,13 @@
 //! Amazon ECS registered.
 //!
 //! The rows differ along what the rule generalises over: the Region (and so the partition)
-//! the stack deploys in, which the published address does NOT move with, the address this
-//! emulator is SERVED at — an IPv4 socket, an IPv6 socket, a host an operator serves it at,
-//! and one carrying no port — which is the authority the published address IS, whether the
-//! template NAMES the repository or leaves the name to CloudFormation, whether that name
-//! carries a namespace path, and how the declaration derives the container image from the
-//! attribute (`Fn::Sub` over it, `Fn::Join` over it, and the bare `Fn::GetAtt`, which carries
-//! no tag at all).
+//! the stack deploys in, which the published address names the holding registry by, the
+//! address this emulator is SERVED at — an IPv4 socket, an IPv6 socket, a host an operator
+//! serves it at, and one carrying no port — which is the zone and the port the published
+//! address carries, whether the template NAMES the repository or leaves the name to
+//! CloudFormation, whether that name carries a namespace path, and how the declaration
+//! derives the container image from the attribute (`Fn::Sub` over it, `Fn::Join` over it, and
+//! the bare `Fn::GetAtt`, which carries no tag at all).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -299,25 +299,50 @@ fn served_authority(served_base: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// The authority Amazon ECR publishes a repository at, for a deployment served at
-/// `served_base`: the address this emulator is SERVED at, host and port, because the URI is
-/// an address a container client dials and that is the one address a client of this
-/// deployment can reach. The registry host layout AWS publishes
-/// (`<account>.dkr.ecr.<region>.amazonaws.com`) resolves at genuine AWS infrastructure
-/// instead, and so does any other name this process is not reached at. Read off the row's own
-/// served address rather than imported, so a published authority built on anything else fails
-/// these rows.
-fn published_authority(served_base: &str) -> &str {
-    served_authority(served_base)
+/// The authority Amazon ECR publishes a repository of `row`'s Region at, for a deployment
+/// served at `row.served_base`: a registry host of the registry that HOLDS the repository —
+/// the owning account, the two fixed registry labels ([`REGISTRY_LABEL_RUN`]) and that Region
+/// — in the zone and on the port this emulator is SERVED at, because the value is parsed for
+/// the registry it names and dialled at the address it carries. The zone AWS serves its own
+/// registries in resolves at genuine AWS infrastructure instead, and so does any other name
+/// this process is not reached at; an address names no zone of its own, so it names the
+/// interface the loopback zone resolves to ([`LOOPBACK_ZONE`]). Composed from the row's own
+/// served address and Region rather than imported, so a published authority built on anything
+/// else fails these rows.
+fn published_authority(row: &Row) -> String {
+    let served = served_authority(row.served_base);
+    // A port follows the LAST `:`, and an IPv6 literal's own colons live inside its brackets.
+    let (host, port) = match served.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => (host, Some(port)),
+        _ => (served, None),
+    };
+    let zone = match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(_address) => LOOPBACK_ZONE,
+        Err(_not_an_address) => host,
+    };
+    let registry_host = format!("{ACCOUNT}{REGISTRY_LABEL_RUN}{}.{zone}", row.region);
+    match port {
+        Some(port) => format!("{registry_host}:{port}"),
+        None => registry_host,
+    }
 }
 
 /// The label run every Amazon ECR registry HOST carries between the owning account's id and
 /// the registry's Region, as `AuthorizationData$proxyEndpoint` spells the registry URL format
 /// (`https://aws_account_id.dkr.ecr.region.amazonaws.com`). The address this emulator
-/// publishes carries none of it: the account and the Region are the members reported beside
-/// it. Spelled out here rather than imported, so a published address that grew a registry
-/// host of its own fails these rows.
+/// publishes carries it, because that address IS a registry host of the registry holding the
+/// repository — what differs is the zone it is served in. Spelled out here rather than
+/// imported, so a published address that lost the registry it names fails these rows.
 const REGISTRY_LABEL_RUN: &str = ".dkr.ecr.";
+
+/// The DNS zone a resolver answers with the loopback interface, which is the zone this
+/// emulator announces a name of its own in when the address it is served at names none (RFC
+/// 6761 reserves `localhost` and every name under it for that interface).
+const LOOPBACK_ZONE: &str = "localhost";
 
 const ROWS: &[Row] = &[
     Row {
@@ -405,21 +430,32 @@ fn authority_and_path<'uri>(case: &str, uri: &'uri str) -> (&'uri str, &'uri str
 }
 
 /// Assert that `uri` is the URI an Amazon ECR registry publishes for `repository`, as the rule
-/// this suite states reads it: the address this emulator is served at, and the repository's
-/// own name as the path — with no registry host of its own, because the registry that holds it
-/// is reported beside the address rather than inside it.
+/// this suite states reads it: a registry host of the registry that holds it, in the zone and
+/// on the port this emulator is served at, and the repository's own name as the path.
 fn assert_registry_uri(case: &str, row: &Row, uri: &str, repository: &str) {
     let (authority, path) = authority_and_path(case, uri);
     assert_eq!(
         authority,
-        published_authority(row.served_base),
-        "case {case:?}: expected the address this emulator is served at ({:?}) as the \
-         authority of {uri:?}, got {authority:?}",
+        published_authority(row).as_str(),
+        "case {case:?}: expected the registry authority this emulator publishes a repository \
+         of {:?} at, for a deployment served at {:?}, as the authority of {uri:?}, got \
+         {authority:?}",
+        row.region,
         row.served_base
     );
     assert!(
-        !authority.to_ascii_lowercase().contains(REGISTRY_LABEL_RUN),
-        "case {case:?}: expected {uri:?} to carry no registry host of its own, got \
+        authority
+            .to_ascii_lowercase()
+            .starts_with(&format!("{ACCOUNT}{REGISTRY_LABEL_RUN}{}.", row.region)),
+        "case {case:?}: expected {uri:?} to name this account's registry in {:?}, got \
+         {authority:?}",
+        row.region
+    );
+    assert!(
+        authority.ends_with(served_authority(row.served_base))
+            || authority.ends_with(&format!(".{LOOPBACK_ZONE}"))
+            || authority.contains(&format!(".{LOOPBACK_ZONE}:")),
+        "case {case:?}: expected {uri:?} to be served in a zone this emulator answers in, got \
          {authority:?}"
     );
     assert_eq!(

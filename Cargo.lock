@@ -14226,6 +14226,7 @@ dependencies = [
 name = "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",

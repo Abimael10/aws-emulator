@@ -80,32 +80,50 @@ pub fn registry_host_in(region: &str) -> String {
     format!("{REGISTRY_ID}.dkr.ecr.{region}.{suffix}")
 }
 
-/// The authority this registry publishes a repository at, to a call made through this
-/// harness: the endpoint this emulator answers that caller's registry requests at
+/// The DNS zone this emulator announces a name of its own in, read off the endpoint it
+/// answers a caller's registry requests at ([`ANNOUNCED_REGISTRY_ENDPOINT`]): that endpoint
+/// is an ADDRESS, which names no zone of its own and names the interface the loopback zone
+/// resolves to — RFC 6761 reserves `localhost` and every name under it for that interface.
+/// Spelled out here rather than imported so a wrong zone in the implementation fails these
+/// tests.
+pub const ANNOUNCED_REGISTRY_ZONE: &str = "localhost";
+
+/// The port that same endpoint is answered on, which a published authority carries whole, so
+/// a client dials the socket this emulator is actually reached at.
+pub const ANNOUNCED_REGISTRY_PORT: &str = "9297";
+
+/// The authority this registry publishes a repository of `region` at, to a call made through
+/// this harness: this registry's own labels — the owning account, the two fixed registry
+/// labels and the Region the repository is held in — in the zone
+/// ([`ANNOUNCED_REGISTRY_ZONE`]) and on the port ([`ANNOUNCED_REGISTRY_PORT`]) of the
+/// endpoint this emulator answers that caller's registry requests at
 /// ([`ANNOUNCED_REGISTRY_ENDPOINT`]).
 ///
-/// `Repository$repositoryUri` is an ADDRESS — a container client splits it on the first `/`
-/// and DIALS what is ahead of that `/` — so the authority is a host and port this process
-/// serves: a name in a zone AWS serves resolves nowhere near this emulator
-/// ([`registry_host_in`]), and neither does any other name this emulator is not reached at.
-/// Which registry HOLDS the repository is reported beside the address instead, by
-/// `Repository$registryId` and `Repository$repositoryArn`. Spelled out here rather than
-/// imported so a wrong composition in the implementation fails these tests.
-pub fn published_registry_authority() -> String {
-    ANNOUNCED_REGISTRY_ENDPOINT.to_string()
+/// `Repository$repositoryUri` is an ADDRESS a container client splits on the first `/` and
+/// DIALS, and a registry host it PARSES the owning account and the Region out of, so both
+/// halves are load-bearing: the labels are the holding registry's, and the zone and the port
+/// are this emulator's, because a name in a zone AWS serves resolves at Amazon ECR rather
+/// than near this emulator ([`registry_host_in`]). Spelled out here rather than imported so a
+/// wrong composition in the implementation fails these tests.
+pub fn published_registry_authority_in(region: &str) -> String {
+    format!(
+        "{REGISTRY_ID}.dkr.ecr.{region}.{ANNOUNCED_REGISTRY_ZONE}:{ANNOUNCED_REGISTRY_PORT}"
+    )
 }
 
-/// The URI Amazon ECR reports for the repository `name` of this account's registry, to a call
-/// made through this harness (`Repository$repositoryUri`: "The URI for the repository. You
-/// can use this URI for container image `push` and `pull` operations"): the authority this
-/// registry is published at ([`published_registry_authority`]) followed by the repository's
-/// name as the path.
-///
-/// It carries no Region of its own: which registry holds the repository is reported beside it
-/// by `Repository$registryId` and `Repository$repositoryArn`, so a reader that needs the
-/// account or the Region reads the members that carry that identity.
+/// The URI Amazon ECR reports for the repository `name` of this account's registry in
+/// `region`, to a call made through this harness (`Repository$repositoryUri`: "The URI for
+/// the repository. You can use this URI for container image `push` and `pull` operations"):
+/// the authority that repository is published at ([`published_registry_authority_in`])
+/// followed by the repository's own name as the path.
+pub fn published_repository_uri_in(region: &str, name: &str) -> String {
+    format!("{}/{name}", published_registry_authority_in(region))
+}
+
+/// [`published_repository_uri_in`] for the Region every call made through [`call`] is signed
+/// for ([`REGION`]).
 pub fn published_repository_uri(name: &str) -> String {
-    format!("{}/{name}", published_registry_authority())
+    published_repository_uri_in(REGION, name)
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").

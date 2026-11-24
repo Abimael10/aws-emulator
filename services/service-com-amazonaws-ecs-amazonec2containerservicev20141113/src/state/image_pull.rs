@@ -169,10 +169,6 @@ const ECR_DKR_ENDPOINT_SUFFIX: &str = ".ecr.dkr";
 /// (`com.amazonaws.<region>.s3`).
 const S3_ENDPOINT_SUFFIX: &str = ".s3";
 
-/// The host part of an Amazon ECR registry URI (`<account>.dkr.ecr.<region>.<suffix>`),
-/// which is what makes an image one the ECR endpoints can reach.
-const ECR_REGISTRY_INFIX: &str = ".dkr.ecr.";
-
 /// What ONE launched task's image fetch depends on: where the launch placed it, what its
 /// containers run, and the principal Amazon ECS pulls as.
 ///
@@ -996,13 +992,21 @@ fn endpoints_reach_registry(
 }
 
 /// Whether `image` names a repository in Amazon ECR, whose registry is an AWS service and
-/// so has VPC endpoints: an ECR image is pulled from `<account>.dkr.ecr.<region>.<suffix>`
-/// (Amazon ECR User Guide, the registry URI a pull uses), or from the ADDRESS that registry
-/// announces its own repositories at here ([`addresses_this_emulators_registry`]), which
-/// names the very same registry.
+/// so has VPC endpoints: an ECR image is pulled from a registry host of that service
+/// (`<account>.dkr.ecr.<region>.<zone>`, the registry URI a pull uses), read through Amazon
+/// ECR's own one reading of such a host
+/// (`::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_host_parts`),
+/// so the spelling AWS publishes and the one that registry publishes HERE — its own labels in
+/// the zone this emulator is reached in — are both read as the registry they name; or from
+/// the ADDRESS that registry announces its own repositories at when that address names no
+/// registry at all ([`addresses_this_emulators_registry`]), which names the very same
+/// registry.
 fn is_ecr_image(image: &str) -> bool {
     let host = registry_host(image);
-    (host.contains(ECR_REGISTRY_INFIX) && host.contains(".amazonaws."))
+    ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_host_parts(
+        host,
+    )
+    .is_some()
         || addresses_this_emulators_registry(host)
 }
 

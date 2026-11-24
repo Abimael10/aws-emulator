@@ -79,6 +79,12 @@ aws-sigv4 = { version = "1", features = ["http1"] }
 # The signing identity `aws-sigv4` takes: this registry's own ephemeral download-plane key.
 aws-credential-types = "1"
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so this crate's one integration-test
+# target (rooted at `tests/all/main.rs`) carries no per-suite list for a new suite to be
+# forgotten from.
+automod = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
