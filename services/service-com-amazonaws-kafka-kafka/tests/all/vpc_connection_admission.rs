@@ -780,11 +780,11 @@ async fn an_explicit_deny_in_the_cluster_policy_refuses_the_readers_it_governs()
 /// the request NAMES, before that target is resolved or parsed, so a
 /// `TargetClusterArn` the caller holds no grant over is refused HTTP 403
 /// `AccessDeniedException` naming the principal, the IAM action and the resource
-/// the decision was taken over — the value as submitted where nothing resolves it,
-/// the wildcard where it is a cluster reference identifying no cluster — and never
-/// a parameter complaint about the value's shape. A value naming a resource of
-/// another KIND is no cluster reference at all, so that gate decides nothing about
-/// it and the operation answers.
+/// the decision was taken over — the wildcard, because a target that resolves to no
+/// cluster leaves the action scoped to no resource, whatever the value was written
+/// as — and never a parameter complaint about the value's shape. A value naming a
+/// resource of another KIND is no cluster reference at all, so that gate decides
+/// nothing about it and the operation answers.
 #[tokio::test]
 async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refusal() {
     let emulator = Emulator::new();
@@ -793,10 +793,9 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
     // The rows differ along every way a value can fail to name a cluster of this
     // account: not an ARN at all (free text, empty, a truncated ARN, a very long
     // opaque value, a non-ASCII one) and a cluster reference missing its id
-    // segment. The resource the refusal names is the value where nothing resolves
-    // it — the decision was taken over the value itself, there being nothing else
-    // it stands for — and the wildcard where it IS a cluster reference and
-    // identifies no cluster, the decision then having been taken over no resource.
+    // segment. The resource the refusal names is the wildcard for every one of
+    // them: none of the values resolves to a cluster, so the decision was taken
+    // over no resource.
     let wildcard = "*";
     let long = format!("not-a-cluster-arn-{}", "x".repeat(200));
     let non_ascii = "ニセのクラスター-arn".to_string();
@@ -805,17 +804,17 @@ async fn a_target_that_names_no_cluster_of_this_account_is_an_authorization_refu
         (
             "not-an-arn-at-all",
             "not-a-cluster-arn".to_string(),
-            "not-a-cluster-arn",
+            wildcard,
         ),
         (
             "free-text-with-spaces",
             "not an arn at all".to_string(),
-            "not an arn at all",
+            wildcard,
         ),
-        ("empty", String::new(), ""),
-        ("truncated-arn", "arn:aws:kafka".to_string(), "arn:aws:kafka"),
-        ("a-long-opaque-value", long.clone(), long.as_str()),
-        ("a-non-ascii-value", non_ascii.clone(), non_ascii.as_str()),
+        ("empty", String::new(), wildcard),
+        ("truncated-arn", "arn:aws:kafka".to_string(), wildcard),
+        ("a-long-opaque-value", long.clone(), wildcard),
+        ("a-non-ascii-value", non_ascii.clone(), wildcard),
         (
             "a-cluster-reference-without-its-id-segment",
             nameless.clone(),

@@ -4,13 +4,13 @@
 //! to end over HTTP.
 //!
 //! One rule is pinned here: a delete the service has carried to the end of its
-//! chain leaves the data source HOLDING nothing for that document while the
-//! deletion's terminal status stays reportable, so
-//! `ListKnowledgeBaseDocuments` keeps one detail for the deleted document
-//! carrying the status the model gives a document that was not found — page by
-//! page as well as in one page — beside the documents that were not deleted, a
-//! targeted `GetKnowledgeBaseDocuments` answers that identifier with the same
-//! status, and the identifier is free for a fresh ingestion to take again.
+//! chain leaves the data source HOLDING nothing for that document, so
+//! `ListKnowledgeBaseDocuments` — which "retrieves all the documents contained
+//! in a data source" — stops reporting it, page by page as well as in one page,
+//! and reports the documents that were not deleted and nothing else; the
+//! deletion's terminal status stays reportable through a targeted
+//! `GetKnowledgeBaseDocuments` of that identifier, and the identifier is free
+//! for a fresh ingestion to take again.
 //!
 //! The rows span what the rule generalises over: the kind of content the data
 //! source holds (each value of the modelled `ContentDataSourceType`), how many
@@ -277,11 +277,11 @@ impl Emulator {
         .await
     }
 
-    /// List the data source's documents until every one of `identifiers` is
-    /// reported with the terminal status of a deletion, or [`POLL_CAP`]
-    /// passes — the end of the chain a delete starts is owed by the CLOCK, and
-    /// this listing is how a client confirms it.
-    async fn poll_until_listed_not_found(
+    /// List the data source's documents until none of `identifiers` is reported
+    /// among them, or [`POLL_CAP`] passes — the end of the chain a delete starts
+    /// is owed by the CLOCK, and this listing is how a client confirms it: the
+    /// identifier LEAVES the collection.
+    async fn poll_until_absent_from_listing(
         &self,
         knowledge_base_id: &str,
         data_source_id: &str,
@@ -293,12 +293,9 @@ impl Emulator {
                 .list_documents(knowledge_base_id, data_source_id, None, None)
                 .await;
             let gone = listed.status == 200
-                && identifiers.iter().all(|identifier| {
-                    listed.details().iter().any(|detail| {
-                        &detail["identifier"] == identifier
-                            && detail["status"].as_str() == Some(NOT_FOUND)
-                    })
-                });
+                && identifiers
+                    .iter()
+                    .all(|identifier| !listed.identifiers().contains(identifier));
             if gone || Instant::now() >= deadline {
                 return listed;
             }
@@ -531,26 +528,17 @@ async fn a_completed_delete_reports_not_found_through_the_listing() {
         }
 
         // The clock carries the delete to its end, which is what a client waits
-        // for on this very listing.
+        // for on this very listing: the deleted identifiers leave it.
         let listed = emulator
-            .poll_until_listed_not_found(&knowledge_base_id, &data_source_id, &doomed)
+            .poll_until_absent_from_listing(&knowledge_base_id, &data_source_id, &doomed)
             .await;
         assert_eq!(
             listed.identifiers(),
-            identifiers,
-            "case {case}: expected the listing to report every document of the data source, \
-             the deleted ones included, got {:?}",
+            survivors,
+            "case {case}: expected the listing to report the documents the data source still \
+             holds and no deleted one, got {:?}",
             listed.body
         );
-        for identifier in &doomed {
-            let detail = listed.detail_of(identifier);
-            assert_eq!(
-                detail["status"].as_str(),
-                Some(NOT_FOUND),
-                "case {case}: expected {NOT_FOUND} listed for the deleted document, \
-                 got {detail:?}"
-            );
-        }
         // The same answer page by page: the listing's cursor runs over the
         // records the data source holds, so walking it one at a time reports
         // them once each and nothing else.
@@ -558,13 +546,14 @@ async fn a_completed_delete_reports_not_found_through_the_listing() {
             .walk_listing(&knowledge_base_id, &data_source_id)
             .await;
         assert_eq!(
-            walked, identifiers,
-            "case {case}: expected the paged listing to report every document of the data \
-             source, the deleted ones included, got {walked:?}"
+            walked, survivors,
+            "case {case}: expected the paged listing to report the surviving documents and no \
+             deleted one, got {walked:?}"
         );
 
         // A targeted read of a deleted identifier reports it as a document that
-        // was not found, at the instant the deletion reached its end — while a
+        // was not found, at the instant the deletion reached its end — which is
+        // where the outcome of a completed deletion stays reportable — while a
         // survivor still reports its own ingestion.
         let fetched = emulator
             .get_documents(&knowledge_base_id, &data_source_id, identifiers.clone())
@@ -576,11 +565,10 @@ async fn a_completed_delete_reports_not_found_through_the_listing() {
                 Some(NOT_FOUND),
                 "case {case}: expected {NOT_FOUND} for the deleted document, got {detail:?}"
             );
-            assert_eq!(
-                detail["updatedAt"],
-                listed.detail_of(identifier)["updatedAt"],
-                "case {case}: expected the targeted read and the listing to report the same \
-                 instant for the deleted document, got {detail:?}"
+            assert!(
+                !detail["updatedAt"].is_null(),
+                "case {case}: the deletion reached its terminal status at an instant, which the \
+                 targeted read reports, got {detail:?}"
             );
         }
         for identifier in &survivors {
@@ -635,14 +623,18 @@ async fn a_completed_delete_reports_not_found_through_the_listing() {
         let relisted = emulator
             .list_documents(&knowledge_base_id, &data_source_id, None, None)
             .await;
-        let mut expected = identifiers.clone();
+        // What the data source holds now: the survivors and the one identifier
+        // the fresh ingestion took again — the deletions that were not re-ingested
+        // stay out of the collection.
+        let mut expected = survivors.clone();
+        expected.push(identifiers[first_doomed].clone());
         let mut reported = relisted.identifiers();
         reported.sort_by_key(|identifier| identifier.to_string());
         expected.sort_by_key(|identifier| identifier.to_string());
         assert_eq!(
             reported, expected,
-            "case {case}: expected the re-ingested document listed once, beside the \
-             survivors and the deletions still reported, got {:?}",
+            "case {case}: expected the re-ingested document listed once beside the survivors, \
+             got {:?}",
             relisted.body
         );
         assert!(
@@ -650,8 +642,8 @@ async fn a_completed_delete_reports_not_found_through_the_listing() {
                 .contains(&relisted.detail_of(&identifiers[first_doomed])["status"]
                     .as_str()
                     .unwrap_or_default()),
-            "case {case}: expected the re-ingested document to replace the deletion reported \
-             for its identifier, got {:?}",
+            "case {case}: expected the re-ingested document to be listed under a status of its \
+             own ingestion, got {:?}",
             relisted.detail_of(&identifiers[first_doomed])
         );
     }

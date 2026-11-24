@@ -1100,20 +1100,17 @@ fn output_cases() -> Vec<OutputCase> {
                 ),
                 (
                     // The cluster's engine is one this emulator SERVES a native wire for, so
-                    // the endpoint Amazon RDS publishes — and so the stack's output carries —
-                    // is the loopback host of the cluster's own engine listener beside the
-                    // port the core assigned it, which is the address a client can reach,
-                    // exactly as the served DB instance row below carries the instance's own
-                    // listener. Its READER endpoint is the name the cluster mints under the
-                    // `cluster-ro-` label, which is what tells a read path from a write path.
+                    // the endpoints Amazon RDS publishes — and so the stack's outputs carry —
+                    // are the two names the cluster mints from its own identifier, in the
+                    // zone the interface its listeners are bound on names, beside the port
+                    // the core assigned that listener: the `cluster-` label names the write
+                    // path and the `cluster-ro-` one the read path.
                     "ClusterEndpoint",
                     Expected::Form {
-                        described: "the loopback host the cluster's engine listener is bound \
-                                    to",
+                        described: "the cluster's writer endpoint name, which carries the \
+                                    `cluster-` label",
                         check: |value| {
-                            value
-                                .parse::<std::net::IpAddr>()
-                                .is_ok_and(|address| address.is_loopback())
+                            is_served_rds_cluster_endpoint(value, "probe-app-cluster", ".cluster-")
                         },
                     },
                 ),

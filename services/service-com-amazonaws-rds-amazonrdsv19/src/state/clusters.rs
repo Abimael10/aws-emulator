@@ -509,28 +509,25 @@ impl DbClusterRecord {
     /// The cluster endpoint: "the connection endpoint for the primary instance of the DB
     /// cluster".
     ///
-    /// A cluster whose data plane this emulator SERVES publishes the HOST of the listener that
-    /// plane is answered on ([`Self::served_endpoint`]) — the same reading a DB instance's
-    /// `Endpoint$Address` ([`DbInstanceRecord::endpoint_address`]) and a DB proxy's `Endpoint`
-    /// ([`DbProxyRecord::endpoint`]) follow. This member and `Port` are the ONE pair a client
-    /// composes the address it dials from, and the port beside it is that listener's
-    /// ([`Self::published_port`]), so the host has to be the same listener's too: a name in a
-    /// zone this emulator neither serves nor owns is no connection endpoint, whatever a
-    /// resolver does with it, and a session can be opened on no other address.
-    ///
-    /// A cluster this emulator serves NO data plane for keeps the published AWS form,
+    /// The name the CLUSTER mints from its own identifier,
     /// `<identifier>.cluster-<server-assigned label>.<region>.<suffix>` (Amazon Aurora User
-    /// Guide, "Amazon Aurora connection management") — the name the CLUSTER mints from its own
-    /// identifier, over the suffix it shares with [`Self::reader_endpoint`]; see
-    /// [`cluster_endpoint_names`]. There is no local plane for such a cluster to lead a client
-    /// to, so the name is all it can publish.
+    /// Guide, "Amazon Aurora connection management") — over the suffix it shares with
+    /// [`Self::reader_endpoint`], which is the zone the cluster's own listeners are reached in
+    /// for a cluster whose engine wire this emulator SERVES and the published AWS form for a
+    /// cluster it serves no plane for ([`Self::endpoint_dns_suffix`]). One name per cluster,
+    /// derived from the cluster rather than read off any member instance, and distinct from
+    /// the reader endpoint by its role label alone: that label is the only thing that tells a
+    /// read path from a write path, and a client told the same host for both can neither split
+    /// its traffic nor tell two clusters apart.
     ///
-    /// A HOST and nothing else, either way: the cluster has one `Port` member for both of its
-    /// endpoints, so neither carries a port of its own.
+    /// A served cluster's name is announced in the zone a resolver answers with the interface
+    /// its listener is bound on, so the pair this member and [`Self::published_port`] make is
+    /// an address a session really opens on; see [`cluster_endpoint_names`] for why that zone
+    /// is never one AWS serves.
+    ///
+    /// A HOST and nothing else: the cluster has one `Port` member for both of its endpoints,
+    /// so neither carries a port of its own.
     pub fn endpoint(&self) -> String {
-        if let Some(served) = &self.served_endpoint {
-            return served.host.clone();
-        }
         self.endpoint_name(CLUSTER_WRITER_LABEL)
     }
 
@@ -641,15 +638,15 @@ impl DbClusterRecord {
     /// distinct from the writer endpoint and of this form whatever the cluster's membership
     /// is — a cluster with no Aurora Replica at all is still reached at it.
     ///
-    /// It is the one endpoint member of a SERVED cluster that is not the address of the
-    /// listener behind it ([`Self::endpoint`] is): the read-only plane is a listener of its
-    /// own ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own, and the one
-    /// `Port` the model gives the pair is the WRITER listener's, so an address literal here
-    /// would name the writer's plane and send a read path's writes through it. The
-    /// `cluster-ro-` label is what tells the two paths apart; publishing the read-only
-    /// listener's own address needs a resource to be dialable at a port of its own, which the
-    /// core does not offer (`vendor/server/src/listeners.rs` binds every listener on the one
-    /// operator-chosen interface at an OS-assigned port).
+    /// It is minted exactly as [`Self::endpoint`] is, and the two differ in their role label
+    /// alone: the read-only plane is a listener of its own
+    /// ([`data_plane::DbEngineEndpoint::reader`]) with a port of its own, and the one `Port`
+    /// the model gives the pair is the WRITER listener's, so the port a client composes with
+    /// this name reaches the writer's plane. The `cluster-ro-` label is what tells the two
+    /// paths apart; publishing the read-only listener's own address needs a resource to be
+    /// dialable at a port of its own, which the core does not offer
+    /// (`vendor/server/src/listeners.rs` binds every listener on the one operator-chosen
+    /// interface at an OS-assigned port).
     pub fn reader_endpoint(&self) -> String {
         self.endpoint_name(CLUSTER_READER_LABEL)
     }

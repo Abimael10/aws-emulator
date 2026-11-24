@@ -325,9 +325,10 @@ pub(crate) const SERVED_SUFFIX: &str = "rds.localhost";
 /// server-assigned label and ONE shared suffix behind them, and neither carries a port. They
 /// are therefore non-empty and distinct whatever the cluster's membership is.
 ///
-/// The pair a cluster this emulator serves no data plane for publishes. A SERVED cluster
-/// publishes the address its own listener answers on as its writer endpoint instead — see
-/// [`assert_served_endpoint_pair`].
+/// The `suffix` is the only thing that depends on where the cluster's data plane is served:
+/// a cluster whose engine wire this emulator serves publishes the same pair under
+/// [`SERVED_SUFFIX`] ([`assert_served_endpoint_pair`]), and one it serves no plane for under
+/// its control plane's own endpoint domain.
 ///
 /// `pub(crate)` so every suite that reads a cluster's endpoints asserts the one rule rather
 /// than a copy of it.
@@ -372,12 +373,10 @@ pub(crate) fn assert_endpoint_name_pair(
     );
 }
 
-/// RULE: a cluster whose engine wire this emulator SERVES publishes, as the `Endpoint` a
-/// client opens a session on, the HOST of the listener that serves it — an address of this
-/// machine, carrying no DNS zone and no port, because the `Port` beside it is that listener's
-/// and the pair is the whole address a client dials. Its `ReaderEndpoint` stays the name the
-/// cluster mints under `cluster-ro-`, which is what tells a read path from a write path, so
-/// the two members are still distinct.
+/// RULE: a cluster whose engine wire this emulator SERVES publishes the same pair of minted
+/// names as any other cluster — the writer under `cluster-`, the reader under `cluster-ro-` —
+/// in the zone the interface its listeners are bound on names ([`SERVED_SUFFIX`]), so the
+/// pair of a published name and the published `Port` is an address a session opens on.
 ///
 /// `pub(crate)` so every suite that reads a served cluster's endpoints asserts the one rule
 /// rather than a copy of it.
@@ -388,33 +387,7 @@ pub(crate) fn assert_served_endpoint_pair(
     writer: &str,
     reader: &str,
 ) {
-    let address = writer.parse::<std::net::IpAddr>();
-    assert!(
-        address.is_ok_and(|address| address.is_loopback()),
-        "case {case:?}: expected the writer endpoint to be the address this emulator serves \
-         the cluster's engine wire at — the loopback interface the core binds on — got \
-         {writer:?}"
-    );
-    assert!(
-        !writer.contains(':') || writer.parse::<std::net::Ipv6Addr>().is_ok(),
-        "case {case:?}: an endpoint member carries no port of its own, got {writer:?}"
-    );
-    let reader_label = format!("{identifier}.cluster-ro-");
-    let tail = format!(".{region}.{SERVED_SUFFIX}");
-    assert!(
-        reader.starts_with(reader_label.as_str()) && reader.ends_with(&tail),
-        "case {case:?}: expected a reader endpoint of the form {reader_label}<label>{tail}, \
-         got {reader:?}"
-    );
-    assert!(
-        !reader.contains(':'),
-        "case {case:?}: an endpoint member carries no port of its own, got {reader:?}"
-    );
-    assert_ne!(
-        writer, reader,
-        "case {case:?}: a cluster's reader endpoint must be distinct from its writer \
-         endpoint, got {writer:?} for both"
-    );
+    assert_endpoint_name_pair(case, identifier, region, SERVED_SUFFIX, writer, reader);
 }
 
 /// One filter row: the case, the filter the request carries, and the clusters it selects.

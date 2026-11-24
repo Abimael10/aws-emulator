@@ -388,23 +388,44 @@ pub struct ImportedModel {
     pub schema: String,
 }
 
-/// The refusal for a document whose FORMAT is settled and which is not a readable
-/// definition of it.
+/// The refusal for a document that PARSED, declares the format it is written in, and is not
+/// a readable definition of that format.
 ///
-/// API Gateway has TWO sentences for a body that is not an API definition, and which one a
-/// caller gets says whether the reader ever determined which format the document is written
-/// in. This is the one for a body whose format it DID determine and could not read as a
-/// definition of it: a document that declares its version and then stops being readable (a
-/// truncated one, an unterminated collection or scalar), and one that parsed whole and
-/// declares a version but cannot be read as that format. The reader has nothing to say
-/// about such a document beyond "this is not a valid one of those", which is what this one
-/// sentence states — it names no member and no position. The other sentence is for a body
-/// whose version was never determined ([`UNDETERMINED_VERSION`]).
+/// An import reads a body in three steps, and WHICH of them failed is what picks the
+/// sentence: the body is parsed as the "JSON/YAML file" the member documents, the parsed
+/// document's version member settles which format it is written in, and the document is then
+/// read as a definition of that format. This is the sentence for the LAST of the three — the
+/// document was discerned and is no valid one of what it says it is (`paths` that is no
+/// mapping of paths). The reader has nothing to say about such a document beyond "this is
+/// not a valid one of those", which is what this one sentence states: it names no member and
+/// no position.
+///
+/// The two sentences beside it are for the earlier steps: a body that never parsed at all
+/// ([`UNPARSEABLE_DEFINITION`]) and a document that parsed and declares no version
+/// ([`UNDETERMINED_VERSION`]). A caller has to be able to tell "these bytes are not a
+/// document" from "nothing here says what this is" from "this is not a valid one of those".
 ///
 /// The emulator's own resource guards keep their own wording instead, because they are this
 /// emulator's bounds rather than anything the service publishes, and a caller has to be able
 /// to tell the two apart.
 pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
+
+/// The refusal for a body that is not a DOCUMENT at all: one no reader could parse, in
+/// either spelling.
+///
+/// The parse is the FIRST of the three steps an import reads a body in (see
+/// [`INVALID_DEFINITION`]), and a body that fails it yields no document — so nothing of what
+/// those bytes happen to contain has been read, no version member among them, and the
+/// refusal can state no more than that the input is no API definition. API Gateway states it
+/// with this one fixed sentence, which names the specification by its own acronym and carries
+/// nothing from the request: not the position the reading stopped at, and not the parser's
+/// own complaint.
+///
+/// It is the sentence for every body the reading could not finish — a truncated document, an
+/// unterminated collection or scalar, text that is no document, bytes that are not text —
+/// whatever version member a prefix of it happened to write, because a body that did not
+/// parse declared nothing.
+pub const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
 
 /// The refusal for a document that PARSED and declares no OAS/Swagger version.
 ///
@@ -934,9 +955,10 @@ fn guard_yaml_nesting(body: &str) -> Result<(), String> {
 /// The root members an OpenAPI/Swagger document declares the format it is written in in:
 /// `openapi` from 3.0 on, `swagger` before it.
 ///
-/// Which one of them a document carries is the first thing read, and whether EITHER was
-/// read is what picks the sentence a document that is not a readable definition is refused
-/// with — see [`UNDETERMINED_VERSION`] and [`INVALID_DEFINITION`].
+/// Which one of them a PARSED document carries is the first thing read of it, and whether
+/// either is there is what separates a document whose format could not be determined
+/// ([`UNDETERMINED_VERSION`]) from one that is no valid definition of the format it names
+/// ([`INVALID_DEFINITION`]).
 const VERSION_MEMBERS: [&str; 2] = ["openapi", "swagger"];
 
 /// Whether `node` declares the format it is written in, which is one of
@@ -948,67 +970,6 @@ fn declares_version(node: &Node) -> bool {
         .any(|member| node.member(member).is_some())
 }
 
-/// Whether `text` writes one of [`VERSION_MEMBERS`] as a member, read off the document as
-/// it was RECEIVED.
-///
-/// This is what settles the format of a body the readers below could not finish, and it is
-/// read from the text because a tree is not available for one: those readers build the
-/// document as they go, and a document that stops being readable can stop before the reader
-/// has delivered anything at all of what it did read (the YAML scanner resolves a flow
-/// mapping's key before it hands over the mapping it belongs to), so how much of a
-/// half-built tree exists says nothing about what the document declares.
-///
-/// What a member looks like is the same in both spellings, and is all this decides: the
-/// name, quoted or not, where a member may START — at the beginning of the document, after
-/// the opener or the separator of a flow collection, or at the start of a line — and
-/// followed by `:`. So a name that merely CONTAINS one (`swaggerVersion`, `x-openapi`) is
-/// not one, and neither is one inside a string value, where the escaped quote before it is
-/// no member separator. WHICH collection the member belongs to is not decided — an
-/// unreadable document has no structure to place it in — so a nested member of that name
-/// settles the format too. Bounded by the length of the body, which [`parse_definition`]
-/// bounds before anything else.
-fn text_declares_version(text: &str) -> bool {
-    VERSION_MEMBERS.iter().any(|member| {
-        text.match_indices(member).any(|(at, _)| {
-            let (before, after) = (&text[..at], &text[at + member.len()..]);
-            // A quoted name owns the quotes on both sides of it, so they are not what
-            // precedes or follows the member.
-            let (before, after) = match (before.chars().next_back(), after.chars().next()) {
-                (Some(opening @ ('"' | '\'')), Some(closing)) if closing == opening => {
-                    (&before[..before.len() - opening.len_utf8()], &after[1..])
-                }
-                _ => (before, after),
-            };
-            starts_a_member(before) && after.trim_start().starts_with(':')
-        })
-    })
-}
-
-/// Whether a member may START where `before` ends: at the beginning of the document, at the
-/// start of a line, or after the opener or the separator of the flow collection it belongs
-/// to — whitespace aside.
-fn starts_a_member(before: &str) -> bool {
-    let kept = before.trim_end();
-    kept.is_empty() || before[kept.len()..].contains('\n') || kept.ends_with(['{', ','])
-}
-
-/// The refusal for a document the reader could not finish, decided by whether the document
-/// says which format it is written in.
-///
-/// Which format a definition is written in is settled from the document's own version member
-/// BEFORE it is read as one, so a document that declares a version and then cannot be read
-/// as a definition of that format is refused as that ([`INVALID_DEFINITION`]), while a body
-/// that declares no version at all is refused as the version that could not be determined
-/// ([`UNDETERMINED_VERSION`]) — the same sentence a document that read WHOLE and declares
-/// neither member earns.
-fn unread_document_refusal(text: &str) -> String {
-    if text_declares_version(text) {
-        INVALID_DEFINITION.to_string()
-    } else {
-        UNDETERMINED_VERSION.to_string()
-    }
-}
-
 /// The YAML spelling of a definition, read through the bounded event reader.
 fn parse_yaml(text: &str) -> Result<Node, String> {
     guard_yaml_nesting(text)?;
@@ -1018,11 +979,10 @@ fn parse_yaml(text: &str) -> Result<Node, String> {
         return Err(format!("Unable to parse API definition: {refusal}"));
     }
     // A body the parser stopped on, and a document whose collections never close, are the
-    // same case: the reader did not finish the document. Refused by whether the document
-    // says which format it is written in, and not with the parser's own position — see
-    // [`unread_document_refusal`].
+    // same case: the reader did not finish the document, so there is no document — and the
+    // refusal says that and not where the reading stopped ([`UNPARSEABLE_DEFINITION`]).
     if read.is_err() || !builder.open.is_empty() {
-        return Err(unread_document_refusal(text));
+        return Err(UNPARSEABLE_DEFINITION.to_string());
     }
     Ok(builder.root.unwrap_or_default())
 }
@@ -1060,9 +1020,9 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
             body.len()
         ));
     }
-    // Bytes that are not text are a body no reader could read a version member out of, so
-    // they are refused as the version that could not be determined.
-    let text = std::str::from_utf8(body).map_err(|_| UNDETERMINED_VERSION.to_string())?;
+    // Bytes that are not text are a body no reader could parse in either spelling, so they
+    // are refused as the input that is no document.
+    let text = std::str::from_utf8(body).map_err(|_| UNPARSEABLE_DEFINITION.to_string())?;
     let document = match ::serde_json::from_str::<Node>(text) {
         Ok(document) => {
             // The YAML reader counts nodes AS it builds them
@@ -3286,73 +3246,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-#[cfg(test)]
-mod version_detection {
-    use super::*;
-
-    /// What a document has to write for its format to be settled: the member's name, in
-    /// either spelling and at a position a member starts, followed by `:`. A name that
-    /// merely contains one, and one inside a string value, are not that — the distinction
-    /// the refusal for an unreadable body is drawn on.
-    #[test]
-    fn the_version_member_is_found_in_either_spelling() {
-        for (case, text, declared) in [
-            (
-                "a JSON object cut off after its version member",
-                "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"x\" NOT A DOCUMENT",
-                true,
-            ),
-            (
-                "the same object with no version member",
-                "{\"info\": {\"title\": \"x\" NOT A DOCUMENT",
-                false,
-            ),
-            (
-                "the version member after another, on the separator",
-                "{\"info\": {\"title\": \"x\"},\"swagger\":\"2.0\"",
-                true,
-            ),
-            ("the block spelling", "swagger: '2.0'\npaths: {", true),
-            ("the block spelling, quoted", "\"swagger\": '2.0'\n", true),
-            (
-                "the block spelling on a later line",
-                "info:\n  title: x\nopenapi: 3.0.1\n",
-                true,
-            ),
-            (
-                "the flow spelling, unquoted",
-                "{openapi: 3.0.1, paths: {",
-                true,
-            ),
-            ("a document writing neither member", "paths: {", false),
-            ("text that is no document", "}not a document{", false),
-            (
-                "a member whose name merely resembles the version field",
-                "{\"swaggerVersion\": \"1.2\"",
-                false,
-            ),
-            (
-                "a vendor extension whose name ends in one",
-                "{\"x-openapi\": \"3.0.1\"",
-                false,
-            ),
-            (
-                "a version-looking name inside a string value",
-                "{\"info\": {\"description\": \"see \\\"openapi\\\": 3\"}, \"paths\": {",
-                false,
-            ),
-            (
-                "an indented member of another mapping, which settles the format too",
-                "info:\n  openapi: 3.0.1\n",
-                true,
-            ),
-        ] {
-            assert_eq!(
-                text_declares_version(text),
-                declared,
-                "case {case}: expected text_declares_version {declared}, got {}",
-                text_declares_version(text)
-            );
-        }
-    }
-}

@@ -54,10 +54,13 @@
 //! ([`CLUSTER_POLICY_ACTIONS`]) there is nothing else a grant can rest on: that
 //! document lives ON the cluster, so a value that stands for no resource this
 //! endpoint could hold a document on can reach no grant, and the authorization
-//! refusal is the answer for a value that is no ARN too — taken over the value as
-//! submitted, there being nothing else it stands for, which is why
+//! refusal is the answer for a value that is no ARN too — which is why
 //! `CreateVpcConnection`'s target has always been decided that way
-//! ([`authorize_target_cluster`]).
+//! ([`authorize_target_cluster`]). WHAT such a refusal names depends on whether the
+//! request ADDRESSED that target: a value carried in the URI is named as it
+//! arrived, and a target named in the BODY is no addressed resource, so the
+//! decision over it is taken against the wildcard
+//! ([`UngrantedResource::Unaddressed`]).
 //!
 //! That is one decision for every call whose target is a cluster, whichever plane
 //! it acts on: the control-plane gate ([`authorize_caller_operation`], taken by
@@ -199,6 +202,17 @@ enum UngrantedResource {
     /// from arrived percent-encoded — which is what lets a client recover the
     /// offending reference by decoding the resource clause.
     SubmittedLabel,
+    /// NO resource at all — [`ANY_RESOURCE`], whatever the submitted value was
+    /// written as: what a decision over a target the request did not ADDRESS is
+    /// taken over.
+    ///
+    /// A cluster named in the request's BODY (`CreateVpcConnection`'s
+    /// `TargetClusterArn`) is not the resource the request addressed, so a value of
+    /// it that resolves to no cluster leaves the action scoped to nothing and the
+    /// decision is taken against the wildcard — where a target carried in the URI
+    /// is the resource the request addressed, and is named as it arrived
+    /// ([`Resolved`](Self::Resolved), [`SubmittedLabel`](Self::SubmittedLabel)).
+    Unaddressed,
 }
 
 /// The characters a non-greedy `@httpLabel` keeps as they are: RFC 3986's
@@ -379,6 +393,7 @@ fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
             let resource = match reading.naming {
                 UngrantedResource::Resolved => resource.to_string(),
                 UngrantedResource::SubmittedLabel => http_label(value),
+                UngrantedResource::Unaddressed => ANY_RESOURCE.to_string(),
             };
             Err(no_grant_for_cluster(engine, ctx, action, &resource))
         }
@@ -402,6 +417,9 @@ fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
 ///   is taken at all, which is where only the resource's own policy could have
 ///   granted the action — is taken over the VALUE as submitted, there being nothing
 ///   else it stands for.
+///
+/// WHAT the refusal then names is the caller's reading ([`UngrantedResource`]): a
+/// target the request did not address is named by neither value.
 fn ungranted_resource<'value>(
     value: &'value str,
     resource_type: &str,
@@ -539,17 +557,26 @@ pub const ANY_RESOURCE: &str = "*";
 /// `target_arn` is meant to name, taken before anything resolves or parses that
 /// target.
 ///
-/// Every action this is taken for is one a cluster POLICY can grant, so it is
-/// [`authorize_caller_operation`] under another name — kept because
+/// Every action this is taken for is one a cluster POLICY can grant, so it is the
+/// same decision [`authorize_caller_operation`] takes, over one difference:
 /// `CreateVpcConnection` names its target in the BODY rather than in a path
-/// segment, which is the one place a reader of that handler looks.
+/// segment, so that target is not the resource the request ADDRESSED. A value of it
+/// that resolves to no cluster therefore leaves the action scoped to no resource,
+/// and the refusal names the wildcard rather than the submitted value
+/// ([`UngrantedResource::Unaddressed`]).
 pub fn authorize_target_cluster<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     target_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_caller_operation(engine, ctx, operation, target_arn)
+    authorize_cluster_action(
+        engine,
+        ctx,
+        &control_plane_action(operation),
+        target_arn,
+        UngrantedResource::Unaddressed,
+    )
 }
 
 /// The refusal for a request whose target value identifies no cluster of this

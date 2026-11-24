@@ -2,32 +2,32 @@
 
 //! WHERE a client opens a session on a DB cluster whose engine wire this emulator serves.
 //!
-//! The rule under test: the endpoint member a client DIALS carries the address this emulator
-//! answers that resource's engine wire at — the HOST of the listener the core opened for it,
-//! beside that listener's port in the one `DBCluster$Port` ("the port that the database engine
-//! is listening on") — so the pair the client composes is the whole address of the plane that
-//! serves it. It is the reading a DB instance's `Endpoint$Address` and a DB proxy's `Endpoint`
-//! already follow; a cluster is read the same way, because a host in a zone this emulator
-//! neither serves nor owns is no connection endpoint whatever a resolver happens to do with
-//! it, and no session can be opened anywhere else.
+//! The rule under test: the endpoint member a client DIALS carries the NAME the cluster mints
+//! from its own identifier (`<identifier>.cluster-<label>`), announced in the zone a resolver
+//! answers with the interface the core opened that cluster's listener on, beside that
+//! listener's port in the one `DBCluster$Port` ("the port that the database engine is
+//! listening on") — so the pair the client composes RESOLVES to the plane that serves it. One
+//! name per cluster, and one per role: the `cluster-` label names the write path and
+//! `cluster-ro-` the read path, which is what a client that splits its traffic reads.
 //!
-//! A cluster this emulator serves NO data plane for keeps the published AWS form — there is no
-//! local plane for such a cluster to lead a client to — which is the contrast row below.
+//! A cluster this emulator serves NO data plane for keeps the same form under the published
+//! AWS domain — there is no local plane for such a cluster to lead a client to — which is the
+//! contrast row below.
 //!
 //! The rows span what the rule generalises over: both wires this emulator speaks (PostgreSQL
 //! and MySQL), both cluster types (an Aurora cluster and a Multi-AZ DB cluster), a cluster
 //! with no member instance at all, every operation that answers with a cluster envelope (the
 //! create, the describe and `DescribeDBClusterEndpoints`), and an engine whose wire this
-//! emulator serves nothing for. Each published pair is then DIALLED over a real TCP
-//! connection, in one process, and a row is round-tripped through it; the last test opens the
-//! Amazon S3 import on the published pair, so what a client at that address reads is the
+//! emulator serves nothing for. Each published pair is then RESOLVED and DIALLED over a real
+//! TCP connection, in one process, and a row is round-tripped through it; the last test opens
+//! the Amazon S3 import on the published pair, so what a client at that address reads is the
 //! engine's own refusal of an import with no role associated rather than a transport failure.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::db_cluster_engine_endpoint::MULTI_AZ_SETTINGS;
-use crate::db_clusters::the_cluster;
+use crate::db_clusters::{assert_served_endpoint_pair, the_cluster};
 use crate::db_instance_engine_endpoint::{
     wire_login as login, Wire, DATABASE, MASTER_PASSWORD, MASTER_USER,
 };
@@ -189,21 +189,36 @@ async fn a_served_clusters_published_endpoint_is_the_address_its_engine_listener
             row.case
         );
 
-        // And that address is the listener's own: an address of this machine, carrying no DNS
-        // zone for a client to resolve, with the listener's port beside it.
-        let address = endpoint.parse::<IpAddr>();
-        assert!(
-            address.is_ok(),
-            "case {:?}: expected the address this emulator answers the cluster's engine wire \
-             at, got the name {endpoint:?}",
-            row.case
-        );
+        // And that address leads to the listener's own: the name the cluster minted, in the
+        // zone the interface that listener is bound on names, with the listener's port beside
+        // it — so what the client resolves is the interface the plane answers on.
+        let reader = text(&settled, "ReaderEndpoint");
+        assert_served_endpoint_pair(row.case, row.identifier, REGION, &endpoint, &reader);
         let listener = listener_address(&engine, row.case, row.identifier);
         assert_eq!(
-            (endpoint.as_str(), port),
-            (listener.0.as_str(), listener.1),
-            "case {:?}: expected the cluster's own listener address {listener:?}, got \
-             {endpoint:?}:{port}",
+            port, listener.1,
+            "case {:?}: expected the port the cluster's own listener answers on ({}), got \
+             {port}",
+            row.case, listener.1
+        );
+        let resolved: Vec<std::net::SocketAddr> =
+            tokio::net::lookup_host((endpoint.as_str(), port))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {:?}: the published endpoint {endpoint:?} must resolve, got {error}",
+                        row.case
+                    )
+                })
+                .collect();
+        let bound: IpAddr = listener
+            .0
+            .parse()
+            .unwrap_or_else(|_| panic!("case {:?}: the listener is bound on an address", row.case));
+        assert!(
+            resolved.contains(&std::net::SocketAddr::new(bound, port)),
+            "case {:?}: expected the published pair to resolve to the cluster's own listener \
+             {bound}:{port}, got {resolved:?}",
             row.case
         );
 

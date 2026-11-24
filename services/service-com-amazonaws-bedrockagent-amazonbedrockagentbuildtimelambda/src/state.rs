@@ -2505,11 +2505,11 @@ pub enum DocumentStatus {
     /// The document is gone from the data source — the terminal status of a
     /// deletion, which the modelled member documents as the status of a document
     /// that "wasn't found", so the clock owes it nothing more. The data source
-    /// HOLDS it no longer: it counts against no bound, carries no content and is
-    /// no source document. Its record stays behind so the deletion's outcome is
-    /// reportable — the listing is how a client confirms WHICH document was
-    /// removed — bounded by [`DELETED_DOCUMENT_RECORDS_KEPT`], and the identity
-    /// is free again for a later ingestion to take.
+    /// HOLDS it no longer: it counts against no bound, carries no content, is
+    /// no source document and is enumerated by no listing of the data source's
+    /// contents. Its record stays behind so the deletion's outcome is reportable
+    /// through a TARGETED read — bounded by [`DELETED_DOCUMENT_RECORDS_KEPT`],
+    /// and the identity is free again for a later ingestion to take.
     NotFound,
 }
 
@@ -2548,9 +2548,10 @@ impl DocumentStatus {
     ///
     /// Every status but the terminal one of a deletion is a document the data
     /// source holds: it counts against the data source's bound, its content can
-    /// be retrieved and an ingestion job over a pushed data source scans it. A
-    /// document whose deletion has run to its end is held no longer — its
-    /// record stays only to report that outcome.
+    /// be retrieved, an ingestion job over a pushed data source scans it and a
+    /// listing of the data source's contents enumerates it. A document whose
+    /// deletion has run to its end is held no longer — its record stays only to
+    /// report that outcome to a targeted read.
     fn is_held(self) -> bool {
         !matches!(self, Self::NotFound)
     }
@@ -3676,14 +3677,19 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// holds, in document order and from the position `cursor` names, at most
     /// `page_size` of them, plus the token to resume from when more remain.
     ///
-    /// Every document the data source has a record for is reported, whatever
-    /// its status — one whose deletion is still in flight, and one whose
-    /// deletion has run to its terminal `NOT_FOUND` status alike, because the
-    /// listing is how a client confirms which document a delete removed — and
-    /// no other data source's: a document is identified within the data source
-    /// it was ingested into. A completed deletion the data source has forgotten
-    /// ([`DELETED_DOCUMENT_RECORDS_KEPT`]) is in no page. A data source holding
-    /// none reports an empty listing — an unknown one has nothing to enumerate,
+    /// The operation "retrieves all the documents contained in a data source",
+    /// so what a page carries is what the data source still HOLDS
+    /// ([`DocumentStatus::is_held`]): a document whose deletion is still in
+    /// flight is contained in it and reported under the status of that deletion,
+    /// and one whose deletion has run to its end is contained in it no longer
+    /// and is in no page — a client confirms a deletion by the identifier
+    /// LEAVING the collection. The outcome of that deletion stays reportable
+    /// through the targeted read, which answers the retained record's terminal
+    /// status ([`DELETED_DOCUMENT_RECORDS_KEPT`]).
+    ///
+    /// No other data source's documents are reported: a document is identified
+    /// within the data source it was ingested into. A data source holding none
+    /// reports an empty listing — an unknown one has nothing to enumerate,
     /// which the caller refuses as a missing resource before asking.
     pub fn page_of_documents(
         &self,
@@ -3698,6 +3704,7 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| {
                 record.knowledge_base_id == knowledge_base_id
                     && record.data_source_id == data_source_id
+                    && record.is_held()
             })
             .collect();
         ordered.sort_by(|left, right| left.key.sort_key().cmp(&right.key.sort_key()));

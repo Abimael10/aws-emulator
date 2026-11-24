@@ -19,10 +19,13 @@
 //!    `topic_plane_denial_names_the_submitted_cluster_arn`);
 //! 2. a value that is no ARN at all resolves to nothing either, so where only the
 //!    resource's OWN policy could have granted the action — the four actions an MSK
-//!    cluster policy governs — the decision is taken over the value AS SUBMITTED,
-//!    there being nothing else it stands for, and the refusal names that value;
-//!    where an identity-based document could have granted the action, there is
-//!    nothing to decide and the operation answers the parameter;
+//!    cluster policy governs — the decision is taken over the value AS SUBMITTED
+//!    where the request ADDRESSED that target (a value the URI carried), there being
+//!    nothing else it stands for, and the refusal names that value; a target the
+//!    request named in its BODY is no addressed resource, so the decision over it is
+//!    taken against the wildcard and the refusal names `*`. Where an identity-based
+//!    document could have granted the action, there is nothing to decide and the
+//!    operation answers the parameter;
 //! 3. an ARN naming a resource of ANOTHER KIND is no reference of this kind at all,
 //!    so no permission scoped to the action's own resource is ever matched against it:
 //!    the gate decides nothing and the operation answers the reference it cannot use.
@@ -154,6 +157,14 @@ impl Call {
                 self.body.clone(),
             ),
         }
+    }
+
+    /// Whether the request ADDRESSES its target: a value the URI carries (a path
+    /// label or a query parameter) is the resource the request addressed, where one
+    /// carried in the body is not — which is what decides whether a refusal over an
+    /// unresolvable value names it or the wildcard.
+    fn addresses_its_target(&self) -> bool {
+        !matches!(self.target, Target::Body { .. })
     }
 
     /// Make this call against `value`.
@@ -344,10 +355,12 @@ async fn a_cluster_reference_identifying_no_cluster_is_refused_over_the_wildcard
 
 /// RULE (reading 2): a value that is no ARN at all stands for nothing a document
 /// could be attached to, so for the four actions only a cluster's own policy can
-/// grant the decision is taken over the VALUE AS SUBMITTED and the refusal names it
-/// verbatim — again one sentence, with no clause — while for the actions an
-/// identity-based document could grant there is nothing to decide and the operation
-/// answers the parameter instead.
+/// grant the decision is taken over the VALUE AS SUBMITTED where the request
+/// addressed that target, and the refusal names it verbatim — while a target the
+/// request carried in its BODY is no addressed resource, so the decision is taken
+/// over no resource and the refusal names the wildcard. Either way it is one
+/// sentence, with no clause; for the actions an identity-based document could grant
+/// there is nothing to decide and the operation answers the parameter instead.
 #[tokio::test]
 async fn a_value_that_is_no_arn_is_decided_over_itself_or_left_to_the_operation() {
     let emulator = Emulator::new();
@@ -381,10 +394,14 @@ async fn a_value_that_is_no_arn_is_decided_over_itself_or_left_to_the_operation(
                 reply.status,
                 reply.body
             );
+            let resource = match call.addresses_its_target() {
+                true => value.clone(),
+                false => ANY_RESOURCE.to_string(),
+            };
             assert_eq!(
                 reply.error_message(),
-                not_authorized(&call.action, &value),
-                "case {case:?}: expected the refusal over the submitted value, got {:?}",
+                not_authorized(&call.action, &resource),
+                "case {case:?}: expected the refusal over {resource:?}, got {:?}",
                 reply.error_message()
             );
             assert!(
