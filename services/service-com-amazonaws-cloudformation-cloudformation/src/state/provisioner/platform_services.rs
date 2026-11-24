@@ -2188,16 +2188,39 @@ pub(super) const BACKUP_PLANS_URI: &str = "/backup/plans";
 
 /// Every property `AWS::Backup::BackupVault` publishes that this arm carries to AWS
 /// Backup: the name the vault is created under, the tags the create takes, the KMS key it
-/// encrypts the vault with, and the vault lock a second call applies
-/// ([`BACKUP_VAULT_LOCK_PROPERTY`]). A declaration naming anything else — `AccessPolicy`
-/// and `Notifications`, whose `PutBackupVaultAccessPolicy` and
-/// `PutBackupVaultNotifications` this emulator does not serve yet — is REFUSED rather than
-/// deployed with the property dropped.
+/// encrypts the vault with, and the three configurations a call of that service's own
+/// applies to the vault just created — its lock ([`BACKUP_VAULT_LOCK_PROPERTY`]), its
+/// resource policy ([`BACKUP_VAULT_ACCESS_POLICY_PROPERTY`]) and its notifications
+/// ([`BACKUP_VAULT_NOTIFICATIONS_PROPERTY`]). A declaration naming anything else is REFUSED
+/// rather than deployed with the property dropped.
 pub(super) const BACKUP_VAULT_PROPERTIES: &[&str] = &[
     "BackupVaultName",
     "BackupVaultTags",
     "EncryptionKeyArn",
     BACKUP_VAULT_LOCK_PROPERTY,
+    BACKUP_VAULT_ACCESS_POLICY_PROPERTY,
+    BACKUP_VAULT_NOTIFICATIONS_PROPERTY,
+];
+
+/// The property carrying the vault's RESOURCE POLICY. It is no member of
+/// `CreateBackupVault` either: it is the `PutBackupVaultAccessPolicy` a client makes next on
+/// the vault just created, whose own `Policy` member takes the document as TEXT — so a
+/// declaration that writes it as an inline object is rendered ([`document_text`]), and
+/// `DeleteBackupVaultAccessPolicy` is what a declaration that no longer states it asks for.
+pub(super) const BACKUP_VAULT_ACCESS_POLICY_PROPERTY: &str = "AccessPolicy";
+
+/// The property carrying the vault's NOTIFICATION configuration — no member of the create
+/// either: it is the `PutBackupVaultNotifications` a client makes next on the vault just
+/// created, whose two members this property's own are named identically to, and
+/// `DeleteBackupVaultNotifications` is what a declaration that no longer states it asks for.
+pub(super) const BACKUP_VAULT_NOTIFICATIONS_PROPERTY: &str = "Notifications";
+
+/// The members of that notification call, as (property, member) pairs — identical on both
+/// sides (`smithy_query(query="operation",operation="PutBackupVaultNotifications")` against
+/// AWS's `NotificationObjectType`).
+pub(super) const BACKUP_VAULT_NOTIFICATION_MEMBERS: &[(&str, &str)] = &[
+    ("BackupVaultEvents", "BackupVaultEvents"),
+    ("SNSTopicArn", "SNSTopicArn"),
 ];
 
 /// The property carrying the vault's lock. It is no member of `CreateBackupVault` at all:
@@ -2275,9 +2298,10 @@ pub(super) const BACKUP_RULE_MEMBERS: &[(&str, &str)] = &[
 ///
 /// The vault carries the tags CloudFormation gives it beside the declared ones
 /// ([`tags_of`]), as the tag MAP that create takes under this type's own
-/// `BackupVaultTags`. A declared `LockConfiguration` is no member of the create: it is the
-/// `PutBackupVaultLockConfiguration` a client makes next on the vault just created, so a
-/// vault declared with one is locked rather than created unlocked.
+/// `BackupVaultTags`. The declared lock, resource policy and notifications are no members
+/// of the create at all: each is a call of AWS Backup's own that a client makes next on the
+/// vault just created ([`apply_backup_vault_configuration`]), so a vault declared with one
+/// is deployed with it rather than created without it.
 ///
 /// The ARN AWS Backup minted is reported back as the `BackupVaultArn` attribute the type
 /// publishes, beside the `BackupVaultName` it answered with.
@@ -2294,7 +2318,7 @@ pub(super) async fn create_backup_vault(
         request.insert("EncryptionKeyArn".to_string(), Value::String(key));
     }
     let tags = tags_as_map(&tags_of(
-        &backup_declared_tags(resource, BACKUP_VAULT_TAGS_PROPERTY),
+        &backup_declared_tags(&resource.properties, BACKUP_VAULT_TAGS_PROPERTY),
         propagated,
     ));
     if !tags.is_empty() {
@@ -2312,23 +2336,14 @@ pub(super) async fn create_backup_vault(
         Some(&Value::Object(request)),
     )
     .await?;
-    if let Some(declared) = resource.properties.get(BACKUP_VAULT_LOCK_PROPERTY) {
-        let locked = call_rest_json(
-            ctx,
-            BACKUP_SIGNING_NAME,
-            region,
-            "PUT",
-            &format!("{}/vault-lock", backup_vault_uri(&name)),
-            Some(&mapped_members(declared, BACKUP_VAULT_LOCK_MEMBERS)),
-        )
-        .await;
-        if let Err(refusal) = locked {
-            // The vault exists but not with the lock it was declared with, and the stack
-            // will record no resource for it, so it is removed before the failure is
-            // reported — a refused delete changes nothing about the refusal that caused it.
-            let _ = delete_backup_vault(ctx, region, &name).await;
-            return Err(refusal);
-        }
+    if let Err(refusal) =
+        apply_backup_vault_configuration(ctx, region, &name, &resource.properties).await
+    {
+        // The vault exists but not as it was declared, and the stack will record no
+        // resource for it, so it is removed before the failure is reported — a refused
+        // delete changes nothing about the refusal that caused it.
+        let _ = delete_backup_vault(ctx, region, &name).await;
+        return Err(refusal);
     }
     let mut attributes = BTreeMap::new();
     attributes.insert(
@@ -2339,6 +2354,270 @@ pub(super) async fn create_backup_vault(
         attributes.insert("BackupVaultArn".to_string(), arn);
     }
     Ok(Created::attributes(attributes))
+}
+
+/// Apply the configurations a vault's declaration states that `CreateBackupVault` has no
+/// member for, each through the call of AWS Backup's own that carries it, on the vault the
+/// create just made.
+///
+/// A property the declaration does not state asks for nothing, so nothing is called about
+/// it: a vault declared without a lock is left unlocked, one declared without a policy
+/// carries none, and one declared without notifications publishes none — which is the state
+/// a vault a client created with the bare create is in.
+async fn apply_backup_vault_configuration(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<(), Refusal> {
+    if let Some(declared) = properties.get(BACKUP_VAULT_LOCK_PROPERTY) {
+        call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "PUT",
+            &backup_vault_lock_uri(name),
+            Some(&mapped_members(declared, BACKUP_VAULT_LOCK_MEMBERS)),
+        )
+        .await?;
+    }
+    if let Some(declared) = properties.get(BACKUP_VAULT_ACCESS_POLICY_PROPERTY) {
+        call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "PUT",
+            &backup_vault_access_policy_uri(name),
+            Some(&backup_vault_access_policy(declared)),
+        )
+        .await?;
+    }
+    if let Some(declared) = properties.get(BACKUP_VAULT_NOTIFICATIONS_PROPERTY) {
+        call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "PUT",
+            &backup_vault_notifications_uri(name),
+            Some(&mapped_members(declared, BACKUP_VAULT_NOTIFICATION_MEMBERS)),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Apply a CHANGED declaration to a vault that already exists.
+///
+/// AWS Backup publishes no `UpdateBackupVault`: what a vault that exists can be given a new
+/// value for is exactly the three configurations its own calls carry — its lock, its
+/// resource policy and its notifications — so each is re-applied where the two declarations
+/// differ, and REMOVED through that configuration's own delete where this declaration no
+/// longer states it. Everything else the type publishes is create-only: the name and the
+/// encryption key are both in the position
+/// [`super::super::template::replacement_properties`] records (the name by its own rule,
+/// [`super::super::template::name_is_create_only`]), so a change to either never reaches
+/// here, and the tags reach AWS Backup
+/// through its own tagging calls ([`retag_backup_vault`]) — which is why a deployment that
+/// changes only them asks nothing of this.
+///
+/// The type publishes the vault's name and ARN, neither of which a change can move, so the
+/// update reports no attribute of its own.
+pub(super) async fn update_backup_vault(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    if let Value::Object(properties) = declared {
+        if let Some(property) = unmapped_property(properties, BACKUP_VAULT_PROPERTIES) {
+            return Err(Refusal {
+                code: NOT_IMPLEMENTED.to_string(),
+                message: format!(
+                    "this emulator does not apply the {property} property of {}",
+                    resource.resource_type
+                ),
+            });
+        }
+    }
+    let name = &resource.physical_resource_id;
+    for (property, uri, written) in [
+        (
+            BACKUP_VAULT_LOCK_PROPERTY,
+            backup_vault_lock_uri(name),
+            BACKUP_VAULT_LOCK_MEMBERS,
+        ),
+        (
+            BACKUP_VAULT_NOTIFICATIONS_PROPERTY,
+            backup_vault_notifications_uri(name),
+            BACKUP_VAULT_NOTIFICATION_MEMBERS,
+        ),
+    ] {
+        if resource.properties.get(property) == declared.get(property) {
+            continue;
+        }
+        match declared.get(property) {
+            Some(wanted) => {
+                call_rest_json(
+                    ctx,
+                    BACKUP_SIGNING_NAME,
+                    region,
+                    "PUT",
+                    &uri,
+                    Some(&mapped_members(wanted, written)),
+                )
+                .await?;
+            }
+            None => {
+                call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "DELETE", &uri, None).await?;
+            }
+        }
+    }
+    if resource.properties.get(BACKUP_VAULT_ACCESS_POLICY_PROPERTY)
+        != declared.get(BACKUP_VAULT_ACCESS_POLICY_PROPERTY)
+    {
+        let uri = backup_vault_access_policy_uri(name);
+        match declared.get(BACKUP_VAULT_ACCESS_POLICY_PROPERTY) {
+            Some(wanted) => {
+                call_rest_json(
+                    ctx,
+                    BACKUP_SIGNING_NAME,
+                    region,
+                    "PUT",
+                    &uri,
+                    Some(&backup_vault_access_policy(wanted)),
+                )
+                .await?;
+            }
+            None => {
+                call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "DELETE", &uri, None).await?;
+            }
+        }
+    }
+    Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// Bring the tags of the vault a resource record names to the ones this deployment gives it,
+/// through AWS Backup's own `TagResource` and `UntagResource`.
+///
+/// `CreateBackupVault`'s `BackupVaultTags` map applies to the vault that call creates and to
+/// no vault that already exists, and that service publishes no call that changes a vault's
+/// configuration at all — so this is where the set a vault is to end up carrying, the
+/// stack's own tags included, is reconciled. Where the two already agree nothing is called,
+/// which is what makes this safe to ask on every deployment; a vault AWS Backup no longer
+/// holds has no tags to reconcile.
+///
+/// Those calls address a resource of that service by its ARN rather than by the name the
+/// vault's own operations take, which is why the ARN the stack published for it is resolved
+/// first ([`backup_vault_arn`]).
+pub(super) async fn retag_backup_vault(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let Some(arn) = backup_vault_arn(ctx, region, resource).await? else {
+        return Ok(());
+    };
+    let answered = match call_rest_json(
+        ctx,
+        BACKUP_SIGNING_NAME,
+        region,
+        "GET",
+        &backup_tags_uri(BACKUP_TAGS_URI, &arn),
+        None,
+    )
+    .await
+    {
+        Ok(answered) => answered,
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => return Ok(()),
+        Err(refusal) => return Err(refusal),
+    };
+    // That service answers a resource's tags as the MAP its tag write takes them in, so one
+    // reader serves both sides.
+    let held = reported_tag_map(&answered, "Tags");
+    let desired = tags_of(
+        &backup_declared_tags(declared, BACKUP_VAULT_TAGS_PROPERTY),
+        propagated,
+    );
+    let (added, removed) = tag_delta(&held, &desired);
+    if !added.is_empty() {
+        let request = Value::Object(
+            [("Tags".to_string(), Value::Object(tags_as_map(&added)))]
+                .into_iter()
+                .collect(),
+        );
+        call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "POST",
+            &backup_tags_uri(BACKUP_TAGS_URI, &arn),
+            Some(&request),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        let request = Value::Object(
+            [("TagKeyList".to_string(), tag_keys_as_list(&removed))]
+                .into_iter()
+                .collect(),
+        );
+        call_rest_json(
+            ctx,
+            BACKUP_SIGNING_NAME,
+            region,
+            "POST",
+            &backup_tags_uri(BACKUP_UNTAG_URI, &arn),
+            Some(&request),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ARN AWS Backup minted for the vault a resource record names: the value the type
+/// publishes as its `BackupVaultArn` attribute, which the stack already records, and
+/// otherwise that service's own report of the vault. `None` for a vault it no longer holds,
+/// which is nothing to reconcile.
+async fn backup_vault_arn(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<String>, Refusal> {
+    if let Some(arn) = resource.attributes.get("BackupVaultArn") {
+        return Ok(Some(arn.clone()));
+    }
+    let uri = backup_vault_uri(&resource.physical_resource_id);
+    match call_rest_json(ctx, BACKUP_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answered) => Ok(reported_text(&answered, "BackupVaultArn")),
+        Err(refusal) if refusal.code == BACKUP_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The declared resource policy as the body `PutBackupVaultAccessPolicy` takes.
+///
+/// Its `Policy` member is modelled a STRING carrying "the backup vault access policy
+/// document in JSON format", and CloudFormation accepts such a document as an inline object
+/// (JSON or YAML) or as the text of one — so a document is rendered and text passes through
+/// ([`document_text`]). A value that is no document at all is sent exactly as declared: that
+/// service's own validation is what judges it.
+fn backup_vault_access_policy(declared: &Value) -> Value {
+    let policy = document_text(declared).map_or_else(|| declared.clone(), Value::String);
+    Value::Object([("Policy".to_string(), policy)].into_iter().collect())
+}
+
+/// The URI prefixes AWS Backup binds its two tagging calls to
+/// (`POST /tags/{ResourceArn}`, which `GET` reads the set back from, and
+/// `POST /untag/{ResourceArn}`).
+pub(super) const BACKUP_TAGS_URI: &str = "/tags";
+pub(super) const BACKUP_UNTAG_URI: &str = "/untag";
+
+/// The URI that addresses the tags of ONE AWS Backup resource: the `@httpLabel` each
+/// tagging call binds the resource's ARN to, percent-encoded as a non-greedy label is sent.
+fn backup_tags_uri(prefix: &str, arn: &str) -> String {
+    format!("{prefix}/{}", percent_encoded(arn))
 }
 
 /// Delete the backup vault a stack created, addressed by its name — this resource's
@@ -2391,6 +2670,24 @@ pub(super) fn backup_vault_uri(name: &str) -> String {
     format!("{BACKUP_VAULTS_URI}/{}", percent_encoded(name))
 }
 
+/// The URI that addresses ONE vault's LOCK (`PUT`/`DELETE
+/// /backup-vaults/{BackupVaultName}/vault-lock`).
+fn backup_vault_lock_uri(name: &str) -> String {
+    format!("{}/vault-lock", backup_vault_uri(name))
+}
+
+/// The URI that addresses ONE vault's RESOURCE POLICY (`PUT`/`DELETE
+/// /backup-vaults/{BackupVaultName}/access-policy`).
+fn backup_vault_access_policy_uri(name: &str) -> String {
+    format!("{}/access-policy", backup_vault_uri(name))
+}
+
+/// The URI that addresses ONE vault's NOTIFICATION configuration (`PUT`/`DELETE
+/// /backup-vaults/{BackupVaultName}/notification-configuration`).
+fn backup_vault_notifications_uri(name: &str) -> String {
+    format!("{}/notification-configuration", backup_vault_uri(name))
+}
+
 /// Create the backup plan an `AWS::Backup::BackupPlan` declares, in AWS Backup itself — so
 /// a client that deployed the stack and then calls `backup get-backup-plan` with the id the
 /// stack published reads the plan back, rather than a `ResourceNotFoundException` for a
@@ -2440,7 +2737,7 @@ pub(super) async fn create_backup_plan(
     let mut request = Map::new();
     request.insert("BackupPlan".to_string(), Value::Object(plan));
     let tags = tags_as_map(&tags_of(
-        &backup_declared_tags(resource, BACKUP_PLAN_TAGS_PROPERTY),
+        &backup_declared_tags(&resource.properties, BACKUP_PLAN_TAGS_PROPERTY),
         propagated,
     ));
     if !tags.is_empty() {
@@ -2661,9 +2958,13 @@ pub(super) fn backup_selection_uri(resource: &StoredResource) -> Result<String, 
 /// and [`declared_tags`] already reads either SHAPE — so the declared map is handed to it
 /// under the one property name it looks for, and the merge rule a resource's declared tags
 /// and the stack's follow is the same one every other type here applies.
-pub(super) fn backup_declared_tags(resource: &StoredResource, property: &str) -> Value {
+///
+/// `properties` is a property document — the one a resource was deployed with, or the one a
+/// deployment declares for it — so the create and the re-tagging read the declared set the
+/// same way.
+pub(super) fn backup_declared_tags(properties: &Value, property: &str) -> Value {
     let mut tags = Map::new();
-    if let Some(declared) = resource.properties.get(property) {
+    if let Some(declared) = properties.get(property) {
         tags.insert("Tags".to_string(), declared.clone());
     }
     Value::Object(tags)

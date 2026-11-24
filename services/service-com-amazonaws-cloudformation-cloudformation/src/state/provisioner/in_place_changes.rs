@@ -840,6 +840,14 @@ impl Provisioner {
             Self::VpcLatticeAccessLogSubscription => {
                 update_vpc_lattice_access_log_subscription(ctx, region, resource, declared).await
             }
+            // AWS Backup publishes no `UpdateBackupVault`: what a vault that exists can be
+            // given a new value for is exactly the three configurations its own calls carry —
+            // its lock, its resource policy and its notifications — so a changed declaration
+            // of any of them reaches the vault AWS Backup already holds rather than replacing
+            // it. Its name and its encryption key are create-only
+            // ([`super::super::template::replacement_properties`]), and its tags travel
+            // through [`Self::retag`].
+            Self::BackupVault => update_backup_vault(ctx, region, resource, declared).await,
             _ => Ok(None),
         }
     }
@@ -1037,6 +1045,14 @@ impl Provisioner {
             // which is the resource's physical id.
             Self::VpcLatticeServiceNetwork | Self::VpcLatticeAccessLogSubscription => {
                 retag_vpc_lattice_resource(ctx, region, resource, declared, propagated).await
+            }
+            // A vault's tags are AWS Backup's own `TagResource` and `UntagResource`:
+            // `CreateBackupVault`'s `BackupVaultTags` map applies to the vault that call
+            // creates, and that service publishes no call that changes a vault's
+            // configuration at all, so this is where the set a vault is to end up carrying is
+            // reconciled — by the ARN it minted, which the type publishes as an attribute.
+            Self::BackupVault => {
+                retag_backup_vault(ctx, region, resource, declared, propagated).await
             }
             // Every Amazon RDS resource's tags are that service's own `AddTagsToResource` and
             // `RemoveTagsFromResource`, addressed by the resource's ARN: each create's `Tags`

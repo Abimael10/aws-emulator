@@ -100,6 +100,15 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // different group, which CloudFormation replaces. (A subnet group needs no entry:
         // both of its properties beside the name are `UpdateSubnetGroup`'s own members.)
         MEMORYDB_PARAMETER_GROUP => &["Description", "Family"],
+        // A BACKUP VAULT keeps the KMS key AWS Backup encrypts it under: `EncryptionKeyArn`
+        // is a member of `CreateBackupVault` and of no call that changes a vault — that
+        // service publishes no `UpdateBackupVault` at all — so a declaration restating it
+        // asks for a DIFFERENT vault, which CloudFormation replaces. (Its three remaining
+        // configurations — the lock, the resource policy and the notifications — are each
+        // applied by a call of that service's own, so a change to any of them reaches the
+        // vault in place; its NAME is in this position through [`name_is_create_only`], and
+        // its tags through that service's own tagging calls.)
+        BACKUP_VAULT => &["EncryptionKeyArn"],
         // A MediaConvert queue keeps the PRICING PLAN it was created with: `pricingPlan` is a
         // member of `CreateQueue` and of no member of `UpdateQueue` — which takes a queue's
         // description, status, concurrency and reservation plan and no pricing plan at all
