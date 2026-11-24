@@ -217,6 +217,11 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         let record = self.fleets.get_mut(fleet_id)?;
         record.fleet.fleet_state = Some(current_state.to_string());
+        // The state the deletion put the fleet in is an event of its history, recorded at the
+        // instant the deletion was asked for: the sub types `EventInformation$EventSubType`
+        // publishes for a fleet change are the state words themselves, so the word recorded is
+        // the one the fleet entered.
+        record.history.push(fleet_change_event(current_state, at));
         // The `active` the clock owed a `submitted` fleet is not owed a deleted one; what it
         // owes now is the `deleted` the fleet reaches when its instances are gone.
         record.pending = Some(FleetTransition::starting_now(FLEET_STATE_DELETED));

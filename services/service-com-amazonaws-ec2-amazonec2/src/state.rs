@@ -3002,6 +3002,12 @@ mod fleet_placements;
 /// declares is re-exported below, so a handler reaches it as `crate::state::delete_fleet`
 /// like any helper of this module.
 mod fleet_deletion;
+/// The EVENT HISTORY one EC2 Fleet has been through: the stored event, the words it carries,
+/// how far back a report of them reaches, the order a report pages over and the writers that
+/// record one — in a file of its own rather than as more lines beside the fleet record.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::FleetHistoryEvent` like any primitive of this module.
+mod fleet_history;
 mod network_insights;
 /// Reading an Amazon Resource Name — the one reader of an ARN's fields and of the resource its
 /// resource field names, in a file of its own rather than as more lines here. Everything it
@@ -3317,6 +3323,7 @@ pub use network_insights::*;
 pub use fleets::*;
 pub use fleet_placements::*;
 pub use fleet_deletion::*;
+pub use fleet_history::*;
 pub use network_acl_store::*;
 pub use account_attributes::*;
 

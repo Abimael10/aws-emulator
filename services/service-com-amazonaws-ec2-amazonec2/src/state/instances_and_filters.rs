@@ -316,6 +316,11 @@ impl ComAmazonawsEc2Amazonec2State {
                     at,
                 );
             }
+            // The same event in the history of the EC2 Fleet that placed this instance, if one
+            // did: an EC2 Fleet names the instances it placed itself, so the event is recorded
+            // for the instance rather than for a Spot request it may not have been placed
+            // through. One idempotent termination still records one event.
+            self.record_fleet_instance_event(instance_id, EVENT_SUB_TYPE_TERMINATED, at);
             // An instance on its way out no longer runs in the Capacity Reservation it was
             // launched into, so that capacity is available again. Written on the SAME
             // idempotent arm as the move itself, so a second termination cannot give the

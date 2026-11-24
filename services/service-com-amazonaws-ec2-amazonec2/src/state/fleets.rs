@@ -123,6 +123,11 @@ pub struct FleetRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_fleets`] is the one place a move is
     /// applied.
     pub pending: Option<FleetTransition>,
+    /// The events this fleet has been through, in the order they were recorded — what
+    /// `DescribeFleetHistory` reports. Each event ([`FleetHistoryEvent`]) is recorded at the
+    /// instant it happened, by the writer that made it happen, so a report of the history
+    /// derives nothing and writes nothing.
+    pub history: Vec<FleetHistoryEvent>,
 }
 
 /// The move the clock owes one EC2 Fleet: a [`ClockTransition`] to the `FleetStateCode`
@@ -147,8 +152,8 @@ impl FleetRecord {
         self.fleet.fleet_state.as_deref().unwrap_or_default()
     }
 
-    /// Apply what the clock owes this fleet: the state move that has fallen due, and the
-    /// activity status that move leaves the fleet reporting.
+    /// Apply what the clock owes this fleet: the state move that has fallen due, the event that
+    /// move is, and the activity status it leaves the fleet reporting.
     ///
     /// Owed to the CLOCK rather than to a caller — the move was due at this instant whether
     /// or not anybody called — so a reporting operation may apply it.
@@ -169,10 +174,15 @@ impl FleetRecord {
             .as_ref()
             .filter(|pending| now >= pending.due_at)
             .filter(|pending| pending.to != FLEET_STATE_DELETED || !running_instances)
-            .map(|pending| pending.to);
-        if let Some(to) = due {
+            .map(|pending| (pending.to, pending.at));
+        if let Some((to, at)) = due {
             self.fleet.fleet_state = Some(to.to_string());
             self.pending = None;
+            // A change in the status of the fleet is an event of its history, recorded at the
+            // instant the change FELL DUE rather than the instant somebody read it — the state
+            // changed when the move fell due. Its sub type is the state word the fleet entered,
+            // which is what `EventInformation$EventSubType` publishes for a fleet change.
+            self.history.push(fleet_change_event(to, at));
         }
         // "For fleets of type `instant`, the status is `fulfilled` after all requests are
         // placed, regardless of whether target capacity is met (this is the only possible
@@ -418,6 +428,22 @@ impl ComAmazonawsEc2Amazonec2State {
             return None;
         }
         self.add_stored_bytes(charge);
+        // The first event of every fleet's history is the state this write put it in, and the
+        // instances the write PLACED are a launch each: "instances are launched immediately if
+        // there is available capacity" (`CreateFleet`), so both happened at the instant the
+        // fleet was created. The state word is resolved back to the modelled catalog, so only a
+        // modelled word reaches the history.
+        let mut history: Vec<FleetHistoryEvent> = fleet_state_word(fleet.fleet_state.as_deref().unwrap_or_default())
+            .map(|state| fleet_change_event(state, spec.create_time))
+            .into_iter()
+            .collect();
+        history.extend(spec.instances.iter().map(|placed| {
+            fleet_instance_change_event(
+                EVENT_SUB_TYPE_LAUNCHED,
+                &placed.instance_id,
+                spec.create_time,
+            )
+        }));
         self.fleets.insert(
             fleet_id.clone(),
             FleetRecord {
@@ -430,6 +456,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 fleet,
                 instances: spec.instances,
                 pools: spec.pools,
+                history,
             },
         );
         Some(fleet_id)

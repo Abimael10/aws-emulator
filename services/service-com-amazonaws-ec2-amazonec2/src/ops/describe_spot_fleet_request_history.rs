@@ -158,10 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             MAX_PAGE_SIZE, PageTokenRule, date_time_to_system_time,
-            decode_scoped_page_token, invalid_pagination_token_for,
+            decode_scoped_page_token, fleet_history_position, invalid_pagination_token_for,
             require_known_spot_fleet_request, require_service_state,
             require_well_formed_spot_fleet_request_id, SPOT_FLEET_HISTORY_AVAILABILITY,
-            scoped_page_from_cursor, spot_fleet_history_position, spot_fleet_history_record_view,
+            scoped_page_from_cursor, spot_fleet_history_record_view,
             system_time_to_date_time,
         };
 
@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(_, event)| wanted_type.is_none_or(|wanted| wanted == event.event_type))
             .map(|(recorded, event)| {
                 (
-                    spot_fleet_history_position(event.at, recorded),
+                    fleet_history_position(event.at, recorded),
                     spot_fleet_history_record_view(event),
                 )
             })

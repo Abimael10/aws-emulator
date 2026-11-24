@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The EVENT HISTORY of a Spot Fleet request: the events the fleet itself has been through,
-//! the words the model publishes for each one, and where each sits in the order a report of
-//! them pages over.
+//! The EVENT HISTORY of a Spot Fleet request: the events the fleet itself has been through and
+//! the words the model publishes for each one. Where an event sits in the order a report of
+//! them pages over is the one ordering both fleet histories read
+//! ([`fleet_history_position`]).
 //!
 //! "Describes an event in the history of the Spot Fleet request" (`HistoryRecord`): an event
 //! is a FACT of the fleet, recorded at the instant it happened by whichever writer of
@@ -127,24 +128,6 @@ pub fn spot_fleet_history_record_view(
         event_type: Some(event.event_type.to_string()),
         timestamp: Some(system_time_to_date_time(event.at)),
     }
-}
-
-/// Where one event sits in the order a report of a fleet's history pages over: the instant it
-/// happened, then the position it was recorded at.
-///
-/// The instant alone is not a position — two events of one fleet can fall due in the same
-/// instant — so the recorded position breaks the tie, which makes the order TOTAL and lets a
-/// cursor always advance. Both halves are printed at a fixed width, so ordering these strings
-/// orders the history the way it ran, oldest event first, and an event recorded later is
-/// appended rather than shifting the position of one already reported.
-pub fn spot_fleet_history_position(at: SystemTime, recorded: usize) -> String {
-    let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let separator = CURSOR_SCOPE_SEPARATOR;
-    format!(
-        "{:020}.{:09}{separator}{recorded:020}",
-        since_epoch.as_secs(),
-        since_epoch.subsec_nanos()
-    )
 }
 
 impl ComAmazonawsEc2Amazonec2State {
