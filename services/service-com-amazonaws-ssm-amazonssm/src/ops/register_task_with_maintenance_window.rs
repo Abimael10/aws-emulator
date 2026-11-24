@@ -296,7 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // number the higher the priority".
             priority: input.priority.unwrap_or(tasks::DEFAULT_PRIORITY),
             logging_info: input.logging_info,
-            service_role_arn: input.service_role_arn,
+            // "If you do not specify a service role ARN, Systems Manager uses a service-linked
+            // role in your account": a register naming no role registers a task that runs as
+            // that role, which is what every later read of the task reports.
+            service_role_arn: tasks::held_service_role_arn(input.service_role_arn),
             name: input.name,
             description: input.description,
             // "CONTINUE_TASK: When the cutoff time is reached, any tasks that are running

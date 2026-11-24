@@ -373,8 +373,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // task, where a member left out is cleared to what a register that named it nothing
         // would have persisted: nothing at all for a member a read reports only when a write
         // set it, the empty list the modelled length admits for the targets, no parameters at
-        // all for the parameter map, and the documented default for the priority and the
-        // cutoff behaviour.
+        // all for the parameter map, the account's service-linked role for the role the task
+        // runs as, and the documented default for the priority and the cutoff behaviour.
         //
         // What the update does NOT touch is the task's identity — its minted id, its window,
         // its Region, its task type and the idempotency token its register carried — nor when
@@ -384,8 +384,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cleared: a replacement states it and a patch that leaves it out keeps what the task
         // runs.
         record.task_arn = input.task_arn.unwrap_or(record.task_arn);
-        record.service_role_arn =
-            updated_optional_member(input.service_role_arn, record.service_role_arn, replace);
+        // "If you do not specify a service role ARN, Systems Manager uses a service-linked role
+        // in your account": the role is read the way the register reads it, so a replacement
+        // that states none leaves the task running as that role rather than as nothing.
+        record.service_role_arn = tasks::held_service_role_arn(updated_optional_member(
+            input.service_role_arn,
+            Some(record.service_role_arn),
+            replace,
+        ));
         record.task_parameters = updated_member(
             input
                 .task_parameters
@@ -437,14 +443,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MaxConcurrency value": what the update persisted, which is what a later read of this
         // task reports. A member the task now carries nothing for is reported as nothing at
         // all, the way a read of a task whose register named none of them does — except the
-        // priority, which the model states a default of 0 for and a read always reports.
+        // priority, which the model states a default of 0 for and a read always reports, the
+        // role the task runs as, which is the account's service-linked role where neither the
+        // register nor this update named one, and the parameter map, which every registered
+        // task carries and a read therefore reports present and (where it holds none) empty.
         let output = UpdateMaintenanceWindowTaskOutput {
             window_id: Some(record.window_id.clone()),
             window_task_id: Some(record.window_task_id.clone()),
             targets: Some(record.targets.clone()),
             task_arn: Some(record.task_arn.clone()),
-            service_role_arn: record.service_role_arn.clone(),
-            task_parameters: record.reported_task_parameters(),
+            service_role_arn: Some(record.service_role_arn.clone()),
+            task_parameters: Some(record.reported_task_parameters()),
             task_invocation_parameters: record.task_invocation_parameters.clone(),
             priority: record.priority,
             max_concurrency: record.max_concurrency.clone(),

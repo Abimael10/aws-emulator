@@ -18,8 +18,8 @@
 //! minted, which the model fixes as the 8-4-4-4-12 hexadecimal UUID
 //! (`MaintenanceWindowTaskId`'s pattern).
 //!
-//! Two members are not held as the register stated them, because the model states what the
-//! service puts there instead:
+//! Several members are not held as the register stated them, because the model states what
+//! the service puts there instead:
 //!
 //! * `MaxConcurrency`/`MaxErrors` — "For maintenance window tasks without a target specified,
 //!   you can't supply a value for this option. Instead, the system inserts a placeholder
@@ -30,12 +30,16 @@
 //!   running continue. The default value"
 //!   (`RegisterTaskWithMaintenanceWindowRequest$CutoffBehavior`), so a register carrying none
 //!   holds [`DEFAULT_CUTOFF_BEHAVIOR`].
-//!
-//! `ServiceRoleArn` is held exactly as stated, including not at all: it names a role the
-//! CALLER hands the task ("the ARN of the IAM service role for Amazon Web Services Systems
-//! Manager to assume when running a maintenance window task"), and the service-linked role
-//! Systems Manager falls back to is one it assumes when the task RUNS rather than one this
-//! register mints, so nothing is invented for a register that named no role.
+//! * `ServiceRoleArn` — "if you do not specify a service role ARN, Systems Manager uses a
+//!   service-linked role in your account" (`MaintenanceWindowTask$ServiceRoleArn`), so a task
+//!   whose register (or replacing update) named no role holds the account's service-linked role
+//!   for this service ([`service_linked_role_arn`]) rather than nothing at all: every
+//!   registered task names the identity it runs as, which is what a read-modify-write of the
+//!   task feeds back without rewriting who it runs as.
+//! * `TaskParameters` — the map "that should be passed to the task when it is run" is one the
+//!   service materialises for every registered task, so a task registered with no parameters
+//!   holds the EMPTY map and a read reports it present and empty
+//!   ([`MaintenanceWindowTaskRecord::reported_task_parameters`]).
 //!
 //! What a task TARGETS is stated as criteria rather than resolved here, the way a window's
 //! targets are ([`super::maintenance_window_targets`]) — except that one criterion names a
@@ -70,6 +74,48 @@ pub const DEFAULT_CUTOFF_BEHAVIOR: &str = "CONTINUE_TASK";
 /// `MaintenanceWindowTask$Priority` (`default 0`) — "the lower the number the higher the
 /// priority".
 pub const DEFAULT_PRIORITY: i32 = 0;
+
+/// The service principal the role a maintenance window task runs as is linked to, in the
+/// global spelling IAM files and trusts a service by — the same principal this service's other
+/// role readings name it with ([`super::activation_role::HYBRID_REGISTRATION_PRINCIPAL`]).
+pub const SERVICE_LINKED_ROLE_PRINCIPAL: &str =
+    super::activation_role::HYBRID_REGISTRATION_PRINCIPAL;
+
+/// The name of the service-linked role Systems Manager keeps in the account for its
+/// maintenance window tasks, which is the name IAM publishes for
+/// [`SERVICE_LINKED_ROLE_PRINCIPAL`] and therefore the role IAM's own reads resolve
+/// (`::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::published_service_linked_role_name`).
+pub const SERVICE_LINKED_ROLE_NAME: &str = "AWSServiceRoleForAmazonSSM";
+
+/// The ARN of the role a task whose request named none runs as: "if you do not specify a
+/// service role ARN, Systems Manager uses a service-linked role in your account"
+/// (`MaintenanceWindowTask$ServiceRoleArn`).
+///
+/// A role is an IAM resource, and IAM is global, so the ARN names IAM and carries no Region
+/// whichever Region the request was signed for; it is composed by IAM's own role-ARN and
+/// service-linked-role-path builders, so the ARN this service reports is the one IAM reports
+/// for that role.
+#[must_use]
+pub fn service_linked_role_arn() -> String {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    iam::role_arn(
+        &iam::service_linked_role_path(SERVICE_LINKED_ROLE_PRINCIPAL),
+        SERVICE_LINKED_ROLE_NAME,
+    )
+}
+
+/// The role a task is HELD as running as, given the role the request stated: the role it
+/// stated, or the account's service-linked role ([`service_linked_role_arn`]) where it stated
+/// none.
+///
+/// The register and the update read the member the same way, because the sentence is stated on
+/// both (`RegisterTaskWithMaintenanceWindowRequest$ServiceRoleArn`,
+/// `UpdateMaintenanceWindowTaskRequest$ServiceRoleArn`).
+#[must_use]
+pub fn held_service_role_arn(stated: Option<String>) -> String {
+    stated.unwrap_or_else(service_linked_role_arn)
+}
 
 /// The criterion key by which a task's `Targets` names a REGISTERED target of its own window
 /// rather than nodes: "specify maintenance window targets using the following format:
@@ -176,7 +222,8 @@ pub struct MaintenanceWindowTaskRecord {
     /// register stated them.
     pub targets: Vec<Target>,
     /// "The parameters that should be passed to the task when it is run", ordered so two
-    /// reads of one task report them the same way. Empty for a register that carried none.
+    /// reads of one task report them the same way. EMPTY for a register that carried none,
+    /// which a read reports as the empty map (see the module docs).
     pub task_parameters: BTreeMap<String, MaintenanceWindowTaskParameterValueExpression>,
     /// "The parameters that the task should use during execution", held as stated.
     pub task_invocation_parameters: Option<MaintenanceWindowTaskInvocationParameters>,
@@ -193,9 +240,9 @@ pub struct MaintenanceWindowTaskRecord {
     /// bucket to write managed node-level logs to", or `None`.
     pub logging_info: Option<LoggingInfo>,
     /// "The Amazon Resource Name (ARN) of the IAM service role for Amazon Web Services
-    /// Systems Manager to assume when running a maintenance window task", or `None` for a
-    /// register that named none (see the module docs).
-    pub service_role_arn: Option<String>,
+    /// Systems Manager to assume when running a maintenance window task" — the role stated,
+    /// or the account's service-linked role where none was ([`held_service_role_arn`]).
+    pub service_role_arn: String,
     /// "An optional name for the task", or `None`.
     pub name: Option<String>,
     /// "An optional description for the task", or `None`.
@@ -227,10 +274,10 @@ impl MaintenanceWindowTaskRecord {
             // `MaintenanceWindowTask` names the register's `TaskType` `Type`.
             r#type: Some(self.task_type.clone()),
             targets: Some(self.targets.clone()),
-            task_parameters: self.reported_task_parameters(),
+            task_parameters: Some(self.reported_task_parameters()),
             priority: self.priority,
             logging_info: self.logging_info.clone(),
-            service_role_arn: self.service_role_arn.clone(),
+            service_role_arn: Some(self.service_role_arn.clone()),
             max_concurrency: self.max_concurrency.clone(),
             max_errors: self.max_errors.clone(),
             name: self.name.clone(),
@@ -240,23 +287,18 @@ impl MaintenanceWindowTaskRecord {
         }
     }
 
-    /// The task parameters a read reports: the map the register stated, or nothing at all for
-    /// a register that stated none — so a read of a task registered without parameters
-    /// carries no empty map the register never sent.
+    /// The task parameters a read reports: the map this task holds, which is the EMPTY map for
+    /// a register that stated none — the map is one the service materialises for every
+    /// registered task, so a read reports it present and empty rather than leaving the member
+    /// out (see the module docs).
     #[must_use]
     pub fn reported_task_parameters(
         &self,
-    ) -> Option<std::collections::HashMap<String, MaintenanceWindowTaskParameterValueExpression>>
-    {
-        if self.task_parameters.is_empty() {
-            return None;
-        }
-        Some(
-            self.task_parameters
-                .iter()
-                .map(|(name, expression)| (name.clone(), expression.clone()))
-                .collect(),
-        )
+    ) -> std::collections::HashMap<String, MaintenanceWindowTaskParameterValueExpression> {
+        self.task_parameters
+            .iter()
+            .map(|(name, expression)| (name.clone(), expression.clone()))
+            .collect()
     }
 
     /// Whether this task names the registered target `window_target_id` among its targets,
@@ -348,7 +390,7 @@ impl MaintenanceWindowTaskRecord {
             self.max_concurrency.as_deref().unwrap_or_default(),
             self.max_errors.as_deref().unwrap_or_default(),
             self.logging_info,
-            self.service_role_arn.as_deref().unwrap_or_default(),
+            self.service_role_arn,
             self.name.as_deref().unwrap_or_default(),
             self.description.as_deref().unwrap_or_default(),
             self.cutoff_behavior,

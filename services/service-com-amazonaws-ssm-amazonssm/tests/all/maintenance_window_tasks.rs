@@ -37,6 +37,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::maintenance_window_task_service_role::service_linked_role_arn;
 use crate::parameter_store::{call_in_region, error_code, error_message, router, REGION};
 
 /// A second Region, so a window and its tasks are shown to live at the endpoint of ONE
@@ -53,13 +54,15 @@ const UNKNOWN_TASK_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// The optional members a get reports only when the register supplied them, so a row that
 /// leaves one out is checked to report nothing for it.
+///
+/// `ServiceRoleArn` and `TaskParameters` are NOT among them: the role a task runs as and the
+/// parameter map it carries are materialised for every registered task, so a read reports both
+/// whatever the register stated (see `all/maintenance_window_task_service_role.rs`).
 const OPTIONAL_MEMBERS: &[&str] = &[
     "Name",
     "Description",
-    "ServiceRoleArn",
     "LoggingInfo",
     "AlarmConfiguration",
-    "TaskParameters",
     "TaskInvocationParameters",
     "MaxConcurrency",
     "MaxErrors",
@@ -341,9 +344,12 @@ async fn a_read_reports_what_the_register_persisted() {
                 "MaxConcurrency": "50%",
                 "MaxErrors": "0",
                 // The register carried no Priority and no CutoffBehavior, so the service's
-                // own defaults stand.
+                // own defaults stand, and no ServiceRoleArn and no TaskParameters, so the
+                // task runs as the account's service-linked role and holds the empty map.
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "WindowTargetIds", "Values": [window_target_id] }],
                 "TaskInvocationParameters": {
                     "Automation": { "DocumentVersion": "$DEFAULT" },
@@ -365,6 +371,8 @@ async fn a_read_reports_what_the_register_persisted() {
                 "TaskArn": "arn:aws:lambda:us-west-2:123456789012:function:maintenance",
                 "Priority": 10,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [],
                 // A targetless task holds the documented placeholder for both bounds.
                 "MaxConcurrency": "1",
@@ -402,6 +410,8 @@ async fn a_read_reports_what_the_register_persisted() {
                 "MaxErrors": "100%",
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "tag:Environment", "Values": ["production"] }],
                 "LoggingInfo": {
                     "S3BucketName": "maintenance-logs",
@@ -433,6 +443,8 @@ async fn a_read_reports_what_the_register_persisted() {
                 "MaxErrors": "1",
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "tag-key", "Values": ["Patch"] }],
             }),
         ),

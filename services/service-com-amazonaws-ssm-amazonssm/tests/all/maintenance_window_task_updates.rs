@@ -36,6 +36,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::maintenance_window_task_service_role::service_linked_role_arn;
 use crate::parameter_store::{call_in_region, error_code, error_message, router, REGION};
 
 /// A second Region, so a task is shown to be reachable only through the endpoint of the Region
@@ -53,13 +54,15 @@ const UNKNOWN_TASK_ID: &str = "00000000-0000-0000-0000-000000000000";
 /// The members a read reports only when a write set them, so a row that leaves one out is
 /// checked to report nothing for it: the optional members of `GetMaintenanceWindowTaskResult`
 /// (`smithy_query(query="operation",operation="GetMaintenanceWindowTask")`).
+///
+/// `ServiceRoleArn` and `TaskParameters` are NOT among them: the role a task runs as and the
+/// parameter map it carries are materialised for every registered task, so an update reports
+/// both whatever it stated (see `all/maintenance_window_task_service_role.rs`).
 const OPTIONAL_MEMBERS: &[&str] = &[
     "Name",
     "Description",
-    "ServiceRoleArn",
     "LoggingInfo",
     "AlarmConfiguration",
-    "TaskParameters",
     "TaskInvocationParameters",
     "MaxConcurrency",
     "MaxErrors",
@@ -553,9 +556,13 @@ async fn a_replacing_update_clears_what_it_leaves_out() {
                 "TaskArn": "AWS-RunShellScript",
                 // Everything else the register stated is cleared to what a register that named
                 // it nothing would have persisted: the service's own default for the priority
-                // and the cutoff behaviour, and nothing at all for the rest.
+                // and the cutoff behaviour, the account's service-linked role for the role the
+                // task runs as, the empty map for the parameters, and nothing at all for the
+                // rest.
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "tag:Team", "Values": ["payments"] }],
             }),
         ),
@@ -567,6 +574,8 @@ async fn a_replacing_update_clears_what_it_leaves_out() {
                 "TaskArn": "AWS-RunShellScript",
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 // Cleared to the empty list the modelled length admits, which leaves the task
                 // targetless — so both bounds hold the documented placeholder.
                 "Targets": [],

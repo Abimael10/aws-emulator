@@ -31,6 +31,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::maintenance_window_task_service_role::service_linked_role_arn;
 use crate::parameter_store::{call_in_region, error_code, error_message, router, REGION};
 
 /// A second Region, so a window and its tasks are shown to live at the endpoint of ONE Region.
@@ -48,13 +49,16 @@ const UNKNOWN_TASK_ID: &str = "00000000-0000-0000-0000-000000000000";
 /// one out is checked to report nothing for it. `MaintenanceWindowTask`'s own member list
 /// (`smithy_query(query="shape",shape="MaintenanceWindowTask")`) holds no
 /// `TaskInvocationParameters`, so it is not among them.
+///
+/// `ServiceRoleArn` and `TaskParameters` are NOT among them either: the role a task runs as and
+/// the parameter map it carries are materialised for every registered task, so the listing
+/// reports both whatever the register stated (see
+/// `all/maintenance_window_task_service_role.rs`).
 const OPTIONAL_MEMBERS: &[&str] = &[
     "Name",
     "Description",
-    "ServiceRoleArn",
     "LoggingInfo",
     "AlarmConfiguration",
-    "TaskParameters",
     "MaxConcurrency",
     "MaxErrors",
 ];
@@ -201,6 +205,10 @@ async fn the_listing_reports_what_each_register_persisted() {
                 "MaxErrors": "0",
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                // The register named no role and no parameters, so the task runs as the
+                // account's service-linked role and holds the empty map.
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "tag:Environment", "Values": ["production", "staging"] }],
             }),
         ),
@@ -217,6 +225,8 @@ async fn the_listing_reports_what_each_register_persisted() {
                 "TaskArn": "arn:aws:lambda:us-west-2:123456789012:function:window-task",
                 "Priority": 10,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [],
                 // "the system inserts a placeholder value of 1"
                 // (`RegisterTaskWithMaintenanceWindowRequest$MaxConcurrency`).
@@ -249,6 +259,8 @@ async fn the_listing_reports_what_each_register_persisted() {
                 "MaxErrors": "1",
                 "Priority": 0,
                 "CutoffBehavior": "CONTINUE_TASK",
+                "ServiceRoleArn": service_linked_role_arn(),
+                "TaskParameters": {},
                 "Targets": [{ "Key": "InstanceIds", "Values": ["i-00000000000000001"] }],
                 "LoggingInfo": {
                     "S3BucketName": "window-logs",

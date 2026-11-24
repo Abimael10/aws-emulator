@@ -262,9 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             window_task_id: Some(held.window_task_id.clone()),
             targets: Some(held.targets.clone()),
             task_arn: Some(held.task_arn.clone()),
-            service_role_arn: held.service_role_arn.clone(),
+            // The role the task runs as is the one its register or a later update stated, or
+            // the account's service-linked role where neither did, and the parameter map is
+            // one every registered task carries — so both are reported, the map empty where
+            // the task holds no parameters.
+            service_role_arn: Some(held.service_role_arn.clone()),
             task_type: Some(held.task_type.clone()),
-            task_parameters: held.reported_task_parameters(),
+            task_parameters: Some(held.reported_task_parameters()),
             task_invocation_parameters: held.task_invocation_parameters.clone(),
             priority: held.priority,
             max_concurrency: held.max_concurrency.clone(),
