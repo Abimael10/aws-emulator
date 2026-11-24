@@ -34,9 +34,9 @@ use crate::harness::{
 use crate::stack_lifecycle::{describe_stack, form_encode, output_value};
 
 /// The three resource types under test.
-const SLO: &str = "AWS::ApplicationSignals::ServiceLevelObjective";
-const GROUPING_CONFIGURATION: &str = "AWS::ApplicationSignals::GroupingConfiguration";
-const INSTRUMENTATION_CONFIG: &str = "AWS::ApplicationSignals::InstrumentationConfig";
+pub(crate) const SLO: &str = "AWS::ApplicationSignals::ServiceLevelObjective";
+pub(crate) const GROUPING_CONFIGURATION: &str = "AWS::ApplicationSignals::GroupingConfiguration";
+pub(crate) const INSTRUMENTATION_CONFIG: &str = "AWS::ApplicationSignals::InstrumentationConfig";
 
 /// The fixed text CloudFormation refuses a template declaring a type it does NOT know with,
 /// which no row of any table here may ever see.
@@ -50,7 +50,7 @@ const NOT_FOUND_STATUS: u16 = 404;
 
 /// The one `DynamicInstrumentationSignalType` the model declares
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` -> `["SNAPSHOT"]`).
-const SNAPSHOT: &str = "SNAPSHOT";
+pub(crate) const SNAPSHOT: &str = "SNAPSHOT";
 
 /// The key a stack of this suite carries its own tag under, which CloudFormation propagates to
 /// every resource it creates.
@@ -232,7 +232,11 @@ async fn submitted(
 
 /// Deploy `template` as `stack_name` and answer the `DescribeStacks` body of the COMPLETED
 /// stack, quoting the stack's own failure reasons when the create did not complete.
-async fn deployed(
+///
+/// Shared with the suite that asserts what a stack PUBLISHES for each of these types
+/// ([`crate::application_signals_published_identities`]), so the two cannot drift in how they
+/// deploy a declaration and read the settled stack.
+pub(crate) async fn deployed(
     router: &MultiServiceRouter,
     case: &str,
     stack_name: &str,
@@ -256,7 +260,7 @@ async fn deployed(
 /// The value of one output of a described stack, which every row of this suite expects to be
 /// there: an output carrying a key and no value is what a client's `{o["OutputKey"]:
 /// o["OutputValue"]}` read raises on.
-fn output(case: &str, described: &str, key: &str) -> String {
+pub(crate) fn output(case: &str, described: &str, key: &str) -> String {
     output_value(described, key).unwrap_or_else(|| {
         panic!("case {case:?}: expected an {key} output carrying a value, got {described}")
     })
@@ -285,7 +289,7 @@ async fn deleted(router: &MultiServiceRouter, case: &str, stack_name: &str) {
 
 /// A `CaptureConfiguration` with only its `@required` members
 /// (`smithy_query(query="shape",shape="CodeCaptureConfiguration,CaptureLimitsConfig")`).
-fn minimal_capture() -> Value {
+pub(crate) fn minimal_capture() -> Value {
     json!({ "CodeCapture": { "CaptureLimits": { "MaxHits": 5 } } })
 }
 
@@ -689,7 +693,7 @@ async fn a_declared_grouping_configuration_is_the_accounts_own_singleton() {
             },
             "Outputs": {
                 "GroupingRef": { "Value": { "Ref": "Grouping" } },
-                "AwsAccountId": { "Value": { "Fn::GetAtt": ["Grouping", "AwsAccountId"] } },
+                "AccountId": { "Value": { "Fn::GetAtt": ["Grouping", "AccountId"] } },
                 "UpdatedAt": { "Value": { "Fn::GetAtt": ["Grouping", "UpdatedAt"] } },
             }
         })
@@ -711,7 +715,7 @@ async fn a_declared_grouping_configuration_is_the_accounts_own_singleton() {
     let published = output(case, &described, "GroupingRef");
     assert_eq!(
         published,
-        output(case, &described, "AwsAccountId"),
+        output(case, &described, "AccountId"),
         "case {case:?}: expected Ref to return the account whose configuration it is, got \
          {published}"
     );
@@ -902,11 +906,16 @@ async fn a_declared_instrumentation_point_is_recorded_where_the_sdk_fetches_it()
 
         let described = deployed(&router, case, row.stack_name, &template).await;
         let published = output(case, &described, "PointRef");
+        let arn = output(case, &described, "PointArn");
         let hash = output(case, &described, "LocationHash");
         assert_eq!(
             published,
-            output(case, &described, "PointArn"),
-            "case {case:?}: expected Ref to return the ARN the type publishes, got {published}"
+            format!(
+                "{}|{}|{}|{SNAPSHOT}|{hash}",
+                row.instrumentation_type, row.service, environment
+            ),
+            "case {case:?}: expected Ref to return the type's composite primary identifier, got \
+             {published}"
         );
         assert!(
             hash.len() == 16 && hash.chars().all(|held| held.is_ascii_hexdigit()),
@@ -914,8 +923,8 @@ async fn a_declared_instrumentation_point_is_recorded_where_the_sdk_fetches_it()
              {hash:?}"
         );
         assert!(
-            published.ends_with(&format!("/{hash}")),
-            "case {case:?}: expected the ARN to carry the location hash, got {published}"
+            arn.ends_with(&format!("/{hash}")),
+            "case {case:?}: expected the ARN to carry the location hash, got {arn}"
         );
         let created_at = output(case, &described, "CreatedAt");
         assert!(
@@ -940,7 +949,7 @@ async fn a_declared_instrumentation_point_is_recorded_where_the_sdk_fetches_it()
         );
         assert_eq!(
             read["Configuration"]["ARN"].as_str(),
-            Some(published.as_str()),
+            Some(arn.as_str()),
             "case {case:?}: expected the stored record to carry the ARN the stack published, got \
              {read}"
         );

@@ -484,10 +484,13 @@ pub(super) const DIRECTORY_SERVICE_SIMPLE_AD_ATTRIBUTES: &[&str] = &["Alias", "D
 ///   a stack declares at most one and its identity is the account's rather than a name of its
 ///   own ([`APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES`]);
 /// * an INSTRUMENTATION CONFIG — the dynamic instrumentation point
-///   `CreateInstrumentationConfiguration` records for one code location. That service MINTS its
-///   ARN around the LOCATION HASH it computes (`InstrumentationConfigurationArn`:
-///   `^arn:[^:]+:application-signals:[^:]+:[0-9]{12}:instrumentationConfig/.+/[0-9a-f]{16}$`),
-///   which no naming rule could compute, so [`identity_is_service_assigned`] names this one.
+///   `CreateInstrumentationConfiguration` records for one code location. Its primary identifier
+///   is COMPOSITE ([`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY`]): the four dimensions
+///   every read and delete of one addresses it by, and the LOCATION HASH that service computes
+///   from the location. The ARN it MINTS around that hash (`InstrumentationConfigurationArn`:
+///   `^arn:[^:]+:application-signals:[^:]+:[0-9]{12}:instrumentationConfig/.+/[0-9a-f]{16}$`) is
+///   a published attribute beside it. The hash is no value a naming rule could compute, so
+///   [`identity_is_service_assigned`] names this one.
 pub const APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE: &str =
     "AWS::ApplicationSignals::ServiceLevelObjective";
 pub const APPLICATION_SIGNALS_GROUPING_CONFIGURATION: &str =
@@ -559,22 +562,26 @@ pub(super) const APPLICATION_SIGNALS_SLO_ATTRIBUTES: &[&str] = &[
 pub(super) const APPLICATION_SIGNALS_SLO_ARN_ATTRIBUTE: &str = "Arn";
 
 /// Every `Fn::GetAtt` attribute an [`APPLICATION_SIGNALS_GROUPING_CONFIGURATION`] publishes,
-/// in the sorted order a resource's own attribute map holds them in: the account whose
-/// configuration it is — the one identifier that service addresses a grouping configuration by
-/// (`ListGroupingAttributeDefinitions$AwsAccountId`), which is also what this type's `Ref`
-/// returns — and the instant it recorded for the configuration
+/// in the sorted order a resource's own attribute map holds them in: the ACCOUNT whose
+/// configuration it is — the type's own primary identifier, which is also what its `Ref`
+/// returns — and the instant that service recorded for the configuration
 /// (`GroupingConfiguration$UpdatedAt`).
 ///
-/// The account id is a value these naming rules compute; the instant is that service's clock,
-/// so it stands in ([`service_assigned_document`]) until [`crate::state::provisioner`] has
-/// reported what `PutGroupingConfiguration` answered.
+/// The account is no member of the wire at all: `PutGroupingConfiguration` takes only the
+/// definitions and answers only them and the instant, so the configuration is the SINGLETON of
+/// the account the call was signed for, and that account is what the type publishes as its
+/// `AccountId`. The id is a value these naming rules compute (the one account this emulator
+/// mints); the instant is that service's clock, so it stands in
+/// ([`service_assigned_document`]) until [`crate::state::provisioner`] has reported what the
+/// put answered.
 pub(super) const APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES: &[&str] =
-    &["AwsAccountId", "UpdatedAt"];
+    &["AccountId", "UpdatedAt"];
 
 /// The attribute of [`APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES`] that carries the
 /// account whose configuration the resource is, which is the identity a `Ref` to one resolves
-/// to.
-pub(super) const APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE: &str = "AwsAccountId";
+/// to. Visible to the rest of this service's state because it IS that type's primary identifier
+/// ([`crate::state::primary_identifier`]).
+pub const APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE: &str = "AccountId";
 
 /// Every `Fn::GetAtt` attribute an [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG`] publishes, in
 /// the sorted order a resource's own attribute map holds them in: the three values the created
@@ -584,8 +591,13 @@ pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES: &[&str] 
     &["Arn", "CreatedAt", "LocationHash"];
 
 /// The attribute of [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES`] that carries the
-/// ARN that service minted, which is the identity a `Ref` to one resolves to.
+/// ARN that service minted, which the type publishes BESIDE its identity rather than as it
+/// ([`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY`]).
 pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE: &str = "Arn";
+
+/// The attribute of [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES`] that carries the
+/// location hash that service computed, which is the last part of the type's own identity.
+pub(super) const APPLICATION_SIGNALS_LOCATION_HASH_ATTRIBUTE: &str = "LocationHash";
 
 /// How many lowercase hexadecimal characters an instrumentation configuration's `LocationHash`
 /// carries: `LocationHash`'s own `@length(min: 16, max: 16)`, which the ARN pattern repeats as
@@ -593,13 +605,67 @@ pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE: &str 
 /// ([`return_values`]) so a value standing in for one is the shape that service answers.
 pub(super) const APPLICATION_SIGNALS_LOCATION_HASH_CHARS: usize = 16;
 
-/// The properties an instrumentation configuration's identity is spelled from, in the order
-/// the ARN carries them after the service and the environment: the declaration states all
-/// four, and the fourth — the location — is what that service hashes.
+/// The properties an instrumentation configuration's identity is spelled from: the four
+/// dimensions `GetInstrumentationConfiguration` and `DeleteInstrumentationConfiguration` address
+/// one by, and the LOCATION that service hashes into the fifth part of that identity.
+pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_TYPE_PROPERTY: &str = "InstrumentationType";
 pub(super) const APPLICATION_SIGNALS_SERVICE_PROPERTY: &str = "Service";
 pub(super) const APPLICATION_SIGNALS_ENVIRONMENT_PROPERTY: &str = "Environment";
 pub(super) const APPLICATION_SIGNALS_SIGNAL_TYPE_PROPERTY: &str = "SignalType";
 pub(super) const APPLICATION_SIGNALS_LOCATION_PROPERTY: &str = "Location";
+
+/// The COMPOSITE primary identifier of an [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG`], in the
+/// order its parts are joined in: the four dimensions that address one configuration, and the
+/// `LocationHash` that service computed from the location it watches.
+///
+/// Those five values are what every read and delete of one configuration takes
+/// (`GetInstrumentationConfiguration`/`DeleteInstrumentationConfiguration` carry the four beside
+/// a `LocationIdentifier` naming the location by its hash), and the type declares no name of its
+/// own — so they are what a client names one by, which is what this type's `Ref` returns
+/// ([`instrumentation_config_identity`]).
+pub const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY: &[&str] = &[
+    APPLICATION_SIGNALS_INSTRUMENTATION_TYPE_PROPERTY,
+    APPLICATION_SIGNALS_SERVICE_PROPERTY,
+    APPLICATION_SIGNALS_ENVIRONMENT_PROPERTY,
+    APPLICATION_SIGNALS_SIGNAL_TYPE_PROPERTY,
+    APPLICATION_SIGNALS_LOCATION_HASH_ATTRIBUTE,
+];
+
+/// The physical resource id of one such configuration: the five parts of that identity joined
+/// with [`COMPOSITE_IDENTITY_SEPARATOR`], which is what the type's `Ref` returns.
+///
+/// Not a row of [`composite_identity`]: that one builds an identity out of the values a
+/// declaration STATES, and the last part of this one is the hash Application Signals computes,
+/// which no declaration carries. So the identity is built here as a stand-in and again by
+/// [`crate::state::provisioner`] from the record that service answered — the one place every
+/// part of it is really known.
+pub(crate) fn instrumentation_config_identity(
+    instrumentation_type: &str,
+    service: &str,
+    environment: &str,
+    signal_type: &str,
+    location_hash: &str,
+) -> String {
+    [
+        instrumentation_type,
+        service,
+        environment,
+        signal_type,
+        location_hash,
+    ]
+    .join(COMPOSITE_IDENTITY_SEPARATOR)
+}
+
+/// The `LocationHash` such an identity carries ([`instrumentation_config_identity`]); `None` for
+/// a value that is not one, so a call is never addressed with a part of a value of another
+/// shape.
+pub(crate) fn instrumentation_config_location_hash(identity: &str) -> Option<&str> {
+    let parts: Vec<&str> = identity.split(COMPOSITE_IDENTITY_SEPARATOR).collect();
+    if parts.len() != APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY.len() {
+        return None;
+    }
+    parts.last().copied()
+}
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an AWS Elemental MEDIACONVERT
 /// CERTIFICATE ASSOCIATION: the trust between an AWS Certificate Manager certificate and the

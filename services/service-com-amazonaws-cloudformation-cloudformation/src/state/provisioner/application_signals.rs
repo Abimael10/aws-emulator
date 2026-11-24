@@ -44,6 +44,14 @@
 
 use super::*;
 
+// The composite primary identifier of an `AWS::ApplicationSignals::InstrumentationConfig`: its
+// join and the hash its last part carries live beside the return-value catalogue that publishes
+// the type's identity ([`crate::state::template`]), so this module and that catalogue cannot
+// spell one identifier two ways.
+use crate::state::template::{
+    instrumentation_config_identity, instrumentation_config_location_hash,
+};
+
 /// CloudWatch Application Signals' signing name, from its model (`sigv4Name:
 /// application-signals`), which speaks `restJson1` — so its calls ride on
 /// [`call_rest_json_named`], each on the URI its own operation's `@http` binding declares,
@@ -699,12 +707,18 @@ const INSTRUMENTATION_CONFIG_MAPPED_PROPERTIES: &[&str] = &[
 ];
 
 /// The members the read and the delete address ONE configuration by, beside the location: the
-/// four identity dimensions the create's documented conflict is on.
+/// four identity dimensions the create's documented conflict is on, which are also the first
+/// four parts of this type's composite primary identifier
+/// ([`instrumentation_config_identity`]).
+const INSTRUMENTATION_TYPE_MEMBER: &str = "InstrumentationType";
+const SERVICE_MEMBER: &str = "Service";
+const ENVIRONMENT_MEMBER: &str = "Environment";
+const SIGNAL_TYPE_MEMBER: &str = "SignalType";
 const INSTRUMENTATION_IDENTITY_MEMBERS: &[(&str, &str)] = &[
-    ("InstrumentationType", "InstrumentationType"),
-    ("Service", "Service"),
-    ("Environment", "Environment"),
-    ("SignalType", "SignalType"),
+    (INSTRUMENTATION_TYPE_MEMBER, INSTRUMENTATION_TYPE_MEMBER),
+    (SERVICE_MEMBER, SERVICE_MEMBER),
+    (ENVIRONMENT_MEMBER, ENVIRONMENT_MEMBER),
+    (SIGNAL_TYPE_MEMBER, SIGNAL_TYPE_MEMBER),
 ];
 
 /// The member the read and the delete take the location under, and the member of that union
@@ -720,8 +734,11 @@ const EXPIRES_AT_PROPERTY: &str = "ExpiresAt";
 /// The attributes an instrumentation configuration publishes that Application Signals reports
 /// as SCALARS, as `(attribute, member)`: the ARN it minted — whose own member is spelled `ARN`
 /// — and the location hash it computed.
-const INSTRUMENTATION_ATTRIBUTE_MEMBERS: &[(&str, &str)] =
-    &[("Arn", "ARN"), ("LocationHash", "LocationHash")];
+const ARN_ATTRIBUTE: &str = "Arn";
+const INSTRUMENTATION_ATTRIBUTE_MEMBERS: &[(&str, &str)] = &[
+    (ARN_ATTRIBUTE, "ARN"),
+    (LOCATION_HASH_MEMBER, LOCATION_HASH_MEMBER),
+];
 
 /// The one attribute of this type that is an INSTANT: the instant that service recorded for
 /// the record it created.
@@ -748,9 +765,11 @@ const INSTRUMENTATION_REPORTED_PROPERTIES: &[(&str, &str)] = &[
 /// beside the ones CloudFormation gives the resource ([`tags_of`]) as the `TagList` that
 /// create's own `Tags` member takes.
 ///
-/// The identity is that service's: the ARN it minted — which carries the `LocationHash` it
-/// computed — becomes this resource's physical id, and the three values the type publishes are
-/// read off the record it answered.
+/// The identity is the type's own COMPOSITE primary identifier
+/// ([`instrumentation_config_identity`]): the four dimensions the declaration states and the
+/// `LocationHash` that service computed, which is the identifier every later read and delete of
+/// the configuration takes. The ARN it minted around that hash is published BESIDE it, as this
+/// type's `Arn`, with the three values the type publishes read off the record it answered.
 pub(super) async fn create_instrumentation_config(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -784,16 +803,44 @@ pub(super) async fn create_instrumentation_config(
     )
     .await?;
     let attributes = instrumentation_attributes(&answered);
-    let Some(arn) = attributes.get("Arn").cloned() else {
-        return Err(Refusal {
-            code: "InternalFailure".to_string(),
-            message: "the CloudWatch Application Signals control plane answered a created \
-                      instrumentation configuration without an ARN"
-                .to_string(),
-        });
+    // Both values that service MINTS are required members of its answer, and each is a value no
+    // naming rule could compute: the hash is the last part of this resource's identity and the
+    // ARN is what the type publishes beside it. An answer carrying neither names no
+    // configuration a client could reach, so it is reported as a failure rather than as a
+    // resource with a part of its identity missing.
+    for minted in [LOCATION_HASH_MEMBER, ARN_ATTRIBUTE] {
+        if !attributes.contains_key(minted) {
+            return Err(Refusal {
+                code: "InternalFailure".to_string(),
+                message: format!(
+                    "the CloudWatch Application Signals control plane answered a created \
+                     instrumentation configuration without a {minted}"
+                ),
+            });
+        }
+    }
+    let location_hash = attributes
+        .get(LOCATION_HASH_MEMBER)
+        .cloned()
+        .unwrap_or_default();
+    // Each dimension of the identity is the one the ANSWER carries — every one of them is a
+    // required member of it — and the value the declaration stated where that answer carries
+    // none, which is what the create was asked for.
+    let identity_part = |member: &str| {
+        answered
+            .get(member)
+            .and_then(scalar_text)
+            .or_else(|| resource.properties.get(member).and_then(scalar_text))
+            .unwrap_or_default()
     };
     Ok(Created {
-        physical_resource_id: Some(arn),
+        physical_resource_id: Some(instrumentation_config_identity(
+            &identity_part(INSTRUMENTATION_TYPE_MEMBER),
+            &identity_part(SERVICE_MEMBER),
+            &identity_part(ENVIRONMENT_MEMBER),
+            &identity_part(SIGNAL_TYPE_MEMBER),
+            &location_hash,
+        )),
         attributes,
     })
 }
@@ -857,8 +904,9 @@ pub(super) async fn describe_instrumentation_config(
 /// admits.
 ///
 /// The hash is the `LocationHash` attribute the create reported; a record that carries none
-/// falls back to the last segment of this resource's physical id, which is the ARN's own final
-/// `[0-9a-f]{16}` segment.
+/// falls back to the last part of this resource's physical id, which is the same hash — it is
+/// the final part of this type's composite primary identifier
+/// ([`instrumentation_config_identity`]).
 fn instrumentation_identity(resource: &StoredResource) -> Value {
     let mut request = Map::new();
     if let Some(properties) = resource.properties.as_object() {
@@ -881,10 +929,7 @@ fn instrumentation_location_hash(resource: &StoredResource) -> String {
     if let Some(hash) = resource.attributes.get(LOCATION_HASH_MEMBER) {
         return hash.clone();
     }
-    resource
-        .physical_resource_id
-        .rsplit('/')
-        .next()
+    instrumentation_config_location_hash(&resource.physical_resource_id)
         .unwrap_or_default()
         .to_string()
 }

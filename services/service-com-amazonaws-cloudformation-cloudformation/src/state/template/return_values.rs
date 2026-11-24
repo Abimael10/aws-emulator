@@ -1171,13 +1171,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // An Application Signals INSTRUMENTATION CONFIG is one more:
         // `CreateInstrumentationConfiguration` takes no identifier for the configuration — the
         // declaration states the service, the environment, the signal type and the code
-        // location — and answers the ARN that service minted, whose final segment is the
-        // `LocationHash` it computed from that location (16 lowercase hexadecimal characters,
-        // which no name CloudFormation decides is). That ARN is what the type's `Ref` returns,
-        // so the identity in force is the one that service answered. (A SERVICE LEVEL
-        // OBJECTIVE is NOT one of them: its ARN carries the objective's own name, which the
-        // naming rules compute; nor is a GROUPING CONFIGURATION, whose identity is the account
-        // the configuration belongs to.)
+        // location — and answers the `LocationHash` it computed from that location (16 lowercase
+        // hexadecimal characters, which no name CloudFormation decides is) beside the ARN it
+        // minted around it. That hash is the last part of this type's own primary identifier
+        // ([`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY`]), and the ARN the type
+        // publishes beside it, so the identity in force is the one that service answered. (A
+        // SERVICE LEVEL OBJECTIVE is NOT one of them: its ARN carries the objective's own name,
+        // which the naming rules compute; nor is a GROUPING CONFIGURATION, whose identity is the
+        // account the configuration belongs to.)
         || resource_type == APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG
         // A CLEAN ROOMS ML training dataset is one more: `CreateTrainingDataset` takes no
         // identifier for the dataset — the declaration states its name, the role that reads
@@ -1590,6 +1591,17 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
             APPCONFIG_VERSION_NUMBER_ATTRIBUTE,
         ],
         APPCONFIG_DEPLOYMENT => &["ApplicationId", "EnvironmentId", "DeploymentNumber"],
+        // An Application Signals INSTRUMENTATION CONFIG is in that same position: a
+        // configuration is addressed by the instrumentation type, the service, the environment,
+        // the signal type and the `LocationHash` that service computed — the five values
+        // `GetInstrumentationConfiguration` and `DeleteInstrumentationConfiguration` each take
+        // to name one — and the type declares no name of its own. The last part is that
+        // service's to compute, so [`composite_identity`] answers `None` for one (the
+        // declaration carries no hash to join) and the identity is built from what the create
+        // answered instead ([`instrumentation_config_identity`]).
+        APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => {
+            APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY
+        }
         // The three Amazon ECS types whose resource is not a named entity of its own but a
         // BINDING, each identified by the values that service's own API addresses one by: the
         // capacity-provider configuration of a cluster by that cluster (there is one per

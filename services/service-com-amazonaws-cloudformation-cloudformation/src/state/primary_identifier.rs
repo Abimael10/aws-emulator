@@ -127,15 +127,16 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // service on the resource takes as its identifier. A network's own `Name` is only what
         // it is called, and a subscription declares no name at all.
         VPCLATTICE_SERVICE_NETWORK | VPCLATTICE_ACCESS_LOG_SUBSCRIPTION => "Arn",
-        // An Application Signals service level objective and an instrumentation config are
-        // each identified by the ARN that type's `Ref` returns — the objective's is the one
-        // every SLO operation takes as its `Id`, the configuration's the one its create
-        // answered. A GROUPING CONFIGURATION is identified by the ACCOUNT whose configuration
-        // it is: there is one per account and Region, its create takes no identifier at all,
-        // and `AwsAccountId` is the one member that service's own read of one narrows by.
-        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE
-        | APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => "Arn",
-        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => "AwsAccountId",
+        // An Application Signals service level objective is identified by the ARN that type's
+        // `Ref` returns — the one every SLO operation takes as its `Id`. A GROUPING
+        // CONFIGURATION is identified by the ACCOUNT whose configuration it is: there is one per
+        // account and Region, its put takes no identifier at all and answers a record carrying
+        // no account member, so the account the call was signed for is what names one. (An
+        // INSTRUMENTATION CONFIG is not here: its primary identifier is the COMPOSITE
+        // [`super::template::composite_identity_properties`] records, which the step above
+        // answers.)
+        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => "Arn",
+        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE,
         // The private Amazon ECR registry's own signing configuration, identified by the
         // REGISTRY whose configuration it is: a registry holds one, neither the put nor the
         // delete takes an identifier at all, and `registryId` is the one member the calls that

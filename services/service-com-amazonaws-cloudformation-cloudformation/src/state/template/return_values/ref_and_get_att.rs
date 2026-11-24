@@ -2346,12 +2346,14 @@ pub(crate) fn return_values(
         }
         // The grouping configuration an `AWS::ApplicationSignals::GroupingConfiguration`
         // declares. `PutGroupingConfiguration` keeps ONE configuration per account and Region
-        // ("Creates or updates the grouping configuration for this account") and takes no
-        // identifier for it, and the read that reports one narrows by `AwsAccountId` — so the
-        // resource's identity is the account whose configuration it is, not a name of its own,
-        // and a second declaration of the type in the same account names the same resource.
-        // Its `UpdatedAt` is that service's clock and stands in until `super::provisioning`
-        // has reported what the put answered
+        // ("Creates or updates the grouping configuration for this account"), takes no
+        // identifier for it and answers a record that carries no account member at all — the
+        // configuration is the singleton of the account the call was signed for. So the
+        // resource's identity is that ACCOUNT rather than a name of its own, which is what both
+        // the physical id and the `AccountId` this type publishes carry, and a second
+        // declaration of the type in the same account names the same resource. Its `UpdatedAt`
+        // is that service's clock and stands in until `super::provisioning` has reported what
+        // the put answered
         // ([`super::provisioner::Provisioner::ApplicationSignalsGroupingConfiguration`]).
         APPLICATION_SIGNALS_GROUPING_CONFIGURATION => {
             let account_id = ::emulator_server::emulator_account_id().to_string();
@@ -2371,15 +2373,19 @@ pub(crate) fn return_values(
             (account_id, attributes)
         }
         // The instrumentation point an `AWS::ApplicationSignals::InstrumentationConfig`
-        // declares. `CreateInstrumentationConfiguration` takes no identifier for it and
-        // answers the ARN it minted, which carries the service, the environment, the signal
-        // type and the `LocationHash` that service computed from the LOCATION — a hash no
-        // naming rule computes, which is what [`identity_is_service_assigned`] names this type
-        // for. The value here is therefore a STAND-IN of that form: the three parts the
-        // declaration states, and a stable digest of the declared location at the width that
-        // member carries, re-pointed at the ARN the create really answered
+        // declares. Its primary identifier is the COMPOSITE of the four dimensions every read
+        // and delete of one addresses it by and the `LocationHash` that service computed from
+        // the LOCATION ([`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_IDENTITY`]), so that is
+        // what a `Ref` to one resolves to ([`instrumentation_config_identity`]); the ARN
+        // `CreateInstrumentationConfiguration` minted around that same hash is published BESIDE
+        // it, as this type's `Arn`.
+        //
+        // The hash is no value a naming rule computes, which is what
+        // [`identity_is_service_assigned`] names this type for: the identity and the ARN here
+        // are STAND-INS carrying a stable digest of the declared location at the width that
+        // member has, re-pointed at what the create really answered
         // ([`super::provisioner::Provisioner::ApplicationSignalsInstrumentationConfig`]). The
-        // instant and the hash itself are that service's too, so both stand in beside it.
+        // instant is that service's clock, so it stands in beside them.
         APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => {
             let mut declared_part = |property: &str| {
                 properties
@@ -2387,6 +2393,8 @@ pub(crate) fn return_values(
                     .and_then(|value| text(value, scope, 0, budget))
                     .unwrap_or_default()
             };
+            let instrumentation_type =
+                declared_part(APPLICATION_SIGNALS_INSTRUMENTATION_TYPE_PROPERTY);
             let service = declared_part(APPLICATION_SIGNALS_SERVICE_PROPERTY);
             let environment = declared_part(APPLICATION_SIGNALS_ENVIRONMENT_PROPERTY);
             let signal_type = declared_part(APPLICATION_SIGNALS_SIGNAL_TYPE_PROPERTY);
@@ -2399,34 +2407,51 @@ pub(crate) fn return_values(
                 .get(APPLICATION_SIGNALS_LOCATION_PROPERTY)
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            let arn = ::emulator_server::emulator_arn(
-                APPLICATION_SIGNALS_ARN_NAMESPACE,
-                region,
-                &format!(
-                    "{APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_PATH}/{service}/{environment}/\
-                     {signal_type}/{}",
-                    crate::state::stable_identifier_digits(
-                        &format!("{name}/{location}"),
-                        APPLICATION_SIGNALS_LOCATION_HASH_CHARS
-                    )
-                ),
+            let location_hash = crate::state::stable_identifier_digits(
+                &format!("{name}/{location}"),
+                APPLICATION_SIGNALS_LOCATION_HASH_CHARS,
             );
             attributes.insert(
                 APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE.to_string(),
-                arn.clone(),
+                ::emulator_server::emulator_arn(
+                    APPLICATION_SIGNALS_ARN_NAMESPACE,
+                    region,
+                    &format!(
+                        "{APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_PATH}/{service}/\
+                         {environment}/{signal_type}/{location_hash}"
+                    ),
+                ),
             );
-            for attribute in APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES
-                .iter()
-                .filter(|attribute| {
+            // The hash is the one part of the identity this computes a value for, so it is
+            // published as the attribute that carries it rather than standing in as a document:
+            // the identity, the ARN and `Fn::GetAtt LocationHash` then name one location.
+            attributes.insert(
+                APPLICATION_SIGNALS_LOCATION_HASH_ATTRIBUTE.to_string(),
+                location_hash.clone(),
+            );
+            // Every other published value is that service's own clock, so it stands in until
+            // the create has reported it.
+            for attribute in APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES.iter().filter(
+                |attribute| {
                     **attribute != APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE
-                })
-            {
+                        && **attribute != APPLICATION_SIGNALS_LOCATION_HASH_ATTRIBUTE
+                },
+            ) {
                 attributes.insert(
                     (*attribute).to_string(),
                     service_assigned_document(name, attribute),
                 );
             }
-            (arn, attributes)
+            (
+                instrumentation_config_identity(
+                    &instrumentation_type,
+                    &service,
+                    &environment,
+                    &signal_type,
+                    &location_hash,
+                ),
+                attributes,
+            )
         }
         // Clean Rooms ML's own control plane: the training dataset an
         // `AWS::CleanRoomsML::TrainingDataset` declares. "Ref returns the training dataset ARN"
