@@ -47,9 +47,12 @@
 //!
 //! Which members the `result` carries follows from the tool, not from the call:
 //! `structuredContent` reports a RUN (its members are `stdout`, `stderr`, `exitCode`,
-//! `executionTime`, `taskId`, `taskStatus`), so a workspace tool has nothing to put in
-//! it; and `isError` says that "the result represents an error", so a tool that did
-//! what was asked reports nothing there. [`ToolOutcome`] is where that lives.
+//! `executionTime`, `taskId`, `taskStatus`), so a tool that performed no run — a
+//! workspace tool, or work no engine here performs — has nothing to put in it. `isError`
+//! is the result's own success flag: it is documented as `true` when "the content
+//! contains error messages or exception information" and `false` when "the content
+//! contains successful execution results", so EVERY result reports it, `false`
+//! included. [`ToolOutcome`] is where that lives.
 //!
 //! # A tool that could not do what was asked
 //!
@@ -653,6 +656,15 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 // The engine spawns the run's own thread and bounds the wait for its
                 // answer itself, so nothing of the run reaches the async worker.
                 let run = crate::state::run_python(&context_scripts, &submitted, &filesystem).await;
+                // The workspace the run read and wrote, taken back BY VALUE here — before
+                // any state guard is taken, and without ever waiting: `try_unwrap` answers
+                // at once, with the workspace when this call is its only holder and with
+                // nothing while a run that outlived its bound still holds one. So no lock
+                // of a run is ever acquired underneath the guard every other request to
+                // this service needs.
+                let written = Arc::try_unwrap(filesystem).ok().map(|held| {
+                    held.into_inner().unwrap_or_else(PoisonError::into_inner)
+                });
                 (
                     ScriptRun {
                         stdout: run.stdout,
@@ -661,7 +673,7 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                         elapsed: run.elapsed,
                         failed_context: run.failed_context,
                     },
-                    Some(filesystem),
+                    written,
                 )
             }
         };
@@ -673,15 +685,14 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 store.session_bytes_elsewhere(code_interpreter_identifier, session_id);
             // What the run wrote in the workspace, back into the session: the file tools
             // and the command plane read the same filesystem a run writes. A write the
-            // workspace had no room for is said so on the run's own error stream.
+            // workspace had no room for is said so on the run's own error stream. The
+            // workspace is already owned here, so this guarded block takes no other lock.
             if let Some(filesystem) = &sandbox {
-                let filesystem = filesystem.lock().unwrap_or_else(PoisonError::into_inner);
                 if filesystem.changed() {
                     if let Some(session) =
                         store.code_interpreter_session_mut(code_interpreter_identifier, session_id)
                     {
-                        let refused =
-                            filesystem.apply_to(session, SystemTime::now(), elsewhere);
+                        let refused = filesystem.apply_to(session, SystemTime::now(), elsewhere);
                         if refused > 0 {
                             run.stderr.push_str(&workspace_had_no_room(refused));
                         }
@@ -1144,15 +1155,16 @@ fn no_such_task(tool: &str, task_id: &str) -> ToolOutcome {
 
 /// What one tool invocation did, before it is worded as a `CodeInterpreterResult`.
 ///
-/// Which members the result carries follows from the KIND of tool, because both of the
-/// optional ones are only meaningful for some of them:
+/// Which members the result carries follows from the KIND of tool:
 ///
 /// * `structuredContent` reports a RUN — `stdout`, `stderr`, `exitCode`,
 ///   `executionTime`, `taskId`, `taskStatus` are its only members — so it belongs to a
-///   tool that runs code or a command, and a tool that reads or writes the workspace
-///   has nothing to put in it;
-/// * `isError` is documented as indicating that "the result represents an error", so a
-///   tool that did what was asked reports nothing there.
+///   tool that ran code, performed a command or reports a task, and a tool that reads
+///   or writes the workspace, or whose work nothing performed, has nothing to put in
+///   it;
+/// * `isError` is the flag that distinguishes a result that "represents an error" from
+///   one carrying "successful execution results", so it is reported on every result —
+///   `true` for a tool that could not do what was asked, `false` for one that did.
 enum ToolOutcome {
     /// A workspace tool that did what was asked: the blocks a client reads, and
     /// nothing else.
@@ -1209,13 +1221,14 @@ fn tool_failed(tool: &str, reason: impl Into<String>) -> ToolOutcome {
 
 impl ToolOutcome {
     /// The `result` event's own shape: the blocks, the structured report where the tool
-    /// made one, and `isError` where the result is an error.
+    /// performed a run, and `isError` — always, because the flag is what tells a client
+    /// reading a 200 whether the tool succeeded.
     fn into_result(self) -> CodeInterpreterResult {
         match self {
             Self::Content(content) => CodeInterpreterResult {
                 content,
                 structured_content: None,
-                is_error: None,
+                is_error: Some(false),
             },
             // A tool-level failure is reported on the result rather than as an API
             // error, with the lead-in the tool plane words every one of them with: the
@@ -1271,18 +1284,15 @@ impl ToolOutcome {
                         .as_ref()
                         .map(|run| run.elapsed.as_secs_f64() * MILLISECONDS_PER_SECOND),
                 }),
-                is_error: run
-                    .as_ref()
-                    .map(|run| run.exit_code != 0)
-                    .filter(|failed| *failed),
+                is_error: Some(run.as_ref().is_some_and(|run| run.exit_code != 0)),
             },
-            // No output, status or duration: nothing ran to produce any.
+            // Nothing performed this work, so there is no run to report: no output, no
+            // exit status, no duration — and no structured report at all, which would
+            // say a run happened and carry a diagnostic as though a tool had written it
+            // to a stream.
             Self::NothingRan(reason) => CodeInterpreterResult {
-                content: vec![text_block(reason.clone())],
-                structured_content: Some(ToolResultStructuredContent {
-                    stderr: Some(reason),
-                    ..Default::default()
-                }),
+                content: vec![text_block(reason)],
+                structured_content: None,
                 is_error: Some(true),
             },
         }

@@ -18,7 +18,7 @@
 //! * the file tools round-trip the session's workspace, and a path that would leave it
 //!   is refused;
 //! * a tool this emulator embeds no engine for answers `isError` with the reason and
-//!   reports no output, exit status or duration for work nothing performed;
+//!   reports no run — no output, exit status or duration — for work nothing performed;
 //! * a session that is `TERMINATED` — stopped, or past its time-to-live — serves no
 //!   tool, and a stop moves it there (and only the first stop does: a second one
 //!   conflicts, while a replayed `clientToken` answers with the stop it performed).
@@ -731,11 +731,17 @@ async fn the_file_tools_round_trip_the_session_workspace() {
             !is_error(&written),
             "case {case:?}: expected the write to succeed, got {written}"
         );
-        // A workspace tool reports no run, so it carries neither the structured report
-        // of one nor an error flag.
-        assert!(
-            written.get("structuredContent").is_none() && written.get("isError").is_none(),
-            "case {case:?}: a workspace tool that did what was asked reports `content` only, \
+        // A workspace tool performed no run, so it carries no structured report of one
+        // — but `isError` is the result's own success flag, reported either way.
+        assert_eq!(
+            written.get("structuredContent"),
+            None,
+            "case {case:?}: a workspace tool reports no run, got {written}"
+        );
+        assert_eq!(
+            written.get("isError").and_then(Value::as_bool),
+            Some(false),
+            "case {case:?}: a tool that did what was asked reports isError false, \
              got {written}"
         );
         assert!(
@@ -1336,7 +1342,7 @@ async fn a_tool_invocation_missing_a_required_argument_is_refused() {
 }
 
 /// A LANGUAGE this emulator embeds no engine for says so: `isError`, the reason in the
-/// result, and NO output, exit status or duration for work nothing performed.
+/// result, and NO structured run report for work nothing performed.
 #[tokio::test]
 async fn a_tool_with_no_engine_reports_that_nothing_ran() {
     let (router, _engine) = emulator();
@@ -1369,24 +1375,15 @@ async fn a_tool_with_no_engine_reports_that_nothing_ran() {
             !text_of(&result).is_empty(),
             "case {case:?}: expected the result to say what was not run, got {result}"
         );
-        assert!(
-            structured(&result, "exitCode").is_null(),
-            "case {case:?}: nothing ran, so there is no exit status, got {result}"
+        assert_eq!(
+            result.get("structuredContent"),
+            None,
+            "case {case:?}: nothing ran, so there is no run to report, got {result}"
         );
-        assert!(
-            structured(&result, "executionTime").is_null(),
-            "case {case:?}: nothing ran, so there is no duration, got {result}"
-        );
-        assert!(
-            structured(&result, "stdout").is_null(),
-            "case {case:?}: nothing ran, so there is no output, got {result}"
-        );
-        assert!(
-            !structured(&result, "stderr")
-                .as_str()
-                .unwrap_or_default()
-                .is_empty(),
-            "case {case:?}: expected the reason on the error stream, got {result}"
+        assert_eq!(
+            result.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "case {case:?}: work nothing ran is an error, got {result}"
         );
     }
 }

@@ -21,6 +21,8 @@
 //!   a task id that names none — is reported IN BAND on a 200 whose result carries
 //!   `isError` and a text block beginning `Error executing tool ` and the tool's name,
 //!   never as a modelled API error;
+//! * every result reports `isError`, the success flag included, and only a tool that
+//!   performed a run reports `structuredContent`;
 //! * a run reaches nothing of the HOST: no socket, no process, no host file and no bound
 //!   of its own.
 //!
@@ -1132,5 +1134,207 @@ async fn a_python_run_is_bounded() {
     assert!(
         is_error(&deep) && structured_text(&deep, "stderr").contains("Recursion"),
         "deep recursion ends on the interpreter's own error, got {deep}"
+    );
+}
+
+/// EVERY `result` event reports `isError`, and only a tool that performed a run reports
+/// `structuredContent`.
+///
+/// `isError` is the one in-band signal a 200 carries about whether the tool did what was
+/// asked — it is `true` when "the content contains error messages or exception
+/// information" and `false` when "the content contains successful execution results"
+/// (source: smithy_query query="shape" shape="CodeInterpreterResult") — so a result that
+/// leaves it out tells a client nothing, and a client reading the member gets a missing
+/// key. `structuredContent` is the RUN's own report (`stdout`, `stderr`, `exitCode`,
+/// `executionTime`, `taskId`, `taskStatus` are its only members, source: smithy_query
+/// query="shape" shape="ToolResultStructuredContent"), so a tool that performed no run
+/// reports none of it.
+///
+/// Rows span the tool classes of the surface (source: smithy_query query="shape"
+/// shape="ToolName") and both outcomes of each: a workspace tool that did what was asked
+/// and one that could not, a run that ended 0 and one that did not in each language this
+/// session runs, a command of each kind, a language no engine here runs, and a task id
+/// this session holds no task for.
+#[tokio::test]
+async fn every_result_reports_is_error_and_only_a_run_reports_a_structured_report() {
+    let (router, _engine) = emulator();
+    let session = start_session(&router, json!({})).await;
+    let seeded = tool(
+        &router,
+        "seed-the-workspace",
+        &session,
+        "writeFiles",
+        json!({"content": [
+            {"path": "held.txt", "text": "held\n"},
+            {"path": "spare.txt", "text": "spare\n"},
+        ]}),
+    )
+    .await;
+    assert!(!is_error(&seeded), "the seed must be served, got {seeded}");
+
+    // (case, tool, arguments, the result is an error, the tool performed a run)
+    let cases: Vec<(&str, &str, Value, bool, bool)> = vec![
+        (
+            "write-a-file",
+            "writeFiles",
+            json!({"content": [{"path": "written.txt", "text": "x"}]}),
+            false,
+            false,
+        ),
+        (
+            "read-a-file-it-holds",
+            "readFiles",
+            json!({"paths": ["held.txt"]}),
+            false,
+            false,
+        ),
+        ("list-the-workspace", "listFiles", json!({}), false, false),
+        (
+            "remove-a-file-it-holds",
+            "removeFiles",
+            json!({"paths": ["spare.txt"]}),
+            false,
+            false,
+        ),
+        (
+            "read-a-file-it-does-not-hold",
+            "readFiles",
+            json!({"paths": ["absent.txt"]}),
+            true,
+            false,
+        ),
+        (
+            "remove-a-file-it-does-not-hold",
+            "removeFiles",
+            json!({"paths": ["absent.txt"]}),
+            true,
+            false,
+        ),
+        (
+            "write-outside-the-workspace",
+            "writeFiles",
+            json!({"content": [{"path": "../escape.txt", "text": "x"}]}),
+            true,
+            false,
+        ),
+        (
+            "run-javascript-that-prints",
+            "executeCode",
+            json!({"code": "console.log(1 + 1)", "language": "javascript"}),
+            false,
+            true,
+        ),
+        (
+            "run-javascript-that-throws",
+            "executeCode",
+            json!({"code": "throw new Error('boom')", "language": "javascript"}),
+            true,
+            true,
+        ),
+        (
+            "run-python-that-prints",
+            "executeCode",
+            python("print(1 + 1)"),
+            false,
+            true,
+        ),
+        (
+            "run-python-that-raises",
+            "executeCode",
+            python("print(absent_name)"),
+            true,
+            true,
+        ),
+        (
+            "a-command-that-succeeds",
+            "executeCommand",
+            json!({"command": "cat held.txt"}),
+            false,
+            true,
+        ),
+        (
+            "a-command-that-fails",
+            "executeCommand",
+            json!({"command": "cat absent.txt"}),
+            true,
+            true,
+        ),
+        (
+            "a-language-no-engine-here-runs",
+            "executeCode",
+            json!({"code": "const a: number = 1;", "language": "typescript"}),
+            true,
+            false,
+        ),
+        (
+            "a-task-this-session-holds-none-of",
+            "getTask",
+            json!({"taskId": "task-0000000000000000000000000"}),
+            true,
+            false,
+        ),
+    ];
+
+    for (case, name, arguments, failed, ran) in cases {
+        let result = tool(&router, case, &session, name, arguments).await;
+        assert_eq!(
+            result.get("isError").and_then(Value::as_bool),
+            Some(failed),
+            "case {case:?}: every result reports isError, got {result}"
+        );
+        assert_eq!(
+            result.get("structuredContent").is_some(),
+            ran,
+            "case {case:?}: only a tool that performed a run reports structuredContent, \
+             got {result}"
+        );
+    }
+
+    // The asynchronous half reports the same way: the submission, and each read of the
+    // task that follows it, carries the flag beside the task's own report.
+    let submitted = tool(
+        &router,
+        "submit-a-task",
+        &session,
+        "startCommandExecution",
+        json!({"command": "echo task-ran"}),
+    )
+    .await;
+    assert_eq!(
+        (
+            submitted.get("isError").and_then(Value::as_bool),
+            submitted.get("structuredContent").is_some(),
+        ),
+        (Some(false), true),
+        "a submitted task is no error and carries its own report, got {submitted}"
+    );
+    let task_id = structured_text(&submitted, "taskId");
+    let converged = poll_task(&router, "poll-the-task", &session, &task_id).await;
+    assert_eq!(
+        (
+            converged.get("isError").and_then(Value::as_bool),
+            structured_text(&converged, "taskStatus"),
+        ),
+        (Some(false), "completed".to_string()),
+        "a task whose command exits 0 is no error, got {converged}"
+    );
+
+    let failing = tool(
+        &router,
+        "submit-a-failing-task",
+        &session,
+        "startCommandExecution",
+        json!({"command": "cat absent.txt"}),
+    )
+    .await;
+    let failing_id = structured_text(&failing, "taskId");
+    let failed = poll_task(&router, "poll-the-failing-task", &session, &failing_id).await;
+    assert_eq!(
+        (
+            failed.get("isError").and_then(Value::as_bool),
+            structured_text(&failed, "taskStatus"),
+        ),
+        (Some(true), "failed".to_string()),
+        "a task whose command failed is an error result, got {failed}"
     );
 }
