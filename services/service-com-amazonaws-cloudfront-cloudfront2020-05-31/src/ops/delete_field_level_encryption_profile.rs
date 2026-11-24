@@ -181,40 +181,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::unresolved_field_level_encryption_profile`]).
         // Nothing is removed and the delete says so rather than reporting a removal it never
         // performed.
-        let Some(current_etag) = store
-            .field_level_encryption_profile(&input.id)
-            .map(|stored| stored.etag.clone())
-        else {
+        if store.field_level_encryption_profile(&input.id).is_none() {
             return Err(
                 DeleteFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
                     crate::state::unresolved_field_level_encryption_profile(&input.id),
                 )
                 .into(),
             );
-        };
+        }
 
         // "The value of the ETag header that you received when retrieving the profile to
-        // delete": the precondition is checked first, the way HTTP evaluates one, so a caller
-        // holding a version that is no longer current is told that before anything about what
-        // the profile is used by.
-        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
-            crate::state::IfMatch::Current => {}
-            crate::state::IfMatch::Invalid => {
-                return Err(
-                    DeleteFieldLevelEncryptionProfileErrorModeled::InvalidIfMatchVersion(
-                        crate::state::invalid_if_match_version(),
-                    )
-                    .into(),
-                );
-            }
-            crate::state::IfMatch::Stale => {
-                return Err(
-                    DeleteFieldLevelEncryptionProfileErrorModeled::PreconditionFailed(
-                        crate::state::precondition_failed(),
-                    )
-                    .into(),
-                );
-            }
+        // delete": what this route evaluates of that header is its FORM — "the If-Match
+        // version is missing or not valid" — and not whose version the token is
+        // ([`crate::state::if_match_form_admits`]). A delete stating no version token at all
+        // is refused with `InvalidIfMatchVersion`; one stating a version token proceeds, as
+        // this route's recorded answers report even where the token was issued to another
+        // record of the account.
+        if !crate::state::if_match_form_admits(input.if_match.as_deref()) {
+            return Err(
+                DeleteFieldLevelEncryptionProfileErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
         }
 
         // A field-level encryption configuration names the profile its matching fields are

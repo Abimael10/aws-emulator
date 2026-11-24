@@ -52,3 +52,34 @@ Cause 2 - divergence_key service=cloudfront|DeleteFieldLevelEncryptionProfile|st
 3. Cause 2: replay fixture cloudfront-fle-config-not-found-and-invalid-ifmatch-errors IN FULL, including step teardown#7 - DeleteFieldLevelEncryptionProfile for the profile the fixture created, sending If-Match set to the ETag the emulator last published for it. Expect 204 with an empty body; observe 412 PreconditionFailed. The fixture's earlier not-found and invalid-If-Match probe steps must be replayed first, because they are what appears to advance the stored version.
 4. Confirm the contract with smithy_query(query="operation", operation="DeleteFieldLevelEncryptionProfile", model_path="services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/smithy-model/com-amazonaws-cloudfront-cloudfront2020-05-31.json"): http code 204, Id @required @httpLabel, IfMatch bound to the If-Match header, and NoSuchFieldLevelEncryptionProfile (404) / InvalidIfMatchVersion (400) / PreconditionFailed (412) as conditional errors rather than default answers.
 5. Re-replay both fixtures after the fix; both clusters must pass.
+
+## Resolution
+
+Both causes are closed; the replay reports both of this issue's keys `fixed`.
+
+- Cause 1 was already served by the current code base and is now pinned by replay: an
+  operation ADDRESSED by a field-level encryption profile `Id` reads that identifier's form
+  before resolving it against the store, so a value outside the form CloudFront issues a
+  profile identifier in carries the unreadable-identifier sentence and one of that form the
+  store holds no profile under carries the absent-profile sentence
+  (`state::unresolved_field_level_encryption_profile`). `cloudfront-field-level-encryption-errors`
+  replays end to end.
+- Cause 2 FIXED: what the conditional delete of CloudFront's KEY MATERIAL — a public key, and
+  the field-level encryption profile that encrypts with one — evaluates of its `If-Match` is
+  the FORM of the version token it carries, not whose version that token is. A header carrying
+  no version token is `InvalidIfMatchVersion` (400); any value written as one admits the
+  delete, which answers 204 and removes the record. The recorded teardown of
+  `cloudfront-fle-config-not-found-and-invalid-ifmatch-errors` presents, at both teardown#7
+  (this profile) and teardown#8 (the public key), the version token the run had been handed for
+  the field-level encryption CONFIGURATION created earlier in the same fixture, and AWS answers
+  204 to each — so the comparison the emulator was making is what refused them. The resources a
+  caller conditionally REWRITES keep the comparison, the field-level encryption configuration
+  among them (`state::check_if_match`), as their own recorded 412 answers report.
+  `teardown#8` (`DeletePublicKey`, cause 2 of
+  `20261118T213617Z-cloudfront-public-key-lifecycle-refuses-creates-and-deletes.md`) is served
+  by the same rule and now passes too; that issue's other two causes are untouched.
+- Still diverging in this fixture, and NOT this issue's: `GetFieldLevelEncryptionConfig`
+  at task#4 answers the unreadable-identifier sentence where the recording answers the
+  absent-configuration one. That cluster is owned by
+  `20261114T142904Z-cloudfront-reopens-field-level-encryption-lookups-report-the.md`, it
+  diverged before this change and is unaffected by it.

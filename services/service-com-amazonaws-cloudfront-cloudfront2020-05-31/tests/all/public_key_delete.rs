@@ -11,11 +11,11 @@
 //!   names no public key through either reader (`NoSuchPublicKey`, HTTP 404), the listing
 //!   stops reporting it, and the caller reference it held is free for a later create to claim
 //!   under a new id;
-//! * the delete is gated on the key's own version token: an absent `If-Match` and one that is
-//!   no version token at all are `InvalidIfMatchVersion` (HTTP 400) — a property of the
-//!   REQUEST, so it is answered for an id no key holds too — a well-formed token that is not
-//!   this key's current one is `PreconditionFailed` (HTTP 412), and in either case the key
-//!   stays exactly where it was;
+//! * the delete is gated on the FORM of the version token the `If-Match` header carries: an
+//!   absent header and one carrying no version token at all are `InvalidIfMatchVersion` (HTTP
+//!   400) — a property of the REQUEST, so it is answered for an id no key holds too — and the
+//!   key then stays exactly where it was, while any value written as a version token admits
+//!   the delete, whose own token it is or not ([`crate::key_material_if_match_form`]);
 //! * a public key another stored record still references cannot be removed: a key group lists
 //!   "the identifiers of the public keys in the key group", and a field-level encryption
 //!   profile's encryption entity names "the public key associated with a set of field-level
@@ -25,10 +25,9 @@
 //! The rows span what those rules generalise over: the form of the encoded key (single-line
 //! and multi-line PEM, long and short bodies) and of the comment (absent, empty, ASCII, XML
 //! metacharacters, and exactly the published 128-character bound); every form an `If-Match`
-//! takes (absent, empty, bare, quoted, weak, lower case, another key's token, a token this
-//! service never minted, a value that is no token at all); which kind of record holds the
-//! reference and at which position of its list; and ids of several shapes the store holds no
-//! key for.
+//! takes (absent, empty, bare, quoted, weak, lower case, a value that is no token at all);
+//! which kind of record holds the reference and at which position of its list; and ids of
+//! several shapes the store holds no key for.
 //!
 //! The wire harness is [`crate::distribution_lifecycle`]'s, the public key writer and reader
 //! are [`crate::public_key_lifecycle`]'s, and the two records that reference a public key are
@@ -51,9 +50,6 @@ const PUBLIC_KEY_IN_USE_MESSAGE: &str =
      encryption profile. Please disassociate the key before deleting.";
 const INVALID_IF_MATCH_VERSION_MESSAGE: &str =
     "The If-Match version is missing or not valid for the resource.";
-const PRECONDITION_FAILED_MESSAGE: &str =
-    "The request failed because it didn't meet the preconditions in one or more \
-     request-header fields.";
 
 // ---------------------------------------------------------------------------
 // Calling the surfaces this suite drives
@@ -342,13 +338,14 @@ async fn every_stored_key_is_removed_by_its_delete() {
     }
 }
 
-/// The delete is gated on the key's OWN version token, and a header no version could satisfy is
-/// answered on the header rather than on the id.
+/// The delete is gated on the FORM of the version token the header carries, and a header no
+/// version could satisfy is answered on the header rather than on the id.
 ///
-/// The rows span every form an `If-Match` takes: absent, empty, a value that is no version
-/// token, a token spelled in lower case, a well-formed token belonging to another key, one this
-/// service never minted, and the current token bare, quoted and weak — the three ways HTTP and
-/// CloudFront's own `ETag` header spell one.
+/// The rows span the forms an `If-Match` carries no version token in — absent, empty, a value
+/// that is no version token, a token spelled in lower case — and the current token bare, quoted
+/// and weak, the three ways HTTP and CloudFront's own `ETag` header spell one. Whose token an
+/// admissible one is, this route does not read: that is tabled in
+/// [`crate::key_material_if_match_form`].
 #[tokio::test]
 async fn the_version_token_gates_the_delete() {
     let router = emulator();
@@ -356,7 +353,7 @@ async fn the_version_token_gates_the_delete() {
     let other = key_row(0, "public-key-delete-gate-other");
     let (_, other_etag) = seed(&router, &other).await;
 
-    let refusals: [(&str, Option<String>, u16, &str, &str); 6] = [
+    let refusals: [(&str, Option<String>, u16, &str, &str); 4] = [
         (
             "no If-Match at all",
             None,
@@ -385,20 +382,6 @@ async fn the_version_token_gates_the_delete() {
             "InvalidIfMatchVersion",
             INVALID_IF_MATCH_VERSION_MESSAGE,
         ),
-        (
-            "a version token that is another key's",
-            Some(other_etag.clone()),
-            412,
-            "PreconditionFailed",
-            PRECONDITION_FAILED_MESSAGE,
-        ),
-        (
-            "a well-formed token this service never minted",
-            Some("E1Z2Y3X4W5V6U7".to_string()),
-            412,
-            "PreconditionFailed",
-            PRECONDITION_FAILED_MESSAGE,
-        ),
     ];
 
     for (index, (case, if_match, status, code, message)) in refusals.iter().enumerate() {
@@ -426,13 +409,9 @@ async fn the_version_token_gates_the_delete() {
         assert_still_stored(&router, &id, &etag, case).await;
 
         // The same header against an id no key holds: a form no version could satisfy is
-        // answered on the header, a well-formed one on the id.
+        // answered on the header rather than on the id.
         let unknown = delete_key(&router, "K2NEVERMINTED1", if_match.as_deref()).await;
-        let (expected_status, expected_code) = if *status == 400 {
-            (400, "InvalidIfMatchVersion")
-        } else {
-            (404, "NoSuchPublicKey")
-        };
+        let (expected_status, expected_code) = (400, "InvalidIfMatchVersion");
         assert_eq!(
             unknown.status, expected_status,
             "case {case:?} on an unknown id: expected HTTP {expected_status}, got {} with {}",
@@ -636,15 +615,16 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
         );
         assert_still_stored(&router, &subject, &subject_etag, case).await;
 
-        // A version that is not the key's is refused on its own terms, before anything about the
-        // reference.
+        // A header carrying no version token is refused on its own terms, before anything about
+        // the reference; a header carrying one is read no further than its form, so the
+        // reference is what refuses the delete whichever record's token it names.
         for (description, if_match, status, code) in [
             ("no If-Match at all", None, 400, "InvalidIfMatchVersion"),
             (
                 "a version token that is the referencing record's",
                 Some(record_etag.as_str()),
-                412,
-                "PreconditionFailed",
+                409,
+                "PublicKeyInUse",
             ),
         ] {
             let answer = delete_key(&router, &subject, if_match).await;
@@ -706,12 +686,14 @@ async fn a_key_a_stored_record_references_cannot_be_deleted() {
              with {}",
             reader.status, reader.raw
         );
+        // The reference is what refuses that delete: the header carries a version token, which
+        // is all this route reads of it ([`crate::key_material_if_match_form`]).
         let moved = delete_key(&router, &replacement, Some("E1Z2Y3X4W5V6U7")).await;
         assert_eq!(
             moved.error_code(),
-            "PreconditionFailed",
-            "case {case:?}: expected the key the record was moved onto to be gated on its own \
-             version first, got {}",
+            "PublicKeyInUse",
+            "case {case:?}: expected the key the record was moved onto to be refused on the \
+             reference, got {}",
             moved.raw
         );
     }

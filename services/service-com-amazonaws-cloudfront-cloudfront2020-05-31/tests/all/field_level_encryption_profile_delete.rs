@@ -10,10 +10,11 @@
 //!   no profile (`NoSuchFieldLevelEncryptionProfile`, HTTP 404) — through the profile reader as
 //!   well as the configuration one — the listing stops reporting it, and the caller reference
 //!   it held is free for a later create to claim under a new id;
-//! * the delete is gated on the profile's own version token: an absent `If-Match` and one that
-//!   is no version token at all are `InvalidIfMatchVersion` (HTTP 400), a well-formed token
-//!   that is not this profile's current one is `PreconditionFailed` (HTTP 412), and in either
-//!   case the profile stays exactly where it was;
+//! * the delete is gated on the FORM of the version token the `If-Match` header carries: an
+//!   absent header and one carrying no version token at all are `InvalidIfMatchVersion` (HTTP
+//!   400) and the profile stays exactly where it was, while any value written as a version
+//!   token admits the delete, whose own token it is or not
+//!   ([`crate::key_material_if_match_form`]);
 //! * a field-level encryption configuration names the profile its matching fields are
 //!   encrypted under through a mapping's `ProfileId` — on a query argument-profile mapping or
 //!   on a content type-profile one — so a profile any stored configuration still names is
@@ -24,9 +25,9 @@
 //! [`crate::field_level_encryption_profile_lifecycle::table`] (no encryption entity, one and
 //! several; one field pattern and several; the forms a pattern takes; and comments that are
 //! absent, empty, plain ASCII, XML metacharacters or exactly on the published bound), every
-//! form an `If-Match` takes (absent, empty, bare, quoted, weak, lower case, a token of another
-//! resource, a value that is no token), which mapping kind of which section names the profile,
-//! and ids of several shapes the store holds nothing for.
+//! form an `If-Match` takes (absent, empty, bare, quoted, weak, lower case, a value that is no
+//! token), which mapping kind of which section names the profile, and ids of several shapes the
+//! store holds nothing for.
 //!
 //! The wire harness is the one [`crate::distribution_lifecycle`] builds, the profile create and
 //! the two readers are [`crate::field_level_encryption_profile_lifecycle`]'s, and the
@@ -59,7 +60,10 @@ type Spelling = fn(&str) -> String;
 /// `DELETE /2020-05-31/field-level-encryption-profile/{Id}` under the version token `if_match`
 /// — the route and the header the model binds this operation to (`IfMatch` travels in
 /// `If-Match`).
-async fn delete_profile(
+///
+/// `pub(crate)` so the suite that tables what this route reads of that header
+/// ([`crate::key_material_if_match_form`]) drives the same wire path rather than a copy of it.
+pub(crate) async fn delete_profile(
     router: &MultiServiceRouter,
     profile_id: &str,
     if_match: Option<&str>,
@@ -299,24 +303,17 @@ async fn every_stored_profile_is_removed_by_its_delete() {
     }
 }
 
-/// The delete is gated on the profile's OWN version token.
+/// The delete is gated on the FORM of the version token the header carries.
 ///
-/// The rows span every form an `If-Match` takes: absent, empty, a value that is no version token
-/// at all, a token spelled in lower case, a well-formed token belonging to another profile, and
-/// the current token bare, quoted and weak — the three ways HTTP and CloudFront's own `ETag`
-/// header spell one.
+/// The rows span the forms an `If-Match` carries no version token in — absent, empty, a value
+/// that is no version token at all, a token spelled in lower case — and the current token bare,
+/// quoted and weak, the three ways HTTP and CloudFront's own `ETag` header spell one. Whose
+/// token an admissible one is, this route does not read: that is tabled in
+/// [`crate::key_material_if_match_form`].
 #[tokio::test]
 async fn the_version_token_gates_the_delete() {
     let router = emulator();
     let keys = upload_keys(&router).await;
-
-    let other = Profile::new(
-        "another profile, whose token is not the subject's",
-        "fle-profile-version-gate-other",
-        None,
-        Vec::new(),
-    );
-    let (_, other_etag) = create(&router, &other).await;
 
     let subject = Profile::new(
         "the profile under the version gate",
@@ -341,12 +338,6 @@ async fn the_version_token_gates_the_delete() {
             Some("e1stale1version"),
             400,
             "InvalidIfMatchVersion",
-        ),
-        (
-            "a version token that is another profile's",
-            Some(other_etag.as_str()),
-            412,
-            "PreconditionFailed",
         ),
     ];
 
@@ -514,15 +505,16 @@ async fn a_profile_a_configuration_names_cannot_be_deleted() {
             "case {case:?}: expected the refused delete to leave the profile readable"
         );
 
-        // A version that is not the profile's is refused on its own terms, before anything about
-        // the reference.
+        // A header carrying no version token is refused on its own terms, before anything about
+        // the reference; a header carrying one is read no further than its form, so the
+        // reference is what refuses the delete whichever record's token it names.
         for (description, if_match, status, code) in [
             ("no If-Match at all", None, 400, "InvalidIfMatchVersion"),
             (
                 "a version token that is the configuration's",
                 Some(config_etag.as_str()),
-                412,
-                "PreconditionFailed",
+                409,
+                "FieldLevelEncryptionProfileInUse",
             ),
         ] {
             let answer = delete_profile(&router, &profile_id, if_match).await;

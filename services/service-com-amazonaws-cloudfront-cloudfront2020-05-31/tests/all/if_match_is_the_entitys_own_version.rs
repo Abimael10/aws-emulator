@@ -5,9 +5,9 @@
 //! Every assertion goes through the router, so each case exercises routing, restXml
 //! (de)serialization, the handler, the persisted state and serialization — the same path a
 //! client takes. The rule under test is the one the modelled `PreconditionFailed` states ("the
-//! precondition in one or more of the request fields evaluated to false"): a conditional
-//! mutation compares the `If-Match` header against the version token of the ENTITY IT
-//! ADDRESSES, so
+//! precondition in one or more of the request fields evaluated to false"): where a conditional
+//! mutation COMPARES the `If-Match` header, it compares it against the version token of the
+//! ENTITY IT ADDRESSES, so
 //!
 //! * the entity's own current token — the value the service last returned in that entity's
 //!   `ETag` response header — is served (HTTP 204 for these deletes);
@@ -17,12 +17,20 @@
 //! * a well-formed token this service never issued is the same refusal, and an absent header
 //!   is `InvalidIfMatchVersion` (HTTP 400) — a property of the request alone.
 //!
+//! WHICH routes compare is each route's own recorded contract: the field-level encryption
+//! CONFIGURATION compares, while the key material the configuration reaches — the public keys
+//! and the field-level encryption profiles that encrypt with them — reads a conditional
+//! delete's header no further than its FORM, tabled in [`crate::key_material_if_match_form`].
+//! So the comparison rows below address the configuration, and every kind of the chain is shown
+//! to be deleted under its OWN token.
+//!
 //! The rows span what the rule generalises over: the three resource kinds of one field-level
 //! encryption chain (a public key, the profile that encrypts with it and the configuration
-//! that maps to that profile), each addressed with every other kind's current token as well as
-//! with its own. The chain matters because the tokens are minted from one counter, so a token
-//! another resource of the same account holds is exactly the value a caller that mixed up two
-//! handles would send — and it names no version of the entity addressed.
+//! that maps to that profile), each deleted under the token its own create reported, and the
+//! configuration addressed with every other kind's current token as well as with a token
+//! nothing was ever issued. The chain matters because the tokens are minted from one counter,
+//! so a token another resource of the same account holds is exactly the value a caller that
+//! mixed up two handles would send — and it names no version of the entity addressed.
 //!
 //! The wire harness is [`crate::distribution_lifecycle`]'s, and the three creates and their
 //! readers are the public key, profile and configuration suites' own helpers — reused rather
@@ -157,15 +165,16 @@ async fn chain(router: &MultiServiceRouter) -> Vec<Held> {
     ]
 }
 
-/// RULE: the token a conditional delete is checked against is the ADDRESSED entity's own, so a
-/// token this service issued to another resource of the same account — or one it never issued
-/// at all — is a failed precondition, and the entity it was aimed at is left exactly as it was.
+/// RULE: the token a conditional delete that COMPARES is checked against is the ADDRESSED
+/// entity's own, so a token this service issued to another resource of the same account — or one
+/// it never issued at all — is a failed precondition, and the entity it was aimed at is left
+/// exactly as it was.
 #[tokio::test]
 async fn a_version_token_of_another_resource_is_a_failed_precondition() {
     let router = emulator();
     let held = chain(&router).await;
 
-    for addressed in &held {
+    for addressed in held.iter().filter(|held| held.kind == Kind::Config) {
         // Every OTHER resource's current token, plus a token nothing was ever issued.
         let mut foreign: Vec<(String, String)> = held
             .iter()

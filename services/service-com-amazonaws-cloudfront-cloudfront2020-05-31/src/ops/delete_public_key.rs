@@ -172,15 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The FORM of the `If-Match` header: `InvalidIfMatchVersion` is "the If-Match
         // version is missing or not valid", a property of the request alone, so it is
         // decided before the id is resolved — no version of any key could make an absent or
-        // malformed header valid. The same order `UpdatePublicKey` answers in, so the two
-        // mutations of one record cannot disagree about what a header says.
-        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
-        else {
+        // malformed header valid. The form is also ALL this route evaluates of the header:
+        // a delete stating a version token proceeds, as its recorded answers report even
+        // where the token was issued to another record of the account
+        // ([`crate::state::if_match_form_admits`]).
+        if !crate::state::if_match_form_admits(input.if_match.as_deref()) {
             return Err(DeletePublicKeyErrorModeled::InvalidIfMatchVersion(
                 crate::state::invalid_if_match_version(),
             )
             .into());
-        };
+        }
 
         let mut store = state.lock();
         // Materialise whatever the clock already owes the rest of the store before this call
@@ -194,19 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what resolves the `Id` — the model constrains that member no further than
         // `string` — so an `Id` no key answers to is the key that is absent, whatever form
         // the value takes ([`crate::state::no_such_public_key`]).
-        let Some(stored) = store.public_key(&input.id) else {
+        if store.public_key(&input.id).is_none() {
             return Err(DeletePublicKeyErrorModeled::NoSuchPublicKey(
                 crate::state::no_such_public_key(),
-            )
-            .into());
-        };
-
-        // The precondition is checked against the STORED version, the way HTTP evaluates
-        // one: a caller holding a version that is no longer current is told that before
-        // anything about what the key is referenced by.
-        if submitted_version != stored.etag {
-            return Err(DeletePublicKeyErrorModeled::PreconditionFailed(
-                crate::state::precondition_failed(),
             )
             .into());
         }

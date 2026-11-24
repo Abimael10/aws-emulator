@@ -1299,6 +1299,28 @@ pub fn check_if_match(current: &str, if_match: Option<&str>) -> IfMatch {
     }
 }
 
+/// Whether the `If-Match` of a conditional request may proceed on the KEY-MATERIAL surface —
+/// CloudFront's signed-URL public keys and the field-level encryption profiles that encrypt
+/// with them — where a version token is read for its FORM and not compared to the addressed
+/// record's own.
+///
+/// `InvalidIfMatchVersion` is documented as "the `If-Match` version is missing or not valid",
+/// and that is the whole of what these deletes evaluate: an absent header, or one carrying
+/// anything that is no version token at all, is refused with it ([`if_match_version`]), and
+/// any value written as a version token admits the delete. Their recorded answers are what
+/// says so — a delete of a public key, and one of a field-level encryption profile, each
+/// carrying a well-formed version token this service had issued to ANOTHER record of the same
+/// account, are both served (HTTP 204) rather than refused.
+///
+/// The resources a caller conditionally REWRITES keep the comparison instead
+/// ([`check_if_match`]): a distribution, a policy, a key group or a field-level encryption
+/// configuration presented a version token that is not its current one answers
+/// `PreconditionFailed`, as their own recorded answers report. Which of the two a route
+/// follows is each route's recorded contract, so do not fold the two into one.
+pub fn if_match_form_admits(if_match: Option<&str>) -> bool {
+    if_match_version(if_match).is_some()
+}
+
 /// Whether two invalidation batches ask for the same thing, which is what decides
 /// whether a repeated `CallerReference` is the same request again.
 pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
