@@ -2432,6 +2432,23 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 record.user_key = to_key.clone();
             }
         }
+        for record in self.ssh_public_keys.values_mut() {
+            if record.user_key == from_key {
+                record.user_key = to_key.clone();
+            }
+        }
+        // An MFA device is in use BY the user it was enabled for, of either kind the account
+        // keeps, so the devices it holds move with it exactly as its other credentials do.
+        for device in self.virtual_mfa_devices.values_mut() {
+            if device.user_key.as_deref() == Some(from_key) {
+                device.user_key = Some(to_key.clone());
+            }
+        }
+        for security_key in self.fido_security_keys.values_mut() {
+            if security_key.user_key == from_key {
+                security_key.user_key = to_key.clone();
+            }
+        }
         for credential in self.service_specific_credentials.values_mut() {
             if name_key(&credential.user_name) == from_key {
                 credential.user_name = user_name.to_string();
