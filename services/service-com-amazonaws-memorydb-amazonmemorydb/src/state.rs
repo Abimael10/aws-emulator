@@ -27,6 +27,10 @@ use crate::ops::types::{
 pub mod subnet_placement;
 pub use subnet_placement::{Placement, StoredSubnet, SubnetPlacement, SubnetRefusal};
 
+/// Which network types a subnet, and a group of subnets, supports.
+pub mod network_types;
+pub use network_types::{group_network_types, reported_network_types, subnet_network_types};
+
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
 /// region every generated emulator defaults to (see `engine::emulator_arn`).
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -199,11 +203,15 @@ pub const PARAMETER_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
 
 /// The window the SUBNET-GROUP listing serves — `DescribeSubnetGroups`.
 ///
-/// No refusal of THAT listing's page size is recorded, so it is held to the window its
-/// sibling group listing publishes ([`PARAMETER_PAGE_SIZE_WINDOW`]): a parameter group
-/// and a subnet group are the two configuration groups a cluster is assembled from, and
-/// their listings are the one surface rather than two.
-pub const SUBNET_GROUP_PAGE_SIZE_WINDOW: PageSizeWindow = PARAMETER_PAGE_SIZE_WINDOW;
+/// The same bounds as the other `20..=100` listings, and its refusal names the page size
+/// "max records" — the noun the recorded refusal of THAT listing uses, which is also the
+/// one `MaxResults`' own documentation uses ("The maximum number of records to include in
+/// the response").
+pub const SUBNET_GROUP_PAGE_SIZE_WINDOW: PageSizeWindow = PageSizeWindow {
+    min: 20,
+    max: 100,
+    noun: "max records",
+};
 
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
@@ -1747,9 +1755,10 @@ const SUBNET_ID_HEX_DIGITS: [usize; 2] = [8, 17];
 /// Read by every write path that takes `SubnetIds` before the group is persisted, so a
 /// stored subnet group never lists a value no Amazon EC2 subnet could be addressed by.
 /// Whether a WELL-FORMED identifier names a subnet that exists is Amazon EC2's to say,
-/// which [`subnet_placement::resolve_subnets`] asks it — and both halves are refused in
-/// the SAME words ([`invalid_subnet_message`]), because they are the one modelled
-/// `InvalidSubnet` condition. The caller maps the message onto that fault.
+/// which [`subnet_placement::resolve_subnets`] asks it; that is the other half of the rule
+/// and the service answers it in its own words ([`absent_subnet_ids_message`]), so this
+/// one is only about the FORM of the value. The caller maps the message onto the modelled
+/// `InvalidSubnet`.
 pub fn subnet_id_rejection(subnet_id: &str) -> Option<String> {
     let well_formed = subnet_id
         .strip_prefix(SUBNET_ID_PREFIX)
@@ -1769,6 +1778,26 @@ pub fn subnet_id_rejection(subnet_id: &str) -> Option<String> {
 /// was refused. The one wording for the condition, whichever half of it refused the value.
 pub fn invalid_subnet_message(subnet_id: &str) -> String {
     format!("The specified subnet is not valid: {subnet_id}")
+}
+
+/// The sentence this service states for `SubnetIds` entries that name no subnet of the
+/// account: `The provided input subnet ids are invalid : [<ids>].`
+///
+/// The fixed text is `The provided input subnet ids are invalid : [` and `].`; the one
+/// variable part is the offending identifiers, verbatim from the request and in the order it
+/// listed them, comma-separated — so a caller learns WHICH of the values it provided name
+/// nothing. A subnet is Amazon EC2's resource and only that service can say an identifier
+/// names none, so this is answered only for identifiers it reported no subnet for
+/// ([`subnet_placement::resolve_subnets`]).
+///
+/// The condition is a VALUE this service cannot serve rather than one of the subnet faults,
+/// so it is answered with the modelled `InvalidParameterValueException` ("The specified
+/// parameter value is not valid.", HTTP 400) by every write path that takes `SubnetIds`.
+pub fn absent_subnet_ids_message(subnet_ids: &[String]) -> String {
+    format!(
+        "The provided input subnet ids are invalid : [{}].",
+        subnet_ids.join(", ")
+    )
 }
 
 /// The most subnets this service stores in one subnet group.
@@ -2303,8 +2332,8 @@ pub struct StoredSubnetGroup {
     /// stored group has a description to report.
     pub description: String,
     /// The subnets the group places a cluster in, as the request listed them, each with
-    /// the Availability Zone Amazon EC2 reports it in
-    /// ([`subnet_placement::resolve_subnets`]).
+    /// the Availability Zone Amazon EC2 reports it in and the network types the families it
+    /// is addressed in support ([`subnet_placement::resolve_subnets`]).
     pub subnets: Vec<StoredSubnet>,
     /// `SubnetGroup$VpcId` — "The Amazon Virtual Private Cloud identifier (VPC ID) of the
     /// subnet group": the VPC Amazon EC2 reports those subnets in, and `None` where no EC2
@@ -2331,12 +2360,17 @@ impl StoredSubnetGroup {
                                 name: Some(name.clone()),
                             }
                         }),
-                        supported_network_types: None,
+                        // The types the subnet itself supports, as resolved for it.
+                        supported_network_types: reported_network_types(
+                            subnet.supported_network_types.clone(),
+                        ),
                     })
                     .collect(),
             ),
             arn: Some(self.arn.clone()),
-            supported_network_types: None,
+            // The group's own types are DERIVED from its subnets' rather than held beside
+            // them, so the two can never disagree: see [`group_network_types`].
+            supported_network_types: reported_network_types(group_network_types(&self.subnets)),
         }
     }
 }

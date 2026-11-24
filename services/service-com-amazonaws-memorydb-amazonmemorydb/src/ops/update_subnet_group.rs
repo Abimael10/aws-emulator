@@ -84,9 +84,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `UpdateSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#UpdateSubnetGroup")]
+//
+// `InvalidParameterValueException` — the shape this SERVICE models for a member whose VALUE
+// it cannot serve — is widened in through `extra_errors`, for the same condition the create
+// answers with it: `SubnetIds` entries that name no subnet of the account.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#UpdateSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum UpdateSubnetGroupErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupNotFoundFault(SubnetGroupNotFoundFault),
@@ -199,7 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let subnet_group_name = crate::state::fold_name(&input.subnet_group_name);
         // The subnets a change states are resolved against the service that owns them,
         // exactly as the create resolves the ones it is given, so an updated group reports
-        // the VPC and the zones Amazon EC2 holds for its new placement.
+        // the VPC, the zones and the network types Amazon EC2 holds for its new placement —
+        // and a change naming a subnet that service holds none for is refused in the same
+        // words the create refuses one with, before the stored group is touched.
         let placement = match &input.subnet_ids {
             Some(subnet_ids) => {
                 match crate::state::subnet_placement::resolve_subnets(ctx, &region, subnet_ids)
@@ -207,12 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     crate::state::SubnetPlacement::Resolved(placement) => Some(placement),
                     crate::state::SubnetPlacement::Refused(
-                        crate::state::SubnetRefusal::Invalid(message),
+                        crate::state::SubnetRefusal::Absent(subnet_ids),
                     ) => {
-                        return Err(UpdateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
-                            message: Some(message),
-                        })
-                        .into());
+                        return Err(
+                            UpdateSubnetGroupErrorModeled::InvalidParameterValueException(
+                                InvalidParameterValueException {
+                                    message: Some(crate::state::absent_subnet_ids_message(
+                                        &subnet_ids,
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
                     }
                     crate::state::SubnetPlacement::Refused(
                         crate::state::SubnetRefusal::NotAllowed(message),

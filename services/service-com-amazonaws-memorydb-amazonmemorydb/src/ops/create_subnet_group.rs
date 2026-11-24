@@ -9,9 +9,13 @@
 //! recorded as a `subnet-group` event, which `DescribeEvents` reports.
 //!
 //! The subnets are recorded as the request listed them, each identifier held to the
-//! Amazon EC2 form ([`crate::state::subnet_id_rejection`]); which VPC and Availability
-//! Zone a subnet is in is that service's to report, so those members are answered absent
-//! rather than invented (see [`crate::state::StoredSubnetGroup`]).
+//! Amazon EC2 form ([`crate::state::subnet_id_rejection`]) and then resolved against the
+//! service that owns subnets: an identifier that names no subnet of the account is refused
+//! with the modelled `InvalidParameterValueException`
+//! ([`crate::state::absent_subnet_ids_message`]) before anything is persisted, and which
+//! VPC and Availability Zone a subnet is in and which network types it supports are that
+//! service's to report, so those members are answered from what it reported rather than
+//! invented (see [`crate::state::StoredSubnetGroup`]).
 //!
 //! ## Shape of an operation
 //!
@@ -101,9 +105,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `CreateSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#CreateSubnetGroup")]
+//
+// `InvalidParameterValueException` — the shape this SERVICE models for a member whose VALUE
+// it cannot serve — is widened in through `extra_errors`: the model's own `errors` list for
+// this operation omits it, while the service refuses `SubnetIds` entries that name no subnet
+// of the account with exactly it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#CreateSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum CreateSubnetGroupErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupAlreadyExistsFault(SubnetGroupAlreadyExistsFault),
@@ -226,9 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let subnet_group_name = crate::state::fold_name(&input.subnet_group_name);
         // WHERE the group places a cluster is the owning service's to report: the subnets
         // are resolved against Amazon EC2 before anything is persisted, so a stored group
-        // never lists a subnet that service holds none for and never reports a VPC or a
-        // zone nothing read ([`crate::state::subnet_placement`]). The read is made before
-        // the store is locked, since it is a call into this emulator.
+        // never lists a subnet that service holds none for and never reports a VPC, a zone
+        // or a network type nothing read ([`crate::state::subnet_placement`]). The read is
+        // made before the store is locked, since it is a call into this emulator.
         let placement = match crate::state::subnet_placement::resolve_subnets(
             ctx,
             &region,
@@ -237,13 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             crate::state::SubnetPlacement::Resolved(placement) => placement,
-            crate::state::SubnetPlacement::Refused(crate::state::SubnetRefusal::Invalid(
-                message,
+            crate::state::SubnetPlacement::Refused(crate::state::SubnetRefusal::Absent(
+                subnet_ids,
             )) => {
-                return Err(CreateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
-                    message: Some(message),
-                })
-                .into());
+                // Identifiers the owning service holds no subnet for: a VALUE this service
+                // cannot serve, which is what its `InvalidParameterValueException` is
+                // modelled for, and nothing is written for them.
+                return Err(
+                    CreateSubnetGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::absent_subnet_ids_message(&subnet_ids)),
+                        },
+                    )
+                    .into(),
+                );
             }
             crate::state::SubnetPlacement::Refused(crate::state::SubnetRefusal::NotAllowed(
                 message,

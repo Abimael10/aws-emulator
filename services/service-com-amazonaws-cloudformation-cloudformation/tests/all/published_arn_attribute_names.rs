@@ -126,19 +126,31 @@ fn rows() -> Vec<Row> {
             declared_name: Some("probe-parameters"),
         },
         // The subnet group of the same estate, in the YAML spelling with short-form
-        // intrinsics, and with a LIST property beside the name.
+        // intrinsics, and with a LIST property beside the name. The group is placed over a
+        // subnet of the SAME stack: Amazon MemoryDB resolves every `SubnetIds` entry against
+        // the service that owns subnets, so a group can only be created over one that exists.
         Row {
             case: "a memorydb subnet group in the YAML spelling",
             stack_name: "memorydb-subnet-group",
             template: format!(
                 "Resources:\n  \
+                   Vpc:\n    \
+                     Type: AWS::EC2::VPC\n    \
+                     Properties:\n      \
+                       CidrBlock: 10.60.0.0/16\n  \
+                   Subnet:\n    \
+                     Type: AWS::EC2::Subnet\n    \
+                     Properties:\n      \
+                       VpcId: !Ref Vpc\n      \
+                       CidrBlock: 10.60.1.0/24\n      \
+                       AvailabilityZone: {REGION}a\n  \
                    {LOGICAL_ID}:\n    \
                      Type: {MEMORYDB_SUBNET_GROUP}\n    \
                      Properties:\n      \
                        SubnetGroupName: probe-subnets\n      \
                        Description: the placement of a probe cluster\n      \
                        SubnetIds:\n        \
-                         - subnet-0123456789abcdef0\n{}",
+                         - !Ref Subnet\n{}",
                 yaml_outputs("SubnetGroup")
             ),
             service: "memorydb",
@@ -151,9 +163,15 @@ fn rows() -> Vec<Row> {
             case: "a memorydb subnet group whose name CloudFormation generates",
             stack_name: "memorydb-generated-name",
             template: format!(
-                r#"{{"Resources":{{"{LOGICAL_ID}":{{"Type":"{MEMORYDB_SUBNET_GROUP}",
+                r#"{{"Resources":{{
+                     "Vpc":{{"Type":"AWS::EC2::VPC",
+                       "Properties":{{"CidrBlock":"10.61.0.0/16"}}}},
+                     "Subnet":{{"Type":"AWS::EC2::Subnet",
+                       "Properties":{{"VpcId":{{"Ref":"Vpc"}},"CidrBlock":"10.61.1.0/24",
+                         "AvailabilityZone":"{REGION}a"}}}},
+                     "{LOGICAL_ID}":{{"Type":"{MEMORYDB_SUBNET_GROUP}",
                      "Properties":{{"Description":"a group the template does not name",
-                       "SubnetIds":["subnet-0123456789abcdef0"]}}}}}},
+                       "SubnetIds":[{{"Ref":"Subnet"}}]}}}}}},
                    {}}}"#,
                 json_outputs("SubnetGroup")
             ),

@@ -92,9 +92,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `DescribeSubnetGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#DescribeSubnetGroups")]
+//
+// `InvalidParameterValueException` — the shape this SERVICE models for a member whose
+// VALUE it cannot serve, and the error every other listing in this service answers a bad
+// page size or an unreadable page token with — is widened in through `extra_errors`: the
+// model's own `errors` list for this operation omits it, while the service refuses an
+// out-of-window `MaxResults` with exactly it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#DescribeSubnetGroups",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeSubnetGroupsErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupNotFoundFault(SubnetGroupNotFoundFault),
 }
@@ -161,10 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::SUBNET_GROUP_PAGE_SIZE_WINDOW.rejection(input.max_results)
         {
-            // A page size outside the window this surface serves names no page. This
-            // operation models no invalid-value error, so it is refused as a bad request
-            // rather than served as an empty page.
-            return Err(crate::scaffolded::Scaffolded::validation(message));
+            // A page size outside the window this surface serves names no page: refused
+            // with the service's own modelled invalid-value error, the same one every other
+            // listing in this service answers with, rather than served as an empty page.
+            return Err(
+                DescribeSubnetGroupsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
         // A subnet-group name is a case-insensitive identifier, so the name this request
         // asks about is folded exactly as the store is keyed.
@@ -209,8 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(
-                "NextToken does not name a position in this listing.",
+            DescribeSubnetGroupsError::from(
+                DescribeSubnetGroupsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "NextToken does not name a position in this listing.".to_string(),
+                        ),
+                    },
+                ),
             )
         })?;
         Ok(DescribeSubnetGroupsOutput {
