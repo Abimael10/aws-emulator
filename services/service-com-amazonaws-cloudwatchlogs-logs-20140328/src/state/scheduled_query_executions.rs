@@ -59,11 +59,14 @@
 //! WHICH UNIT the instants are stated in follows each member's own documentation: an epoch
 //! instant of this service is stated in MILLISECONDS unless the member itself says it is a
 //! number of seconds. A scheduled query's schedule window (`scheduleStartTime`,
-//! `scheduleEndTime`) and its history's window and `triggeredTimestamp` say only "in Unix
-//! epoch format", so they carry the milliseconds the instants of the RESOURCE (`creationTime`,
-//! `lastUpdatedTime`, `lastTriggeredTime`) and every other record of this service carry —
-//! which is the unit the store keeps them in, so nothing is converted at that edge. Only a
-//! member that states a number of seconds is seconds: the lookback OFFSETS (`startTimeOffset`,
+//! `scheduleEndTime`) and its history's window say only "in Unix epoch format", stating no
+//! unit at all, so each stated bound is read in the magnitude it states and compared in the
+//! milliseconds the instants of the RESOURCE (`creationTime`, `lastUpdatedTime`,
+//! `lastTriggeredTime`) and every other record of this service are kept in
+//! ([`super::scheduled_query_epoch`]), while a history record states its own
+//! `triggeredTimestamp` in the seconds a consumer of a run reads it in
+//! ([`ScheduledQueryExecution::triggered_secs`]). Only a member that states a number of
+//! seconds is seconds by its own words: the lookback OFFSETS (`startTimeOffset`,
 //! `endTimeOffset`) and the window of the query a run starts (`StartQuery$startTime`,
 //! "specified as epoch time, the number of seconds since January 1, 1970"), which is what
 //! [`execution_window_secs`] converts into.
@@ -157,8 +160,10 @@ pub struct ScheduledQueryExecution {
     /// this run's own rows under it.
     pub query_id: String,
     /// `TriggerHistoryRecord$triggeredTimestamp` — "The timestamp when the scheduled query
-    /// execution was triggered". Kept — and reported — in the epoch MILLISECONDS this service
-    /// states an epoch instant in, which is the unit the run's own query is created at.
+    /// execution was triggered". Kept in the epoch MILLISECONDS the store keeps every instant
+    /// of a scheduled query in, which is the unit the run's own query is created at, and
+    /// REPORTED in the epoch seconds a history record states its instant in
+    /// ([`ScheduledQueryExecution::triggered_secs`]).
     pub triggered_ms: i64,
     /// `TriggerHistoryRecord$executionStatus` — "The execution status of the scheduled query
     /// run", one of the [`EXECUTION_STATUS_RUNNING`] family.
@@ -200,6 +205,20 @@ impl ScheduledQueryExecution {
         }
     }
 
+    /// The instant this run was triggered at as a history record STATES it: the epoch
+    /// SECONDS a consumer of a scheduled query's runs reads it in.
+    ///
+    /// `triggeredTimestamp` says only "The timestamp when the scheduled query execution was
+    /// triggered" and the model renders it a plain `long` with no `timestampFormat`, so the
+    /// member states no unit of its own; the unit is the seconds this service states the window
+    /// of a query's own run in (`StartQuery$startTime`, "the number of seconds since January 1,
+    /// 1970"), which is the instant a client lines a reported run up against. The RESOURCE's
+    /// own instants (`creationTime`, `lastUpdatedTime`, `lastTriggeredTime`) keep the
+    /// milliseconds they are stored in.
+    pub fn triggered_secs(&self) -> i64 {
+        self.triggered_ms.div_euclid(MILLIS_PER_SECOND)
+    }
+
     /// This execution as the model's `TriggerHistoryRecord`, which is what
     /// `GetScheduledQueryHistory` reports — so one stored execution renders the same way
     /// through any reader of it.
@@ -207,7 +226,7 @@ impl ScheduledQueryExecution {
         TriggerHistoryRecord {
             query_id: Some(self.query_id.clone()),
             execution_status: Some(self.status.clone()),
-            triggered_timestamp: Some(self.triggered_ms),
+            triggered_timestamp: Some(self.triggered_secs()),
             error_message: self.error_message.clone(),
             // A query configured with no destination delivers to none, so the member is
             // reported by nothing rather than as an empty list.
@@ -344,8 +363,9 @@ impl ScheduledQueryRecord {
 /// ([`super::log_alarm_queries`]), so none of them has an instant due here.
 ///
 /// The two ends of the schedule window are the caller's own "Unix epoch format" instants,
-/// which state no number of seconds and so are read in the epoch MILLISECONDS this service
-/// states an epoch instant in — the very unit the store keeps its clock in.
+/// which state no unit of their own, so each is read in the magnitude it states and walked in
+/// the milliseconds the store keeps its clock in
+/// ([`super::scheduled_query_epoch`]).
 fn due_instants(record: &ScheduledQueryRecord, now_ms: i64) -> Vec<i64> {
     let Some(created_ms) = record.creation_time_ms else {
         return Vec::new();
@@ -358,9 +378,12 @@ fn due_instants(record: &ScheduledQueryRecord, now_ms: i64) -> Vec<i64> {
     };
     let eligible_from = record
         .schedule_start_time
+        .map(super::scheduled_query_epoch::instant_ms)
         .unwrap_or(created_ms)
         .max(created_ms);
-    let stops_after = record.schedule_end_time;
+    let stops_after = record
+        .schedule_end_time
+        .map(super::scheduled_query_epoch::window_end_ms);
     let timezone = record.timezone.as_deref();
     let mut candidate = match record.last_triggered_time_ms {
         // Every run after the first falls at the next instant the schedule names after the

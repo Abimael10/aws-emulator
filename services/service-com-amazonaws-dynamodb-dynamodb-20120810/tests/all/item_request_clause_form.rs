@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH FORM a constraint clause takes is a fact of the SERVED OPERATION, over every member
-//! of it and every value that broke a bound.
+//! WHICH FORM a constraint clause takes is a fact of the MEMBER of the SERVED OPERATION, over
+//! every value that broke a bound.
 //!
 //! The rule under test: a request member outside the bound its target shape declares is
 //! refused 400 `ValidationException`, inside the envelope that counts the clauses, and the
-//! clause is worded in the ONE form the served operation states its clauses in:
+//! clause is worded in the ONE form the served operation states THAT MEMBER in:
 //!
 //! * an ITEM REQUEST — a keyed read, a table walk, a batched or transactional item request —
 //!   names the member by its WIRE spelling and echoes NO value (`Value at 'Limit' failed to
-//!   satisfy constraint: Member must have value greater than or equal to 1`);
+//!   satisfy constraint: Member must have value greater than or equal to 1`), except for the
+//!   table walk's own page size, which takes the form below;
 //! * a CONTROL-PLANE listing names it by the lowerCamel path the request validator builds and
 //!   DOES echo the rejected value (`Value '0' at 'limit' failed to satisfy constraint: …`).
 //!
@@ -19,8 +20,9 @@
 //! `ListTablesInputLimit` with `@range{min:1,max:100}`
 //! (`smithy_query(query="operation", operation="Query,Scan,ListBackups,ListTables")`), and the
 //! same `RequestItems` map, `@length{min:1}` on both, is stated by its wire spelling on
-//! `BatchGetItem` and by the validator's path on `BatchWriteItem`. So the operation is the
-//! only thing the form can be read off, which is what the rows below read back.
+//! `BatchGetItem` and by the validator's path on `BatchWriteItem`. So the served operation and
+//! the member the clause is about are the only things the form can be read off, which is what
+//! the rows below read back.
 //!
 //! The rows span what the rule generalises over: the OPERATION (two item requests, two
 //! batched ones, two control-plane listings), the MEMBER (a page size, a parallel-scan bound,
@@ -112,19 +114,31 @@ async fn refusal(
     message(&body)
 }
 
-/// RULE: both item requests state the SAME member, breaking the SAME bound, in the wire form
-/// that echoes no value — whatever value was rejected.
+/// RULE: the keyed read states its page size in the wire form that echoes no value — whatever
+/// value was rejected — while the table walk states that same member, breaking that same bound,
+/// with the rejected value echoed under the validator's path.
 #[tokio::test]
 async fn an_item_requests_page_size_is_stated_by_its_wire_name_whatever_the_value() {
     let router = seeded().await;
-    let expected = wire_form("Limit", &at_least(1));
 
     // The values span the rejected side of the published minimum: zero, one below, a handful
     // below, and the smallest value a 32-bit member carries.
     for rejected in [0_i64, -1, -9, -2_147_483_648] {
-        for (case, operation, request) in [
-            ("a keyed read", "Query", keyed(rejected)),
-            ("a table walk", "Scan", walk(rejected)),
+        for (case, operation, request, expected, echoed) in [
+            (
+                "a keyed read",
+                "Query",
+                keyed(rejected),
+                wire_form("Limit", &at_least(1)),
+                false,
+            ),
+            (
+                "a table walk",
+                "Scan",
+                walk(rejected),
+                echoing_form("limit", rejected, &at_least(1)),
+                true,
+            ),
         ] {
             let stated = refusal(&router, case, operation, request).await;
             assert_eq!(
@@ -132,18 +146,20 @@ async fn an_item_requests_page_size_is_stated_by_its_wire_name_whatever_the_valu
                 "case {case:?} ({operation}, Limit {rejected}): expected the message \
                  {expected:?}, got {stated:?}"
             );
-            assert!(
-                !stated.contains(&rejected.to_string()),
-                "case {case:?} ({operation}, Limit {rejected}): this form echoes no part of \
-                 the rejected value, got {stated:?}"
+            assert_eq!(
+                stated.contains(&format!("'{rejected}'")),
+                echoed,
+                "case {case:?} ({operation}, Limit {rejected}): expected the rejected value \
+                 {} the message, got {stated:?}",
+                if echoed { "quoted in" } else { "absent from" }
             );
         }
     }
 }
 
-/// RULE: every other bounded member of an item request takes that same form — the walk's
+/// RULE: every other bounded member of an item request takes the wire form — the walk's
 /// parallel-scan bounds at either end of their ranges, and a batched request map below its
-/// own minimum — so the form is the operation's and not one member's.
+/// own minimum — so the page size above is the member that states its own form, not the rule.
 #[tokio::test]
 async fn every_member_of_an_item_request_takes_the_same_form() {
     let router = seeded().await;

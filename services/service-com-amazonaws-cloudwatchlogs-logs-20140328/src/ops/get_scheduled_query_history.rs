@@ -236,12 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // "The start time for the history query" and "The end time for the history query": a
-        // window whose end precedes its start includes no instant at all, so it is not a time
-        // range and the request is refused in the sentence CloudWatch Logs states for a
-        // reversed window — fixed text about the two ends, interpolating neither of their
-        // values.
-        if input.end_time < input.start_time {
+        // "The start time for the history query" and "The end time for the history query":
+        // each states no unit of its own, so each is read as the instant its own magnitude
+        // names ([`crate::state::scheduled_query_epoch`]) and the two are compared as
+        // instants. A window whose end precedes its start includes no instant at all, so it is
+        // not a time range and the request is refused in the sentence CloudWatch Logs states
+        // for a reversed window — fixed text about the two ends, interpolating neither of
+        // their values.
+        let window_start_ms = crate::state::scheduled_query_epoch::instant_ms(input.start_time);
+        let window_end_ms = crate::state::scheduled_query_epoch::window_end_ms(input.end_time);
+        if window_end_ms < window_start_ms {
             return Err(invalid(
                 crate::state::REVERSED_TIME_RANGE_MESSAGE.to_string(),
             ));
@@ -338,17 +342,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The window SELECTS which executions are reported — both of its ends included, the
-        // way every window of this service is read, and in the epoch MILLISECONDS this service
-        // states an epoch instant in: `startTime`, `endTime` and `triggeredTimestamp` state no
-        // number of seconds of their own ("in Unix epoch format"), so they carry the unit every
-        // other instant of this surface does — and "only executions with the specified statuses
-        // are returned", so a request naming none is not narrowed by status at all.
+        // way every window of this service is read, as the instants read above — and "only
+        // executions with the specified statuses are returned", so a request naming none is
+        // not narrowed by status at all.
         let statuses = input.execution_statuses.clone().unwrap_or_default();
         let mut matching: Vec<&crate::state::ScheduledQueryExecution> = recorded
             .iter()
             .filter(|execution| {
-                execution.triggered_ms >= input.start_time
-                    && execution.triggered_ms <= input.end_time
+                execution.triggered_ms >= window_start_ms && execution.triggered_ms <= window_end_ms
             })
             .filter(|execution| statuses.is_empty() || statuses.contains(&execution.status))
             .collect();

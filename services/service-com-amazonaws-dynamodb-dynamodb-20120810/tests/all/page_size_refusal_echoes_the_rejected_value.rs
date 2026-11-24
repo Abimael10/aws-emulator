@@ -4,7 +4,7 @@
 //! REQUEST carried.
 //!
 //! A page size below the `@range` minimum the model declares is refused 400
-//! `ValidationException` whose clause is stated in one of two forms, per operation
+//! `ValidationException` whose clause is stated in one of two forms, per operation and member
 //! (`tests/all/page_size_clause_forms.rs` pins which form each takes): the
 //! request-validator form names the member by its lowerCamel path and quotes the rejected
 //! value, the item-request form names it as the model spells it and quotes nothing. This suite
@@ -12,11 +12,11 @@
 //! rather than fixed, which is the diagnostic a caller reads the offending value out of.
 //!
 //! Every row drives the SAME violation class, and they differ along what the rule generalises
-//! over: the operation (two control-plane listings), which published bound the
+//! over: the operation (a table walk and two control-plane listings), which published bound the
 //! value broke (the minimum, and a maximum where the member declares one), how far past it the
 //! value went (one past, a handful, and the integral extremes a 32-bit member can carry), and
 //! how the rejected value is written (zero, a negative, a large magnitude). The contrast test
-//! drives the same sweep through the item requests whose form quotes NO value, so a value that
+//! drives the same sweep through the keyed read, whose form quotes NO value, so a value that
 //! happens to appear in a message cannot pass for a value the clause echoed.
 
 use serde_json::{json, Value};
@@ -108,6 +108,12 @@ async fn an_echoing_page_size_clause_quotes_the_value_the_request_carried() {
         // Each row: the case, the operation, its request, and the bound the value broke.
         let rows: Vec<(&str, &str, Value, String)> = vec![
             (
+                "a table walk's page size below its minimum",
+                "Scan",
+                walk(rejected),
+                at_least(1),
+            ),
+            (
                 "a table listing's page size below its minimum",
                 "ListTables",
                 json!({"Limit": rejected}),
@@ -145,7 +151,7 @@ async fn an_echoing_page_size_clause_quotes_the_value_the_request_carried() {
     }
 }
 
-/// RULE: the other form quotes NO value — an item request, whose clause about its page size
+/// RULE: the other form quotes NO value — the keyed read, whose clause about its page size
 /// names the member alone, states the same requirement whatever value was rejected, so none of
 /// the rejected values appears in the message at all.
 #[tokio::test]
@@ -157,18 +163,11 @@ async fn a_wire_form_page_size_clause_quotes_none_of_the_rejected_value() {
         at_least(1)
     );
     for rejected in REJECTED_BELOW {
-        for (case, operation, request) in [
-            (
-                "a keyed read's page size below its minimum",
-                "Query",
-                keyed(rejected),
-            ),
-            (
-                "a table walk's page size below its minimum",
-                "Scan",
-                walk(rejected),
-            ),
-        ] {
+        for (case, operation, request) in [(
+            "a keyed read's page size below its minimum",
+            "Query",
+            keyed(rejected),
+        )] {
             let stated = refusal(&router, case, operation, request).await;
             assert_eq!(
                 stated, expected,

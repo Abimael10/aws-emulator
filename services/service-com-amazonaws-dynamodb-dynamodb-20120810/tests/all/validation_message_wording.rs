@@ -214,13 +214,13 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
                 .to_string(),
         ),
         (
-            // The same bound, on the same member name, through the table WALK: one form per
-            // operation, and both item requests state it the same way
-            // (`tests/all/page_size_clause_forms.rs` pins the forms per operation).
+            // The same bound, on the same member name, through the table WALK: the walk
+            // states ITS page size in the other form, so one violation is worded two ways
+            // (`tests/all/page_size_clause_forms.rs` pins the forms per member).
             "the same bound on another item request's Limit",
             "Scan",
             json!({"TableName": "Music", "Limit": 0}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1"
                 .to_string(),
         ),

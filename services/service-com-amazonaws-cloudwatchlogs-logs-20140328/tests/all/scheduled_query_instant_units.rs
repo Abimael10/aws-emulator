@@ -1,25 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The UNIT the scheduled-query surface states an epoch instant in.
+//! The MAGNITUDE the scheduled-query surface states an epoch instant in.
 //!
-//! The rule under test: an epoch instant of this service is stated in MILLISECONDS unless the
-//! member itself says it is a number of seconds. The scheduled-query members say only "in Unix
-//! epoch format"
+//! The rule under test: a scheduled-query instant stated "in Unix epoch format" names the
+//! instant its own MAGNITUDE names, and the run it selects is the same run whichever magnitude
+//! it was stated in. The members
 //! (`smithy_query(query="shape",shape="GetScheduledQueryHistoryRequest,TriggerHistoryRecord,CreateScheduledQueryRequest")`:
 //! `startTime`, `endTime`, `triggeredTimestamp`, `scheduleStartTime`, `scheduleEndTime`, all
-//! `Timestamp` rendered `long` with no `timestampFormat`), so every one of them carries the
-//! milliseconds the resource's own instants (`creationTime`, `lastUpdatedTime`,
-//! `lastTriggeredTime`) and every log event of this service carry. Only a member that states a
-//! number of seconds is seconds — the lookback offsets `startTimeOffset`/`endTimeOffset` ("the
-//! time offset in seconds") and `StartQuery$startTime` ("the number of seconds since January 1,
-//! 1970") — and none of those is read here.
+//! `Timestamp` rendered `long` with no `timestampFormat`) state no unit at all, so neither of
+//! the two magnitudes an epoch instant is written in — the seconds this service states a query's
+//! own window in (`StartQuery$startTime`, "the number of seconds since January 1, 1970") nor the
+//! milliseconds its log events and resource instants are stated in — is excluded by what the
+//! member says, and the two magnitudes name disjoint sets of values. A bound stated in seconds
+//! names that whole second. Only a member that states a number of seconds is unambiguous — the
+//! lookback offsets `startTimeOffset`/`endTimeOffset` ("the time offset in seconds") — and
+//! neither of those is read here.
 //!
-//! The tables span what the rule generalises over rather than one request: windows a whole
-//! minute either side of a run, windows of the single millisecond it was triggered at, windows
-//! one millisecond before and after it — the resolution a seconds-based reading cannot tell
-//! apart — and the same windows restated in the seconds magnitude, which name instants of 1970
-//! and therefore select nothing; and, for the schedule window, an end stated in milliseconds
-//! that is still ahead against the same end restated in seconds, which is already long past.
+//! The reported `triggeredTimestamp` is the epoch SECONDS a history record states its run's
+//! instant in, while the RESOURCE's own instants (`creationTime`, `lastUpdatedTime`,
+//! `lastTriggeredTime`) are the milliseconds they are stored in, so one run's instant is
+//! reported as the same instant by the two readers that report it — one as its second, one as
+//! its millisecond.
+//!
+//! The tables span what the rule generalises over rather than one request: windows a whole minute
+//! either side of a run and windows of the single millisecond it was triggered at, in both
+//! magnitudes; windows one unit before and after it, which select nothing in either magnitude;
+//! and, for the schedule window, an end that is still ahead against one that is already past, in
+//! both magnitudes.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a response
@@ -58,6 +65,9 @@ const HISTORY_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How long to wait between two looks while polling for one.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The milliseconds one second holds, which is what restates a bound in the other magnitude.
+const MILLIS_PER_SECOND: i64 = 1_000;
 
 /// Seed `group` with [`MESSAGE`], stamped an hour back so every run's lookback holds it.
 async fn seed_events(logs: &Logs, group: &str) {
@@ -141,15 +151,15 @@ struct Window {
     selects: bool,
 }
 
-/// The window a read states selects the runs of THAT window, read in epoch milliseconds: a
-/// client that asks for the milliseconds around now sees its run, the single millisecond the run
-/// was triggered at selects it, a millisecond either side of it does not, and the very same
-/// window restated in the seconds magnitude names instants of 1970 and selects nothing.
+/// The window a read states selects the runs of THAT window, in whichever magnitude its ends are
+/// stated: a client that asks for the milliseconds around now sees its run, so does one that asks
+/// for the seconds around now, the single unit the run was triggered in selects it in either
+/// magnitude, and one unit either side of it selects nothing in either.
 #[tokio::test]
-async fn the_history_window_is_read_in_epoch_milliseconds() {
+async fn the_history_window_is_read_in_the_magnitude_it_states() {
     let logs = Logs::new();
     let group = "/aws/emulator/instant-units/window";
-    let name = "window-in-milliseconds";
+    let name = "window-in-either-magnitude";
     seed_events(&logs, group).await;
     let created_at = now_ms();
     create_query(&logs, name, group, &json!({})).await;
@@ -160,17 +170,17 @@ async fn the_history_window_is_read_in_epoch_milliseconds() {
         Some("Complete"),
         "a run that produced its results is complete, got {record}"
     );
-    let triggered = record["triggeredTimestamp"]
+    let triggered_secs = record["triggeredTimestamp"]
         .as_i64()
         .unwrap_or_else(|| panic!("a record is triggered at an instant, got {record}"));
 
-    // The instant reported is the MILLISECOND the run was triggered at: it lies inside the
-    // milliseconds this test spans, which a value in seconds (a thousandth of it) cannot.
+    // The instant a record reports is the SECOND the run was triggered in: it lies inside the
+    // seconds this test spans.
     let now = now_ms();
     assert!(
-        triggered >= created_at && triggered <= now,
-        "expected the triggered instant to be the milliseconds between the create \
-         ({created_at}) and now ({now}), got {triggered}"
+        triggered_secs >= created_at / MILLIS_PER_SECOND && triggered_secs <= now / MILLIS_PER_SECOND,
+        "expected the triggered instant to be the seconds between the create \
+         ({created_at}) and now ({now}), got {triggered_secs}"
     );
 
     // The run's own query, which the record is a handle on, really answered the window's rows.
@@ -185,18 +195,22 @@ async fn the_history_window_is_read_in_epoch_milliseconds() {
         "the run's query has run, got {results}"
     );
 
-    // One instant of one run, reported by the history and by the query itself: both state it in
-    // the same epoch milliseconds, so the two values are equal rather than a factor apart.
+    // One instant of one run, reported by the query itself and by the history: the resource's
+    // own member states the milliseconds it is stored in, the record states that same instant's
+    // second, so the one is the other's thousandth rather than a different instant.
     let reported = logs.ok(GET, &json!({"identifier": name})).await;
+    let triggered = reported["lastTriggeredTime"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the query reports its last triggered instant, got {reported}"));
     assert_eq!(
-        reported["lastTriggeredTime"].as_i64(),
-        Some(triggered),
-        "the query's last triggered instant is that run's, in the same unit, got {reported}"
+        triggered / MILLIS_PER_SECOND,
+        triggered_secs,
+        "the query's last triggered instant is that run's, got {reported}"
     );
 
-    let rows: [Window; 8] = [
+    let rows: [Window; 10] = [
         Window {
-            case: "a minute either side of the run, as a client asks for it",
+            case: "a minute either side of the run, in milliseconds",
             ends: |triggered| (triggered - 60 * 1_000, triggered + 60 * 1_000),
             selects: true,
         },
@@ -226,13 +240,33 @@ async fn the_history_window_is_read_in_epoch_milliseconds() {
             selects: false,
         },
         Window {
-            case: "the same minute either side of the run, restated in the seconds magnitude",
-            ends: |triggered| (triggered / 1_000 - 60, triggered / 1_000 + 60),
-            selects: false,
+            case: "the same minute either side of the run, in seconds",
+            ends: |triggered| {
+                (
+                    triggered / MILLIS_PER_SECOND - 60,
+                    triggered / MILLIS_PER_SECOND + 60,
+                )
+            },
+            selects: true,
         },
         Window {
-            case: "the whole of 1970 up to the run's instant in the seconds magnitude",
-            ends: |triggered| (0, triggered / 1_000),
+            case: "the single second the run was triggered in",
+            ends: |triggered| (triggered / MILLIS_PER_SECOND, triggered / MILLIS_PER_SECOND),
+            selects: true,
+        },
+        Window {
+            case: "the whole of the epoch up to the second the run was triggered in",
+            ends: |triggered| (0, triggered / MILLIS_PER_SECOND),
+            selects: true,
+        },
+        Window {
+            case: "the two seconds after the one the run was triggered in",
+            ends: |triggered| {
+                (
+                    triggered / MILLIS_PER_SECOND + 1,
+                    triggered / MILLIS_PER_SECOND + 2,
+                )
+            },
             selects: false,
         },
     ];
@@ -275,18 +309,17 @@ struct Schedule {
     due: bool,
 }
 
-/// A query's own schedule window is read in the same epoch milliseconds: "The query will stop
-/// executing after this time", so an end stated in milliseconds that is still ahead leaves a run
-/// due, while the very same end restated in the seconds magnitude is an instant of 1970 — long
-/// past — and owes nothing.
+/// A query's own schedule window is read in the magnitude it states too: "The query will stop
+/// executing after this time", so an end that is still ahead leaves a run due and one that has
+/// passed owes nothing, whether the instant is stated in seconds or in milliseconds.
 #[tokio::test]
-async fn the_schedule_window_is_read_in_epoch_milliseconds() {
+async fn the_schedule_window_is_read_in_the_magnitude_it_states() {
     let logs = Logs::new();
     let group = "/aws/emulator/instant-units/schedule";
     seed_events(&logs, group).await;
     let now = now_ms();
 
-    let rows: [Schedule; 3] = [
+    let rows: [Schedule; 4] = [
         Schedule {
             case: "a schedule end in milliseconds that is still ahead",
             name: "schedule-end-ahead-in-millis",
@@ -294,15 +327,21 @@ async fn the_schedule_window_is_read_in_epoch_milliseconds() {
             due: true,
         },
         Schedule {
-            case: "the same schedule end restated in the seconds magnitude",
+            case: "the same schedule end in seconds",
             name: "schedule-end-ahead-in-seconds",
-            end: |now| (now + 24 * 60 * 60 * 1_000) / 1_000,
-            due: false,
+            end: |now| (now + 24 * 60 * 60 * 1_000) / MILLIS_PER_SECOND,
+            due: true,
         },
         Schedule {
             case: "a schedule end in milliseconds that has passed",
             name: "schedule-end-passed-in-millis",
             end: |now| now - 60 * 1_000,
+            due: false,
+        },
+        Schedule {
+            case: "the same schedule end in seconds",
+            name: "schedule-end-passed-in-seconds",
+            end: |now| (now - 60 * 1_000) / MILLIS_PER_SECOND,
             due: false,
         },
     ];
@@ -317,17 +356,18 @@ async fn the_schedule_window_is_read_in_epoch_milliseconds() {
         .await;
     }
 
-    // The query whose window is still open is the one whose run falls due; every other query has
-    // had the same chance of the clock by the time that run is recorded, so one that still
-    // reports nothing is one the schedule owes nothing.
-    let eligible = &rows[0];
-    let record = first_run_over_a_millisecond_window(&logs, eligible.case, eligible.name).await;
-    assert_eq!(
-        record["executionStatus"].as_str(),
-        Some("Complete"),
-        "case {:?}: a run that produced its results is complete, got {record}",
-        eligible.case
-    );
+    // Each query whose window is still open is one whose run falls due; every other query has had
+    // the same chance of the clock by the time those runs are recorded, so one that still reports
+    // nothing is one the schedule owes nothing.
+    for row in rows.iter().filter(|row| row.due) {
+        let record = first_run_over_a_millisecond_window(&logs, row.case, row.name).await;
+        assert_eq!(
+            record["executionStatus"].as_str(),
+            Some("Complete"),
+            "case {:?}: a run that produced its results is complete, got {record}",
+            row.case
+        );
+    }
 
     for row in rows.iter().filter(|row| !row.due) {
         let found = history_over(&logs, row.name, 0, now_ms() + 24 * 60 * 60 * 1_000).await;

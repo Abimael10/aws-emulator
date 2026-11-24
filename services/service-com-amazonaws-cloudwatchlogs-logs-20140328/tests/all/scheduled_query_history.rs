@@ -260,9 +260,10 @@ async fn the_history_reports_the_runs_the_schedule_made_due() {
             .as_i64()
             .unwrap_or_else(|| panic!("case {case:?}: a record is triggered at an instant, got {record}"));
         assert!(
-            triggered >= created_at && triggered <= now_ms(),
-            "case {case:?}: expected the run to be triggered between {created_at} and now, got \
-             {triggered}"
+            triggered >= created_at / 1_000 && triggered <= now_ms() / 1_000,
+            "case {case:?}: expected the run to be triggered between {} and now, in the epoch \
+             seconds a record states its instant in, got {triggered}",
+            created_at / 1_000
         );
 
         // The id the record carries is a handle on THIS run's results: the rows are the ERROR
@@ -297,12 +298,13 @@ async fn the_history_reports_the_runs_the_schedule_made_due() {
         }
 
         // The query itself now reports that run as its last: both members report an execution
-        // that happened. `lastTriggeredTime` and the history's `triggeredTimestamp` are the
-        // same instant of the same run, stated in the same epoch milliseconds, so the two
-        // values are equal rather than a factor apart.
+        // that happened. `lastTriggeredTime` is the RESOURCE's own instant, in the epoch
+        // milliseconds the resource's instants are stated in, and the history's
+        // `triggeredTimestamp` is that same instant as a record states it, in epoch seconds —
+        // so the one is the other's second.
         let reported = logs.ok(GET, &json!({"identifier": name})).await;
         assert_eq!(
-            reported["lastTriggeredTime"].as_i64(),
+            reported["lastTriggeredTime"].as_i64().map(|ms| ms / 1_000),
             Some(triggered),
             "case {case:?}: the query's last triggered instant is that run's, got {reported}"
         );
@@ -529,8 +531,8 @@ async fn query_with_recorded_runs(logs: &Logs, name: &str, runs: &[(&str, i64, &
 
 /// The instant the recorded runs of the tables below are spaced around: each run one minute
 /// apart, within the hour before now, and each at an instant whose millisecond part is not
-/// zero — the resolution this operation states its window and its records' instants in, so a
-/// window that named them in whole seconds could not pick one of them out.
+/// zero — the resolution this operation's records state their instants at, so a window stated
+/// in whole milliseconds picks exactly one of them out.
 fn run_instants() -> [i64; 5] {
     let newest = (now_ms() - 60 * 1_000) / 1_000 * 1_000 + 457;
     [

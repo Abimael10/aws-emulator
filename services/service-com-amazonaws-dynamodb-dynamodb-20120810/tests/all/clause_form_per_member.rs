@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! WHICH form a constraint clause takes is a fact of the MEMBER of the served operation.
+//!
+//! The rule under test: a request member outside the bound its target shape declares is refused
+//! 400 `ValidationException` whose clause is worded in the form the served operation states THAT
+//! MEMBER in — so two members of ONE operation can be stated in two different forms, and one
+//! member name shared by two operations can be stated differently by each:
+//!
+//! * the ITEM-REQUEST form names the member by its WIRE spelling and echoes no value (`Value at
+//!   'TotalSegments' failed to satisfy constraint: …`);
+//! * the REQUEST-VALIDATOR form names it by the lowerCamel path the request validator builds
+//!   and echoes the rejected value (`Value '0' at 'limit' failed to satisfy constraint: …`).
+//!
+//! Nothing about the model chooses between them: the table walk's page size and its two
+//! parallel-scan bounds are declared alongside each other on one input — `Scan$Limit` targets
+//! `PositiveIntegerObject` `@range{min:1}`, `Scan$TotalSegments`
+//! `@range{min:1,max:1000000}` and `Scan$Segment` `@range{min:0,max:999999}`
+//! (`smithy_query(query="operation", operation="Scan")`) — and `Query$Limit` targets the very
+//! same shape as the walk's page size (`smithy_query(query="operation", operation="Query")`),
+//! yet the walk states its page size with the value echoed while it states its parallel-scan
+//! bounds, and the keyed read states that same page-size member, by the wire spelling. So the
+//! form has to be read off the member of the operation being served, which is what the rows
+//! below read back.
+//!
+//! The rows differ along what the rule generalises over: the OPERATION (a table walk, a keyed
+//! read, a control-plane listing), the MEMBER (a page size, both parallel-scan bounds), which
+//! end of the published bound the value broke, how far past it the value went, and how many
+//! members of one request were outside their bounds at once.
+
+use serde_json::{json, Value};
+
+use crate::emulator::{call, describe_when_active, error_code, message, ok};
+
+/// The table the rows address: one hash key, which is all a refusal about a bounded numeric
+/// member of the request needs.
+const TABLE: &str = "ClauseFormPerMember";
+
+/// Create [`TABLE`] and wait out the `CREATING` -> `ACTIVE` transition the clock owes it.
+async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
+    let router = crate::emulator::emulator();
+    ok(
+        &router,
+        "CreateTable",
+        json!({
+            "TableName": TABLE,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await;
+    describe_when_active(&router, "create the table the rows read", TABLE).await;
+    router
+}
+
+/// The requirement phrase AWS states for a `@range` minimum of `min`.
+fn at_least(min: i64) -> String {
+    format!("Member must have value greater than or equal to {min}")
+}
+
+/// The requirement phrase AWS states for a `@range` maximum of `max`.
+fn at_most(max: i64) -> String {
+    format!("Member must have value less than or equal to {max}")
+}
+
+/// One clause naming `member` by its wire spelling, echoing no value.
+fn wire_clause(member: &str, requirement: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: {requirement}")
+}
+
+/// One clause naming `path` by the validator's path, echoing the rejected `value`.
+fn echoing_clause(path: &str, value: i64, requirement: &str) -> String {
+    format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The envelope a refusal states `clauses` inside, counting them.
+fn envelope(clauses: &[String]) -> String {
+    let count = clauses.len();
+    let plural = if count == 1 { "error" } else { "errors" };
+    format!("{count} validation {plural} detected: {}", clauses.join("; "))
+}
+
+/// The message the refusal of `request` carries, asserted to be a 400 `ValidationException`
+/// first so a different refusal cannot pass for this one.
+async fn refusal(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: Value,
+) -> String {
+    let (status, body) = call(router, operation, request).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case {case:?} ({operation}): expected 400 ValidationException, got {status} {body}"
+    );
+    message(&body)
+}
+
+/// RULE: the walk states its own page size with the rejected value echoed under the validator's
+/// path, whatever that value is, while the keyed read states the SAME member by its wire
+/// spelling with nothing echoed.
+#[tokio::test]
+async fn one_member_name_is_stated_in_the_form_each_operation_gives_it() {
+    let router = seeded().await;
+
+    // The values span the rejected side of the one bound both members declare: zero, one below,
+    // a handful below, and the smallest value a 32-bit member carries.
+    for rejected in [0_i64, -1, -9, -2_147_483_648] {
+        let walk = refusal(
+            &router,
+            "a table walk's page size",
+            "Scan",
+            json!({"TableName": TABLE, "Limit": rejected}),
+        )
+        .await;
+        let expected = envelope(&[echoing_clause("limit", rejected, &at_least(1))]);
+        assert_eq!(
+            walk, expected,
+            "case \"a table walk's page size\" (Limit {rejected}): expected {expected:?}, got \
+             {walk:?}"
+        );
+
+        let keyed = refusal(
+            &router,
+            "a keyed read's page size",
+            "Query",
+            json!({"TableName": TABLE, "Limit": rejected, "KeyConditionExpression": "pk = :p",
+                   "ExpressionAttributeValues": {":p": {"S": "one"}}}),
+        )
+        .await;
+        let expected = envelope(&[wire_clause("Limit", &at_least(1))]);
+        assert_eq!(
+            keyed, expected,
+            "case \"a keyed read's page size\" (Limit {rejected}): expected {expected:?}, got \
+             {keyed:?}"
+        );
+        assert!(
+            !keyed.contains(&format!("'{rejected}'")),
+            "case \"a keyed read's page size\" (Limit {rejected}): this form echoes no part of \
+             the rejected value, got {keyed:?}"
+        );
+    }
+}
+
+/// RULE: the other members of the same operation keep that operation's own form — so the walk
+/// states its parallel-scan bounds by their wire spelling at either end of their ranges, and a
+/// request outside two of its bounds at once states one clause per member, each in that member's
+/// form, inside the one envelope that counts them.
+#[tokio::test]
+async fn every_other_member_of_the_walk_keeps_its_operations_form() {
+    let router = seeded().await;
+
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "the segment count below its minimum",
+            json!({"TableName": TABLE, "TotalSegments": 0}),
+            envelope(&[wire_clause("TotalSegments", &at_least(1))]),
+        ),
+        (
+            "the segment count past its maximum",
+            json!({"TableName": TABLE, "TotalSegments": 1_000_001}),
+            envelope(&[wire_clause("TotalSegments", &at_most(1_000_000))]),
+        ),
+        (
+            "the segment below its zero minimum",
+            json!({"TableName": TABLE, "Segment": -1}),
+            envelope(&[wire_clause("Segment", &at_least(0))]),
+        ),
+        (
+            "the segment past its maximum",
+            json!({"TableName": TABLE, "Segment": 1_000_000}),
+            envelope(&[wire_clause("Segment", &at_most(999_999))]),
+        ),
+        (
+            "the page size and the segment count at once",
+            json!({"TableName": TABLE, "Limit": 0, "TotalSegments": 0}),
+            envelope(&[
+                echoing_clause("limit", 0, &at_least(1)),
+                wire_clause("TotalSegments", &at_least(1)),
+            ]),
+        ),
+        (
+            "the page size and the segment at once",
+            json!({"TableName": TABLE, "Limit": -3, "Segment": -1}),
+            envelope(&[
+                echoing_clause("limit", -3, &at_least(1)),
+                wire_clause("Segment", &at_least(0)),
+            ]),
+        ),
+    ];
+
+    for (case, request, expected) in rows {
+        let stated = refusal(&router, case, "Scan", request).await;
+        assert_eq!(
+            stated, expected,
+            "case {case:?} (Scan): expected the message {expected:?}, got {stated:?}"
+        );
+    }
+}
+
+/// RULE: the form says nothing about WHEN there is a clause — every member above AT its
+/// published bound is inside the range the model declares, so such a request is served.
+#[tokio::test]
+async fn a_value_at_a_published_bound_is_served_by_either_form() {
+    let router = seeded().await;
+
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "the walk's page size at its minimum",
+            "Scan",
+            json!({"TableName": TABLE, "Limit": 1}),
+        ),
+        (
+            "the walk's parallel-scan bounds at their minimum",
+            "Scan",
+            json!({"TableName": TABLE, "Segment": 0, "TotalSegments": 1}),
+        ),
+        (
+            "the walk's parallel-scan bounds at their maximum",
+            "Scan",
+            json!({"TableName": TABLE, "Segment": 999_999, "TotalSegments": 1_000_000}),
+        ),
+        (
+            "the keyed read's page size at that same minimum",
+            "Query",
+            json!({"TableName": TABLE, "Limit": 1, "KeyConditionExpression": "pk = :p",
+                   "ExpressionAttributeValues": {":p": {"S": "one"}}}),
+        ),
+    ];
+
+    for (case, operation, request) in rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (200, "<no __type>"),
+            "case {case:?} ({operation}): a request inside every published bound is served, got \
+             {status} {body}"
+        );
+        let stated = message(&body);
+        assert!(
+            !stated.contains("failed to satisfy constraint"),
+            "case {case:?} ({operation}): a value at a published bound is no constraint \
+             violation, got {status} {stated:?}"
+        );
+    }
+}

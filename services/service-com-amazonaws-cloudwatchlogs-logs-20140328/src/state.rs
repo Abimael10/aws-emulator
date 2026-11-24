@@ -265,6 +265,9 @@ pub mod log_alarm_queries;
 mod scheduled_query_rules;
 pub use scheduled_query_rules::*;
 
+/// The magnitude a scheduled query's epoch instants are stated in.
+pub mod scheduled_query_epoch;
+
 /// The EXECUTIONS of a scheduled query — the runs its own schedule makes due — as they are
 /// recorded, run and reported.
 pub mod scheduled_query_executions;
