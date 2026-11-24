@@ -59,7 +59,17 @@ const REGION: &str = "eu-west-1";
 /// port. The broker's own socket is a DIFFERENT address — one port serves one wire — and
 /// which one that is, is the core's to choose, so every assertion about it reads it back
 /// rather than naming it.
-const SERVED_AT: &str = "https://127.0.0.1:39355";
+///
+/// The port is below the range a host hands out for a bind that asks for any free port
+/// (Linux's `net.ipv4.ip_local_port_range` starts at 32768), because the broker's socket is
+/// a real loopback bind whose port the OS chooses: a served port inside that range could be
+/// the one the OS hands the broker, and the two unrelated sockets would then spell one
+/// address.
+const SERVED_AT: &str = "https://127.0.0.1:29355";
+
+/// The `host:port` a client reaches that API at — the authority half of [`SERVED_AT`] —
+/// which is NOT the address a data endpoint is published at.
+const SERVED_AUTHORITY: &str = "127.0.0.1:29355";
 
 /// How long a leg of the exchange may take before the case fails. Generous: it bounds a
 /// wait on a CONDITION (a packet the broker writes, a socket it closes), not the speed of
@@ -183,7 +193,7 @@ async fn discover(
     let (status, rendered, parsed) = call(
         router,
         "GET",
-        &format!("https://127.0.0.1:39355/endpoint{query}"),
+        &format!("{SERVED_AT}/endpoint{query}"),
         "iot",
         "",
     )
@@ -405,7 +415,7 @@ fn a_discovered_endpoint_accepts_an_mqtt_connection_the_connection_apis_report()
                      {address:?}"
                 );
                 assert_ne!(
-                    address, "127.0.0.1:39355",
+                    address, SERVED_AUTHORITY,
                     "case {case:?}: a data endpoint must name the broker's own socket"
                 );
 

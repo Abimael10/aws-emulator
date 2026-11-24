@@ -60,8 +60,17 @@ const DEFAULT_REGION: &str = "us-east-1";
 const FALLBACK_HOST_REGION: &str = "ap-northeast-1";
 
 /// The address this emulator is served at wherever a test is not varying it: a loopback
-/// bind with an OS-assigned port, which is what the emulator's own data port looks like.
-const SERVED_AT: &str = "https://127.0.0.1:39355";
+/// host and a port, which is what the emulator's own data port looks like.
+///
+/// Every LOOPBACK port this suite serves the emulator at is below the range a host hands
+/// out for a bind that asks for any free port (Linux's `net.ipv4.ip_local_port_range`
+/// starts at 32768). The broker opens a real socket on loopback and lets the OS choose its
+/// port, so a served port taken from that range could be the very port the OS hands the
+/// broker: two unrelated sockets would then spell one address, and whether the data
+/// endpoint is the API endpoint would be decided by which port that host assigned. It is
+/// also no PREFIX of a port an addressing case below names, so an assertion that the
+/// published address carries no host the caller chose reads the two apart.
+const SERVED_AT: &str = "https://127.0.0.1:29355";
 
 /// One address this emulator can be served at (`MultiServiceRouter::set_url_base`, which
 /// is what the core sets from its data port), and the `host[:port]` a client reaches it
@@ -72,7 +81,7 @@ const SERVED_AT: &str = "https://127.0.0.1:39355";
 /// host with a port, and the base of an emulator that is not served on a port at all
 /// (`smithy_server_runtime::UNSERVED_URL_BASE`, reached in process).
 const SERVING_CASES: &[(&str, &str)] = &[
-    ("https://127.0.0.1:39355", "127.0.0.1:39355"),
+    ("https://127.0.0.1:29355", "127.0.0.1:29355"),
     ("https://127.0.0.1:9297", "127.0.0.1:9297"),
     ("https://[::1]:8443", "[::1]:8443"),
     ("https://emulator.test:443", "emulator.test:443"),

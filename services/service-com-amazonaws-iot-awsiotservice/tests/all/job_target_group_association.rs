@@ -103,28 +103,15 @@ impl Emulator {
         reply.expect_ok(case, "UpdateIndexingConfiguration");
     }
 
-    /// `CreateDynamicThingGroup`: `POST /dynamic-thing-groups/{thingGroupName}`.
-    ///
-    /// A dynamic group is a view of the fleet index, so the index it queries has to exist
-    /// before one can be created: the setup brings it up with
-    /// `UpdateIndexingConfiguration` (`POST /indexing/config`), the way the other suites
-    /// of this crate that need a dynamic group do.
-    async fn create_dynamic_thing_group(&self, case: &str, group_name: &str) {
-        let indexed = self
-            .dispatch(
-                "POST",
-                "/indexing/config",
-                Some(&json!({
-                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
-                })),
-            )
-            .await;
-        indexed.expect_ok(case, "UpdateIndexingConfiguration");
+    /// `CreateDynamicThingGroup`: `POST /dynamic-thing-groups/{thingGroupName}`, over the
+    /// request body that records the query the group's membership is derived from — so a
+    /// case may record that query however it likes.
+    async fn create_dynamic_thing_group(&self, case: &str, group_name: &str, body: &Value) {
         let reply = self
             .dispatch(
                 "POST",
                 &format!("/dynamic-thing-groups/{group_name}"),
-                Some(&json!({ "queryString": "thingName:*" })),
+                Some(body),
             )
             .await;
         reply.expect_ok(case, "CreateDynamicThingGroup");
@@ -474,7 +461,26 @@ async fn a_group_target_whose_devices_are_unknown_is_refused() {
     // A dynamic group's members are the things its query selects, so the account's thing
     // index has to be on before one can be created at all.
     emulator.enable_thing_indexing("setup").await;
-    emulator.create_dynamic_thing_group("setup", "derived").await;
+    // Two dynamic groups, differing in HOW their query was recorded: one left to the
+    // defaults the create fills in, one naming the index and the query version itself.
+    // Either way the group's devices are the things its query selects.
+    emulator
+        .create_dynamic_thing_group("setup", "derived", &json!({ "queryString": "thingName:*" }))
+        .await;
+    emulator
+        .create_dynamic_thing_group(
+            "setup",
+            "derived-explicit",
+            // `indexName` is "Currently one index is supported: AWS_Things" and
+            // `queryVersion` "Currently one query version is supported: 2017-09-30"
+            // (smithy_query(query="operation",operation="CreateDynamicThingGroup")).
+            &json!({
+                "queryString": "attributes.site:north",
+                "indexName": "AWS_Things",
+                "queryVersion": "2017-09-30",
+            }),
+        )
+        .await;
 
     let gateway = thing_arn("gateway-0");
     emulator
@@ -494,6 +500,12 @@ async fn a_group_target_whose_devices_are_unknown_is_refused() {
         (
             "a dynamic group, whose devices are the things its query selects",
             "derived",
+            400,
+            "InvalidRequestException",
+        ),
+        (
+            "a dynamic group whose query names the index and version explicitly",
+            "derived-explicit",
             400,
             "InvalidRequestException",
         ),
