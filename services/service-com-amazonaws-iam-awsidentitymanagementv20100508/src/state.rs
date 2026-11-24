@@ -34,6 +34,7 @@ pub mod identity_provider_metadata;
 pub mod input_formats;
 pub mod member_forms;
 pub mod mfa_devices;
+pub mod open_id_connect_provider_urls;
 pub mod outbound_web_identity_federation;
 pub mod outbound_web_identity_keys;
 pub mod permissions_boundary;
@@ -74,6 +75,7 @@ pub use identity_provider_metadata::*;
 pub use input_formats::*;
 pub use member_forms::*;
 pub use mfa_devices::*;
+pub use open_id_connect_provider_urls::*;
 pub use outbound_web_identity_federation::*;
 pub use outbound_web_identity_keys::*;
 pub use permissions_boundary::*;
@@ -1374,6 +1376,17 @@ pub struct OpenIdConnectProviderRecord {
     /// the provider's ARN is built from, which is also the issuer form a client
     /// compares an OIDC token's `iss` claim against.
     pub url: String,
+    /// The `host[:port]` this emulator was reached at when the provider was registered
+    /// ([`published_endpoint_authority`]), and `None` for an emulator served on no port at
+    /// all.
+    ///
+    /// A read of the provider publishes its URL under this address where the issuer names a
+    /// host AWS itself serves ([`published_open_id_connect_url`]), because `Url` is an
+    /// address a relying party FETCHES. It is recorded once, by the create, rather than read
+    /// off each later request: the endpoint an in-process call reports and the one a served
+    /// request reports need not be the same string, and a provider must not publish a
+    /// different address on every read.
+    pub served_endpoint: Option<String>,
     /// "A list of client IDs (also known as audiences) that are associated with the
     /// specified IAM OIDC provider resource object"
     /// (`GetOpenIDConnectProvider$ClientIDList`), in the order they were registered.
@@ -2417,9 +2430,9 @@ pub fn insert_service_linked_role(
         create_date: now(),
         // The service that the role is linked to is the one that can assume it.
         assume_role_policy_document: Some(service_linked_role_trust_policy(service_principal)),
-        // The one spelling a record keeps for the absence of a description
-        // ([`held_description`]), so a create that supplied none and one that supplied no
-        // text leave the same record behind.
+        // The one reading a record keeps a description by ([`held_description`]): the text
+        // the create carried, the empty string included, and no description at all where it
+        // carried no member.
         description: held_description(description),
         max_session_duration: Some(DEFAULT_MAX_SESSION_DURATION_SECONDS),
         // A brand-new role carries neither a boundary nor tags, and has never been assumed,

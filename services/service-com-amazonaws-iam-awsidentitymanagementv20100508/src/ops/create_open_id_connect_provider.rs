@@ -409,6 +409,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn.clone(),
             crate::state::OpenIdConnectProviderRecord {
                 url,
+                // The address this emulator is reached at, recorded with the provider: a read
+                // publishes the issuer's path under it where the issuer names a host AWS
+                // itself serves, so the discovery document a relying party fetches next is
+                // one this emulator answers (`crate::state::published_open_id_connect_url`).
+                served_endpoint: crate::state::published_endpoint_authority(
+                    ctx.parts(),
+                    ctx.endpoint().as_str(),
+                ),
                 client_id_list,
                 thumbprint_list,
                 create_date: crate::state::now(),

@@ -240,10 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if let Some(description) = input.description {
-            // Replaced with what the request wrote, held in the one spelling a record keeps
-            // for a description carrying no text at all
-            // (`crate::state::held_description`): a write of the empty string leaves the
-            // role undescribed rather than described by nothing.
+            // Replaced with what the request wrote, held in the one reading a record keeps a
+            // description by (`crate::state::held_description`): the text as it stands, the
+            // empty string included, so a write that clears the description leaves the role
+            // described by that empty text and every later read reports it.
             role.description = crate::state::held_description(Some(description));
         }
         if let Some(max_session_duration) = input.max_session_duration {

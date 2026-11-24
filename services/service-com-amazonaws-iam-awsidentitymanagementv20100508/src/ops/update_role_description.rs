@@ -221,9 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The new description, held in the one spelling a record keeps for a description
-        // carrying no text at all (`crate::state::held_description`): a replacement by the
-        // empty string leaves the role undescribed, which is what every later read reports.
+        // The new description, held in the one reading a record keeps a description by
+        // (`crate::state::held_description`): the text the request wrote, the empty string
+        // included — a replacement by the empty string describes the role by that empty
+        // text, which is what this response and every later read report.
         role.description = crate::state::held_description(Some(input.description));
 
         Ok(UpdateRoleDescriptionOutput {

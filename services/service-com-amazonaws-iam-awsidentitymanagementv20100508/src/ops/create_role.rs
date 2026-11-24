@@ -426,10 +426,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             assume_role_policy_document: Some(crate::state::stored_trust_policy(
                 &input.assume_role_policy_document,
             )),
-            // A `Description` carrying no text is no description, so it is held as none —
-            // the one spelling a record keeps for its absence
-            // (`crate::state::held_description`) — and no reader of the role then reports
-            // the member at all.
+            // The description the request carried, held in the one reading a record keeps a
+            // description by (`crate::state::held_description`): the text as it was written,
+            // the empty string included, and no description at all for a create that carried
+            // no member — which is the only case a later read omits the member for.
             description: crate::state::held_description(input.description),
             // "If you do not specify a value for this setting, the default value of
             // one hour is applied."

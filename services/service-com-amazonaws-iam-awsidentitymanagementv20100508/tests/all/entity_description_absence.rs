@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a read reports for an entity DESCRIBED BY NOTHING, end to end over the awsQuery wire.
+//! What a read reports for the DESCRIPTION an entity holds, end to end over the awsQuery wire.
 //!
 //! RULE: a description is free text an account writes about one of its own entities, and the
 //! members carrying one are optional with a published length whose floor is zero
 //! (`Policy$Description` targets `policyDescriptionType` and `Role$Description`
-//! `roleDescriptionType`, both `@length(min 0)`) — so text that is not there is not a
-//! description: a request supplying the empty string describes the entity exactly as much as
-//! one supplying no member at all, and every read of the entity then omits the member rather
-//! than serializing it empty. It is the same answer whichever way the entity came to be
-//! undescribed: created without the member, created with no text, or updated to no text.
+//! `roleDescriptionType`, both `@length(min 0)`) — a floor of zero makes the empty string a
+//! legal VALUE of the member rather than a way of supplying none, so a request supplying the
+//! empty string describes the entity by that empty text and every read of the entity reports
+//! the member as empty. Only a request carrying no member at all leaves the entity
+//! undescribed, and only then does a read omit the member.
 //!
 //! Why the wire form matters: in the awsQuery/XML protocol an absent member and one
-//! serialized as `<Description></Description>` decode differently, so a client that reads
-//! presence as "this entity has a description", or round-trips a read into a create, must see
-//! the member only where there is text to report.
+//! serialized as `<Description></Description>` decode differently, so a client that reads a
+//! description back after CLEARING it — writing the empty string is what clears one — sees
+//! the empty text it wrote rather than a missing member to unwrap.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the entity
-//! kind (managed policy, role), how the entity came to be described by nothing (no member, the
-//! empty string at create, the empty string at update), the reader it is read back through
-//! (the entity's own read and the account-wide authorization report — a listing reports "a
-//! subset of the available attributes" and carries no description at all), the operation
-//! that wrote the description, and the texts that ARE descriptions — one character, a
-//! sentence, and blank characters, which are text.
+//! kind (managed policy, role), what the request supplied for the member (no member, the
+//! empty string, text), the reader it is read back through (the entity's own read and the
+//! account-wide authorization report — a listing reports "a subset of the available
+//! attributes" and carries no description at all), the operation that wrote the description,
+//! and the texts that are descriptions — one character, a sentence, and blank characters.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns; `optional` (a member
 //! asserted ABSENT) is `tests/all/role_lifecycle.rs`'s.
@@ -47,8 +46,8 @@ struct Described {
     reported: Option<&'static str>,
 }
 
-/// Rows spanning the ways an entity ends up described by nothing, and the texts that ARE
-/// descriptions.
+/// Rows spanning what a request supplies for the member: no member at all, the empty string,
+/// and the texts that are descriptions.
 const DESCRIBED: &[Described] = &[
     Described {
         case: "no Description member at all",
@@ -58,7 +57,7 @@ const DESCRIBED: &[Described] = &[
     Described {
         case: "the empty description",
         supplied: Some(""),
-        reported: None,
+        reported: Some(""),
     },
     Described {
         case: "a single character",
@@ -93,9 +92,10 @@ async fn served(
 }
 
 /// RULE for a managed policy: the create's own response and every reader of the record it
-/// persisted report the description only where the request carried text.
+/// persisted report the description the request supplied, and omit the member only where the
+/// request carried none.
 #[tokio::test]
-async fn a_policy_described_by_nothing_reports_no_description_member() {
+async fn a_policy_reports_the_description_the_request_supplied() {
     for row in DESCRIBED {
         // One account per row, holding exactly ONE policy, so a member a reader reports is
         // this policy's and no other entity's.
@@ -140,10 +140,10 @@ async fn a_policy_described_by_nothing_reports_no_description_member() {
     }
 }
 
-/// RULE for a role: the create's own response and `GetRole` report the description only where
-/// the request carried text.
+/// RULE for a role: the create's own response and `GetRole` report the description the
+/// request supplied, and omit the member only where the request carried none.
 #[tokio::test]
-async fn a_role_described_by_nothing_reports_no_description_member() {
+async fn a_role_reports_the_description_the_request_supplied() {
     let router = router();
 
     for (index, row) in DESCRIBED.iter().enumerate() {
@@ -180,12 +180,11 @@ async fn a_role_described_by_nothing_reports_no_description_member() {
     }
 }
 
-/// RULE through the two operations that REPLACE a role's description: a replacement carrying
-/// no text leaves the role described by nothing, and one carrying text describes it with
-/// exactly that text — whichever operation wrote it, and however the role was described
-/// before.
+/// RULE through the two operations that REPLACE a role's description: the replacement is
+/// reported back exactly as it was written, the empty string included — whichever operation
+/// wrote it, and however the role was described before.
 #[tokio::test]
-async fn a_replacement_carrying_no_text_leaves_the_role_described_by_nothing() {
+async fn a_replacement_is_reported_back_exactly_as_it_was_written() {
     let router = router();
 
     for update in ["UpdateRoleDescription", "UpdateRole"] {

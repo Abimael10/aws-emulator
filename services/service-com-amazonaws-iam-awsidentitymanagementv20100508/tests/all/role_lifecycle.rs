@@ -147,11 +147,10 @@ impl CreateCase {
     }
 
     /// The `Description` the response must report for this row: the text the request
-    /// carried, and NO member where it carried none or carried no text — a description
-    /// carrying no text is no description, which is the one state a record keeps for its
-    /// absence (`state::held_description`).
+    /// carried, the empty string included, and NO member only where it carried none — a
+    /// description is held exactly as it was supplied (`state::held_description`).
     fn reported_description(&self) -> Option<&'static str> {
-        self.description.filter(|text| !text.is_empty())
+        self.description
     }
 }
 
