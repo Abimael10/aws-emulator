@@ -60,7 +60,7 @@ use crate::ops::types::{TargetDescription, TargetHealth, TargetHealthDescription
 
 use super::{
     target_group_attribute, targets_per_target_group, GuardingGroups, RegisteredTarget,
-    TargetGroupRecord, TargetKey, SETTLE_AFTER,
+    TargetGroupRecord, TargetKey, LAMBDA_TARGET_TYPE, SETTLE_AFTER,
 };
 
 /// The target group attribute that holds how long a deregistering target drains, from
@@ -571,6 +571,39 @@ pub struct SchedulerRegistration {
     pub guarded_by: GuardingGroups,
 }
 
+/// The only Availability Zone a target of a `lambda` target group is in
+/// (`TargetDescription$AvailabilityZone`: "if the target type is `lambda`, this parameter is
+/// optional and the only supported value is `all`").
+///
+/// A Lambda function is invoked rather than reached at an address, so it sits in no one zone
+/// of the target group's network: it is reachable from the load balancer nodes of every
+/// enabled zone, which is what `all` means for this member ("an Availability Zone or `all`.
+/// This determines whether the target receives traffic from the load balancer nodes in the
+/// specified Availability Zone or from all enabled Availability Zones for the load
+/// balancer").
+pub const ALL_AVAILABILITY_ZONES: &str = "all";
+
+/// The Availability Zone a registration is STORED under, and therefore the one every read of
+/// it reports.
+///
+/// A target whose zone the group's network decides takes the zone that was resolved for it —
+/// "if the target type is `ip` and the IP address is in a subnet of the VPC for the target
+/// group, the Availability Zone is automatically detected" — else the zone the request named
+/// for it. A target of a `lambda` group is in NO such zone and has only one supported value
+/// for the member ([`ALL_AVAILABILITY_ZONES`]), so a registration of one carries that value
+/// whether or not the request named it: the member is not a caller-chosen setting there but
+/// the one fact the target type fixes.
+pub fn registered_availability_zone(
+    target_type: &str,
+    resolved: Option<String>,
+    declared: Option<&str>,
+) -> Option<String> {
+    if target_type == LAMBDA_TARGET_TYPE {
+        return Some(ALL_AVAILABILITY_ZONES.to_string());
+    }
+    resolved.or_else(|| declared.map(str::to_string))
+}
+
 impl RegisteredTarget {
     /// Whether the workload behind this registration answers on `port` \u2014 `None` when
     /// nothing declares which ports it serves ([`ServedPorts`]), which is no answer either
@@ -773,12 +806,21 @@ impl TargetGroupRecord {
         if self.targets.len() >= targets_per_target_group(self) {
             return false;
         }
+        // The zone this registration is stored under, read off the group before it is
+        // written to: a target type whose targets are in no one zone of the group's network
+        // carries the one value the member supports there
+        // ([`registered_availability_zone`]).
+        let availability_zone = registered_availability_zone(
+            &self.target_type,
+            declared.availability_zone.clone(),
+            None,
+        );
         self.targets.insert(
             key.clone(),
             RegisteredTarget {
                 id: key.0,
                 port: key.1,
-                availability_zone: declared.availability_zone.clone(),
+                availability_zone,
                 registered_at: now,
                 healthy_at: due_at(now, SETTLE_AFTER),
                 draining_until: None,

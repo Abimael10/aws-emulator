@@ -4,7 +4,9 @@
 //!
 //! Two kinds of identifier reach this API from a caller: the id of a target
 //! ([`check_target_id`]) and the ARN of a resource this API addresses
-//! ([`check_resource_arn`], [`check_arn_format`]). Both are judged on
+//! ([`check_resource_arn`], [`check_arn_format`]). A caller-supplied target also carries
+//! MEMBERS that only some kinds of target have at all ([`check_target_ports`]), read in the
+//! same place and for the same reason. All of them are judged on
 //! the value alone, so the judgement is the same whatever the store holds — and it is made
 //! ahead of the store, because the two answers are not interchangeable to a caller: a
 //! value that is not an identifier this API could ever address is a bad REQUEST
@@ -117,6 +119,41 @@ pub const INVALID_LAMBDA_FUNCTION_ARN_MESSAGE: &str = "Invalid Lambda function A
 /// address itself ([`network::parse_ip_target`]).
 const IP_TARGET_TYPE: &str = "ip";
 
+/// The sentence a target of a `lambda` target group that names a `Port` is refused with.
+///
+/// Recorded behaviour, and ENTIRELY fixed text: Elastic Load Balancing states which member
+/// does not apply and to which kind of target, and quotes neither the port nor the function
+/// the request carried.
+pub const PORT_NOT_FOR_LAMBDA_TARGET_MESSAGE: &str =
+    "Port cannot be specified for Lambda function targets";
+
+/// Whether the `Port` every target of a request names is a member a target of a
+/// `target_type` target group HAS, and — when it is not — the rule it broke.
+///
+/// `TargetDescription$Port` is "the port on which the target is listening ... this parameter
+/// is not used if the target is a Lambda function": a Lambda function is invoked rather than
+/// connected to, so it listens on no port and a target of a `lambda` group names none. A
+/// request that names one anyway is asking for something this kind of group cannot carry, so
+/// it is the request that has to be fixed — this service's `ValidationError`, under the fixed
+/// sentence [`PORT_NOT_FOR_LAMBDA_TARGET_MESSAGE`] — rather than a port silently carried into
+/// the group. Every other target type takes the member, so none is judged here.
+///
+/// Read for every operation that takes a `Targets` list, and for the WHOLE list before
+/// anything is done with any of it, so a refused call leaves the target group exactly as it
+/// was: the member applies to the kind of group or it does not, which does not depend on what
+/// is being asked of it.
+pub fn check_target_ports(
+    target_type: &str,
+    targets: &[crate::ops::types::TargetDescription],
+) -> Result<(), String> {
+    if target_type == LAMBDA_TARGET_TYPE
+        && targets.iter().any(|target| target.port.is_some())
+    {
+        return Err(PORT_NOT_FOR_LAMBDA_TARGET_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
 /// Whether every target of a request is written the way a target of a `target_type` target
 /// group is written, answering the ADDRESS each `ip` target names.
 ///
@@ -127,6 +164,10 @@ const IP_TARGET_TYPE: &str = "ip";
 /// to add, so it is refused rather than treated as the no-op a well-formed target that was
 /// never registered earns.
 ///
+/// Which MEMBERS a target of this kind of group has is read first
+/// ([`check_target_ports`]): a request naming a member the kind of group does not have at
+/// all is refused before the value of any id it carries is judged.
+///
 /// The whole list is judged before anything is done with any of it, so a refusal leaves the
 /// target group exactly as it was.
 pub fn check_target_forms(
@@ -134,6 +175,7 @@ pub fn check_target_forms(
     ip_address_type: Option<&str>,
     targets: &[crate::ops::types::TargetDescription],
 ) -> Result<Vec<std::net::IpAddr>, String> {
+    check_target_ports(target_type, targets)?;
     let mut addresses = Vec::with_capacity(targets.len());
     for target in targets {
         check_target_id(target_type, &target.id)?;

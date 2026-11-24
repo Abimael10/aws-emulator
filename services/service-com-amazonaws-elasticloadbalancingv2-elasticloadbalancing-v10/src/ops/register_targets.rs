@@ -260,8 +260,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The zone the address resolved to, else what the request named:
                     // "if the target type is ip and the IP address is in a subnet of the
                     // VPC for the target group, the Availability Zone is automatically
-                    // detected".
-                    availability_zone: zone.or_else(|| target.availability_zone.clone()),
+                    // detected" — and, for a target type whose targets are in no one zone
+                    // of the group's network, the one value the member supports there
+                    // ([`crate::state::registered_availability_zone`]).
+                    availability_zone: crate::state::registered_availability_zone(
+                        &target_type,
+                        zone,
+                        target.availability_zone.as_deref(),
+                    ),
                     registered_at: now,
                     healthy_at: now + crate::state::SETTLE_AFTER,
                     // A registration replaces whatever this key held, so registering a

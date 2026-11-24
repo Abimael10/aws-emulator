@@ -99,8 +99,9 @@ pub use source_ip_conditions::{
 pub mod target_health;
 
 pub use target_health::{
-    deregistration_delay, health_check_interval, health_check_timeout, SchedulerRegistration,
-    ServedPorts, TargetProbe, DEREGISTRATION_DELAY_ATTRIBUTE,
+    deregistration_delay, health_check_interval, health_check_timeout,
+    registered_availability_zone, SchedulerRegistration, ServedPorts, TargetProbe,
+    ALL_AVAILABILITY_ZONES, DEREGISTRATION_DELAY_ATTRIBUTE,
 };
 
 /// Whether the security groups of a target's own network interface let a health check of it
@@ -255,9 +256,10 @@ pub mod identifier_syntax;
 
 pub use identifier_syntax::{
     arn_format_message, check_arn_format, check_resource_arn, check_target_forms,
-    check_target_group_name, check_target_group_name_as, check_target_id, invalid_arn_message,
-    invalid_instance_id_message, invalid_instance_targets_message, is_resource_arn,
-    targets_not_in_target_group_vpc_message, ArnKind, INVALID_LAMBDA_FUNCTION_ARN_MESSAGE,
+    check_target_group_name, check_target_group_name_as, check_target_id, check_target_ports,
+    invalid_arn_message, invalid_instance_id_message, invalid_instance_targets_message,
+    is_resource_arn, targets_not_in_target_group_vpc_message, ArnKind,
+    INVALID_LAMBDA_FUNCTION_ARN_MESSAGE, PORT_NOT_FOR_LAMBDA_TARGET_MESSAGE,
     SELECTED_TARGET_GROUP_NAME_SUBJECT, TARGET_GROUP_NAME_SUBJECT,
 };
 

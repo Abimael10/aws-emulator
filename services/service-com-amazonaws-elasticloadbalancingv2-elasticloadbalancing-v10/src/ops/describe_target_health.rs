@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Which MEMBERS a target of this kind of group has, judged BEFORE anything is
+        // reported: a `Port` on a target of a `lambda` group names a member such a target
+        // does not have, so the request is refused rather than answered for a registration
+        // key no such target could ever have been stored under — the same rule, read in the
+        // same place, that `RegisterTargets` and `DeregisterTargets` apply to the targets
+        // they add and remove ([`crate::state::check_target_ports`]).
+        if let Some(targets) = input.targets.as_deref() {
+            crate::state::check_target_ports(&group.target_type, targets)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
         // What the CLOCK already owes this group: a registration whose draining span is
         // over left the target group at the instant the deregistration delay ran out,
         // whether or not anything called then. This is the only thing a health read
