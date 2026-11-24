@@ -312,15 +312,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An `@idempotencyToken` retry returns the first call's result and has no
         // further effect, rather than creating a second cluster or conflicting on the
-        // name that call took. The remembered entry is never overwritten, so the token
-        // names the FIRST call's cluster for as long as it is remembered.
-        let remembered = state
-            .remembered_create(Self::NAME, input.client_token.as_ref())
-            .map(|remembered| remembered.resource_id.clone());
-        if let Some(first) = remembered.as_deref().and_then(|id| state.clusters.get(id)) {
-            return Ok(CreateClusterOutput {
-                cluster: Some(first.to_api()),
-            });
+        // name that call took. What the token is remembered with is the resource the
+        // first call MINTED — the `clusterName` it created the cluster under — so only a
+        // request asking for that same cluster is that retry: one naming another cluster
+        // conflicts rather than being answered with the first call's cluster while
+        // creating nothing. The remembered entry is never overwritten, so the token names
+        // the FIRST call's cluster for as long as it is remembered.
+        match state.remembered_create_retry(
+            Self::NAME,
+            input.client_token.as_ref(),
+            None,
+            &input.cluster_name,
+        ) {
+            Some(crate::state::RememberedCreateRetry::Replay(resource_id)) => {
+                if let Some(first) = state.clusters.get(&resource_id) {
+                    return Ok(CreateClusterOutput {
+                        cluster: Some(first.to_api()),
+                    });
+                }
+            }
+            Some(crate::state::RememberedCreateRetry::Conflict(remembered)) => {
+                return Err(CreateClusterErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "create",
+                        crate::state::CLUSTER,
+                        &remembered.resource_id,
+                    ),
+                )
+                .into());
+            }
+            None => {}
         }
 
         // A name another cluster already holds is a conflict. The message is the
@@ -371,7 +392,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cluster_ids_by_name
             .insert(record.name.clone(), id.clone());
         state.clusters.insert(id.clone(), record);
-        state.remember_create(Self::NAME, input.client_token.as_ref(), None, &id);
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            None,
+            &id,
+            &input.cluster_name,
+        );
 
         // Answered from the STORED record, so a create and a later read cannot differ.
         let Some(stored) = state.clusters.get(&id) else {

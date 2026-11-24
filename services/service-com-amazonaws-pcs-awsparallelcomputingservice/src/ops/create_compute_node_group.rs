@@ -366,37 +366,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // An `@idempotencyToken` retry returns the first call's result and has no
-        // further effect. The token is remembered with the cluster the first call
-        // created the group in, so a retry naming a DIFFERENT cluster cannot slip past
-        // the replay and create a second group: it conflicts.
-        if let Some(remembered) = state
-            .remembered_create(Self::NAME, input.client_token.as_ref())
-            .cloned()
-        {
-            let first = (remembered.cluster_id.as_deref() == Some(cluster_id.as_str()))
-                .then(|| {
-                    state
-                        .clusters
-                        .get(&cluster_id)
-                        .and_then(|cluster| cluster.compute_node_groups.get(&remembered.resource_id))
-                })
-                .flatten();
-            let Some(first) = first else {
-                return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "clientToken was already used to create compute node group {}",
-                            remembered.resource_id
+        // further effect. What the token is remembered with is the resource the first
+        // call MINTED — the cluster and the `computeNodeGroupName` it created the group
+        // under — so only a request asking for that same group is that retry: one naming
+        // a different cluster, or a different group in the same cluster, conflicts
+        // rather than being answered with the first call's group while creating nothing.
+        match state.remembered_create_retry(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &input.compute_node_group_name,
+        ) {
+            Some(crate::state::RememberedCreateRetry::Replay(resource_id)) => {
+                let Some(first) = state
+                    .clusters
+                    .get(&cluster_id)
+                    .and_then(|cluster| cluster.compute_node_groups.get(&resource_id))
+                else {
+                    return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
+                        crate::state::client_token_conflict(
+                            "create",
+                            crate::state::COMPUTE_NODE_GROUP,
+                            &resource_id,
                         ),
-                        resource_id: remembered.resource_id,
-                        resource_type: "computenodegroup".to_string(),
-                    },
+                    )
+                    .into());
+                };
+                return Ok(CreateComputeNodeGroupOutput {
+                    compute_node_group: Some(first.to_api()),
+                });
+            }
+            Some(crate::state::RememberedCreateRetry::Conflict(remembered)) => {
+                return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "create",
+                        crate::state::COMPUTE_NODE_GROUP,
+                        &remembered.resource_id,
+                    ),
                 )
                 .into());
-            };
-            return Ok(CreateComputeNodeGroupOutput {
-                compute_node_group: Some(first.to_api()),
-            });
+            }
+            None => {}
         }
 
         let Some(cluster) = state.clusters.get(&cluster_id) else {
@@ -464,7 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             seq,
             arn: crate::state::compute_node_group_arn(&region, &cluster.id, &id),
             id: id.clone(),
-            name: input.compute_node_group_name,
+            name: input.compute_node_group_name.clone(),
             cluster_id: cluster.id.clone(),
             status: crate::state::STATUS_CREATING.to_string(),
             created_at: now,
@@ -489,6 +499,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.client_token.as_ref(),
             Some(&cluster_id),
             &id,
+            &input.compute_node_group_name,
         );
 
         // Answered from the STORED record, so a create and a later read cannot differ.

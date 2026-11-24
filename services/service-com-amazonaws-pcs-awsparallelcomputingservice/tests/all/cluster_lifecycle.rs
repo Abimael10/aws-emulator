@@ -25,6 +25,10 @@ mod settles_on_the_next_request;
 #[path = "cluster_lifecycle/queue_associations.rs"]
 mod queue_associations;
 
+// What a reused `clientToken` on a CREATE answers is its own suite, declared the same way.
+#[path = "cluster_lifecycle/idempotent_create_retry.rs"]
+mod idempotent_create_retry;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{

@@ -687,11 +687,12 @@ pub struct RememberedCreate {
     pub cluster_id: Option<String>,
     /// The id of the resource the first call acted on.
     pub resource_id: String,
-    /// The name that resource was known by, recorded only where the record itself does
-    /// not outlive the call — a DELETE: a retry may address the resource by EITHER form
-    /// its `*Identifier` allows, and neither form can be resolved against a record the
-    /// service no longer holds. `None` where the resource is still stored, because there
-    /// the identifier resolves against the record itself.
+    /// The name that resource was known by, so a retry can be told apart from a request
+    /// that merely reuses the token: a CREATE mints its resource, so the name its
+    /// `@required` `*Name` member asks for is what says whether the retry is the first
+    /// call again, and a DELETE outlives its record, so the name is the other form its
+    /// `*Identifier` may address the resource by once there is nothing left to resolve it
+    /// against. `None` only for an entry remembered without one.
     pub resource_name: Option<String>,
 }
 
@@ -701,6 +702,18 @@ impl RememberedCreate {
     fn names(&self, identifier: &str) -> bool {
         self.resource_id == identifier || self.resource_name.as_deref() == Some(identifier)
     }
+}
+
+/// How a retry that presents an `@idempotencyToken` a previous CREATE used must be
+/// answered.
+#[derive(Debug)]
+pub enum RememberedCreateRetry {
+    /// The retry asks for the SAME resource that create minted, so it replays the first
+    /// call's success and has no further effect: the id of the record to answer from.
+    Replay(String),
+    /// The token already created ANOTHER resource, so the retry is not that request: it
+    /// carries what the token was used for, for the refusal to name.
+    Conflict(RememberedCreate),
 }
 
 /// How a retry that presents an `@idempotencyToken` a previous DELETE used must be
@@ -827,7 +840,10 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         self.client_tokens.get(&client_token_key(operation, token?))
     }
 
-    /// Remember what `operation` with `token` created, so a retry replays it.
+    /// Remember what `operation` with `token` created — the resource's id and the
+    /// `resource_name` the call asked for — so a retry asking for that same resource
+    /// replays it ([`Self::remembered_create_retry`]) and a request that merely reuses
+    /// the token does not.
     ///
     /// An existing entry is never overwritten — the token names the FIRST call's
     /// resource for as long as it is remembered — and the index is kept at
@@ -838,6 +854,7 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
         token: Option<&String>,
         cluster_id: Option<&str>,
         resource_id: &str,
+        resource_name: &str,
     ) {
         self.remember(
             operation,
@@ -845,9 +862,35 @@ impl ComAmazonawsPcsAwsparallelcomputingserviceState {
             RememberedCreate {
                 cluster_id: cluster_id.map(str::to_string),
                 resource_id: resource_id.to_string(),
-                resource_name: None,
+                resource_name: Some(resource_name.to_string()),
             },
         );
+    }
+
+    /// How a retry of the CREATE `operation` presenting `token`, asking for a resource
+    /// named `resource_name` inside `cluster_id`, must be answered — or `None` when no
+    /// call of that operation has used the token (the request is not a retry, so it is a
+    /// create of its own).
+    ///
+    /// A create mints its resource, so the only thing that says whether a retry is the
+    /// first call again is WHAT it asks for: the same resource — the same name, in the
+    /// same cluster — replays that call's result, and anything else is a different
+    /// request that happens to carry a used token, which conflicts rather than being
+    /// answered with the first call's resource.
+    pub fn remembered_create_retry(
+        &self,
+        operation: &str,
+        token: Option<&String>,
+        cluster_id: Option<&str>,
+        resource_name: &str,
+    ) -> Option<RememberedCreateRetry> {
+        let remembered = self.remembered_create(operation, token)?;
+        if remembered.cluster_id.as_deref() == cluster_id
+            && remembered.resource_name.as_deref() == Some(resource_name)
+        {
+            return Some(RememberedCreateRetry::Replay(remembered.resource_id.clone()));
+        }
+        Some(RememberedCreateRetry::Conflict(remembered.clone()))
     }
 
     /// Remember that `operation` with `token` DELETED the resource `resource_id`, known as
@@ -1324,6 +1367,27 @@ pub fn not_active(kind: ResourceKind, resource_id: &str) -> ConflictException {
     }
     ConflictException {
         message: format!("A {} isn't in {STATUS_ACTIVE} status.", kind.noun),
+        resource_id: resource_id.to_string(),
+        resource_type: kind.resource_type.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` (HTTP 409) for a request whose `@idempotencyToken` a
+/// previous call of the same operation already used for ANOTHER resource, so the request
+/// is not a retry of that call: `verb` is what the operation does ("create", "update",
+/// "delete"), and `resource_id` the resource the token was used for, which the refusal
+/// names both in the sentence and in `resourceId` so the caller can tell the two requests
+/// apart.
+pub fn client_token_conflict(
+    verb: &str,
+    kind: ResourceKind,
+    resource_id: &str,
+) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "clientToken was already used to {verb} {} {resource_id}",
+            kind.noun
+        ),
         resource_id: resource_id.to_string(),
         resource_type: kind.resource_type.to_string(),
     }

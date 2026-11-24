@@ -358,14 +358,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 || remembered.resource_id != group_id
             {
                 return Err(UpdateComputeNodeGroupErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "clientToken was already used to update compute node group {}",
-                            remembered.resource_id
-                        ),
-                        resource_id: remembered.resource_id,
-                        resource_type: crate::state::COMPUTE_NODE_GROUP.resource_type.to_string(),
-                    },
+                    crate::state::client_token_conflict(
+                        "update",
+                        crate::state::COMPUTE_NODE_GROUP,
+                        &remembered.resource_id,
+                    ),
                 )
                 .into());
             }
@@ -464,11 +461,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Answered from the STORED record, so the update and a later read cannot differ.
         let updated = group.to_api();
+        let group_name = group.name.clone();
         state.remember_create(
             Self::NAME,
             input.client_token.as_ref(),
             Some(&cluster_id),
             &group_id,
+            &group_name,
         );
 
         Ok(UpdateComputeNodeGroupOutput {

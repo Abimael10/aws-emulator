@@ -231,14 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             Some(crate::state::RememberedDelete::Replay) => return Ok(DeleteQueueOutput {}),
             Some(crate::state::RememberedDelete::Conflict(remembered)) => {
-                return Err(DeleteQueueErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "clientToken was already used to delete queue {}",
-                        remembered.resource_id
+                return Err(DeleteQueueErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "delete",
+                        crate::state::QUEUE,
+                        &remembered.resource_id,
                     ),
-                    resource_id: remembered.resource_id,
-                    resource_type: crate::state::QUEUE.resource_type.to_string(),
-                })
+                )
                 .into());
             }
             None => {}
