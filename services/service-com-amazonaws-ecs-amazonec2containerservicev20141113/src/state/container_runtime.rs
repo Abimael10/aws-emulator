@@ -409,12 +409,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // image" that same member's own documentation names
                 // ([`super::container_servers::image_declared_command`]). An image this
                 // emulator holds none of leaves such a container no program at all, exactly as
-                // it did before.
-                // A container whose revision overrides NEITHER the entry point nor the command
-                // runs the command its IMAGE declares — the "default command from the Docker
-                // image" that same member's own documentation names
-                // ([`super::container_servers::image_declared_command`]). An image this
-                // emulator holds none of leaves such a container no program at all, exactly as
                 // it did before. WHICH image that is comes off the container
                 // ([`ContainerRecord::running_image`]): a reference into a repository that
                 // caches an upstream image names that upstream image, so what the image

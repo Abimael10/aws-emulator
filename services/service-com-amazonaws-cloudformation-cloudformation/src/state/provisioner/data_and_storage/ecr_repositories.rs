@@ -208,6 +208,10 @@ fn lifecycle_policy_request(
 }
 
 /// One Amazon ECR call, over the awsJson1.1 wire that registry speaks.
+///
+/// The ONE wrapper of that wire this catalogue keeps: the sibling arms of the same registry
+/// make their calls through it too, so one spelling of the signing name, the protocol and the
+/// target prefix serves every one of them.
 pub(super) async fn call_ecr(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,

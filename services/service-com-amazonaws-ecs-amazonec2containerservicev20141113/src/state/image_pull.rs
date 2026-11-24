@@ -1192,6 +1192,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// resolved it to: `Container$imageDigest` is "The container image manifest digest",
     /// which is known from the pull on — and stays absent for an image no registry here
     /// resolved, because no manifest of it was fetched to digest.
+    ///
+    /// Each container whose image a repository that CACHES one served records the upstream
+    /// reference the pull resolved ([`ContainerRecord::cached_image_source`]), which is the
+    /// image the container really runs.
     pub fn record_image_pulls(&mut self, verdicts: &[ImagePullVerdict], now: SystemTime) {
         let at = reported_instant(now);
         for verdict in verdicts {
