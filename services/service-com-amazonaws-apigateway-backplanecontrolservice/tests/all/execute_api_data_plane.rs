@@ -57,6 +57,12 @@ mod stated_request_identity;
 #[path = "execute_api_data_plane/response_override_status_type.rs"]
 mod response_override_status_type;
 
+/// That each MEMBER one response template's override object states is applied on its own type
+/// — a discarded status leaving the headers stated beside it untouched — in its own file beside
+/// this one, declared as the siblings above are.
+#[path = "execute_api_data_plane/override_member_independence.rs"]
+mod override_member_independence;
+
 /// WHICH INVOCATION of its Lambda function a method's integration makes — the `InvocationType`
 /// its `requestParameters` map onto the integration request — and what the caller is served
 /// for one made for no answer, in its own file beside this one, declared as the siblings above

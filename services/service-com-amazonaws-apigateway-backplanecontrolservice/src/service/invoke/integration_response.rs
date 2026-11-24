@@ -245,7 +245,9 @@ fn rendered(
 ///
 /// An override of the status is what lets one integration response answer a call with a status
 /// of its own — a backend's `200` served as a `400`, say — so it has the last word over the
-/// code the selected integration response is keyed by. A value that is no HTTP status is a
+/// code the selected integration response is keyed by. Only an INTEGER the template stated
+/// reaches here, since a value of any other type states no status at all
+/// ([`mapping_template::Overrides::status`]); an integer that is no HTTP status is a
 /// configuration error of the template rather than a response sent with a status nothing
 /// names.
 fn overridden_status(

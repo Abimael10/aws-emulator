@@ -139,9 +139,10 @@ pub struct Overrides {
     pub path: BTreeMap<String, String>,
     /// The status the response is to be sent with, as the template stated it.
     ///
-    /// A status is a NUMBER, where a parameter carries text: an override assigned a value of
-    /// any other type states no status, so this stays `None` and the response is sent with
-    /// the status its integration response declares.
+    /// A status is an INTEGER, where a parameter carries text: an override assigned a value of
+    /// any other type — a string that spells a status number and a number that is not integral
+    /// among them — states no status, so this stays `None` and the response is sent with the
+    /// status its integration response declares.
     pub status: Option<String>,
 }
 
@@ -417,17 +418,20 @@ impl Render<'_> {
             // building, so what is kept is the TEXT the expression comes to — the same text a
             // reference to that expression would render ([`Render::written`]), since a
             // parameter carries text and nothing else. The one member that is NOT a parameter
-            // is the response's status, which is a number ([`Overrides::status`]).
+            // is the response's status, which is an integer ([`Overrides::status`]).
             Directive::Override(overriding) => {
                 if inside {
                     let stated = self.value_of(&overriding.value, 0)?;
-                    // The STATUS a response is sent with is a NUMBER, where every other
+                    // The STATUS a response is sent with is an INTEGER, where every other
                     // parameter an override names carries text: a value of any other type
                     // states no status at all — a quoted literal that happens to spell a
-                    // status number included — so the response is sent with the status its
-                    // integration response declares, and the directive states nothing.
+                    // status number, and a number that is not integral, included — so the
+                    // response is sent with the status its integration response declares, and
+                    // the directive states nothing. Each member of the override object is
+                    // stated on its own, so a status discarded here leaves every parameter the
+                    // same template states untouched.
                     if overriding.target == directives::OverrideTarget::Status
-                        && !stated.is_number()
+                        && stated.as_i64().is_none()
                     {
                         return Ok(());
                     }
@@ -2175,7 +2179,8 @@ mod tests {
     /// RULE: an override directive states the parameter it names, with the value its
     /// expression comes to, renders nothing itself, and keeps the FIRST value stated for a
     /// parameter it names twice. The response's STATUS is the one member it states that takes
-    /// a number: an expression coming to a value of any other type states no status at all.
+    /// an integer: an expression coming to a value of any other type states no status at all,
+    /// and states nothing about the other members the same template names.
     #[test]
     fn an_override_states_the_parameter_it_names() {
         /// (case, the template, the text it renders to, the parameters it stated as
@@ -2223,6 +2228,20 @@ mod tests {
                 "#set($context.responseOverride.status = $input.params('tenant'))",
                 "",
                 &[],
+            ),
+            (
+                "a number that is not integral, which is no integer and states no status",
+                "#set($context.responseOverride.status = 201.5)",
+                "",
+                &[],
+            ),
+            (
+                "a status discarded for its type beside a header of the same side, which is \
+                 stated all the same",
+                "#set($context.responseOverride.status = \"201\")\
+                 #set($context.responseOverride.header.x-overridden = 'applied')",
+                "",
+                &["response header x-overridden=applied"],
             ),
             (
                 "a header whose value is a quoted number, which a parameter carries as text",
