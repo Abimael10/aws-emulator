@@ -318,7 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is told is what a later reader of the gateway will see for them.
         Ok(UnassignPrivateNatGatewayAddressOutput {
             nat_gateway_id: answered_id,
-            nat_gateway_addresses: Some(unassigning),
+            nat_gateway_addresses: Some(crate::state::reported_nat_gateway_addresses(
+                &unassigning,
+            )),
         })
     }
 }

@@ -1986,7 +1986,7 @@ use crate::ops::types::{
     IpPermission, IpRange, Ipv6Range,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, MacModificationTask, MacSystemIntegrityProtectionConfiguration,
-    Monitoring, NatGateway, NetworkInsightsAccessScope,
+    Monitoring, NatGateway, NatGatewayAddress, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, NetworkInsightsAnalysis, NetworkInsightsPath,
     NetworkInterface, NetworkInterfacePermission,
     NetworkInterfacePermissionState, NetworkInterfaceIpv6Address, Ipv6PrefixSpecification,

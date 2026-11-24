@@ -1129,6 +1129,80 @@ pub fn nat_gateway_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E
 /// ([`ComAmazonawsEc2Amazonec2State::nat_gateway_eip_count`]).
 pub const MAX_EIPS_PER_PUBLIC_NAT_GATEWAY: usize = 2;
 
+/// One `NatGatewayAddress` as a REPORT of it renders: the stored record, with the
+/// Availability Zone members reported only for an address that associates an Elastic IP
+/// address.
+///
+/// "The Availability Zone where this Elastic IP address (EIP) is being used to handle outbound
+/// NAT traffic" (`NatGatewayAddress$AvailabilityZone`) and "the ID of the Availability Zone
+/// where this Elastic IP address (EIP) is being used" (`$AvailabilityZoneId`) are facts of the
+/// ELASTIC IP ADDRESS, not of the gateway or of its subnet:
+///
+/// ```text
+/// smithy_query(query="shape",shape="NatGatewayAddress",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// So an address that associates NO Elastic IP address reports neither member — there is no
+/// EIP being used in a zone to report one for — exactly as the EIP's own `allocationId`,
+/// `associationId` and `publicIp` are left out for it ("[Public NAT gateway only]", each of
+/// those three members' own doc). That covers every address of a private NAT gateway, a
+/// private address assigned to a gateway beside its Elastic IP ones, and an address whose
+/// Elastic IP has been released. Reporting a zone for one of them would say the gateway is
+/// handling outbound NAT traffic from an EIP pinned to that zone, which is the opposite of
+/// what a private gateway does.
+///
+/// A projection of the record rather than a rule applied at each write, so the member cannot
+/// outlive the Elastic IP it describes: a gateway whose addresses have given their Elastic IPs
+/// up ([`crate::ops::delete_nat_gateway`]) reports no zone for them either.
+pub fn reported_nat_gateway_address(address: &NatGatewayAddress) -> NatGatewayAddress {
+    // "[Public NAT gateway only] The allocation ID of the Elastic IP address that's associated
+    // with the NAT gateway" (`NatGatewayAddress$AllocationId`) is what says this address HAS
+    // an Elastic IP address: it is the id of that address.
+    let associates_elastic_ip = address.allocation_id.is_some();
+    NatGatewayAddress {
+        availability_zone: address
+            .availability_zone
+            .clone()
+            .filter(|_| associates_elastic_ip),
+        availability_zone_id: address
+            .availability_zone_id
+            .clone()
+            .filter(|_| associates_elastic_ip),
+        ..address.clone()
+    }
+}
+
+/// Every address of `addresses` as a report renders it
+/// ([`reported_nat_gateway_address`]) — the one projection every operation that answers a
+/// NAT gateway's addresses hands its list through, so the six of them cannot disagree about
+/// what an address reports.
+pub fn reported_nat_gateway_addresses(addresses: &[NatGatewayAddress]) -> Vec<NatGatewayAddress> {
+    addresses.iter().map(reported_nat_gateway_address).collect()
+}
+
+/// The `NatGateway` a report RENDERS for the stored `gateway`: the record as it stands, with
+/// the appliance list this service always knows the contents of reported as a list, and each
+/// address projected by [`reported_nat_gateway_address`].
+///
+/// "The proxy appliances attached to the NAT Gateway for filtering and inspecting traffic"
+/// (`NatGateway$AttachedAppliances`, the `attachedApplianceSet` of
+/// `NatGatewayAttachedApplianceList`) is a fact this service always has in full: a gateway
+/// either holds appliances or holds none. So a gateway with none is reported with an EMPTY
+/// list rather than with the member left out — an absent member says the appliances were not
+/// reported, which is a different answer from "none are attached", and a reader deciding
+/// whether traffic is being inspected cannot act on the first. The same thing a report
+/// already does for the tags of a gateway that carries none.
+pub fn reported_nat_gateway(gateway: &NatGateway) -> NatGateway {
+    NatGateway {
+        attached_appliances: Some(gateway.attached_appliances.clone().unwrap_or_default()),
+        nat_gateway_addresses: gateway
+            .nat_gateway_addresses
+            .as_deref()
+            .map(reported_nat_gateway_addresses),
+        ..gateway.clone()
+    }
+}
+
 /// The move the clock owes one NAT gateway address: which gateway holds it, the terminal
 /// `NatGatewayAddressStatus` it is going to, and when that falls due.
 ///

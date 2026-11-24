@@ -413,7 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader of the gateway will see for them.
         Ok(AssignPrivateNatGatewayAddressOutput {
             nat_gateway_id: answered_id,
-            nat_gateway_addresses: Some(assigned),
+            nat_gateway_addresses: Some(crate::state::reported_nat_gateway_addresses(&assigned)),
         })
     }
 }

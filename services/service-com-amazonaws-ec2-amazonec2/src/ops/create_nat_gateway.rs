@@ -361,7 +361,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             if let Some(nat_gateway_id) = store.nat_gateway_client_tokens.get(token).cloned() {
-                let gateway = store.nat_gateways.get(&nat_gateway_id).cloned();
+                let gateway = store
+                    .nat_gateways
+                    .get(&nat_gateway_id)
+                    .map(crate::state::reported_nat_gateway);
                 return Ok(CreateNatGatewayOutput {
                     client_token: client_token.clone(),
                     nat_gateway: gateway,
@@ -618,7 +621,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::drive_nat_gateway_metrics(&self.engine);
         Ok(CreateNatGatewayOutput {
             client_token,
-            nat_gateway: Some(stored),
+            nat_gateway: Some(crate::state::reported_nat_gateway(&stored)),
         })
     }
 }

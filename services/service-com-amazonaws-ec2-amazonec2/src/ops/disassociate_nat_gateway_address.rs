@@ -343,7 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DisassociateNatGatewayAddressOutput {
             nat_gateway_id: answered_id,
-            nat_gateway_addresses: Some(answered),
+            nat_gateway_addresses: Some(crate::state::reported_nat_gateway_addresses(&answered)),
         })
     }
 }
