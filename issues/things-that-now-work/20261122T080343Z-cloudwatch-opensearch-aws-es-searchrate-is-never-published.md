@@ -43,3 +43,29 @@ Actual: the windowed Sum stays below 20 for the whole 302.9 s of polling — no 
 3. Issue 20 signed POST <endpoint>/<index>/_search requests (term query matching all 25 docs); each answers HTTP 200 with hits.total {value: 25, relation: 'eq'}.
 4. cloudwatch GetMetricData with MetricStat {Metric {Namespace 'AWS/ES', MetricName 'SearchRate', Dimensions [{Name 'ClientId', Value <account>}, {Name 'DomainName', Value <domain>}]}, Period 60, Stat 'Sum'}, ScanBy TimestampAscending, over the minute the searches began through two minutes past the minute they ended.
 5. Expect the per-minute Sums to total at least 20; observe no datapoints accounting for the searches for 300 s of polling.
+
+## Resolution
+The check's unit replays green end to end (`replay_issue_units`: verdict `passed`, this report's
+`Issue-Key` state `fixed`).
+
+The emitter this report asks for is in place: `src/state/search_rate.rs` of the opensearch crate
+counts the searches a data-plane request had the cluster execute into the domain's `SearchRate`
+series of `AWS/ES`, written through the one `publish_readings` seam the namespace's gauge series use
+(`src/state/cluster_metrics.rs`), under the `{ClientId, DomainName}` dimension set and at the
+namespace's one-minute storage resolution. The count is taken by the step that served the query
+(`record_searched` in `src/service/domain_rest.rs`, and the by-query delete in
+`src/service/domain_rest/delete_by_query.rs`) and published once this service's store is released
+(`domain_rest.rs`, the `publish_searches` call after the answer is composed). It landed with the
+closing commit of the sibling report
+`issues/things-that-now-work/20261111T120957Z-cloudwatch-opensearch-the-aws-es-metric-catalogue-never.md`,
+which names this report as the leg it was serving, so no behaviour had to change here.
+
+What the closing commit of THIS report adds is the reading this report states its expectation in,
+pinned as a test: `tests/all/search_rate_window.rs` drives a table of clusters over their own REST
+data plane and asserts, through CloudWatch's own `GetMetricData`, that the per-minute `Sum`s over
+the window from the minute the requests began through two minutes past the minute they ended total
+the number of searches the cluster executed — over the routes that execute one (a `_search`, and
+both forms of a `_delete_by_query`), over the counts a window can carry (none, one, two, the twenty
+of the recorded case), and at both periods a reader folds the series into. The sibling suite
+`tests/all/search_rate.rs` keeps asserting the same rule over the forms a `_search` and a `_count`
+arrive in and over the requests the cluster refuses.
