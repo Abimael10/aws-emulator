@@ -221,16 +221,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // relevant PromptVariant object", so a default variant naming none of the
         // variants the request carries is a bad request rather than a prompt to store.
         // It constrains the request alone, so it is answered before the prompt the
-        // request addressed is resolved.
+        // request addressed is resolved. The rule relates two input members, so the
+        // refusal states it as the fixed cross-member sentence rather than as a
+        // constraint of `defaultVariant` alone.
         if !crate::state::default_variant_names_a_variant(
             input.default_variant.as_deref(),
             input.variants.as_deref(),
         ) {
             return Err(UpdatePromptErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::default_variant_pattern_message(
-                        input.default_variant.as_deref().unwrap_or_default(),
-                    )),
+                    message: Some(
+                        crate::state::DEFAULT_VARIANT_NOT_IN_VARIANTS_MESSAGE.to_string(),
+                    ),
                     field_list: None,
                 },
             )

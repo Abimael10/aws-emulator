@@ -760,10 +760,11 @@ async fn create_prompt_refuses_a_default_variant_that_names_no_variant() {
             "case {case}: expected the modelled ValidationException, got {refused:?}"
         );
         let message = refused.string(&["message"]);
-        assert!(
-            message.contains("at 'defaultVariant' failed to satisfy constraint"),
-            "case {case}: expected the refusal to name the member and its constraint, got \
-             {message:?}"
+        assert_eq!(
+            message,
+            "Default variant must be present in the variants list. \
+             Retry your request with the correct default variant.",
+            "case {case}: expected the fixed cross-member sentence, got {message:?}"
         );
     }
 

@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::prompt_default_variant_membership::DEFAULT_VARIANT_NOT_IN_VARIANTS;
+
 /// A SigV4 `Authorization` header scoped to the `bedrock` signing name: the routing key
 /// this service claims on, and the source of the region its ARNs carry.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -529,9 +531,9 @@ async fn update_prompt_refuses_a_request_it_cannot_serve_and_leaves_the_draft_st
             "case {case} ({form}): expected ValidationException, got {refused:?}"
         );
         let message = refused.string(&["message"]);
-        assert!(
-            message.contains("defaultVariant"),
-            "case {case} ({form}): the refusal names the member that failed, \
+        assert_eq!(
+            message, DEFAULT_VARIANT_NOT_IN_VARIANTS,
+            "case {case} ({form}): the refusal states the cross-member rule, \
              got {message:?}"
         );
     }

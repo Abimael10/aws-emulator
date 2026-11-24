@@ -382,15 +382,17 @@ pub fn default_variant_names_a_variant(
 /// The `ValidationException` message a prompt operation answers when its
 /// `defaultVariant` names none of the variants the prompt carries.
 ///
-/// AWS's wording for a member whose value fails a constraint of its own, with two
-/// variable parts: the value the request sent and the member it sent it in. The
-/// constraint clause is the rule the member's own documentation states.
-pub fn default_variant_pattern_message(default_variant: &str) -> String {
-    format!(
-        "Value '{default_variant}' at 'defaultVariant' failed to satisfy constraint: \
-         Member must match the name of one of the variants provided for the prompt"
-    )
-}
+/// This pre-condition relates TWO input members to each other rather than measuring one
+/// member's value against a constraint of its own, so it is NOT worded through the
+/// per-member constraint envelope (`Value '…' at '…' failed to satisfy constraint: …`,
+/// which [`prompt_identifier_pattern_message`] and its peers use for a value that fails
+/// its own shape's pattern): the service states the cross-member rule as one fixed
+/// sentence with a remediation clause and interpolates nothing from the request — not the
+/// offending value, not the member name, not the names of the variants supplied.
+pub const DEFAULT_VARIANT_NOT_IN_VARIANTS_MESSAGE: &str = concat!(
+    "Default variant must be present in the variants list. ",
+    "Retry your request with the correct default variant.",
+);
 
 impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// Mint an unused `promptId`, which the modelled `PromptId` shape constrains to the
