@@ -226,10 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the DEEP end of the range is checked: a label is read from
         // decimal digits, so it never addresses a zoom below the world tile.
+        // The sentence names the style the MAP stores, which is what decided
+        // the ceiling.
         if z > u64::from(entry.max_zoom) {
             return Err(field_validation_failed(
                 map_tiles::ZOOM_MEMBER,
-                map_tiles::zoom_out_of_range(entry.max_zoom),
+                map_tiles::zoom_out_of_range(&style, entry.max_zoom),
             )
             .into());
         }

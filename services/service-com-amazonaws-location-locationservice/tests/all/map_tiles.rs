@@ -219,7 +219,8 @@ async fn a_zoom_past_the_styles_own_pyramid_is_refused() {
                 refused.error_code(),
                 refused.body
             );
-            let sentence = format!("'Z' must not be greater than {max_zoom}");
+            let sentence =
+                format!("'Z' must not be greater than maximum zoom of style {style} ({max_zoom}).");
             assert_eq!(
                 refused.message(),
                 sentence,
@@ -541,7 +542,7 @@ async fn an_address_outside_the_grid_or_outside_the_pattern_is_refused() {
             x: "4",
             y: "0",
             member: "X",
-            sentence: "'X' must not be greater than 3",
+            sentence: "'X' must be an integer in the range 0..2^Zoom-1 (0..3).",
         },
         BadAddress {
             case: "a row past the grid of this zoom",
@@ -549,7 +550,7 @@ async fn an_address_outside_the_grid_or_outside_the_pattern_is_refused() {
             x: "0",
             y: "4",
             member: "Y",
-            sentence: "'Y' must not be greater than 3",
+            sentence: "'Y' must be an integer in the range 0..2^Zoom-1 (0..3).",
         },
         BadAddress {
             case: "the second tile of the world zoom",
@@ -557,7 +558,7 @@ async fn an_address_outside_the_grid_or_outside_the_pattern_is_refused() {
             x: "1",
             y: "0",
             member: "X",
-            sentence: "'X' must not be greater than 0",
+            sentence: "'X' must be an integer in the range 0..2^Zoom-1 (0..0).",
         },
         BadAddress {
             case: "a column larger than any address",
@@ -565,7 +566,7 @@ async fn an_address_outside_the_grid_or_outside_the_pattern_is_refused() {
             x: "99999999999999999999999",
             y: "0",
             member: "X",
-            sentence: "'X' must not be greater than 3",
+            sentence: "'X' must be an integer in the range 0..2^Zoom-1 (0..3).",
         },
         BadAddress {
             case: "a zoom that is not a number",

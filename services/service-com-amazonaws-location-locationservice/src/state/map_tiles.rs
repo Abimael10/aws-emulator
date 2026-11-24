@@ -94,29 +94,36 @@ pub fn tile_label(raw: &str) -> Option<u64> {
 
 /// The sentence a `Z` deeper than the zoom range the map's style publishes is
 /// refused with: the member as the model spells it in single quotes, then the
-/// deepest zoom that style has tiles for.
+/// bound it missed — named as the maximum zoom OF THE STYLE the addressed map
+/// carries, with that style's own name and its deepest zoom in parentheses, and
+/// closed with a period.
 ///
-/// This is the sentence this service family states for a value past an upper
-/// bound — the member in single quotes, "must not be greater than", the bound —
-/// rather than the generic constraint-validator clause. The bound is the one the
-/// MAP's style publishes, which is also the `maxzoom` its style descriptor
-/// declares, so a caller refused here reads the same number out of the document
-/// it renders from. The requested value is never echoed: `Z` targets a
-/// `@sensitive` shape.
-pub fn zoom_out_of_range(max_zoom: u32) -> String {
-    format!("'{ZOOM_MEMBER}' must not be greater than {max_zoom}")
+/// The ceiling this operation applies is not a property of the request but of
+/// the map resource, so the sentence names the style it came from: a caller
+/// refused here learns both WHICH style's ceiling was applied and what that
+/// ceiling is, and so can clamp its zoom or pick another style from the refusal
+/// alone. The number is the one the MAP's style publishes, which is also the
+/// `maxzoom` its style descriptor declares, so the refusal and the document a
+/// client renders from state one pyramid. The requested value is never echoed:
+/// `Z` targets a `@sensitive` shape.
+pub fn zoom_out_of_range(style: &str, max_zoom: u32) -> String {
+    format!("'{ZOOM_MEMBER}' must not be greater than maximum zoom of style {style} ({max_zoom}).")
 }
 
 /// The sentence an `X` or `Y` outside the grid of the requested zoom is refused
-/// with, worded as [`zoom_out_of_range`] words the zoom's own bound: a zoom
-/// level's axis holds `2^Z` tiles, so the last column and row it addresses is
-/// `axis - 1`.
+/// with: the member in single quotes, then the whole range of columns (or rows)
+/// the requested zoom defines — stated both as the rule it follows, `0..2^Zoom-1`,
+/// and as the pair of numbers that rule works out to for this request — closed
+/// with a period.
 ///
-/// The bound is what the sentence names; the value the request sent is not
-/// echoed, since `X` and `Y` target `@sensitive` shapes.
+/// A zoom level's axis holds `2^Z` tiles, so its last column and row is
+/// `axis - 1`; the sentence states the computed RANGE rather than only its top,
+/// so a caller learns the whole set of addresses the zoom it asked for admits.
+/// The value the request sent is not echoed, since `X` and `Y` target
+/// `@sensitive` shapes.
 pub fn axis_out_of_range(member: &str, axis_tiles: u64) -> String {
     format!(
-        "'{member}' must not be greater than {}",
+        "'{member}' must be an integer in the range 0..2^Zoom-1 (0..{}).",
         axis_tiles.saturating_sub(1)
     )
 }
