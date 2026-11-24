@@ -477,6 +477,36 @@ pub async fn role_is_absent(
     )
 }
 
+/// Whether IAM ANSWERED that this account HOLDS a role under the name `role_arn` carries.
+///
+/// The other side of [`role_is_absent`], asked through the emulator callback rather than
+/// through a request's own context, and the question a service puts before it reads an
+/// IMPLICIT deny as an answer about a role: a role this account's IAM holds is the authority
+/// on what may be done under it, so a policy set of ITS that allows the action nowhere — an
+/// empty set included — is an answer about that role and not about this store, while a role
+/// IAM holds nothing under says nothing either way (a service role is routinely provisioned
+/// out of band). [`role_states_permissions_through`] answers the narrower question of whether
+/// such a role carries any identity-based policy at all, for a caller that reads an empty set
+/// as no answer.
+///
+/// `false` — establish nothing — for every answer that is NOT IAM reporting the role held: a
+/// value that names no role of THIS account, IAM reporting the role absent, an answer this
+/// emulator could not read, and an emulator with no IAM mounted to ask. The hop is the SAME
+/// `GetRole` every reading here makes ([`crate::iam_client`]).
+pub async fn role_is_held_through(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    let Some(role_name) = role_name(role_arn) else {
+        return false;
+    };
+    matches!(
+        role_answer(callback, region, role_name).await,
+        RoleAnswer::Held(_)
+    )
+}
+
 /// Whether the trust document IAM reported for a role it HOLDS withholds `service_principal`:
 /// the ONE reading of a stored trust document both readings above take, so a role IAM
 /// answered about is judged the same way whichever of them asked.

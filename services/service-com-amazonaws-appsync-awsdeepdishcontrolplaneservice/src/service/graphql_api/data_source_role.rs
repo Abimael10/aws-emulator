@@ -23,56 +23,61 @@ use super::PlaneContext;
 /// source's role do not allow `action` on `resource`, or `None` when nothing is known against
 /// it.
 ///
-/// Which answer counts is `::service_common::iam_role`'s own rule: a role that STATES
-/// identity-based policies is the authority on what it may do, so it has to be ALLOWED the
-/// call; a role IAM holds no policy for says nothing about the action — a data source's
-/// service role is routinely provisioned out of band — so only a statement that DENIES it
-/// holds the call back. Everything that is not an answer (no IAM to ask, a value naming no
-/// role of this account, a failed hop) withholds nothing.
+/// Which answer counts is WHETHER IAM HOLDS THE ROLE: a role this account's IAM holds is the
+/// authority on what may be done under it, so the call has to be ALLOWED by its policies and
+/// an implicit deny — a policy set that allows the action nowhere, an empty set included —
+/// refuses it; a role IAM holds nothing under says nothing about the action, since a data
+/// source's service role is routinely provisioned out of band, so only a statement that
+/// DENIES it holds the call back. That is the same reading the invocation of an `AWS_LAMBDA`
+/// data source's function takes of its own service role ([`super::lambda::role_refusal`]),
+/// which reads those documents out of the store instead of asking for them, so one role is
+/// judged alike whichever data source names it.
+///
+/// Everything that is not an answer (no IAM to ask, a value naming no role of this account, a
+/// failed hop) withholds nothing.
 pub async fn withheld(
     context: &PlaneContext,
     role_arn: &str,
     action: &str,
     resource: &str,
 ) -> Option<String> {
-    let states_permissions = ::service_common::iam_role::role_states_permissions_through(
+    let decision = ::service_common::iam_role::role_action_decision_through(
         &context.callback,
         &context.region,
         role_arn,
+        action,
+        resource,
+        &[],
     )
-    .await;
-    let withheld = if states_permissions {
-        ::service_common::iam_role::role_withholds_action_through(
-            &context.callback,
-            &context.region,
-            role_arn,
-            action,
-            resource,
-        )
-        .await
-    } else {
-        ::service_common::iam_role::role_denies_action_through(
-            &context.callback,
-            &context.region,
-            role_arn,
-            action,
-            resource,
-        )
-        .await
-    };
-    withheld.then(|| {
-        let reason = if states_permissions {
-            ::service_common::iam_authorization::no_identity_policy_allows(action)
-        } else {
+    .await?;
+    let reason = match decision {
+        ::service_common::iam_authorization::Decision::Allowed => return None,
+        ::service_common::iam_authorization::Decision::Denied => {
             ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
-        };
+        }
+        // Nothing in force states this call, which is an answer about the role only where IAM
+        // holds the role whose policies were weighed.
+        ::service_common::iam_authorization::Decision::NotStated => {
+            if !::service_common::iam_role::role_is_held_through(
+                &context.callback,
+                &context.region,
+                role_arn,
+            )
+            .await
+            {
+                return None;
+            }
+            ::service_common::iam_authorization::no_identity_policy_allows(action)
+        }
+    };
+    Some(
         ::service_common::iam_authorization::not_authorized_by_identity_policy(
             &assumed_role_principal(role_arn),
             action,
             resource,
             &reason,
-        )
-    })
+        ),
+    )
 }
 
 /// The principal AppSync makes such a call as: a SESSION of the role the data source names

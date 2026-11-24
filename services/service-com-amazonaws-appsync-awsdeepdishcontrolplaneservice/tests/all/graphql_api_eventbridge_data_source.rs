@@ -437,13 +437,14 @@ async fn the_documents_in_force_on_the_data_sources_role_decide_the_publication(
             published: false,
         },
         Row {
-            // A role IAM holds no document for says nothing about the action — a data
-            // source's service role is routinely provisioned out of band — so the
-            // publication is made.
+            // A role IAM HOLDS is the authority on what may be done under it, so an action
+            // nothing in force on it allows is refused — an EMPTY set of documents allows
+            // nothing. (A role IAM holds nothing under is the case that says nothing, since
+            // a service role is routinely provisioned out of band.)
             case: "a role carrying no identity-based document at all",
             role: "undocumented",
             policy: None,
-            published: true,
+            published: false,
         },
     ];
     for row in &rows {
