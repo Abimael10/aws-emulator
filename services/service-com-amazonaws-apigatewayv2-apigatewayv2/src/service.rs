@@ -154,6 +154,10 @@ pub mod domain_name_socket;
 // mints a portal, which is what opens that portal's socket and gives its
 // `PortalDefaultDomainName` the address to publish.
 pub mod portal_socket;
+// `pub` for the same reason: `invoke_plane_socket::ensure_published` is called by the
+// operations that mint an HTTP api, which is what opens the socket this emulator publishes an
+// api's data plane on and gives its `ApiEndpoint` the address to announce.
+pub mod invoke_plane_socket;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;

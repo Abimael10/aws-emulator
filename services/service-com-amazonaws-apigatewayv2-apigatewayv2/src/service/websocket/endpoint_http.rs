@@ -3,14 +3,17 @@
 //! What a core-owned SOCKET of this service answers an ordinary HTTP request with: this
 //! emulator's own front door, on that socket's port.
 //!
-//! Two sockets of this service are reached by plain HTTP requests, and both are served here
-//! so one implementation decides how such a request is read, bounded and handed on:
+//! THREE sockets of this service are reached by plain HTTP requests, and all three are served
+//! here so one implementation decides how such a request is read, bounded and handed on:
 //!
 //! * a WEBSOCKET api's own socket, for every request on it that is NOT an opening handshake
 //!   ([`super::transport`]) — handed to the router exactly as it arrived;
 //! * the socket a CUSTOM DOMAIN NAME is reached at
 //!   ([`crate::service::domain_name_socket`]) — RE-ADDRESSED first, at the api and stage that
-//!   domain name's api mapping routes the request's base path to.
+//!   domain name's api mapping routes the request's base path to;
+//! * the socket every HTTP api's `ApiEndpoint` is published on
+//!   ([`crate::service::invoke_plane_socket`]) — handed on as it arrived, the api named by the
+//!   reserved data-plane path the endpoint was published under.
 //!
 //! # Why a socket serves plain HTTP at all
 //!
@@ -53,6 +56,10 @@
 //! against DNS rebinding and the browser (`Origin` / `Sec-Fetch-Site`) check — and the
 //! request is read under one deadline, one in-flight cap and one body ceiling, all the
 //! core's, so a slow or oversized caller cannot hold a connection permit open.
+//!
+//! And every answer written here names its fields in the CANONICAL HTTP spelling (see
+//! [`serve_readdressed`]), because every address served here is one a client dials rather than
+//! this emulator's front door.
 
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
@@ -129,6 +136,18 @@ pub(crate) async fn serve_readdressed(
     if let Err(error) = ::hyper::server::conn::http1::Builder::new()
         .timer(::hyper_util::rt::TokioTimer::new())
         .header_read_timeout(request_deadline())
+        // Every field name of every answer written here goes out in its CANONICAL,
+        // hyphen-separated spelling — `Content-Type`, `Content-Length`,
+        // `Configuration-Version` — which is the spelling an HTTP endpoint puts on the wire
+        // and the name a client that reads a response's field names AS RECEIVED looks a value
+        // up under. A field name is case-insensitive (RFC 9110 §5.1), so this changes no
+        // field's meaning; what it changes is the bytes such a client sees, and an answer
+        // whose media type arrived spelled `content-type` is one that client finds no media
+        // type in at all. Every address served here is one a client DIALS — an api's own
+        // endpoint, a custom domain name, the published api data plane — rather than this
+        // emulator's front door, whose encoder writes the names as they are held: normalised
+        // to lower case.
+        .title_case_headers(true)
         .serve_connection(io, service)
         .await
     {

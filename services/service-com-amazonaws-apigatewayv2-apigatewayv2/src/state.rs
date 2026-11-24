@@ -33,6 +33,7 @@ pub mod domain_name_transport;
 pub mod ec2_subnets;
 pub mod integration_response_key;
 pub mod integration_subtype;
+pub mod invoke_plane_transport;
 pub mod invoke_transport;
 pub mod jwt_issuer;
 pub mod listener_registry;
@@ -1134,6 +1135,12 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// ([`invoke_transport::InvokeTransport`]). Held beside the apis under the same lock, for
     /// the reason [`Self::websocket_transport`] is.
     pub invoke_transport: invoke_transport::InvokeTransport,
+    /// The SOCKET every HTTP api's `ApiEndpoint` is published on: the address this emulator
+    /// serves an api's data plane at for a client that dials what it was told
+    /// ([`invoke_plane_transport::InvokePlaneTransport`]). Data-plane state, like
+    /// [`Self::websocket_transport`], and held beside the apis under the same lock so an api's
+    /// records and the address it announces cannot drift apart.
+    pub invoke_plane_transport: invoke_plane_transport::InvokePlaneTransport,
 }
 
 impl ComAmazonawsApigatewayv2Apigatewayv2State {
@@ -4671,7 +4678,11 @@ fn reached_emulator_endpoint(parts: &::http::request::Parts) -> Option<String> {
 /// Only a value SHAPED like a host is taken
 /// (`service_common::data_plane_addressing::is_host_shaped`), so nothing that is not an
 /// address reaches a URL this service announces.
-fn served_endpoint_authority(served_base: &str) -> Option<String> {
+///
+/// `pub` because it is also the reading of "does this emulator publish a dialable address at
+/// all": a socket for an api's data plane is opened only where it does
+/// ([`crate::service::invoke_plane_socket`]).
+pub fn served_endpoint_authority(served_base: &str) -> Option<String> {
     if served_base == ::smithy_server_runtime::UNSERVED_URL_BASE {
         return None;
     }

@@ -5,10 +5,10 @@
 //!
 //! RULE: **an api's `ApiEndpoint` is an address THIS emulator serves that api's data plane at,
 //! whichever request minted the api — so the value a stack publishes through
-//! `Fn::GetAtt <api>.ApiEndpoint` is the one API Gateway v2 really minted (the endpoint this
-//! emulator is served at, with the api behind the reserved data-plane path, for an emulator
-//! served on a port, and the api's own `{api-id}.execute-api.{region}.amazonaws.com` host,
-//! which the front door claims as well, for one served on no port), it is what every later
+//! `Fn::GetAtt <api>.ApiEndpoint` is the one API Gateway v2 really minted (the address this
+//! emulator opens for that plane, with the api behind the reserved data-plane path, for an
+//! emulator served on a port, and the api's own `{api-id}.execute-api.{region}.amazonaws.com`
+//! host, which the front door claims as well, for one served on no port), it is what every later
 //! reporter of the api reports, and the invoke URL a client builds from it (that value with the
 //! stage name appended, the reserved stage that serves the api's root being reached with no
 //! stage segment at all) resolves to the route's own integration. An api whose
@@ -314,19 +314,38 @@ fn emulator(served_base: Option<&str>) -> MultiServiceRouter {
 }
 
 /// The authority and base path an api of `api_id` must be published on, for an emulator served
-/// at `served_base`: that endpoint with the api behind the reserved data-plane path, and — for
-/// an emulator served on no port at all — the api's own documented `execute-api` host.
-fn expected_published_parts(served_base: Option<&str>, api_id: &str) -> (String, String) {
+/// at `served_base`: a loopback address of the SOCKET this emulator publishes an api's data
+/// plane on, with the api behind the reserved data-plane path — whose port this suite cannot
+/// predict, so the authority is left for [`assert_dialable_authority`] — and, for an emulator
+/// served on no port at all, the api's own documented `execute-api` host.
+fn expected_published_parts(served_base: Option<&str>, api_id: &str) -> (Option<String>, String) {
     match served_base {
-        Some(base) => (
-            announced_parts(base).0,
-            format!("{LOCAL_ENDPOINT_PREFIX}/{api_id}"),
-        ),
+        Some(_base) => (None, format!("{LOCAL_ENDPOINT_PREFIX}/{api_id}")),
         None => (
-            format!("{api_id}.execute-api.{REGION}.amazonaws.com"),
+            Some(format!("{api_id}.execute-api.{REGION}.amazonaws.com")),
             String::new(),
         ),
     }
+}
+
+/// Assert `authority` is an address ON THIS MACHINE a client can dial: a loopback host with a
+/// port, which is what every address this emulator opens for a data plane of its own is.
+///
+/// The PORT is the core's to choose, so it is not predicted here; that the address is one this
+/// emulator answers the api on is read by the invoke that follows.
+fn assert_dialable_authority(case: &str, authority: &str) {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => panic!("case {case:?}: expected a published host:port, got {authority:?}"),
+    };
+    assert!(
+        port.parse::<u16>().is_ok_and(|port| port > 0),
+        "case {case:?}: expected a port a client can dial, got {authority:?}"
+    );
+    assert!(
+        ::emulator_server::is_loopback_host(host.trim_start_matches('[').trim_end_matches(']')),
+        "case {case:?}: expected an address on this machine, got {authority:?}"
+    );
 }
 
 /// One output of the settled stack, which every api of the table publishes two of.
@@ -398,11 +417,14 @@ async fn assert_row(row: &Row) {
         let (authority, base_path) = announced_parts(&published);
         let (expected_authority, expected_base_path) =
             expected_published_parts(row.served_base, &api_id);
-        assert_eq!(
-            authority, expected_authority,
-            "case {case:?}: the stack must publish the api on {expected_authority}, got \
-             {published:?}"
-        );
+        match expected_authority {
+            Some(expected_authority) => assert_eq!(
+                authority, expected_authority,
+                "case {case:?}: the stack must publish the api on {expected_authority}, got \
+                 {published:?}"
+            ),
+            None => assert_dialable_authority(&case, &authority),
+        }
         assert_eq!(
             base_path, expected_base_path,
             "case {case:?}: the stack must publish the base path {expected_base_path:?}, got \

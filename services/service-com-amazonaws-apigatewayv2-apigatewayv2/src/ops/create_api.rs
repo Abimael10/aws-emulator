@@ -436,6 +436,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::option::Option::None
         };
 
+        // An HTTP api's data plane is one request and one response, so it needs no socket to
+        // RUN on — but the endpoint it announces is one an arbitrary HTTP client DIALS, and
+        // such a client reads the fields of the answer under the names the connection wrote
+        // them in. So where this emulator publishes a dialable address at all, that endpoint
+        // is published on a socket of this service's own, whose encoder writes those names
+        // canonically ([`crate::state::invoke_plane_transport`]); an emulator that publishes
+        // none announces the endpoint this request arrived at instead, which the front door
+        // serves the same plane on. The socket is the account's rather than this api's, so it
+        // is opened once and shared, and a create refused below leaves it serving every api
+        // that already announced it.
+        let published_plane = if is_websocket {
+            ::std::option::Option::None
+        } else {
+            crate::service::invoke_plane_socket::ensure_published(
+                &*self.engine,
+                ctx.callback(),
+                ctx.endpoint().as_str(),
+            )
+            .await
+        };
+
         let mut store = state.lock();
         // The transport this call was handed is kept as the one this api's routes are
         // performed over when the request being served carries none of its own
@@ -462,9 +483,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let region = crate::state::request_region(ctx.parts());
-        let api_endpoint = match announced_socket.as_deref() {
-            Some(authority) => crate::state::websocket_transport::announced_endpoint(authority),
-            None => crate::state::emulator_served_api_endpoint(
+        let api_endpoint = match (announced_socket.as_deref(), published_plane.as_deref()) {
+            (Some(authority), _) => {
+                crate::state::websocket_transport::announced_endpoint(authority)
+            }
+            (None, Some(authority)) => {
+                crate::state::invoke_plane_transport::announced_endpoint(authority, &api_id)
+            }
+            (None, None) => crate::state::emulator_served_api_endpoint(
                 &api_id,
                 &region,
                 &input.protocol_type,

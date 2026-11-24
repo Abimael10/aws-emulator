@@ -221,6 +221,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented("ImportApi"));
         };
+        // The socket this emulator publishes an HTTP api's data plane on, opened before the
+        // store is locked because opening one is the core's work and is awaited
+        // ([`crate::state::invoke_plane_transport`], which says why the endpoint is published
+        // there rather than at this emulator's front door, and
+        // [`crate::service::invoke_plane_socket::ensure_published`], which says when one is
+        // opened at all).
+        let published_plane = crate::service::invoke_plane_socket::ensure_published(
+            &*self.engine,
+            ctx.callback(),
+            ctx.endpoint().as_str(),
+        )
+        .await;
         let mut store = state.lock();
 
         // The transport this call was handed is kept as the one this api's routes are
@@ -254,13 +266,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An imported api speaks HTTP, so its endpoint carries that protocol's
             // scheme — the same value `CreateApi` reports for an HTTP api: the address
             // this emulator serves the api id this import minted at.
-            api_endpoint: crate::state::emulator_served_api_endpoint(
-                &api_id,
-                &region,
-                crate::state::HTTP_PROTOCOL_TYPE,
-                ctx.parts(),
-                ctx.endpoint().as_str(),
-            ),
+            api_endpoint: match published_plane.as_deref() {
+                Some(authority) => {
+                    crate::state::invoke_plane_transport::announced_endpoint(authority, &api_id)
+                }
+                None => crate::state::emulator_served_api_endpoint(
+                    &api_id,
+                    &region,
+                    crate::state::HTTP_PROTOCOL_TYPE,
+                    ctx.parts(),
+                    ctx.endpoint().as_str(),
+                ),
+            },
             api_id: api_id.clone(),
             region,
             name: definition.name,

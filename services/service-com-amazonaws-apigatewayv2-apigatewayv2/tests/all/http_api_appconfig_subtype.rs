@@ -83,6 +83,10 @@ const BAD_REQUEST_MESSAGE: &str = "Bad Request";
 /// The header AppConfig's own api binds `Configuration$ConfigurationVersion` onto.
 const CONFIGURATION_VERSION_HEADER: &str = "configuration-version";
 
+/// The reserved data-plane path segments an api's endpoint is published under on the address
+/// this emulator serves that plane at: `/_aws/execute-api/{api-id}`.
+const LOCAL_MARKER: &str = "_aws/execute-api";
+
 /// The state AppConfig reports for a deployment that has finished rolling out, and the longest
 /// a poll waits for one to reach it.
 ///
@@ -1229,74 +1233,47 @@ async fn a_request_carrying_no_mapped_required_parameter_is_refused_as_a_bad_req
     );
 }
 
-/// RULE: the media type AppConfig stated for the configuration goes out ON THE WIRE as the
-/// answer's `Content-Type` field, so a client that reads the response's own header fields —
-/// rather than one driving this emulator in process — is told what the bytes it received are.
+/// One answer read off the wire: its status line, its field lines as HTTP wrote them, and its
+/// body as the bytes it is.
+struct OnTheWire {
+    status: String,
+    fields: Vec<String>,
+    body: Vec<u8>,
+}
+
+impl OnTheWire {
+    /// One line about this answer for an assertion that failed.
+    fn summary(&self) -> String {
+        format!(
+            "{:?} {:?} body={:?}",
+            self.status,
+            self.fields,
+            String::from_utf8_lossy(&self.body)
+        )
+    }
+}
+
+/// One request written straight onto the published `authority` as the bytes of an HTTP/1.1
+/// message, and the answer read back as the bytes it is.
 ///
-/// Driven over a REAL socket, served the way this emulator's own entrypoint serves the router
-/// (`emulator_server::serve_on_ephemeral_port`), and read as the RAW response bytes: the
-/// assertion is on the field line as HTTP writes it, which is the only level at which "the
-/// header the client sees" is observable at all.
-#[tokio::test]
-async fn the_media_type_the_action_stated_is_a_field_of_the_answer_on_the_wire() {
-    const CONTENT: &[u8] = br#"{"marker":"on-the-wire"}"#;
-    const CONTENT_TYPE: &str = "application/json";
-
-    let case = "the answer as it goes out on the wire";
-    let emulator = Emulator::new();
-    let role = emulator.role(case).await;
-    let application = emulator.application(case, "wire-fleet").await;
-    let strategy = emulator.strategy(case, "all-at-once").await;
-    let deployed = emulator
-        .deploy(
-            case,
-            &application,
-            &strategy,
-            Hosting {
-                environment: "production",
-                profile: "features",
-                content: CONTENT,
-                content_type: CONTENT_TYPE,
-            },
-        )
-        .await;
-    emulator.settled(case, &deployed).await;
-    let (_host, api_id) = emulator
-        .api(
-            case,
-            &[(
-                "GET /config",
-                subtype_integration(
-                    &role,
-                    json!({
-                        "Application": deployed.application_id,
-                        "Environment": deployed.environment_id,
-                        "Configuration": deployed.profile_id,
-                        "ClientId": "a-device",
-                    }),
-                ),
-            )],
-        )
-        .await;
-
-    // The SAME router, served on a socket by the framework that serves the emulator's own data
-    // port. The port it landed on is the only part of the address this reads: the socket below is
-    // dialled at the LOOPBACK address, which is the one this emulator's own listeners bind.
-    let (endpoint, _served) =
-        emulator_server::serve_on_ephemeral_port(emulator.router.clone()).await;
-    let port: u16 = endpoint
+/// Dialled at the LOOPBACK address the core binds every listener of this emulator on, with the
+/// port the published authority names — nothing outside this machine is reached. The connection
+/// is made IN THE CLEAR, which the published address serves beside the `https` a client dials
+/// (`service_common::in_band_tls`), so what this reads is the answer as it goes out — no client
+/// library normalises a field name on the way in.
+async fn written_on_the_wire(authority: &str, target: &str) -> OnTheWire {
+    let port: u16 = authority
         .rsplit_once(':')
-        .and_then(|(_before, port)| port.parse().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: no port in the served endpoint {endpoint:?}"));
+        .and_then(|(_host, port)| port.parse().ok())
+        .unwrap_or_else(|| panic!("the published authority {authority:?} names a port"));
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
-        .expect("the served port accepts a connection");
-    let authority = format!("127.0.0.1:{port}");
-    // The address a client that resolves the api's own host nowhere reaches the stage at, which
-    // is the one every other suite here drives through the router in process.
+        .unwrap_or_else(|error| {
+            panic!("the published address {authority:?} accepts a connection: {error}")
+        });
     let request = format!(
-        "GET /_aws/execute-api/{api_id}/config HTTP/1.1\r\nhost: {authority}\r\nauthorization: \
-         {}\r\nconnection: close\r\n\r\n",
+        "GET {target} HTTP/1.1\r\nhost: {authority}\r\nauthorization: {}\r\nconnection: \
+         close\r\n\r\n",
         Emulator::authorization("execute-api")
     );
     socket
@@ -1308,29 +1285,220 @@ async fn the_media_type_the_action_stated_is_a_field_of_the_answer_on_the_wire()
         .read_to_end(&mut raw)
         .await
         .expect("the answer is read");
-    let answered = String::from_utf8_lossy(&raw).to_string();
-    let (head, body) = answered
-        .split_once("\r\n\r\n")
-        .map(|(head, body)| (head.to_string(), body.to_string()))
-        .unwrap_or((answered.clone(), String::new()));
+    const SEPARATOR: &[u8] = b"\r\n\r\n";
+    let at = raw
+        .windows(SEPARATOR.len())
+        .position(|window| window == SEPARATOR);
+    let (head, body) = match at {
+        Some(at) => (raw[..at].to_vec(), raw[at + SEPARATOR.len()..].to_vec()),
+        None => (raw.clone(), Vec::new()),
+    };
+    let head = String::from_utf8_lossy(&head).to_string();
+    let mut lines = head.lines().map(str::to_string);
+    OnTheWire {
+        status: lines.next().unwrap_or_default(),
+        fields: lines.collect(),
+        body,
+    }
+}
+
+/// Assert `answered` carries `name: value` written EXACTLY so — the canonical spelling of the
+/// field name — and carries that field under no other spelling.
+///
+/// A field name is case-insensitive (RFC 9110 §5.1), so this is not about the field's meaning:
+/// it is about the bytes a client that reads a response's field names AS RECEIVED sees, which
+/// is the only name such a client can look the value up under.
+fn assert_field(case: &str, answered: &OnTheWire, name: &str, value: &str) {
+    let carried: Vec<&String> = answered
+        .fields
+        .iter()
+        .filter(|line| {
+            line.split_once(':')
+                .is_some_and(|(field, _value)| field.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    assert_eq!(
+        carried,
+        vec![&format!("{name}: {value}")],
+        "case {case:?}: expected the answer to carry {name:?} as {value:?} under that exact \
+         spelling, got {}",
+        answered.summary()
+    );
+}
+
+/// RULE: an api's `ApiEndpoint` is an address a CLIENT DIALS, and every field of an answer
+/// read there is written under the canonical HTTP spelling of its name — so a client that
+/// reads a response's field names AS RECEIVED finds the configuration's media type under
+/// `Content-Type` and the version those bytes belong to under `Configuration-Version`, exactly
+/// as it does calling AppConfig itself.
+///
+/// Driven over a REAL socket against the address the api PUBLISHES, on a router served on a
+/// port the way this emulator's own entrypoint serves it: the field line as HTTP wrote it is
+/// the only level at which "the field the client sees" is observable at all, so every
+/// assertion below is on those bytes.
+///
+/// The rows differ along what the rule generalises over: the media type the answer carries (a
+/// JSON document, plain text, a YAML document, bytes that are not text at all), and WHICH
+/// answer it is — the action's own payload, and the gateway's own envelope for a path no route
+/// of the api matches.
+#[tokio::test]
+async fn every_field_of_an_answer_at_the_published_endpoint_carries_its_canonical_name() {
+    /// One deployed configuration and the route that serves it.
+    struct Row {
+        case: &'static str,
+        environment: &'static str,
+        profile: &'static str,
+        content: &'static [u8],
+        content_type: &'static str,
+        route_key: &'static str,
+        path: &'static str,
+    }
+    let rows: &[Row] = &[
+        Row {
+            case: "a JSON document",
+            environment: "production",
+            profile: "features",
+            content: br#"{"marker":"on-the-wire"}"#,
+            content_type: "application/json",
+            route_key: "GET /config",
+            path: "/config",
+        },
+        Row {
+            case: "a plain-text document",
+            environment: "staging",
+            profile: "banner",
+            content: b"maintenance = false\n",
+            content_type: "text/plain",
+            route_key: "GET /banner",
+            path: "/banner",
+        },
+        Row {
+            case: "a YAML document",
+            environment: "canary",
+            profile: "rollout",
+            content: b"rollout:\n  enabled: true\n",
+            content_type: "application/x-yaml",
+            route_key: "GET /rollout",
+            path: "/rollout",
+        },
+        Row {
+            case: "bytes that are not text",
+            environment: "devices",
+            profile: "firmware",
+            content: &[0x00, 0x01, 0xfe, 0xff, 0x10, 0x00, 0x7f],
+            content_type: "application/octet-stream",
+            route_key: "GET /firmware",
+            path: "/firmware",
+        },
+    ];
+
+    let case = "the answers as they go out on the wire";
+    let emulator = Emulator::new();
+    // SERVED on a port, as the emulator a client dials is: that is what makes this emulator
+    // publish addresses at all, and so what gives the api's data plane an address of its own.
+    // The port is published as the `https://` URL the core publishes its data port as, which
+    // is the form a router records as the base it is served at.
+    let (endpoint, _served) =
+        emulator_server::serve_on_ephemeral_port(emulator.router.clone()).await;
+    let endpoint = endpoint.replacen("http://", "https://", 1);
+    emulator_server::EmulatorService::serving_at(&emulator.router, &endpoint);
+
+    let role = emulator.role(case).await;
+    let application = emulator.application(case, "wire-fleet").await;
+    let strategy = emulator.strategy(case, "all-at-once").await;
+    // Every row's deployment is STARTED first and waited for afterwards: they are deployments
+    // of different environments, so AppConfig rolls them out side by side.
+    let mut deployed = Vec::new();
+    for row in rows {
+        deployed.push(
+            emulator
+                .deploy(
+                    row.case,
+                    &application,
+                    &strategy,
+                    Hosting {
+                        environment: row.environment,
+                        profile: row.profile,
+                        content: row.content,
+                        content_type: row.content_type,
+                    },
+                )
+                .await,
+        );
+    }
+    for (row, deployed) in rows.iter().zip(&deployed) {
+        emulator.settled(row.case, deployed).await;
+    }
+    let routes: Vec<(&str, Value)> = rows
+        .iter()
+        .zip(&deployed)
+        .map(|(row, deployed)| {
+            (
+                row.route_key,
+                subtype_integration(
+                    &role,
+                    json!({
+                        "Application": deployed.application_id,
+                        "Environment": deployed.environment_id,
+                        "Configuration": deployed.profile_id,
+                        "ClientId": "a-device",
+                    }),
+                ),
+            )
+        })
+        .collect();
+    let (announced, api_id) = emulator.api(case, &routes).await;
+    let (authority, base_path) = announced
+        .split_once('/')
+        .map(|(authority, path)| (authority.to_string(), format!("/{path}")))
+        .unwrap_or_else(|| (announced.clone(), String::new()));
+    // The api is published on an address of its own DATA PLANE rather than on the endpoint the
+    // control call reached, and the api it serves is named by the path it was announced
+    // under — the addressing every reader of that value places an api by.
+    let front_door = endpoint
+        .split_once("://")
+        .map_or(endpoint.as_str(), |(_scheme, rest)| rest)
+        .trim_end_matches('/')
+        .to_string();
+    assert_ne!(
+        authority, front_door,
+        "case {case:?}: expected the api to publish an address of its own data plane, got \
+         {announced:?}"
+    );
+    assert_eq!(
+        base_path,
+        format!("/{LOCAL_MARKER}/{api_id}"),
+        "case {case:?}: expected the announced path to name the api, got {announced:?}"
+    );
+
+    for (row, deployed) in rows.iter().zip(&deployed) {
+        let case = row.case;
+        let answered = written_on_the_wire(&authority, &format!("{base_path}{}", row.path)).await;
+        assert!(
+            answered.status.starts_with("HTTP/1.1 200"),
+            "case {case:?}: expected the action's own answer, got {}",
+            answered.summary()
+        );
+        // The three fields that say what the client just received: the media type AppConfig
+        // stated for the bytes, the version they belong to, and how many of them there are.
+        assert_field(case, &answered, "Content-Type", row.content_type);
+        assert_field(case, &answered, "Configuration-Version", &deployed.version);
+        assert_field(case, &answered, "Content-Length", &row.content.len().to_string());
+        assert_eq!(
+            answered.body, row.content,
+            "case {case:?}: expected the deployed content as the whole body, got {}",
+            answered.summary()
+        );
+    }
+
+    // And the same holds of the gateway's OWN answer at that address: a path no route of the
+    // api matches is the endpoint's `404`, whose JSON envelope is named canonically too.
+    let case = "a path no route of the api matches";
+    let answered = written_on_the_wire(&authority, &format!("{base_path}/nothing-here")).await;
     assert!(
-        head.starts_with("HTTP/1.1 200"),
-        "case {case:?}: expected the action's own answer, got {head:?}"
+        answered.status.starts_with("HTTP/1.1 404"),
+        "case {case:?}: expected the endpoint's own refusal, got {}",
+        answered.summary()
     );
-    // The field line itself, as HTTP writes a field name: lowercase, which is what every field
-    // of every answer this emulator sends is written as.
-    let field = head
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
-        .unwrap_or_else(|| panic!("case {case:?}: no content-type field in {head:?}"));
-    assert_eq!(
-        field.trim(),
-        format!("content-type: {CONTENT_TYPE}"),
-        "case {case:?}: expected the deployed media type as the answer's field, got {head:?}"
-    );
-    assert_eq!(
-        body.as_bytes(),
-        CONTENT,
-        "case {case:?}: expected the deployed content as the whole body, got {body:?}"
-    );
+    assert_field(case, &answered, "Content-Type", "application/json");
 }
