@@ -9,8 +9,9 @@
 //! is "the service you want the health status from" and `ELB` means "use Elastic Load
 //! Balancing health checks" — so an instance whose registration a load balancer the group is
 //! attached to reports as having failed that load balancer's health checks is reported
-//! `HealthStatus=Unhealthy` by `DescribeAutoScalingInstances` and `DescribeAutoScalingGroups`,
-//! and `Healthy` while no such load balancer reports it failing. A member reported unhealthy
+//! `HealthStatus` unhealthy by `DescribeAutoScalingInstances` and `DescribeAutoScalingGroups`,
+//! and healthy while no such load balancer reports it failing (each read publishes that state
+//! in its own token). A member reported unhealthy
 //! then owes what any failed health check of a group owes — "Amazon EC2 Auto Scaling
 //! terminates and replaces the unhealthy instance" (`SetInstanceHealth$HealthStatus`) — so the
 //! verdict is one the group acts on and not only one it reports.
@@ -86,9 +87,15 @@ const POLL: Duration = Duration::from_millis(100);
 const HELD_READS: usize = 20;
 
 /// The `HealthStatus` values Auto Scaling reports for an instance
-/// (`smithy_query(query="doc",shape="SetInstanceHealthQuery",member="HealthStatus")`).
-const HEALTHY: &str = "Healthy";
-const UNHEALTHY: &str = "Unhealthy";
+/// (`smithy_query(query="doc",shape="SetInstanceHealthQuery",member="HealthStatus")`), in the
+/// token the ACCOUNT-level instance read publishes them under.
+///
+/// `AutoScalingInstanceDetails$HealthStatus` is an unconstrained string whose states the
+/// model documents in prose only, and `DescribeAutoScalingInstances` — the read every leg
+/// below takes the verdict from ([`reported_health`]) — publishes the upper-case token, while
+/// the group's own per-instance projection publishes the mixed-case spelling.
+const HEALTHY: &str = "HEALTHY";
+const UNHEALTHY: &str = "UNHEALTHY";
 
 /// The `LifecycleState` of an instance the group has brought into service.
 const IN_SERVICE: &str = "InService";

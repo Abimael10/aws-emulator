@@ -312,7 +312,7 @@ fn instance_details(
         availability_zone: view.availability_zone,
         availability_zone_id: view.availability_zone_id,
         lifecycle_state: view.lifecycle_state,
-        health_status: view.health_status,
+        health_status: reported_health_status(&view.health_status),
         launch_configuration_name: view.launch_configuration_name,
         launch_template: view.launch_template,
         image_id: view.image_id,
@@ -322,4 +322,23 @@ fn instance_details(
         // the group's own read of the instance carries.
         weighted_capacity: view.weighted_capacity,
     }
+}
+
+/// The `HealthStatus` THIS read reports for one instance, from the state its group holds
+/// for it.
+///
+/// `AutoScalingInstanceDetails$HealthStatus` is an unconstrained string whose states the
+/// model documents in prose only — "`Healthy` means that the instance is healthy and
+/// should remain in service. `Unhealthy` means that the instance is unhealthy and Amazon
+/// EC2 Auto Scaling should terminate and replace it"
+/// (`smithy_query(query="doc",shape="AutoScalingInstanceDetails",member="HealthStatus")`)
+/// — so the token is not read off an enumeration. The token THIS operation publishes is
+/// the upper-case spelling of the state the group holds; the mixed-case spelling the state
+/// is stored and recorded in ([`crate::state::HEALTH_STATUS_HEALTHY`],
+/// [`crate::state::HEALTH_STATUS_UNHEALTHY`]) is what the group's own per-instance
+/// projection reports under `AutoScalingGroups[].Instances[]`. The two surfaces are
+/// rendered apart here rather than sharing one token, so a client that string-compares
+/// either field sees the spelling that surface publishes.
+fn reported_health_status(health_status: &str) -> String {
+    health_status.to_uppercase()
 }

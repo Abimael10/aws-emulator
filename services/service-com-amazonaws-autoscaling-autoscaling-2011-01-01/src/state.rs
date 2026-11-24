@@ -4725,8 +4725,8 @@ pub fn max_records_out_of_range_within(max_records: Option<i32>, ceiling: i32) -
 }
 
 /// The message a paginated read refuses a `MaxRecords` outside that range with: the
-/// standard sentence the service states for a member value outside its bounds, naming
-/// the member as the wire names it and the bound the value missed.
+/// sentence that belongs to the bound the value missed
+/// ([`max_records_violation_message_within`]).
 pub fn max_records_violation_message(max_records: i32) -> String {
     max_records_violation_message_within(
         max_records,
@@ -4739,14 +4739,47 @@ pub fn max_records_violation_message(max_records: i32) -> String {
 /// the value missed is the caller's to name.
 ///
 /// THE ONE COPY of that sentence for every paginated read of this service, whichever
-/// ceiling it holds its pages to.
+/// ceiling it holds its pages to — and a value is weighed against TWO bounds, under the
+/// sentence each of them carries:
+///
+/// * the member's own bounds, which every paginated read of the service shares
+///   ([`MIN_MAX_RECORDS`] to [`MAX_MAX_RECORDS`]): a value outside them is a member value
+///   outside its bounds and is stated as one ([`constraint_violation_message`]), naming the
+///   bound of the MEMBER rather than the read's own cap;
+/// * the page cap of THIS read, where it is smaller than the member's ceiling: a value
+///   inside the member's bounds but past that cap asks for more records than the read
+///   returns, which is the service's own limit ([`over_page_cap_message`]).
 pub fn max_records_violation_message_within(max_records: i32, ceiling: i32) -> String {
-    let constraint = if max_records < MIN_MAX_RECORDS {
-        format!("Member must have value greater than or equal to {MIN_MAX_RECORDS}")
-    } else {
-        format!("Member must have value less than or equal to {ceiling}")
-    };
-    constraint_violation_message(max_records, "maxRecords", &constraint)
+    let member_ceiling = i32::try_from(MAX_MAX_RECORDS).unwrap_or(i32::MAX);
+    if max_records < MIN_MAX_RECORDS {
+        return constraint_violation_message(
+            max_records,
+            "maxRecords",
+            &format!("Member must have value greater than or equal to {MIN_MAX_RECORDS}"),
+        );
+    }
+    if max_records > member_ceiling {
+        return constraint_violation_message(
+            max_records,
+            "maxRecords",
+            &format!("Member must have value less than or equal to {member_ceiling}"),
+        );
+    }
+    over_page_cap_message(ceiling)
+}
+
+/// The sentence a paginated read refuses a `MaxRecords` inside the member's own bounds but
+/// ABOVE the page cap it holds its pages to with, which names that cap.
+///
+/// `MaxRecords` is a plain integer in this service's model, with no range of its own
+/// (`smithy_query(query="shape",shape="MaxRecords")`), so a cap smaller than the member's
+/// ceiling is not a constraint the request failed to satisfy: it is how many records the
+/// read is willing to return, and the refusal says so. The cap is the operation's own — the
+/// name-ordered describes hold their pages to [`MAX_MAX_RECORDS`] and the instance and
+/// warm-pool reads to [`DEFAULT_MAX_RECORDS`] — so it is the only variable part of the
+/// sentence; the rest is fixed text.
+pub fn over_page_cap_message(ceiling: i32) -> String {
+    format!("The number of records returned is limited to {ceiling}")
 }
 
 /// Join the values a refusal names into the comma-separated list a service message

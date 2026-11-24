@@ -53,12 +53,34 @@ const IN_SERVICE: &str = "InService";
 const MAX_RECORDS_CEILING: usize = 50;
 const MAX_RECORDS_FLOOR: usize = 1;
 
+/// The largest `MaxRecords` the MEMBER itself admits on the paginated reads of this service,
+/// which is larger than the cap this read holds its pages to.
+///
+/// SOURCE: the name-ordered describes publish the member's own range — "The default value is
+/// `50` and the maximum value is `100`"
+/// (`smithy_query(query="doc",shape="AutoScalingGroupNamesType",member="MaxRecords")`) —
+/// while this read's own documentation caps it at 50, so a value between the two is inside
+/// the member's bounds and past this read's cap.
+const MEMBER_CEILING: usize = 100;
+
 /// An instance id of the issued form that the whole account holds nothing for.
 const ABSENT_INSTANCE_ID: &str = "i-00000000000000099";
 
 /// How many pages one walk may take before it is called a failure rather than a loop: far
 /// more than any case here needs, so only a read that never stops trips it.
 const PAGE_CAP: usize = 32;
+
+/// The `HealthStatus` token THIS read publishes for each state a group holds for one of its
+/// instances.
+///
+/// The member is an unconstrained string whose states the model documents in prose only
+/// (`smithy_query(query="doc",shape="AutoScalingInstanceDetails",member="HealthStatus")`):
+/// the group's own per-instance projection reports the state in the mixed-case spelling
+/// `SetInstanceHealth$HealthStatus` publishes, while the account-level read publishes the
+/// upper-case token. So a group's view of an instance is turned into the account read's view
+/// through this table.
+const ACCOUNT_READ_HEALTH_TOKENS: [(&str, &str); 2] =
+    [("Healthy", "HEALTHY"), ("Unhealthy", "UNHEALTHY")];
 
 /// One instance as a read reports it: every member of the reported shape, plus the group it
 /// belongs to.
@@ -106,6 +128,26 @@ fn members(list: &str, group: Option<&str>) -> Vec<Member> {
             weighted_capacity: tag_value(chunk, "WeightedCapacity"),
         })
         .collect()
+}
+
+impl Member {
+    /// This group view of an instance as the ACCOUNT-level read reports it: the same record,
+    /// with the health token that read publishes ([`ACCOUNT_READ_HEALTH_TOKENS`]).
+    fn as_account_read(&self) -> Member {
+        let (_, published) = ACCOUNT_READ_HEALTH_TOKENS
+            .iter()
+            .find(|(held, _)| *held == self.health_status)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the group reports one of the two documented health states, got {:?}",
+                    self.health_status
+                )
+            });
+        Member {
+            health_status: (*published).to_string(),
+            ..self.clone()
+        }
+    }
 }
 
 /// POST one `DescribeAutoScalingInstances` and answer its status and body.
@@ -231,12 +273,21 @@ struct Account {
 }
 
 impl Account {
-    /// Every instance of the account, in the order the groups above hold them: what a read
-    /// naming no ids and no page size must report.
+    /// Every instance of the account, in the order the groups above hold them, as the OWNING
+    /// GROUP reports it.
     fn every_member(&self) -> Vec<Member> {
         self.groups
             .iter()
             .flat_map(|(_, members)| members.clone())
+            .collect()
+    }
+
+    /// The same instances as the account-level read reports them: what a read naming no ids
+    /// and no page size must answer.
+    fn every_member_as_read(&self) -> Vec<Member> {
+        self.every_member()
+            .iter()
+            .map(Member::as_account_read)
             .collect()
     }
 
@@ -297,11 +348,12 @@ async fn the_account_read_reports_every_group_member_as_its_group_does() {
              {token:?}",
             account.every_member().len()
         );
-        // Each entry is the owning group's own record of that instance, in the order the
-        // groups hold them: one instance, two reads, one answer.
+        // Each entry is the owning group's own record of that instance, under the health
+        // token this read publishes, in the order the groups hold them: one instance, two
+        // reads, one answer.
         assert_eq!(
             reported,
-            account.every_member(),
+            account.every_member_as_read(),
             "case {case:?}: expected each group's own view of its instances, got {reported:?}"
         );
         // And every entry names the group it belongs to, which the group's own read does not
@@ -325,7 +377,7 @@ async fn the_account_read_reports_every_group_member_as_its_group_does() {
 async fn the_account_read_pages_over_every_group_and_each_page_follows_the_last() {
     let case = "two groups holding four instances between them";
     let account = account(case, &[3, 1]).await;
-    let all = account.every_member();
+    let all = account.every_member_as_read();
     let total = all.len();
     assert_eq!(
         total, 4,
@@ -395,7 +447,7 @@ struct FilterRow {
 async fn the_account_read_filters_by_the_ids_it_is_given_and_ignores_the_rest() {
     let case = "two groups holding three instances between them";
     let account = account(case, &[2, 1]).await;
-    let all = account.every_member();
+    let all = account.every_member_as_read();
     assert_eq!(
         all.len(),
         3,
@@ -488,8 +540,9 @@ struct BoundRow {
     refusal: Option<String>,
 }
 
-/// A `MaxRecords` outside the bounds this read publishes is refused with the sentence for a
-/// member value outside its bounds, and a value inside them is served.
+/// A `MaxRecords` outside the bounds this read publishes is refused — above the ceiling with
+/// the service's own sentence naming the page cap, below the floor with the sentence for a
+/// member value outside its bounds — and a value inside them is served.
 #[tokio::test]
 async fn the_account_read_holds_its_page_size_to_the_bounds_it_publishes() {
     let case = "one group holding two instances";
@@ -529,10 +582,23 @@ async fn the_account_read_holds_its_page_size_to_the_bounds_it_publishes() {
             case: "one past the published ceiling",
             max_records: (MAX_RECORDS_CEILING + 1).to_string(),
             refusal: Some(format!(
+                "The number of records returned is limited to {MAX_RECORDS_CEILING}"
+            )),
+        },
+        BoundRow {
+            case: "the largest page the member itself admits, which is past this read's cap",
+            max_records: MEMBER_CEILING.to_string(),
+            refusal: Some(format!(
+                "The number of records returned is limited to {MAX_RECORDS_CEILING}"
+            )),
+        },
+        BoundRow {
+            case: "one past the largest page the member admits",
+            max_records: (MEMBER_CEILING + 1).to_string(),
+            refusal: Some(format!(
                 "1 validation error detected: Value '{}' at 'maxRecords' failed to satisfy \
-                 constraint: Member must have value less than or equal to \
-                 {MAX_RECORDS_CEILING}",
-                MAX_RECORDS_CEILING + 1
+                 constraint: Member must have value less than or equal to {MEMBER_CEILING}",
+                MEMBER_CEILING + 1
             )),
         },
     ];
@@ -676,9 +742,10 @@ async fn the_account_read_reflects_what_the_groups_hold_and_changes_nothing() {
     let members = settled(&account.router, case, &grown, 3).await;
     let reported = wait_for_account_read(&account.router, case, 4).await;
     for member in &members {
+        let expected = member.as_account_read();
         assert!(
-            reported.contains(member),
-            "case {case:?}: expected the account read to report {member:?}, got {reported:?}"
+            reported.contains(&expected),
+            "case {case:?}: expected the account read to report {expected:?}, got {reported:?}"
         );
     }
 

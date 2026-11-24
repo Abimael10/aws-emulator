@@ -1100,11 +1100,7 @@ async fn an_unsatisfiable_request_is_refused() {
             absent_group: None,
             status: 400,
             code: "ValidationError",
-            message: format!(
-                "1 validation error detected: Value '{}' at 'maxRecords' failed to satisfy \
-                 constraint: Member must have value less than or equal to {MAX_MAX_RECORDS}",
-                MAX_MAX_RECORDS + 1
-            ),
+            message: format!("The number of records returned is limited to {MAX_MAX_RECORDS}"),
         },
         Refusal {
             case: "a token this service never issued",

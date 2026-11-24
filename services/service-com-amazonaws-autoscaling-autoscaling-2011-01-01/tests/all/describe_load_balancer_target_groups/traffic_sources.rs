@@ -479,9 +479,7 @@ fn refusal_rows(stored_group: &str) -> Vec<RefusalRow> {
             extra: vec![p("MaxRecords", "51")],
             status: 400,
             code: "ValidationError",
-            message: "1 validation error detected: Value '51' at 'maxRecords' failed to satisfy \
-                      constraint: Member must have value less than or equal to 50"
-                .to_string(),
+            message: "The number of records returned is limited to 50".to_string(),
         },
         RefusalRow {
             case: "a token with no page size beside it",

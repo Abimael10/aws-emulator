@@ -61,6 +61,24 @@ const IN_SERVICE: &str = "InService";
 const HEALTHY: &str = "Healthy";
 const UNHEALTHY: &str = "Unhealthy";
 
+/// The same two states as the ACCOUNT-level instance read publishes them.
+///
+/// `AutoScalingInstanceDetails$HealthStatus` is an unconstrained string whose states the
+/// model documents in prose only, and the token that read publishes is the upper-case one,
+/// while the group's own per-instance projection publishes the mixed-case spelling above:
+/// the two surfaces are compared against each other here through this pairing.
+const INSTANCE_READ_HEALTH_TOKENS: [(&str, &str); 2] =
+    [(HEALTHY, "HEALTHY"), (UNHEALTHY, "UNHEALTHY")];
+
+/// The token the account-level instance read publishes for the state a group reports.
+fn instance_read_health_token(held: &str) -> String {
+    INSTANCE_READ_HEALTH_TOKENS
+        .iter()
+        .find(|(group_token, _)| *group_token == held)
+        .map(|(_, published)| (*published).to_string())
+        .unwrap_or_else(|| panic!("the group reports one of the two documented states, got {held:?}"))
+}
+
 /// The image and instance type every launch template in this suite carries.
 const IMAGE_ID: &str = "ami-00000000000000071";
 const INSTANCE_TYPE: &str = "t3.micro";
@@ -180,13 +198,19 @@ async fn reported_member(
             group_of, name,
             "case {case:?}: the instance reader must report the group holding {instance_id}"
         );
-        if from_instance_read == from_group {
+        // One stored instance, two surfaces: the records agree member for member, with the
+        // health state in the token each surface publishes it under.
+        let expected = Reported {
+            health_status: instance_read_health_token(&from_group.health_status),
+            ..from_group.clone()
+        };
+        if from_instance_read == expected {
             return from_group;
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: the two reads must report one instance for {instance_id}, got \
-             {from_instance_read:?} from the instance reader and {from_group:?} from the group"
+             {from_instance_read:?} from the instance reader and {expected:?} from the group"
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
