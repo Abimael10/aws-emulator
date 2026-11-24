@@ -115,8 +115,8 @@ const PUBLISHED_TYPES: &[(&str, &str)] = &[
 ///
 /// They differ along what the rule generalises over: how many parameters the action takes
 /// (none, one, two or more), whether the published text opens with an assertion, an
-/// imperative or a noun, and which AWS service the id belongs to. Only the first row was
-/// cited by an issue.
+/// imperative, an `It ` or a noun, and which AWS service the id belongs to. Only the third
+/// row was cited by an issue.
 const PUBLISHED_ACTION_TEXT: &[(&str, &str)] = &[
     (
         "aws:cloudwatch:assert-alarm-state",
@@ -128,17 +128,18 @@ const PUBLISHED_ACTION_TEXT: &[(&str, &str)] = &[
     ),
     (
         "aws:ecs:task-network-latency",
-        "Adds latency and jitter to the network traffic of a set of Amazon ECS tasks.",
-    ),
-    ("aws:fis:wait", "Waits for the specified duration."),
-    (
-        "aws:rds:failover-db-cluster",
-        "Fails over a set of Amazon Aurora DB clusters.",
+        "It adds latency, with jitter, to outgoing or incoming traffic from a configurable \
+         list of sources (Supported: IPv4, IPv4/CIDR, domain name, DYNAMODB|S3).",
     ),
     (
-        "aws:s3:bucket-pause-replication",
-        "Pauses replication from a set of S3 buckets.",
+        "aws:eks:pod-memory-stress",
+        "Runs memory stress on the target pods.",
     ),
+    (
+        "aws:rds:reboot-db-instances",
+        "Reboot the specified DB instances.",
+    ),
+    ("aws:ssm:send-command", "Run the specified SSM document."),
 ];
 
 /// The name every template this suite creates gives its one target.

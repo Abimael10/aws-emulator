@@ -203,10 +203,13 @@ pub const FIS_ACTION_ID_CONDITION_KEY: &str = "ec2:FisActionId";
 ///   a noun phrase rather than a sentence), and it is the value a client that renders or
 ///   snapshots `Action$description` sees. The published strings follow no one pattern — some
 ///   are imperative (`aws:ec2:reboot-instances`, `aws:ec2:stop-instances`,
-///   `aws:ec2:terminate-instances`, `aws:ssm:send-command`,
+///   `aws:ec2:terminate-instances`, `aws:rds:reboot-db-instances`, `aws:ssm:send-command`,
 ///   `aws:ssm:start-automation-execution` and `aws:arc:start-zonal-autoshift` are published
-///   that way, which is why they read differently from their neighbours), others open with
-///   the verb in the third person — so a row carries the string published for ITS id and
+///   that way, which is why they read differently from their neighbours), some open with
+///   `It ` and name the command or the sources the fault is applied to (every
+///   `aws:ecs:task-*` action), others open with the verb in the third person and name the
+///   fault's subject the way the action's own page does (`the target pods`, for
+///   `aws:eks:pod-*-stress`) — so a row carries the string published for ITS id and
 ///   never one shaped after a sibling row's, and a row whose published string is not
 ///   established keeps the text it has rather than being restated to look published;
 /// * an action FIS performs through another service's agent carries that service's own
@@ -560,7 +563,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-kill-process",
-        description: "Kills a process on a set of Amazon ECS tasks.",
+        description: "It kills a particular process by name, using the killall command.",
         parameters: &[
             ActionCatalogParameter {
                 name: "installDependencies",
@@ -587,7 +590,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-blackhole-port",
-        description: "Drops traffic on a port of a set of Amazon ECS tasks.",
+        description: "It drops incoming or outgoing traffic for a configurable protocol (tcp or \
+                      udp) and port which is useful for simulating dependency failures.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -624,8 +628,9 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-latency",
-        description: "Adds latency and jitter to the network traffic of a set of Amazon ECS \
-                      tasks.",
+        description: "It adds latency, with jitter, to outgoing or incoming traffic from a \
+                      configurable list of sources (Supported: IPv4, IPv4/CIDR, domain name, \
+                      DYNAMODB|S3).",
         parameters: &[
             ActionCatalogParameter {
                 name: "delayMilliseconds",
@@ -662,7 +667,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-packet-loss",
-        description: "Drops a percentage of the network packets of a set of Amazon ECS tasks.",
+        description: "It adds packet loss to outgoing or incoming traffic from a configurable \
+                      list of sources (Supported: IPv4, IPv4/CIDR, domain name, DYNAMODB|S3).",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -694,7 +700,8 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:inject-kubernetes-custom-resource",
-        description: "Applies a Kubernetes custom resource to an Amazon EKS cluster.",
+        description: "Injects the specified kubernetes custom resource in the target EKS \
+                      cluster.",
         parameters: &[
             ActionCatalogParameter {
                 name: "kubernetesApiVersion",
@@ -731,7 +738,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-cpu-stress",
-        description: "Runs CPU stress on a set of Kubernetes pods.",
+        description: "Runs CPU stress on the target pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -783,7 +790,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-io-stress",
-        description: "Runs I/O stress on a set of Kubernetes pods.",
+        description: "Runs IO stress on the target pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -814,7 +821,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-memory-stress",
-        description: "Runs memory stress on a set of Kubernetes pods.",
+        description: "Runs memory stress on the target pods.",
         parameters: &[
             ActionCatalogParameter {
                 name: "duration",
@@ -1328,7 +1335,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
     },
     ActionCatalogEntry {
         id: "aws:rds:reboot-db-instances",
-        description: "Reboots a set of Amazon RDS DB instances.",
+        description: "Reboot the specified DB instances.",
         parameters: &[ActionCatalogParameter {
             name: "forceFailover",
             description: "Whether to force a failover of a Multi-AZ DB instance.",
