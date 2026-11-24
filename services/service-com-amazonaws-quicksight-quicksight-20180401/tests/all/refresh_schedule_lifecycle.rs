@@ -26,6 +26,13 @@
 //! set or the schedule the path names is not held. The rows about it vary the region, the
 //! account, the form of the ids, the deleted schedule's interval and its position among
 //! the data set's schedules.
+//!
+//! The other half of that rule is what a delete removes when its path identifies no
+//! schedule of the caller's account: nothing. Those rows span an account id outside the
+//! shape the model constrains it to, an account holding no data set, a data set the
+//! account does not hold, a schedule the data set does not hold, and a schedule id a
+//! sibling data set of the same account holds — and each one is followed by a read of
+//! every schedule the fixture held.
 
 use serde_json::{json, Value};
 
@@ -1277,6 +1284,200 @@ async fn a_delete_touches_no_other_data_set_or_account() {
             "keying {account}/{data_set_id}: expected the surviving schedule's own ARN, got {body}"
         );
     }
+}
+
+/// One delete whose path identifies no schedule of the caller's account, and the status
+/// its refusal takes.
+struct RefusedDeleteCase {
+    /// Case name, reported by every assertion below.
+    name: &'static str,
+    /// The account the row addresses.
+    account: &'static str,
+    /// The data set the row addresses.
+    data_set_id: &'static str,
+    /// The schedule the row addresses.
+    schedule_id: &'static str,
+    /// The HTTP status the refusal takes.
+    status: u16,
+    /// The error shape the refusal names.
+    error: &'static str,
+}
+
+/// The fixture the refused-delete rows are addressed against: two data sets of
+/// [`ACCOUNT`], each holding a schedule the other does not.
+const REFUSAL_FIXTURE: &[(&str, &str, &str)] = &[
+    ("orders", "nightly", "DAILY"),
+    ("orders", "hourly", "HOURLY"),
+    ("returns", "monthly", "MONTHLY"),
+];
+
+/// Rows spanning the ways a delete's path can fail to identify a schedule: an
+/// `AwsAccountId` outside the shape the model constrains it to — `len 12..12,
+/// pattern ^[0-9]{12}$`, source `smithy_query(query="shape", shape="AwsAccountId")` —
+/// which the framework refuses before the handler runs, and an address within that shape
+/// naming an account, a data set or a schedule that is not held, including a schedule id a
+/// SIBLING data set of the same account holds.
+const REFUSED_DELETE_CASES: &[RefusedDeleteCase] = &[
+    RefusedDeleteCase {
+        name: "an account id one digit short",
+        account: "00000000000",
+        data_set_id: "orders",
+        schedule_id: "nightly",
+        status: 400,
+        error: "ValidationException",
+    },
+    RefusedDeleteCase {
+        name: "an account id one digit long",
+        account: "0000000000000",
+        data_set_id: "orders",
+        schedule_id: "nightly",
+        status: 400,
+        error: "ValidationException",
+    },
+    RefusedDeleteCase {
+        name: "a 12-character account id carrying a letter",
+        account: "00000000000a",
+        data_set_id: "orders",
+        schedule_id: "nightly",
+        status: 400,
+        error: "ValidationException",
+    },
+    RefusedDeleteCase {
+        name: "a 12-character account id carrying a separator",
+        account: "0000-0000000",
+        data_set_id: "orders",
+        schedule_id: "nightly",
+        status: 400,
+        error: "ValidationException",
+    },
+    RefusedDeleteCase {
+        name: "an account that holds no data set",
+        account: "123456789012",
+        data_set_id: "orders",
+        schedule_id: "nightly",
+        status: 404,
+        error: "ResourceNotFoundException",
+    },
+    RefusedDeleteCase {
+        name: "a data set the account does not hold",
+        account: ACCOUNT,
+        data_set_id: "no-such-data-set",
+        schedule_id: "nightly",
+        status: 404,
+        error: "ResourceNotFoundException",
+    },
+    RefusedDeleteCase {
+        name: "a schedule the data set does not hold",
+        account: ACCOUNT,
+        data_set_id: "orders",
+        schedule_id: "no-such-schedule",
+        status: 404,
+        error: "ResourceNotFoundException",
+    },
+    RefusedDeleteCase {
+        name: "a schedule a sibling data set of the same account holds",
+        account: ACCOUNT,
+        data_set_id: "orders",
+        schedule_id: "monthly",
+        status: 404,
+        error: "ResourceNotFoundException",
+    },
+];
+
+#[tokio::test]
+async fn a_delete_whose_path_identifies_no_schedule_removes_nothing() {
+    let harness = Harness::new();
+    for data_set_id in ["orders", "returns"] {
+        data_set_fixture(&harness, ACCOUNT, data_set_id).await;
+    }
+    for (data_set_id, schedule_id, interval) in REFUSAL_FIXTURE.iter().copied() {
+        let (status, body) = create_schedule(
+            &harness,
+            ACCOUNT,
+            data_set_id,
+            daily_schedule(schedule_id, interval),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "fixture {data_set_id}/{schedule_id}: create expected 200, got {status} with body {body}"
+        );
+    }
+
+    // What every schedule of the fixture reports before any refused delete.
+    let mut before: Vec<(&str, &str, Value)> = Vec::new();
+    for (data_set_id, schedule_id, _) in REFUSAL_FIXTURE.iter().copied() {
+        let (status, body) = describe_schedule(&harness, ACCOUNT, data_set_id, schedule_id).await;
+        assert_eq!(
+            status, 200,
+            "fixture {data_set_id}/{schedule_id}: describe expected 200, got {status} with body {body}"
+        );
+        before.push((data_set_id, schedule_id, body["RefreshSchedule"].clone()));
+    }
+
+    for case in REFUSED_DELETE_CASES {
+        let name = case.name;
+        let (status, body) = delete_schedule_in(
+            &harness,
+            REGION,
+            case.account,
+            case.data_set_id,
+            case.schedule_id,
+        )
+        .await;
+        assert_eq!(
+            status, case.status,
+            "case {name}: expected {}, got {status} with body {body}",
+            case.status
+        );
+        assert_eq!(
+            body["__type"],
+            json!(case.error),
+            "case {name}: expected {}, got {body}",
+            case.error
+        );
+    }
+
+    // Every refusal above removed nothing: each schedule still reads back exactly as it
+    // did, and each data set still lists exactly the schedules it held.
+    for (data_set_id, schedule_id, stored) in &before {
+        let (status, body) = describe_schedule(&harness, ACCOUNT, data_set_id, schedule_id).await;
+        assert_eq!(
+            status, 200,
+            "{data_set_id}/{schedule_id}: a refused delete must leave the schedule readable, got {status} with body {body}"
+        );
+        assert_eq!(
+            &body["RefreshSchedule"], stored,
+            "{data_set_id}/{schedule_id}: a refused delete changed the stored schedule: expected {stored}, got {}",
+            body["RefreshSchedule"]
+        );
+    }
+    for data_set_id in ["orders", "returns"] {
+        let listed = list_schedule_ids(&harness, REGION, ACCOUNT, data_set_id, data_set_id).await;
+        let mut expected_ids: Vec<String> = REFUSAL_FIXTURE
+            .iter()
+            .filter(|(held_in, _, _)| *held_in == data_set_id)
+            .map(|(_, schedule_id, _)| schedule_id.to_string())
+            .collect();
+        expected_ids.sort();
+        assert_eq!(
+            listed, expected_ids,
+            "{data_set_id}: after the refused deletes the list expected {expected_ids:?}, got {listed:?}"
+        );
+    }
+
+    // And the schedule a refusal named by a sibling data set's id is still deletable
+    // through the data set that does hold it.
+    let (status, body) = delete_schedule_in(&harness, REGION, ACCOUNT, "returns", "monthly").await;
+    assert_eq!(
+        status, 200,
+        "the sibling's own delete expected 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        body["Arn"],
+        json!(refresh_schedule_arn(ACCOUNT, "returns", "monthly")),
+        "the sibling's own delete expected that schedule's ARN, got {body}"
+    );
 }
 
 #[tokio::test]
