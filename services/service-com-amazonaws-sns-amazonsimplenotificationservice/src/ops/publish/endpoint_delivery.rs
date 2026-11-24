@@ -20,6 +20,13 @@
 //! ([`PendingConfirmation`]). Until it is confirmed it receives nothing, exactly as the
 //! publishing path already decides for every unconfirmed subscription.
 //!
+//! That request is retried along its schedule ON THE CLOCK rather than only while the call
+//! that started it is open ([`send_about_the_subscription`]): its token is the subscriber's
+//! only path to `ConfirmSubscription`, and no answer of this service reports whether it
+//! arrived, so a receiver that could not take it YET — one still provisioning, or one
+//! throttling what reaches it — is POSTed to again after the call has answered, as the
+//! schedule the subscription's own delivery policy states allows.
+//!
 //! HOW MANY TIMES one notification is attempted is the subscription's own retry budget:
 //! "DeliveryPolicy – The policy that defines how Amazon SNS retries failed deliveries to
 //! HTTP/S endpoints" (`SetSubscriptionAttributesInput$AttributeName`), reported as its
@@ -596,6 +603,8 @@ pub(crate) struct PendingConfirmation {
     message_id: String,
     /// The document POSTed.
     body: String,
+    /// The wait before each RETRY of this request, in order ([`about_the_subscription_waits`]).
+    waits: Vec<Duration>,
 }
 
 impl PendingConfirmation {
@@ -649,6 +658,10 @@ impl PendingConfirmation {
                 &signer,
             ),
             message_id,
+            waits: about_the_subscription_waits(&state::effective_subscription_delivery(
+                topic,
+                subscription,
+            )),
         })
     }
 }
@@ -768,6 +781,8 @@ pub(crate) struct Cancellation {
     message_id: String,
     /// The document POSTed.
     body: String,
+    /// The wait before each RETRY of this message, in order ([`about_the_subscription_waits`]).
+    waits: Vec<Duration>,
 }
 
 impl Cancellation {
@@ -816,6 +831,10 @@ impl Cancellation {
             ),
             subscription_arn: subscription.arn.clone(),
             message_id,
+            waits: about_the_subscription_waits(&state::effective_subscription_delivery(
+                topic,
+                subscription,
+            )),
         })
     }
 }
@@ -867,14 +886,15 @@ pub(crate) async fn send_confirmation(
 ) {
     send_about_the_subscription(
         ctx,
-        &AboutTheSubscription {
+        AboutTheSubscription {
             message_type: SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE,
             named_in_a_header: false,
-            target: &pending.target,
-            topic_arn: &pending.topic_arn,
-            subscription_arn: &pending.subscription_arn,
-            message_id: &pending.message_id,
-            body: &pending.body,
+            target: pending.target.clone(),
+            topic_arn: pending.topic_arn.clone(),
+            subscription_arn: pending.subscription_arn.clone(),
+            message_id: pending.message_id.clone(),
+            body: pending.body.clone(),
+            waits: pending.waits.clone(),
         },
     )
     .await;
@@ -892,14 +912,15 @@ pub(crate) async fn send_cancellation(
 ) {
     send_about_the_subscription(
         ctx,
-        &AboutTheSubscription {
+        AboutTheSubscription {
             message_type: UNSUBSCRIBE_CONFIRMATION_MESSAGE_TYPE,
             named_in_a_header: true,
-            target: &cancelled.target,
-            topic_arn: &cancelled.topic_arn,
-            subscription_arn: &cancelled.subscription_arn,
-            message_id: &cancelled.message_id,
-            body: &cancelled.body,
+            target: cancelled.target.clone(),
+            topic_arn: cancelled.topic_arn.clone(),
+            subscription_arn: cancelled.subscription_arn.clone(),
+            message_id: cancelled.message_id.clone(),
+            body: cancelled.body.clone(),
+            waits: cancelled.waits.clone(),
         },
     )
     .await;
@@ -909,71 +930,70 @@ pub(crate) async fn send_cancellation(
 /// published message: the confirmation a new subscription's endpoint is sent, and the final
 /// cancellation an unauthenticated `Unsubscribe` delivers. Both carry a token the endpoint
 /// owner presents to `ConfirmSubscription`, and both are POSTed the same way.
-struct AboutTheSubscription<'r> {
+///
+/// It OWNS every value it POSTs, because the attempts it has left outlive the call that
+/// started it ([`continued_on_the_clock`]): nothing of the request being served is borrowed
+/// into them.
+#[derive(Debug, Clone)]
+struct AboutTheSubscription {
     /// The kind of message, which the request's own header and the document's `Type` state.
-    message_type: &'r str,
+    message_type: &'static str,
     /// Whether the request NAMES the subscription it is about in a header: a cancellation
     /// does, because the endpoint has been receiving that subscription's notifications and
     /// the message is about ending them, while a confirmation does not — the subscriber
     /// learns the ARN from `ConfirmSubscription`.
     named_in_a_header: bool,
     /// The URL the request is POSTed to.
-    target: &'r EndpointLocation,
-    topic_arn: &'r str,
-    subscription_arn: &'r str,
-    message_id: &'r str,
+    target: EndpointLocation,
+    topic_arn: String,
+    subscription_arn: String,
+    message_id: String,
     /// The document POSTed.
-    body: &'r str,
+    body: String,
+    /// The wait before each RETRY of this request, in order
+    /// ([`about_the_subscription_waits`]).
+    waits: Vec<Duration>,
 }
 
-/// POST `request` to the endpoint of the subscription it is about.
-///
-/// An endpoint that could not take the request YET is attempted again along the phases the
-/// published delivery policy opens with ([`super::retry_waits`]), within one request's own
-/// waiting budget — the schedule every other endpoint kind of this crate retries such an
-/// answer along. It is that schedule rather than the subscription's `numRetries` because this
-/// request is not a delivery of a published message: a subscriber that is not up yet is
-/// exactly the condition those phases exist for, and the retry budget a client sizes governs
-/// the NOTIFICATIONS it will receive.
-async fn send_about_the_subscription(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    request: &AboutTheSubscription<'_>,
-) {
-    let transport = ctx.callback().http_connector();
-    let mut waiting = RetryBudget::new();
-    let mut waits = super::retry_waits();
-    let mut headers = vec![
-        (MESSAGE_TYPE_HEADER, request.message_type),
-        (MESSAGE_ID_HEADER, request.message_id),
-        (TOPIC_ARN_HEADER, request.topic_arn),
-    ];
-    if request.named_in_a_header {
-        headers.push((SUBSCRIPTION_ARN_HEADER, request.subscription_arn));
+impl AboutTheSubscription {
+    /// The `x-amz-sns-*` headers this request carries.
+    fn headers(&self) -> Vec<(&str, &str)> {
+        let mut headers = vec![
+            (MESSAGE_TYPE_HEADER, self.message_type),
+            (MESSAGE_ID_HEADER, self.message_id.as_str()),
+            (TOPIC_ARN_HEADER, self.topic_arn.as_str()),
+        ];
+        if self.named_in_a_header {
+            headers.push((SUBSCRIPTION_ARN_HEADER, self.subscription_arn.as_str()));
+        }
+        headers
     }
-    loop {
+
+    /// ONE POST of this request, and what that attempt came to.
+    async fn attempt(&self, transport: &SharedHttpConnector) -> HandOver {
         let posted = post(
-            &transport,
-            request.target,
-            &headers,
+            transport,
+            &self.target,
+            &self.headers(),
             &state::RequestPolicy::system_default().header_content_type,
-            request.body,
+            &self.body,
         )
         .await;
-        let outcome = match &posted {
+        match &posted {
             Posted::Answered { status, .. } if SUCCESS_STATUSES.contains(status) => {
                 ::tracing::info!(
-                    subscription = %request.subscription_arn,
-                    endpoint = %request.target.url,
-                    message_type = %request.message_type,
+                    subscription = %self.subscription_arn,
+                    endpoint = %self.target.url,
+                    message_type = %self.message_type,
                     "a subscribed endpoint was sent the request about its own subscription"
                 );
-                return;
+                HandOver::Taken
             }
             Posted::Answered { status, .. } => {
                 ::tracing::warn!(
-                    subscription = %request.subscription_arn,
-                    endpoint = %request.target.url,
-                    message_type = %request.message_type,
+                    subscription = %self.subscription_arn,
+                    endpoint = %self.target.url,
+                    message_type = %self.message_type,
                     status = *status,
                     "a subscribed endpoint did not take the request about its own subscription"
                 );
@@ -981,9 +1001,9 @@ async fn send_about_the_subscription(
             }
             Posted::NotReached(detail) => {
                 ::tracing::warn!(
-                    subscription = %request.subscription_arn,
-                    endpoint = %request.target.url,
-                    message_type = %request.message_type,
+                    subscription = %self.subscription_arn,
+                    endpoint = %self.target.url,
+                    message_type = %self.message_type,
                     detail = %detail,
                     "a subscribed endpoint could not be reached, so the request about its own \
                      subscription was not delivered"
@@ -993,20 +1013,140 @@ async fn send_about_the_subscription(
                 // nothing. The subscriber asks for another request by subscribing again.
                 HandOver::Refused
             }
-        };
-        if outcome != HandOver::NotYet {
+        }
+    }
+}
+
+/// The wait before each RETRY of a request about the subscription itself, in order.
+///
+/// "Amazon SNS defines a delivery policy for each delivery protocol. The delivery policy
+/// defines how Amazon SNS retries the delivery of messages when server-side errors occur" — so
+/// such a request is retried along the published policy's own opening phases
+/// ([`super::retry_waits`]: three immediate retries and two a second apart) and then along the
+/// `healthyRetryPolicy` in force on the subscription ([`retry_waits`]), the schedule
+/// `EffectiveDeliveryPolicy` reports for it. The two together are what a subscriber that is not
+/// up YET is given: the opening phases are the ones a receiver almost ready is reached by, and
+/// the policy's own delays are what carry the request to one that takes longer.
+fn about_the_subscription_waits(policy: &state::SubscriptionDeliveryPolicy) -> Vec<Duration> {
+    super::retry_waits()
+        .chain(retry_waits(&policy.healthy_retry_policy))
+        .collect()
+}
+
+/// How long the attempts made AFTER the call that started them has answered may spend waiting,
+/// across one request about a subscription.
+///
+/// EMULATOR-CHOSEN: the policy's own later phases span days, which this process does not hold
+/// work for. Sized to the whole schedule the ACCOUNT SYSTEM DEFAULT `healthyRetryPolicy`
+/// states — its three retries at its twenty-second delay targets
+/// ([`state::HealthyRetryPolicy::system_default`]) — which is the schedule a subscription
+/// nobody configured runs under, so that schedule is carried out in full and a policy asking
+/// for longer delays than it is given up on here.
+const MAX_CONTINUED_WAIT: Duration = Duration::from_secs(60);
+
+/// How many requests about a subscription may be waiting on their next attempt AT ONCE, over
+/// every subscription this process serves.
+///
+/// A waiting attempt is work in flight, and a caller subscribing endpoints that take nothing
+/// drives such work, so every continuation takes one of these permits before it waits: a
+/// request that finds none left is not continued, which is where a schedule that has run out
+/// leaves one too. The permit is released as soon as the continuation ends, so what this bounds
+/// is what is in flight rather than how many requests may ever be continued.
+const MAX_CONTINUED_REQUESTS: usize = 64;
+
+/// Those permits, one per continuation in flight.
+static CONTINUATIONS: ::tokio::sync::Semaphore =
+    ::tokio::sync::Semaphore::const_new(MAX_CONTINUED_REQUESTS);
+
+/// POST `request` to the endpoint of the subscription it is about.
+///
+/// An endpoint that could not take the request YET is attempted again along
+/// [`about_the_subscription_waits`]: the attempts whose wait fits what this call has left to
+/// spend ([`RetryBudget`]) are made while it is open, and the rest on a task of their OWN
+/// ([`continued_on_the_clock`]). The schedule runs on the CLOCK rather than inside the call
+/// because the token this request carries is the subscriber's only path to
+/// `ConfirmSubscription` and no answer of this service reports whether it arrived: abandoning
+/// the schedule when the call answers loses the token to a receiver that was briefly unable to
+/// take it.
+async fn send_about_the_subscription(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    request: AboutTheSubscription,
+) {
+    let transport = ctx.callback().http_connector();
+    let mut waiting = RetryBudget::new();
+    let mut waits = request.waits.clone().into_iter().enumerate();
+    loop {
+        if request.attempt(&transport).await != HandOver::NotYet {
             return;
         }
-        let Some(wait) = waits.next() else {
+        let Some((index, wait)) = waits.next() else {
             return;
         };
         if !wait.is_zero() && !waiting.charge(wait) {
+            // What is left of the schedule outlives this call, so it is carried out there.
+            continued_on_the_clock(ctx, &request, index);
             return;
         }
         if !wait.is_zero() {
             ::tokio::time::sleep(wait).await;
         }
     }
+}
+
+/// Make the attempts of `request` from its `from`th wait on, on a task of its OWN, so that
+/// what is left of the schedule runs on the CLOCK instead of inside the call that started it.
+///
+/// The task holds a clone of the emulator this handler runs within, so every POST it makes is
+/// dispatched back into this same process exactly as the attempts before it were ([`post`]),
+/// and nothing of the call being served is borrowed into it. It stops at the first answer that
+/// settles the request — taken, or a refusal the next attempt would earn again — and gives up
+/// once the schedule is exhausted or its waiting would pass [`MAX_CONTINUED_WAIT`], which is
+/// where the phases this emulator does not perform end too. Nothing is continued beyond
+/// [`MAX_CONTINUED_REQUESTS`] requests in flight.
+fn continued_on_the_clock(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    request: &AboutTheSubscription,
+    from: usize,
+) {
+    let waits: Vec<Duration> = request.waits.iter().copied().skip(from).collect();
+    if waits.is_empty() {
+        return;
+    }
+    let Ok(permit) = CONTINUATIONS.try_acquire() else {
+        ::tracing::warn!(
+            subscription = %request.subscription_arn,
+            endpoint = %request.target.url,
+            message_type = %request.message_type,
+            waiting = MAX_CONTINUED_REQUESTS,
+            "as many requests about a subscription are already waiting on their next attempt as \
+             this emulator carries at once, so this one is not attempted again"
+        );
+        return;
+    };
+    let request = request.clone();
+    let callback = ctx.callback().clone();
+    ::tokio::spawn(async move {
+        let _held = permit;
+        let transport = callback.http_connector();
+        let mut spent = Duration::ZERO;
+        for wait in waits {
+            spent = spent.saturating_add(wait);
+            if spent > MAX_CONTINUED_WAIT {
+                break;
+            }
+            ::tokio::time::sleep(wait).await;
+            if request.attempt(&transport).await != HandOver::NotYet {
+                return;
+            }
+        }
+        ::tracing::warn!(
+            subscription = %request.subscription_arn,
+            endpoint = %request.target.url,
+            message_type = %request.message_type,
+            "a subscribed endpoint never took the request about its own subscription, so the \
+             schedule its delivery policy states is exhausted"
+        );
+    });
 }
 
 #[cfg(test)]
