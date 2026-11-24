@@ -46,6 +46,10 @@
 //! Nothing is waited out: the stacks are asked for together and each is polled to the status it
 //! settles on, and every alarm state is polled until the evaluation its owning service's clock
 //! owes has been materialised.
+//!
+//! The harness this suite needs to reach that estate — the assembled router, the three services'
+//! wire calls, the stack poll, the alarm read and the history read — is `pub(crate)` here, so a
+//! sibling suite over the same estate imports it rather than holding a second copy of it.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,19 +76,19 @@ const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
 const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 const LOGS_SIGNING_NAME: &str = "logs";
 
-/// The three values of `StateValue` this suite names
+/// The three values of `StateValue` these suites name
 /// (`smithy_query(query="shape",shape="StateValue")`): the one a create sets
 /// ("When this operation creates an alarm, the alarm state is immediately set to
 /// INSUFFICIENT_DATA", `PutMetricAlarm`), the one an empty series under `notBreaching` settles
 /// in, and the one a breaching series moves the alarm to.
-const STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
-const STATE_OK: &str = "OK";
-const STATE_ALARM: &str = "ALARM";
+pub(crate) const STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+pub(crate) const STATE_OK: &str = "OK";
+pub(crate) const STATE_ALARM: &str = "ALARM";
 
 /// The `HistoryItemType` a state transition is recorded under
 /// (`smithy_query(query="shape",shape="HistoryItemType")`), and the order a history read asks
 /// for so the items come back oldest first (`DescribeAlarmHistoryInput$ScanBy`).
-const STATE_UPDATE: &str = "StateUpdate";
+pub(crate) const STATE_UPDATE: &str = "StateUpdate";
 const ASCENDING: &str = "TimestampAscending";
 
 /// The alarm type every alarm here is (`smithy_query(query="shape",shape="AlarmType")`), asked
@@ -104,7 +108,7 @@ const EVALUATION_PERIODS: i64 = 1;
 
 /// The period every row's alarm aggregates, in seconds: one minute, the shortest regular
 /// resolution a metric filter's series is published at.
-const PERIOD_SECS: i64 = 60;
+pub(crate) const PERIOD_SECS: i64 = 60;
 
 /// The logical ids the template declares its three resources and its one stream under, and the
 /// output keys it publishes the alarm's and the group's identity under.
@@ -120,11 +124,11 @@ const GROUP_NAME_OUTPUT: &str = "LogGroupName";
 ///
 /// Generous on purpose, and never measured: what a row asserts is WHAT it read, never how long
 /// the reading took, so a loaded host takes longer and still decides the same way.
-const DEADLINE: Duration = Duration::from_secs(90);
-const LOOK_AGAIN: Duration = Duration::from_millis(100);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(90);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
 /// The whole emulator over one engine, exactly as the binary assembles it.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(engine);
     // Signature verification is the front door's concern, not this suite's.
@@ -143,7 +147,7 @@ fn authorization(service: &str) -> String {
 }
 
 /// One CloudFormation `awsQuery` form call, which must answer 200.
-async fn cfn(
+pub(crate) async fn cfn(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -203,7 +207,7 @@ async fn rpc(
 }
 
 /// One Amazon CloudWatch call (`awsJson1_0`), which must answer 200.
-async fn cw(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn cw(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = rpc(
         router,
         CLOUDWATCH_SIGNING_NAME,
@@ -221,7 +225,7 @@ async fn cw(router: &MultiServiceRouter, case: &str, operation: &str, body: &Val
 }
 
 /// One Amazon CloudWatch Logs call (`awsJson1_1`), which must answer 200.
-async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = rpc(
         router,
         LOGS_SIGNING_NAME,
@@ -241,7 +245,7 @@ async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, body: &V
 
 /// Milliseconds since the epoch, which is the unit a log event is stamped in
 /// (`InputLogEvent$timestamp`).
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -424,40 +428,65 @@ fn template_of(row: &Row) -> String {
     .to_string()
 }
 
-/// Poll a row's stack until it first reports a status other than `CREATE_IN_PROGRESS`, answering
-/// the `DescribeStacks` answer it was read from. The wait is on that CONDITION, looked at again
-/// until it holds or [`DEADLINE`] passes, so nothing is waited out past it.
-async fn settled_stack(router: &MultiServiceRouter, row: &Row) -> String {
+/// Poll the stack named `stack` until it first reports a status other than `CREATE_IN_PROGRESS`,
+/// answering the `DescribeStacks` answer it was read from. The wait is on that CONDITION, looked at
+/// again until it holds or [`DEADLINE`] passes, so nothing is waited out past it.
+pub(crate) async fn settled_stack(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+) -> String {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let described = cfn(
-            router,
-            row.case,
-            "DescribeStacks",
-            &[("StackName", row.stack)],
-        )
-        .await;
+        let described = cfn(router, case, "DescribeStacks", &[("StackName", stack)]).await;
         let status = opt_element(&described, "StackStatus").unwrap_or_default();
         if status != CREATE_IN_PROGRESS {
             return described;
         }
         assert!(
             Instant::now() < deadline,
-            "case {:?}: the stack never left {CREATE_IN_PROGRESS}, last read {described}",
-            row.case
+            "case {case:?}: the stack never left {CREATE_IN_PROGRESS}, last read {described}"
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
 }
 
-/// The one `MetricAlarms` entry `DescribeAlarms` reports for `name`, looked at again until its
-/// `StateValue` is `wanted` — the state the evaluation the clock owes the alarm reaches.
+/// The one `MetricAlarms` entry `DescribeAlarms` reports for `name`, of which there must be exactly
+/// one.
 ///
-/// `CompositeAlarms` must stay empty throughout: a metric alarm is reported under the metric
-/// half of the answer and nowhere else ("if you omit this parameter or specify MetricAlarms, the
-/// operation returns only a list of metric alarms",
+/// `CompositeAlarms` must stay empty: a metric alarm is reported under the metric half of the
+/// answer and nowhere else ("if you omit this parameter or specify MetricAlarms, the operation
+/// returns only a list of metric alarms",
 /// `smithy_query(query="doc",shape="DescribeAlarmsInput",member="AlarmTypes")`).
-async fn settled_alarm(
+pub(crate) async fn described_alarm(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Value {
+    let described = cw(router, case, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
+    let reported = described["MetricAlarms"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: expected DescribeAlarms {name:?} to report exactly one MetricAlarms \
+         entry, got {described}"
+    );
+    assert!(
+        described["CompositeAlarms"]
+            .as_array()
+            .is_none_or(|alarms| alarms.is_empty()),
+        "case {case:?}: expected no CompositeAlarms entry for the metric alarm {name:?}, got \
+         {described}"
+    );
+    reported[0].clone()
+}
+
+/// That same entry, looked at again until its `StateValue` is `wanted` — the state the evaluation
+/// the clock owes the alarm reaches.
+pub(crate) async fn settled_alarm(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -465,25 +494,7 @@ async fn settled_alarm(
 ) -> Value {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let described = cw(router, case, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
-        let reported = described["MetricAlarms"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(
-            reported.len(),
-            1,
-            "case {case:?}: expected DescribeAlarms {name:?} to report exactly one MetricAlarms \
-             entry, got {described}"
-        );
-        assert!(
-            described["CompositeAlarms"]
-                .as_array()
-                .is_none_or(|alarms| alarms.is_empty()),
-            "case {case:?}: expected no CompositeAlarms entry for the metric alarm {name:?}, got \
-             {described}"
-        );
-        let last = reported[0].clone();
+        let last = described_alarm(router, case, name).await;
         if last["StateValue"].as_str() == Some(wanted) {
             return last;
         }
@@ -495,9 +506,14 @@ async fn settled_alarm(
     }
 }
 
-/// The `HistorySummary` of every `StateUpdate` item `DescribeAlarmHistory` holds for `name`,
-/// oldest first.
-async fn state_history(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<String> {
+/// The `HistorySummary` of every history item of `item_type` `DescribeAlarmHistory` holds for
+/// `name`, oldest first.
+pub(crate) async fn history(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    item_type: &str,
+) -> Vec<String> {
     let described = cw(
         router,
         case,
@@ -505,7 +521,7 @@ async fn state_history(router: &MultiServiceRouter, case: &str, name: &str) -> V
         &json!({
             "AlarmName": name,
             "AlarmTypes": [METRIC_ALARM],
-            "HistoryItemType": STATE_UPDATE,
+            "HistoryItemType": item_type,
             "ScanBy": ASCENDING,
         }),
     )
@@ -525,7 +541,7 @@ async fn state_history(router: &MultiServiceRouter, case: &str, name: &str) -> V
 }
 
 /// The summary a transition between two states is recorded under.
-fn transition(from: &str, to: &str) -> String {
+pub(crate) fn transition(from: &str, to: &str) -> String {
     format!("Alarm updated from {from} to {to}")
 }
 
@@ -636,7 +652,7 @@ async fn a_stacks_declared_alarm_is_evaluated_over_its_declared_metric_filters_l
     // 1. Each stack completes and publishes the identity of the alarm and of the group.
     for row in &rows {
         let case = row.case;
-        let described = settled_stack(&router, row).await;
+        let described = settled_stack(&router, case, row.stack).await;
         let status = opt_element(&described, "StackStatus").unwrap_or_default();
         if status != CREATE_COMPLETE {
             let events = cfn(
@@ -739,12 +755,12 @@ async fn a_stacks_declared_alarm_is_evaluated_over_its_declared_metric_filters_l
         //    are not breaching, so it reaches OK with no call forcing it.
         let settled = settled_alarm(&router, case, row.alarm, STATE_OK).await;
         assert_configuration(case, &settled, row);
-        let history = state_history(&router, case, row.alarm).await;
+        let recorded = history(&router, case, row.alarm, STATE_UPDATE).await;
         assert_eq!(
-            history,
+            recorded,
             vec![transition(STATE_INSUFFICIENT_DATA, STATE_OK)],
             "case {case:?}: expected the settling of the deployed alarm to be its one recorded \
-             transition, got {history:?}"
+             transition, got {recorded:?}"
         );
     }
 
@@ -795,15 +811,15 @@ async fn a_stacks_declared_alarm_is_evaluated_over_its_declared_metric_filters_l
         );
         let fired = settled_alarm(&router, case, row.alarm, STATE_ALARM).await;
         assert_configuration(case, &fired, row);
-        let history = state_history(&router, case, row.alarm).await;
+        let recorded = history(&router, case, row.alarm, STATE_UPDATE).await;
         let wanted = [
             transition(STATE_INSUFFICIENT_DATA, STATE_OK),
             transition(STATE_OK, STATE_ALARM),
         ];
         assert!(
-            history.len() >= wanted.len() && history[..wanted.len()] == wanted,
+            recorded.len() >= wanted.len() && recorded[..wanted.len()] == wanted,
             "case {case:?}: expected the deployed alarm's history to open with {wanted:?}, got \
-             {history:?}"
+             {recorded:?}"
         );
     }
 }
