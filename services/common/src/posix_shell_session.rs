@@ -3545,7 +3545,7 @@ impl ShellSession {
             let _ = self.write_stderr("printf: usage: printf format [arguments]\n", redirections);
             return self.config.statuses.failure;
         };
-        let Some(text) = formatted(format, rest) else {
+        let Some(text) = printf_formatted(format, rest) else {
             let _ = self.write_stderr(
                 &format!("printf: {format}: invalid format\n"),
                 redirections,
@@ -4156,14 +4156,20 @@ pub fn value_test_answer(arguments: &[String]) -> Option<bool> {
 }
 
 /// `format` with `arguments` substituted, as `printf` writes it, or `None` for a format
-/// this session does not perform.
+/// this command does not perform.
+///
+/// The ONE reading of a `printf` format in this workspace: every session that provides the
+/// utility writes it from here ([`ShellSession::run_printf`], and the container session of
+/// `…ecs…::state::container_shell`, whose walk is async and whose catalog is its own), so two
+/// of them cannot write one format differently.
 ///
 /// The conversions are `%s` (the argument as it is), `%d` and `%i` (the argument read as an
 /// integer, and a value that is not one is worth zero, as the utility reads it) and `%%`
 /// (one per cent sign). The escapes are `\n`, `\t`, `\r` and `\\`. An argument the format
 /// has no conversion for is left out, and a conversion with no argument left takes the
 /// empty string, which is what the utility writes for one.
-fn formatted(format: &str, arguments: &[String]) -> Option<String> {
+#[must_use]
+pub fn printf_formatted(format: &str, arguments: &[String]) -> Option<String> {
     let mut written = String::new();
     let mut taken = arguments.iter();
     let mut characters = format.chars();

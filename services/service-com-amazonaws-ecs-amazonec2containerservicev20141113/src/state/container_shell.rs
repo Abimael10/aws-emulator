@@ -42,6 +42,15 @@
 //! is therefore no language subset to keep in step with a specification: a command either
 //! names one of those utilities, or it did not run.
 //!
+//! What decides whether a NAME belongs in that catalog is where the command's effect lands: a
+//! command whose whole effect is inside this session — its output, its status, its variables,
+//! its signal handlers, its own filesystem — or inside a CONTROL STRUCTURE this walk already
+//! performs. That is why the catalog holds the two special built-ins that leave a LOOP
+//! ([`BREAK_COMMAND`], [`CONTINUE_COMMAND`]): the loops are performed here
+//! ([`ContainerShell::run_loop`], [`ContainerShell::run_for_clause`]), and a loop that cannot
+//! be left is no loop a real program is written around — the shape every one-shot probe takes
+//! is "try the work; on success report it and leave the loop; otherwise try again".
+//!
 //! The programs of the container's ENVIRONMENT this session provides beside those utilities
 //! are the AWS CLI ([`super::container_aws_cli`]) — a container's image is routinely one whose
 //! program calls the account's services, and those calls are made as the task role — and the
@@ -202,6 +211,28 @@ const SIGTERM_NUMBER: i32 = 15;
 /// the bare name, the `SIG`-prefixed name and the number.
 const SIGTERM_NAMES: [&str; 3] = ["TERM", "SIGTERM", "15"];
 
+/// The special built-ins that leave the enclosing LOOP: `break` — "exit from within a `for`,
+/// `while` or `until` loop" — and `continue`, which goes on with "the next iteration of the
+/// smallest enclosing `for`, `while` or `until` loop". Each takes an optional count of the
+/// enclosing loops it leaves ("the n-th enclosing loop").
+///
+/// They are commands of the LOOPS this session performs ([`ContainerShell::run_loop`],
+/// [`ContainerShell::run_for_clause`]), which is why they are performed by the walk that holds
+/// those loops rather than by a utility: a program written as a retry loop leaves it with one
+/// of these, so a session that performs the loop and not the command performs no such program
+/// at all. The shared session's own walk performs them under the same rule
+/// ([`::service_common::posix_shell_session`]), as it does the loops, the conditionals and
+/// `set -e` around them.
+const BREAK_COMMAND: &str = "break";
+const CONTINUE_COMMAND: &str = "continue";
+
+/// The utility that WRITES a format with its arguments substituted: "the `printf` utility shall
+/// write formatted operands to the standard output". Its whole effect is the container's own
+/// output, exactly as `echo`'s is, and what one format WRITES is this workspace's one reading of
+/// a `printf` format ([`::service_common::posix_shell_session::printf_formatted`]) rather than a
+/// second one — a program that reports a value writes it with either utility.
+const PRINTF_COMMAND: &str = "printf";
+
 /// The utility that REPLACES the session with the command it names: "the `exec` utility shall
 /// open, close, and/or copy file descriptors as specified by any redirections as part of the
 /// command. If `exec` is specified with command, it shall replace the shell with command without
@@ -215,8 +246,9 @@ const EXEC_COMMAND: &str = "exec";
 /// The commands this container provides, as their names.
 ///
 /// Each one's whole effect is inside the container's own session, which is why it can be
-/// performed in process: `echo` writes to the container's output, `true`, `false` and `:`
-/// answer a status, `exit` ends the session, `export`/`unset` change its variables, `trap`
+/// performed in process: `echo` and `printf` write to the container's output, `true`, `false`
+/// and `:` answer a status, `exit` ends the session, `export`/`unset` change its variables,
+/// `trap`
 /// records what a signal does to it, `sleep` waits, `wait` answers for the jobs it has none
 /// of, `exec` runs the command it names IN PLACE of the session ("the shell shall replace
 /// itself with the command"), which is how a container's command hands itself to the server its
@@ -225,14 +257,17 @@ const EXEC_COMMAND: &str = "exec";
 /// was given or about the container's own filesystem ([`ContainerShell::run_test`]). `pwd`,
 /// `id`, `ulimit` and `df` REPORT the process this session is — where it runs, who it runs
 /// as, the limits it runs under and the space on the filesystem it writes on — off the
-/// settings its launch resolved ([`PROCESS_REPORT_COMMANDS`]).
+/// settings its launch resolved ([`PROCESS_REPORT_COMMANDS`]). `break` and `continue` leave the
+/// LOOP they stand in ([`BREAK_COMMAND`], [`CONTINUE_COMMAND`]), which is how a program written
+/// as a retry loop ends it.
 /// The commands that work over that filesystem are [`FILE_COMMANDS`]; a command outside either
 /// catalog and outside the text filters and the SERVERS the container's image ships
 /// ([`super::container_servers`]) needs a program or a network this container does not
 /// have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
-    "echo", "true", "false", ":", "exit", "export", "unset", "trap", "sleep", "wait", "test",
-    "[", "set", "exec", "hostname", "pwd", "id", "ulimit", "df",
+    "echo", PRINTF_COMMAND, "true", "false", ":", "exit", "export", "unset", "trap", "sleep",
+    "wait", "test", "[", "set", "exec", "hostname", "pwd", "id", "ulimit", "df", BREAK_COMMAND,
+    CONTINUE_COMMAND,
 ];
 
 /// The commands of [`BUILT_IN_COMMANDS`] that REPORT a fact about the process this session
@@ -246,7 +281,15 @@ const PROCESS_REPORT_COMMANDS: [&str; 4] = ["pwd", "id", "ulimit", "df"];
 /// The commands an assignment written before them persists in the session for: POSIX's
 /// special built-in utilities, for which "variable assignments specified with special
 /// built-in utilities remain in effect after the built-in completes".
-const PERSISTING_COMMANDS: &[&str] = &[":", "exit", "export", "unset", "trap"];
+const PERSISTING_COMMANDS: &[&str] = &[
+    ":",
+    "exit",
+    "export",
+    "unset",
+    "trap",
+    BREAK_COMMAND,
+    CONTINUE_COMMAND,
+];
 
 /// The shells this session reads a `-c` PROGRAM from, by the name they are invoked under.
 ///
@@ -354,6 +397,17 @@ const MAX_PENDING_LINE_BYTES: usize = 256 * 1024;
 /// A future this session's own recursion goes through, so the mutually recursive walk over
 /// the grammar's tree has a size the compiler can work out.
 type ShellFuture<'a, T> = Pin<Box<dyn ::std::future::Future<Output = T> + Send + 'a>>;
+
+/// What a `break` or a `continue` asked for: which of the two it was, and how many enclosing
+/// loops it leaves ([`BREAK_COMMAND`], [`CONTINUE_COMMAND`]).
+#[derive(Debug, Clone, Copy)]
+struct LoopControl {
+    /// Whether the loop being left goes on to its next iteration (`continue`) or ends
+    /// (`break`).
+    goes_on: bool,
+    /// How many enclosing loops this leaves — "the n-th enclosing loop", at least one.
+    levels: usize,
+}
 
 /// How many bytes ONE command substitution, or ONE stage of a pipeline, may carry. THIS
 /// NUMBER IS THE EMULATOR'S, under [`MAX_EXPANSION_BYTES`]' rule applied to what a nested
@@ -616,6 +670,14 @@ pub struct ContainerShell {
     /// How deeply this session's walk over the grammar's COMPOUND forms is nested right now,
     /// which is what [`MAX_COMPOUND_DEPTH`] bounds.
     compound_depth: usize,
+    /// How many LOOPS this walk is performing inside one another right now, which is what
+    /// decides whether a `break` or a `continue` has a loop to leave at all
+    /// ([`Self::run_loop_control`]).
+    loop_depth: usize,
+    /// The loop the program asked to leave and how many enclosing loops it is leaving —
+    /// `None` while no `break` or `continue` is in flight. Set by those commands and taken by
+    /// the loop that honours it ([`Self::taken_loop_control`]).
+    loop_control: Option<LoopControl>,
     /// Whether the pipeline just performed was written with `!`, which is the other form
     /// `set -e` does not end the program for.
     negated_pipeline: bool,
@@ -710,6 +772,8 @@ impl ContainerShell {
             errexit: false,
             condition_depth: 0,
             compound_depth: 0,
+            loop_depth: 0,
+            loop_control: None,
             negated_pipeline: false,
             serving,
             listening: Vec::new(),
@@ -1058,11 +1122,30 @@ impl ContainerShell {
     /// answer the status of the last body that ran ([`EXIT_SUCCESS`] for a loop whose body
     /// never ran, which is the status POSIX gives it).
     ///
+    /// A body that performed a `break` or a `continue` ends the loop, or goes on with its
+    /// next iteration, where that command stands ([`Self::taken_loop_control`]): this is one
+    /// of the loops those commands are commands OF, which is what counting this level is for
+    /// ([`Self::loop_depth`]).
+    ///
     /// The loop is bounded by the run's own step budget and deadline: every ITERATION takes
     /// a step out of them, as does every command inside it, so a loop that outlasts either
     /// abandons the run rather than spinning for ever — including one whose condition and
     /// body are forms this container declines and so perform no command at all.
     fn run_loop<'a>(
+        &'a mut self,
+        clause: &'a ::brush_parser::ast::WhileOrUntilClauseCommand,
+        while_zero: bool,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            self.loop_depth = self.loop_depth.saturating_add(1);
+            let status = self.run_loop_iterations(clause, while_zero).await;
+            self.loop_depth = self.loop_depth.saturating_sub(1);
+            status
+        })
+    }
+
+    /// The ITERATIONS of that loop, inside the level [`Self::run_loop`] counts.
+    fn run_loop_iterations<'a>(
         &'a mut self,
         clause: &'a ::brush_parser::ast::WhileOrUntilClauseCommand,
         while_zero: bool,
@@ -1092,6 +1175,11 @@ impl ContainerShell {
                 if self.stopped() {
                     return status;
                 }
+                match self.taken_loop_control() {
+                    Some(true) => continue,
+                    Some(false) => return status,
+                    None => {}
+                }
             }
         })
     }
@@ -1106,10 +1194,26 @@ impl ContainerShell {
     /// iterates over nothing here: it would take the positional parameters, which a container
     /// whose program is its argument vector has none of.
     ///
+    /// A body that performed a `break` or a `continue` ends this loop, or goes on with its
+    /// next word, exactly as a `while` body's does ([`Self::run_loop`]).
+    ///
     /// Each ITERATION takes a step out of the run's budget before its body is reached, the
     /// way a `while` iteration does ([`Self::take_command_budget`]), so a list of many words
     /// is bounded exactly as a loop with no end of its own is.
     fn run_for_clause<'a>(
+        &'a mut self,
+        clause: &'a ::brush_parser::ast::ForClauseCommand,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            self.loop_depth = self.loop_depth.saturating_add(1);
+            let status = self.run_for_iterations(clause).await;
+            self.loop_depth = self.loop_depth.saturating_sub(1);
+            status
+        })
+    }
+
+    /// The ITERATIONS of that `for`, inside the level [`Self::run_for_clause`] counts.
+    fn run_for_iterations<'a>(
         &'a mut self,
         clause: &'a ::brush_parser::ast::ForClauseCommand,
     ) -> ShellFuture<'a, i32> {
@@ -1132,6 +1236,11 @@ impl ContainerShell {
                 if self.stopped() {
                     return status;
                 }
+                match self.taken_loop_control() {
+                    Some(true) => continue,
+                    Some(false) => break,
+                    None => {}
+                }
             }
             status
         })
@@ -1139,6 +1248,11 @@ impl ContainerShell {
 
     /// Run a compound LIST — the grammar's list of and-or lists inside a group, a loop body
     /// or a conditional — and answer the status of the last one that ran.
+    ///
+    /// A `break` or a `continue` one of them performed ends the list where it stands: what
+    /// runs next is for the enclosing LOOP to decide ([`Self::taken_loop_control`]), so the
+    /// lists between that command and the loop — the branch of an `if`, a brace group, a
+    /// `case` item — stop too, exactly as the program's own `exit` stops them.
     fn run_compound_list<'a>(
         &'a mut self,
         list: &'a ::brush_parser::ast::CompoundList,
@@ -1147,12 +1261,58 @@ impl ContainerShell {
             let mut status = EXIT_SUCCESS;
             for item in &list.0 {
                 status = self.run_and_or_list(&item.0).await;
-                if self.stopped() {
+                if self.stopped() || self.loop_control.is_some() {
                     return status;
                 }
             }
             status
         })
+    }
+
+    /// What the `break` or `continue` the body just performed means FOR THIS LOOP:
+    /// `Some(true)` to go on with its next iteration, `Some(false)` to end it, and `None`
+    /// when the body performed neither — or when the one it performed is leaving an OUTER
+    /// loop too, which is left in flight for that loop to take and makes this one end where
+    /// it stands.
+    fn taken_loop_control(&mut self) -> Option<bool> {
+        let control = self.loop_control?;
+        if control.levels > 1 {
+            // "the n-th enclosing loop": this loop is one of the ones being left, and the
+            // rest of them is the enclosing loop's to honour.
+            self.loop_control = Some(LoopControl {
+                levels: control.levels - 1,
+                ..control
+            });
+            return Some(false);
+        }
+        self.loop_control = None;
+        Some(control.goes_on)
+    }
+
+    /// Perform `break` or `continue` ([`BREAK_COMMAND`], [`CONTINUE_COMMAND`]): leave the
+    /// enclosing loops the argument names — one by default — so what runs next is that
+    /// loop's next iteration or the command after it.
+    ///
+    /// "If n is greater than the number of enclosing loops, the outermost enclosing loop
+    /// shall be used", so a count past the loops being performed leaves all of them; one
+    /// performed where there is no loop at all leaves nothing and answers success, and a
+    /// count that is not a positive integer is the command's own usage failure.
+    fn run_loop_control(&mut self, goes_on: bool, arguments: &[String]) -> i32 {
+        let levels = match arguments.first() {
+            Some(written) => match written.parse::<usize>() {
+                Ok(levels) if levels >= 1 => levels,
+                _ => return EXIT_FAILURE,
+            },
+            None => 1,
+        };
+        if self.loop_depth == 0 {
+            return EXIT_SUCCESS;
+        }
+        self.loop_control = Some(LoopControl {
+            goes_on,
+            levels: levels.min(self.loop_depth),
+        });
+        EXIT_SUCCESS
     }
 
     /// Run a compound list as a CONDITION — an `if`'s, an `elif`'s or a loop's — which is
@@ -2006,6 +2166,10 @@ impl ContainerShell {
                     }
                 }
                 "true" | ":" => EXIT_SUCCESS,
+                // "The printf utility shall write formatted operands to the standard output":
+                // the format and its arguments, written as this workspace reads one
+                // ([`Self::run_printf`]).
+                PRINTF_COMMAND => self.run_printf(arguments, redirections).await,
                 // "hostname — show or set the system's host name": with no operand it WRITES
                 // the name, which for a container is the one the runtime gave it
                 // ([`super::container_runtime::HOSTNAME_VARIABLE`]). Only the unqualified name
@@ -2071,6 +2235,10 @@ impl ContainerShell {
                 }
                 "trap" => self.run_trap(arguments),
                 "set" => self.run_set(arguments),
+                // The commands of the LOOPS this walk performs: each leaves the enclosing
+                // loops its argument names ([`Self::run_loop_control`]).
+                BREAK_COMMAND => self.run_loop_control(false, arguments),
+                CONTINUE_COMMAND => self.run_loop_control(true, arguments),
                 "sleep" => self.run_sleep(arguments).await,
                 // "wait: ... If no process ID is given, waits for all currently active
                 // child processes" — this session has none, so there is nothing to wait
@@ -2176,6 +2344,41 @@ impl ContainerShell {
     /// [`Self::run_test`]).
     fn file_test_answer(&self, arguments: &[String]) -> Option<bool> {
         ::service_common::posix_shell_files::file_test_answer(arguments, &self.filesystem)
+    }
+
+    /// `printf FORMAT [ARGUMENT…]`: the format with its arguments substituted, on the
+    /// container's standard output.
+    ///
+    /// What one format writes is the workspace's one reading of a `printf` format
+    /// ([`::service_common::posix_shell_session::printf_formatted`]), so a program that
+    /// reports a value writes the same text whichever session performs it. An invocation with
+    /// no format at all, and a format carrying a conversion or an escape that reading does not
+    /// perform, writes NOTHING and answers the utility's own failure with its diagnostic on
+    /// standard error — the utility ran and refused the format, so it is not a command this
+    /// session could not run.
+    async fn run_printf(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let Some((format, rest)) = arguments.split_first() else {
+            self.write_stderr(
+                &format!("{PRINTF_COMMAND}: usage: {PRINTF_COMMAND} format [arguments]\n"),
+                redirections,
+            )
+            .await;
+            return EXIT_FAILURE;
+        };
+        let Some(text) = ::service_common::posix_shell_session::printf_formatted(format, rest)
+        else {
+            self.write_stderr(
+                &format!("{PRINTF_COMMAND}: {format}: invalid format\n"),
+                redirections,
+            )
+            .await;
+            return EXIT_FAILURE;
+        };
+        if self.write_stdout(&text, redirections).await {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
     }
 
     /// `set [-e|+e|-u|+u|-o pipefail|+o pipefail]`: turn the shell options its arguments name
