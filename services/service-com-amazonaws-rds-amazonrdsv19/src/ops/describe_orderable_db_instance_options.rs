@@ -687,6 +687,38 @@ fn vcpus(size: &str) -> Option<i32> {
         .map(|(_, vcpus)| *vcpus)
 }
 
+/// The number of vCPUs the DB instance class `db_instance_class` has, or `None` for a class
+/// whose hardware this service publishes nothing about.
+///
+/// The sibling of [`class_memory_bytes`], read off the same published naming: a `large` is 2
+/// vCPUs and each `<n>xlarge` is `4 * n` ([`vcpus`]), and the three burstable sizes below
+/// `large` carry [`BURSTABLE_SHARED_VCPUS`].
+///
+/// `pub` for the same reason as [`class_memory_bytes`]: a constraint another operation states
+/// over the vCPU count of a class — the minimum reserved capacity a future-dated DB capacity
+/// reservation must total — is evaluated against this one published table rather than a
+/// second copy of it.
+pub fn class_vcpus(db_instance_class: &str) -> Option<i32> {
+    let lowered = db_instance_class.to_ascii_lowercase();
+    let (family, size) = lowered.strip_prefix("db.")?.split_once('.')?;
+    if family.starts_with('t')
+        && BURSTABLE_SIZE_MEMORY_GIB
+            .iter()
+            .any(|(named, _)| *named == size)
+    {
+        return Some(BURSTABLE_SHARED_VCPUS);
+    }
+    vcpus(size)
+}
+
+/// The vCPUs a BURSTABLE class below `large` has: the three sizes whose count the
+/// `<n>xlarge` naming does not give.
+///
+/// Source: the same "DB instance classes — hardware specifications" table
+/// [`BURSTABLE_SIZE_MEMORY_GIB`] is read off, which publishes two vCPUs for each of the
+/// burstable `micro`, `small` and `medium` sizes.
+const BURSTABLE_SHARED_VCPUS: i32 = 2;
+
 /// One gibibyte, the unit the published instance-class table states memory in.
 const GIB: u64 = 1024 * 1024 * 1024;
 

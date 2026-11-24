@@ -104,6 +104,7 @@ mod tests {
             db_instance_class: "db.t3.micro".to_string(),
             engine: "mysql".to_string(),
             engine_version: None,
+            db_capacity_reservation_identifier: None,
             status: DB_INSTANCE_STATUS_AVAILABLE.to_string(),
             pending_status: None,
             ready_at: ::std::time::Instant::now(),

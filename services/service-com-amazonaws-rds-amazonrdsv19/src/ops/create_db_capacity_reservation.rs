@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -249,18 +240,287 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBCapacityReservation"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateDBCapacityReservationError::validation)?;
+
+        // The name the reservation is looked up by beside its minted identifier. Its
+        // length, its alphabet and its hyphen rules are the `@length` and `@pattern` of the
+        // `DBCapacityReservationName` shape, already refused at the boundary; the one clause
+        // that pattern cannot express is checked here.
+        let name = input.db_capacity_reservation_name;
+        crate::state::check_db_capacity_reservation_name(&name)
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+
+        // "The database engine to reserve capacity for." A value that is no engine of this
+        // front door at all is an invalid parameter value; an engine it DOES serve but which
+        // capacity reservations do not cover — a custom engine, or a sibling control plane's
+        // — is the modelled unsupported fault, because the configuration rather than the
+        // value is what cannot be served.
+        let engine = input.engine;
+        crate::state::check_engine(&engine)
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+        if !crate::state::reserves_capacity_for_engine(&engine) {
+            return Err(unsupported("Engine", &engine));
+        }
+        // "The compute and memory capacity to reserve, for example db.m5.large." The FORM of
+        // the value is `DBInstanceClass`'s own pattern, refused at the boundary; what is
+        // checked here is whether this service publishes that instance generation at all,
+        // since capacity cannot be reserved in a generation no DB instance can be ordered
+        // in.
+        let db_instance_class = input.db_instance_class;
+        if !crate::ops::describe_orderable_db_instance_options::publishes_instance_family(
+            &db_instance_class,
+        ) {
+            return Err(unsupported("DBInstanceClass", &db_instance_class));
+        }
+
+        // How many DB instances are reserved in each zone, and which zones they are
+        // reserved in. "The total reserved capacity is CapacityPerAvailabilityZone
+        // multiplied by the number of Availability Zones."
+        let capacity_per_availability_zone = input.capacity_per_availability_zone;
+        crate::state::check_capacity_per_availability_zone(capacity_per_availability_zone)
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+        let availability_zones = input.availability_zones;
+        crate::state::check_reservation_availability_zones(&region, &availability_zones)
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+
+        // "Specify this parameter only for RDS for Microsoft SQL Server Enterprise Edition,
+        // Standard Edition, and Developer Edition, for RDS for Oracle, or for RDS for Db2
+        // Standard Edition and Advanced Edition. Amazon RDS rejects the request for any
+        // other engine." Which licences an engine is offered under is the one published
+        // answer `DescribeOrderableDBInstanceOptions` gives, so the licence is resolved
+        // against that report rather than against a second list of engines: an engine whose
+        // licence a caller does not choose is offered under none of the values this member
+        // takes, so naming one is the combination that cannot hold.
+        if let Some(license_model) = &input.license_model {
+            if !crate::state::reservation_takes_a_license_model(&engine)
+                || !crate::ops::describe_orderable_db_instance_options::offers_license_model(
+                    &engine,
+                    license_model,
+                )
+            {
+                return Err(
+                    CreateDBCapacityReservationError::invalid_parameter_combination(format!(
+                        "RDS does not support reserving capacity with the following \
+                         combination: Engine={engine}, LicenseModel={license_model}."
+                    )),
+                );
+            }
+        }
+
+        // "Specify StartDate and CommitmentDuration together to create a future-dated
+        // reservation": neither means anything without the other, so one on its own is the
+        // combination that cannot hold.
+        let now = crate::state::now_as_wire_timestamp();
+        let commitment = match (input.start_date, input.commitment_duration) {
+            (None, None) => None,
+            (Some(start_date), Some(commitment_duration)) => {
+                crate::state::check_reservation_start_date(start_date, now)
+                    .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+                crate::state::check_commitment_duration(commitment_duration, &db_instance_class)
+                    .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+                // The additional constraints of a future-dated reservation: the DB instance
+                // class families capacity can be held for in advance, and the reserved
+                // capacity such a reservation must total in each Availability Zone.
+                if !crate::state::future_dated_class_is_eligible(&db_instance_class) {
+                    return Err(unsupported("DBInstanceClass", &db_instance_class));
+                }
+                crate::state::check_future_dated_reserved_capacity(
+                    &db_instance_class,
+                    capacity_per_availability_zone,
+                )
+                .map_err(CreateDBCapacityReservationError::invalid_parameter_combination)?;
+                Some((
+                    start_date,
+                    crate::state::DbCapacityReservationCommitment {
+                        committed_capacity_per_availability_zone: capacity_per_availability_zone,
+                        commitment_end_date: crate::state::granted_commitment_end_date(
+                            start_date,
+                            commitment_duration,
+                        ),
+                    },
+                ))
+            }
+            (start_date, _) => {
+                let (named, requires) = if start_date.is_some() {
+                    ("StartDate", "CommitmentDuration")
+                } else {
+                    ("CommitmentDuration", "StartDate")
+                };
+                return Err(
+                    CreateDBCapacityReservationError::invalid_parameter_combination(format!(
+                        "{named} requires {requires}: specify both to create a future-dated \
+                         reservation"
+                    )),
+                );
+            }
+        };
+
+        // "The date and time when the reservation expires ... If you don't specify a value,
+        // the reservation doesn't expire." A future-dated reservation holds its capacity for
+        // the length of the commitment, so it cannot expire before that commitment ends.
+        if let Some(end_date) = input.end_date {
+            crate::state::check_reservation_end_date(
+                end_date,
+                now,
+                commitment
+                    .as_ref()
+                    .map(|(_, commitment)| commitment.commitment_end_date),
+            )
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+        }
+
+        // The tags are stored request data, so the list and each entry are bounded before
+        // any of it is kept.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateDBCapacityReservationError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated reservation.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // "This name must be unique for your Amazon Web Services account in the Amazon Web
+        // Services Region": a second create under the same name is the modelled
+        // already-exists fault rather than a silent overwrite of the first.
+        if store.db_capacity_reservation_name_taken(&region, &name) {
+            return Err(
+                CreateDBCapacityReservationErrorModeled::DBCapacityReservationAlreadyExistsFault(
+                    DBCapacityReservationAlreadyExistsFault {
+                        message: Some(format!("DB capacity reservation already exists: {name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's DB capacity reservation allowance: a store that grows without bound
+        // is not what the real service does. This counts EVERY record the region holds,
+        // whatever state it is in, so a reservation whose capacity has been released cannot
+        // be recycled into unbounded growth — the reserved-instance check below counts only
+        // the reservations that still hold capacity.
+        if store.capacity_reservations_in(&region).len()
+            >= crate::state::DB_CAPACITY_RESERVATION_QUOTA_PER_REGION
+        {
+            return Err(
+                CreateDBCapacityReservationErrorModeled::InstanceQuotaExceededFault(
+                    InstanceQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of DB capacity \
+                             reservations in {region} ({})",
+                            crate::state::DB_CAPACITY_RESERVATION_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Reserving capacity for a DB instance takes a unit of the Region's DB instance
+        // allowance, so a reservation that would take the account past it is the modelled
+        // `InstanceQuotaExceededFault` — "the request would result in the user exceeding the
+        // allowed number of DB instances". This is what bounds the store too; see
+        // `crate::state`.
+        let requested = usize::try_from(capacity_per_availability_zone)
+            .unwrap_or(0)
+            .saturating_mul(availability_zones.len());
+        let reserved = store.reserved_db_instances_in(&region);
+        if reserved.saturating_add(requested) > crate::state::DB_INSTANCE_QUOTA_PER_REGION {
+            return Err(
+                CreateDBCapacityReservationErrorModeled::InstanceQuotaExceededFault(
+                    InstanceQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would reserve capacity for {} DB instances in \
+                             {region}, and the allowed number is {}",
+                            reserved.saturating_add(requested),
+                            crate::state::DB_INSTANCE_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // And the number of regions this store keeps records for at all — this emulator's
+        // own resource guard rather than an AWS allowance, so the message says which bound
+        // was reached.
+        if !store.has_room_for_region(&region) {
+            return Err(
+                CreateDBCapacityReservationErrorModeled::InstanceQuotaExceededFault(
+                    InstanceQuotaExceededFault {
+                        message: Some(format!(
+                            "this emulator holds records for at most {} regions, and {region} \
+                             is not one of them yet",
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // `InsufficientDBInstanceCapacityFault` — "the specified DB instance class isn't
+        // available in the specified Availability Zone" — is modelled for this operation but
+        // unreachable from it: every class this service publishes an option for is offered
+        // in every zone of its Region (`DescribeOrderableDBInstanceOptions` reports exactly
+        // that), so no zone of an accepted request can be short of a class it admits.
+
+        let mint = store.next_mint();
+        // An accepted create reports the state Amazon RDS is in while it brings the reserved
+        // capacity up: a reservation that starts immediately is `pending` while "Amazon RDS
+        // is creating the reserved capacity" and reaches `active` when the transition the
+        // clock owes it comes due; a future-dated one is `assessing` while "Amazon RDS is
+        // evaluating the request" and reaches `scheduled` once it has accepted it, where it
+        // waits for its start date. Nothing sleeps: the due instant is stored and the next
+        // call materialises it.
+        let (reported, reached) = if commitment.is_some() {
+            (
+                crate::state::DB_CAPACITY_RESERVATION_STATE_ASSESSING,
+                crate::state::DB_CAPACITY_RESERVATION_STATE_SCHEDULED,
+            )
+        } else {
+            (
+                crate::state::DB_CAPACITY_RESERVATION_STATE_PENDING,
+                crate::state::DB_CAPACITY_RESERVATION_STATE_ACTIVE,
+            )
+        };
+        let record = crate::state::DbCapacityReservationRecord {
+            identifier: crate::state::mint_db_capacity_reservation_identifier(mint),
+            name,
+            region: region.clone(),
+            db_instance_class,
+            engine,
+            license_model: input.license_model,
+            reserved_capacity_per_availability_zone: capacity_per_availability_zone,
+            availability_zones,
+            create_date: now,
+            start_date: commitment.as_ref().map(|(start_date, _)| *start_date),
+            end_date: input.end_date,
+            commitment: commitment.map(|(_, commitment)| commitment),
+            state: reported.to_string(),
+            pending_state: Some(crate::state::PendingStatus::in_a_moment(reached)),
+            tags,
+        };
+        let created = record.to_wire();
+        store
+            .db_capacity_reservations
+            .insert((region, record.identifier.clone()), record);
+        Ok(CreateDBCapacityReservationOutput {
+            db_capacity_reservation: Some(created),
+        })
     }
+}
+
+/// The modelled `DBCapacityReservationUnsupportedFault` for a configuration DB capacity
+/// reservations do not cover, naming the member and the value that is not covered.
+fn unsupported(member: &str, value: &str) -> CreateDBCapacityReservationError {
+    CreateDBCapacityReservationErrorModeled::DBCapacityReservationUnsupportedFault(
+        DBCapacityReservationUnsupportedFault {
+            message: Some(crate::state::db_capacity_reservation_unsupported_message(
+                member, value,
+            )),
+        },
+    )
+    .into()
 }

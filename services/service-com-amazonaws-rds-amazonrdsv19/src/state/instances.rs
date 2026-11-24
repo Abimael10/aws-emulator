@@ -352,6 +352,16 @@ pub struct DbInstanceRecord {
     /// that waits for a reboot is in force yet
     /// ([`data_plane::pg_server::running_parameters`]).
     pub engine_started_at: ::aws_smithy_types::DateTime,
+    /// The DB capacity reservation this instance uses, held as the reservation's own minted
+    /// identifier.
+    ///
+    /// `StartDBInstance$DBCapacityReservationIdentifier` is "the identifier or the name of
+    /// the DB capacity reservation for the DB instance to use after it starts", resolved
+    /// against the reservations this region holds before it is stored here, so the
+    /// association can only name a reservation some create really stored. `None` for an
+    /// instance that uses no reserved capacity — which is what a `StopDBInstance` that
+    /// detaches it leaves behind (`DetachFromDBCapacityReservation`).
+    pub db_capacity_reservation_identifier: Option<String>,
     pub tags: Vec<Tag>,
     /// `AssociatedRoles`: the IAM roles associated with this instance, in the order they
     /// were associated — what `AddRoleToDBInstance` adds to and
@@ -1397,6 +1407,9 @@ impl DbInstanceRecord {
             // configuration, so no upgrade of it is ever recommended.
             is_storage_config_upgrade_available: Some(false),
             engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
+            // The DB capacity reservation this instance uses, for one that was started into
+            // a reservation; absent for an instance that uses no reserved capacity.
+            db_capacity_reservation_identifier: self.db_capacity_reservation_identifier.clone(),
             ..DBInstance::default()
         }
     }

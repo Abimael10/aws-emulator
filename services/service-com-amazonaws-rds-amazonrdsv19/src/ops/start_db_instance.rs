@@ -281,20 +281,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `DBCapacityReservationIdentifier` names "the identifier or the name of the DB
-        // capacity reservation for the DB instance to use after it starts". No operation of
-        // this emulator mints a DB capacity reservation
-        // (`CreateDBCapacityReservation` is still a scaffold), so no name can resolve to
-        // one and the modelled not-found fault is the honest answer — never a start that
-        // silently ignores the reservation the caller asked for.
+        // capacity reservation for the DB instance to use after it starts", so it is
+        // resolved against the DB capacity reservations this region holds
+        // (`CreateDBCapacityReservation` is what stores them): a value that names none of
+        // them is the modelled not-found fault, never a start that silently ignores the
+        // reservation the caller asked for. What is kept is the reservation's own minted
+        // identifier, whichever of its two names the request used, so the started instance
+        // reports the reservation it uses.
+        let mut capacity_reservation = None;
         if let Some(reservation) = &input.db_capacity_reservation_identifier {
-            return Err(
-                StartDBInstanceErrorModeled::DBCapacityReservationNotFoundFault(
-                    DBCapacityReservationNotFoundFault {
-                        message: Some(format!("DBCapacityReservation {reservation} not found.")),
-                    },
-                )
-                .into(),
-            );
+            let Some(record) = store.resolve_db_capacity_reservation(&region, reservation) else {
+                return Err(
+                    StartDBInstanceErrorModeled::DBCapacityReservationNotFoundFault(
+                        DBCapacityReservationNotFoundFault {
+                            message: Some(
+                                crate::state::db_capacity_reservation_not_found_message(
+                                    reservation,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            capacity_reservation = Some(record.identifier.clone());
         }
 
         // The DB subnet group the instance reports is that GROUP's own record, resolved
@@ -330,6 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A stopped instance's engine was not running; starting it starts the engine's run
         // again, which is what `pg_postmaster_start_time()` reports on the data plane.
         record.engine_started_at = crate::state::now_as_wire_timestamp();
+        // And the reservation the request named, resolved above, is the one the instance
+        // uses from now on; a start that named none leaves the association it already had.
+        if let Some(reservation) = capacity_reservation {
+            record.db_capacity_reservation_identifier = Some(reservation);
+        }
         let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),

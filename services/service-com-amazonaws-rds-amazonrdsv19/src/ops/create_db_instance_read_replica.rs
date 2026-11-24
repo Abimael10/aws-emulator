@@ -1473,7 +1473,9 @@ fn resolve_source_cluster(
         instance_create_time: cluster.cluster_create_time,
         engine_started_at: cluster.cluster_create_time,
         // The replica's tags are the request's, and its roles, staged changes and log are its
-        // own from its creation: none of the cluster's are inherited.
+        // own from its creation: none of the cluster's are inherited. It uses no reserved
+        // capacity either, as a create does not.
+        db_capacity_reservation_identifier: None,
         tags: Vec::new(),
         associated_roles: Vec::new(),
         deferred_modification: None,

@@ -871,6 +871,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Its engine's first run starts with it, the same as a create's; a later
                 // reboot or start moves it.
                 engine_started_at: crate::state::now_as_wire_timestamp(),
+                // Restored using no reserved capacity, as a create is.
+                db_capacity_reservation_identifier: None,
                 tags,
                 // A restore publishes no `AssociatedRoles` member either, so the restored
                 // instance starts with none of the source's associations: each one is made

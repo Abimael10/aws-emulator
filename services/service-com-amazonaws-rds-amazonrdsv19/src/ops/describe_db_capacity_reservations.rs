@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBCapacityReservations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBCapacityReservations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBCapacityReservations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBCapacityReservations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBCapacityReservationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBCapacityReservations"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBCapacityReservationsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBCapacityReservationsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filters(&filters)
+            .map_err(DescribeDBCapacityReservationsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBCapacityReservationsError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed at
+        // this instant whether or not anybody called — here the state an accepted create
+        // owed a reservation, and the expiry its own `EndDate` owes it.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the DB capacity reservations of the region it
+        // was signed for. "If you don't specify a DBCapacityReservationIdentifier, this
+        // operation returns information about all DB capacity reservations for your Amazon
+        // Web Services account"; a value that names none of them is the modelled not-found
+        // fault, since the member "doesn't refer to an existing DB capacity reservation".
+        let candidates: Vec<&crate::state::DbCapacityReservationRecord> =
+            match &input.db_capacity_reservation_identifier {
+                Some(requested) => {
+                    let record = store
+                        .resolve_db_capacity_reservation(&region, requested)
+                        .ok_or_else(|| {
+                        DescribeDBCapacityReservationsErrorModeled::DBCapacityReservationNotFoundFault(
+                            DBCapacityReservationNotFoundFault {
+                                message: Some(
+                                    crate::state::db_capacity_reservation_not_found_message(
+                                        requested,
+                                    ),
+                                ),
+                            },
+                        )
+                    })?;
+                    vec![record]
+                }
+                None => store.capacity_reservations_in(&region),
+            };
+
+        // "When you specify more than one value for a filter, the response includes the
+        // reservations that match any of those values. When you specify more than one
+        // filter, the response includes only the reservations that match every filter."
+        let reported: Vec<(String, DBCapacityReservation)> = candidates
+            .into_iter()
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBCapacityReservationsError::invalid_parameter_value)?;
+        Ok(DescribeDBCapacityReservationsOutput {
+            marker: page.next_marker,
+            db_capacity_reservations: Some(page.items),
+        })
     }
+}
+
+/// The filter that accepts "DB capacity reservation names. The response includes only the
+/// reservations that these names identify."
+const NAME_FILTER: &str = "db-capacity-reservation-name";
+
+/// The filter that accepts "reservation states".
+const STATE_FILTER: &str = "state";
+
+/// The filter that accepts "database engine names".
+const ENGINE_FILTER: &str = "engine";
+
+/// The filter that accepts "DB instance classes".
+const DB_INSTANCE_CLASS_FILTER: &str = "db-instance-class";
+
+/// The filter that accepts "Availability Zone names. The response includes only the
+/// reservations that cover these Availability Zones."
+const AVAILABILITY_ZONE_FILTER: &str = "availability-zone";
+
+/// The filter names this operation's `Filters` member documents. "Amazon RDS rejects the
+/// request when a filter name isn't in this list, or when a filter specifies no values."
+const SUPPORTED_FILTER_NAMES: [&str; 5] = [
+    NAME_FILTER,
+    STATE_FILTER,
+    ENGINE_FILTER,
+    DB_INSTANCE_CLASS_FILTER,
+    AVAILABILITY_ZONE_FILTER,
+];
+
+/// Refuse a `Filters` entry this report cannot apply: a name outside
+/// [`SUPPORTED_FILTER_NAMES`] ("filter names are case-sensitive"), a filter carrying no
+/// value at all, or a `state` value outside the states that filter accepts.
+///
+/// A filter is refused rather than ignored, because ignoring one would report reservations
+/// the caller excluded.
+fn check_filters(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(crate::state::unrecognized_filter_name_message(&filter.name));
+        }
+        if filter.values.is_empty() {
+            return Err(format!(
+                "The filter {} specifies no values. Specify one or more values for it",
+                filter.name
+            ));
+        }
+        if filter.name == STATE_FILTER {
+            // "The state filter doesn't accept expired. To find an expired reservation,
+            // compare EndDate against the current date and time." So the domain of this
+            // filter is every published state bar that one, and a value outside it names
+            // no state this report could match.
+            let accepted = crate::state::db_capacity_reservation_filter_states();
+            if let Some(unknown) = filter
+                .values
+                .iter()
+                .find(|value| !accepted.contains(&value.as_str()))
+            {
+                return Err(format!(
+                    "Invalid value {unknown} for the {STATE_FILTER} filter. Valid values are \
+                     {}",
+                    accepted.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::DbCapacityReservationRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        NAME_FILTER => *wanted == record.name,
+        STATE_FILTER => *wanted == record.state,
+        ENGINE_FILTER => *wanted == record.engine,
+        DB_INSTANCE_CLASS_FILTER => *wanted == record.db_instance_class,
+        // The zone filter matches a reservation that COVERS the zone, so it is read against
+        // every zone the reservation holds capacity in rather than against one member.
+        AVAILABILITY_ZONE_FILTER => record.availability_zones.contains(wanted),
+        // Unreachable: `check_filters` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
+        _ => false,
+    })
 }

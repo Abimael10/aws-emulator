@@ -50,6 +50,9 @@
 //! copy of its database under that same page ceiling) and at most
 //! [`MAX_BACKTRACKS_PER_CLUSTER`] records of the backtracks performed on it —
 //! `MAX_REGIONS * DB_SHARD_GROUP_QUOTA_PER_REGION` DB shard groups,
+//! at most `MAX_REGIONS * DB_CAPACITY_RESERVATION_QUOTA_PER_REGION` DB capacity
+//! reservations — whatever state each is in, and each holding capacity for at most that
+//! region's DB instance allowance —
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
 //! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
 //! `MAX_REGIONS * DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION` cluster parameter groups
@@ -77,9 +80,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AvailabilityZone, BacktrackDBClusterOutput, Certificate, CertificateDetails,
+    AvailabilityZone, AvailableCapacityPerAvailabilityZone, BacktrackDBClusterOutput, Certificate,
+    CertificateDetails,
     ClusterPendingModifiedValues,
     CreateDBClusterEndpointOutput, CreateDBShardGroupOutput,
+    DBCapacityReservation, DBCapacityReservationCommitmentInfo,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
     DBClusterSnapshotAttributesResult, DBInstance, DBInstanceAutomatedBackup,
@@ -184,6 +189,10 @@ mod parameter_groups;
 // request names. Its own file beside the parameter-group records, because it is reference
 // data about the ENGINE rather than about any group.
 mod engine_settings;
+// The DB CAPACITY RESERVATION records, their published states and the projection that
+// reports one: their own concern, because a reservation holds capacity for DB instances
+// rather than being one.
+mod capacity_reservations;
 mod shard_groups;
 mod snapshots;
 // The tenant databases a DB snapshot CAPTURED, beside the snapshot records themselves:
@@ -204,6 +213,7 @@ pub use default_catalog::*;
 pub use event_catalog::*;
 pub use recommendations::*;
 pub use event_subscriptions::*;
+pub use capacity_reservations::*;
 pub use engine_settings::*;
 pub use option_groups::*;
 pub use parameter_groups::*;
@@ -632,6 +642,22 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// [`DB_SHARD_GROUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`] regions — and
     /// `DescribeDBShardGroups` reports what is here.
     pub db_shard_groups: BTreeMap<RegionalKey, DbShardGroupRecord>,
+    /// DB capacity reservations by `(region, DBCapacityReservationIdentifier)` — the
+    /// `dbcr-` identifier this service MINTED, so a caller cannot choose a key; the NAME it
+    /// chose is resolved against the same region's range
+    /// ([`Self::resolve_db_capacity_reservation`]). Ordered, so
+    /// `DescribeDBCapacityReservations` pages deterministically within a region.
+    ///
+    /// `CreateDBCapacityReservation` inserts here, bounded by
+    /// [`DB_CAPACITY_RESERVATION_QUOTA_PER_REGION`] records per region — a count over every
+    /// record the region holds, whatever state each is in, so a reservation whose capacity
+    /// has been released cannot be recycled into unbounded growth — and by [`MAX_REGIONS`]
+    /// regions. A second, narrower gate caps what those records may RESERVE: a reservation
+    /// holds capacity for `CapacityPerAvailabilityZone` DB instances in each of its zones,
+    /// and a create is refused once the reservations of a region that still hold capacity
+    /// would hold it for more than [`DB_INSTANCE_QUOTA_PER_REGION`] of them
+    /// ([`Self::reserved_db_instances_in`]).
+    pub db_capacity_reservations: BTreeMap<RegionalKey, DbCapacityReservationRecord>,
     /// Custom DB engine versions by `(region, custom_db_engine_version_key)` — the CEVs
     /// the account itself minted, as opposed to the engine versions this service
     /// publishes as reference data. Ordered, so `DescribeDBEngineVersions` reports and
@@ -932,6 +958,19 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         }
         for key in gone.drain(..) {
             self.db_shard_groups.remove(&key);
+        }
+        // A DB capacity reservation settles against two clocks: the state the create owed
+        // it, and the expiry its own `EndDate` makes due. Neither removes the record, so
+        // this walk collects no keys.
+        let wall_clock = now_as_wire_timestamp();
+        for (key, reservation) in self
+            .db_capacity_reservations
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            reservation.settle(now, wall_clock);
         }
         for (key, deployment) in self
             .blue_green_deployments
@@ -2117,6 +2156,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.db_subnet_groups.keys())
             .chain(self.db_security_groups.keys())
             .chain(self.db_shard_groups.keys())
+            .chain(self.db_capacity_reservations.keys())
             .chain(self.blue_green_deployments.keys())
             .chain(self.integrations.keys())
             .chain(self.tenant_databases.keys())

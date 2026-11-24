@@ -971,6 +971,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance_create_time: crate::state::now_as_wire_timestamp(),
             // The engine's first run starts with the instance; a later restart moves it.
             engine_started_at: crate::state::now_as_wire_timestamp(),
+            // Created using no reserved capacity: `StartDBInstance` is the one path that
+            // associates a DB capacity reservation with an instance so far.
+            db_capacity_reservation_identifier: None,
             tags: input.tags.unwrap_or_default(),
             // `CreateDBInstance` publishes no `AssociatedRoles` member, so an instance is
             // created with none: `AddRoleToDBInstance` is what associates a role with one.

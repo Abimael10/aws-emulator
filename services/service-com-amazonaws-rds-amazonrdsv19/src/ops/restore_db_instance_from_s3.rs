@@ -877,6 +877,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // with it, the same as a create's.
                 instance_create_time: crate::state::now_as_wire_timestamp(),
                 engine_started_at: crate::state::now_as_wire_timestamp(),
+                // Restored using no reserved capacity, as a create is.
+                db_capacity_reservation_identifier: None,
                 tags: tags.clone(),
                 // This operation publishes no `AssociatedRoles` member, so the restored
                 // instance starts with none: each association is made against the instance

@@ -356,11 +356,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DetachFromDBCapacityReservation` "controls the reservation that the DB instance
         // belongs to", and "if the DB instance uses no DB capacity reservation, this
-        // parameter has no effect". No operation of this emulator mints a DB capacity
-        // reservation (`CreateDBCapacityReservation` is still a scaffold), so no stored
-        // instance uses one and the parameter has no effect for either of its values —
-        // which is also why `InvalidDBCapacityReservationStateFault` is unreachable here.
-        let _ = input.detach_from_db_capacity_reservation;
+        // parameter has no effect": a stop that detaches releases the association
+        // `StartDBInstance` stored, which is applied with the stop below. The parameter has
+        // no effect for an instance that uses none, which is also why
+        // `InvalidDBCapacityReservationStateFault` is unreachable here.
+        let detach_from_capacity_reservation =
+            input.detach_from_db_capacity_reservation.unwrap_or(false);
 
         // The DB subnet group the instance reports is that GROUP's own record, resolved
         // here — before the instance record is taken mutably below — so the answer carries
@@ -392,6 +393,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
             DB_INSTANCE_STATUS_STOPPED,
         ));
+        // Bar the reservation a stop was asked to detach it from, which it stops using
+        // here.
+        if detach_from_capacity_reservation {
+            record.db_capacity_reservation_identifier = None;
+        }
         let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),
