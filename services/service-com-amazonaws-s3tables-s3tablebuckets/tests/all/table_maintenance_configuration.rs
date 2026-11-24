@@ -31,10 +31,6 @@ use super::harness::{Emulator, Reply};
 /// The fixed sentence this service states a table the store does not hold with.
 const NO_TABLE: &str = "The specified table does not exist.";
 
-/// The fixed sentence this service states a table bucket the store does not
-/// hold with.
-const NO_BUCKET: &str = "The specified bucket does not exist.";
-
 /// The settings S3 Tables compacts a table under when nothing configured it,
 /// from the S3 Tables maintenance documentation: compaction is on, it rewrites
 /// towards 512 MB files, and the strategy is derived from the table's own sort
@@ -76,6 +72,20 @@ impl Reported {
     pub(super) fn default_snapshot_management() -> Self {
         let (status, minimum, age) = DEFAULT_SNAPSHOT_MANAGEMENT;
         Self::SnapshotManagement(Some(status.to_string()), Some(minimum), Some(age))
+    }
+
+    /// The same configuration under `status`: what a put carrying a status and
+    /// no settings leaves in force for the task.
+    pub(super) fn under_status(&self, status: &str) -> Self {
+        let status = Some(status.to_string());
+        match self {
+            Self::Compaction(_, target, strategy) => {
+                Self::Compaction(status, *target, strategy.clone())
+            }
+            Self::SnapshotManagement(_, minimum, age) => {
+                Self::SnapshotManagement(status, *minimum, *age)
+            }
+        }
     }
 }
 
@@ -564,8 +574,9 @@ async fn the_read_reports_the_configuration_a_put_persisted() {
             );
         }
 
-        // The put replaces the whole configuration of its task: a second put of
-        // another configuration for the same task leaves no trace of the first.
+        // The put settles the members its value NAMES: a second put carrying a
+        // status and no settings settles the status and leaves the settings in
+        // force for the task standing.
         let replacing = json!({ "status": "enabled" });
         let replaced = emulator
             .put_table_maintenance_configuration(
@@ -591,15 +602,10 @@ async fn the_read_reports_the_configuration_a_put_persisted() {
             case.label,
             case.kind,
         );
-        let expected_after = match case.kind {
-            TableMaintenanceType::IcebergCompaction => Reported::default_compaction(),
-            TableMaintenanceType::IcebergSnapshotManagement => {
-                Reported::default_snapshot_management()
-            }
-        };
+        let expected_after = case.expected.under_status("enabled");
         assert_eq!(
             after, expected_after,
-            "case {label:?}: a put must replace the whole configuration of its task, expected \
+            "case {label:?}: a put must settle only the members its value names, expected \
              {expected_after:?}, got {after:?}",
             label = case.label
         );
@@ -812,20 +818,24 @@ async fn a_call_against_a_resource_the_store_does_not_hold_is_refused() {
 
     // (case, the bucket ARN addressed, the namespace, the table name, the fixed
     // sentence the refusal must carry)
+    //
+    // The maintenance operations address ONE resource, the table the three
+    // together name, so the refusal names the TABLE whichever part of that
+    // address resolves to nothing — an absent bucket included.
     let cases: Vec<(&str, String, &str, &str, &str)> = vec![
         (
             "a table bucket that was never created",
             "arn:aws:s3tables:us-east-1:000000000000:bucket/maintenance-absent".to_string(),
             namespace,
             table,
-            NO_BUCKET,
+            NO_TABLE,
         ),
         (
             "the resident bucket's name in another account",
             bucket_arn.replace("000000000000", "123456789012"),
             namespace,
             table,
-            NO_BUCKET,
+            NO_TABLE,
         ),
         (
             "a namespace the bucket does not hold",

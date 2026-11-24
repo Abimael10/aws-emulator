@@ -137,17 +137,14 @@ impl From<PutTableMaintenanceConfigurationErrorModeled> for PutTableMaintenanceC
     }
 }
 
-/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
-/// request addresses.
-fn no_such_bucket() -> PutTableMaintenanceConfigurationError {
-    PutTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
-    })
-    .into()
-}
-
-/// `NotFoundException` (HTTP 404) — no table is stored at what the request
-/// addresses.
+/// `NotFoundException` (HTTP 404) — the request addresses no table this store
+/// holds.
+///
+/// The operation addresses ONE resource — the table named by the bucket ARN, the
+/// namespace and the name together — so the refusal names the TABLE whichever
+/// part of that address resolves to nothing, as it does for the read of the same
+/// table's configuration
+/// (`crate::ops::get_table_maintenance_configuration`).
 fn no_such_table() -> PutTableMaintenanceConfigurationError {
     PutTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
         message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
@@ -172,9 +169,8 @@ fn bad_request(message: String) -> PutTableMaintenanceConfigurationError {
 /// put replaces. Settings naming another task than the path does configure
 /// nothing: the request is one S3 Tables acts on — the recorded response to it is
 /// the modelled 204, and the read that follows in the same recording reports the
-/// addressed task still under the service's own defaults — so the status settles
-/// the task the path named and the task the settings named keeps the settings it
-/// had.
+/// addressed task still under the configuration in force for it — so the status
+/// settles the task the path named and neither task's settings move.
 fn stored_settings(
     kind: crate::state::TableMaintenanceType,
     settings: Option<&TableMaintenanceSettings>,
@@ -297,15 +293,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let settings = stored_settings(kind, input.value.settings.as_ref())?;
 
         let mut store = state.lock();
-        // The table is resolved through the bucket the request names, so a
-        // request against a bucket the store does not hold is refused for that
-        // reason rather than reported as a missing table.
+        // The whole address resolves to one table, or to no table at all.
         let table = store
             .table_buckets
             .get_mut(&input.table_bucket_arn)
-            .ok_or_else(no_such_bucket)?
-            .namespaces
-            .get_mut(&input.namespace)
+            .and_then(|bucket| bucket.namespaces.get_mut(&input.namespace))
             .and_then(|namespace| namespace.tables.get_mut(&input.name))
             .ok_or_else(no_such_table)?;
 
@@ -332,13 +324,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The operation REPLACES the configuration of the task it names and
-        // leaves every other task's alone, so what a read reports for this task
-        // afterwards is exactly this request's configuration.
+        // The operation settles the configuration of the task it names and
+        // leaves every other task's alone. What it settles are the members the
+        // request's value NAMES: a member the value leaves out is one the
+        // request says nothing about, so the value in force for it stays
+        // standing — a put carrying only a status settles the status and leaves
+        // the settings the task runs under where they were.
         let schedule = crate::state::table_task_schedule(table, kind);
-        table
-            .maintenance
-            .insert(kind, TableMaintenance { status, settings });
+        let settled = crate::state::applied_task_maintenance(
+            kind,
+            table.maintenance.get(&kind),
+            &TableMaintenance { status, settings },
+        );
+        table.maintenance.insert(kind, settled);
         // Turning a task on starts the period it runs in, and turning it off
         // ends it, so the job this task runs reports against the configuration
         // now in force. A put that leaves the task's status where it was leaves

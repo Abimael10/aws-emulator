@@ -255,7 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The operation REPLACES the configuration of the task it names and
         // leaves every other task's alone, so what a read reports for this task
-        // afterwards is exactly this request's configuration.
+        // afterwards is exactly this request's configuration. A TABLE's
+        // maintenance put reads the value it carries against the configuration
+        // in force instead, so a member it leaves out keeps its value
+        // (`crate::state::applied_task_maintenance`); that is what the recorded
+        // responses of the TABLE puts show, and no recorded response of this one
+        // settles the question for a table BUCKET's task, so this put is left
+        // replacing until one does.
         let schedule = crate::state::bucket_task_schedule(bucket, kind);
         bucket
             .maintenance

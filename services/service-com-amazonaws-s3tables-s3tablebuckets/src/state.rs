@@ -690,6 +690,53 @@ pub fn default_table_maintenance(kind: TableMaintenanceType) -> TableMaintenance
     }
 }
 
+/// `preferred`'s members where it names them and `fallback`'s where it does
+/// not: the member-by-member overlay of one maintenance configuration on
+/// another.
+///
+/// Every member of a `TableMaintenanceConfigurationValue` is optional in the
+/// model — the status, the settings, and each member inside them — so reading
+/// one configuration against another is this one walk, whether the configuration
+/// underneath is the task's service default ([`effective_task_maintenance`]) or
+/// the one a previous put left in force ([`applied_task_maintenance`]).
+///
+/// Settings of one task cannot be overlaid on settings of the other: such a pair
+/// configures nothing of either task, so what lies underneath stands. The put is
+/// what keeps that pair out of the store, by filing only settings of the task it
+/// was addressed with, so the arm is reached for a configuration that carries no
+/// settings at all.
+fn overlay(preferred: &TableMaintenance, fallback: &TableMaintenance) -> TableMaintenance {
+    let settings = match (preferred.settings, fallback.settings) {
+        (
+            Some(MaintenanceSettings::IcebergCompaction(preferred)),
+            Some(MaintenanceSettings::IcebergCompaction(fallback)),
+        ) => Some(MaintenanceSettings::IcebergCompaction(CompactionSettings {
+            target_file_size_mb: preferred
+                .target_file_size_mb
+                .or(fallback.target_file_size_mb),
+            strategy: preferred.strategy.or(fallback.strategy),
+        })),
+        (
+            Some(MaintenanceSettings::IcebergSnapshotManagement(preferred)),
+            Some(MaintenanceSettings::IcebergSnapshotManagement(fallback)),
+        ) => Some(MaintenanceSettings::IcebergSnapshotManagement(
+            SnapshotManagementSettings {
+                min_snapshots_to_keep: preferred
+                    .min_snapshots_to_keep
+                    .or(fallback.min_snapshots_to_keep),
+                max_snapshot_age_hours: preferred
+                    .max_snapshot_age_hours
+                    .or(fallback.max_snapshot_age_hours),
+            },
+        )),
+        _ => fallback.settings,
+    };
+    TableMaintenance {
+        status: preferred.status.or(fallback.status),
+        settings,
+    }
+}
+
 /// The maintenance configuration in force for one task of a table: the
 /// configuration the store holds for it with every member a put left out filled
 /// in from [`default_table_maintenance`], so a caller that set only a status
@@ -699,42 +746,9 @@ pub fn effective_task_maintenance(
     stored: Option<&TableMaintenance>,
 ) -> TableMaintenance {
     let default = default_table_maintenance(kind);
-    let Some(stored) = stored else {
-        return default;
-    };
-    let settings = match (stored.settings, default.settings) {
-        // A stored setting for the task, with each member the put left out
-        // taken from the task's default.
-        (
-            Some(MaintenanceSettings::IcebergCompaction(stored)),
-            Some(MaintenanceSettings::IcebergCompaction(default)),
-        ) => Some(MaintenanceSettings::IcebergCompaction(CompactionSettings {
-            target_file_size_mb: stored.target_file_size_mb.or(default.target_file_size_mb),
-            strategy: stored.strategy.or(default.strategy),
-        })),
-        (
-            Some(MaintenanceSettings::IcebergSnapshotManagement(stored)),
-            Some(MaintenanceSettings::IcebergSnapshotManagement(default)),
-        ) => Some(MaintenanceSettings::IcebergSnapshotManagement(
-            SnapshotManagementSettings {
-                min_snapshots_to_keep: stored
-                    .min_snapshots_to_keep
-                    .or(default.min_snapshots_to_keep),
-                max_snapshot_age_hours: stored
-                    .max_snapshot_age_hours
-                    .or(default.max_snapshot_age_hours),
-            },
-        )),
-        // The put carried no settings for the task, so it runs under the
-        // task's own defaults. The remaining shape — settings of the OTHER
-        // task filed under this one — cannot be stored: the put refuses that
-        // combination before anything is written, so this arm is reached only
-        // for a configuration that carries no settings.
-        _ => default.settings,
-    };
-    TableMaintenance {
-        status: stored.status.or(default.status),
-        settings,
+    match stored {
+        None => default,
+        Some(stored) => overlay(stored, &default),
     }
 }
 
@@ -748,6 +762,26 @@ pub fn effective_table_maintenance(
         .copied()
         .map(|kind| (kind, effective_task_maintenance(kind, stored.get(&kind))))
         .collect()
+}
+
+/// The configuration in force for `kind` once the value a put carries has been
+/// applied to it.
+///
+/// A member the value leaves out is not a member set to nothing: it is one the
+/// request says nothing about, so the value in force for it STAYS — the
+/// configuration the last put that named that member left, else the task's own
+/// service default ([`effective_task_maintenance`]). So a put carrying only a
+/// status settles the status and leaves the settings the task runs under alone,
+/// and one carrying only a target file size leaves the strategy alone.
+///
+/// `in_force` is the entry the store holds for `kind`, and `requested` the value
+/// this put carries, already read into its stored form.
+pub fn applied_task_maintenance(
+    kind: TableMaintenanceType,
+    in_force: Option<&TableMaintenance>,
+    requested: &TableMaintenance,
+) -> TableMaintenance {
+    overlay(requested, &effective_task_maintenance(kind, in_force))
 }
 
 /// `TableBucketMaintenanceType` — the maintenance tasks S3 Tables runs on a
@@ -1084,7 +1118,9 @@ pub struct Table {
     /// The maintenance configurations a put has set on this table, keyed by the
     /// task each settles. A task with no entry runs under the service's own
     /// defaults, which [`effective_table_maintenance`] is where it is reported
-    /// from — so what is persisted here is what a caller asked for.
+    /// from — so what is persisted here is the configuration in force for the
+    /// task once each put's own members have been applied to it
+    /// ([`applied_task_maintenance`]).
     pub maintenance: BTreeMap<TableMaintenanceType, TableMaintenance>,
     /// The schedule each of this table's maintenance tasks runs under, keyed by
     /// the task, written by the put that turns a task on or off. A task with no
@@ -1451,9 +1487,38 @@ pub fn request_caller(parts: &::http::request::Parts) -> String {
     ::emulator_server::extract_akid(&parts.headers)
 }
 
+/// This service's ARN namespace, the value its model publishes as
+/// `aws.api#service$arnNamespace` (`smithy_query(query="service_info")`): the
+/// vendor field of every ARN this service mints and resolves.
+pub const ARN_NAMESPACE: &str = "s3tables";
+
 /// The ARN of a table bucket: `arn:aws:s3tables:<region>:<account>:bucket/<name>`.
 pub fn table_bucket_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("s3tables", region, &format!("bucket/{name}"))
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("bucket/{name}"))
+}
+
+/// The Region an ARN of this service's own namespace names, and `None` for a
+/// value that names none — one that is no ARN, one of another vendor, and one
+/// whose Region field is empty (a partition-global ARN) or outside the Region
+/// grammar.
+///
+/// The parse is the workspace's one reader of a caller-supplied ARN
+/// ([`::service_common::arn`]), so this service cannot disagree with another
+/// about what an ARN is or about which text is a Region label.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    ::service_common::arn::region_of(arn, ARN_NAMESPACE)
+}
+
+/// Whether `arn` names a resource of a Region other than `region`, the Region
+/// the request was made against.
+///
+/// An ARN carries the Region its resource lives in, and this endpoint serves one
+/// Region, so an ARN naming another one addresses no resource reachable here —
+/// which is [`REGION_MISMATCH_MESSAGE`]. A value that names no Region of this
+/// service at all is not a mismatch: there is nothing to compare, and what such
+/// a value does name is for the operation that reads it to say.
+pub fn arn_names_another_region(arn: &str, region: &str) -> bool {
+    arn_region(arn).is_some_and(|named| named != region)
 }
 
 /// The ARN of a table: its bucket's ARN, then `/table/<table id>`.
@@ -1569,6 +1634,19 @@ pub const INVALID_TABLE_BUCKET_ARN_MESSAGE: &str = "The specified table bucket A
 /// text — it names the CLASS of the failure and takes nothing from the request,
 /// and it says "bucket" rather than "table bucket".
 pub const BUCKET_NOT_FOUND_MESSAGE: &str = "The specified bucket does not exist.";
+
+/// How this service states a request whose resource ARN names a Region other
+/// than the one the endpoint serves: the client request error the model's
+/// `BadRequestException` (HTTP 400) names, since re-pointing the client — not
+/// retrying and not creating anything — is what makes the call possible. FIXED
+/// text, as [`BUCKET_NOT_FOUND_MESSAGE`]: it names the class of the failure and
+/// takes neither the Region of the request nor the Region of the ARN from it.
+///
+/// It is NOT a not-found: an ARN of another Region is an addressing mistake,
+/// and whether a resource of that name exists in the Region it names is not
+/// something this endpoint answers.
+pub const REGION_MISMATCH_MESSAGE: &str =
+    "The provided Region does not match the Region of the resource.";
 
 /// How this service states a table bucket that has no resource-based policy:
 /// the `NotFoundException` (HTTP 404) the bucket policy operations model. FIXED

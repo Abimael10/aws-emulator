@@ -117,17 +117,15 @@ impl From<GetTableMaintenanceConfigurationErrorModeled> for GetTableMaintenanceC
     }
 }
 
-/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
-/// request addresses.
-fn no_such_bucket() -> GetTableMaintenanceConfigurationError {
-    GetTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
-    })
-    .into()
-}
-
-/// `NotFoundException` (HTTP 404) — no table is stored at what the request
-/// addresses.
+/// `NotFoundException` (HTTP 404) — the request addresses no table this store
+/// holds.
+///
+/// The operation addresses ONE resource: the table named by the bucket ARN, the
+/// namespace and the name together. So the refusal names the TABLE whichever
+/// part of that address resolves to nothing — a bucket this account does not
+/// hold, a namespace that bucket does not hold, a name that namespace does not
+/// hold — rather than naming a container the lookup passed through, which the
+/// request did not address and which this operation reports nothing else about.
 fn no_such_table() -> GetTableMaintenanceConfigurationError {
     GetTableMaintenanceConfigurationErrorModeled::NotFoundException(NotFoundException {
         message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
@@ -211,12 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: what it answers with is reconstructed from the table's
         // own record, and nothing in the store is touched.
         let store = state.lock();
+        // The whole address resolves to one table, or to no table at all.
         let table = store
             .table_buckets
             .get(&input.table_bucket_arn)
-            .ok_or_else(no_such_bucket)?
-            .namespaces
-            .get(&input.namespace)
+            .and_then(|bucket| bucket.namespaces.get(&input.namespace))
             .and_then(|namespace| namespace.tables.get(&input.name))
             .ok_or_else(no_such_table)?;
 

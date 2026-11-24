@@ -46,27 +46,19 @@
 //! A request whose input names no resource of this service at all — the create of
 //! a table bucket, a listing of them — is served: there is nothing for this
 //! decision, or for the sentence a refusal carries, to name as the resource.
+//!
+//! The wrapper is also where the one other decision taken for every operation of
+//! this service is made: whether the ARNs the request addresses a resource by
+//! name the Region this endpoint serves ([`super::addressed_region`]), which is
+//! asked first, since an ARN of another Region names no resource for a policy
+//! decision to be about.
 
 use ::std::sync::Arc;
 
-use ::service_common::management_events::{recorded_member_name, recorded_shape, WithheldFromRecord};
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{BoxFuture, ErasedOperation, Operation, OperationContext, Service};
 
-/// The input members this gate never reads a resource out of, and which are left
-/// out of the document it reads: the values a write CARRIES — a policy document,
-/// a table's Iceberg metadata, a tag map, a configuration value. None of them
-/// names the resource the request acts on, and a caller controls their size.
-const PAYLOAD_MEMBERS: &[&str] = &[
-    "resourcePolicy",
-    "metadata",
-    "tags",
-    "tagKeys",
-    "value",
-    "configuration",
-    "encryptionConfiguration",
-    "storageClassConfiguration",
-];
+use super::addressing::Addressing;
 
 /// The resource a request acts on and the resource-based policy in force on the
 /// table bucket that holds it.
@@ -80,20 +72,14 @@ struct Governed {
     policy: Option<String>,
 }
 
-/// The resource the request's `input` addresses and the resource-based policy in
-/// force on it, or `None` when the input names no resource of this service at
-/// all (the create of a table bucket, a listing of them), which leaves this
-/// decision nothing to be taken on.
+/// The resource the request addresses and the resource-based policy in force on
+/// it, or `None` when it names no resource of this service at all (the create of
+/// a table bucket, a listing of them), which leaves this decision nothing to be
+/// taken on.
 ///
-/// The members are this model's own (`smithy_query(query="operation")`), read in
-/// the order a request narrows what it addresses:
-///
-/// * `resourceArn` — the tagging operations, which address a table bucket or a
-///   table by ARN ("The tagged resource can be a table bucket or a table");
-/// * `tableArn` — a table's own ARN, which the replication and record-expiration
-///   operations address one by;
-/// * `tableBucketARN`, with `namespace` and `name` when the operation addresses a
-///   table inside that bucket by its coordinates.
+/// The members are this model's own ([`super::addressing::ARN_MEMBERS`]), read in
+/// the order a request narrows what it addresses, with `namespace` and `name`
+/// when the operation addresses a table inside the bucket by its coordinates.
 ///
 /// The ARN the request NAMED is the resource whatever the store holds at it, so a
 /// request for a resource this account does not hold is decided — and refused —
@@ -101,24 +87,9 @@ struct Governed {
 /// guard, and nothing in it is written.
 fn addressed<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
-    schema: &::aws_smithy_schema::Schema,
+    addressed: &Addressing,
 ) -> Option<Governed> {
-    let document = recorded_shape(
-        input,
-        schema,
-        WithheldFromRecord {
-            omitted: PAYLOAD_MEMBERS,
-            ..WithheldFromRecord::default()
-        },
-    );
-    let text = |member: &str| {
-        document
-            .get(recorded_member_name(member))
-            .and_then(::serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
+    let text = |member: &str| addressed.text(member).map(str::to_string);
     let state = crate::state::service_state(engine)?;
     let store = state.lock();
     // The policy of the bucket a table ARN names: a table's permissions are
@@ -171,18 +142,17 @@ fn addressed<Eng: Send + Sync + 'static>(
 /// force on the caller and on what it addresses do not let it perform that
 /// action, and `None` when nothing refuses it.
 ///
-/// `input` is the request's own built input and `schema` that operation's input
-/// schema, which is where the resource the decision is taken on comes from. The
-/// store guard is released before the decision is asked.
+/// `addressed` is what the request's own input addresses, which is where the
+/// resource the decision is taken on comes from. The store guard is released
+/// before the decision is asked.
 #[must_use]
 pub fn refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     operation: &str,
-    input: &dyn ::aws_smithy_schema::serde::SerializableStruct,
-    schema: &::aws_smithy_schema::Schema,
+    addressed_by: &Addressing,
 ) -> Option<String> {
-    let governed = addressed(engine, input, schema)?;
+    let governed = addressed(engine, addressed_by)?;
     crate::state::authorization::refusal(
         engine,
         ctx,
@@ -235,9 +205,19 @@ where
         input: Self::Input,
         ctx: &OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(message) = refusal(&*self.engine, ctx, O::NAME, &input, O::INPUT_SCHEMA) {
+        // What the request addresses, read once: both decisions below are about
+        // the resource its own input names.
+        let addressed_by = Addressing::of(&input, O::INPUT_SCHEMA);
+        // The Region first: an ARN of another Region addresses no resource of
+        // this endpoint, so there is nothing for a policy decision to be taken
+        // on and nothing for a handler to resolve.
+        if let Some(message) = super::addressed_region::refusal(ctx, &addressed_by) {
+            return Err(crate::scaffolded::Scaffolded::bad_request(message));
+        }
+        if let Some(message) = refusal(&*self.engine, ctx, O::NAME, &addressed_by) {
             return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
+        drop(addressed_by);
         self.operation.handle(input, ctx).await
     }
 }

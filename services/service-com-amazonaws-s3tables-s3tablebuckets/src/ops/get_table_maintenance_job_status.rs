@@ -115,17 +115,14 @@ impl From<GetTableMaintenanceJobStatusErrorModeled> for GetTableMaintenanceJobSt
     }
 }
 
-/// `NotFoundException` (HTTP 404) — no table bucket is stored at the ARN the
-/// request addresses.
-fn no_such_bucket() -> GetTableMaintenanceJobStatusError {
-    GetTableMaintenanceJobStatusErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::BUCKET_NOT_FOUND_MESSAGE.to_string()),
-    })
-    .into()
-}
-
-/// `NotFoundException` (HTTP 404) — no table is stored at what the request
-/// addresses.
+/// `NotFoundException` (HTTP 404) — the request addresses no table this store
+/// holds.
+///
+/// The operation addresses ONE resource — the table named by the bucket ARN, the
+/// namespace and the name together — so the refusal names the TABLE whichever
+/// part of that address resolves to nothing, as it does for the configuration
+/// read of the same table
+/// (`crate::ops::get_table_maintenance_configuration`).
 fn no_such_table() -> GetTableMaintenanceJobStatusError {
     GetTableMaintenanceJobStatusErrorModeled::NotFoundException(NotFoundException {
         message: Some(crate::state::TABLE_NOT_FOUND_MESSAGE.to_string()),
@@ -196,17 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // touched — so two reads of a table nobody reconfigured answer the same.
         let at = ::std::time::SystemTime::now();
         let store = state.lock();
-        // The table is resolved through the bucket the request names, so a
-        // request against a bucket the store does not hold is refused for that
-        // reason rather than reported as a missing table.
-        let bucket = store
+        // The whole address resolves to one table, or to no table at all; the
+        // bucket it is held in is what the bucket-level job is reported from.
+        let (bucket, table) = store
             .table_buckets
             .get(&input.table_bucket_arn)
-            .ok_or_else(no_such_bucket)?;
-        let table = bucket
-            .namespaces
-            .get(&input.namespace)
-            .and_then(|namespace| namespace.tables.get(&input.name))
+            .and_then(|bucket| {
+                bucket
+                    .namespaces
+                    .get(&input.namespace)
+                    .and_then(|namespace| namespace.tables.get(&input.name))
+                    .map(|table| (bucket, table))
+            })
             .ok_or_else(no_such_table)?;
 
         // S3 Tables maintains every table from the moment it is created, so the

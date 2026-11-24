@@ -189,6 +189,18 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 /// (`smithy_query(query="operation", operation="GetTableEncryption")`).
 pub const ACCESS_DENIED_STATUS: u16 = 403;
 
+/// The error code a client-input refusal this service decides in front of a
+/// handler carries: the name of the shape its own model declares for one,
+/// `com.amazonaws.s3tables#BadRequestException` — "The request is invalid or
+/// malformed" (`smithy_query(query="shape", shape="BadRequestException")`),
+/// which is the code S3 Tables answers such a request with.
+pub const BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The HTTP status that shape carries: its own `@httpError(400)`
+/// (`smithy_query(query="operation",
+/// operation="GetTableMaintenanceConfiguration")`).
+pub const BAD_REQUEST_STATUS: u16 = 400;
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -208,6 +220,18 @@ pub enum Scaffolded<E> {
     /// there cannot travel through an error channel one handler's own model happens
     /// not to declare.
     AccessDenied(crate::ops::types::shared_types::AccessDeniedException),
+    /// The request addresses a resource by an ARN naming a Region other than the
+    /// one this endpoint serves: HTTP 400 with the error code
+    /// `BadRequestException`, in the shape THIS service's model declares for it
+    /// (`crate::ops::types::shared_types::BadRequestException`, whose `message`
+    /// member carries the sentence this service states that class with).
+    ///
+    /// It is a variant of the wrapper rather than of an operation's
+    /// `#[operation_error]` enum for the same reason as [`Self::AccessDenied`]:
+    /// the decision is taken for EVERY operation this service serves
+    /// (`crate::service::addressed_region`), ahead of the handler, while the
+    /// model lists the shape for only some of them.
+    BadRequest(crate::ops::types::shared_types::BadRequestException),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
@@ -257,6 +281,18 @@ impl<E> Scaffolded<E> {
             message: Some(message.into()),
         })
     }
+
+    /// The client-input refusal carrying `message`: HTTP 400
+    /// `BadRequestException`, in the shape this service's own model declares.
+    ///
+    /// For a refusal decided in front of every operation's handler. An
+    /// operation's OWN refusals travel through its modelled error enum, which
+    /// declares the same shape.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest(crate::ops::types::shared_types::BadRequestException {
+            message: Some(message.into()),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -266,6 +302,11 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::AccessDenied(e) => write!(
                 f,
                 "{ACCESS_DENIED_CODE}: {}",
+                e.message.as_deref().unwrap_or_default()
+            ),
+            Self::BadRequest(e) => write!(
+                f,
+                "{BAD_REQUEST_CODE}: {}",
                 e.message.as_deref().unwrap_or_default()
             ),
             Self::Modeled(e) => write!(f, "{e}"),
@@ -282,6 +323,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             // The modelled shape is a plain structure and carries no source of its own.
             Self::AccessDenied(_) => None,
+            Self::BadRequest(_) => None,
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
@@ -297,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::AccessDenied(e) => e,
+            Self::BadRequest(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
         }
@@ -308,6 +351,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::AccessDenied(_) => {
                 &crate::ops::types::shared_types::SCHEMA_ACCESS_DENIED_EXCEPTION
             }
+            Self::BadRequest(_) => &crate::ops::types::shared_types::SCHEMA_BAD_REQUEST_EXCEPTION,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
@@ -321,6 +365,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::AccessDenied(_) => ACCESS_DENIED_CODE,
+            Self::BadRequest(_) => BAD_REQUEST_CODE,
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
@@ -334,6 +379,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
+            Self::BadRequest(_) => BAD_REQUEST_STATUS,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
         }
@@ -348,6 +394,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The modelled shape carries no `awsQueryError` trait either, and this
             // service speaks no query protocol.
             Self::AccessDenied(_) => None,
+            Self::BadRequest(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,

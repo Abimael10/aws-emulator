@@ -572,34 +572,42 @@ async fn a_call_against_a_table_bucket_the_store_does_not_hold_is_refused() {
     let kind = TableBucketMaintenanceType::IcebergUnreferencedFileRemoval;
     let bucket_arn = create_bucket(&emulator, region, "bucket-maintenance-present").await;
 
-    let cases: Vec<(&str, String)> = vec![
+    // (the case, the ARN the call addresses, the Region the request is made in)
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "a table bucket that was never created",
             "arn:aws:s3tables:us-east-1:000000000000:bucket/bucket-maintenance-absent".to_string(),
+            region,
         ),
         (
             "the resident bucket's name in another account",
             bucket_arn.replace("000000000000", "123456789012"),
+            region,
         ),
+        // The same name in another Region is a bucket of that Region, so the
+        // case is made for that Region: an ARN of a Region other than the
+        // endpoint's is an addressing mistake rather than a bucket that is not
+        // there, which `region_addressing.rs` is where that class is covered.
         (
-            "the resident bucket's name in another region",
+            "the resident bucket's name in another region, called in that region",
             bucket_arn.replace("us-east-1", "eu-west-1"),
+            "eu-west-1",
         ),
     ];
 
-    for (case, arn) in cases {
+    for (case, arn, case_region) in cases {
         for (operation, reply) in [
             (
                 "GetTableBucketMaintenanceConfiguration",
                 emulator
-                    .get_table_bucket_maintenance_configuration(region, &arn)
+                    .get_table_bucket_maintenance_configuration(case_region, &arn)
                     .await,
             ),
             (
                 "PutTableBucketMaintenanceConfiguration",
                 emulator
                     .put_table_bucket_maintenance_configuration(
-                        region,
+                        case_region,
                         &arn,
                         kind.as_wire(),
                         &json!({ "status": "disabled" }),

@@ -788,23 +788,31 @@ async fn an_arn_no_create_minted_is_not_found() {
         body = created.body
     );
 
+    // (the case, the ARN the read addresses, the Region the request is made in)
     let cases = [
         (
             "a name nothing created",
             expected_arn("us-east-1", "never-created"),
+            "us-east-1",
         ),
+        // The same name in another Region is a bucket of that Region, so it is
+        // read for that Region: an ARN of a Region other than the endpoint's is
+        // an addressing mistake rather than a bucket that is not there, which
+        // `region_addressing.rs` is where that class is covered.
         (
-            "the right name in another region",
+            "the right name in another region, read in that region",
             expected_arn("eu-west-1", "the-one-that-exists"),
+            "eu-west-1",
         ),
         (
             "the right name under another account",
             "arn:aws:s3tables:us-east-1:123456789012:bucket/the-one-that-exists".to_string(),
+            "us-east-1",
         ),
     ];
 
-    for (label, arn) in &cases {
-        let read = emulator.get_table_bucket("us-east-1", arn).await;
+    for (label, arn, region) in &cases {
+        let read = emulator.get_table_bucket(region, arn).await;
         assert_eq!(
             read.status, 404,
             "case {label:?}: an unknown bucket must not be found, got {status} {body}",

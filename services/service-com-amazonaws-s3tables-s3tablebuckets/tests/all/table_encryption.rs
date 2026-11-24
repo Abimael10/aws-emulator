@@ -475,17 +475,24 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
     // here rather than read out of the crate.
     let no_bucket = "The specified bucket does not exist.";
     let no_table = "The specified table does not exist.";
-    // (case, bucket ARN, namespace, table, expected sentence)
-    let rows: Vec<(&str, String, &str, &str, &str)> = vec![
+    // (case, the Region the request is made in, bucket ARN, namespace, table,
+    // expected sentence)
+    let rows: Vec<(&str, &str, String, &str, &str, &str)> = vec![
         (
             "a bucket that was never created",
+            region,
             expected_bucket_arn(region, "table-encryption-absent"),
             NAMESPACE,
             "resident",
             no_bucket,
         ),
+        // The same name in another Region is a bucket of that Region, so the row
+        // is read for that Region: an ARN of a Region other than the endpoint's
+        // is an addressing mistake rather than a resource that is not there,
+        // which `region_addressing.rs` is where that class is covered.
         (
-            "the resident bucket's name in another region",
+            "the resident bucket's name in another region, read in that region",
+            "eu-west-1",
             expected_bucket_arn("eu-west-1", "table-encryption-refusals"),
             NAMESPACE,
             "resident",
@@ -493,6 +500,7 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
         ),
         (
             "another account's bucket of the same name",
+            region,
             arn.replace("000000000000", "123456789012"),
             NAMESPACE,
             "resident",
@@ -500,6 +508,7 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
         ),
         (
             "a namespace the bucket does not hold",
+            region,
             arn.clone(),
             "absent_ns",
             "resident",
@@ -507,6 +516,7 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
         ),
         (
             "a table the namespace does not hold",
+            region,
             arn.clone(),
             NAMESPACE,
             "absent",
@@ -514,6 +524,7 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
         ),
         (
             "a table that was deleted",
+            region,
             arn.clone(),
             NAMESPACE,
             "doomed",
@@ -521,9 +532,9 @@ async fn a_read_of_a_table_the_store_does_not_hold_is_refused() {
         ),
     ];
 
-    for (case, bucket_arn, namespace, table, sentence) in &rows {
+    for (case, case_region, bucket_arn, namespace, table, sentence) in &rows {
         let read = emulator
-            .get_table_encryption(region, bucket_arn, namespace, table)
+            .get_table_encryption(case_region, bucket_arn, namespace, table)
             .await;
         assert_eq!(
             read.status, 404,

@@ -35,10 +35,6 @@ use super::harness::{Emulator, Reply};
 /// The fixed sentence this service states a table the store does not hold with.
 const NO_TABLE: &str = "The specified table does not exist.";
 
-/// The fixed sentence this service states a table bucket the store does not
-/// hold with.
-const NO_BUCKET: &str = "The specified bucket does not exist.";
-
 /// Every value `TableMaintenanceJobType` declares, from
 /// `smithy_query(query="shape",shape="TableMaintenanceJobType")`. A read reports
 /// one entry per job, so this is the whole key set of the `status` map.
@@ -551,13 +547,16 @@ async fn a_read_of_a_resource_the_store_does_not_hold_is_refused() {
     let emulator = Emulator::new();
     let (bucket_arn, _) = create_table(&emulator, region, "job-status-404", namespace, "t").await;
 
+    // The read addresses ONE resource, the table the bucket ARN, the namespace
+    // and the name together name, so the refusal names the TABLE whichever part
+    // of that address resolves to nothing.
     let cases: [(&str, String, &str, &str, &str); 3] = [
         (
             "a bucket the store does not hold",
             format!("arn:aws:s3tables:{region}:000000000000:bucket/absent-bucket"),
             namespace,
             "t",
-            NO_BUCKET,
+            NO_TABLE,
         ),
         (
             "a namespace the bucket does not hold",

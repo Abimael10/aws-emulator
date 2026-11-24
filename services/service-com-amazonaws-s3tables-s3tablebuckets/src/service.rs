@@ -63,6 +63,15 @@ use crate::ops::types::{BadRequestException, SCHEMA_BAD_REQUEST_EXCEPTION};
 /// the decision every operation this service serves is taken behind.
 mod authorization;
 
+/// What a request addresses: the input members that name the resource it acts
+/// on, read once for the decisions taken in front of every handler.
+mod addressing;
+
+/// Whether the ARNs a request addresses a resource by name the Region this
+/// endpoint serves — the check every operation this service serves is taken
+/// behind.
+mod addressed_region;
+
 /// How this service refuses a request body it cannot read into the operation's
 /// modelled input at all — a layer in FRONT of the generated walk, because the
 /// framework states that failure in its own codec's words under an error code
