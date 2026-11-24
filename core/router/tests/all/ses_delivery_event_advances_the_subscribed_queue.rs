@@ -41,7 +41,7 @@ const SENDER: &str = "notices@queue-watchers.example.com";
 /// The mailbox-simulator mailbox that TAKES a message, and the one that refuses it. Both are
 /// the simulator's own mailboxes, whose reactions are the ones the simulator defines, so a
 /// case does not depend on what any other mailbox would do with the message.
-const TAKES_THE_MESSAGE: &str = "success@simulator.amazonses.com";
+pub(crate) const TAKES_THE_MESSAGE: &str = "success@simulator.amazonses.com";
 const REFUSES_THE_MESSAGE: &str = "bounce@simulator.amazonses.com";
 
 /// The SQS attribute a consumer polls for the queue's depth: "the approximate number of
@@ -252,7 +252,7 @@ async fn send(router: &MultiServiceRouter, case: &str, set: &str, recipient: &st
 
 /// What the queue at `url` reports as its depth, as the decimal string the attribute map
 /// carries.
-async fn depth(router: &MultiServiceRouter, case: &str, url: &str) -> String {
+pub(crate) async fn depth(router: &MultiServiceRouter, case: &str, url: &str) -> String {
     let answered = sqs(
         router,
         case,
@@ -268,7 +268,7 @@ async fn depth(router: &MultiServiceRouter, case: &str, url: &str) -> String {
 
 /// Ask the queue at `url` how deep it is until it reports `wanted`, answering what it last
 /// reported. Nothing sleeps for the publication: this stops as soon as the depth arrives.
-async fn depth_reaching(
+pub(crate) async fn depth_reaching(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
@@ -288,7 +288,7 @@ async fn depth_reaching(
 
 /// Receive from the queue at `url` until `wanted` messages have been handed over or the polls
 /// run out, leaving every message where it is (nothing is deleted).
-async fn received(
+pub(crate) async fn received(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
@@ -320,7 +320,7 @@ async fn received(
 
 /// The SES event one received `message` carries: its `Body` is the SNS notification, whose
 /// `Message` is the published document.
-fn published_event(case: &str, message: &Value, topic: &str) -> Value {
+pub(crate) fn published_event(case: &str, message: &Value, topic: &str) -> Value {
     let body = message["Body"].as_str().unwrap_or_default();
     let envelope: Value = serde_json::from_str(body)
         .unwrap_or_else(|error| panic!("case {case:?}: the body is no SNS envelope ({error}): {body}"));
@@ -342,7 +342,7 @@ fn published_event(case: &str, message: &Value, topic: &str) -> Value {
 
 /// Assert the members `ReceiveMessage` answers for one arrived message: the queue's own id and
 /// receipt handle, and the digest of the body it holds.
-fn assert_message_members(case: &str, message: &Value) {
+pub(crate) fn assert_message_members(case: &str, message: &Value) {
     let message_id = message["MessageId"].as_str().unwrap_or_default();
     assert!(
         !message_id.is_empty(),

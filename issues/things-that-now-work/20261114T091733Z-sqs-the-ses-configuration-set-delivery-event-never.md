@@ -59,3 +59,26 @@ Context in the same fixture: step task#8 (sesv2 SendEmail) answers 400 with no M
 4. Step task#9: poll sqs GetQueueAttributes(QueueUrl=<queue>, AttributeNames=['ApproximateNumberOfMessages']). Observe it stays '0' across all 40 polls where AWS converges to a non-zero count.
 5. Step task#10: call sqs ReceiveMessage on the same queue. Observe an empty 200 body with no Messages member, where AWS returns one Message carrying the SES event JSON Body plus MessageId, ReceiptHandle and MD5OfBody.
 6. Re-replay both steps after wiring the SES event-destination publication into SNS and the SNS sqs-protocol delivery into sqs queue state.
+
+## Resolution
+
+The component this issue asks for is in place: an accepted send publishes each matched event of
+each `Enabled` event destination, the SNS sqs-protocol subscription delivers it into sqs queue
+state, and the queue counts it and hands it over. That is pinned end to end over the production
+service set by `core/router/tests/all/ses_event_reaches_every_subscribed_queue.rs` (every queue
+subscribed to the destination's topic reports the depth of what arrived, and each received
+message carries a `MessageId`, a `ReceiptHandle`, a `Body` and an `MD5OfBody` that is the MD5
+digest of that body), beside the older
+`ses_delivery_event_advances_the_subscribed_queue` and `ses_send_events_reach_a_subscribed_queue`.
+
+The two fixture steps above still diverge, for a cause outside these two sqs operations: task#8's
+`SendEmail` is refused because the account holds no identity covering the sender. The replayed
+trace establishes none — instrumenting the identity gate during a replay shows the sesv2 identity
+table and the shared SES identity registry both empty at task#8 while the configuration set from
+the earlier step is present, and making every identity-establishing operation of both SES surfaces
+refuse unconditionally adds no divergence to the fixture, so no step of it creates or verifies an
+email identity. The recorded account already held the verified sending domain. With no such
+identity AWS refuses that send too, and the empty queue the two steps report is then faithful.
+
+Step task#8 is owned by `20261121T085411Z-sesv2-sendemail-through-a-configuration-set-with-an-sns.md`;
+the `20261109T232952Z-…` report cited above exists in neither issue folder.

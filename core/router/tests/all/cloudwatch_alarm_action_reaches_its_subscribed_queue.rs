@@ -124,7 +124,7 @@ async fn sqs(router: &MultiServiceRouter, case: &str, region: &str, operation: &
 }
 
 /// One SNS call over the `awsQuery` form wire that service serves, which must answer 200.
-async fn sns(
+pub(crate) async fn sns(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -190,6 +190,28 @@ pub(crate) async fn given_topic_with_subscriber(
     name: &str,
     grant: Grant,
 ) -> (String, String) {
+    let topic = element(
+        &sns(router, case, region, "CreateTopic", &[("Name", name)]).await,
+        "TopicArn",
+    );
+    let url = given_queue_subscribed_to(router, case, region, name, &topic, grant).await;
+    (topic, url)
+}
+
+/// A queue named `name` in `region`, subscribed to the EXISTING topic `topic` and granting SNS
+/// the send the way `grant` writes it. Answers the queue's url.
+///
+/// Separate from [`given_topic_with_subscriber`] so that a suite can put SEVERAL queues on one
+/// topic, which is what tells a delivery made to one subscriber from a delivery made to all of
+/// them.
+pub(crate) async fn given_queue_subscribed_to(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    name: &str,
+    topic: &str,
+    grant: Grant,
+) -> String {
     let created = sqs(router, case, region, "CreateQueue", &json!({"QueueName": name})).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -207,10 +229,6 @@ pub(crate) async fn given_topic_with_subscriber(
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no QueueArn in {attributes}"))
         .to_string();
-    let topic = element(
-        &sns(router, case, region, "CreateTopic", &[("Name", name)]).await,
-        "TopicArn",
-    );
     sqs(
         router,
         case,
@@ -218,7 +236,7 @@ pub(crate) async fn given_topic_with_subscriber(
         "SetQueueAttributes",
         &json!({
             "QueueUrl": url,
-            "Attributes": {"Policy": grant.policy(&queue_arn, &topic)},
+            "Attributes": {"Policy": grant.policy(&queue_arn, topic)},
         }),
     )
     .await;
@@ -228,13 +246,13 @@ pub(crate) async fn given_topic_with_subscriber(
         region,
         "Subscribe",
         &[
-            ("TopicArn", &topic),
+            ("TopicArn", topic),
             ("Protocol", "sqs"),
             ("Endpoint", &queue_arn),
         ],
     )
     .await;
-    (topic, url)
+    url
 }
 
 /// Take every notification waiting on the queue at `url`, as the alarm documents SNS
