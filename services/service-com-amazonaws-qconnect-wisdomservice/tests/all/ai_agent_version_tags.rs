@@ -10,14 +10,17 @@
 //! body are inspected, so a response that is not computed from persisted state cannot pass.
 //!
 //! The rule under test, asserted over a TABLE of inputs rather than one recorded request:
-//! the `tags` a published version reports is the tag set the AI agent carried at the instant
-//! it was published — EXACTLY that set, with nothing added to it and nothing dropped from it.
+//! the `tags` a published version reports carries the tag set the AI agent carried at the
+//! instant it was published — EXACTLY that set, with nothing dropped from it — beside the one
+//! entry a published version of this endpoint reports for the agent it was published from
+//! (`ai_agent_version_resource_tag.rs` owns that entry's own rule, and this suite expects it
+//! through that suite's helper).
 //! `Tags` is "The tags used to organize, track, or control access for this resource"
 //! (`smithy_query(query="shape",shape="AIAgentData",member="tags")`), the key pattern
 //! reserves the `aws:` prefix (`^(?!aws:)[a-zA-Z+-=._:/]+$`) and so leaves every other key to
-//! the account, and nothing in this surface writes a tag of its own: a tag reaches a version
-//! only by having been applied to the agent — through the create's own `tags` member or a
-//! later `TagResource` merge — before the publish took its snapshot. The snapshot being
+//! the account: a tag of the CALLER's reaches a version only by having been applied to the
+//! agent — through the create's own `tags` member or a later `TagResource` merge — before the
+//! publish took its snapshot. The snapshot being
 //! immutable, a later tag write to the working copy leaves an already-published version's map
 //! as it was, while the next publish carries the set as it then stands.
 //!
@@ -42,6 +45,7 @@ use super::ai_agent::{
     assistant_id, create_agent, expected_agent_arn, full_configuration, get_agent,
     QUALIFIER_LATEST, VISIBILITY_SAVED,
 };
+use super::ai_agent_version_resource_tag::expected_version_tags;
 use super::ai_agent_versions::{list_versions, publish};
 use super::resource_tags::{label, Emulator, Reply};
 use super::tag_resource::{stored_tags, tag_resource};
@@ -270,6 +274,7 @@ async fn a_published_version_reports_the_tag_set_its_agent_carried_and_nothing_e
 
         // The publish's own answer, the listing's summary of that version and the
         // version-addressed read: one map, the agent's own, whichever projection reports it.
+        let expected = expected_version_tags(&on_the_agent, &agent_arn);
         let listed = list_versions(&emulator, &assistant, &agent, "").await;
         let read = get_agent(&emulator, &assistant, &format!("{agent}:{version_number}")).await;
         for (what, actual) in [
@@ -292,9 +297,9 @@ async fn a_published_version_reports_the_tag_set_its_agent_carried_and_nothing_e
             ),
         ] {
             assert_eq!(
-                actual, on_the_agent,
+                actual, expected,
                 "case {case:?}: {what} must report the tag set the agent carried when \
-                 version {version_number} was published, expected {on_the_agent:?}, got \
+                 version {version_number} was published, expected {expected:?}, got \
                  {actual:?}"
             );
         }
@@ -402,10 +407,11 @@ async fn a_published_versions_tag_map_is_immutable_under_a_later_tag_write() {
             "/aiAgentVersionSummaries/0/aiAgentSummary/tags",
             &listed,
         );
+        let expected = expected_version_tags(&at_publish, &agent_arn);
         assert_eq!(
-            actual, at_publish,
+            actual, expected,
             "case {case:?}: version {version_number} must keep the tag set it was published \
-             with, expected {at_publish:?}, got {actual:?}"
+             with, expected {expected:?}, got {actual:?}"
         );
 
         // A version published AFTER the write carries the set as it now stands.
@@ -416,10 +422,11 @@ async fn a_published_versions_tag_map_is_immutable_under_a_later_tag_write() {
             republished.status, republished.body
         );
         let actual = tags_at(case, "the second publish", "/aiAgent/tags", &republished);
+        let expected = expected_version_tags(&now_on_the_agent, &agent_arn);
         assert_eq!(
-            actual, now_on_the_agent,
+            actual, expected,
             "case {case:?}: the version published after the write must report the agent's \
-             tags as they now stand, expected {now_on_the_agent:?}, got {actual:?}"
+             tags as they now stand, expected {expected:?}, got {actual:?}"
         );
     }
 }

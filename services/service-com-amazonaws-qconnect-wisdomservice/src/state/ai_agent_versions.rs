@@ -12,9 +12,9 @@
 //! qualifier reads the snapshot rather than the working copy. The snapshot is a whole
 //! [`AiAgent`] record, so every member a version reports is rendered by the SAME
 //! projection a read of the working copy renders, and the two cannot disagree about what
-//! was published. The publish adds nothing of its own to that record: a version's `tags` is
-//! the tag set the agent carried when it was published, which is the tag set a caller
-//! applied, so nothing but a tag write to the working copy ever puts an entry there.
+//! was published. The publish adds ONE entry of its own to that record's tag map, naming
+//! the agent the snapshot was taken of — see [`AI_AGENT_VERSION_RESOURCE_TAG_KEY`]; every
+//! other member is the agent's as it stood, the caller's own tags included.
 //!
 //! The numbering is the one the modelled `Version` range (`min 1`) admits: 1 for an
 //! agent's first version and the previous number plus 1 for each later publish. A number a
@@ -31,6 +31,27 @@ use crate::ops::types::AIAgentVersionSummary;
 /// of this family ([`MESSAGE_AI_AGENT_NOT_FOUND`]), with the resource token spelled as the
 /// API itself names the resource.
 pub const MESSAGE_AI_AGENT_VERSION_NOT_FOUND: &str = "AI Agent version does not exist.";
+
+/// The key of the tag entry the publish writes into a version's tag map, valued with the
+/// UNQUALIFIED ARN of the AI agent the version was published from.
+///
+/// RECORDED BEHAVIOUR of this endpoint, and nothing a caller supplies: in the wire
+/// recording of an AI-agent lifecycle (corpus `simparity-wire-aws-v1`, fixture
+/// `qconnect-ai-agent-lifecycle`) the client applies no tag at all — its `CreateAIAgent`
+/// carries no `tags` member and it never calls `TagResource` — and the publish of that
+/// agent answers 200 with `aiAgent.tags` holding exactly this one entry, valued with the
+/// agent's own ARN without a version qualifier; the listing of that agent's versions
+/// reports the same map under the version's `aiAgentSummary.tags`, while the read of the
+/// WORKING COPY in the same recording reports no tag whatever. So the entry belongs to the
+/// version RECORD the publish materialises, is rendered out of the agent's own identity,
+/// and is no echo of a request: a version reports it whether or not its agent carries tags
+/// of its own, and the working copy — and so `ListTagsForResource`, which reads the tags
+/// the agent itself holds — never reports it.
+///
+/// It is written LAST, so a version reports the agent's ARN under this key even where the
+/// agent carries a tag of its own under it: the entry states which agent the snapshot was
+/// taken of, which is the record's own fact rather than the caller's.
+pub const AI_AGENT_VERSION_RESOURCE_TAG_KEY: &str = "resourceArn";
 
 /// The most versions one AI agent may hold at a time; a publish beyond it is refused with
 /// the modelled `ServiceQuotaExceededException` (HTTP 402), which `CreateAIAgentVersion`
@@ -94,8 +115,9 @@ pub struct AiAgentVersion {
     /// version and the previous one plus 1 for each later publish, which is what the
     /// modelled `Version` range (`min 1`) admits.
     pub version_number: i64,
-    /// The working copy as it was when this version was published — its tag map included,
-    /// which is the tag set the agent carried at that instant and nothing besides.
+    /// The working copy as it was when this version was published, carrying the tag map
+    /// this version REPORTS: the set the agent held at that instant, plus the entry
+    /// [`AI_AGENT_VERSION_RESOURCE_TAG_KEY`] naming the agent it was published from.
     /// Immutable: a
     /// later write to the agent leaves this record alone.
     pub snapshot: AiAgent,
@@ -199,7 +221,12 @@ impl Assistant {
     ///
     /// `None` — nothing published — when this agent already holds
     /// [`MAX_AI_AGENT_VERSIONS_PER_AGENT`] versions, which is what keeps this store finite.
-    pub fn publish_ai_agent_version(&mut self, snapshot: AiAgent) -> Option<i64> {
+    ///
+    /// What is stored is `snapshot` as it stands, with the one entry the publish
+    /// materialises written into its tag map ([`AI_AGENT_VERSION_RESOURCE_TAG_KEY`]), so
+    /// every operation that later reports this version renders that map out of the stored
+    /// record instead of restating the rule.
+    pub fn publish_ai_agent_version(&mut self, mut snapshot: AiAgent) -> Option<i64> {
         let history = self
             .ai_agent_versions
             .entry(snapshot.ai_agent_id.clone())
@@ -207,6 +234,12 @@ impl Assistant {
         if history.versions.len() >= MAX_AI_AGENT_VERSIONS_PER_AGENT {
             return None;
         }
+        // The agent's own ARN, which carries no version qualifier: the entry names the AI
+        // agent this snapshot was taken OF, not the version it is published as.
+        let published_from = snapshot.ai_agent_arn.clone();
+        snapshot
+            .tags
+            .insert(AI_AGENT_VERSION_RESOURCE_TAG_KEY.to_string(), published_from);
         history.last_version_number += 1;
         let version_number = history.last_version_number;
         history.versions.push(AiAgentVersion {

@@ -164,15 +164,24 @@ async fn get_assistant(emulator: &Emulator, assistant: &str) -> Reply {
 }
 
 /// The `AIAgentData` a read of one VERSION must answer with: the record the working copy
-/// carried when that version was published, with the one member a version renders
-/// differently — the ARN names the version addressed.
+/// carried when that version was published, with the two members a version renders
+/// differently — the ARN names the version addressed, and the tag map carries, beside the
+/// agent's own tags, the entry a published version of this endpoint reports for the agent it
+/// was published from (see `ai_agent_version_resource_tag.rs`, which owns that rule).
 fn versioned(record: &Value, version_number: i64) -> Value {
     let mut expected = record.clone();
     let arn = record
         .get("aiAgentArn")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     expected["aiAgentArn"] = json!(format!("{arn}:{version_number}"));
+    let mut tags = expected
+        .get("tags")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    tags[super::ai_agent_version_resource_tag::VERSION_RESOURCE_TAG_KEY] = json!(arn);
+    expected["tags"] = tags;
     expected
 }
 
