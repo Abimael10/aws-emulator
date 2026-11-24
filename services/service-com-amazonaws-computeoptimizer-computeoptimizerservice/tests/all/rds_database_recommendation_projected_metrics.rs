@@ -19,19 +19,22 @@
 //!   of the two classes' capacities and cannot pass 100, and every other metric — the
 //!   workload's own and the storage's — is projected unchanged;
 //! * `stat` selects which observed statistic is projected;
-//! * a database the analysis would not move has no option, so there is nothing to project.
+//! * a database the analysis would not move has no option, so there is nothing to project;
+//! * an ARN whose ACCOUNT field names an account other than the one this service answers for
+//!   is REFUSED, never answered with the empty list of projections.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RDSDBUtilizationMetric;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY,
-    MAX_PROJECTED_METRIC_DATA_POINTS, SOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, MAX_PROJECTED_METRIC_DATA_POINTS,
+    SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
-use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, call_in_region, emulator_with_engine, error_code, make_analysis_due, opt_in, ACCOUNT,
+};
 
 /// The region the harness signs for, and so the regional endpoint every call below addresses
 /// unless it names another.
@@ -47,6 +50,14 @@ const WINDOW_START: i64 = 1_761_000_000;
 /// (`GetRDSDatabaseRecommendationProjectedMetrics$resourceArn`).
 fn db_arn(account_id: &str, name: &str) -> String {
     format!("arn:aws:rds:{REGION}:{account_id}:db:{name}")
+}
+
+/// An Amazon Aurora DB cluster ARN: "arn:aws:rds:{region}:{accountId}:cluster:{resourceName}"
+/// — the other ARN form this service's Aurora and RDS members document
+/// (`GetRDSDatabaseRecommendations$resourceArns`), which this reader takes too because it
+/// reports on Aurora databases as well as RDS ones.
+fn db_cluster_arn(account_id: &str, name: &str) -> String {
+    format!("arn:aws:rds:{REGION}:{account_id}:cluster:{name}")
 }
 
 /// One utilization metric as the analysis observed it: an `RDSDBMetricName`, the
@@ -241,24 +252,30 @@ fn catalog_size(engine: &Arc<engine::InMemoryEngine>) -> usize {
 /// An emulator whose account is opted in, whose analysis is due and whose findings catalog
 /// holds [`corpus`].
 ///
-/// A projection is reported only once the analysis the enrollment started is due
-/// ([`ANALYSIS_DELAY`]), so the fixture waits that span out before reading, the way every
-/// other recommendation suite of this crate does; the extra margin covers scheduler jitter.
+/// A projection is reported only once the analysis the enrollment started is due, so the
+/// fixture moves the stored enrollment instant back a span ([`make_analysis_due`]) instead of
+/// waiting for the clock to reach it: the condition is then true however fast or loaded the
+/// host is.
 async fn emulator_with_corpus() -> (
     smithy_server_runtime::MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
 ) {
-    let (router, engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_recorded_corpus();
     opt_in(&router).await;
-    record(&engine, &corpus());
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(&engine);
     (router, engine)
 }
 
-/// A request for one database over one window.
+/// A request for one database of the account this service answers for, over one window.
 fn request(name: &str, stat: &str, period: i64, start: i64, end: i64) -> Value {
+    request_for_arn(&db_arn(ACCOUNT, name), stat, period, start, end)
+}
+
+/// A request for whatever ARN it carries, over one window — for a case whose subject is the
+/// ARN itself rather than a database of this account.
+fn request_for_arn(arn: &str, stat: &str, period: i64, start: i64, end: i64) -> Value {
     json!({
-        "resourceArn": db_arn(ACCOUNT, name),
+        "resourceArn": arn,
         "stat": stat,
         "period": period,
         "startTime": start,
@@ -876,7 +893,10 @@ async fn the_read_waits_for_the_enrollment_and_the_analysis() {
          {response}"
     );
 
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    // The analysis becomes due a span after the enrollment was recorded: the stored instant
+    // is moved back rather than waited out, so what the read below reports does not depend on
+    // how fast the host runs.
+    make_analysis_due(&engine);
     let response = projected(&router, "once the analysis is due", body).await;
     assert!(
         !response["recommendedOptionProjectedMetrics"]
@@ -915,7 +935,7 @@ async fn the_projected_option_is_the_recommended_option() {
         )],
     );
     // The catalog is read only once the analysis the enrollment started is due.
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(&engine);
     let before = catalog_size(&engine);
     let seeded = db_arn(SEEDED_ACCOUNT, "orders-primary");
 
@@ -977,4 +997,237 @@ async fn the_projected_option_is_the_recommended_option() {
         before,
         "a read must not add or drop a catalog row"
     );
+}
+
+/// The refusal an ARN of another account is answered with: the one wording this service
+/// records for the condition, which names neither the member nor the account — it states the
+/// permission that is missing and how an organization account gets it.
+const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
+     is an organization account, request the management account to enable service access.";
+
+/// Well-formed 12-digit account ids that are NOT the one this service answers for: the
+/// documentation's own example account, an id one digit away from the emulator's own, and
+/// both extremes of the 12-digit range.
+const OTHER_ACCOUNTS: [&str; 5] = [
+    "111122223333",
+    "123456789012",
+    "210987654321",
+    "000000000001",
+    "999999999999",
+];
+
+/// How a case builds the ARN it sends: from the account that owns the database and the
+/// database's name.
+type ArnOf = fn(&str, &str) -> String;
+
+/// The two ARN forms this reader's member is an instance of: a DB instance ARN
+/// ("arn:aws:rds:{region}:{accountId}:db:{resourceName}",
+/// `GetRDSDatabaseRecommendationProjectedMetrics$resourceArn`) and an Aurora DB cluster ARN
+/// (`GetRDSDatabaseRecommendations$resourceArns`).
+const ARN_FORMS: [(&str, ArnOf); 2] = [
+    ("a DB instance ARN", db_arn),
+    ("an Aurora DB cluster ARN", db_cluster_arn),
+];
+
+/// An emulator whose findings catalog holds [`corpus`] and whose account has not opted in
+/// yet: a case that needs the analysis READABLE opts in and then moves the stored enrollment
+/// instant back ([`make_analysis_due`]) rather than waiting for the clock, so what it asserts
+/// holds however fast or loaded the host is.
+fn emulator_with_recorded_corpus() -> (
+    smithy_server_runtime::MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+) {
+    let (router, engine) = emulator_with_engine();
+    record(&engine, &corpus());
+    (router, engine)
+}
+
+/// `OTHER_ACCOUNTS` is only a set of OTHER accounts while none of its ids is the one this
+/// service answers for: asserted in every case below, so a change to the emulator's account
+/// id fails loudly instead of turning a row into a refusal of the caller's own account.
+fn assert_other_accounts_are_other() {
+    assert!(
+        !OTHER_ACCOUNTS.contains(&ACCOUNT),
+        "the other-account rows must not name the account this service answers for \
+         ({ACCOUNT}), got {OTHER_ACCOUNTS:?}"
+    );
+}
+
+/// This reader takes no `accountIds`, so the one account it answers about is the caller's
+/// own: an ARN whose ACCOUNT field names any other account asks about a database this
+/// service cannot report on and is refused with `InvalidParameterValueException` (HTTP 400)
+/// carrying the service's cross-account message — never answered with the empty list of
+/// projections, which a client reads as "that database has no projection".
+///
+/// The rows span the ARN forms the member documents, the account fields a well-formed ARN
+/// can carry, a database this endpoint holds an analysis for and one it holds none for, and
+/// both statistics a request may ask for.
+#[tokio::test]
+async fn a_database_of_another_account_is_refused_rather_than_answered_empty() {
+    assert_other_accounts_are_other();
+    let (router, engine) = emulator_with_recorded_corpus();
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+
+    for (form, arn_of) in ARN_FORMS {
+        // A database this endpoint HOLDS an analysis for, and one it holds none for: the
+        // account field decides the answer either way, so the refusal cannot be mistaken for
+        // a report about what the catalog holds.
+        for name in ["orders-writer", "no-such-database"] {
+            for account_id in OTHER_ACCOUNTS {
+                for stat in ["Maximum", "Average"] {
+                    let arn = arn_of(account_id, name);
+                    let case = format!("{form} for {name:?} of {account_id} under {stat}");
+                    let (status, body) = call(
+                        &router,
+                        "GetRDSDatabaseRecommendationProjectedMetrics",
+                        request_for_arn(&arn, stat, 3_600, WINDOW_START, WINDOW_START + 3_600),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 400,
+                        "case {case:?}: expected 400, got {status}: {body}"
+                    );
+                    assert_eq!(
+                        error_code(&body),
+                        "InvalidParameterValueException",
+                        "case {case:?}: expected InvalidParameterValueException, got {body}"
+                    );
+                    assert_eq!(
+                        body["message"].as_str().unwrap_or_default(),
+                        CROSS_ACCOUNT_MESSAGE,
+                        "case {case:?}: expected the cross-account refusal, got {body}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The same ARN forms for the account this service DOES answer for are answered, so the
+    // 400s above are about the account field and not about the form or the window: the
+    // analysed database reports its projection, and one this endpoint holds no analysis for
+    // reports the empty list — the two answers a client can tell apart.
+    let case = "the analysed database of this account";
+    let response = projected(
+        &router,
+        case,
+        request_for_arn(
+            &db_arn(ACCOUNT, "orders-writer"),
+            "Maximum",
+            3_600,
+            WINDOW_START,
+            WINDOW_START + 3_600,
+        ),
+    )
+    .await;
+    assert!(
+        !response["recommendedOptionProjectedMetrics"]
+            .as_array()
+            .expect("a list of options")
+            .is_empty(),
+        "case {case:?}: this account's analysed database reports its projection, got {response}"
+    );
+    for (case, arn) in [
+        (
+            "a DB instance of this account with no analysis",
+            db_arn(ACCOUNT, "no-such-database"),
+        ),
+        (
+            "an Aurora cluster of this account with no analysis",
+            db_cluster_arn(ACCOUNT, "orders-writer"),
+        ),
+    ] {
+        let response = projected(
+            &router,
+            case,
+            request_for_arn(&arn, "Maximum", 3_600, WINDOW_START, WINDOW_START + 3_600),
+        )
+        .await;
+        assert_eq!(
+            response["recommendedOptionProjectedMetrics"],
+            json!([]),
+            "case {case:?}: an ARN of this account is answered, got {response}"
+        );
+    }
+}
+
+/// The cross-account refusal is about the REQUEST, not about what the store holds for the
+/// caller: it precedes the opt-in gate and the analysis gate, and it precedes the window
+/// checks, so the same ARN is refused the same way whatever else the request carries.
+#[tokio::test]
+async fn the_cross_account_refusal_precedes_every_gate_this_reader_applies() {
+    assert_other_accounts_are_other();
+    let foreign = db_arn(OTHER_ACCOUNTS[0], "orders-writer");
+    let own = db_arn(ACCOUNT, "orders-writer");
+    let window = (WINDOW_START, WINDOW_START + 3_600);
+
+    // (case, whether the account has opted in, whether its analysis is due)
+    for (case, enrolled, analysed) in [
+        ("never opted in", false, false),
+        ("opted in, analysis not due yet", true, false),
+        ("opted in, analysis due", true, true),
+    ] {
+        let (router, engine) = emulator_with_recorded_corpus();
+        if enrolled {
+            opt_in(&router).await;
+        }
+        if analysed {
+            make_analysis_due(&engine);
+        }
+
+        // The foreign ARN beside each window shape this reader judges — a valid one and two
+        // it refuses: the account field of the ARN is judged first, so every one of them is
+        // answered with the one cross-account refusal rather than with the window's own.
+        for (shape, body) in [
+            (
+                "a valid window",
+                request_for_arn(&foreign, "Maximum", 3_600, window.0, window.1),
+            ),
+            (
+                "the modelled default granularity",
+                request_for_arn(&foreign, "Maximum", 0, window.0, window.1),
+            ),
+            (
+                "a window that runs backwards",
+                request_for_arn(&foreign, "Average", 3_600, window.1, window.0),
+            ),
+        ] {
+            let case = format!("{case}, {shape}");
+            let (status, response) = call(
+                &router,
+                "GetRDSDatabaseRecommendationProjectedMetrics",
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400 for {body}, got {status}: {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "InvalidParameterValueException",
+                "case {case:?}: expected InvalidParameterValueException, got {response}"
+            );
+            assert_eq!(
+                response["message"].as_str().unwrap_or_default(),
+                CROSS_ACCOUNT_MESSAGE,
+                "case {case:?}: expected the cross-account refusal, got {response}"
+            );
+        }
+
+        // The same window for the caller's OWN account reaches the gates the refusal above
+        // precedes: 403 before the account opted in, and 200 once it has.
+        let (status, response) = call(
+            &router,
+            "GetRDSDatabaseRecommendationProjectedMetrics",
+            request_for_arn(&own, "Maximum", 3_600, window.0, window.1),
+        )
+        .await;
+        let wanted = if enrolled { 200 } else { 403 };
+        assert_eq!(
+            status, wanted,
+            "case {case:?}: this account's own ARN reaches the enrollment gate, expected \
+             {wanted}, got {status}: {response}"
+        );
+    }
 }
