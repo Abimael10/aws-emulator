@@ -1031,6 +1031,197 @@ async fn paging_walks_the_selection_exactly_once() {
     );
 }
 
+/// Regional endpoints other than the one the calls above address: one that reports the same
+/// region-free analysis under its OWN ARNs, and one in another partition area again. A token
+/// minted at [`REGION`] names a position in neither of their walks.
+const OTHER_REGIONS: &[&str] = &[OTHER_REGION, "ap-southeast-2"];
+
+/// Every idle resource of the caller's own account as the endpoint in `region` names it, in
+/// record order: the seeded analysis plus [`recorded_instance`].
+fn own_arns_in(region: &str) -> Vec<String> {
+    seeded_arns(region)
+        .into_iter()
+        .chain([recorded_instance_arn(region)])
+        .collect()
+}
+
+/// An opted-in emulator holding [`recorded_instance`] beside the seeded analysis, with that
+/// analysis already DUE.
+///
+/// The due instant is reached by moving the stored enrollment record back a span
+/// (`crate::harness::make_analysis_due`) rather than by waiting for the clock to pass it, so
+/// the condition the read needs holds however fast or loaded the host is and nothing below
+/// depends on elapsed time.
+async fn emulator_with_due_analysis() -> smithy_server_runtime::MultiServiceRouter {
+    let (router, engine) = emulator_with_engine();
+    opt_in(&router).await;
+    make_analysis_due(&engine);
+    record(&engine, vec![recorded_instance()]);
+    router
+}
+
+/// A `nextToken` names a position in the walk of the ENDPOINT and the SELECTION it was minted
+/// over, and in no other.
+///
+/// Compute Optimizer is regional while the analysis it holds is region-free: a recommendation
+/// names its resource by the ARN of the endpoint reporting it, and that ARN is what a
+/// `resourceArns` selection is matched against, so the sequence a token names a position in
+/// belongs to the Region the request was signed for. Replayed at another endpoint — or with
+/// another selection at its own — the token names no position in the sequence being walked, so
+/// it is refused with HTTP 400 `InvalidParameterValueException` rather than answered with a
+/// page of a different result set, which would leave a client reading an empty page as "the
+/// walk is finished".
+///
+/// The rows span the selections a token binds: none at all, a pair of the endpoint's own ARNs,
+/// a wider subset of them, and every one of them filtered and sorted. Each token is replayed
+/// at the endpoint that minted it (where it resumes exactly where its page stopped), at two
+/// other endpoints with the selection unchanged and with the same selection restated in those
+/// endpoints' OWN ARNs, and at its own endpoint with the selection ordered the other way.
+#[tokio::test]
+async fn a_page_token_resumes_only_the_endpoint_and_selection_that_minted_it() {
+    let router = emulator_with_due_analysis().await;
+
+    // (case, which of the endpoint's own resources the selection names — by index into record
+    // order — and the rest of the request)
+    let rows: Vec<(&str, &[usize], Value)> = vec![
+        ("no resourceArns", &[], json!({})),
+        ("two resource ARNs", &[0, 1], json!({})),
+        ("four resource ARNs", &[1, 3, 5, 8], json!({})),
+        (
+            "every resource ARN, filtered and sorted",
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+            json!({
+                "filters": [{"name": "Finding", "values": ["Idle", "Unused"]}],
+                "orderBy": {"dimension": "SavingsValue", "order": "Desc"},
+            }),
+        ),
+    ];
+
+    for (case, named, rest) in rows {
+        // The selection as the endpoint in `region` writes it: the ARNs it names are the ones
+        // that endpoint reports its resources under.
+        let selection = |region: &str| -> Value {
+            let arns = own_arns_in(region);
+            let mut request = rest.clone();
+            if !named.is_empty() {
+                request["resourceArns"] = json!(named
+                    .iter()
+                    .map(|index| arns[*index].clone())
+                    .collect::<Vec<String>>());
+            }
+            request
+        };
+
+        let whole = reported_arns(&get_idle(&router, case, selection(REGION)).await);
+        assert!(
+            whole.len() >= 2,
+            "case {case:?}: this selection must hold at least two recommendations for a token to \
+             resume at one, got {whole:?}"
+        );
+
+        let mut first_page = selection(REGION);
+        first_page["maxResults"] = json!(1);
+        let body = get_idle(&router, case, first_page.clone()).await;
+        assert_eq!(
+            reported_arns(&body),
+            whole[..1].to_vec(),
+            "case {case:?}: the first page carries the first recommendation of the selection, \
+             got {body}"
+        );
+        let token = body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: a one-item page of a longer selection hands out a nextToken, \
+                     got {body}"
+                )
+            })
+            .to_string();
+
+        // At the endpoint that minted it, for the selection it was minted over, the token
+        // resumes exactly where that page stopped.
+        let mut resumed = first_page.clone();
+        resumed["nextToken"] = json!(token);
+        let body = get_idle(&router, case, resumed).await;
+        assert_eq!(
+            reported_arns(&body),
+            whole[1..2].to_vec(),
+            "case {case:?}: the token must resume where its page stopped, got {body}"
+        );
+
+        for other_region in OTHER_REGIONS {
+            // That endpoint has its own page of the same analysis to report, so what the
+            // refusals below answer is the TOKEN and not an empty result set.
+            let (status, body) = call_in_region(
+                &router,
+                other_region,
+                "GetIdleRecommendations",
+                selection(other_region),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} at {other_region}: expected 200, got {status}: {body}"
+            );
+            assert!(
+                reported_arns(&body).len() >= 2,
+                "case {case:?} at {other_region}: this endpoint must have a walk of its own for \
+                 a token to be refused rather than answered empty, got {body}"
+            );
+
+            let mut replays: Vec<(&str, Value)> =
+                vec![("the selection it was minted for", selection(REGION))];
+            if !named.is_empty() {
+                replays.push((
+                    "that selection restated in this endpoint's own ARNs",
+                    selection(other_region),
+                ));
+            }
+            for (how, mut request) in replays {
+                request["maxResults"] = json!(1);
+                request["nextToken"] = json!(token);
+                let label = format!("{case}: a {REGION} token replayed at {other_region} with {how}");
+                let (status, body) =
+                    call_in_region(&router, other_region, "GetIdleRecommendations", request.clone())
+                        .await;
+                assert_eq!(
+                    status, 400,
+                    "case {label:?}: expected {request} to be refused with 400, got {status}: \
+                     {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterValueException",
+                    "case {label:?}: expected InvalidParameterValueException, got {body}"
+                );
+                assert!(
+                    body["idleRecommendations"].is_null(),
+                    "case {label:?}: a refused read reports no page at all, got {body}"
+                );
+            }
+        }
+
+        // A different ORDER over the same resources is a different sequence at the same
+        // endpoint, so the token names no position in it either.
+        let mut reordered = selection(REGION);
+        reordered["orderBy"] = json!({"dimension": DIMENSION_SAVINGS_VALUE, "order": "Asc"});
+        reordered["maxResults"] = json!(1);
+        reordered["nextToken"] = json!(token);
+        let label = format!("{case}: a token replayed over a differently ordered selection");
+        let (status, body) =
+            call_in_region(&router, REGION, "GetIdleRecommendations", reordered.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: expected {reordered} to be refused with 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {label:?}: expected InvalidParameterValueException, got {body}"
+        );
+    }
+}
+
 /// A resource the request names that the analysis holds nothing for is simply ABSENT from the
 /// answer: the call succeeds, the recommendation list carries only the analysed resources, and
 /// `errors` stays empty — it lists resources an idle analysis rejected, not the ones it has
