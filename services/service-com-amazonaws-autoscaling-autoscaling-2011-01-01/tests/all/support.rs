@@ -377,6 +377,34 @@ pub async fn create_launch_template(router: &MultiServiceRouter, name: &str) -> 
     (id, latest_version)
 }
 
+/// Delete one Amazon EC2 launch template through the service that owns it, and assert a client
+/// can no longer read it back THERE — the precondition every suite that drives a DANGLING
+/// launch-template reference rests on, since a group's reference is resolved against that
+/// service's own store.
+///
+/// THE ONE COPY for the suites here whose subject is a reference to a template the account no
+/// longer holds: the template is Amazon EC2's resource, so it is removed where a client removes
+/// it rather than out of that service's store by hand.
+pub async fn delete_launch_template(router: &MultiServiceRouter, case: &str, id: &str) {
+    let (status, body) =
+        ec2_query(router, "DeleteLaunchTemplate", &[p("LaunchTemplateId", id)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DeleteLaunchTemplate for {id:?} expected 200, got {status}: {body}"
+    );
+    let (status, body) = ec2_query(
+        router,
+        "DescribeLaunchTemplates",
+        &[p("LaunchTemplateId.1", id)],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: Amazon EC2 must no longer hold the deleted template {id:?}, got {status}: \
+         {body}"
+    );
+}
+
 /// Where a group places the instances it launches, for a suite whose cases span both ways of
 /// stating it.
 ///

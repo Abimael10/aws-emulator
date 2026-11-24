@@ -33,7 +33,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 use crate::support::{
-    borrowed, ec2_query, emulator, p, query, tag_value, tag_values, xml_unescape, REGION,
+    borrowed, delete_launch_template, ec2_query, emulator, p, query, tag_value, tag_values,
+    xml_unescape, REGION,
 };
 
 /// The AMI and instance type every launch template in this suite carries.
@@ -222,27 +223,6 @@ async fn create_template(router: &MultiServiceRouter, case: &str, name: &str) ->
     id
 }
 
-/// Delete one launch template through the service that owns it, and assert a client can no
-/// longer read it back — the precondition a deleted-template row rests on.
-async fn delete_template(router: &MultiServiceRouter, case: &str, id: &str) {
-    let (status, body) = ec2_query(router, "DeleteLaunchTemplate", &[p("LaunchTemplateId", id)]).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: DeleteLaunchTemplate for {id:?} expected 200, got {status}: {body}"
-    );
-    let (status, body) = ec2_query(
-        router,
-        "DescribeLaunchTemplates",
-        &[p("LaunchTemplateId.1", id)],
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: DescribeLaunchTemplates must refuse the deleted template, got {status}: \
-         {body}"
-    );
-}
-
 /// Create the group every update and refresh row drives, from the template the account holds.
 async fn create_group(router: &MultiServiceRouter, case: &str) {
     let zone = zone();
@@ -364,7 +344,7 @@ async fn a_reference_that_resolves_to_no_template_is_refused_by_the_half_it_stat
                     id, held_id,
                     "case {case:?}: the two templates must be two resources, got {id:?}"
                 );
-                delete_template(&router, case, &id).await;
+                delete_launch_template(&router, case, &id).await;
                 match named {
                     Named::Id => id,
                     Named::Name => DELETED_TEMPLATE_NAME.to_string(),
@@ -497,7 +477,7 @@ async fn an_id_the_mint_never_issued_is_reported_as_amazon_ec2_reports_it() {
     let case = "the mint screen";
     let held_id = create_template(&router, case, HELD_TEMPLATE_NAME).await;
     let deleted_id = create_template(&router, case, DELETED_TEMPLATE_NAME).await;
-    delete_template(&router, case, &deleted_id).await;
+    delete_launch_template(&router, case, &deleted_id).await;
     create_group(&router, case).await;
 
     // (case, the id, the sentence it earns, or `None` where the create must be served)
