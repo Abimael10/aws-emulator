@@ -66,25 +66,25 @@ const RUNTIME: &str = "python3.12";
 const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// The `State` a mapping reports once it polls its event source.
-const STATE_ENABLED: &str = "Enabled";
+pub(crate) const STATE_ENABLED: &str = "Enabled";
 
 /// The `OperationType` a stream record reports for each kind of change
 /// (`smithy_query(query="shape", shape="OperationType")`, DynamoDB Streams).
-const INSERT: &str = "INSERT";
+pub(crate) const INSERT: &str = "INSERT";
 /// See [`INSERT`].
-const MODIFY: &str = "MODIFY";
+pub(crate) const MODIFY: &str = "MODIFY";
 /// See [`INSERT`].
-const REMOVE: &str = "REMOVE";
+pub(crate) const REMOVE: &str = "REMOVE";
 
 /// The one Amazon SQS action the handler's own call takes, which is all its execution role is
 /// granted of that service.
-const SEND_MESSAGE: [&str; 1] = ["SendMessage"];
+pub(crate) const SEND_MESSAGE: [&str; 1] = ["SendMessage"];
 
 /// Lambda, DynamoDB, DynamoDB Streams, Amazon SQS and IAM on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in: the mapping's source is a table's stream, the
 /// handler forwards what it was handed to a queue, and the execution role the poller and the
 /// handler act as is the one IAM holds.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -147,7 +147,7 @@ def lambda_handler(event, context):
 /// The row's function: it RUNS [`forwarding_handler`], as `role_arn`, forwarding to the queue
 /// `queue_url` addresses; waited out to `Active`, because a mapping polls nothing for a
 /// function that cannot be invoked.
-async fn given_function(
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -202,7 +202,7 @@ async fn given_function(
 
 /// The row's mapping on `stream_arn`, carrying the row's patterns as its `FilterCriteria`
 /// when it has any; waited out to `Enabled`, and answered as its UUID.
-async fn given_mapping(
+pub(crate) async fn given_mapping(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -300,7 +300,7 @@ async fn take_markers(router: &MultiServiceRouter, case: &str, url: &str) -> Vec
 }
 
 /// How this suite names one delivered record: the change it reported and the key it changed.
-fn marker(event_name: &str, key: &str) -> String {
+pub(crate) fn marker(event_name: &str, key: &str) -> String {
     format!("{event_name}#{key}")
 }
 

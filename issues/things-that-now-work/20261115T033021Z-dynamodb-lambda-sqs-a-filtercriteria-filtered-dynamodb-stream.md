@@ -7,6 +7,26 @@ Issue-Commit: 2bc939698b9a959721d42e691c2ca676c39ad8ba
 
 # dynamodb__lambda__sqs: a FilterCriteria-filtered DynamoDB-stream event source mapping produces no invocation at all — the INSERT positive control never arrives and the check hangs to the budget
 
+> _Resolution: the cause as REPORTED — "nothing is ever delivered", no invocation for the
+> matching record — is NOT present at this commit. Driven through the recorded wiring, the
+> mapping reads both records off the shard from `TRIM_HORIZON`, its one pattern admits the
+> `INSERT` and rejects the `MODIFY`, the function is invoked exactly once with the admitted
+> record, the handler's own `SendMessage` succeeds, and the message is received off the sink
+> queue by a consumer long-polling it — after which the queue is empty and the mapping reports
+> `Enabled` with an `OK` processing result. That whole chain is now pinned by
+> `services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/dynamodb_stream_filtered_mapping_long_polling_consumer.rs`,
+> over four wirings: the recorded insert-only shape, one with a record written behind the
+> withheld change, one whose two ORed patterns admit a change and a removal with the rejected
+> record at the head of the shard, and one whose clause names a value nested inside the changed
+> item's key.
+>
+> What remains is the recorded check's own WALL CLOCK, which no AWS rule fixes: its collect step
+> keeps long-polling the sink queue after the one message it was waiting for has arrived, and
+> the harness's 60 s cap falls while it is inside `receive_message` — the `_collect#19|Timeout`
+> key this report carries. The delivery itself lands about 7 s after the table is created, so
+> the replay of this check will keep timing out until a later change makes the whole check fit
+> the cap; the key is NOT evidence that a record is undelivered._
+
 > _Note: this issue was identified against the code base at commit `2bc939698b9a959721d42e691c2ca676c39ad8ba`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
