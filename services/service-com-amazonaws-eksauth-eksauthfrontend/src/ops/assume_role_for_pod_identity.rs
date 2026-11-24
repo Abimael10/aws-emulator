@@ -17,18 +17,23 @@
 //!    the header, so the segments past it are never decoded and no claim is ever read:
 //!    the modelled `ExpiredTokenException` is reachable only from the issuing cluster's
 //!    own record of what it issued (step 4), never from an `exp` the caller wrote;
-//! 2. the `clusterName` label must name a cluster this service holds — otherwise the
+//! 2. the `kid` the header names must resolve to a key some cluster this service holds
+//!    publishes — otherwise the header names no key any token this service can read was
+//!    signed with, and the answer is `InvalidTokenException` (400) again. Resolving the
+//!    key id is the last layer of reading the header, and it is reached for every
+//!    `clusterName` the model admits: the key material a request presents is judged
+//!    before the label is resolved as a resource, so a caller holding no key material a
+//!    cluster published learns nothing here about which cluster names exist;
+//! 3. the `clusterName` label must name a cluster this service holds — otherwise the
 //!    request addresses a resource that is not there and the answer is the modelled
 //!    `ResourceNotFoundException` (404). The label is a RESOURCE identity, so it is
-//!    resolved as one, and before anything about the presented token is judged against
-//!    state: that is what lets a caller tell "this agent is pointed at a cluster that is
-//!    not there" (non-retryable) from "my projected token is stale" (re-read it and
-//!    retry). Only a caller IAM has allowed this action on that cluster gets this far
-//!    (see `crate::service::identity_authorization`, which runs ahead of this handler);
-//! 3. the `kid` the header names must resolve to a key the OIDC provider of THAT cluster
-//!    publishes — otherwise the header names no key the cluster could have signed with,
-//!    and the answer is `InvalidTokenException` (400) again. Resolving the key id is the
-//!    last layer of reading the header;
+//!    resolved as one, once the presented header has resolved: that is what lets a caller
+//!    holding a cluster-issued token tell "this agent is pointed at a cluster that is not
+//!    there" (non-retryable) from "my projected token is stale" (re-read it and retry).
+//!    Only a caller IAM has allowed this action on that cluster gets this far (see
+//!    `crate::service::identity_authorization`, which runs ahead of this handler). The
+//!    key the header names then has to be one THAT cluster publishes, since a key another
+//!    cluster published signed no token for this one — the same header refusal as above;
 //! 4. the token must be one that cluster issued for the pod identity audience and still
 //!    within its lifetime — otherwise `ExpiredTokenException` or `InvalidTokenException`
 //!    (400), decided by the cluster's own record of what it issued, never by inspecting
@@ -268,20 +273,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // key, and its associations.
         let (association, identity, cluster_arn) = {
             let guard = state.lock();
-            // THE CLUSTER THE LABEL NAMES is resolved first, as the resource it is: a
-            // `clusterName` that names no cluster is the modelled not-found, whatever the
-            // presented token is worth, because the request addresses a resource that is
-            // not there. Only a caller IAM allowed this action on that cluster reaches
-            // this line, so what it learns about the cluster is what it was granted.
+            // RESOLVING THE KEY THE HEADER NAMES finishes reading that header, and it is
+            // answered BEFORE the `clusterName` label is resolved as a resource: a `kid`
+            // is resolved against the signing keys this service holds, so a key id no
+            // cluster published names no key a token this service can read was signed
+            // with — a verdict about the presented value alone. Answering it first is
+            // what keeps this layer reachable for every name the model admits, and what
+            // keeps a caller holding no key material from learning here whether a cluster
+            // name resolves.
+            if !guard.resolves_signing_key(&token_headers.key_id) {
+                refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
+                return Err(malformed_token(TokenMalformation::InvalidHeader(
+                    KEY_ID_HEADER,
+                )));
+            }
+            // THE CLUSTER THE LABEL NAMES is resolved next, as the resource it is: a
+            // `clusterName` that names no cluster is the modelled not-found, because the
+            // request addresses a resource that is not there. It is reached by a caller
+            // whose `kid` resolved, which is a caller that already holds key material
+            // some cluster published. Only a caller IAM allowed this action on that
+            // cluster reaches this line, so what it learns about the cluster is what it
+            // was granted.
             let cluster = guard.cluster(&input.cluster_name).ok_or_else(|| {
                 refused(&caller_akid, &input.cluster_name, "ResourceNotFoundException");
                 no_cluster(&input.cluster_name)
             })?;
-            // RESOLVING THE KEY THE HEADER NAMES is the last layer of reading that
-            // header: a `kid` is resolved through the OIDC provider of the cluster the
-            // request names, so a key id that cluster does not publish names no key this
-            // request could have been signed with. The answer is about the token's
-            // header, and is reached only once the cluster itself resolved.
+            // The key the header names has to be one THAT cluster publishes: a key id
+            // another cluster published signed no token for this one, so the header still
+            // names no key this request could have been signed with — the same refusal
+            // the resolution above gives.
             if !cluster.publishes_signing_key(&token_headers.key_id) {
                 refused(&caller_akid, &input.cluster_name, "InvalidTokenException");
                 return Err(malformed_token(TokenMalformation::InvalidHeader(
@@ -537,8 +557,8 @@ fn token_rejection(rejection: TokenRejection) -> AssumeRoleForPodIdentityError {
 
 /// The `clusterName` label names no cluster this service holds, so the request addresses
 /// a resource that is not there: the modelled `ResourceNotFoundException` (404), which is
-/// what a caller pointed at a deleted or misspelled cluster is answered with however good
-/// its token.
+/// what a caller whose token names a key this service published, pointed at a deleted or
+/// misspelled cluster, is answered with.
 ///
 /// AWS's not-found sentence for a cluster name, whose only variable part is the name the
 /// request URI carried — a value the caller sent, so echoing it tells it nothing it did

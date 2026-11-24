@@ -237,6 +237,21 @@ impl ComAmazonawsEksauthEksauthfrontendState {
         self.clusters.get_mut(name)
     }
 
+    /// Whether `key_id` names a key ANY cluster this service holds publishes — resolving a
+    /// presented token's `kid` against the whole of the key material this service can see
+    /// rather than against one cluster's JWKS.
+    ///
+    /// This is what finishes reading a presented header: a key id no cluster published
+    /// signed no token this service can read, which is a verdict about the presented value
+    /// and about nothing else, so it needs no cluster to have been resolved. WHICH cluster
+    /// publishes a key id that does resolve is [`Cluster::publishes_signing_key`]'s
+    /// question, asked once the cluster the request addresses has itself resolved.
+    pub fn resolves_signing_key(&self, key_id: &str) -> bool {
+        self.clusters
+            .values()
+            .any(|cluster| cluster.publishes_signing_key(key_id))
+    }
+
     /// Register a pod identity association on the cluster named `cluster_name`, binding
     /// `namespace`/`service_account` in it to `role_arn`.
     ///

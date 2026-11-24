@@ -15,10 +15,10 @@
 //!    service account tokens with -> "... has invalid header - alg.";
 //! 3. `kid` must name something — absent, `null`, empty and whitespace-only all name
 //!    nothing -> "... has missing header - kid.";
-//! 4. the `kid` must resolve to a key the named cluster's OIDC provider publishes; a
-//!    value outside the form every key id takes, one no cluster publishes, and one
-//!    published by a DIFFERENT cluster all resolve to nothing -> "... has invalid header
-//!    - kid.".
+//! 4. the `kid` must resolve to a key some cluster this service holds publishes, and then
+//!    to one the NAMED cluster publishes; a value outside the form every key id takes, one
+//!    no cluster publishes, and one published by a DIFFERENT cluster all resolve to nothing
+//!    -> "... has invalid header - kid.".
 //!
 //! A header wrong at several layers is reported only on the shallowest, so the four
 //! layers stay four distinct diagnoses: that is what lets an operator tell "the projected
@@ -26,8 +26,10 @@
 //!
 //! Layers 1 to 3 are decided from the VALUE, so they are the answer whichever cluster the
 //! URI names. Layer 4 is the one layer that READS STATE for a key id in the form a key id
-//! takes: it resolves that id through the named cluster's OIDC provider, which means the
-//! cluster has to be there — a `clusterName` that names no cluster is the modelled
+//! takes, and it resolves that id against the key material the SERVICE holds before the
+//! `clusterName` label is resolved as a resource: a key id no cluster published is this
+//! layer's refusal whichever cluster the URI names, registered or not, and only a key id
+//! that DOES resolve reaches the label, where a name that names no cluster is the modelled
 //! `ResourceNotFoundException` (404) instead (see
 //! `tests/all/cluster_label_and_claim_rejections.rs`).
 //!
@@ -184,8 +186,8 @@ async fn assert_layer(
 }
 
 /// Assert the named cluster is reported as the missing resource it is: the answer a
-/// readable header gets when the `clusterName` label resolves to nothing, whatever key
-/// its `kid` names.
+/// readable header whose `kid` RESOLVES gets when the `clusterName` label resolves to
+/// nothing.
 async fn assert_not_found(harness: &Harness, cluster: &str, case: &str, token: &str) {
     let reply = assume(harness, cluster, token).await;
     assert_eq!(
@@ -209,13 +211,18 @@ async fn assert_not_found(harness: &Harness, cluster: &str, case: &str, token: &
 
 /// Each layer's class of defective header, over the registered cluster and over one that
 /// is not registered: a layer decided from the VALUE is reported the same way for both,
-/// while the one layer that resolves a key id through the named cluster's provider needs
-/// that cluster to be there at all — and a name that names no cluster is answered as the
-/// missing resource it is.
+/// and so is the resolution layer, which resolves a key id against the key material the
+/// SERVICE holds — only a key id that really resolves reaches the `clusterName` label,
+/// where a name that names no cluster is answered as the missing resource it is.
 #[tokio::test]
 async fn every_header_defect_is_reported_at_its_own_layer() {
     let harness = Harness::seeded();
     let foreign_key_id = harness.signing_key_id(OTHER_CLUSTER);
+    // Every key id a cluster in the seeded world publishes: the ones that resolve.
+    let published: Vec<String> = REGISTERED
+        .iter()
+        .map(|cluster| harness.signing_key_id(cluster))
+        .collect();
 
     // (case, header, the layer it must be reported at)
     let rows: &[(&str, serde_json::Value, Layer)] = &[
@@ -389,15 +396,192 @@ async fn every_header_defect_is_reported_at_its_own_layer() {
     for cluster in [CLUSTER, UNREGISTERED_CLUSTER, "a"] {
         for (case, header, layer) in rows {
             let token = token_with_header(header);
-            // A header that READS is judged against the named cluster's own provider, so
-            // a name that names no cluster is answered as the missing resource it is; a
-            // header that does not read is the value's own answer, whichever cluster the
-            // URI names.
-            if parse_service_account_token(&token).is_ok() && !REGISTERED.contains(&cluster) {
+            // A header whose `kid` RESOLVES against the key material the service holds is
+            // past the header layers, so a name that names no cluster is answered as the
+            // missing resource it is; a header that fails any layer — including a key id
+            // nothing published — is the value's own answer, whichever cluster the URI
+            // names.
+            let resolves = parse_service_account_token(&token)
+                .is_ok_and(|headers| published.contains(&headers.key_id));
+            if resolves && !REGISTERED.contains(&cluster) {
                 assert_not_found(&harness, cluster, case, &token).await;
             } else {
                 assert_layer(&harness, cluster, case, &token, *layer).await;
             }
+        }
+    }
+}
+
+/// THE ORDER OF THE TWO STATE-READING LAYERS: the `kid` is resolved against the key
+/// material the service holds BEFORE the `clusterName` label is resolved as a resource, so
+/// a key id no cluster published is the invalid-`kid` refusal for every name the model
+/// admits — registered or not — and the modelled not-found is reachable only once the key
+/// id resolves.
+///
+/// The rows span what the rule generalises over: the cluster names are the published
+/// bounds of the member's `@length` (1 and 100 characters) and the character classes its
+/// `@pattern` admits beyond the first position (a trailing `-`, an inner `_`, digits,
+/// mixed case), and the key ids are the forms a 43-character base64url key id takes.
+#[tokio::test]
+async fn an_unresolvable_key_id_is_refused_before_the_cluster_label_is_resolved() {
+    let harness = Harness::seeded();
+
+    // Cluster names inside the modelled `ClusterName` (1..100 characters of
+    // `^[0-9A-Za-z][A-Za-z0-9\-_]*$`, from the member's own constraints) that the seeded
+    // world does not register, so each is a name a request can address and nothing can
+    // resolve.
+    let absent_names: Vec<(&str, String)> = vec![
+        ("the shortest name the model admits", "a".to_string()),
+        ("a single digit", "0".to_string()),
+        ("the longest name the model admits", "a".repeat(100)),
+        ("a name ending in a hyphen", "sim2realbehav-".to_string()),
+        (
+            "a name carrying an underscore and upper case",
+            "sim2real_behav-CN9".to_string(),
+        ),
+        ("a name nothing registered", UNREGISTERED_CLUSTER.to_string()),
+        (
+            "a registered name with its case flipped",
+            "DEMO-CLUSTER".to_string(),
+        ),
+    ];
+
+    // Key ids in the form a Kubernetes API server derives for every key it signs with, so
+    // each one reaches the state-reading layer; no seeded cluster publishes any of them.
+    let unresolvable: Vec<(&str, String)> = vec![
+        ("a key id nothing published", key_id(21)),
+        ("another key id nothing published", key_id(22)),
+        ("a key id of 32 zero bytes", key_id(0)),
+        (
+            "a key id of the right form carrying only hyphens and underscores",
+            "-".repeat(21) + "_".repeat(22).as_str(),
+        ),
+    ];
+
+    for (name_case, cluster) in &absent_names {
+        for (key_case, unpublished) in &unresolvable {
+            let token = token_with_header(&serde_json::json!({
+                "alg": TOKEN_SIGNING_ALGORITHM,
+                "kid": unpublished,
+                "typ": "JWT",
+            }));
+            assert_layer(
+                &harness,
+                cluster,
+                &format!("{name_case} with {key_case}"),
+                &token,
+                Layer::UnresolvableKeyId,
+            )
+            .await;
+            // And the answer says nothing about which names resolve: it is identical to
+            // the one the SAME token earns against a cluster that really is registered,
+            // so this operation is no cluster-existence oracle for a caller holding key
+            // material nothing published.
+            let reply = assume(&harness, cluster, &token).await;
+            let registered = assume(&harness, CLUSTER, &token).await;
+            assert_eq!(
+                (reply.verdict(), reply.message.clone()),
+                (registered.verdict(), registered.message.clone()),
+                "case {name_case:?} with {key_case:?}: an absent name must answer exactly \
+                 as a registered one does, got {reply:?} against {registered:?}"
+            );
+        }
+    }
+
+    // THE CONTROL, and the case the reopened not-found rule rests on: the same names with
+    // a key id that DOES resolve — the key a seeded cluster publishes — reach the label
+    // and are answered as the missing resource.
+    for (name_case, cluster) in &absent_names {
+        for registered in REGISTERED {
+            let token = token_with_header(&serde_json::json!({
+                "alg": TOKEN_SIGNING_ALGORITHM,
+                "kid": harness.signing_key_id(registered),
+                "typ": "JWT",
+            }));
+            assert_not_found(
+                &harness,
+                cluster,
+                &format!("{name_case} with the key id {registered} publishes"),
+                &token,
+            )
+            .await;
+        }
+    }
+}
+
+/// The same ordering, holding the header constant and varying only the payload: no claim
+/// is read before the key id is resolved, so every claim body under one unresolvable
+/// `kid` collapses onto that one refusal and none of them reaches the cluster label.
+#[tokio::test]
+async fn no_claim_body_changes_the_unresolvable_key_id_refusal() {
+    let harness = Harness::seeded();
+    let header = serde_json::json!({
+        "alg": TOKEN_SIGNING_ALGORITHM,
+        "kid": key_id(23),
+        "typ": "JWT",
+    });
+    let signature = encode_jwt_segment([7_u8; 32]);
+    let epoch = |offset: i64| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_secs() as i64
+            + offset
+    };
+
+    // The claim bodies a caller can present: inside its window, long expired, addressed
+    // elsewhere, empty, and not JSON at all.
+    let payloads: Vec<(&str, String)> = vec![
+        (
+            "inside its validity window",
+            encode_jwt_segment(
+                serde_json::json!({
+                    "aud": ["pods.eks.amazonaws.com"],
+                    "iat": epoch(-60),
+                    "exp": epoch(3_600),
+                })
+                .to_string(),
+            ),
+        ),
+        (
+            "expired an hour ago",
+            encode_jwt_segment(
+                serde_json::json!({
+                    "aud": ["pods.eks.amazonaws.com"],
+                    "iat": epoch(-7_200),
+                    "exp": epoch(-3_600),
+                })
+                .to_string(),
+            ),
+        ),
+        (
+            "addressed to another audience",
+            encode_jwt_segment(
+                serde_json::json!({ "aud": ["sts.amazonaws.com"], "exp": epoch(3_600) })
+                    .to_string(),
+            ),
+        ),
+        ("an empty claim object", encode_jwt_segment("{}")),
+        (
+            "a payload that is not JSON at all",
+            encode_jwt_segment([0x8f, 0x01, 0xff, 0x7e, 0x00]),
+        ),
+    ];
+
+    for cluster in [UNREGISTERED_CLUSTER, CLUSTER, "0"] {
+        for (case, payload) in &payloads {
+            let token = format!(
+                "{}.{payload}.{signature}",
+                encode_jwt_segment(header.to_string())
+            );
+            assert_layer(
+                &harness,
+                cluster,
+                &format!("the claims {case}"),
+                &token,
+                Layer::UnresolvableKeyId,
+            )
+            .await;
         }
     }
 }
