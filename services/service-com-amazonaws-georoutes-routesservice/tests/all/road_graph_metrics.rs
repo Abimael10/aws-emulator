@@ -42,6 +42,56 @@ use crate::routing::{great_circle_m, int, post, routes_service, MATRIX, OPTIMIZE
 /// can drift from the source on its own.
 pub(crate) const ROAD_SPACING_DEG: f64 = 0.000_5;
 
+/// How far off the decimal coordinate grid a caller writes a position on the carriageways of
+/// this network sit, in degrees, as `src/state.rs` holds it (`CARRIAGEWAY_OFFSET_DEG`): the
+/// road at grid index `i` runs at `i * ROAD_SPACING_DEG + CARRIAGEWAY_OFFSET_DEG`, so a
+/// coordinate written to four or five decimals is never a coordinate of a road and a
+/// position is matched onto the carriageway nearest it rather than left where it was
+/// written.
+pub(crate) const CARRIAGEWAY_OFFSET_DEG: f64 = 0.000_164;
+
+/// The coordinate the road at grid index `index` runs at (`road_coordinate` in
+/// `src/state.rs`): the longitude of a road running north-south, the latitude of one
+/// running east-west. The offset is a whole number of the network's own precision, so the
+/// carriageway sits at a coordinate the geometry carries exactly and the arithmetic here is
+/// rounded to it rather than left with its own residue.
+pub(crate) fn road_line(index: i64) -> f64 {
+    at_the_networks_precision(index as f64 * ROAD_SPACING_DEG + CARRIAGEWAY_OFFSET_DEG)
+}
+
+/// `coordinate` at the precision the network's geometry carries ([`POLYLINE_PRECISION`]).
+pub(crate) fn at_the_networks_precision(coordinate: f64) -> f64 {
+    let scale = 10_f64.powi(POLYLINE_PRECISION);
+    (coordinate * scale).round() / scale
+}
+
+/// The grid index of the road nearest `coordinate`, i.e. the one a position there is matched
+/// onto.
+pub(crate) fn road_index(coordinate: f64) -> i64 {
+    ((coordinate - CARRIAGEWAY_OFFSET_DEG) / ROAD_SPACING_DEG).round() as i64
+}
+
+/// `coordinate` moved ONTO the road of the network nearest it: the coordinate a position
+/// matched onto that road reports.
+pub(crate) fn on_a_road(coordinate: f64) -> f64 {
+    road_line(road_index(coordinate))
+}
+
+/// `coordinate` moved to the point MIDWAY between the road nearest it and the next one: as
+/// far from either as a position inside this network's coverage gets in that axis, so a
+/// position there is matched onto the road of the other orientation.
+pub(crate) fn between_roads(coordinate: f64) -> f64 {
+    at_the_networks_precision(on_a_road(coordinate) + ROAD_SPACING_DEG / 2.0)
+}
+
+/// Whether `coordinate` is the coordinate a road of the network runs at, within the
+/// `POSITION_EPSILON` of `src/state.rs` below which two positions are the same place. A
+/// position READ OFF the network lies on a road, so one of its two coordinates is one of
+/// these.
+pub(crate) fn on_a_road_line(coordinate: f64) -> bool {
+    (coordinate - on_a_road(coordinate)).abs() <= 1e-7
+}
+
 /// Posted speeds of the classes of road the network carries, in km/h, as `src/state.rs`
 /// holds them (`MOTORWAY_SPEED_KPH`, `TRUNK_SPEED_KPH`, `STREET_SPEED_KPH`,
 /// `FOOTPATH_SPEED_KPH`).
@@ -247,22 +297,25 @@ async fn a_journey_worth_taking_the_fast_roads_implies_more_of_a_speed_than_a_lo
 /// same run on foot takes the footpath pace.
 ///
 /// Each row is a run straight along one parallel road of the grid, taken as the shortest
-/// route so that the path is that road: latitude 49.4 is a multiple of 400 grid steps,
-/// where the network puts a motorway, 49.45 is a multiple of 100, where it puts a trunk
-/// road, and 49.4505 is neither, so it carries a street (`class_of` in `src/state.rs`).
+/// route so that the path is that road: the parallel road nearest latitude 49.4 is at a
+/// multiple of 400 grid steps, where the network puts a motorway, the one nearest 49.45 is at
+/// a multiple of 100, where it puts a trunk road, and the one nearest 49.4505 is at neither,
+/// so it carries a street (`class_of` in `src/state.rs`). Each run is driven along the
+/// carriageway itself ([`on_a_road`]), which is not the round decimal the road is named by
+/// here.
 #[tokio::test]
 async fn the_duration_of_a_run_is_its_length_at_the_pace_of_the_road_it_runs_on() {
     let router = routes_service();
     // name, the latitude the run follows, the speed the road is posted at, what one of its
     // junctions costs.
     let runs: [(&str, f64, f64, f64); 3] = [
-        ("along a motorway", 49.4, MOTORWAY_SPEED_KPH, MOTORWAY_JUNCTION_DELAY_S),
-        ("along a trunk road", 49.45, TRUNK_SPEED_KPH, TRUNK_JUNCTION_DELAY_S),
-        ("along a street", 49.4505, STREET_SPEED_KPH, STREET_JUNCTION_DELAY_S),
+        ("along a motorway", on_a_road(49.4), MOTORWAY_SPEED_KPH, MOTORWAY_JUNCTION_DELAY_S),
+        ("along a trunk road", on_a_road(49.45), TRUNK_SPEED_KPH, TRUNK_JUNCTION_DELAY_S),
+        ("along a street", on_a_road(49.4505), STREET_SPEED_KPH, STREET_JUNCTION_DELAY_S),
     ];
-    // A longitude between two meridian roads, so the run's endpoints match onto the
+    // A longitude midway between two meridian roads, so the run's endpoints match onto the
     // parallel road they sit on rather than onto a meridian crossing it.
-    let (west, east) = (-123.097_23, -123.067_23);
+    let (west, east) = (between_roads(-123.097_23), between_roads(-123.067_23));
 
     let mut measured: Vec<(&str, i64, i64, f64)> = Vec::new();
     for (case, latitude, posted_kph, delay_s) in runs {
@@ -402,7 +455,7 @@ fn fastest_street_pace_mps(mode: &str) -> f64 {
 fn is_on_local_streets(position: [f64; 2]) -> bool {
     position
         .iter()
-        .all(|coordinate| (coordinate / ROAD_SPACING_DEG).round() as i64 % TRUNK_EVERY != 0)
+        .all(|coordinate| road_index(*coordinate) % TRUNK_EVERY != 0)
 }
 
 /// Journeys between positions on local streets, spanning fractions and multiples of the

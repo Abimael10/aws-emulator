@@ -25,26 +25,18 @@
 
 use serde_json::{json, Value};
 
+use crate::road_graph_metrics::{between_roads, on_a_road, on_a_road_line};
 use crate::routing::{great_circle_m, int, position, post, routes_service, ROUTES, SNAP};
 
-/// Spacing of the synthetic road grid, in degrees, as documented on `ROAD_SPACING_DEG` in
-/// `src/state.rs`: every multiple of it in longitude is a meridian road and every multiple
-/// in latitude is a parallel road. A point ON the network therefore has one coordinate at
-/// a multiple of this.
-const ROAD_SPACING_DEG: f64 = 0.0005;
-
-/// Tolerance, in degrees, for reading a coordinate as sitting on a grid line — the
+/// Tolerance, in degrees, for reading a coordinate as sitting on a road of the network — the
 /// `POSITION_EPSILON` of `src/state.rs`, below which two positions are the same place.
 const GRID_EPSILON_DEG: f64 = 1e-7;
 
-/// Whether `position` lies on a road of the grid: a meridian road fixes its longitude and
-/// a parallel road its latitude, so one of its two coordinates is a multiple of the
-/// spacing.
+/// Whether `position` lies on a road of the network: a meridian road fixes its longitude and
+/// a parallel road its latitude, so one of its two coordinates is the coordinate a road of
+/// the network runs at (`road_coordinate` in `src/state.rs`).
 fn lies_on_the_grid(position: [f64; 2]) -> bool {
-    position.iter().any(|coordinate| {
-        let multiples = coordinate / ROAD_SPACING_DEG;
-        (multiples - multiples.round()).abs() * ROAD_SPACING_DEG <= GRID_EPSILON_DEG
-    })
+    position.iter().copied().any(on_a_road_line)
 }
 
 /// The leg details of whichever leg type `leg` is.
@@ -84,43 +76,51 @@ async fn the_places_of_a_leg_report_the_submitted_position_and_its_match() {
     /// name, origin, destination, travel mode, how far each position must be matched.
     type PlaceCase = (&'static str, [f64; 2], [f64; 2], &'static str, f64);
     let cases: [PlaceCase; 6] = [
-        // -123.1 and 49.28 are both multiples of the grid spacing, so both endpoints are
-        // already on a road and nothing has to move.
-        ("both endpoints on a road", [-123.1, 49.28], [-123.12, 49.26], "Car", 0.0),
+        // Both endpoints sit on the carriageway of a meridian road and of a parallel road,
+        // so both are already on a road and nothing has to move.
         (
+            "both endpoints on a road",
+            [on_a_road(-123.1), on_a_road(49.28)],
+            [on_a_road(-123.12), on_a_road(49.26)],
+            "Car",
+            0.0,
+        ),
+        (
+            // Midway between the roads of both orientations: as far off the carriageways as
+            // a position inside this network's coverage gets.
             "both endpoints off the roads",
-            [-123.100_18, 49.280_18],
-            [-123.120_22, 49.260_22],
+            [between_roads(-123.1), between_roads(49.28)],
+            [between_roads(-123.12), between_roads(49.26)],
             "Car",
             5.0,
         ),
         (
             "seven decimals of precision, off the roads",
-            [-123.100_180_7, 49.280_180_7],
-            [-123.120_220_3, 49.260_220_3],
+            [between_roads(-123.1) + 0.000_000_7, between_roads(49.28) + 0.000_000_7],
+            [between_roads(-123.12) + 0.000_000_3, between_roads(49.26) + 0.000_000_3],
             "Truck",
             5.0,
         ),
         (
             "a pedestrian leg, off the roads",
-            [-123.100_18, 49.280_18],
-            [-123.102_22, 49.278_22],
+            [between_roads(-123.1), between_roads(49.28)],
+            [between_roads(-123.102), between_roads(49.278)],
             "Pedestrian",
             5.0,
         ),
         (
             "a scooter leg in the southern hemisphere",
-            [151.210_18, -33.870_18],
-            [151.200_22, -33.860_22],
+            [between_roads(151.21), between_roads(-33.87)],
+            [between_roads(151.2), between_roads(-33.86)],
             "Scooter",
             5.0,
         ),
         (
-            // Longitude -123.100_18 lies between meridian roads; latitude 49.28 is a
-            // parallel road a car may travel, so only one coordinate has to move.
+            // A longitude midway between two meridian roads; the parallel road nearest
+            // 49.28 is one a car may travel, so only one coordinate has to move.
             "a position on a parallel road but not a meridian one",
-            [-123.100_18, 49.28],
-            [-123.12, 49.26],
+            [between_roads(-123.1), on_a_road(49.28)],
+            [on_a_road(-123.12), on_a_road(49.26)],
             "Car",
             0.0,
         ),
@@ -204,7 +204,10 @@ async fn a_pass_through_place_reports_the_submitted_position_and_its_match() {
     // Rows differ in how many pass-through waypoints the leg carries and how far off the
     // network they sit.
     let cases: [(&str, Vec<[f64; 2]>); 3] = [
-        ("one waypoint on a road", vec![[-123.105, 49.27]]),
+        (
+            "one waypoint on a road",
+            vec![[on_a_road(-123.105), on_a_road(49.27)]],
+        ),
         ("one waypoint off the roads", vec![[-123.105_18, 49.274_22]]),
         (
             "two waypoints off the roads",
@@ -213,7 +216,11 @@ async fn a_pass_through_place_reports_the_submitted_position_and_its_match() {
     ];
 
     for (case, through) in cases {
-        let mut body = route_request([-123.1, 49.28], [-123.12, 49.26], "Car");
+        let mut body = route_request(
+            [on_a_road(-123.1), on_a_road(49.28)],
+            [on_a_road(-123.12), on_a_road(49.26)],
+            "Car",
+        );
         body["Waypoints"] = Value::Array(
             through
                 .iter()

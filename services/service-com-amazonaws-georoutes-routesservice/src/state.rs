@@ -89,10 +89,26 @@ const METRES_PER_DEGREE_LAT: f64 = 110_574.0;
 /// Metres per degree of longitude at the equator; scaled by `cos(latitude)` in use.
 const METRES_PER_DEGREE_LON_EQUATOR: f64 = 111_320.0;
 
-/// Spacing of the synthetic road grid, in degrees: every integer multiple of this in
-/// longitude is a meridian road (running north-south) and every multiple in latitude is a
-/// parallel road (running east-west). ~55 m, so any position is within ~28 m of a road.
+/// Spacing of the synthetic road grid, in degrees: the roads running north-south sit this
+/// far apart in longitude and the roads running east-west this far apart in latitude, each
+/// at the coordinate [`road_coordinate`] puts it at. ~55 m, so any position is within ~28 m
+/// of a road.
 const ROAD_SPACING_DEG: f64 = 0.0005;
+
+/// How far the carriageways of this network sit OFF the decimal coordinate grid a caller
+/// writes a position on, in degrees: the road at grid index `i` runs at
+/// `i * ROAD_SPACING_DEG + CARRIAGEWAY_OFFSET_DEG` rather than at the multiple of the
+/// spacing itself ([`road_coordinate`]).
+///
+/// A carriageway lies where it was surveyed, and nothing ties that to the round decimals a
+/// position is written in, so a submitted coordinate is ON a road only where it is a
+/// coordinate of that road's own geometry. The offset is a whole number of the network's own
+/// precision ([`POLYLINE_PRECISION`] digits), so a road sits at a coordinate the geometry
+/// can carry exactly; it is not a multiple of a tenth of the spacing, so no coordinate
+/// written to four or five decimals lies on a road of this network, and a position matched
+/// onto one is moved onto the carriageway by the distance to it — which is what tells a
+/// client whether its own position was on a road at all.
+const CARRIAGEWAY_OFFSET_DEG: f64 = 0.000_164;
 
 /// Side, in degrees, of the grid cell materialised into
 /// [`ComAmazonawsGeoroutesRoutesserviceState::road_network`] at a time. One cell carries
@@ -447,7 +463,8 @@ pub struct RoadSegment {
     pub class: RoadClass,
     /// Which way the run points.
     pub orientation: RoadOrientation,
-    /// The road's grid index: which multiple of [`ROAD_SPACING_DEG`] the road sits at.
+    /// The road's grid index: which line of the grid the road runs on
+    /// ([`road_coordinate`]).
     /// With [`RoadSegment::orientation`] it identifies the ROAD, which the per-cell
     /// [`RoadSegment::id`] does not — one road crosses as many cells as it spans.
     pub grid_index: i64,
@@ -499,22 +516,21 @@ impl TravelledRoad {
     /// Which TOPOLOGY SEGMENT of this road `position` lies on: a linear stretch of road
     /// between two junctions.
     ///
-    /// The roads crossing this one sit at every multiple of [`ROAD_SPACING_DEG`] along its
-    /// own axis ([`Self::junction_with`]), so its junctions cut it into the intervals of
-    /// that spacing and the segment is the interval `position` falls in. Two positions
-    /// report the same segment of the same road exactly when no junction of the network
-    /// lies between them.
+    /// The roads crossing this one sit [`ROAD_SPACING_DEG`] apart along its own axis
+    /// ([`Self::junction_with`]), so its junctions cut it into the intervals of that spacing
+    /// and the segment is the interval `position` falls in. Two positions report the same
+    /// segment of the same road exactly when no junction of the network lies between them.
     pub fn topology_segment(&self, position: Position) -> i64 {
-        (position[self.orientation.axis()] / ROAD_SPACING_DEG).floor() as i64
+        road_index_at(position[self.orientation.axis()]).floor() as i64
     }
 
     /// The junction this road and `other` meet in: the point they cross and the angle
     /// between their forward directions. `None` for two roads of the same orientation,
     /// which run parallel and so never meet.
     ///
-    /// Every road of the grid sits at a multiple of [`ROAD_SPACING_DEG`] along its own axis
-    /// and runs the whole way along the other, so a meridian road and a parallel road cross
-    /// in exactly one point: the meridian's longitude and the parallel's latitude. The
+    /// Every road of the grid runs at the coordinate [`road_coordinate`] puts it at and
+    /// spans the whole of the other axis, so a meridian road and a parallel road cross in
+    /// exactly one point: the meridian's longitude and the parallel's latitude. The
     /// per-cell segments the network materialises are pieces of those roads, not their
     /// extent, so the junction is read off the roads rather than off the pieces a leg
     /// happened to snap onto.
@@ -528,8 +544,8 @@ impl TravelledRoad {
         };
         Some(Junction {
             position: [
-                meridian.grid_index as f64 * ROAD_SPACING_DEG,
-                parallel.grid_index as f64 * ROAD_SPACING_DEG,
+                road_coordinate(RoadOrientation::Meridian, meridian.grid_index),
+                road_coordinate(RoadOrientation::Parallel, parallel.grid_index),
             ],
             crossing_angle_deg: turn_between_deg(
                 self.orientation.forward_bearing_deg(),
@@ -934,10 +950,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         let mut indices = Vec::new();
 
         // Meridian roads: constant longitude, spanning the cell north to south.
-        let first = (lon_min / ROAD_SPACING_DEG).floor() as i64;
-        let last = (lon_max / ROAD_SPACING_DEG).ceil() as i64;
+        let first = road_index_at(lon_min).floor() as i64;
+        let last = road_index_at(lon_max).ceil() as i64;
         for i in first..=last {
-            let lon = i as f64 * ROAD_SPACING_DEG;
+            let lon = road_coordinate(RoadOrientation::Meridian, i);
             let road = road_at(RoadOrientation::Meridian, i);
             indices.push(self.road_network.len());
             self.road_network.push(RoadSegment {
@@ -953,10 +969,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         }
 
         // Parallel roads: constant latitude, spanning the cell west to east.
-        let first = (lat_min / ROAD_SPACING_DEG).floor() as i64;
-        let last = (lat_max / ROAD_SPACING_DEG).ceil() as i64;
+        let first = road_index_at(lat_min).floor() as i64;
+        let last = road_index_at(lat_max).ceil() as i64;
         for j in first..=last {
-            let lat = j as f64 * ROAD_SPACING_DEG;
+            let lat = road_coordinate(RoadOrientation::Parallel, j);
             let road = road_at(RoadOrientation::Parallel, j);
             indices.push(self.road_network.len());
             self.road_network.push(RoadSegment {
@@ -1417,6 +1433,36 @@ fn hemisphere(meridian: bool, index: i64) -> &'static str {
     }
 }
 
+/// The coordinate the road of `orientation` at grid index `index` runs at, in degrees: its
+/// longitude where it runs north-south, its latitude where it runs east-west.
+///
+/// It is the grid index's multiple of [`ROAD_SPACING_DEG`] plus [`CARRIAGEWAY_OFFSET_DEG`],
+/// so the carriageway does not coincide with the decimal grid a caller writes a coordinate
+/// on: this is the one place the network says where a road IS, so a position matched onto a
+/// road, the junction two roads meet in and the geometry of travel along one all report the
+/// same carriageway. A road at the edge of the WGS 84 domain is held inside it, because no
+/// position of this API lies outside it.
+pub fn road_coordinate(orientation: RoadOrientation, index: i64) -> f64 {
+    let bounds = match orientation {
+        RoadOrientation::Meridian => LONGITUDE_BOUNDS,
+        RoadOrientation::Parallel => LATITUDE_BOUNDS,
+    };
+    road_line_at(index as f64).clamp(bounds.0, bounds.1)
+}
+
+/// Where the grid's `index`th line runs, in degrees, for a possibly fractional index: the
+/// arithmetic behind [`road_coordinate`], used where a run of consecutive roads is walked.
+fn road_line_at(index: f64) -> f64 {
+    index * ROAD_SPACING_DEG + CARRIAGEWAY_OFFSET_DEG
+}
+
+/// `coordinate` expressed in grid lines: the inverse of [`road_line_at`]. Its whole part
+/// names the road before `coordinate` and rounding it names the road nearest it, which is
+/// the one a position there is matched onto.
+fn road_index_at(coordinate: f64) -> f64 {
+    (coordinate - CARRIAGEWAY_OFFSET_DEG) / ROAD_SPACING_DEG
+}
+
 /// The grid cell a position falls in.
 fn cell_of(pos: Position) -> (i64, i64) {
     (
@@ -1575,10 +1621,13 @@ pub fn road_path_between(from: &SnappedPosition, to: &SnappedPosition) -> Vec<Po
             }
             None => {
                 // The two roads run parallel. The axis they both run along is where a
-                // crossing road sits at every multiple of the grid spacing, so the one
-                // nearest the far end connects them with no detour past it.
+                // crossing road sits every grid spacing, so the one nearest the far end
+                // connects them with no detour past it.
                 let axis = from.road.orientation.axis();
-                let crossing = (end[axis] / ROAD_SPACING_DEG).round() * ROAD_SPACING_DEG;
+                let crossing = road_coordinate(
+                    from.road.orientation.crossing(),
+                    road_index_at(end[axis]).round() as i64,
+                );
                 let mut leave = start;
                 leave[axis] = crossing;
                 let mut join = end;
@@ -1630,8 +1679,8 @@ pub fn road_shape_points(orientation: RoadOrientation, from: Position, to: Posit
     // already, whether or not a crossing road sits on one of them.
     let (lo, hi) = if span > 0.0 { (start, end) } else { (end, start) };
     let (first, last) = (
-        (lo / ROAD_SPACING_DEG).floor() + 1.0,
-        (hi / ROAD_SPACING_DEG).ceil() - 1.0,
+        road_index_at(lo).floor() + 1.0,
+        road_index_at(hi).ceil() - 1.0,
     );
     if last - first + 1.0 < 1.0 {
         return Vec::new();
@@ -1640,7 +1689,7 @@ pub fn road_shape_points(orientation: RoadOrientation, from: Position, to: Posit
     let mut points = Vec::new();
     let mut index = if span > 0.0 { first } else { last };
     while points.len() < MAX_SHAPE_POINTS && index >= first && index <= last {
-        let fraction = (index * ROAD_SPACING_DEG - start) / span;
+        let fraction = (road_line_at(index) - start) / span;
         points.push(round_to_network_precision(interpolate(
             from,
             to,

@@ -61,8 +61,8 @@ pub struct Stretch {
     pub seconds: f64,
 }
 
-/// A road of the grid, as the traversal names one: which way it runs and which multiple of
-/// [`ROAD_SPACING_DEG`] it sits at.
+/// A road of the grid, as the traversal names one: which way it runs and which line of the
+/// grid it runs on ([`road_coordinate`]).
 ///
 /// It is the ROAD and not one of the per-cell [`RoadSegment`]s the network materialises
 /// pieces of it as, so a traversal reads the graph off the grid's own rule and materialises
@@ -130,10 +130,10 @@ impl GridRoad {
             + self.crossings(from, to) * junction_delay_of(self.class(), mode)
     }
 
-    /// The coordinate this road sits at, in degrees: its longitude where it runs
-    /// north-south, its latitude where it runs east-west.
+    /// The coordinate this road runs at, in degrees: its longitude where it runs
+    /// north-south, its latitude where it runs east-west ([`road_coordinate`]).
     fn coordinate(self) -> f64 {
-        self.index as f64 * ROAD_SPACING_DEG
+        road_coordinate(self.orientation, self.index)
     }
 
     /// Where this road and `other` cross. The roads of a way alternate orientation, so the
@@ -472,8 +472,8 @@ fn through_roads(
     candidates
 }
 
-/// The grid index of a coordinate: which multiple of [`ROAD_SPACING_DEG`] the road nearest
-/// it sits at.
+/// The grid index of a coordinate: the index of the road of that orientation nearest it
+/// ([`road_coordinate`]).
 ///
 /// Every coordinate a request of this service is admitted with lies inside the WGS 84
 /// domain ([`LONGITUDE_BOUNDS`], [`LATITUDE_BOUNDS`]), so the index of one lies inside
@@ -485,7 +485,7 @@ fn grid_index(coordinate: f64) -> i64 {
         return 0;
     }
     let bound = GRID_INDEX_BOUND as f64;
-    (coordinate / ROAD_SPACING_DEG).round().clamp(-bound, bound) as i64
+    road_index_at(coordinate).round().clamp(-bound, bound) as i64
 }
 
 /// The furthest grid index a position of the WGS 84 domain sits at: half a turn of

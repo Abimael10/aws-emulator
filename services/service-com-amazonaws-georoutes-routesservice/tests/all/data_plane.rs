@@ -43,18 +43,15 @@ const DEEP_PACIFIC: [f64; 2] = [-130.5, 44.6];
 const MOVED_BY_LARGE_DISTANCE: &str = "TracePointsMovedByLargeDistance";
 const NOT_MATCHED: &str = "TracePointsNotMatched";
 
-/// Spacing of the synthetic road grid, in degrees, as documented on `ROAD_SPACING_DEG` in
-/// `src/state.rs`. A position read off the network lies on a road, so at least one of its
-/// coordinates is a multiple of this.
-const ROAD_SPACING_DEG: f64 = 0.0005;
-
-/// A position exactly on a junction of the grid: both coordinates are multiples of the
-/// spacing, so the network matches it with no offset at any radius.
-const ON_A_JUNCTION: [f64; 2] = [-123.1, 49.28];
+/// A position exactly on a junction of the network: both coordinates are coordinates a road
+/// runs at (`road_coordinate` in `src/state.rs`: the grid index's multiple of
+/// `ROAD_SPACING_DEG` plus the carriageway offset), so the network matches it with no offset
+/// at any radius.
+const ON_A_JUNCTION: [f64; 2] = [-123.099_836, 49.280_164];
 /// The centre of the grid cell north-east of that junction: about as far from a road as a
 /// position inside this network's coverage gets, which is what a tight radius leaves
 /// without a road of its own.
-const OFF_THE_ROADS: [f64; 2] = [-123.100_25, 49.280_25];
+const OFF_THE_ROADS: [f64; 2] = [-123.099_586, 49.280_414];
 
 /// Three fixes along neighbouring downtown streets, every one of them inside the mapped
 /// territory the network covers.
@@ -64,11 +61,11 @@ const DOWNTOWN: [[f64; 2]; 3] = [
     [-122.3433, 47.6120],
 ];
 
-/// Whether `coordinate` is a multiple of the grid spacing, i.e. the fixed coordinate of a
-/// road of the network.
+/// Whether `coordinate` is the coordinate a road of the network runs at
+/// (`crate::road_graph_metrics::on_a_road_line`, which this target keeps the network's
+/// parameters in).
 fn on_a_road_line(coordinate: f64) -> bool {
-    let multiples = coordinate / ROAD_SPACING_DEG;
-    (multiples - multiples.round()).abs() * ROAD_SPACING_DEG <= 1e-9
+    crate::road_graph_metrics::on_a_road_line(coordinate)
 }
 
 // ---------------------------------------------------------------------------

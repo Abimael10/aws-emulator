@@ -31,7 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // footpaths sit, and the precision its geometry carries — are the copies
 // `all/road_graph_metrics.rs` keeps of `src/state.rs`, read from there rather than kept a
 // second time here.
-use crate::road_graph_metrics::{FOOTPATH_EVERY, POLYLINE_PRECISION, ROAD_SPACING_DEG, TRUNK_EVERY};
+use crate::road_graph_metrics::{
+    on_a_road_line, road_index, road_line, FOOTPATH_EVERY, POLYLINE_PRECISION, ROAD_SPACING_DEG,
+    TRUNK_EVERY,
+};
 use crate::routing::{great_circle_m, int, position, post, routes_service, ROUTES};
 
 /// The path `CalculateIsolines` is bound to.
@@ -1092,9 +1095,9 @@ async fn the_answer_reports_the_time_the_request_pinned_the_calculation_to() {
 /// coordinates is the road's own and which is measured along the road.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Orientation {
-    /// North-south: the road sits at a whole number of grid steps of longitude.
+    /// North-south: the road runs at a fixed longitude.
     Meridian,
-    /// East-west: the road sits at a whole number of grid steps of latitude.
+    /// East-west: the road runs at a fixed latitude.
     Parallel,
 }
 
@@ -1107,8 +1110,8 @@ impl Orientation {
         }
     }
 
-    /// The coordinate the roads of this orientation sit at a whole number of grid steps of:
-    /// a match onto one of them puts the submitted position at that road's own value here.
+    /// The coordinate the roads of this orientation run at: a match onto one of them puts
+    /// the submitted position at that road's own value here.
     fn across(self) -> usize {
         match self {
             Self::Meridian => 0,
@@ -1142,7 +1145,7 @@ fn road_allows(orientation: Orientation, index: i64, mode: &str) -> bool {
 /// road a position there is matched onto, since a road the mode may not use is no candidate
 /// for it.
 fn usable_index(orientation: Orientation, coordinate: f64, mode: &str) -> i64 {
-    let nearest = (coordinate / ROAD_SPACING_DEG).round() as i64;
+    let nearest = road_index(coordinate);
     (0..FOOTPATH_EVERY)
         .flat_map(|step| [nearest + step, nearest - step])
         .find(|index| road_allows(orientation, *index, mode))
@@ -1163,10 +1166,10 @@ fn anchor_near(city: [f64; 2], orientation: Orientation, mode: &str, across: f64
     anchor
 }
 
-/// The coordinate the road of `orientation` nearest `coordinate` that `mode` may travel sits
-/// at.
+/// The coordinate the road of `orientation` nearest `coordinate` that `mode` may travel runs
+/// at ([`road_line`]).
 fn road_coordinate(orientation: Orientation, coordinate: f64, mode: &str) -> f64 {
-    usable_index(orientation, coordinate, mode) as f64 * ROAD_SPACING_DEG
+    road_line(usable_index(orientation, coordinate, mode))
 }
 
 /// The point of the network a position matched onto the road of `orientation` nearest it
@@ -1306,12 +1309,12 @@ async fn the_snapped_anchor_is_the_point_of_the_road_network_nearest_the_anchor(
              got {matched:?}"
         );
         // The reported point lies ON a road: its coordinate across the road it matched onto
-        // is a whole number of grid steps, which the caller's own coordinate is not.
-        let steps = matched[orientation.across()] / ROAD_SPACING_DEG;
+        // is the coordinate that road runs at, which the caller's own coordinate is not.
+        let across_coordinate = matched[orientation.across()];
         assert!(
-            (steps - steps.round()).abs() * ROAD_SPACING_DEG < 1e-6,
+            on_a_road_line(across_coordinate),
             "case {case:?}: a matched point is a point of the network, so its {orientation:?} \
-             coordinate is a whole number of the {ROAD_SPACING_DEG} grid steps, got {matched:?}"
+             coordinate is the one a road of the network runs at, got {matched:?}"
         );
         // Along the road there was nothing to match, so the caller's own coordinate is kept
         // — at the precision the network's geometry carries, never quantized to the

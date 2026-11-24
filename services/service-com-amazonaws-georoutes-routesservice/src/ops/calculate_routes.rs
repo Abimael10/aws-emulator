@@ -934,9 +934,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .snap(point.position, travel_mode)
                     .map(|snapped| snapped.position);
             }
-            let computed: Vec<state::CachedRoute> = (0..=u32::try_from(alternatives).unwrap_or(0))
-                .map(|variant| state.compute_route(&positions, travel_mode, objective, variant))
-                .collect();
+            let mut computed: Vec<state::CachedRoute> = Vec::new();
+            for variant in 0..=u32::try_from(alternatives).unwrap_or(0) {
+                let route = state.compute_route(&positions, travel_mode, objective, variant);
+                // `MaxAlternatives` is a MAXIMUM ("Maximum number of alternative routes to
+                // be provided"), and an alternative is ANOTHER way through the road graph:
+                // where the graph offers no further way whose own distance differs from the
+                // routes already answered, there is no alternative to report — a route that
+                // reported the route's own distance would not be another route.
+                if computed.iter().any(|seen| reports_the_same_journey(seen, &route)) {
+                    continue;
+                }
+                computed.push(route);
+            }
             (computed, state.pricing_bucket(Self::NAME))
         };
 
@@ -1234,6 +1244,16 @@ impl<Eng> CalculateRoutes<Eng> {
         }
         Ok(route_leg)
     }
+}
+
+/// Whether two computed routes are the same journey to the caller that reads them: they
+/// cover the same distance.
+///
+/// An alternative is another way through the road graph, and the distance the answer reports
+/// is what tells a caller one route from another: a second route reporting the route's own
+/// distance is not an alternative to it.
+fn reports_the_same_journey(a: &state::CachedRoute, b: &state::CachedRoute) -> bool {
+    a.distance_m == b.distance_m
 }
 
 /// The computed sub-legs grouped into the legs of the answer: a new leg starts at every

@@ -25,6 +25,7 @@
 
 use serde_json::{json, Value};
 
+use crate::road_graph_metrics::{between_roads, on_a_road, on_a_road_line, ROAD_SPACING_DEG};
 use crate::routing::{
     great_circle_m, int, position, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP,
 };
@@ -32,20 +33,9 @@ use crate::routing::{
 /// The path `CalculateIsolines` is bound to.
 const ISOLINES: &str = "/v2/isolines";
 
-/// Spacing of the synthetic road grid, in degrees, as documented on `ROAD_SPACING_DEG` in
-/// `src/state.rs`.
-const ROAD_SPACING_DEG: f64 = 0.0005;
-
 /// Precision of the coordinates the network's geometry carries, in decimal digits, as
 /// documented on `POLYLINE_PRECISION` in `src/state.rs`.
 const NETWORK_PRECISION_DIGITS: i32 = 6;
-
-/// Whether `coordinate` is a multiple of the grid spacing, i.e. whether it is the fixed
-/// coordinate of a road of the network.
-fn on_a_road_line(coordinate: f64) -> bool {
-    let multiples = coordinate / ROAD_SPACING_DEG;
-    (multiples - multiples.round()).abs() * ROAD_SPACING_DEG <= 1e-9
-}
 
 /// Whether `value` carries no more than the network's coordinate precision, which is what
 /// a position read off the network must be reported at: rounding it to that precision
@@ -209,7 +199,11 @@ async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
             [-123.100_180_7, 49.280_180_7],
             [-123.120_220_3, 49.260_220_3],
         ),
-        ("on a road line in both coordinates", [-123.1, 49.28], [-123.12, 49.26]),
+        (
+            "on a road line in both coordinates",
+            [on_a_road(-123.1), on_a_road(49.28)],
+            [on_a_road(-123.12), on_a_road(49.26)],
+        ),
         (
             "the southern hemisphere, six decimals",
             [151.210_183, -33.870_183],
@@ -338,6 +332,206 @@ async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
 }
 
 // ---------------------------------------------------------------------------
+// A matched position is a coordinate of the road network
+// ---------------------------------------------------------------------------
+
+/// Positions written the way a caller writes one: round decimals, including coordinates that
+/// are whole multiples of the network's road spacing, in four places of two hemispheres and
+/// both signs of longitude. None of them is a coordinate of the network's own geometry, which
+/// every row below checks for itself before it reads the answer.
+const ROUND_DECIMALS: [(&str, [f64; 2]); 6] = [
+    ("four decimals", [-122.3421, 47.6097]),
+    (
+        "four decimals, both a whole multiple of the road spacing",
+        [-122.342, 47.6095],
+    ),
+    ("three decimals", [-123.101, 49.282]),
+    ("five decimals", [-123.101_25, 49.282_25]),
+    ("five decimals, southern hemisphere", [151.209_25, -33.868_75]),
+    ("four decimals, east of the prime meridian", [2.2945, 48.8584]),
+];
+
+/// `coordinate` rounded to `digits` decimal places.
+fn round_to(coordinate: f64, digits: i32) -> f64 {
+    let scale = 10_f64.powi(digits);
+    (coordinate * scale).round() / scale
+}
+
+/// The position each operation of this service reports as the one it used for its
+/// calculation, for a request built around `submitted`: the isoline's `SnappedOrigin` and
+/// `SnappedDestination`, a leg's departure `Place.Position`, and a trace point's
+/// `SnappedPosition`.
+async fn matched_positions(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    submitted: [f64; 2],
+    case: &str,
+) -> Vec<(&'static str, [f64; 2])> {
+    // A second position for the requests that need two, far enough off not to be the one
+    // under test.
+    let other = [submitted[0] + 0.004, submitted[1] + 0.004];
+    let mut reported = Vec::new();
+
+    for (member, reported_member) in [("Origin", "SnappedOrigin"), ("Destination", "SnappedDestination")] {
+        let (status, answer, _) = post(
+            router,
+            ISOLINES,
+            &json!({
+                member: submitted,
+                "Thresholds": { "Distance": [500] },
+                "IsolineGranularity": { "MaxPoints": 31 },
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+        reported.push((reported_member, position(&answer[reported_member], case)));
+    }
+
+    let (status, answer, _) = post(
+        router,
+        ROUTES,
+        &json!({ "Origin": submitted, "Destination": other }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+    reported.push((
+        "CalculateRoutes Departure Position",
+        position(
+            &answer["Routes"][0]["Legs"][0]["VehicleLegDetails"]["Departure"]["Place"]["Position"],
+            case,
+        ),
+    ));
+
+    let (status, answer, _) = post(
+        router,
+        SNAP,
+        &json!({
+            "TracePoints": [{ "Position": submitted }, { "Position": other }],
+            "SnapRadius": 300,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+    reported.push((
+        "SnapToRoads SnappedPosition",
+        position(&answer["SnappedTracePoints"][0]["SnappedPosition"], case),
+    ));
+
+    reported
+}
+
+/// The position an answer reports as the one used for its calculation — `SnappedOrigin` /
+/// `SnappedDestination` ("the actual point on the road network used for calculations, which
+/// may differ from the requested origin if Origin was not directly on a road"), a leg's
+/// `Place.Position`, a trace point's `SnappedPosition` — is a coordinate of the ROAD
+/// NETWORK's own geometry, so a position the caller wrote in round decimals comes back MOVED
+/// onto the carriageway nearest it and never as that position re-emitted at some precision.
+///
+/// The carriageways of this network sit off the decimal grid a coordinate is written on
+/// (`CARRIAGEWAY_OFFSET_DEG` in `src/state.rs`), so no coordinate of four or five decimals is
+/// a coordinate of a road: every row is matched onto a road beside it, by the distance to
+/// that road and by no more than the farthest a position inside the network's coverage can be
+/// from one.
+///
+/// Rows span how many decimals the caller wrote (three to five, and coordinates that are
+/// whole multiples of the road spacing), the place and the hemisphere, and every operation
+/// that reports a matched position.
+#[tokio::test]
+async fn a_matched_position_is_a_coordinate_of_the_network_and_not_the_submitted_one() {
+    let router = routes_service();
+
+    for (case, submitted) in ROUND_DECIMALS {
+        assert!(
+            !submitted.iter().copied().any(on_a_road_line),
+            "case {case:?}: no coordinate written in round decimals is a coordinate of a road \
+             of this network, so the row must lie on none, got {submitted:?}"
+        );
+        for (member, matched) in matched_positions(&router, submitted, case).await {
+            let case = &format!("{case} / {member}");
+            assert!(
+                matched.iter().copied().any(on_a_road_line),
+                "case {case:?}: the position used for the calculation is a point of the road \
+                 network, so one of its coordinates is the one a road of the network runs at, \
+                 got {matched:?}"
+            );
+            let moved = great_circle_m(submitted, matched);
+            assert!(
+                moved > 1.0 && moved <= MAX_MATCH_OFFSET_M,
+                "case {case:?}: {submitted:?} lies on no carriageway, so it is matched onto the \
+                 one nearest it — more than a metre and at most {MAX_MATCH_OFFSET_M:.1} m away — \
+                 got {moved:.3} m to {matched:?}"
+            );
+            assert!(
+                matched.iter().copied().all(at_network_precision),
+                "case {case:?}: the point is read off the network, so it carries the network's \
+                 own precision, got {matched:?}"
+            );
+            for digits in 3..=7 {
+                let quantized = [round_to(submitted[0], digits), round_to(submitted[1], digits)];
+                assert_ne!(
+                    matched, quantized,
+                    "case {case:?}: the point is resolved against the road network, so it is not \
+                     the submitted position at {digits} decimals, got {matched:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A position read off the network is a position OF the network: submitted back, it is
+/// already on a road, so the match reports it unchanged and moves it nothing at all.
+///
+/// That round trip is what a client does with `SnappedOrigin` — feeding it into a follow-up
+/// call as a road-anchored point — and what makes the "was my position on a road?" check
+/// worth making: it answers no for a coordinate the caller wrote and yes for the point the
+/// service answered with.
+///
+/// Rows are the same span of written coordinates, through both isoline anchors.
+#[tokio::test]
+async fn a_position_read_off_the_network_is_matched_to_itself() {
+    let router = routes_service();
+
+    for (case, submitted) in ROUND_DECIMALS {
+        for (member, reported_member) in [("Origin", "SnappedOrigin"), ("Destination", "SnappedDestination")] {
+            let case = &format!("{case} / {reported_member}");
+            let matched = isoline_anchor(&router, member, reported_member, submitted, case).await;
+            let again = isoline_anchor(&router, member, reported_member, matched, case).await;
+            assert_eq!(
+                again, matched,
+                "case {case:?}: {matched:?} is a point of the road network, so submitting it is \
+                 submitting a position already on a road: the match reports that same point and \
+                 moves it nothing at all, got {again:?}"
+            );
+            assert!(
+                matched.iter().copied().any(on_a_road_line),
+                "case {case:?}: the point reported is a coordinate of the network, got {matched:?}"
+            );
+        }
+    }
+}
+
+/// The point `CalculateIsolines` reports for an anchor submitted under `member`.
+async fn isoline_anchor(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    member: &str,
+    reported_member: &str,
+    anchor: [f64; 2],
+    case: &str,
+) -> [f64; 2] {
+    let (status, answer, _) = post(
+        router,
+        ISOLINES,
+        &json!({
+            member: anchor,
+            "Thresholds": { "Distance": [500] },
+            "IsolineGranularity": { "MaxPoints": 31 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+    position(&answer[reported_member], case)
+}
+
+// ---------------------------------------------------------------------------
 // The confidence of a match
 // ---------------------------------------------------------------------------
 
@@ -378,12 +572,13 @@ async fn confidence_of(
 #[tokio::test]
 async fn a_match_is_scored_on_the_match_and_not_on_the_requested_radius() {
     let router = routes_service();
-    // Longitude -123.095 is an odd multiple of ten grid steps, where the network puts a
-    // footpath no car may travel, so the nearest road a car can be matched to in that axis
-    // is a grid step and a half away and these rows differ only in the LATITUDE offset from
-    // the parallel road at 49.28. The offsets run from none to a quarter of the grid
-    // spacing, which is as far as a point on this network can be from the road nearest it.
-    let on_a_road = [-123.095, 49.28];
+    // The meridian road nearest longitude -123.095 is at an odd multiple of ten grid steps,
+    // where the network puts a footpath no car may travel, so the nearest road a car can be
+    // matched to in that axis is a grid step and a half away and these rows differ only in
+    // the LATITUDE offset from the parallel road nearest 49.28. The offsets run from none to
+    // a quarter of the grid spacing, which is as far as a point on this network can be from
+    // the road nearest it.
+    let on_a_carriageway = [on_a_road(-123.095), on_a_road(49.28)];
     let cases: [(&str, f64); 4] = [
         ("on the road", 0.0),
         ("a tenth of the spacing off the road", 0.000_05),
@@ -393,7 +588,7 @@ async fn a_match_is_scored_on_the_match_and_not_on_the_requested_radius() {
 
     let mut by_offset: Vec<(&str, f64)> = Vec::new();
     for (case, offset_deg) in cases {
-        let point = [on_a_road[0], on_a_road[1] + offset_deg];
+        let point = [on_a_carriageway[0], on_a_carriageway[1] + offset_deg];
         let mut radii: Vec<(i64, f64)> = Vec::new();
         for radius in [50_i64, 300, 1_000, 10_000] {
             let confidence = confidence_of(&router, case, point, radius).await;
@@ -444,11 +639,17 @@ async fn a_match_is_scored_on_the_match_and_not_on_the_requested_radius() {
          match, so it scores near the bottom of the 0..1 range, got {poorest}"
     );
 
-    // Longitude -123.0945 carries a meridian street, so a point a metre east of it sits at
-    // a crossing of two roads a car may travel. WHICH of the two carried it is not what
-    // this value reports: the point lies on the network either way, so the match is as
-    // certain as any other on-road match.
-    let at_a_crossing = confidence_of(&router, "at a crossing", [-123.094_49, 49.28], 300).await;
+    // The meridian road nearest longitude -123.0945 is a street, so a point a metre east of
+    // its carriageway sits at a crossing of two roads a car may travel. WHICH of the two
+    // carried it is not what this value reports: the point lies on the network either way, so
+    // the match is as certain as any other on-road match.
+    let at_a_crossing = confidence_of(
+        &router,
+        "at a crossing",
+        [on_a_road(-123.094_5) + 0.000_01, on_a_road(49.28)],
+        300,
+    )
+    .await;
     assert!(
         at_a_crossing > 0.9,
         "a point at a crossing of two roads lies on the network whichever of them carried it, so \
@@ -474,21 +675,31 @@ async fn the_snapped_geometry_runs_along_the_roads_the_trace_matched() {
     // line has to turn, and carries more vertices than there are matched points).
     let cases: [(&str, Vec<[f64; 2]>, bool); 5] = [
         (
-            // Both on the parallel road at 49.28, 110 m apart along it.
+            // Both on the parallel road nearest 49.28, ~70 m apart along it, each midway
+            // between the meridian roads crossing it.
             "two points on one road",
-            vec![[-123.1, 49.28], [-123.0985, 49.28]],
+            vec![
+                [between_roads(-123.1), on_a_road(49.28)],
+                [between_roads(-123.099), on_a_road(49.28)],
+            ],
             false,
         ),
         (
             // One on a parallel road, one on a meridian road: they cross.
             "two points on crossing roads",
-            vec![[-123.1, 49.2803], [-123.1015, 49.281]],
+            vec![
+                [between_roads(-123.1), on_a_road(49.28)],
+                [on_a_road(-123.1), between_roads(49.2805)],
+            ],
             true,
         ),
         (
             // Both on meridian roads of different longitude: they never meet.
             "two points on roads that never meet",
-            vec![[-123.1, 49.2803], [-123.102, 49.2817]],
+            vec![
+                [on_a_road(-123.1), between_roads(49.2805)],
+                [on_a_road(-123.101), between_roads(49.2815)],
+            ],
             true,
         ),
         (

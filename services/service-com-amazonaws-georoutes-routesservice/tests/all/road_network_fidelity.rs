@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 // conversion to metres per second and the coordinate precision of this API — are the copies
 // `all/road_graph_metrics.rs` keeps of `src/state.rs`, read from there rather than kept a
 // second time here.
-use crate::road_graph_metrics::{KPH_TO_MPS, POSITION_PRECISION, ROAD_SPACING_DEG, STREET_SPEED_KPH};
+use crate::road_graph_metrics::{
+    between_roads, on_a_road, KPH_TO_MPS, POSITION_PRECISION, ROAD_SPACING_DEG, STREET_SPEED_KPH,
+};
 use crate::routing::{great_circle_m, int, position, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP};
 
 // ---------------------------------------------------------------------------
@@ -175,13 +177,14 @@ async fn a_journey_on_the_local_streets_takes_longer_than_its_length_at_the_stre
         );
     }
 
-    // Latitude 49.4 is a multiple of 400 grid steps, where the network puts a motorway:
-    // its crossings are grade-separated, so a run along it is travelled at its posted
-    // speed and nothing is given up on the way.
+    // The parallel road nearest latitude 49.4 is at a multiple of 400 grid steps, where the
+    // network puts a motorway: its crossings are grade-separated, so a run along it is
+    // travelled at its posted speed and nothing is given up on the way. The run follows the
+    // carriageway itself, midway between the meridian roads crossing it.
     let (distance, duration) = traversal(
         &router,
-        [-123.097_23, 49.4],
-        [-123.067_23, 49.4],
+        [between_roads(-123.097_23), on_a_road(49.4)],
+        [between_roads(-123.067_23), on_a_road(49.4)],
         "Car",
         "ShortestRoute",
         "along a motorway",
@@ -299,16 +302,17 @@ async fn every_reported_position_is_on_the_coordinate_grid_of_the_api() {
 #[tokio::test]
 async fn a_match_is_scored_by_how_far_the_point_moved_wherever_it_is() {
     let router = routes_service();
-    // name, a position lying exactly on a parallel road of the grid (its latitude is a
-    // whole number of grid steps) and midway between two meridian roads (so the parallel
-    // road it sits on stays the nearest road for every offset probed below).
-    let on_a_road: [(&str, [f64; 2]); 3] = [
-        ("Seattle", [-122.332_25, 47.606]),
-        ("Vancouver", [-123.101_75, 49.2825]),
-        ("Sydney", [151.209_25, -33.869]),
+    // name, a position lying exactly on a parallel road of the network and midway between
+    // two meridian roads (so the parallel road it sits on stays the nearest road for every
+    // offset probed below). The carriageway is not at the round decimal the place is named
+    // by, so the position is read off the network's own rule.
+    let on_the_carriageway: [(&str, [f64; 2]); 3] = [
+        ("Seattle", [between_roads(-122.332_25), on_a_road(47.606)]),
+        ("Vancouver", [between_roads(-123.101_75), on_a_road(49.2825)]),
+        ("Sydney", [between_roads(151.209_25), on_a_road(-33.869)]),
     ];
 
-    for (place, point) in on_a_road {
+    for (place, point) in on_the_carriageway {
         for mode in ["Car", "Truck", "Pedestrian"] {
             let case = &format!("{place}, {mode}");
             let mut by_offset: Vec<(f64, f64)> = Vec::new();
