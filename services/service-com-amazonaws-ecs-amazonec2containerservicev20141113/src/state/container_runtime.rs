@@ -791,6 +791,10 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
     // ([`::service_common::served_http_addresses`]), and an engine that vends none leaves a
     // container's server reachable by nothing.
     let addresses = ::service_common::served_http_addresses::ServedAddresses::of(&**engine);
+    // And the account's own network, which decides whether a request one container's program
+    // makes to ANOTHER workload's address arrives ([`super::task_reachability`]). Taken once
+    // for the whole pass, like the records above.
+    let network = TaskNetwork::of(&**engine);
     for launch in launches {
         let container_arn = launch.container_arn.clone();
         let run_state = ::engine::ServiceState::clone(&state);
@@ -811,13 +815,15 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             });
         // And the client its program reaches those same servers THROUGH, for a task reached at
         // an address of its own: a container's program routinely asks its own server for a
-        // document ([`super::container_http_client`]).
+        // document ([`super::container_http_client`]) — and another workload's, which the
+        // account's network decides the arrival of ([`super::task_reachability`]).
         let http = launch
             .address
             .clone()
             .zip(addresses.clone())
             .map(|(address, addresses)| {
                 ContainerHttpClient::new(address, addresses)
+                    .on_network(network.clone())
                     .accounting_into(Arc::clone(&launch.consumption))
             });
         // The volumes the container's `mountPoints` mount, resolved with NO guard of this

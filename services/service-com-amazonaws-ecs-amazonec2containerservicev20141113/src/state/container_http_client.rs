@@ -18,8 +18,21 @@
 //! belong to the same task can communicate over the `localhost` interface"
 //! (`NetworkMode`/`AwsVpcConfiguration`). The loopback inside the task and the address of the
 //! task's own interface therefore reach the same servers — the ones the containers of that task
-//! started ([`super::container_servers`]) — and every other address is one this session has no
-//! network to reach, which stays a command it could not run.
+//! started ([`super::container_servers`]).
+//!
+//! # Another workload's address
+//!
+//! A program of a container is not confined to its own task: an interface of the account is
+//! reachable from another one, and what decides whether a packet arrives there is the security
+//! groups on the DESTINATION's interface — the one control over who reaches a task
+//! ([`super::task_reachability`]). So a request this client makes to another workload's address
+//! is answered by the server published at that address when a rule of those groups names the
+//! packet, and a packet no rule names is DROPPED: nothing comes back, and the client reports the
+//! request as one that timed out rather than as a connection something refused. The two are
+//! what a client tells a filtered destination from a reachable one with nothing listening by.
+//!
+//! An address no interface of the account holds is on no network this emulator has, which stays
+//! a command this session could not run, exactly as a host that is no address at all is.
 //!
 //! # Where the document GOES
 //!
@@ -36,7 +49,11 @@
 //! So a document asked for on standard output goes through the session's own stream — the pipe
 //! the next command of a pipeline reads, the file a redirection names, or the container's own
 //! output — and nothing is saved for it; one asked for by NAME is saved under that name and goes
-//! nowhere else.
+//! nowhere else. Beside the document, a client asked for a WRITE-OUT format (`-w`) writes what
+//! that format comes to on its own output once the transfer is over, whatever became of the
+//! document — the shape every probe that wants only the status is written in
+//! (`-o /dev/null -w '%{http_code}'`), read through the workspace's ONE reading of that format
+//! ([`::service_common::instance_metadata_service::written_out`]).
 //!
 //! # No socket, no host
 //!
@@ -61,9 +78,11 @@
 //! process is bounded here rather than by whatever the server holds.
 
 use ::service_common::instance_metadata_service::{
-    Invocation, COULD_NOT_CONNECT, HTTP_RETURNED_ERROR,
+    written_out, Invocation, TransferOutcome, COULD_NOT_CONNECT, HTTP_RETURNED_ERROR,
 };
 use ::service_common::served_http_addresses::ServedAddresses;
+
+use super::task_reachability::{Reach, TaskNetwork};
 
 /// The HTTP client a container's session provides under its own name, the one every documented
 /// container health check is written with.
@@ -88,6 +107,15 @@ const WGET_NETWORK_FAILURE: i32 = 4;
 /// response" — which that client reports for every such response, having no option to be asked
 /// for one.
 const WGET_SERVER_ERROR: i32 = 8;
+
+/// The status `curl` exits with when the request was never answered because the packets went
+/// nowhere: "28  Operation timeout" (the curl manual's exit codes), which is what a destination
+/// whose security groups drop the connection leaves it waiting for.
+const CURL_OPERATION_TIMEOUT: i32 = 28;
+
+/// The status the downloader exits with for the same: "4   Network failure" (the GNU Wget
+/// manual's exit-status list), the one it reports for a connection it never got an answer on.
+const WGET_TIMEOUT: i32 = WGET_NETWORK_FAILURE;
 
 /// The status `curl` exits with for a document past the bytes it was given to carry: "63
 /// Maximum file size exceeded" (the curl manual's exit codes).
@@ -127,6 +155,12 @@ pub struct FetchedDocument {
     /// The path the client was told to SAVE it at, and `None` for one that writes it to its own
     /// output.
     pub save_to: Option<String>,
+    /// What the client WRITES once the transfer is over, for an invocation that asked for a
+    /// write-out format (`-w`/`--write-out`) — the text that format comes to
+    /// ([`::service_common::instance_metadata_service::written_out`]). It goes to the client's
+    /// own output whatever became of the document, which is what makes `-o /dev/null -w
+    /// '%{http_code}'` report the status and nothing else.
+    pub written_out: Option<String>,
 }
 
 /// One REQUEST a container's session makes, as the words of either client state it.
@@ -158,6 +192,26 @@ struct Request {
     /// Whether the client writes the document at all: the one invocation that asks only whether
     /// the document is THERE writes none ([`WGET_SPIDER_FLAG`]).
     wants_document: bool,
+    /// The format the client writes once the transfer is over, where the invocation asked for
+    /// one (`-w`/`--write-out`), and `None` otherwise. The downloader takes no such option, so a
+    /// request stated in its grammar never carries one.
+    write_out: Option<String>,
+}
+
+impl Request {
+    /// What this invocation WRITES once the transfer is over: the format it asked for with what
+    /// the request came to put in it — and `None` for one that asked for no format.
+    ///
+    /// Read through the workspace's ONE reading of that format
+    /// ([`::service_common::instance_metadata_service::written_out`]), the same one an instance
+    /// guest's own client writes, so one format is read one way whatever performed the request.
+    /// A request that was never ANSWERED reports the status such a transfer has — no status at
+    /// all — rather than a status no server gave it.
+    fn written_out(&self, outcome: &TransferOutcome) -> Option<String> {
+        self.write_out
+            .as_deref()
+            .map(|format| written_out(format, outcome))
+    }
 }
 
 /// `arguments` as the request they state, for the client `program` names — `None` for a form
@@ -196,6 +250,7 @@ fn read_request(program: &str, arguments: &[String]) -> Option<Request> {
         to_standard_output: invocation.output.as_deref() == Some(STANDARD_OUTPUT_OPERAND),
         report_error: invocation.fail,
         wants_document: true,
+        write_out: invocation.write_out.clone(),
     })
 }
 
@@ -309,6 +364,8 @@ fn read_downloader_request(arguments: &[String]) -> Option<Request> {
         to_standard_output: false,
         report_error: true,
         wants_document: true,
+        // The downloader has no write-out option of its own.
+        write_out: None,
     };
     let mut named_output: Option<String> = None;
     let mut words = arguments.iter();
@@ -376,11 +433,17 @@ fn read_downloader_request(arguments: &[String]) -> Option<Request> {
 /// it, which is why it holds no mutable state of its own.
 #[derive(Debug, Clone)]
 pub struct ContainerHttpClient {
-    /// The private address of the interface the task was allocated, which — beside the loopback
-    /// inside the task — is the host a request of this container may name.
+    /// The private address of the interface the task was allocated, which is both the host a
+    /// request of this container reaches its own task's servers by and the SOURCE address a
+    /// request to another workload comes from.
     address: String,
     /// The records the servers of this task's containers are published in.
     addresses: ServedAddresses,
+    /// The account's own network, which decides whether a request to ANOTHER workload's
+    /// address arrives ([`super::task_reachability`]) — `None` for a session on an engine that
+    /// vends none, where no address resolves to an interface and so no other workload is
+    /// addressable at all.
+    network: Option<TaskNetwork>,
     /// Where the bytes this client's requests move are accounted for
     /// ([`super::container_consumption`]) — the accounting of the container's RUN, which the
     /// collections that report its network traffic sample. A client given none counts into a
@@ -397,10 +460,19 @@ impl ContainerHttpClient {
         Self {
             address,
             addresses,
+            network: None,
             accounting: ::std::sync::Arc::new(
                 super::container_consumption::ContainerConsumption::new(),
             ),
         }
+    }
+
+    /// This client on `network` — the account's own, which decides whether a request it makes
+    /// to another workload's address arrives ([`super::task_reachability`]).
+    #[must_use]
+    pub fn on_network(mut self, network: Option<TaskNetwork>) -> Self {
+        self.network = network;
+        self
     }
 
     /// This client accounting the bytes its requests move into `accounting` — the accounting of
@@ -416,31 +488,68 @@ impl ContainerHttpClient {
 
     /// What one invocation of `program` answers — `None` for an invocation this client performs
     /// nothing of: a form that client's reading does not read, a scheme it does not make a
-    /// request over, or a host that is not this container's own task, which such a container has
-    /// no network to reach.
+    /// request over, or a host on no network this emulator holds, which such a session cannot
+    /// reach at all.
     ///
     /// WHERE the document goes is each client's own (see this module's header): the answer
     /// carries the path it is SAVED at, and none for the one that is written to the session's
     /// standard output.
     ///
-    /// A READ: asking a server for a document moves nothing of the container, of the task or of
-    /// the records the server is published in. What it does move is BYTES, which are counted
-    /// into the container's run as they are sent and received
+    /// A READ: asking a server for a document moves nothing of the container, of the task, of
+    /// the account's network or of the records the server is published in. What it does move is
+    /// BYTES, which are counted into the container's run as they are sent and received
     /// ([`super::container_consumption`]).
     #[must_use]
     pub fn fetch(&self, program: &str, arguments: &[String]) -> Option<FetchedDocument> {
         let downloader = program == HTTP_DOWNLOADER;
         let request = read_request(program, arguments)?;
-        let (port, path) = self.addressed(&request.url)?;
+        let (destination, port, path) = self.addressed(&request.url)?;
+        // WHERE the request is answered from: this task's own servers for its own address and
+        // the loopback inside it, and the server published at another workload's address for a
+        // packet the account's network delivers there.
+        let served_at = match &destination {
+            Destination::OwnTask => self.address.clone(),
+            Destination::Peer(address) => {
+                match self
+                    .network
+                    .as_ref()
+                    .map_or(Reach::OffNetwork, |network| {
+                        network.reach(&self.address, address, port)
+                    })
+                {
+                    Reach::Admitted => address.clone(),
+                    Reach::Dropped => {
+                        // The request line went out and nothing came back: no security group
+                        // on the destination's interface names this packet, so the client is
+                        // left waiting for an answer that never arrives.
+                        self.accounting
+                            .record_network_sent(request.method.len().saturating_add(path.len()));
+                        return Some(FetchedDocument {
+                            status: if downloader {
+                                WGET_TIMEOUT
+                            } else {
+                                CURL_OPERATION_TIMEOUT
+                            },
+                            document: None,
+                            save_to: None,
+                            written_out: request.written_out(&TransferOutcome::default()),
+                        });
+                    }
+                    // An address no interface of the account holds is on no network this
+                    // session has, which is a command it could not run.
+                    Reach::OffNetwork => return None,
+                }
+            }
+        };
         // The request line this client puts on the connection, which is what it sends.
         self.accounting
             .record_network_sent(request.method.len().saturating_add(path.len()));
         let Some(answered) = self
             .addresses
-            .serve(&self.address, port, &request.method, &path)
+            .serve(&served_at, port, &request.method, &path)
         else {
-            // Nothing of this task is listening there, so the request was never answered:
-            // the connection could not be made.
+            // Nothing is listening there, so the request was never answered: the connection
+            // could not be made.
             return Some(FetchedDocument {
                 status: if downloader {
                     WGET_NETWORK_FAILURE
@@ -449,10 +558,17 @@ impl ContainerHttpClient {
                 },
                 document: None,
                 save_to: None,
+                written_out: request.written_out(&TransferOutcome::default()),
             });
         };
         // The bytes the server really answered with, whatever the client then does with them.
         self.accounting.record_network_received(answered.body.len());
+        // What this request came to, as the variables a write-out format names stand for.
+        let outcome = TransferOutcome {
+            status: Some(answered.status),
+            size: answered.body.len(),
+            content_type: answered.content_type.clone(),
+        };
         if answered.body.len() > MAX_FETCHED_BYTES {
             return Some(FetchedDocument {
                 status: if downloader {
@@ -462,6 +578,7 @@ impl ContainerHttpClient {
                 },
                 document: None,
                 save_to: None,
+                written_out: request.written_out(&outcome),
             });
         }
         // An error response is a failure of the client's own only where that client reports one
@@ -476,6 +593,7 @@ impl ContainerHttpClient {
                 },
                 document: None,
                 save_to: None,
+                written_out: request.written_out(&outcome),
             });
         }
         // The bytes a server answered with, as the text a session carries. A document that is
@@ -499,17 +617,23 @@ impl ContainerHttpClient {
                 }
                 (None, _) => None,
             },
+            written_out: request.written_out(&outcome),
         })
     }
 
-    /// The `(port, path)` of this task's own server that `url` addresses, and `None` for a URL
-    /// addressing anything else.
+    /// WHAT one request addresses: the destination, the port and the path it asks for — `None`
+    /// for a URL this client makes no request to at all.
     ///
     /// The address is read by the `http` crate's own URI type — the maintained parser this
     /// workspace already carries for a request line — rather than by anything written here, so a
     /// query string is not part of the path and a URL written without a scheme is read as the
     /// scheme a client assumes for one.
-    fn addressed(&self, url: &str) -> Option<(i32, String)> {
+    ///
+    /// A host that is the loopback inside the task or the task's own address is this task's own;
+    /// every other host written as an IP ADDRESS is another workload's, reached across the
+    /// account's network. A host written as a NAME is neither: nothing of a container's session
+    /// resolves one, so no request is made to it.
+    fn addressed(&self, url: &str) -> Option<(Destination, i32, String)> {
         let written = if url.contains("://") {
             url.to_string()
         } else {
@@ -528,12 +652,17 @@ impl ContainerHttpClient {
             .iter()
             .any(|loopback| host.eq_ignore_ascii_case(loopback))
             || host.eq_ignore_ascii_case(&self.address);
-        if !own {
+        let destination = if own {
+            Destination::OwnTask
+        } else if host.parse::<::std::net::IpAddr>().is_ok() {
+            Destination::Peer(host.to_string())
+        } else {
             return None;
-        }
+        };
         let port = parsed.port_u16().map_or(default_port, i32::from);
         let path = parsed.path();
         Some((
+            destination,
             port,
             if path.is_empty() {
                 "/".to_string()
@@ -542,6 +671,18 @@ impl ContainerHttpClient {
             },
         ))
     }
+}
+
+/// WHICH workload a request addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    /// This container's OWN task: the loopback inside it, and the address of the interface the
+    /// task was allocated. Both reach the servers the task's containers started, and no
+    /// security group stands between a container and its own task's namespace.
+    OwnTask,
+    /// Another workload, at the address written here — reached across the account's network,
+    /// which decides whether the packet arrives ([`super::task_reachability`]).
+    Peer(String),
 }
 
 /// Where the DOWNLOADER saves a document the invocation named no path for: the last segment of
@@ -641,13 +782,14 @@ mod tests {
 
     /// RULE: a request a container makes to its OWN task — the loopback inside it or the address
     /// of its own interface — is answered by the server that task's container is running, and the
-    /// client exits with what it was answered; every other host is one such a session has no
-    /// network to reach.
+    /// client exits with what it was answered; a host on no network this emulator holds is one
+    /// such a session cannot reach at all.
     ///
     /// The rows span what the rule generalises over: which client the request is written with,
     /// which form of the task's own address it names, the port it names, the path it asks for,
-    /// whether the client was asked to report an error response, and the hosts that are not this
-    /// task's.
+    /// whether the client was asked to report an error response, and the hosts that are neither
+    /// this task's nor on a network it has — a name nothing resolves, an address of a workload
+    /// this engine holds no interface for, and a scheme no request is made over.
     #[test]
     fn a_container_reaches_the_server_of_its_own_task_and_nothing_else() {
         let (client, _listening) = client();
@@ -944,8 +1086,196 @@ mod tests {
                 status: COULD_NOT_CONNECT,
                 document: None,
                 save_to: None,
+                written_out: None,
             }),
             "expected the connection the client could not make, got {fetched:?}"
         );
+    }
+
+    /// RULE: a client asked for a WRITE-OUT format writes what that format comes to on its own
+    /// output once the transfer is over, whatever became of the document — the status the server
+    /// answered, how many bytes came back and the media type they came as — and the status of a
+    /// request that was never answered at all is the one such a transfer has.
+    ///
+    /// The rows span what the rule generalises over: which variable the format names, a format
+    /// carrying text and an escape of its own, a request whose document was saved elsewhere, a
+    /// request nothing answered, and a variable this client has no value for.
+    #[test]
+    fn a_write_out_format_is_written_with_what_the_transfer_came_to() {
+        let (client, _listening) = client();
+        // (case, the command line, the text the client must write)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "the status of a document the server serves",
+                "-s -o /dev/null -w %{http_code} http://localhost/ping",
+                Some("200"),
+            ),
+            (
+                "the same status under the other name for it",
+                "-s -o /dev/null -w %{response_code} http://localhost/ping",
+                Some("200"),
+            ),
+            (
+                "the status of a path the server answers an error for",
+                "-s -o /dev/null -w %{http_code} http://localhost/gone",
+                Some("404"),
+            ),
+            (
+                "how many bytes came back, beside text of the format's own",
+                "-s -o /dev/null -w bytes=%{size_download} http://localhost/ping",
+                Some("bytes=4"),
+            ),
+            (
+                "the media type the server served them as",
+                "-s -o /dev/null -w %{content_type} http://localhost/ping",
+                Some("text/html"),
+            ),
+            (
+                "a request nothing of the task answered at all",
+                "-s -o /dev/null -w %{http_code} http://localhost:8080/ping",
+                Some("000"),
+            ),
+            (
+                "a variable this client has no value for",
+                "-s -o /dev/null -w [%{time_total}] http://localhost/ping",
+                Some("[]"),
+            ),
+            (
+                "an invocation that asked for no format at all",
+                "-s -o /dev/null http://localhost/ping",
+                None,
+            ),
+        ];
+        for (case, line, expected) in rows {
+            let fetched = client.fetch(HTTP_CLIENT, &words(line));
+            let written = fetched
+                .as_ref()
+                .and_then(|fetched| fetched.written_out.clone());
+            assert_eq!(
+                written.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?} written out, got {fetched:?}"
+            );
+        }
+        // The format is read for its escapes, which is what lets a probe end its own line.
+        let fetched = client.fetch(
+            HTTP_CLIENT,
+            &words("-s -o /dev/null -w %{http_code}\\n http://localhost/ping"),
+        );
+        let written = fetched
+            .as_ref()
+            .and_then(|fetched| fetched.written_out.clone());
+        assert_eq!(
+            written.as_deref(),
+            Some("200\n"),
+            "case \"a format ending its own line\": expected the escape read, got {fetched:?}"
+        );
+    }
+
+    /// The port the OTHER workload's server listens on in the rows below.
+    const PEER_PORT: i32 = 8080;
+
+    /// RULE: a request a container makes to ANOTHER workload's address is answered by the
+    /// server published there when a security group on that workload's interface names the
+    /// packet; a packet no rule names is dropped, which the client reports as a request that
+    /// timed out — not as a connection something refused, which is what a reachable address
+    /// with nothing listening on the port answers.
+    ///
+    /// The rows span what the rule generalises over: the rule admitting the packet and no rule
+    /// admitting it, which client the request is written with, a reachable address with nothing
+    /// listening on the port asked for, and an address no interface of the account holds.
+    #[test]
+    fn another_workloads_address_is_reached_only_where_its_groups_admit_the_request() {
+        use super::super::task_reachability::fixtures::{
+            permission, two_workloads, CLIENT_ADDRESS, SERVER_ADDRESS, SUBNET_CIDR,
+        };
+
+        // One row: what it is, the PORT the destination's one inbound rule admits the client on
+        // — and none for a destination carrying no rule at all — the client the request is
+        // written with, its command line, the status it exits with, and the document it carries.
+        type Row = (
+            &'static str,
+            Option<i32>,
+            &'static str,
+            &'static str,
+            Option<i32>,
+            Option<&'static str>,
+        );
+        let rows: &[Row] = &[
+            (
+                "a rule admitting the client on the port it asks for",
+                Some(PEER_PORT),
+                HTTP_CLIENT,
+                "-fsS http://10.70.1.12:8080/ping",
+                Some(0),
+                Some("pong"),
+            ),
+            (
+                "the other client, where that rule admits it",
+                Some(PEER_PORT),
+                HTTP_DOWNLOADER,
+                "-q -O - http://10.70.1.12:8080/ping",
+                Some(0),
+                Some("pong"),
+            ),
+            (
+                "no rule naming the packet at all",
+                None,
+                HTTP_CLIENT,
+                "-fsS http://10.70.1.12:8080/ping",
+                Some(CURL_OPERATION_TIMEOUT),
+                None,
+            ),
+            (
+                "the other client, where no rule names the packet",
+                None,
+                HTTP_DOWNLOADER,
+                "-q -O - http://10.70.1.12:8080/ping",
+                Some(WGET_TIMEOUT),
+                None,
+            ),
+            (
+                "an admitted port nothing of the destination listens on",
+                Some(9999),
+                HTTP_CLIENT,
+                "-fsS http://10.70.1.12:9999/ping",
+                Some(COULD_NOT_CONNECT),
+                None,
+            ),
+            (
+                "an address no interface of the account holds",
+                Some(PEER_PORT),
+                HTTP_CLIENT,
+                "-fsS http://10.70.9.9:8080/ping",
+                None,
+                None,
+            ),
+        ];
+        for (case, admits_port, program, line, status, document) in rows {
+            let rules = admits_port
+                .map(|port| vec![permission("tcp", Some((port, port)), Some(SUBNET_CIDR), None)])
+                .unwrap_or_default();
+            let engine = two_workloads(rules, true);
+            let addresses = ServedAddresses::of(&engine).expect("the engine vends the records");
+            // The server the OTHER workload's container is running, published at that
+            // workload's own address.
+            let _listening = addresses.publish(SERVER_ADDRESS, PEER_PORT, Arc::new(Serving));
+            let client = ContainerHttpClient::new(CLIENT_ADDRESS.to_string(), addresses)
+                .on_network(TaskNetwork::of(&engine));
+            let fetched = client.fetch(program, &words(line));
+            let reported = fetched.as_ref().map(|fetched| fetched.status);
+            assert_eq!(
+                reported, *status,
+                "case {case:?}: expected status {status:?}, got {fetched:?}"
+            );
+            let carried = fetched
+                .as_ref()
+                .and_then(|fetched| fetched.document.clone());
+            assert_eq!(
+                carried.as_deref(),
+                *document,
+                "case {case:?}: expected document {document:?}, got {carried:?}"
+            );
+        }
     }
 }

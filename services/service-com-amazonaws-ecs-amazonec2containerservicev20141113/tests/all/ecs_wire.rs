@@ -806,6 +806,48 @@ pub(crate) fn emulator_with_cloudwatch() -> MultiServiceRouter {
     router
 }
 
+/// One CloudWatch Logs call, the way a client makes it: `POST /` with
+/// `X-Amz-Target: Logs_20140328.<operation>` and a credential scoped to `logs`, which is what
+/// the router picks the service from. Answered with the HTTP status and the parsed body, because
+/// a suite that reads a stream nothing has been delivered to yet is answered a refusal it treats
+/// as "nothing yet" rather than as a failure.
+///
+/// The ONE such caller these suites share: a container's output travels into CloudWatch Logs'
+/// own store, and every suite that reads it back reads it the same way.
+pub(crate) async fn logs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("logs.{SIGNED_REGION}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("Logs_20140328.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
+                 /logs/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let parsed = if payload.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&payload)
+            .unwrap_or_else(|_| json!({ "__unparsed": String::from_utf8_lossy(&payload) }))
+    };
+    (status, parsed)
+}
+
 /// One `x-amz-json-1.0` call to the CloudWatch service, the way a client makes it, returning
 /// its parsed body. A metric or an alarm these suites read or move is read and moved through
 /// CloudWatch's OWN API, never written into a store by hand.

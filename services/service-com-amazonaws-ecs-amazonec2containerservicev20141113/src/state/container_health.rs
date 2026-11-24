@@ -1044,6 +1044,10 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
     // whole pass, exactly as a container's own run takes them
     // ([`super::container_runtime::settle_container_runtime`]).
     let addresses = ::service_common::served_http_addresses::ServedAddresses::of(&**engine);
+    // And the account's own network, for the same reason: the probe runs INSIDE the container,
+    // so it is on the container's network and reaches an address exactly as its program does
+    // ([`super::task_reachability`]).
+    let network = TaskNetwork::of(&**engine);
     for probe in probes {
         let container_arn = probe.container_arn.clone();
         let probe_state = ::engine::ServiceState::clone(&state);
@@ -1057,11 +1061,11 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
         );
         // The client the probe asks the server of its own task for a document with, for a task
         // reached at an address of its own ([`super::container_http_client`]).
-        let http = probe
-            .address
-            .clone()
-            .zip(addresses.clone())
-            .map(|(address, addresses)| ContainerHttpClient::new(address, addresses));
+        let http = probe.address.clone().zip(addresses.clone()).map(
+            |(address, addresses)| {
+                ContainerHttpClient::new(address, addresses).on_network(network.clone())
+            },
+        );
         let handle = runtime
             .spawn(async move { run_health_probe(probe_state, callback, probe, filesystem, http).await });
         // The handle is kept with the container's health record, so a probe whose container

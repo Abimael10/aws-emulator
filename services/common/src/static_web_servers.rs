@@ -144,6 +144,26 @@ pub const DEFAULT_MODULE_PORT: i32 = 8000;
 /// at.
 pub const SERVED_PORTS: ::std::ops::RangeInclusive<i32> = 1..=65535;
 
+/// The INTERPRETER's own options that leave it RUNNING what it was asked to run, and so may
+/// stand in front of the module: `python [-bBdEhiIOqsSuvVWx?] [-m module-name | -c cmd | file]
+/// [args]` (the interpreter's own usage), less the two that print and EXIT — `-h` writes the
+/// usage and `-V` the version, and neither runs a module at all, so an invocation carrying one
+/// starts no server and is read as naming none.
+///
+/// None of the ones left decides WHICH module runs — `-u` only leaves the streams unbuffered,
+/// which is what a program whose output is read as it is written is started with — so an
+/// invocation carrying them runs the same server as one that does not.
+const INTERPRETER_FLAGS: &[char] = &[
+    'b', 'B', 'd', 'i', 'I', 'E', 'O', 'q', 's', 'S', 'u', 'v', 'x',
+];
+
+/// The interpreter's own options that carry a VALUE, which stands in the next word or joined to
+/// the option: a warning filter and an implementation-specific option.
+const INTERPRETER_VALUED_FLAGS: &[char] = &['W', 'X'];
+
+/// The option that names the MODULE to run, which is where [`served_module`] starts reading.
+const MODULE_OPTION: &str = "-m";
+
 /// What one invocation of [`HTTP_SERVER_MODULE`] serves: the port it listens on and the
 /// directory it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,14 +179,40 @@ pub struct ServedModule {
 /// http.server`, with the port it was given (else [`DEFAULT_MODULE_PORT`]) and the directory
 /// `--directory` names (else `working_directory`).
 ///
+/// The INTERPRETER's own options may stand in front of `-m` ([`INTERPRETER_FLAGS`]) and name the
+/// same module, so they are read and skipped: `-u -m http.server` serves what `-m http.server`
+/// serves.
+///
 /// `None` for every other invocation of the interpreter: a program may run an interpreter for
 /// anything, and only this module of it starts a server — and for one whose port operand is no
 /// port a server could listen on ([`SERVED_PORTS`]), which names no server either.
 #[must_use]
 pub fn served_module(arguments: &[String], working_directory: &str) -> Option<ServedModule> {
     let mut words = arguments.iter();
-    if words.next().map(String::as_str) != Some("-m") {
-        return None;
+    // Everything in front of the module is the interpreter's own: a word that is not one of its
+    // options names something else for it to run, which serves nothing here.
+    loop {
+        let word = words.next()?;
+        if word == MODULE_OPTION {
+            break;
+        }
+        let flags = word.strip_prefix('-').filter(|rest| !rest.is_empty())?;
+        let mut letters = flags.chars();
+        while let Some(letter) = letters.next() {
+            if INTERPRETER_FLAGS.contains(&letter) {
+                continue;
+            }
+            if !INTERPRETER_VALUED_FLAGS.contains(&letter) {
+                return None;
+            }
+            // Such an option's value takes the rest of the word where there is one and the next
+            // word otherwise — the two spellings the interpreter takes it in — and the word is
+            // over either way.
+            if letters.as_str().is_empty() {
+                words.next()?;
+            }
+            break;
+        }
     }
     if words.next().map(String::as_str) != Some(HTTP_SERVER_MODULE) {
         return None;
@@ -283,7 +329,10 @@ mod tests {
     ///
     /// The rows span what the reading generalises over: both option spellings of the directory,
     /// an invocation naming only the port, one naming only the directory, one naming the
-    /// address it binds, one naming nothing, and the invocations that are not this module.
+    /// address it binds, one naming nothing, the interpreter's OWN options in front of the
+    /// module (one, several written as one word, one carrying a value in either spelling, and
+    /// the two that print and exit rather than running anything), and the invocations that are
+    /// not this module.
     #[test]
     fn the_interpreters_module_serves_what_its_invocation_names() {
         let argv =
@@ -318,6 +367,46 @@ mod tests {
                 "neither",
                 argv(&["-m", "http.server"]),
                 Some((DEFAULT_MODULE_PORT, "/work")),
+            ),
+            (
+                "the interpreter's own unbuffered-output flag in front of the module",
+                argv(&["-u", "-m", "http.server", "8080"]),
+                Some((8080, "/work")),
+            ),
+            (
+                "several of its own flags written as one word",
+                argv(&["-uB", "-m", "http.server", "8080", "--directory", "/srv/app"]),
+                Some((8080, "/srv/app")),
+            ),
+            (
+                "one of its own options carrying a value in the next word",
+                argv(&["-W", "ignore", "-m", "http.server", "8080"]),
+                Some((8080, "/work")),
+            ),
+            (
+                "the same option with its value joined to it",
+                argv(&["-Xutf8", "-u", "-m", "http.server"]),
+                Some((DEFAULT_MODULE_PORT, "/work")),
+            ),
+            (
+                "an option of its own this reading does not read",
+                argv(&["-Z", "-m", "http.server"]),
+                None,
+            ),
+            (
+                "the option that writes its usage and exits, which runs no module",
+                argv(&["-h", "-m", "http.server", "8080"]),
+                None,
+            ),
+            (
+                "the option that writes its version and exits, likewise",
+                argv(&["-V", "-m", "http.server", "8080"]),
+                None,
+            ),
+            (
+                "a command the interpreter runs instead of a module",
+                argv(&["-c", "print(1)"]),
+                None,
             ),
             ("another module of the interpreter", argv(&["-m", "venv"]), None),
             ("a program of its own", argv(&["app.py"]), None),

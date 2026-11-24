@@ -2804,7 +2804,8 @@ impl ContainerShell {
     }
 
     /// Perform one request of the container's HTTP client: the fetch of
-    /// [`super::container_http_client`], answered by a server of this container's own task.
+    /// [`super::container_http_client`], answered by a server of this container's own task or of
+    /// another workload the account's network delivers to it.
     ///
     /// The invocation is read by the shared reading of that client, so one it performs nothing
     /// of — a host this container has no network to reach, a scheme it makes no request over, an
@@ -2812,7 +2813,9 @@ impl ContainerShell {
     /// ([`Self::declined`]), and so is such a request in a session whose task this emulator
     /// holds no address for. What was FETCHED goes through this session's own streams, or to the
     /// file the invocation asked it to be saved at — and a save that did not happen is the
-    /// status that client reports for one.
+    /// status that client reports for one. What the invocation asked the client to WRITE once
+    /// the transfer is over goes to this session's own output whatever became of the document,
+    /// which is what makes `-o /dev/null -w '%{http_code}'` report the status alone.
     async fn run_http_client(
         &mut self,
         name: &str,
@@ -2825,24 +2828,27 @@ impl ContainerShell {
         let Some(fetched) = client.fetch(name, arguments) else {
             return self.declined();
         };
-        let Some(document) = fetched.document else {
-            return fetched.status;
-        };
-        match fetched.save_to {
-            Some(path) => {
-                if self.filesystem.write(&path, &document, false).is_err() {
-                    return ::service_common::instance_metadata_service::WRITE_ERROR;
+        let mut status = fetched.status;
+        if let Some(document) = fetched.document {
+            match fetched.save_to {
+                Some(path) => {
+                    if self.filesystem.write(&path, &document, false).is_err() {
+                        return ::service_common::instance_metadata_service::WRITE_ERROR;
+                    }
                 }
-                fetched.status
-            }
-            None => {
-                if self.write_stdout(&document, redirections).await {
-                    fetched.status
-                } else {
-                    EXIT_FAILURE
+                None => {
+                    if !self.write_stdout(&document, redirections).await {
+                        return EXIT_FAILURE;
+                    }
                 }
             }
         }
+        if let Some(written) = fetched.written_out {
+            if !self.write_stdout(&written, redirections).await {
+                status = EXIT_FAILURE;
+            }
+        }
+        status
     }
 
     /// `word` with its expansions resolved, or `None` when it carries an expansion this

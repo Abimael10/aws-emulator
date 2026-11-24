@@ -27,7 +27,9 @@
 //! metadata read and a container's own health probe are performed through — and the statuses it
 //! exits with are that client's documented ones, exported beside it. A request written in a form
 //! that reading does not perform runs nothing, like every other command a guest's session cannot
-//! perform.
+//! perform. What the invocation asks the client to WRITE once the transfer is over is read by
+//! that same shared reading ([`written_out`]), which spells the response code in the three-digit
+//! form the client's own `http_code` documentation states.
 //!
 //! An address of any other host is not this module's: nothing of this guest can reach it, which
 //! is what the transfer program itself answers for one ([`super::guest_agents::downloaded`]).
@@ -38,7 +40,7 @@
 use ::std::collections::BTreeMap;
 
 use ::service_common::instance_metadata_service::{
-    Invocation, COULD_NOT_CONNECT, HTTP_RETURNED_ERROR, WRITE_ERROR,
+    written_out, Invocation, TransferOutcome, COULD_NOT_CONNECT, HTTP_RETURNED_ERROR, WRITE_ERROR,
 };
 use ::service_common::posix_shell_session::{ProgramFiles, ProgramStreams};
 
@@ -267,7 +269,7 @@ fn answer_of(
         output.extend(lines_of(&body));
     }
     if let Some(format) = &invocation.write_out {
-        output.extend(lines_of(&written_out(format, answered)));
+        output.extend(lines_of(&written_out(format, &transfer_outcome(answered))));
     }
     ProgramStreams {
         status,
@@ -287,47 +289,11 @@ fn lines_of(written: &str) -> Vec<String> {
     lines
 }
 
-/// The variables the write-out format carries that this client answers, each as the name the
-/// format names it by and what it stands for.
-///
-/// The ONE a script reads to learn the status is the response code, which curl publishes under
-/// two names for the same value ("`http_code`  The numerical response code … `response_code`
-/// The numerical response code").
-const WRITE_OUT_STATUS: &[&str] = &["http_code", "response_code"];
-
-/// The variable naming how many bytes came back, and the one naming the media type the server
-/// served them as.
-const WRITE_OUT_SIZE: &str = "size_download";
-const WRITE_OUT_CONTENT_TYPE: &str = "content_type";
-
-/// The format the invocation asked for, with the variables it names replaced by what this
-/// request came to and the escapes it carries read as the characters they name.
-///
-/// A variable this client answers nothing for is left out, which is what the client itself
-/// writes for one it has no value for.
-fn written_out(format: &str, answered: &GuestHttpResponse) -> String {
-    let mut written = String::new();
-    let mut rest = format;
-    while let Some(at) = rest.find("%{") {
-        written.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let Some(end) = after.find('}') else {
-            written.push_str(&rest[at..]);
-            rest = "";
-            break;
-        };
-        let named = &after[..end];
-        if WRITE_OUT_STATUS.contains(&named) {
-            written.push_str(&answered.status.to_string());
-        } else if named == WRITE_OUT_SIZE {
-            written.push_str(&answered.body.len().to_string());
-        } else if named == WRITE_OUT_CONTENT_TYPE {
-            written.push_str(answered.content_type.as_deref().unwrap_or_default());
-        }
-        rest = &after[end + 1..];
+/// What this request came to, as the variables a write-out format names stand for.
+fn transfer_outcome(answered: &GuestHttpResponse) -> TransferOutcome {
+    TransferOutcome {
+        status: Some(answered.status),
+        size: answered.body.len(),
+        content_type: answered.content_type.clone(),
     }
-    written.push_str(rest);
-    // The format is read for its escapes, which is what lets `-w '%{http_code}\n'` end its own
-    // line.
-    written.replace("\\n", "\n").replace("\\t", "\t")
 }

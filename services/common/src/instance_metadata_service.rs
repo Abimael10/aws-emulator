@@ -361,8 +361,9 @@ const HEAD_FLAGS: &[&str] = &["-I", "--head"];
 const REMOTE_NAME_FLAGS: &[&str] = &["-O", "--remote-name"];
 
 /// The flags that carry no value and change nothing about what is answered here: how much the
-/// client would say about itself, whether it would follow a redirection, and whether it would
-/// check a certificate.
+/// client would say about itself, whether it would follow a redirection, whether it would check
+/// a certificate, which address family it would resolve the host in, and what it would show
+/// while the transfer runs.
 const IGNORED_FLAGS: &[&str] = &[
     "-S",
     "--show-error",
@@ -373,6 +374,15 @@ const IGNORED_FLAGS: &[&str] = &[
     "-g",
     "--globoff",
     "-q",
+    "-v",
+    "--verbose",
+    "-4",
+    "--ipv4",
+    "-6",
+    "--ipv6",
+    "--no-progress-meter",
+    "-#",
+    "--progress-bar",
 ];
 
 /// Whether `flag` is a valueless flag this client reads: one it acts on, or one it ignores.
@@ -518,6 +528,80 @@ impl Invocation {
             .find(|(carried, _)| carried == name)
             .map(|(_, value)| value.clone())
     }
+}
+
+/// What ONE request this client made came to, as the variables a write-out format name it.
+///
+/// The counterpart of [`Invocation`] on the answer's side: one reading of the command line, one
+/// reading of what the format it asked for then says about the transfer, whichever of this
+/// emulator's guests performed it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TransferOutcome {
+    /// The status the server answered, and `None` for a request that was never answered at all
+    /// — a connection nothing accepted, or packets nothing carried.
+    pub status: Option<u16>,
+    /// How many bytes of document came back.
+    pub size: usize,
+    /// The media type the server served them as, where it named one.
+    pub content_type: Option<String>,
+}
+
+/// The variables a write-out format carries that this client answers, each as the name the
+/// format names it by.
+///
+/// The ONE a script reads to learn the status is the response code, which curl publishes under
+/// two names for the same value ("`http_code`  The numerical response code … `response_code`
+/// The numerical response code"); beside it, how many bytes came back and the media type they
+/// came as.
+const WRITE_OUT_STATUS: &[&str] = &["http_code", "response_code"];
+const WRITE_OUT_SIZE: &str = "size_download";
+const WRITE_OUT_CONTENT_TYPE: &str = "content_type";
+
+/// How many digits the response code is written in: "`http_code`  The numerical response code
+/// … in a 3-digit form", which is also what makes the value a request that was NEVER answered
+/// reports (`000`) tell itself from any status a server could answer.
+const WRITE_OUT_STATUS_DIGITS: usize = 3;
+
+/// The format `format` asked for, with the variables it names replaced by what `outcome` came
+/// to and the escapes it carries read as the characters they name.
+///
+/// A variable this client answers nothing for is left out, which is what the client itself
+/// writes for one it has no value for.
+#[must_use]
+pub fn written_out(format: &str, outcome: &TransferOutcome) -> String {
+    let mut written = String::new();
+    let mut rest = format;
+    while let Some(at) = rest.find("%{") {
+        written.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = after.find('}') else {
+            written.push_str(&rest[at..]);
+            rest = "";
+            break;
+        };
+        let named = &after[..end];
+        if WRITE_OUT_STATUS.contains(&named) {
+            // Written into the buffer rather than through a String of its own, as every other
+            // variable of this format is.
+            let _ = ::std::fmt::Write::write_fmt(
+                &mut written,
+                format_args!(
+                    "{:0width$}",
+                    outcome.status.unwrap_or_default(),
+                    width = WRITE_OUT_STATUS_DIGITS
+                ),
+            );
+        } else if named == WRITE_OUT_SIZE {
+            written.push_str(&outcome.size.to_string());
+        } else if named == WRITE_OUT_CONTENT_TYPE {
+            written.push_str(outcome.content_type.as_deref().unwrap_or_default());
+        }
+        rest = &after[end + 1..];
+    }
+    written.push_str(rest);
+    // The format is read for its escapes, which is what lets `-w '%{http_code}\n'` end its own
+    // line.
+    written.replace("\\n", "\n").replace("\\t", "\t")
 }
 
 /// One `Name: value` header as the pair it states, or `None` for a word that is not one.

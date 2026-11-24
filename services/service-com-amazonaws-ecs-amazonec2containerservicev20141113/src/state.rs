@@ -440,6 +440,11 @@ pub use container_aws_cli::*;
 mod container_http_client;
 pub use container_http_client::*;
 
+/// WHO reaches a task at the address of its own elastic network interface: the security groups
+/// on that interface.
+mod task_reachability;
+pub use task_reachability::*;
+
 /// The FILESYSTEM a container's program runs over: its own writable layer, and the volumes
 /// the task definition mounts into it.
 mod container_filesystem;
