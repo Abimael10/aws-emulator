@@ -60,14 +60,20 @@ pub fn requires_distinct_instances(constraints: &[PlacementConstraint]) -> bool 
 /// Whether `constraints` cap a placement of `launch_type` at ONE task per container instance.
 ///
 /// Two halves, both of them necessary. The constraint has to ask for it
-/// ([`requires_distinct_instances`]), and the placement has to be made on the cluster's own
-/// CONTAINER INSTANCES for there to be anything to be distinct about: "if you're using the
-/// Fargate launch type, task placement constraints aren't supported"
-/// (`PlacementConstraint`), and a placement routed through a capacity provider carries no
-/// launch type and so no container instance of this cluster either
-/// ([`needs_registered_capacity`], the same reading the scheduler's own host choice is made
-/// with). A placement this answers `false` for is made exactly as it would be with no
-/// constraint stated: every task asked for is placed.
+/// ([`requires_distinct_instances`]), and the placement has to NAME the infrastructure the
+/// cluster's own container instances are for there to be anything to be distinct about: "if
+/// you're using the Fargate launch type, task placement constraints aren't supported"
+/// (`PlacementConstraint`), so a Fargate placement is not capped
+/// ([`needs_registered_capacity`]). A placement that says where it runs with a
+/// `capacityProviderStrategy` instead is not capped here either, and that is this reading's
+/// own limit rather than a statement about where it runs: the host it is given IS resolved
+/// through the provider's class of capacity
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::placement_launch_type`], which
+/// is what the scheduler's host choice is made with), so such a placement does take container
+/// instances of the cluster — what the cap over them should be for one is the subject of
+/// [`DistinctInstancePlacement`]'s own suite and is not decided here. A placement this
+/// answers `false` for is made exactly as it would be with no constraint stated: every task
+/// asked for is placed.
 pub fn caps_distinct_instances(
     constraints: &[PlacementConstraint],
     launch_type: Option<&str>,

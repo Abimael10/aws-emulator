@@ -775,10 +775,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to
         // your cluster" (and `EXTERNAL` on the on-premises capacity registered to it), so
-        // a cluster with no container instance registered has nowhere to place the task:
-        // the request is refused rather than persisting a task that could never run.
+        // a cluster with no container instance a task can be placed on has nowhere to put
+        // this one: the request is refused rather than persisting a task that could never
+        // run. The capacity a placement can use is the instance that will ACCEPT one —
+        // "only instances connected to an agent can accept task placement requests", and a
+        // `DRAINING` instance is one Amazon ECS "prevents new tasks from being scheduled
+        // for placement on" — which is what
+        // [`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::placeable_container_instances`]
+        // counts; a cluster whose registrations are all beyond placement is as empty to a
+        // placement as a cluster with none.
         if crate::state::needs_registered_capacity(launch_type.as_deref())
-            && guard.registered_container_instances(&cluster_name) == 0
+            && guard.placeable_container_instances(&cluster_name) == 0
         {
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -800,7 +807,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can carry several: the caller's own Auto Scaling group is what has to grow.
         // A name no stored provider carries, and the predefined Fargate providers, name no
         // Auto Scaling group of this account, so this decides nothing about them.
-        if guard.registered_container_instances(&cluster_name) == 0 {
+        if guard.placeable_container_instances(&cluster_name) == 0 {
             if let Some(provider) = task_providers
                 .iter()
                 .flatten()
@@ -912,7 +919,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 provider
                     .as_deref()
                     .and_then(|name| guard.capacity_providers.get(name)),
-                guard.registered_container_instances(&cluster_name),
+                guard.placeable_container_instances(&cluster_name),
             );
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
@@ -944,11 +951,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 schedule.last_status,
             );
+            // `Task$launchType` is "The infrastructure where your task runs on": the launch
+            // type this run named, else the infrastructure the capacity provider that placed
+            // the task binds onto — a placement through either of the Fargate providers runs
+            // on Fargate, whichever of the two it was routed through, and one through a
+            // provider over a caller's Auto Scaling group on the Amazon EC2 instances that
+            // group registers into the cluster
+            // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::placement_launch_type`]).
+            let reported_launch_type =
+                guard.placement_launch_type(launch_type.as_deref(), provider.as_deref());
             // The host this task takes: the one the constrained placement reserved for it,
-            // else the scheduler's ordinary choice.
+            // else the scheduler's ordinary choice, made on the infrastructure resolved
+            // above — so a task whose provider binds onto the cluster's own registered
+            // capacity runs on one of that cluster's container instances and a task on
+            // Fargate on none.
             let container_instance_arn = match constrained.as_ref() {
                 Some(placement) => placement.hosts.get(placed).cloned(),
-                None => guard.select_task_host(&cluster_name, launch_type.as_deref()),
+                None => guard.select_task_host(&cluster_name, reported_launch_type.as_deref()),
             };
             // The HOST ports a task placed on a container instance has its containers bound
             // to, recorded once the host is known ([`crate::state::host_port_bindings`]).
@@ -958,17 +977,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition.container_definitions,
                 &mut containers,
             );
-            // `Task$launchType` is "The infrastructure where your task runs on": the launch
-            // type this run named, else the infrastructure the capacity provider that placed
-            // the task binds onto — a placement through either of the Fargate providers runs
-            // on Fargate, whichever of the two it was routed through
-            // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::capacity_provider_launch_type`]).
-            let reported_launch_type = launch_type.clone().or_else(|| {
-                provider
-                    .as_deref()
-                    .and_then(|name| guard.capacity_provider_launch_type(name))
-                    .map(ToString::to_string)
-            });
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),

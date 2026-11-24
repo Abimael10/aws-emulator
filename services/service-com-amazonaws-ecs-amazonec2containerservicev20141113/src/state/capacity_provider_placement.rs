@@ -146,6 +146,32 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         )
     }
 
+    /// The infrastructure a placement RUNS ON, whichever way the placement says where its
+    /// tasks run: the launch type it named, else the class of capacity the capacity provider
+    /// that places the task binds onto ([`Self::capacity_provider_launch_type`]).
+    ///
+    /// "A task can use either a launch type or a capacity provider strategy", and
+    /// `Task$launchType` — "the infrastructure where your task runs on" — reports the same
+    /// thing for both: a placement through a provider over a caller's Auto Scaling group runs
+    /// on the Amazon EC2 instances that group registers into the cluster, one through a
+    /// Fargate provider on Fargate. So this is the ONE resolution of that pair, read wherever
+    /// the infrastructure decides something about the task — the launch type it reports, and
+    /// whether it is hosted on a container instance of its cluster at all
+    /// ([`needs_registered_capacity`], which is what [`Self::select_task_host`] gives such a
+    /// task one of the cluster's own hosts by).
+    pub fn placement_launch_type(
+        &self,
+        launch_type: Option<&str>,
+        capacity_provider: Option<&str>,
+    ) -> Option<String> {
+        match launch_type {
+            Some(launch_type) => Some(launch_type.to_string()),
+            None => capacity_provider
+                .and_then(|reference| self.capacity_provider_launch_type(reference))
+                .map(ToString::to_string),
+        }
+    }
+
     /// Whether this account holds Amazon ECS Managed Instances capacity at all: a capacity
     /// provider of type [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`] that was created and
     /// not deleted.

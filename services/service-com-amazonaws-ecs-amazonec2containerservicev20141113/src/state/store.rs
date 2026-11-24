@@ -2090,6 +2090,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Record the placement every task PARKED in `cluster_name` is now owed, because the
     /// capacity its capacity provider had to acquire has just registered into the cluster.
     ///
+    /// The placement is WHERE as well as WHEN: a task parked on a provider that binds onto the
+    /// cluster's own registered capacity is placed on one of the container instances that
+    /// capacity brought ([`Self::placement_launch_type`] resolves the infrastructure, exactly
+    /// as the call that placed the task did, and [`Self::select_task_host`] chooses the host),
+    /// so `Task$containerInstanceArn` names the host it runs on, its containers are bound to
+    /// that host's ports and the zone and processor architecture it reports are that host's. A
+    /// task whose infrastructure takes no container instance of this cluster — a Fargate
+    /// placement parked for an interface — keeps the host it already had, which is none.
+    ///
     /// The transition falls due [`TRANSITION_SPAN`] from `now` and
     /// [`Self::advance_clock`] materialises it, so nothing here moves a status that is not
     /// owed yet. A task that cannot be launched before the interface it was allocated is in
@@ -2099,21 +2108,81 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// the two instants. A task the caller has already asked to stop is not placed: its
     /// placement was cancelled, not merely overtaken.
     pub fn place_tasks_awaiting_capacity(&mut self, cluster_name: &str, now: SystemTime) {
-        for task in self.tasks.values_mut() {
-            if task.cluster_name == cluster_name
-                && task.desired_status == STATUS_RUNNING
-                && task.is_awaiting_placement()
-            {
-                let placed_at = now + TRANSITION_SPAN;
-                let mut attached_at: Option<SystemTime> = None;
-                for attachment in &mut task.attachments {
-                    attachment.begin_attaching(now);
-                    if let Some(at) = attachment.attached_due_at() {
-                        attached_at = Some(attached_at.map_or(at, |seen: SystemTime| seen.max(at)));
-                    }
+        // The parked tasks, read before any of them is placed: each placement is then decided
+        // against the hosts the ones before it took, so a batch spreads over the capacity that
+        // arrived exactly as one call's batch does.
+        let parked: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == cluster_name
+                    && task.desired_status == STATUS_RUNNING
+                    && task.is_awaiting_placement()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        for task_arn in parked {
+            let Some(task) = self.tasks.get(&task_arn) else {
+                continue;
+            };
+            let placement_launch_type =
+                self.placement_launch_type(task.launch_type.as_deref(), task.capacity_provider_name.as_deref());
+            let host = self.select_task_host(cluster_name, placement_launch_type.as_deref());
+            let mut containers = task.containers.clone();
+            let subnets = task
+                .awsvpc_configuration
+                .as_ref()
+                .map(|configuration| configuration.subnets.clone())
+                .unwrap_or_default();
+            // The revision this task runs, for the ports its containers are bound to on the
+            // host and the architecture its own `runtimePlatform` may fix.
+            let revision = self
+                .revision_of_arn(&task.task_definition_arn)
+                .map(|revision| {
+                    (
+                        revision.network_mode.clone(),
+                        revision.container_definitions.clone(),
+                        revision.runtime_platform.clone(),
+                    )
+                });
+            let placed_on_host = host.is_some();
+            if placed_on_host {
+                if let Some((network_mode, definitions, _)) = revision.as_ref() {
+                    self.bind_task_host_ports(
+                        host.as_deref(),
+                        network_mode,
+                        definitions,
+                        &mut containers,
+                    );
                 }
-                task.pending_due_at = Some(attached_at.unwrap_or(placed_at).max(placed_at));
             }
+            let availability_zone = self.task_availability_zone(host.as_deref(), &subnets);
+            let cpu_architecture = task_cpu_architecture(
+                self.host_cpu_architecture(host.as_deref()).as_deref(),
+                revision
+                    .as_ref()
+                    .and_then(|(_, _, runtime_platform)| runtime_platform.as_ref()),
+            );
+            let Some(task) = self.tasks.get_mut(&task_arn) else {
+                continue;
+            };
+            if placed_on_host {
+                task.container_instance_arn = host;
+                task.containers = containers;
+                task.cpu_architecture = cpu_architecture;
+                if availability_zone.is_some() {
+                    task.availability_zone = availability_zone;
+                }
+            }
+            let placed_at = now + TRANSITION_SPAN;
+            let mut attached_at: Option<SystemTime> = None;
+            for attachment in &mut task.attachments {
+                attachment.begin_attaching(now);
+                if let Some(at) = attachment.attached_due_at() {
+                    attached_at = Some(attached_at.map_or(at, |seen: SystemTime| seen.max(at)));
+                }
+            }
+            task.pending_due_at = Some(attached_at.unwrap_or(placed_at).max(placed_at));
         }
     }
 
@@ -4019,12 +4088,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// ([`awaits_provisioned_capacity`]). The shortfall it answers carries both spellings
     /// the service reports it in ([`PlacementShortfall`]), so the event stream and
     /// `runStatus` cannot disagree about which capacity was missing.
+    ///
+    /// Capacity that EXISTS is capacity a placement can be made on
+    /// ([`Self::placeable_container_instances`]): "only instances connected to an agent can
+    /// accept task placement requests", and a `DRAINING` instance is one Amazon ECS
+    /// "prevents new tasks from being scheduled for placement on", so a cluster holding
+    /// only those has nowhere to put the task either.
     pub fn placement_capacity_reason(
         &self,
         service: &ServiceRecord,
         placement: &Placement,
     ) -> Option<PlacementShortfall> {
-        if self.registered_container_instances(&service.cluster_name) > 0 {
+        if self.placeable_container_instances(&service.cluster_name) > 0 {
             return None;
         }
         if needs_registered_capacity(placement.launch_type.as_deref()) {
@@ -4098,7 +4173,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .capacity_provider_name
                 .as_deref()
                 .and_then(|name| self.capacity_providers.get(name)),
-            self.registered_container_instances(&service.cluster_name),
+            self.placeable_container_instances(&service.cluster_name),
         );
         let task_id = self.next_task_id();
         let task_arn = task_arn(region, &service.cluster_name, &task_id);
@@ -4156,17 +4231,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // per container instance gets one that runs no task of the group yet, and any other
         // service the scheduler's ordinary choice ([`super::caps_distinct_instances`], which
         // is what keeps a placement made on no container instance at all — Fargate, or a
-        // capacity provider — out of the cap).
+        // capacity provider — out of the cap). The choice itself is made on the
+        // infrastructure the placement RESOLVED: a placement through a capacity provider
+        // names no launch type, and the provider's own class of capacity is what decides
+        // whether the task has a host at all ([`Self::placement_launch_type`]).
+        let placement_launch_type = self.placement_launch_type(
+            placement.launch_type.as_deref(),
+            placement.capacity_provider_name.as_deref(),
+        );
         let container_instance_arn =
             if caps_distinct_instances(&service.placement_constraints, placement.launch_type.as_deref())
             {
                 self.select_distinct_task_host(
                     &service.cluster_name,
                     &group,
-                    placement.launch_type.as_deref(),
+                    placement_launch_type.as_deref(),
                 )
             } else {
-                self.select_task_host(&service.cluster_name, placement.launch_type.as_deref())
+                self.select_task_host(&service.cluster_name, placement_launch_type.as_deref())
             };
         let availability_zone = self.task_availability_zone(
             container_instance_arn.as_deref(),
@@ -4213,14 +4295,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             )),
             // `Task$launchType` is "The infrastructure where your task runs on": the launch
             // type the placement names, else the infrastructure the capacity provider that
-            // placed the task binds onto ([`Self::capacity_provider_launch_type`]).
-            launch_type: placement.launch_type.clone().or_else(|| {
-                placement
-                    .capacity_provider_name
-                    .as_deref()
-                    .and_then(|name| self.capacity_provider_launch_type(name))
-                    .map(ToString::to_string)
-            }),
+            // placed the task binds onto ([`Self::placement_launch_type`], the same
+            // resolution the host above was chosen on).
+            launch_type: placement_launch_type,
             capacity_provider_name: placement.capacity_provider_name.clone(),
             platform_version: platform.platform_version.clone(),
             platform_family: platform.platform_family.clone(),

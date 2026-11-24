@@ -472,6 +472,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service was still waiting to materialise is no longer the newest word on it.
             instance.agent_update_status = None;
             instance.agent_update_due_at = None;
+            // And the connection it holds is good again, so nothing of it is timing out
+            // ([`crate::state::AGENT_CONNECTION_TIMEOUT`]).
+            instance.agent_connection_lost_due_at = None;
             instance.registered_resources = registered_resources;
             instance.attributes = attributes;
             instance.platform_devices = platform_devices;
@@ -542,6 +545,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // requests none, and a re-registration is the agent reporting itself afresh.
             agent_update_status: None,
             agent_update_due_at: None,
+            // The agent that registered is the caller, so its connection is timing out
+            // nowhere.
+            agent_connection_lost_due_at: None,
             registered_resources,
             attributes,
             platform_devices,

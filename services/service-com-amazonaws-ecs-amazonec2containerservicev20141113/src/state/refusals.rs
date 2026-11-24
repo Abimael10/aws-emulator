@@ -397,22 +397,24 @@ pub fn managed_scaling_enabled(provider: &CapacityProviderRecord) -> bool {
 }
 
 /// Whether a task routed through `provider` still has to have capacity ACQUIRED for it
-/// before Amazon ECS can place it, given the `registered_instances` its cluster holds.
+/// before Amazon ECS can place it, given the `placeable_instances` its cluster holds — the
+/// container instances a placement can be made on at all
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::placeable_container_instances`]).
 ///
 /// It is the accepted half of [`needs_registered_capacity_now`]: an Auto Scaling group
 /// provider whose managed scaling Amazon ECS runs ("Amazon ECS manages the scale-in and
 /// scale-out actions of the Auto Scaling group") turns a placement into one ECS can
 /// satisfy by adding capacity, and until that capacity is registered as a container
 /// instance there is nothing to place the task ON. Such a task is accepted but not placed,
-/// which is what [`STATUS_PROVISIONING`] reports; a cluster that already holds registered
-/// capacity places the task now, and a provider that names no Auto Scaling group of this
-/// account (a predefined Fargate provider, a managed-instances provider) acquires no
+/// which is what [`STATUS_PROVISIONING`] reports; a cluster that already holds capacity a
+/// placement can use places the task now, and a provider that names no Auto Scaling group of
+/// this account (a predefined Fargate provider, a managed-instances provider) acquires no
 /// container instance for this cluster, so neither parks a task.
 pub fn awaits_provisioned_capacity(
     provider: Option<&CapacityProviderRecord>,
-    registered_instances: usize,
+    placeable_instances: usize,
 ) -> bool {
-    registered_instances == 0
+    placeable_instances == 0
         && provider.is_some_and(|provider| {
             provider.auto_scaling_group_provider.is_some()
                 && !needs_registered_capacity_now(provider)

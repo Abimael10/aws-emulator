@@ -55,6 +55,16 @@ pub const AGENT_CLUSTER_VARIABLE: &str = "ECS_CLUSTER";
 /// capacity yet, which is what the real one reports while the instance is still coming up.
 pub const AGENT_REGISTRATION_SPAN: Duration = Duration::from_secs(3);
 
+/// How long after the machine under a container instance stops running the agent's
+/// CONNECTION to Amazon ECS times out, which is when the registration stops reporting the
+/// agent connected.
+///
+/// EMULATOR-CHOSEN — AWS publishes no duration for the agent's connection timeout — and
+/// deliberately non-zero: the connection is the agent's own, so a caller that reads the
+/// registration straight after stopping the instance still sees the agent connected, exactly
+/// as the real service reports it until the connection it holds times out.
+pub const AGENT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The ports the agent reports as already in use on the instance it registers: the agent's
 /// own `ECS_RESERVED_PORTS` default, `[22, 2375, 2376, 51678, 51679]`.
 const AGENT_RESERVED_PORTS: [&str; 5] = ["22", "2375", "2376", "51678", "51679"];
@@ -138,7 +148,7 @@ pub fn settle_ec2_capacity<Eng: Send + Sync + 'static>(engine: &Eng, now: System
         return;
     };
     let mut guard = state.lock();
-    apply_departures(&mut guard, &departed);
+    apply_departures(&mut guard, &departed, now);
     apply_registrations(&mut guard, &registrations, now);
 }
 
@@ -354,26 +364,40 @@ fn attribute(name: &str, value: String) -> Attribute {
 }
 
 /// Take the capacity back off the container instances whose Amazon EC2 instance is no
-/// longer running.
+/// longer running — once the agent on it has stopped reporting in for long enough for the
+/// connection it held to time out.
 ///
-/// A stopped instance runs no agent, so its registration reports none connected — "only
-/// instances connected to an agent can accept task placement requests" — and a TERMINATED
-/// instance is gone for good, so its registration is deregistered, which is the `INACTIVE`
-/// status a deregistration leaves. Each change bumps the instance's version counter:
-/// "every time a container instance experiences a change ... the version counter is
-/// incremented."
+/// A stopped instance runs no agent, so its registration ends up reporting none connected —
+/// "only instances connected to an agent can accept task placement requests" — and a
+/// TERMINATED instance is gone for good, so its registration is deregistered, which is the
+/// `INACTIVE` status a deregistration leaves. Neither is reported the instant the machine
+/// stopped: what Amazon ECS holds is the agent's CONNECTION, which outlives the machine
+/// until it times out ([`AGENT_CONNECTION_TIMEOUT`]), so the instant it falls due is
+/// recorded on the registration and nothing moves before it. Each change bumps the
+/// instance's version counter: "every time a container instance experiences a change ...
+/// the version counter is incremented."
 ///
 /// A registration already `INACTIVE` is left as it is: it has nothing left to lose, and a
 /// caller that deregistered an instance of its own accord is not overruled here.
 fn apply_departures(
     store: &mut ComAmazonawsEcsAmazonec2containerservicev20141113State,
     departed: &DepartedInstances,
+    now: SystemTime,
 ) {
     for instance in store.container_instances.values_mut() {
         let Some(gone) = departed.get(&instance.ec2_instance_id).copied() else {
             continue;
         };
         if instance.status == CONTAINER_INSTANCE_INACTIVE {
+            continue;
+        }
+        // The first pass that sees the machine stopped is the pass that sees the agent stop
+        // reporting in, so that is when the connection starts timing out; a later pass reads
+        // the instant it was already owed at rather than pushing it out.
+        let due_at = *instance
+            .agent_connection_lost_due_at
+            .get_or_insert(now + AGENT_CONNECTION_TIMEOUT);
+        if due_at > now {
             continue;
         }
         let mut changed = false;
@@ -396,10 +420,11 @@ fn apply_departures(
 ///
 /// An instance already registered into the cluster is the SAME container instance however
 /// often its agent reports: one instance is one capacity. What a repeat report does is
-/// reconnect the agent of an instance that had stopped and is running again; a registration
-/// a caller has deregistered stays deregistered, and a `DRAINING` one keeps that status —
-/// "new tasks aren't placed on the container instance" is the caller's decision, not the
-/// agent's.
+/// reconnect the agent of an instance that had stopped and is running again — the connection
+/// it holds is good again, so nothing of it is timing out ([`AGENT_CONNECTION_TIMEOUT`]); a
+/// registration a caller has deregistered stays deregistered, and a `DRAINING` one keeps
+/// that status — "new tasks aren't placed on the container instance" is the caller's
+/// decision, not the agent's.
 fn apply_registrations(
     store: &mut ComAmazonawsEcsAmazonec2containerservicev20141113State,
     registrations: &[AgentRegistration],
@@ -421,9 +446,12 @@ fn apply_registrations(
             .map(|instance| instance.arn.clone());
         if let Some(arn) = existing {
             if let Some(instance) = store.container_instances.get_mut(&arn) {
-                if instance.status != CONTAINER_INSTANCE_INACTIVE && !instance.agent_connected {
-                    instance.agent_connected = true;
-                    instance.version += 1;
+                if instance.status != CONTAINER_INSTANCE_INACTIVE {
+                    instance.agent_connection_lost_due_at = None;
+                    if !instance.agent_connected {
+                        instance.agent_connected = true;
+                        instance.version += 1;
+                    }
                 }
             }
             continue;
@@ -455,6 +483,9 @@ fn apply_registrations(
             // "If an update wasn't ever requested, this value is NULL."
             agent_update_status: None,
             agent_update_due_at: None,
+            // The agent that registered is reporting in, so its connection is timing out
+            // nowhere.
+            agent_connection_lost_due_at: None,
             registered_resources: registration.resources.clone(),
             attributes: registration.attributes.clone(),
             platform_devices: Vec::new(),

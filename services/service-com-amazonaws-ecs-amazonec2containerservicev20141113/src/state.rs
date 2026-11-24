@@ -3663,6 +3663,12 @@ pub struct ContainerInstanceRecord {
     /// materialised it. The update is owed by the CLOCK from the instant
     /// `UpdateContainerAgent` accepted it, not by whoever reads the instance next.
     pub agent_update_due_at: Option<SystemTime>,
+    /// When this instance's AGENT CONNECTION falls due to time out, and `None` while the
+    /// agent is reporting in: the connection is the agent's own and outlives the instant the
+    /// machine under it stopped running, so a read taken straight after that still reports
+    /// the agent connected and only a read past this instant reports it gone
+    /// ([`ec2_capacity::AGENT_CONNECTION_TIMEOUT`]).
+    pub agent_connection_lost_due_at: Option<SystemTime>,
     /// `totalResources`, as the agent reported it at registration —
     /// `ContainerInstance$registeredResources` is "the amount of each resource that was
     /// available on the container instance when the container agent registered it".

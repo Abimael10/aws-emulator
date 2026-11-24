@@ -531,10 +531,6 @@ async fn a_refused_region_removal_is_inert_and_delete_directory_takes_the_direct
             Some(STAGE_DELETING),
             "case {case:?}: expected the teardown's first stage straight after the delete"
         );
-
-        // The stage after that one is the terminal stage of the modelled chain, reached by the
-        // clock alone — the polls only read — and the end of the teardown is the record
-        // leaving the store.
         let settled = poll_until(
             case,
             &format!("{directory_id} to leave {STAGE_DELETING}"),
