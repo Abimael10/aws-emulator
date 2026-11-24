@@ -1500,6 +1500,27 @@ fn agentcore_identity_is_assigned(resource_type: &str) -> bool {
     )
 }
 
+/// Whether the physical identifier of a resource of `resource_type` is an ADDRESS of the
+/// endpoint this emulator is served at, so the value in force is the one the owning service
+/// REPORTED and the value the naming rules compute is only another spelling of it.
+///
+/// One type is in that position: an `AWS::SQS::Queue`, whose "Ref returns the queue URL". A
+/// queue url is the only handle every queue-addressed call takes and a client sends the string
+/// it was handed straight back, so Amazon SQS reports a queue at the endpoint the call REACHED
+/// rather than at that service's published regional host — and which endpoint that is depends
+/// on where this emulator is served, which no template states.
+///
+/// What the two spellings share is the `/<accountId>/<QueueName>` PATH that names the queue, so
+/// such an identifier is compared by that path
+/// ([`crate::state::provisioning::is_same_resource`]) and a record matched under the other
+/// spelling keeps the identifier its owning service answered with ([`crate::state::stack`]'s
+/// identity pass). Without that, a re-deploy of the very same template reads as asking for a
+/// DIFFERENT queue: the stack creates a second one and takes the queue every reference resolves
+/// to down with it.
+pub fn identity_is_a_reported_address(resource_type: &str) -> bool {
+    resource_type == SQS_QUEUE
+}
+
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
 ///
 /// Public so a reader of such an identity — a test asserting the triple a resource is known by —

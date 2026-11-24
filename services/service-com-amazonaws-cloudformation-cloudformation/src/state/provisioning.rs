@@ -3888,7 +3888,9 @@ fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
 /// A resource whose physical id its owning service ASSIGNED is matched by the same rule:
 /// the deploying record already carries the id that service minted, because
 /// [`super::StoredStack::deploy_template`] carried it forward — nothing here could
-/// recompute it.
+/// recompute it. One whose id is an ADDRESS that service REPORTED is matched by what that
+/// identifier names rather than by its spelling ([`names_the_same_instance`]), because a
+/// deployment recomputes such a value down to the endpoint it was reported at.
 ///
 /// For a type whose resource lives INSIDE a parent, the physical name identifies one resource
 /// only together with that parent ([`super::physical_name::scope_of`], which is the scope the
@@ -3899,8 +3901,47 @@ fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
 pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
     left.logical_id == right.logical_id
         && left.resource_type == right.resource_type
-        && left.physical_resource_id == right.physical_resource_id
+        && names_the_same_instance(
+            &left.resource_type,
+            &left.physical_resource_id,
+            &right.physical_resource_id,
+        )
         && super::physical_name::scope_of(left) == super::physical_name::scope_of(right)
+}
+
+/// Whether two physical identifiers of a resource of `resource_type` name the SAME instance.
+///
+/// Identical values do, which is the whole answer for every type whose identifier is a name, an
+/// id or an ARN. For a type whose identifier is an ADDRESS of the endpoint this emulator is
+/// served at ([`super::template::identity_is_a_reported_address`]), two DIFFERENT values can
+/// name one resource as well: a queue url names its queue by its `/<accountId>/<QueueName>`
+/// path, its authority naming the endpoint the url was reported at, and "which authority a url
+/// carries decides nothing about WHICH queue it addresses" — that is the reading Amazon SQS
+/// itself resolves a `QueueUrl` by. So the value the naming rules computed against that
+/// service's published regional host and the one it ANSWERED with at this emulator's own
+/// endpoint are one identifier, while two different paths are two queues: a declaration whose
+/// name — generated or stated — resolves to another path still asks for a resource the one
+/// that exists cannot become.
+fn names_the_same_instance(resource_type: &str, left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if !super::template::identity_is_a_reported_address(resource_type) {
+        return false;
+    }
+    // The path of an address: what follows the authority, which is what names the resource.
+    // A value carrying no path at all names nothing to compare.
+    let path = |value: &str| {
+        let after_scheme = ::service_common::data_plane_addressing::url_authority(value);
+        after_scheme
+            .find('/')
+            .map(|at| after_scheme[at..].trim_end_matches('/').to_string())
+            .filter(|path| path.len() > 1)
+    };
+    match (path(left), path(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Whether the record `existing` is the resource `declared` ASKS FOR: the same identity

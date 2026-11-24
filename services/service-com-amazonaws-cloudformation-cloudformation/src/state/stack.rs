@@ -4121,7 +4121,15 @@ fn adopt_identities_in_force(
             // it stands rather than reporting a resource as created in a service that has
             // none ([`provisioning::already_deployed`] is what admitted such a record).
             resource.materialised = existing.materialised;
-            if keeps_its_identifier {
+            // The identity in force is the record's for the types above, and also for a
+            // resource matched under ANOTHER SPELLING of one address
+            // ([`provisioning::is_same_resource`]): the identifier of such a resource is the
+            // one its owning service REPORTED — a queue url carries the endpoint this emulator
+            // answered at — so the record keeps it rather than the value the naming rules
+            // recomputed against that service's own published host, which is the stand-in.
+            let carries_the_recorded_identity = keeps_its_identifier
+                || template::identity_is_a_reported_address(&resource.resource_type);
+            if carries_the_recorded_identity {
                 // The identifier in force is the one that service minted, or the one an
                 // adopted resource already had, so the record keeps it: an output naming
                 // the resource reports the id a client can call that service with, and
@@ -4219,6 +4227,12 @@ pub(super) fn declares_the_same_replacing_properties(
 /// resolved against until the real identifier exists. Without this a re-declaration of such a
 /// resource would be read as a different one — created all over again, under a second
 /// identifier, with the first abandoned.
+///
+/// A type whose identifier is an ADDRESS of the endpoint this emulator is served at
+/// ([`template::identity_is_a_reported_address`]) is NOT one of them: such a value is
+/// recomputable down to its authority, so what carries the recorded one forward is the record
+/// matching the declaration under another spelling of one address
+/// ([`adopt_identities_in_force`]) rather than the type alone.
 fn identity_is_assigned_elsewhere(resource_type: &str) -> bool {
     template::identity_is_service_assigned(resource_type)
         || resource_types::is_custom_resource(resource_type)
