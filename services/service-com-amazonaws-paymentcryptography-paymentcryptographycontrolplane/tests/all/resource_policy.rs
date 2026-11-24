@@ -19,6 +19,9 @@
 //! * a removal removes: once `DeleteResourcePolicy` has run, the key carries no policy at
 //!   all, so every later read reports that same empty document and a later attach starts
 //!   from nothing;
+//! * a read taken at any point of a key's policy history reports the document the last
+//!   ACCEPTED mutation left — the empty document once that was a removal, and whatever was
+//!   attached before a refused attach, since a refused attach writes nothing;
 //! * a removal reaches ONE record and only its policy element: every other key still
 //!   carries the document it was attached, and the named key's own record — its attributes,
 //!   its state, its timestamps, its tags — is what it was before the removal;
@@ -851,5 +854,169 @@ async fn a_removal_clears_only_the_policy_of_the_key_it_names() {
             tags, expected,
             "case {case:?}: expected the tags {expected:?} to survive the removal, got {tags:?}"
         );
+    }
+}
+
+/// One step of a policy script: what a call asks of one key's resource-based policy.
+#[derive(Debug, Clone, Copy)]
+enum PolicyStep {
+    /// Attach the document at this position of [`attachable_documents`].
+    Attach(usize),
+    /// Attach a document this service refuses, with the modelled error class it earns —
+    /// nothing is written, so this is not a mutation.
+    RefusedAttach(&'static str, &'static str),
+    /// Remove whatever document the key carries.
+    Remove,
+}
+
+/// A document whose grant reaches every principal: refused, so it never becomes the
+/// document a read reports.
+const PUBLIC_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+     \"Action\":\"payment-cryptography:DecryptData\",\"Principal\":\"*\",\"Resource\":\"*\"}]}";
+
+/// A text that is not a policy document at all: refused for a different clause than
+/// [`PUBLIC_DOCUMENT`], and equally not a mutation.
+const UNPARSEABLE_DOCUMENT: &str = "this is not a policy";
+
+#[tokio::test]
+async fn the_read_reports_the_document_the_last_accepted_mutation_left() {
+    let (router, engine) = router_with_engine();
+    let documents = attachable_documents();
+
+    // The rows differ along what the rule generalises over: how many mutations one key has
+    // seen, in which order, and whether a call was accepted at all — so a read taken at
+    // any point of a key's policy history is checked against the document the last
+    // ACCEPTED mutation left it, which is the empty document once a removal was the last.
+    let scripts: [(&str, &[PolicyStep]); 9] = [
+        ("a removal before anything was attached", &[PolicyStep::Remove]),
+        (
+            "one attach then its removal",
+            &[PolicyStep::Attach(0), PolicyStep::Remove],
+        ),
+        (
+            "an attach replaced by another, then removed",
+            &[
+                PolicyStep::Attach(1),
+                PolicyStep::Attach(3),
+                PolicyStep::Remove,
+            ],
+        ),
+        (
+            "a removal followed by a fresh attach",
+            &[
+                PolicyStep::Attach(2),
+                PolicyStep::Remove,
+                PolicyStep::Attach(4),
+            ],
+        ),
+        (
+            "a public document refused after a removal",
+            &[
+                PolicyStep::Attach(5),
+                PolicyStep::Remove,
+                PolicyStep::RefusedAttach(PUBLIC_DOCUMENT, "PublicPolicyException"),
+            ],
+        ),
+        (
+            "an unparseable document refused after a removal",
+            &[
+                PolicyStep::Attach(6),
+                PolicyStep::Remove,
+                PolicyStep::RefusedAttach(UNPARSEABLE_DOCUMENT, "ValidationException"),
+            ],
+        ),
+        (
+            "a refused attach while a document is attached",
+            &[
+                PolicyStep::Attach(7),
+                PolicyStep::RefusedAttach(PUBLIC_DOCUMENT, "PublicPolicyException"),
+                PolicyStep::Remove,
+            ],
+        ),
+        (
+            "three rounds of attach and removal",
+            &[
+                PolicyStep::Attach(0),
+                PolicyStep::Remove,
+                PolicyStep::Attach(1),
+                PolicyStep::Remove,
+                PolicyStep::Attach(2),
+                PolicyStep::Remove,
+            ],
+        ),
+        (
+            "two removals before the first attach",
+            &[
+                PolicyStep::Remove,
+                PolicyStep::Remove,
+                PolicyStep::Attach(3),
+                PolicyStep::Remove,
+                PolicyStep::Attach(0),
+            ],
+        ),
+    ];
+
+    for (case, script) in scripts {
+        let arn = create_key(&router).await;
+        // What the last accepted mutation left: `None` is a key carrying no policy at all.
+        let mut held: Option<String> = None;
+
+        for (position, step) in script.iter().enumerate() {
+            match step {
+                PolicyStep::Attach(index) => {
+                    let (_, document) = &documents[*index];
+                    ok_call(
+                        &router,
+                        "PutResourcePolicy",
+                        &json!({"ResourceArn": arn, "Policy": document}),
+                    )
+                    .await;
+                    held = Some(reported(document));
+                }
+                PolicyStep::RefusedAttach(document, code) => {
+                    refused(
+                        &router,
+                        case,
+                        "PutResourcePolicy",
+                        &json!({"ResourceArn": arn, "Policy": document}),
+                        code,
+                    )
+                    .await;
+                }
+                PolicyStep::Remove => {
+                    ok_call(
+                        &router,
+                        "DeleteResourcePolicy",
+                        &json!({"ResourceArn": arn}),
+                    )
+                    .await;
+                    held = None;
+                }
+            }
+
+            // The record holds exactly what the last accepted mutation left it, and the
+            // read reports that — the empty document for a key carrying none, never a
+            // document an earlier attach put there.
+            let stored = stored_policy(&engine, case, &arn);
+            assert_eq!(
+                stored.as_deref(),
+                held.as_deref(),
+                "case {case:?} after step {position} {step:?}: expected the key to hold \
+                 {held:?}, got {stored:?}"
+            );
+            let got = ok_call(&router, "GetResourcePolicy", &json!({"ResourceArn": arn})).await;
+            assert_eq!(
+                string(&got, "Policy"),
+                held.as_deref().unwrap_or(NO_POLICY_DOCUMENT),
+                "case {case:?} after step {position} {step:?}: expected the read to report \
+                 {held:?}, got {got}"
+            );
+            assert_eq!(
+                string(&got, "ResourceArn"),
+                arn,
+                "case {case:?} after step {position} {step:?}: expected the read to echo \
+                 {arn}, got {got}"
+            );
+        }
     }
 }
