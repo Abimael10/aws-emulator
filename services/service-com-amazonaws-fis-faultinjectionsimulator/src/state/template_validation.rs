@@ -515,7 +515,8 @@ pub(super) fn template_map_key_refusal(template: &ExperimentTemplateRecord) -> O
 pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateRefusal> {
     // What the model cannot express is that `roleArn` names an IAM ROLE, what FIS documents
     // for a stop condition's `source`/`value` pair, which values the two `experimentOptions`
-    // enums admit, how a target identifies its resources and scopes them, the resource types
+    // enums admit, whether a report configuration's windows are durations at all,
+    // how a target identifies its resources and scopes them, the resource types
     // FIS publishes with the parameters each one requires of a target, and the actions
     // FIS publishes with the parameters and the targets each one takes. The modelled
     // constraints — the required members, the lengths and patterns, the 50-entry tag map —
@@ -541,6 +542,13 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
     // A log configuration says WHERE the experiment's logs are delivered, so one that names
     // no destination is refused rather than stored.
     if let Some(refusal) = log_configuration_refusal(template.log_configuration.as_ref()) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
+    // A report configuration's windows say how much data AROUND the run a report covers, so
+    // one carrying a window that is no duration is refused rather than stored.
+    if let Some(refusal) =
+        report_configuration_refusal(template.experiment_report_configuration.as_ref())
+    {
         return Some(TemplateRefusal::Invalid(refusal));
     }
     // The targets are judged BEFORE the actions, because an action refers to them: a

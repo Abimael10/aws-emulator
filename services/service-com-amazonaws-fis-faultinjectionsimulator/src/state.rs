@@ -3466,9 +3466,11 @@ pub fn stop_conditions_refusal(
         // the admitted-source rule below rather than silently accepted.
         let source = condition.source.as_deref().unwrap_or_default();
         if source != STOP_CONDITION_SOURCE_NONE && source != STOP_CONDITION_SOURCE_ALARM {
+            // The refusal FIS words for a source it does not define: the fixed sentence,
+            // with the OFFENDING source bracketed in it, which is what identifies the
+            // value a client sent. The input path is not part of it.
             return Some(invalid_input(format!(
-                "stopConditions[{index}].source must be \
-                 {STOP_CONDITION_SOURCE_NONE} or {STOP_CONDITION_SOURCE_ALARM}, got {source:?}"
+                "Invalid source for Stop Condition: [{source}]."
             )));
         }
         if source == STOP_CONDITION_SOURCE_ALARM
@@ -3508,6 +3510,53 @@ pub fn log_configuration_refusal(
     Some(invalid_input(
         "logConfiguration must name cloudWatchLogsConfiguration or s3Configuration.",
     ))
+}
+
+/// `None` when every report window the experiment report configuration of a template
+/// carries names a duration; otherwise the `ValidationException` that refuses the request.
+///
+/// Taken over the STORED configuration, so a created and an updated template are judged by
+/// the same rule. `preExperimentDuration` is "the duration before the experiment start time
+/// for the data sources to include in the report" and `postExperimentDuration` the duration
+/// after the end time, so each one names a SPAN. `ReportConfigurationDuration` is modelled
+/// as a 32-character string whose only constraint is `^[\S]+$` — which admits any word —
+/// so whether the value is a duration at all is a server-side rule, and a configuration
+/// carrying a window the service could not read is refused rather than persisted.
+///
+/// The members are judged in the order the model declares them, so a configuration whose
+/// two windows are both unreadable always earns the same refusal.
+pub fn report_configuration_refusal(
+    configuration: Option<&ExperimentTemplateReportConfiguration>,
+) -> Option<ValidationException> {
+    let configuration = configuration?;
+    report_duration_refusal(
+        "preExperimentDuration",
+        configuration.pre_experiment_duration.as_deref(),
+    )
+    .or_else(|| {
+        report_duration_refusal(
+            "postExperimentDuration",
+            configuration.post_experiment_duration.as_deref(),
+        )
+    })
+}
+
+/// The refusal the report-window member `member` earns when what it carries is no duration;
+/// `None` for a member that carries none, and for one that carries a readable duration.
+///
+/// The reading is [`iso8601_span`], this crate's one reading of a caller's duration: a
+/// report window selects a span of data around the experiment's run, so a value whose
+/// length depends on the calendar names no window any more than a value that is no duration
+/// at all does.
+fn report_duration_refusal(member: &str, value: Option<&str>) -> Option<ValidationException> {
+    let value = value?;
+    if iso8601_span(value).is_some() {
+        return None;
+    }
+    Some(invalid_input(format!(
+        "The {member} parameter value for the experimentReportConfiguration is invalid. \
+         Specify a valid duration value and try again."
+    )))
 }
 
 /// `None` when `value` is absent or is one of `admitted`; otherwise the

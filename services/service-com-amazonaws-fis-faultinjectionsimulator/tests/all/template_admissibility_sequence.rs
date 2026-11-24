@@ -137,7 +137,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a stop condition whose source is neither admitted value",
             members: json!({ "stopConditions": [{ "source": "aws:cloudwatch:metric" }] }),
-            refusal: Some(invalid("stopConditions[0].source")),
+            refusal: Some(invalid("Invalid source for Stop Condition: [aws:cloudwatch:metric].")),
         },
         Row {
             case: "an alarm stop condition naming no alarm",
