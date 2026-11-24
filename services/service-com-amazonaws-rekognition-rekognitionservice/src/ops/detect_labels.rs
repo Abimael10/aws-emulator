@@ -11,11 +11,13 @@
 //! `ImageProperties` are measured off the decoded frame by
 //! [`crate::state::label_detection`]. `Labels` names ENTITIES of the general-label taxonomy
 //! ([`crate::state::label_taxonomy`]), each with every ancestor above it as a unique label of
-//! its own; the measured colours of the frame are a property of the picture rather than an
-//! entity in it, so they are reported under `ImageProperties.DominantColors` alone. An image
-//! carrying no entity this process can measure is answered with an EMPTY `Labels` list, which
-//! is what was measured; a refusal is reserved for an image this service could not read at
-//! all, one modelled error per reason.
+//! its own: the objects this service's own detector located in the frame and, for a frame no
+//! object was located in, the concepts its measured composition establishes. The measured
+//! COLOURS of the frame are a property of the picture rather than an entity in it, so a
+//! colour's own name is reported under `ImageProperties.DominantColors` alone and never as a
+//! label. An image nothing above measures anything in is answered with an EMPTY `Labels` list,
+//! which is what was measured; a refusal is reserved for an image this service could not read
+//! at all, one modelled error per reason.
 //!
 //! `Features` selects the two analyses, and a request naming none asks for `GENERAL_LABELS`
 //! — "if no option is specified GENERAL_LABELS is used by default". `ImageProperties` is

@@ -32,13 +32,27 @@
 //! it is a part of — and holds no alias list at all, so `Aliases` reports the empty list it
 //! has nothing to put in rather than a name nothing looked up.
 //!
-//! What can be measured is what [`super::face_detection`]'s geometric detector finds, so the
-//! rows below are the person-description chain a measured face is reported through. An entity
-//! an image carries that no measurement here reads — an apparel item, an animal, a scene — is
-//! reported by nothing: recognising it needs a trained classifier over the whole published
-//! taxonomy, and no such classifier runs in this process (see [`super::face_detection`] on
-//! what a classifier would be needed for), so an image in which nothing was measured is
-//! answered with an EMPTY label list rather than with a name nothing measured.
+//! The rows below are therefore the entities this service can MEASURE, in the two groups its
+//! measurements support:
+//!
+//! * the person-description chain a face located by [`super::face_detection`]'s geometric
+//!   detector is reported through, and
+//! * the concepts that describe the COMPOSITION of a frame — whether it is one unbroken
+//!   surface, whether its content repeats across it, whether one colour family covers it —
+//!   which the frame's own gradient and colour statistics establish
+//!   ([`super::label_detection`]).
+//!
+//! The composition concepts are entities of the published taxonomy in their own right and are
+//! named as such: the measurement that establishes one reads the frame's colours, but the name
+//! reported is the concept's, never a colour's, because a colour is a property of the picture
+//! and is reported where the model puts a property.
+//!
+//! An entity an image carries that no measurement here reads — an apparel item, an animal, a
+//! named object — is reported by nothing: recognising it needs a trained classifier over the
+//! whole published taxonomy, and no such classifier runs in this process (see
+//! [`super::face_detection`] on what a classifier would be needed for), so a frame in which
+//! nothing at all was measured is answered with an EMPTY label list rather than with a name
+//! nothing measured.
 
 use crate::ops::types::{Instance, Label, LabelCategory, Parent};
 
@@ -52,6 +66,19 @@ pub const FACE: &str = "Face";
 pub const HEAD: &str = "Head";
 pub const PERSON: &str = "Person";
 
+/// The category of the labels that describe how a frame is composed — its surface, the repeat
+/// across it, the colour family covering it — which is the row the concepts measured off a
+/// frame's own gradient and colour statistics belong to.
+pub const COLORS_AND_COMPOSITION_CATEGORY: &str = "Colors and Visual Composition";
+
+/// The composition concepts this service can measure, each the top of its own branch of that
+/// category: a frame carrying no boundary is one unbroken surface, a frame whose parts carry
+/// the same content over again is a repeat, and a frame one colour family covers carries a
+/// single tone.
+pub const TEXTURE: &str = "Texture";
+pub const PATTERN: &str = "Pattern";
+pub const MONOCHROME: &str = "Monochrome";
+
 /// One row of the taxonomy: an entity's name, the category the published taxonomy puts it in,
 /// and the entity it is a part of — `None` for a root, an entity with no ancestor above it.
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +90,7 @@ struct Entity {
 
 /// The rows of the published taxonomy this service holds: one per entity it can measure, and
 /// one per ancestor those entities bring with them.
-const TAXONOMY: [Entity; 3] = [
+const TAXONOMY: [Entity; 6] = [
     Entity {
         name: FACE,
         category: PERSON_DESCRIPTION_CATEGORY,
@@ -77,6 +104,21 @@ const TAXONOMY: [Entity; 3] = [
     Entity {
         name: PERSON,
         category: PERSON_DESCRIPTION_CATEGORY,
+        parent: None,
+    },
+    Entity {
+        name: TEXTURE,
+        category: COLORS_AND_COMPOSITION_CATEGORY,
+        parent: None,
+    },
+    Entity {
+        name: PATTERN,
+        category: COLORS_AND_COMPOSITION_CATEGORY,
+        parent: None,
+    },
+    Entity {
+        name: MONOCHROME,
+        category: COLORS_AND_COMPOSITION_CATEGORY,
         parent: None,
     },
 ];

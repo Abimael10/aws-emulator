@@ -21,11 +21,12 @@
 //! reported where the model puts it, under `ImageProperties`, and a dominant colour's
 //! simplified colour name is a property OF the picture rather than an entity IN it.
 //!
-//! Recognising an arbitrary entity (a flower, a wedding, a landscape) needs a trained
-//! classifier over that whole taxonomy, and no such classifier exists in this process. What
-//! does exist is the geometric face detector in [`super::face_detection`], which measures
-//! the faces an image carries off its own pixels, so the entities reported are the ones its
-//! measurement supports:
+//! Recognising a NAMED thing (a flower, a wedding, a table) needs a trained classifier over
+//! that whole taxonomy, and no such classifier exists in this process. Two measurements of the
+//! submitted pixels do exist, so the entities reported are the ones they support.
+//!
+//! The first is the geometric face detector in [`super::face_detection`], which locates the
+//! faces an image carries off its own pixels:
 //!
 //! * [`label_taxonomy::FACE`] — the entity measured, reported with one `Instance` per face the
 //!   detector located, each carrying the box it measured for that face and the agreement score
@@ -40,8 +41,29 @@
 //!   head or a person extends in the image is not something the face detector measured, and a
 //!   box the size of the face would not be either one's box.
 //!
-//! An image in which no entity was measured is answered with an EMPTY label list — the answer
-//! for an image in which nothing was found — and never with a refusal: a refusal here is
+//! The second reads how the frame is COMPOSED, which its own gradient and colour statistics
+//! establish without a classifier, and which the published taxonomy holds concepts for in its
+//! colour-and-composition category ([`label_taxonomy::COLORS_AND_COMPOSITION_CATEGORY`]).
+//! "For each object, scene, and concept the API returns one or more labels", and a frame in
+//! which no object was located is a picture of its own composition, so what is reported for it
+//! is the concepts that composition establishes:
+//!
+//! * [`label_taxonomy::TEXTURE`] — one unbroken surface fills the frame: the share of it
+//!   carrying no step steep enough, in any colour channel, to be a boundary between two things
+//!   ([`BOUNDARY_GRADIENT`]) clears [`SURFACE_SHARE`], and that share is the confidence
+//!   reported for it.
+//! * [`label_taxonomy::PATTERN`] — a frame whose surface IS broken but whose parts hold the
+//!   same content over again: the parts of the frame agree on their own measured colour to
+//!   within [`PATTERN_AGREEMENT`], and that agreement is the confidence.
+//! * [`label_taxonomy::MONOCHROME`] — one colour family covers the frame: the share of it
+//!   carrying the family most of it carries clears [`MONOCHROME_SHARE`], and that share is the
+//!   confidence. The measurement reads the frame's colours; the name reported is the concept's,
+//!   because a colour family is a property OF the picture and is reported under
+//!   `ImageProperties`, where the model puts a property.
+//!
+//! A frame none of the measurements above reads anything in — one whose surface is broken,
+//! whose parts disagree and whose colours are mixed — is answered with an EMPTY label list, the
+//! answer for an image in which nothing was found, and never with a refusal: a refusal here is
 //! reserved for an image that could not be read at all. Every label reported carries all six
 //! members `Label` models, built in one place ([`super::label_taxonomy`]): the category the
 //! published taxonomy puts it in, every ancestor above it, the instances located for it, and
@@ -129,6 +151,31 @@ pub const MAX_DEVIATION: f64 = 127.5;
 
 /// Bits dropped from each channel to reach [`COLOR_BUCKET_LEVELS`] levels.
 const COLOR_BUCKET_SHIFT: u32 = 8 - COLOR_BUCKET_LEVELS.trailing_zeros();
+
+/// How steep the step from one pixel to its neighbour has to be before it is a BOUNDARY
+/// between two things rather than the drift within one surface, on the 0..255 intensity scale
+/// every gradient here is measured on.
+const BOUNDARY_GRADIENT: f64 = 8.0;
+
+/// How much of a frame must carry no boundary at all before the frame is one unbroken SURFACE
+/// rather than a picture of something: a percentage of the pixels a gradient can be measured
+/// at.
+pub const SURFACE_SHARE: f32 = 99.0;
+
+/// How closely the parts of a frame must agree on their own measured tone before its content
+/// REPEATS across it rather than differing from one part to the next, as a percentage.
+pub const PATTERN_AGREEMENT: f32 = 95.0;
+
+/// How many parts across and down a frame is divided into to measure that agreement.
+const PATTERN_PARTS: usize = 4;
+
+/// How many colour channels a measured pixel carries, which the composition measurements read
+/// one by one: a step one channel alone carries is a step all the same.
+const CHANNELS: usize = 3;
+
+/// How much of a frame one colour family must cover before the frame carries a SINGLE tone
+/// rather than mixed colours, as a percentage of its pixels.
+pub const MONOCHROME_SHARE: f32 = 90.0;
 
 /// The number of colour buckets: [`COLOR_BUCKET_LEVELS`] cubed.
 const COLOR_BUCKETS: usize =
@@ -242,9 +289,10 @@ pub fn analysed_image(
     let labels = if requested.general_labels {
         detected_labels(
             &face_detection::faces_in_decoded_image(&decoded),
+            &plane,
             requested
                 .image_properties
-                .then_some((&plane, requested.max_dominant_colors)),
+                .then_some(requested.max_dominant_colors),
         )
     } else {
         Vec::new()
@@ -349,26 +397,32 @@ fn excluded(filters: &Option<Vec<String>>, values: &[&str], inclusive: bool) -> 
     named != inclusive
 }
 
-/// The labels of the entities measured in one frame: the [`label_taxonomy::FACE`] entity
-/// carrying an instance per measured face, and the ancestor labels the taxonomy expansion
-/// brings with it — "the response includes the all ancestors for a label", "where every
-/// ancestor is a unique label". An empty list when no entity was measured.
+/// The labels of the entities measured in one frame: where the detector located faces, the
+/// [`label_taxonomy::FACE`] entity carrying an instance per measured face, and otherwise the
+/// composition concepts the frame's own statistics establish ([`composition_entities`]) — each
+/// with the ancestor labels the taxonomy expansion brings with it, "the response includes the
+/// all ancestors for a label", "where every ancestor is a unique label". An empty list when
+/// nothing at all was measured.
 ///
-/// `colors`, when the request asked for image properties, is the frame and the colour cap
-/// each instance's own `DominantColors` are measured over.
-fn detected_labels(faces: &[FaceDetail], colors: Option<(&Plane, usize)>) -> Vec<Label> {
+/// A frame an object was located IN is a picture of that object, so its composition is not
+/// what is reported for it; a frame no object was located in is a picture of its own
+/// composition.
+///
+/// `colors`, when the request asked for image properties, is the colour cap each instance's
+/// own `DominantColors` are measured under.
+fn detected_labels(faces: &[FaceDetail], plane: &Plane, colors: Option<usize>) -> Vec<Label> {
     if faces.is_empty() {
-        return Vec::new();
+        return label_taxonomy::reported_labels(composition_entities(plane));
     }
     let instances: Vec<Instance> = faces
         .iter()
         .map(|face| Instance {
             bounding_box: face.bounding_box.clone(),
             confidence: face.confidence,
-            dominant_colors: colors.and_then(|(plane, most)| {
-                face.bounding_box.as_ref().map(|bounds| {
-                    dominant_colors(plane, &Region::within(plane, bounds), most)
-                })
+            dominant_colors: colors.and_then(|most| {
+                face.bounding_box
+                    .as_ref()
+                    .map(|bounds| dominant_colors(plane, &Region::within(plane, bounds), most))
             }),
         })
         .collect();
@@ -385,6 +439,169 @@ fn detected_labels(faces: &[FaceDetail], colors: Option<(&Plane, usize)>) -> Vec
         confidence,
         instances,
     }])
+}
+
+// ---------------------------------------------------------------------------
+// How a frame is composed
+// ---------------------------------------------------------------------------
+
+/// What one frame's own statistics say about how it is COMPOSED: how much of it carries no
+/// boundary, how closely its parts agree on their tone, and how much of it one colour family
+/// covers. Each is a percentage, and each is the confidence of the concept it establishes.
+#[derive(Debug, Clone, Copy)]
+struct Composition {
+    /// The share of the frame carrying no step steep enough to be a boundary.
+    unbroken: f32,
+    /// How closely the frame's own parts agree on their measured tone.
+    agreement: f32,
+    /// The share of the frame the colour family most of it carries covers.
+    one_family: f32,
+}
+
+/// The composition concepts a frame's own statistics establish, in the order they are
+/// measured: at most the surface or the repeat across it — a frame is one or the other, since
+/// a repeat is a repeat OF something and an unbroken surface holds nothing to repeat — and the
+/// single tone covering it.
+///
+/// A frame whose surface is broken, whose parts disagree and whose colours are mixed
+/// establishes none of them, and measures to the empty list.
+fn composition_entities(plane: &Plane) -> Vec<Measured> {
+    let measured = composition_of(plane);
+    let concept = |name: &'static str, confidence: f32| Measured {
+        name,
+        confidence,
+        // Where a concept of the whole frame's composition "extends" is the frame itself,
+        // which is not an instance of a common object located in it.
+        instances: Vec::new(),
+    };
+    let mut entities = Vec::new();
+    if measured.unbroken >= SURFACE_SHARE {
+        entities.push(concept(label_taxonomy::TEXTURE, measured.unbroken));
+    } else if measured.agreement >= PATTERN_AGREEMENT {
+        entities.push(concept(label_taxonomy::PATTERN, measured.agreement));
+    }
+    if measured.one_family >= MONOCHROME_SHARE {
+        entities.push(concept(label_taxonomy::MONOCHROME, measured.one_family));
+    }
+    entities
+}
+
+/// How one frame is composed, measured off its own pixels.
+fn composition_of(plane: &Plane) -> Composition {
+    Composition {
+        unbroken: unbroken_share(plane),
+        agreement: part_agreement(plane),
+        one_family: one_family_share(plane),
+    }
+}
+
+/// How much of a frame carries NO boundary: the share of the pixels a gradient can be measured
+/// at whose own step is gentler than [`BOUNDARY_GRADIENT`], as a percentage. A frame too
+/// small to measure a gradient in carries no measurement, which is a share of none.
+fn unbroken_share(plane: &Plane) -> f32 {
+    let region = Region::whole(plane);
+    let mut measured = 0_u64;
+    let mut gentle = 0_u64;
+    for index in region.inner_indices(plane) {
+        measured += 1;
+        if steepest_step(plane, index) <= BOUNDARY_GRADIENT {
+            gentle += 1;
+        }
+    }
+    if measured == 0 {
+        return 0.0;
+    }
+    percent_of(gentle as f64, measured as f64)
+}
+
+/// The steepest step at one pixel: the gradient magnitude of the COLOUR CHANNEL that changes
+/// most across it, so a step between two colours of the same intensity is read as the boundary
+/// it is rather than missed for carrying no change in brightness.
+fn steepest_step(plane: &Plane, index: usize) -> f64 {
+    let at = |index: usize| {
+        let (red, green, blue) = plane.rgb_at(index);
+        [f64::from(red), f64::from(green), f64::from(blue)]
+    };
+    let (left, right) = (at(index - 1), at(index + 1));
+    let (above, below) = (at(index - plane.width), at(index + plane.width));
+    (0..CHANNELS)
+        .map(|channel| {
+            // Halved, because a central difference spans two pixels.
+            let horizontal = (right[channel] - left[channel]) / 2.0;
+            let vertical = (below[channel] - above[channel]) / 2.0;
+            (horizontal * horizontal + vertical * vertical).sqrt()
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+/// How closely the PARTS of a frame agree on their own colour: the frame is divided into
+/// [`PATTERN_PARTS`] parts across and down, and the agreement is how little each part's own
+/// mean colour departs from the whole frame's — the mean departure per channel, as a
+/// percentage of the largest departure an 8-bit population can have ([`MAX_DEVIATION`]).
+/// Parts that each measure the frame's own colour agree completely, so a frame whose content
+/// repeats finely enough to fall alike in every part agrees with itself; parts each holding a
+/// colour of their own agree least.
+fn part_agreement(plane: &Plane) -> f32 {
+    if plane.pixels() == 0 {
+        return 0.0;
+    }
+    let Some(whole) = mean_color(plane, 0, plane.height, 0, plane.width) else {
+        return 0.0;
+    };
+    let span =
+        |bound: usize, part: usize| (bound * part / PATTERN_PARTS, bound * (part + 1) / PATTERN_PARTS);
+    let mut departure = 0.0_f64;
+    let mut parts = 0_u64;
+    for row in 0..PATTERN_PARTS {
+        let (y0, y1) = span(plane.height, row);
+        for column in 0..PATTERN_PARTS {
+            let (x0, x1) = span(plane.width, column);
+            let Some(part) = mean_color(plane, y0, y1, x0, x1) else {
+                continue;
+            };
+            departure += (0..CHANNELS)
+                .map(|channel| (part[channel] - whole[channel]).abs())
+                .sum::<f64>()
+                / CHANNELS as f64;
+            parts += 1;
+        }
+    }
+    if parts == 0 {
+        return 0.0;
+    }
+    100.0 - percent_of(departure / parts as f64, MAX_DEVIATION)
+}
+
+/// The mean colour of one rectangle of a frame, or `None` where the rectangle holds no pixel.
+fn mean_color(plane: &Plane, y0: usize, y1: usize, x0: usize, x1: usize) -> Option<[f64; CHANNELS]> {
+    let mut total = [0.0_f64; CHANNELS];
+    let mut count = 0_u64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (red, green, blue) = plane.rgb_at(y * plane.width + x);
+            total[0] += f64::from(red);
+            total[1] += f64::from(green);
+            total[2] += f64::from(blue);
+            count += 1;
+        }
+    }
+    (count > 0).then(|| total.map(|channel| channel / count as f64))
+}
+
+/// How much of a frame the colour family most of it carries covers, as a percentage: the
+/// families are the ones [`color_family`] classifies a colour into, read here as a MEASUREMENT
+/// of the frame rather than as a name to report.
+fn one_family_share(plane: &Plane) -> f32 {
+    if plane.pixels() == 0 {
+        return 0.0;
+    }
+    let mut families = [0_u64; SIMPLIFIED_COLORS.len()];
+    for index in 0..plane.pixels() {
+        let (red, green, blue) = plane.rgb_at(index);
+        families[color_family(red, green, blue)] += 1;
+    }
+    let covered = families.into_iter().max().unwrap_or_default();
+    percent_of(covered as f64, plane.pixels() as f64)
 }
 
 /// The simplified colour name a measured colour falls under: one of [`SIMPLIFIED_COLORS`].

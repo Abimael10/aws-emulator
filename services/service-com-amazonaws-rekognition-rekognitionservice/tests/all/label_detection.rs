@@ -9,11 +9,12 @@
 //! the general-label taxonomy, with every ancestor the taxonomy puts above it reported as a
 //! unique label of its own and an `Instance` box per measured instance, and, where the request
 //! asks for image properties, the measured quality and dominant colours of the pixels
-//! themselves. A measurement of the frame's own pixels is not an entity IN the frame, so a
-//! simplified colour name is never a label name: an image carrying no measurable entity is
-//! answered with an empty label list rather than a refusal or the names of the colours
-//! covering it, while those colours are still measured and reported under
-//! `ImageProperties.DominantColors`. A SCALAR member nothing measured is absent while every
+//! themselves. A frame an object was located in is reported by that object and its own chain; a
+//! frame none was located in is reported by the concepts its measured COMPOSITION establishes
+//! (pinned in `frame_composition_labels`). A measurement of the frame's own pixels is not an
+//! entity IN the frame, so a simplified colour name is never a label name: the colours covering
+//! a frame are measured and reported under `ImageProperties.DominantColors` rather than named
+//! as labels of it. A SCALAR member nothing measured is absent while every
 //! modelled LIST member of a reported `Label` is present (empty where there is nothing to
 //! report), `Features` decides which of the two analyses runs, and `MaxLabels`,
 //! `MinConfidence` and `Settings.GeneralLabels` only NARROW what was measured. The image's
@@ -83,9 +84,25 @@ const LIST_MEMBERS: [&str; 4] = ["Instances", "Parents", "Aliases", "Categories"
 /// `smithy_query(query="shape",shape="GeneralLabelsSettings")`).
 const PERSON_DESCRIPTION_CATEGORY: &str = "Person Description";
 
-/// The category the published list puts the COLOUR and composition of a frame in, which this
-/// service measures but reports under `ImageProperties` rather than as a label.
+/// The category the published list puts the composition of a frame in: the row the concepts
+/// measured off a frame's own gradient and colour statistics belong to.
 const COLORS_CATEGORY: &str = "Colors and Visual Composition";
+
+/// The composition concepts this service measures for a frame no object was located in, which
+/// the suite in `frame_composition_labels` is what pins the measurement of.
+const TEXTURE: &str = "Texture";
+const PATTERN: &str = "Pattern";
+const MONOCHROME: &str = "Monochrome";
+const COMPOSITION_CONCEPTS: [&str; 3] = [TEXTURE, PATTERN, MONOCHROME];
+
+/// The category the published taxonomy puts a reported name in.
+fn category_of(name: &str) -> &'static str {
+    if COMPOSITION_CONCEPTS.contains(&name) {
+        COLORS_CATEGORY
+    } else {
+        PERSON_DESCRIPTION_CATEGORY
+    }
+}
 
 /// The twelve simplified colour names a measured colour is reported under — "One of 12
 /// simplified color names"
@@ -103,8 +120,9 @@ fn colour_label(name: &str) -> String {
     capitalised
 }
 
-/// Every label of an answer is one of the entities this service can measure, and never one of
-/// the simplified colour names a measured COLOUR is reported under.
+/// Every label of an answer is one of the entities this service can measure — a person-description
+/// entity it located or a concept of the frame's own composition — and never one of the simplified
+/// colour names a measured COLOUR is reported under.
 fn assert_entity_vocabulary(case: &str, labels: &[Value]) {
     let colours: Vec<String> = SIMPLIFIED_COLORS.iter().map(|name| colour_label(name)).collect();
     for name in names(labels) {
@@ -114,7 +132,7 @@ fn assert_entity_vocabulary(case: &str, labels: &[Value]) {
              not an entity in it, so it is no label name, got {name:?}"
         );
         assert!(
-            PERSON_CHAIN.contains(&name.as_str()),
+            PERSON_CHAIN.contains(&name.as_str()) || COMPOSITION_CONCEPTS.contains(&name.as_str()),
             "case {case:?}: a reported label is named from the general-label taxonomy, \
              got {name:?}"
         );
@@ -244,8 +262,10 @@ fn labels_of(case: &str, reply: &Reply) -> Vec<Value> {
         );
         assert_eq!(
             categories(label),
-            vec![PERSON_DESCRIPTION_CATEGORY.to_string()],
-            "case {case:?}: a category is a row of the published category list, got {label:?}"
+            vec![category_of(label.get("Name").and_then(Value::as_str).unwrap_or_default())
+                .to_string()],
+            "case {case:?}: a category is the row of the published category list the label \
+             belongs to, got {label:?}"
         );
     }
     labels
@@ -317,22 +337,39 @@ fn assert_close(case: &str, what: &str, measured: f64, expected: f64) {
 // ---------------------------------------------------------------------------
 
 /// One label per ENTITY measured in the image, with every ancestor it brings with it and an
-/// instance per measured face; an image carrying no entity reports no label at all — not even
-/// the colours covering it. The same answer whichever format the image was encoded in and
-/// however it was submitted.
+/// instance per measured face. A frame no face was located in is reported by the concepts its
+/// own composition establishes instead — a flat frame is one unbroken surface of a single tone
+/// — and never by the names of the colours covering it. The same answer whichever format the
+/// image was encoded in and however it was submitted.
 #[tokio::test]
 async fn labels_report_the_entities_measured_in_the_image() {
     let router = harness();
     // How many faces the test DREW on each frame, which is how many instances the one
-    // entity label it reports must locate.
-    let cases: Vec<(&str, Portrait, usize)> = vec![
-        ("one centred face", Portrait::one_face(), 1),
-        ("two faces of different sizes", two_face_portrait(), 2),
-        ("a flat light image", Portrait::blank(240, 240, 205), 0),
-        ("a flat dark image", Portrait::blank(240, 240, 15), 0),
+    // entity label it reports must locate, and the concepts a frame with no face is reported
+    // by instead.
+    let cases: Vec<(&str, Portrait, usize, Vec<&str>)> = vec![
+        ("one centred face", Portrait::one_face(), 1, Vec::new()),
+        (
+            "two faces of different sizes",
+            two_face_portrait(),
+            2,
+            Vec::new(),
+        ),
+        (
+            "a flat light image",
+            Portrait::blank(240, 240, 205),
+            0,
+            vec![TEXTURE, MONOCHROME],
+        ),
+        (
+            "a flat dark image",
+            Portrait::blank(240, 240, 15),
+            0,
+            vec![TEXTURE, MONOCHROME],
+        ),
     ];
 
-    for (drawing, portrait, drawn) in cases {
+    for (drawing, portrait, drawn, composition) in cases {
         for (format, label) in [(ImageFormat::Png, "PNG"), (ImageFormat::Jpeg, "JPEG")] {
             let case = format!("{drawing}, {label}");
             let bytes = encode(&portrait.render(), format);
@@ -347,10 +384,15 @@ async fn labels_report_the_entities_measured_in_the_image() {
             );
             assert_entity_vocabulary(&case, &labels);
             if drawn == 0 {
-                assert!(
-                    labels.is_empty(),
-                    "case {case:?}: no entity was measured, so no label is reported, \
-                     got {labels:?}"
+                let mut reported = names(&labels);
+                reported.sort();
+                let mut expected: Vec<String> =
+                    composition.iter().map(|name| (*name).to_string()).collect();
+                expected.sort();
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?}: no face was located, so the frame is reported by the \
+                     concepts its own composition establishes, got {labels:?}"
                 );
                 continue;
             }
@@ -436,9 +478,9 @@ async fn labels_report_the_entities_measured_in_the_image() {
 /// `Instances`, `Parents`, `Aliases`, `Categories` — present and empty where there is
 /// nothing to report rather than omitted, and exactly one category row naming where the
 /// published taxonomy puts the label. The table spans what the rule generalises over: which
-/// kind of label the frame measures (a measured entity, its ancestors, none at all), how the
-/// image was submitted, which `Features` were asked for, and whether the answer was narrowed
-/// or filtered before it was reported.
+/// kind of label the frame measures (a located entity, its ancestors, a concept of the frame's
+/// composition, none at all), how the image was submitted, which `Features` were asked for,
+/// and whether the answer was narrowed or filtered before it was reported.
 #[tokio::test]
 async fn every_reported_label_carries_each_modelled_list_member() {
     let router = harness_with_object_store();
@@ -474,12 +516,12 @@ async fn every_reported_label_carries_each_modelled_list_member() {
             true,
         ),
         (
-            "a frame of one colour and no entity",
+            "a frame of one colour, reported by its own composition",
             json!({ "Image": bytes_image(&flat) }),
-            false,
+            true,
         ),
         (
-            "a frame of two colours and no entity",
+            "a frame of two colours, whose composition establishes nothing",
             json!({ "Image": bytes_image(&two_colours) }),
             false,
         ),
@@ -1280,9 +1322,9 @@ async fn an_instance_reports_the_colours_of_its_own_box() {
 
 /// A measured colour is named from the twelve simplified colour names and reported where the
 /// model puts it — under `ImageProperties.DominantColors` — and NEVER as a label: a frame drawn
-/// flat in one colour carries no entity, so its `Labels` is empty while its colour is
-/// measured. One row per entry of the catalog, each drawn in a colour that falls under it. A
-/// frame drawn in one colour also admits no foreground/background split, so neither side is
+/// flat in one colour is reported by the concepts of its own composition, not by the name of the
+/// colour covering it. One row per entry of the catalog, each drawn in a colour that falls under
+/// it. A frame drawn in one colour also admits no foreground/background split, so neither side is
 /// reported for it.
 #[tokio::test]
 async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
@@ -1318,10 +1360,15 @@ async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
         )
         .await;
         let labels = labels_of(case, &reply);
-        assert!(
-            labels.is_empty(),
-            "case {case:?}: the frame's colour is a property of it and no entity in it, so no \
-             label is reported, got {labels:?}"
+        assert_entity_vocabulary(case, &labels);
+        let mut reported = names(&labels);
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![MONOCHROME.to_string(), TEXTURE.to_string()],
+            "case {case:?}: the frame's colour is a property of it and no entity in it, so it \
+             is reported by the composition a flat frame has and not by its colour's name, \
+             got {labels:?}"
         );
         let properties = reply
             .field("ImageProperties")
@@ -1380,11 +1427,14 @@ async fn the_colours_of_a_frame_are_measured_but_never_reported_as_labels() {
         .await;
         let labels = labels_of(case, &reply);
         assert_entity_vocabulary(case, &labels);
-        assert!(
-            labels.is_empty(),
-            "case {case:?}: the frame carries no entity, so no colour of it is reported as a \
-             label, got {labels:?}"
-        );
+        for name in names(&labels) {
+            assert!(
+                COMPOSITION_CONCEPTS.contains(&name.as_str()),
+                "case {case:?}: no object was located in the frame, so it is reported by the \
+                 concepts of its own composition and never by a colour covering it, \
+                 got {labels:?}"
+            );
+        }
         let families: Vec<String> = reply
             .field("ImageProperties")
             .and_then(|properties| properties.get("DominantColors"))
@@ -1543,9 +1593,17 @@ async fn an_unreadable_image_is_refused_with_the_error_for_why() {
 // ---------------------------------------------------------------------------
 
 /// Each entity of the taxonomy this service can measure, with the ancestors the published
-/// taxonomy puts above it, nearest first: a face is part of a head, which is part of a person.
-/// A reported label's own `Parents` is that list, and each ancestor is a label of its own.
-const ANCESTORS: [(&str, &[&str]); 3] = [(FACE, &[HEAD, PERSON]), (HEAD, &[PERSON]), (PERSON, &[])];
+/// taxonomy puts above it, nearest first: a face is part of a head, which is part of a person,
+/// while each concept of a frame's own composition is the top of its own branch of the
+/// colour-and-composition category and so has none.
+const ANCESTORS: [(&str, &[&str]); 6] = [
+    (FACE, &[HEAD, PERSON]),
+    (HEAD, &[PERSON]),
+    (PERSON, &[]),
+    (TEXTURE, &[]),
+    (PATTERN, &[]),
+    (MONOCHROME, &[]),
+];
 
 /// A grey frame graded from black on the left to white on the right.
 fn graded(width: u32, height: u32) -> GrayImage {
@@ -1554,19 +1612,23 @@ fn graded(width: u32, height: u32) -> GrayImage {
     })
 }
 
+/// The concepts a frame drawn FLAT in one colour establishes: one unbroken surface, of a single
+/// colour family.
+const FLAT_COMPOSITION: [&str; 2] = [TEXTURE, MONOCHROME];
+
 /// One row of the vocabulary table: the frame the test drew, how it is submitted, which
-/// analyses are asked for, and whether the frame carries an entity this service can measure.
+/// analyses are asked for, and the entities this service measures in it.
 struct Drawn {
     what: &'static str,
     bytes: Vec<u8>,
     staged_as: Option<&'static str>,
     features: Option<Value>,
-    entities: bool,
+    reported: Vec<&'static str>,
 }
 
-/// The rows, one per thing the rule generalises over: whether the frame carries an entity at
-/// all, which colour families cover it, how it was drawn (flat, split, graded, banded), the
-/// encoded format, how it was submitted and which `Features` were asked for.
+/// The rows, one per thing the rule generalises over: whether an object was located in the
+/// frame at all, which colour families cover it, how it was drawn (flat, split, graded,
+/// banded), the encoded format, how it was submitted and which `Features` were asked for.
 fn drawn_frames() -> Vec<Drawn> {
     vec![
         Drawn {
@@ -1574,100 +1636,101 @@ fn drawn_frames() -> Vec<Drawn> {
             bytes: colour_png(&flat_colour(64, 64, [255, 255, 255])),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: FLAT_COMPOSITION.to_vec(),
         },
         Drawn {
             what: "a frame drawn flat in one chromatic colour",
             bytes: colour_png(&flat_colour(64, 64, [220, 30, 30])),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: FLAT_COMPOSITION.to_vec(),
         },
         Drawn {
             what: "a frame drawn flat in a colour two families share a hue with",
             bytes: colour_png(&flat_colour(48, 96, [120, 70, 20])),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: FLAT_COMPOSITION.to_vec(),
         },
         Drawn {
             what: "a frame split between two colours",
             bytes: colour_png(&two_colour(100, 50, 40, [30, 60, 220], [220, 30, 30])),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: Vec::new(),
         },
         Drawn {
             what: "a frame graded from dark to light",
             bytes: encode(&graded(120, 60), ImageFormat::Png),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: vec![TEXTURE],
         },
         Drawn {
             what: "a banded frame, whose bands are edges the measurement reads",
             bytes: encode(&banded_tones(120, 120, &[40, 215, 40, 215]), ImageFormat::Png),
             staged_as: None,
             features: None,
-            entities: false,
+            reported: Vec::new(),
         },
         Drawn {
-            what: "a frame carrying no entity, with both analyses asked for",
+            what: "a frame no object was located in, with both analyses asked for",
             bytes: colour_png(&flat_colour(64, 64, [40, 180, 60])),
             staged_as: None,
             features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
-            entities: false,
+            reported: FLAT_COMPOSITION.to_vec(),
         },
         Drawn {
             what: "a portrait carrying one measured face, as PNG",
             bytes: Portrait::one_face().png(),
             staged_as: None,
             features: None,
-            entities: true,
+            reported: PERSON_CHAIN.to_vec(),
         },
         Drawn {
             what: "the same portrait in the other format the service reads",
             bytes: encode(&Portrait::one_face().render(), ImageFormat::Jpeg),
             staged_as: None,
             features: None,
-            entities: true,
+            reported: PERSON_CHAIN.to_vec(),
         },
         Drawn {
             what: "a portrait carrying two measured faces",
             bytes: two_face_portrait().png(),
             staged_as: None,
             features: None,
-            entities: true,
+            reported: PERSON_CHAIN.to_vec(),
         },
         Drawn {
             what: "a portrait with both analyses asked for",
             bytes: Portrait::one_face().png(),
             staged_as: None,
             features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
-            entities: true,
+            reported: PERSON_CHAIN.to_vec(),
         },
         Drawn {
             what: "a portrait read from an S3 object rather than submitted inline",
             bytes: Portrait::one_face().png(),
             staged_as: Some("portrait-taxonomy.png"),
             features: None,
-            entities: true,
+            reported: PERSON_CHAIN.to_vec(),
         },
         Drawn {
             what: "a flat frame read from an S3 object rather than submitted inline",
             bytes: colour_png(&flat_colour(64, 64, [30, 60, 220])),
             staged_as: Some("flat-taxonomy.png"),
             features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
-            entities: false,
+            reported: FLAT_COMPOSITION.to_vec(),
         },
     ]
 }
 
-/// `Labels` names general-label taxonomy ENTITIES and nothing else: a frame carrying a measured
-/// entity reports it with every ancestor above it as a unique label carrying its own ancestors
-/// and category, and a frame carrying none reports an EMPTY list rather than the names of the
-/// colours covering it — which are measured all the same and reported under
-/// `ImageProperties.DominantColors`, where the model puts them.
+/// `Labels` names general-label taxonomy ENTITIES and nothing else: a frame an object was
+/// located in reports it with every ancestor above it as a unique label carrying its own
+/// ancestors and category, a frame none was located in reports the concepts its own composition
+/// establishes, and neither ever reports the names of the colours covering it — which are
+/// measured all the same and reported under `ImageProperties.DominantColors`, where the model
+/// puts them.
 #[tokio::test]
 async fn labels_name_the_entities_measured_and_never_the_colours_of_the_frame() {
     let router = harness_with_object_store();
@@ -1701,11 +1764,18 @@ async fn labels_name_the_entities_measured_and_never_the_colours_of_the_frame() 
         // published category row each belongs to.
         let labels = labels_of(case, &reply);
         assert_entity_vocabulary(case, &labels);
+        let mut measured = names(&labels);
+        measured.sort();
+        let mut expected: Vec<String> = frame
+            .reported
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        expected.sort();
         assert_eq!(
-            !labels.is_empty(),
-            frame.entities,
-            "case {case:?}: a label is reported for each entity measured and for nothing else, \
-             got {labels:?}"
+            measured, expected,
+            "case {case:?}: a label is reported for each entity measured in the frame and for \
+             nothing else, got {labels:?}"
         );
         let reported = names(&labels);
         for label in &labels {

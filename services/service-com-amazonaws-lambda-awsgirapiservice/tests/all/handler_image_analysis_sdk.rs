@@ -106,6 +106,12 @@ const RED_COLOUR: &str = "red";
 /// taxonomy puts above it.
 const ENTITY_CHAIN: [&str; 3] = ["Face", "Head", "Person"];
 
+/// The labels a frame no object was located in is reported with, where it is drawn FLAT in one
+/// colour: the concepts of the published taxonomy's colour-and-composition category that the
+/// frame's own measured composition establishes — one unbroken surface, of a single colour
+/// family. A colour's own name is still no label of the frame.
+const FLAT_COMPOSITION: [&str; 2] = ["Texture", "Monochrome"];
+
 /// The version of the label detection model the service answers with, which is the member's
 /// own documentation: "version number of the label detection model that was used to detect
 /// labels".
@@ -848,20 +854,32 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         );
     }
 
-    // The frames drawn in COLOUR and nothing else: a colour is a measured property of a frame
-    // rather than an entity in it, so each is answered with an empty label list — what was
-    // measured — and with the model that ran all the same.
-    for case in [
-        "one colour, staged as PNG",
-        "the same frame staged in the other format the service reads",
-        "two colours, neither of them the whole frame",
+    // The frames drawn in COLOUR and nothing else: no object is located in either, so each is
+    // answered by the concepts its own measured COMPOSITION establishes — a flat frame is one
+    // unbroken surface of a single colour family, a frame split between two colours establishes
+    // neither — and never by the name of a colour, which is a measured property of the frame
+    // reported under `ImageProperties`.
+    for (case, composition) in [
+        ("one colour, staged as PNG", FLAT_COMPOSITION.to_vec()),
+        (
+            "the same frame staged in the other format the service reads",
+            FLAT_COMPOSITION.to_vec(),
+        ),
+        (
+            "two colours, neither of them the whole frame",
+            Vec::<&str>::new(),
+        ),
     ] {
         let answer = report[case]["answer"].clone();
+        let mut reported = label_names(&answer);
+        reported.sort();
+        let mut expected: Vec<String> =
+            composition.iter().map(|name| (*name).to_string()).collect();
+        expected.sort();
         assert_eq!(
-            label_names(&answer),
-            Vec::<String>::new(),
-            "case {case:?}: expected no entity to be reported for a frame that carries only \
-             colour, got {answer}"
+            reported, expected,
+            "case {case:?}: expected the concepts the frame's own composition establishes and \
+             no colour name among them, got {answer}"
         );
         assert_eq!(
             answer["LabelModelVersion"].as_str(),
