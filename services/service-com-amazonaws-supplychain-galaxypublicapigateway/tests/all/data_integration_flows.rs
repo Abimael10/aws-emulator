@@ -2390,3 +2390,687 @@ async fn an_update_declaring_a_type_without_its_configuration_is_refused() {
         }
     }
 }
+
+// --------------------------------------------------------------------------------------
+// `ListDataIntegrationFlows`
+//
+// RULE under test: the listing reports exactly the data-integration flows the store holds
+// for the addressed instance — each one as `GetDataIntegrationFlow` reports it — in one
+// stable name order, cut into pages of at most `maxResults` with an opaque `nextToken` that
+// resumes where the page stopped; an `instanceId` naming no instance of this account is an
+// authorization failure, a `nextToken` the service did not issue for this query is a
+// validation failure, and the listing changes nothing a later caller sees.
+// --------------------------------------------------------------------------------------
+
+/// The published bounds of `DataIntegrationFlowMaxResults` (`@range(min: 0, max: 20)`).
+const FLOW_MAX_RESULTS_MIN: i64 = 0;
+const FLOW_MAX_RESULTS_MAX: i64 = 20;
+
+/// The `@default` the model gives `maxResults`, applied when a request omits it.
+const FLOW_MAX_RESULTS_DEFAULT: usize = 10;
+
+/// The URI the flow listing is addressed at, as the model's `http` trait spells it:
+/// `/api/data-integration/instance/{instanceId}/data-integration-flows`.
+fn flow_listing_path(instance_id: &str) -> String {
+    format!("/api/data-integration/instance/{instance_id}/data-integration-flows")
+}
+
+/// `ListDataIntegrationFlows` for one instance, with `query` appended verbatim.
+async fn list_flows(emulator: &Emulator, instance_id: &str, query: &str) -> (u16, Value) {
+    let path = flow_listing_path(instance_id);
+    let path = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    };
+    emulator.send("GET", &path, None).await
+}
+
+/// The `flows` member of a success body, as a list.
+fn flows_of(case: &str, body: &Value) -> Vec<Value> {
+    body.get("flows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: response carries no `flows` list: {body}"))
+}
+
+/// The `name` of every entry of a success body's `flows`, in the order answered.
+fn listed_flow_names(case: &str, body: &Value) -> Vec<String> {
+    flows_of(case, body)
+        .iter()
+        .map(|flow| string_of(case, flow, "name"))
+        .collect()
+}
+
+/// The `nextToken` a listing body carries, if any.
+fn listing_next_token(body: &Value) -> Option<String> {
+    body.get("nextToken")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// A distinct flow name of the modelled `DataIntegrationFlowName` shape (`^[A-Za-z0-9-]+$`),
+/// built so that ascending `index` is ascending name.
+fn listing_flow_name(index: usize) -> String {
+    format!("flow-{index:03}")
+}
+
+/// The smallest create body the model admits: one S3 source, no transformation, an S3 target.
+fn minimal_flow_request(slot: &str) -> Value {
+    json!({
+        "sources": [s3_source("orders", "supply-landing", &format!("{slot}/"), None)],
+        "transformation": { "transformationType": "NONE" },
+        "target": {
+            "targetType": "S3",
+            "s3Target": { "bucketName": "supply-exports", "prefix": format!("{slot}/") },
+        },
+    })
+}
+
+/// Walk every page of one listing and return the flow names answered, in order, together
+/// with how many pages it took.
+async fn walk_flow_pages(
+    emulator: &Emulator,
+    case: &str,
+    instance_id: &str,
+    max_results: Option<i64>,
+) -> (Vec<String>, usize) {
+    let limit = match max_results {
+        Some(size) => usize::try_from(size).expect("a page size a case asks for is not negative"),
+        None => FLOW_MAX_RESULTS_DEFAULT,
+    };
+    let mut names = Vec::new();
+    let mut pages = 0;
+    let mut token: Option<String> = None;
+    // A listing of a bounded store terminates in a bounded number of pages; the cap is here
+    // so a token that failed to advance fails the case instead of looping forever.
+    while pages < 64 {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(size) = max_results {
+            query.push(format!("maxResults={size}"));
+        }
+        if let Some(value) = &token {
+            query.push(format!("nextToken={value}"));
+        }
+        let (status, body) = list_flows(emulator, instance_id, &query.join("&")).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: page {pages} expected 200, got {status} with {body}"
+        );
+        let page = listed_flow_names(case, &body);
+        assert!(
+            page.len() <= limit,
+            "case {case:?}: page {pages} holds {} flows, more than maxResults {limit}",
+            page.len()
+        );
+        pages += 1;
+        token = listing_next_token(&body);
+        if token.is_some() {
+            assert!(
+                !page.is_empty(),
+                "case {case:?}: page {pages} is empty yet carries a nextToken, so a client paging \
+                 in a loop could never advance"
+            );
+        }
+        names.extend(page);
+        if token.is_none() {
+            return (names, pages);
+        }
+    }
+    panic!("case {case:?}: the listing never ran out of pages after {pages} pages");
+}
+
+/// RULE: the listing reports exactly the flows the store holds for the addressed instance,
+/// in name order, each one exactly as `GetDataIntegrationFlow` reports it — and nothing of
+/// another instance.
+#[tokio::test]
+async fn flow_listing_reports_exactly_the_stored_flows_of_the_addressed_instance() {
+    let case = "the stored flows of one instance";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+    let other_instance = emulator.create_instance(case).await;
+    let empty_instance = emulator.create_instance(case).await;
+    emulator
+        .given_namespace(case, &instance_id, "logistics")
+        .await;
+    let dataset = emulator
+        .given_dataset(case, &instance_id, "logistics", "orders")
+        .await;
+
+    // Rows differ along the name (the modelled one-character minimum, mixed case and
+    // digits, a name sorting last, the 256-character maximum) and along the pipeline the
+    // flow carries (an S3 end, a dataset end with every option, a SQL transformation and
+    // tags) — deliberately created OUT of name order.
+    let rows: Vec<(&str, String, Value)> = vec![
+        (
+            "single-character name, the modelled minimum",
+            "a".to_string(),
+            minimal_flow_request("a"),
+        ),
+        (
+            "mixed case and digits, SQL into S3",
+            "Zed-9".to_string(),
+            json!({
+                "sources": [s3_source("raw", "supply-landing", "raw/", Some("CSV"))],
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM raw" },
+                },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "zed/" },
+                },
+            }),
+        ),
+        (
+            "a dataset source and a dataset target, tagged",
+            "dataset-pipeline".to_string(),
+            json!({
+                "sources": [dataset_source(
+                    "orders",
+                    &dataset,
+                    Some(json!({ "loadType": "INCREMENTAL", "dedupeRecords": false })),
+                )],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": { "datasetIdentifier": dataset.clone() },
+                },
+                "tags": { "team": "supply" },
+            }),
+        ),
+        (
+            "name at the modelled 256-character maximum",
+            // 256 characters of `^[A-Za-z0-9-]+$`, the shape's upper length bound.
+            format!("f{}", "-A9".repeat(85)),
+            minimal_flow_request("long"),
+        ),
+    ];
+
+    let mut expected_names: Vec<String> = Vec::new();
+    for (row_case, name, request) in &rows {
+        let (status, body) = emulator
+            .create_flow(&instance_id, name, request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {row_case:?}: the flow to list must be created, got {status} with {body}"
+        );
+        // The same name under another instance, so a listing that leaked across the
+        // instance boundary would report it twice.
+        let (status, body) = emulator
+            .create_flow(&other_instance, name, minimal_flow_request("other"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {row_case:?}: the other instance's flow must be created, got {status} with \
+             {body}"
+        );
+        expected_names.push(name.clone());
+    }
+    // One flow only the other instance holds: the addressed instance's listing must not
+    // report it.
+    let (status, body) = emulator
+        .create_flow(&other_instance, "only-elsewhere", minimal_flow_request("x"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the foreign-only flow must be created, got {status} with {body}"
+    );
+    expected_names.sort();
+
+    let (status, body) = list_flows(
+        &emulator,
+        &instance_id,
+        &format!("maxResults={FLOW_MAX_RESULTS_MAX}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        listed_flow_names(case, &body),
+        expected_names,
+        "case {case:?}: expected the stored flows in name order, got {body}"
+    );
+    assert!(
+        listing_next_token(&body).is_none(),
+        "case {case:?}: one page holds every flow, so it must carry no nextToken: {body}"
+    );
+
+    // Every listed flow is the record the single-flow read reports, member for member: the
+    // listing projects persisted state, not a summary of its own.
+    for listed in flows_of(case, &body) {
+        let name = string_of(case, &listed, "name");
+        let (status, read) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDataIntegrationFlow {name} expected 200, got {status} with {read}"
+        );
+        assert_eq!(
+            listed,
+            flow_of(case, &read),
+            "case {case:?}: the listed {name} must equal what GetDataIntegrationFlow reports"
+        );
+    }
+
+    // An instance holding no flow is a successful empty page, never a refusal.
+    let case = "an instance holding no flow";
+    let (status, body) = list_flows(&emulator, &empty_instance, "").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        listed_flow_names(case, &body),
+        Vec::<String>::new(),
+        "case {case:?}: an instance holding no flow is an empty page, got {body}"
+    );
+    assert!(
+        listing_next_token(&body).is_none(),
+        "case {case:?}: an empty page must carry no nextToken: {body}"
+    );
+}
+
+/// RULE: a listing is cut into pages of at most `maxResults`, and the pages a client walks
+/// with the tokens it is handed concatenate to the whole name order exactly once — whatever
+/// the page size.
+#[tokio::test]
+async fn flow_pagination_walks_the_whole_order_exactly_once_at_every_page_size() {
+    let case = "paging over one instance's flows";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+
+    // 24 flows: more than the largest page (20) and more than the default (10), so every
+    // row below needs at least two pages.
+    const SEEDED: usize = 24;
+    let mut all_names = Vec::new();
+    for index in 1..=SEEDED {
+        let name = listing_flow_name(index);
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, minimal_flow_request(&name))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: creating {name} expected 200, got {status} with {body}"
+        );
+        all_names.push(name);
+    }
+    all_names.sort();
+
+    // Rows differ along the page size: the smallest page that can advance, sizes in between
+    // (one of which divides the total exactly), the largest page the model publishes, and
+    // the modelled default, which a row omits `maxResults` to get.
+    let rows: Vec<(&str, Option<i64>)> = vec![
+        ("one flow per page", Some(1)),
+        ("two flows per page", Some(2)),
+        ("eight flows per page", Some(8)),
+        ("seven flows per page", Some(7)),
+        ("the largest page", Some(FLOW_MAX_RESULTS_MAX)),
+        ("the modelled default page", None),
+    ];
+
+    for (row_case, max_results) in rows {
+        let (names, pages) = walk_flow_pages(&emulator, row_case, &instance_id, max_results).await;
+        assert_eq!(
+            names, all_names,
+            "case {row_case:?}: the pages must concatenate to the whole name order exactly once"
+        );
+        let size = match max_results {
+            Some(size) => usize::try_from(size).expect("a page size a row asks for is positive"),
+            None => FLOW_MAX_RESULTS_DEFAULT,
+        };
+        let expected_pages = all_names.len().div_ceil(size);
+        assert_eq!(
+            pages, expected_pages,
+            "case {row_case:?}: {} flows in pages of {size} expected {expected_pages} pages",
+            all_names.len()
+        );
+    }
+}
+
+/// RULE: `maxResults` is served at each bound the model publishes and refused outside them.
+#[tokio::test]
+async fn flow_listing_max_results_is_served_at_its_bounds_and_refused_outside_them() {
+    let case = "the bounds of maxResults";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+    const SEEDED: usize = 3;
+    for index in 1..=SEEDED {
+        let name = listing_flow_name(index);
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, minimal_flow_request(&name))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: creating {name} expected 200, got {status} with {body}"
+        );
+    }
+
+    // Rows: both published bounds of `DataIntegrationFlowMaxResults`, and one past each.
+    let rows: Vec<(&str, i64, u16)> = vec![
+        ("one below the minimum", FLOW_MAX_RESULTS_MIN - 1, 400),
+        ("the minimum", FLOW_MAX_RESULTS_MIN, 200),
+        ("the maximum", FLOW_MAX_RESULTS_MAX, 200),
+        ("one past the maximum", FLOW_MAX_RESULTS_MAX + 1, 400),
+    ];
+
+    for (row_case, max_results, expected_status) in rows {
+        let (status, body) =
+            list_flows(&emulator, &instance_id, &format!("maxResults={max_results}")).await;
+        assert_eq!(
+            status, expected_status,
+            "case {row_case:?}: maxResults {max_results} expected HTTP {expected_status}, got \
+             {status} with {body}"
+        );
+        if expected_status == 400 {
+            assert!(
+                error_type(&body).contains("ValidationException"),
+                "case {row_case:?}: expected the modelled ValidationException, got {body}"
+            );
+            continue;
+        }
+        let listed = listed_flow_names(row_case, &body);
+        let expected = usize::try_from(max_results)
+            .expect("a served bound is not negative")
+            .min(SEEDED);
+        assert_eq!(
+            listed.len(),
+            expected,
+            "case {row_case:?}: expected {expected} flows on the page, got {listed:?}"
+        );
+        if expected == 0 {
+            // A page that holds nothing carries no token: a token a client cannot advance
+            // with would make it page forever.
+            assert!(
+                listing_next_token(&body).is_none(),
+                "case {row_case:?}: a page holding nothing must carry no nextToken: {body}"
+            );
+        }
+    }
+}
+
+/// RULE: only a `nextToken` this service issued for THIS query is a page boundary; anything
+/// else is a validation failure rather than a silently truncated or restarted page.
+#[tokio::test]
+async fn a_flow_listing_next_token_this_service_did_not_issue_is_refused() {
+    let case = "a nextToken this service did not issue";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+    let other_instance = emulator.create_instance(case).await;
+    for index in 1..=3 {
+        let name = listing_flow_name(index);
+        for host in [&instance_id, &other_instance] {
+            let (status, body) = emulator
+                .create_flow(host, &name, minimal_flow_request(&name))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: creating {name} expected 200, got {status} with {body}"
+            );
+        }
+    }
+
+    // The token this service hands out for a query is the control every forged row below is
+    // a variation on: it names the instance and the flow to resume at.
+    let issued = |host: &str, name: &str| {
+        hex::encode(format!("scn:1:data-integration-flow:{host}:{name}"))
+    };
+
+    // Rows differ along HOW the value fails to be a token this service issued for this
+    // query: not hex at all, hex of a foreign payload, hex of a bare store key with no
+    // stamp, the stamp over something no `DataIntegrationFlowName` can be, the stamp of
+    // another listing of this service, and a token issued for another instance.
+    let rows: Vec<(&str, String)> = vec![
+        ("not hex", "not-a-token".to_string()),
+        (
+            "hex of a foreign payload",
+            hex::encode("someone-elses-cursor"),
+        ),
+        (
+            "hex of a bare store key",
+            hex::encode(listing_flow_name(2)),
+        ),
+        (
+            "the stamp over a name the model cannot admit",
+            issued(&instance_id, "not a flow name"),
+        ),
+        (
+            "the stamp of another listing of this service",
+            hex::encode(format!(
+                "scn:1:data-lake-dataset:{instance_id}:default:{}",
+                listing_flow_name(2)
+            )),
+        ),
+        (
+            "a token issued for another instance",
+            issued(&other_instance, &listing_flow_name(2)),
+        ),
+    ];
+
+    for (row_case, token) in rows {
+        let (status, body) =
+            list_flows(&emulator, &instance_id, &format!("nextToken={token}")).await;
+        assert_eq!(
+            status, 400,
+            "case {row_case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("ValidationException"),
+            "case {row_case:?}: expected the modelled ValidationException, got {body}"
+        );
+    }
+
+    // The control: the token the service itself hands out resumes the listing where the
+    // page stopped.
+    let case = "the token the service issued";
+    let (status, first) = list_flows(&emulator, &instance_id, "maxResults=1").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} with {first}"
+    );
+    let token = listing_next_token(&first)
+        .unwrap_or_else(|| panic!("case {case:?}: a truncated page must carry a nextToken"));
+    let (status, second) = list_flows(
+        &emulator,
+        &instance_id,
+        &format!("maxResults=1&nextToken={token}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} with {second}"
+    );
+    assert_eq!(
+        listed_flow_names(case, &second),
+        vec![listing_flow_name(2)],
+        "case {case:?}: the token must resume at the flow the first page stopped at"
+    );
+
+    // ...and that same token is refused once the query it was cut from changes.
+    let case = "the issued token against another instance";
+    let (status, body) = list_flows(
+        &emulator,
+        &other_instance,
+        &format!("maxResults=1&nextToken={token}"),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {body}"
+    );
+    assert!(
+        error_type(&body).contains("ValidationException"),
+        "case {case:?}: expected the modelled ValidationException, got {body}"
+    );
+}
+
+/// RULE: a listing is answered only for a live instance of this account — an `instanceId`
+/// naming none is the gateway's authorization failure, whatever else the request asks for.
+#[tokio::test]
+async fn a_flow_listing_for_an_unknown_instance_is_an_authorization_failure() {
+    let emulator = Emulator::new();
+
+    // Rows differ along what else the request carries, so the authorization step is shown
+    // to run before the page size and the token are read at all: an `instanceId` of the
+    // modelled `UUID` shape that names no instance, with no query, with the largest page
+    // the model publishes, and with a token. (A page size OUTSIDE the modelled range is
+    // refused by the modelled constraint before any handler runs, so it is not a row here.)
+    let unknown_instance = "00000000-0000-4000-8000-000000000000";
+    let rows: Vec<(&str, String)> = vec![
+        ("no query at all", String::new()),
+        (
+            "the largest modelled page",
+            format!("maxResults={FLOW_MAX_RESULTS_MAX}"),
+        ),
+        (
+            "the smallest modelled page",
+            format!("maxResults={FLOW_MAX_RESULTS_MIN}"),
+        ),
+        (
+            "a token of another instance's listing",
+            format!(
+                "nextToken={}",
+                hex::encode(format!(
+                    "scn:1:data-integration-flow:{unknown_instance}:{}",
+                    listing_flow_name(1)
+                ))
+            ),
+        ),
+    ];
+
+    for (case, query) in rows {
+        let (status, body) = list_flows(&emulator, unknown_instance, &query).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: expected HTTP 403, got {status} with {body}"
+        );
+        assert!(
+            error_type(&body).contains("AccessDeniedException"),
+            "case {case:?}: expected the modelled AccessDeniedException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_authorization_failure(unknown_instance),
+            "case {case:?}: the refusal must carry the gateway's authorization sentence"
+        );
+    }
+}
+
+/// RULE: the listing is a report of live state — it changes nothing a later caller sees, and
+/// it answers from the store as every write left it.
+#[tokio::test]
+async fn flow_listing_reports_live_state_and_changes_nothing() {
+    let case = "listing is a report";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+    const SEEDED: usize = 5;
+    let mut names: Vec<String> = Vec::new();
+    for index in 1..=SEEDED {
+        let name = listing_flow_name(index);
+        let (status, body) = emulator
+            .create_flow(&instance_id, &name, minimal_flow_request(&name))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: creating {name} expected 200, got {status} with {body}"
+        );
+        names.push(name);
+    }
+    names.sort();
+
+    let (first, _) = walk_flow_pages(&emulator, case, &instance_id, Some(2)).await;
+    let (second, _) = walk_flow_pages(&emulator, case, &instance_id, Some(2)).await;
+    assert_eq!(
+        first, second,
+        "case {case:?}: two identical listings must answer identically"
+    );
+    assert_eq!(
+        first, names,
+        "case {case:?}: the listing must report every stored flow"
+    );
+
+    let case = "a listing at another page size";
+    let (whole, pages) =
+        walk_flow_pages(&emulator, case, &instance_id, Some(FLOW_MAX_RESULTS_MAX)).await;
+    assert_eq!(
+        whole, first,
+        "case {case:?}: the page size must not change which flows are reported"
+    );
+    assert_eq!(
+        pages, 1,
+        "case {case:?}: {SEEDED} flows fit in one page of {FLOW_MAX_RESULTS_MAX}"
+    );
+
+    // ...and the single-flow read still reports each of them after the listing.
+    for name in &names {
+        let (status, body) = emulator.get_flow(&instance_id, name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDataIntegrationFlow {name} after listing expected 200, got \
+             {status} with {body}"
+        );
+    }
+
+    // A write between two listings is what the next listing reports: the update's new
+    // pipeline, and the deleted flow gone from the order.
+    let case = "a listing after an update and a delete";
+    let updated = names[1].clone();
+    let (status, body) = emulator
+        .update_flow(
+            &instance_id,
+            &updated,
+            json!({
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM orders" },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the update expected 200, got {status} with {body}"
+    );
+    let removed = names[0].clone();
+    let (status, body) = emulator.delete_flow(&instance_id, &removed).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the delete expected 200, got {status} with {body}"
+    );
+
+    let (status, body) = list_flows(
+        &emulator,
+        &instance_id,
+        &format!("maxResults={FLOW_MAX_RESULTS_MAX}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} with {body}"
+    );
+    let listed = listed_flow_names(case, &body);
+    let expected: Vec<String> = names
+        .iter()
+        .filter(|name| **name != removed)
+        .cloned()
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "case {case:?}: the listing must report the flows the writes left, got {body}"
+    );
+    for flow in flows_of(case, &body) {
+        let name = string_of(case, &flow, "name");
+        let (status, read) = emulator.get_flow(&instance_id, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDataIntegrationFlow {name} expected 200, got {status} with {read}"
+        );
+        assert_eq!(
+            flow,
+            flow_of(case, &read),
+            "case {case:?}: the listed {name} must equal what the single-flow read reports"
+        );
+    }
+}

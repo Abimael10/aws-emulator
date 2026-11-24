@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataIntegrationFlows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataIntegrationFlows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages over the data-integration flows the shared store ([`crate::state`])
+//! holds for the addressed instance — exactly what `CreateDataIntegrationFlow` persisted and
+//! `UpdateDataIntegrationFlow` last wrote, projected the same way `GetDataIntegrationFlow`
+//! reports one — and emits a `nextToken` that names the flow the next page resumes at. The
+//! store is a `BTreeMap` keyed by (`instanceId`, `name`), so one instance's flows are
+//! contiguous and the order a page is cut from is stable, which is what keeps a token
+//! meaningful across calls. Nothing here changes a stored flow, so repeated reads answer
+//! identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataIntegrationFlows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `maxResults` is modelled `@range(0..20)`, so a request may ask for a page of nothing: such
+//! a page is answered empty and WITHOUT a token, which ends the listing — a token a client
+//! cannot advance with would make it page forever. A client that wants the flows asks for a
+//! page that can hold one.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +156,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataIntegrationFlows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataIntegrationFlowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataIntegrationFlows"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDataIntegrationFlowsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain data integration store is unavailable on this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` carries `@range(0..20)` and `@default(10)`, both applied before this
+        // handler runs, so the value is already in range here. Stating the bound where it is
+        // relied on keeps a value outside it — which this listing could only read as a page
+        // of nothing — out of the paging loop: it is refused as the modelled
+        // `ValidationException` instead.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(size))
+            .ok_or_else(|| {
+                ListDataIntegrationFlowsError::from(
+                    ListDataIntegrationFlowsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "maxResults must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}, \
+                                 got {}",
+                                input.max_results
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read performs: the instance transition the clock owed at `now`,
+        // which was due whether or not anybody read anything.
+        store.materialize_due_transitions(now);
+
+        // Same gateway rule as every instance-scoped call: an `instanceId` naming no
+        // instance of this account is refused by the authorization step, before the
+        // addressed resources are looked up at all.
+        if !store.instances.contains_key(&input.instance_id) {
+            return Err(ListDataIntegrationFlowsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::instance_authorization_failure_message(
+                        input.instance_id.as_str(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Where this page resumes, read AFTER the authorization step so an unknown instance
+        // is answered as the authorization failure it is rather than as a bad token. A token
+        // carries the query it was cut from, so one this operation did not issue for THIS
+        // instance is a bad request rather than a silently truncated or restarted page.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token, &input.instance_id).ok_or_else(|| {
+                ListDataIntegrationFlowsError::from(
+                    ListDataIntegrationFlowsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a pagination token this service issued for this \
+                                 query"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                )
+            })?),
+            None => None,
+        };
+
+        let mut flows = Vec::new();
+        let mut next_token = None;
+        // The page starts AT the resume key rather than scanning the names behind it, so the
+        // cost of a page does not grow with how far into the instance's flows it sits.
+        for record in
+            store.instance_flows_from(&input.instance_id, resume_at.as_deref().unwrap_or_default())
+        {
+            if flows.len() >= page_size {
+                // One more flow remains than fits: the token names it, so the next page
+                // resumes exactly where this one stopped. A page that holds nothing gets NO
+                // token — a token that cannot advance would make a client paging in a loop
+                // spin forever.
+                if page_size > 0 {
+                    next_token = Some(encode_page_token(&input.instance_id, &record.name));
+                }
+                break;
+            }
+            // Every flow is projected exactly as the single-flow read projects it, so a
+            // listed flow and the one `GetDataIntegrationFlow` reports cannot differ.
+            flows.push(store.flow_to_wire(record));
+        }
+
+        Ok(ListDataIntegrationFlowsOutput { flows, next_token })
     }
+}
+
+/// The published bounds of `DataIntegrationFlowMaxResults` (`@range(min: 0, max: 20)`), which
+/// is what one page of this listing holds.
+const MIN_PAGE_SIZE: usize = 0;
+const MAX_PAGE_SIZE: usize = 20;
+
+/// The published bounds of `DataIntegrationFlowName` (`@length(min: 1, max: 256)`), which is
+/// what a resume key this listing pages on is a value of.
+const MIN_FLOW_NAME_LEN: usize = 1;
+const MAX_FLOW_NAME_LEN: usize = 256;
+
+/// The stamp every token this operation issues carries: this service, the token format
+/// version, and the list it is a boundary for.
+const PAGE_STAMP: &str = "scn:1:data-integration-flow:";
+
+/// The page token naming the flow called `name`, for the query it was cut from: the instance
+/// addressed.
+///
+/// `DataIntegrationFlowNextToken` is modelled as a string of length 1..65535 and nothing
+/// else, so the token is the stamped payload hex-encoded: one value for a client to hand
+/// back, under 700 characters at the modelled maxima — well inside the modelled bound — and
+/// read only through [`decode_page_token`]. The encoding is reversible and is no part of the
+/// check: carrying the query identity is what lets a value this operation did not issue, or
+/// one issued for another instance, be refused instead of honoured as a boundary for THIS
+/// query. The two fields it holds are values the caller addressed the listing with or already
+/// read in a page of it.
+///
+/// `:` separates the two fields because neither of them can contain one: an `instanceId` is a
+/// hyphenated hex UUID and `DataIntegrationFlowName` is `^[A-Za-z0-9-]+$`.
+fn encode_page_token(instance_id: &str, name: &str) -> String {
+    ::hex::encode(format!("{PAGE_STAMP}{instance_id}:{name}").as_bytes())
+}
+
+/// The resume key a token names, or `None` when `token` is not one this operation issued for
+/// this instance — which the caller is told as a `ValidationException`, never as a silently
+/// truncated or restarted page.
+fn decode_page_token(token: &str, instance_id: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.strip_prefix(PAGE_STAMP)?.split(':');
+    let token_instance = fields.next()?;
+    let token_key = fields.next()?;
+    // Every key this operation pages on is the name of a flow of the instance the page was
+    // cut from, so anything else is a boundary this service could not have issued for this
+    // query.
+    (fields.next().is_none() && token_instance == instance_id && is_modelled_flow_name(token_key))
+        .then(|| token_key.to_string())
+}
+
+/// Whether `value` is a name of the model's `DataIntegrationFlowName` shape: length 1..256
+/// and `^[A-Za-z0-9-]+$`. Only such a value can be a flow this listing pages on, so a resume
+/// key that is not one names no boundary this service issued.
+fn is_modelled_flow_name(value: &str) -> bool {
+    (MIN_FLOW_NAME_LEN..=MAX_FLOW_NAME_LEN).contains(&value.chars().count())
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }

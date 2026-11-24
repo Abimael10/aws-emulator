@@ -1618,13 +1618,27 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         self.flows.get_mut(&flow_key(instance_id, name))
     }
 
-    /// How many flows `instance_id` holds — one range scan over the keys that instance's
-    /// flows occupy, which is what [`MAX_FLOWS_PER_INSTANCE`] caps.
-    pub fn flow_count(&self, instance_id: &str) -> usize {
+    /// Every stored flow of `instance_id` whose name sorts at or after `from` (`""` for the
+    /// whole instance), in flow-name order: the contiguous span of the key space that
+    /// instance's flows occupy ([`flow_key`] puts the instance first), which is the order
+    /// `ListDataIntegrationFlows` pages through. The span is SEEKED to `from` rather than
+    /// scanned from the instance's first flow, so resuming a page costs the same whatever
+    /// sits behind the resume key.
+    pub fn instance_flows_from<'a>(
+        &'a self,
+        instance_id: &'a str,
+        from: &str,
+    ) -> impl Iterator<Item = &'a DataIntegrationFlowRecord> + 'a {
         self.flows
-            .range(flow_key(instance_id, "")..)
-            .take_while(|((stored, _), _)| stored == instance_id)
-            .count()
+            .range(flow_key(instance_id, from)..)
+            .take_while(move |((instance, _), _)| instance == instance_id)
+            .map(|(_, record)| record)
+    }
+
+    /// How many flows `instance_id` holds — the length of the span
+    /// [`Self::instance_flows_from`] walks, which is what [`MAX_FLOWS_PER_INSTANCE`] caps.
+    pub fn flow_count(&self, instance_id: &str) -> usize {
+        self.instance_flows_from(instance_id, "").count()
     }
 
     /// Whether a further flow create for `instance_id` would push it past
