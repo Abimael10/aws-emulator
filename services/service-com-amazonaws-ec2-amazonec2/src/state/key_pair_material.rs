@@ -165,7 +165,7 @@ fn generate_rsa_key_pair(key_format: &str, comment: &str) -> Option<GeneratedKey
     };
     Some(GeneratedKeyPair {
         key_material,
-        public_key: openssh_public_key_line(&public_key)?,
+        public_key: openssh_public_key_line(&public_key, comment)?,
         key_fingerprint,
     })
 }
@@ -198,7 +198,7 @@ fn generate_ed25519_key_pair(key_format: &str, comment: &str) -> Option<Generate
     };
     Some(GeneratedKeyPair {
         key_material,
-        public_key: openssh_public_key_line(&public_key)?,
+        public_key: openssh_public_key_line(&public_key, comment)?,
         key_fingerprint,
     })
 }
@@ -214,20 +214,27 @@ fn rsa_public_key(key: &::pkcs1::RsaPrivateKey<'_>) -> Option<::ssh_key::PublicK
     };
     Some(::ssh_key::PublicKey::new(
         ::ssh_key::public::KeyData::Rsa(rsa),
-        // No comment: the public key material EC2 reports is the key, and a comment would
-        // be a name nothing published.
+        // The comment the stored line carries is the key PAIR's name, which
+        // [`openssh_public_key_line`] writes onto it; the key itself carries none.
         String::new(),
     ))
 }
 
-/// `public_key` as the one-line OpenSSH public key `<algorithm> <base64 blob>` a
+/// `public_key` as the one-line OpenSSH public key `<algorithm> <base64 blob> <comment>` a
 /// `known_hosts` or `authorized_keys` entry carries — the form "the public key material"
-/// (`KeyPairInfo$PublicKey`) takes.
+/// (`KeyPairInfo$PublicKey`) takes, under `comment`.
 ///
-/// Shared with [`super::key_pair_import`], which stores an IMPORTED key in the same form, so
-/// one spelling of a stored public key has one implementation.
-pub fn openssh_public_key_line(public_key: &::ssh_key::PublicKey) -> Option<String> {
-    Some(public_key.to_openssh().ok()?.trim_end().to_string())
+/// The comment EC2 reports a stored public key under is the KEY PAIR's name: the material
+/// decides the algorithm and the body, and the pair it belongs to names it. Shared with
+/// [`super::key_pair_import`], which renders an IMPORTED key's line the same way, so one key
+/// pair's public key has one spelling however the account came by it.
+pub fn openssh_public_key_line(
+    public_key: &::ssh_key::PublicKey,
+    comment: &str,
+) -> Option<String> {
+    let mut named = public_key.clone();
+    named.set_comment(comment);
+    Some(named.to_openssh().ok()?.trim_end().to_string())
 }
 
 /// The private half of the RSA key `key`, as the blob a PuTTY file carries: the four values

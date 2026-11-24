@@ -237,8 +237,10 @@ pub struct KeyPairRecord {
     /// Everything `DescribeKeyPairs` reports about this key pair except its public key
     /// material: its id, name, type, fingerprint, creation time and tags.
     pub info: KeyPairInfo,
-    /// "The public key material" (`KeyPairInfo$PublicKey`), as the single-line OpenSSH
-    /// public key the key's own algorithm names it with — the public half EC2 stores.
+    /// "The public key material" (`KeyPairInfo$PublicKey`) — the public half EC2 stores: the
+    /// key itself, as the single-line OpenSSH public key commented with this pair's own NAME
+    /// ([`super::key_pair_material::openssh_public_key_line`]), whether the pair was
+    /// generated or imported.
     pub public_key: String,
 }
 
@@ -265,7 +267,8 @@ pub struct KeyPairSpec {
     /// The fingerprint of the key material that was generated, as the key's own type
     /// fingerprints it ([`super::key_pair_material`]).
     pub key_fingerprint: String,
-    /// The public half EC2 stores, as the OpenSSH public key line.
+    /// The public half EC2 stores, as the OpenSSH public key line of the key under this
+    /// pair's name.
     pub public_key: String,
     /// The tags the request's `TagSpecifications` assign to the key pair.
     pub tags: Vec<Tag>,

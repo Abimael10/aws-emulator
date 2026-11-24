@@ -99,7 +99,10 @@ fn ssh_mpint(value: &[u8]) -> Vec<u8> {
 /// The single-line OpenSSH public key form of `blob`, with `comment` when one is given:
 /// `key-type key-body [comment]`, the form `ssh-keygen` writes into
 /// `~/.ssh/authorized_keys`.
-fn openssh_line(algorithm: &str, blob: &[u8], comment: &str) -> String {
+///
+/// `pub` so the suite that covers what the material is READ as and REPORTED as
+/// ([`super::import_key_pair_material`]) builds its rows with the one builder this one does.
+pub fn openssh_line(algorithm: &str, blob: &[u8], comment: &str) -> String {
     let body = ::base64::engine::general_purpose::STANDARD.encode(blob);
     if comment.is_empty() {
         format!("{algorithm} {body}")
@@ -110,7 +113,7 @@ fn openssh_line(algorithm: &str, blob: &[u8], comment: &str) -> String {
 
 /// `blob` as the armoured public key file RFC 4716 defines, with a `Comment` header — the
 /// other public-key form the import requirements name.
-fn rfc4716_file(blob: &[u8]) -> String {
+pub fn rfc4716_file(blob: &[u8]) -> String {
     let body = ::base64::engine::general_purpose::STANDARD.encode(blob);
     let mut file = String::from("---- BEGIN SSH2 PUBLIC KEY ----\nComment: \"imported\"\n");
     for line in body.as_bytes().chunks(70) {
@@ -141,7 +144,7 @@ fn rsa_modulus(bits: usize, seed: u8) -> Vec<u8> {
 }
 
 /// The blob of an `ssh-rsa` public key of `bits` bits, seeded by `seed`.
-fn rsa_blob(bits: usize, seed: u8) -> Vec<u8> {
+pub fn rsa_blob(bits: usize, seed: u8) -> Vec<u8> {
     ssh_blob(
         "ssh-rsa",
         &[
@@ -152,10 +155,33 @@ fn rsa_blob(bits: usize, seed: u8) -> Vec<u8> {
 }
 
 /// The blob of an `ssh-ed25519` public key seeded by `seed`: the 32 bytes an Ed25519 public
-/// key is.
-fn ed25519_blob(seed: u8) -> Vec<u8> {
-    let key: Vec<u8> = (0..32u8).map(|index| seed.wrapping_add(index)).collect();
-    ssh_blob("ssh-ed25519", &[key])
+/// key is — the public half of the key `seed` names, so the bytes really are a point on that
+/// curve and the material carrying them is a key.
+pub fn ed25519_blob(seed: u8) -> Vec<u8> {
+    ssh_blob("ssh-ed25519", &[ed25519_public_bytes(seed).to_vec()])
+}
+
+/// The public half of the Ed25519 key whose private scalar is `seed` repeated — a real key,
+/// from the crate that implements the curve, so no row has to assume 32 arbitrary bytes are a
+/// public key.
+pub fn ed25519_public_bytes(seed: u8) -> [u8; 32] {
+    ::ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+        .verifying_key()
+        .to_bytes()
+}
+
+/// 32 bytes in the place an Ed25519 public key goes that are NOT one: a real key's bytes with
+/// their first byte stepped until the curve rejects the encoding, so the row that sends them
+/// is a key body that stands for no key rather than a guess about which bytes do.
+pub fn ed25519_bytes_that_encode_no_key() -> [u8; 32] {
+    let mut bytes = ed25519_public_bytes(5);
+    for candidate in 0..=u8::MAX {
+        bytes[0] = candidate;
+        if ::ed25519_dalek::VerifyingKey::from_bytes(&bytes).is_err() {
+            return bytes;
+        }
+    }
+    panic!("every byte in the first position of this key encodes a point on the curve")
 }
 
 // ===========================================================================
@@ -213,7 +239,7 @@ fn rsa_subject_public_key_info(modulus: &[u8], exponent: &[u8]) -> Vec<u8> {
 
 /// The `KeyFingerprint` an imported RSA key pair of this modulus reports: the MD5 digest of
 /// its DER `SubjectPublicKeyInfo`, as colon-separated lowercase hex byte pairs.
-fn expected_rsa_fingerprint(bits: usize, seed: u8) -> String {
+pub fn expected_rsa_fingerprint(bits: usize, seed: u8) -> String {
     let digest = ::md5::Md5::digest(rsa_subject_public_key_info(
         &rsa_modulus(bits, seed),
         &RSA_PUBLIC_EXPONENT,
@@ -231,7 +257,7 @@ fn expected_rsa_fingerprint(bits: usize, seed: u8) -> String {
 /// that digest inside a `SHA256:` rendering of its own, which names the hash rather than
 /// being part of the value). The same rendering a generated Ed25519 key pair's fingerprint
 /// takes, which [`super::key_pairs`] asserts.
-fn expected_ed25519_fingerprint(blob: &[u8]) -> String {
+pub fn expected_ed25519_fingerprint(blob: &[u8]) -> String {
     ::base64::engine::general_purpose::STANDARD.encode(::sha2::Sha256::digest(blob))
 }
 
@@ -241,7 +267,7 @@ fn expected_ed25519_fingerprint(blob: &[u8]) -> String {
 
 /// The form fields of one import: the name, the material (a blob, so base64 on the wire)
 /// and its tags.
-fn import_params(key_name: &str, material: &str, tags: &[(&str, &str)]) -> Vec<Param> {
+pub fn import_params(key_name: &str, material: &str, tags: &[(&str, &str)]) -> Vec<Param> {
     let mut params = vec![
         param("KeyName", key_name),
         param(
@@ -266,7 +292,9 @@ fn import_params(key_name: &str, material: &str, tags: &[(&str, &str)]) -> Vec<P
 }
 
 /// One import that has to succeed, and the body it answered.
-async fn import(
+///
+/// `pub` so [`super::import_key_pair_material`] drives an import the one way this suite does.
+pub async fn import(
     case: &str,
     router: &MultiServiceRouter,
     key_name: &str,
@@ -284,7 +312,7 @@ async fn import(
 
 /// The one key pair a `DescribeKeyPairs` body reports, as its `<item>` element — or a panic
 /// naming the case when it reported none or several.
-fn described_pair<'a, 'i>(
+pub fn described_pair<'a, 'i>(
     case: &str,
     parsed: &'a roxmltree::Document<'i>,
 ) -> roxmltree::Node<'a, 'i> {
@@ -322,6 +350,10 @@ struct ImportCase {
 
 /// The import table: the two algorithms an import takes, each published RSA length, both
 /// public-key forms the requirements name, and a key line with no comment.
+///
+/// Every row's `public_key` is the key it imports under that row's own key NAME, because that
+/// is the comment EC2 reports a stored public key under whatever the material carried — the
+/// rule [`super::import_key_pair_material`] covers over the forms a comment arrives in.
 fn import_table() -> Vec<ImportCase> {
     let mut rows = Vec::new();
     // "Supported lengths: 1024, 2048, and 4096" (Amazon EC2 User Guide, "Create a key pair
@@ -330,37 +362,36 @@ fn import_table() -> Vec<ImportCase> {
     for (index, bits) in ec2::state::IMPORTABLE_RSA_KEY_BITS.into_iter().enumerate() {
         let seed = 7u8.wrapping_add(index as u8);
         let blob = rsa_blob(bits, seed);
-        let line = openssh_line("ssh-rsa", &blob, "fixture@example.com");
+        let key_name = match bits {
+            1024 => "fixture-rsa-1024",
+            2048 => "fixture-rsa-2048",
+            _ => "fixture-rsa-4096",
+        };
         rows.push(ImportCase {
             case: match bits {
                 1024 => "rsa-1024 openssh line",
                 2048 => "rsa-2048 openssh line",
                 _ => "rsa-4096 openssh line",
             },
-            key_name: match bits {
-                1024 => "fixture-rsa-1024",
-                2048 => "fixture-rsa-2048",
-                _ => "fixture-rsa-4096",
-            },
-            material: line.clone(),
+            key_name,
+            material: openssh_line("ssh-rsa", &blob, "fixture@example.com"),
             key_type: ec2::state::KEY_TYPE_RSA,
             fingerprint: expected_rsa_fingerprint(bits, seed),
-            public_key: line,
+            public_key: openssh_line("ssh-rsa", &blob, key_name),
         });
     }
     let ed25519 = ed25519_blob(3);
-    let ed25519_line = openssh_line("ssh-ed25519", &ed25519, "fixture@example.com");
     rows.push(ImportCase {
         case: "ed25519 openssh line",
         key_name: "fixture-ed25519",
-        material: ed25519_line.clone(),
+        material: openssh_line("ssh-ed25519", &ed25519, "fixture@example.com"),
         key_type: ec2::state::KEY_TYPE_ED25519,
         fingerprint: expected_ed25519_fingerprint(&ed25519),
-        public_key: ed25519_line,
+        public_key: openssh_line("ssh-ed25519", &ed25519, "fixture-ed25519"),
     });
     // The SAME key bytes as a `rsa-2048` row, armoured as RFC 4716 instead: a different
-    // input carrying one key, so it must fingerprint by the same rule. The armour carries no
-    // OpenSSH comment, so the stored line carries none either.
+    // input carrying one key, so it must fingerprint by the same rule and be reported as the
+    // same one-line public key — this row's name being its own.
     let armoured_blob = rsa_blob(2048, 8);
     rows.push(ImportCase {
         case: "rsa-2048 rfc 4716 armour",
@@ -368,17 +399,16 @@ fn import_table() -> Vec<ImportCase> {
         material: rfc4716_file(&armoured_blob),
         key_type: ec2::state::KEY_TYPE_RSA,
         fingerprint: expected_rsa_fingerprint(2048, 8),
-        public_key: openssh_line("ssh-rsa", &armoured_blob, ""),
+        public_key: openssh_line("ssh-rsa", &armoured_blob, "fixture-rsa-2048-armoured"),
     });
     let bare_blob = rsa_blob(2048, 40);
-    let bare_line = openssh_line("ssh-rsa", &bare_blob, "");
     rows.push(ImportCase {
         case: "rsa-2048 with no comment",
         key_name: "fixture-rsa-2048-bare",
-        material: bare_line.clone(),
+        material: openssh_line("ssh-rsa", &bare_blob, ""),
         key_type: ec2::state::KEY_TYPE_RSA,
         fingerprint: expected_rsa_fingerprint(2048, 40),
-        public_key: bare_line,
+        public_key: openssh_line("ssh-rsa", &bare_blob, "fixture-rsa-2048-bare"),
     });
     rows
 }
@@ -660,6 +690,49 @@ fn refusal_table() -> Vec<RefusalCase> {
         (
             "a readable key of an algorithm an import does not take",
             import_params("ecdsa", &ecdsa, &[]),
+            ec2::state::INVALID_KEY_FORMAT,
+            400,
+        ),
+        (
+            "an ed25519 key body that encodes no point on the curve",
+            import_params(
+                "ed25519-mangled",
+                &openssh_line(
+                    "ssh-ed25519",
+                    &ssh_blob(
+                        "ssh-ed25519",
+                        &[ed25519_bytes_that_encode_no_key().to_vec()],
+                    ),
+                    "mangled@example.com",
+                ),
+                &[],
+            ),
+            ec2::state::INVALID_KEY_FORMAT,
+            400,
+        ),
+        (
+            "an rsa key whose modulus is no rsa modulus",
+            import_params(
+                "rsa-even-modulus",
+                &openssh_line(
+                    "ssh-rsa",
+                    &ssh_blob(
+                        "ssh-rsa",
+                        &[ssh_mpint(&RSA_PUBLIC_EXPONENT), {
+                            // The same 2048-bit modulus as a row that imports, with its low
+                            // bit cleared: an even number, which no product of two odd primes
+                            // is.
+                            let mut modulus = rsa_modulus(2048, 21);
+                            if let Some(last) = modulus.last_mut() {
+                                *last &= 0xfe;
+                            }
+                            ssh_mpint(&modulus)
+                        }],
+                    ),
+                    "",
+                ),
+                &[],
+            ),
             ec2::state::INVALID_KEY_FORMAT,
             400,
         ),

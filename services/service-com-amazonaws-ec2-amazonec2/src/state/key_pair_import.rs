@@ -11,10 +11,19 @@
 //! are the only ones a key can be read as.
 //!
 //! The material is read by [`ssh_key`], the crate that implements the OpenSSH key formats,
-//! rather than by matching on the text: what counts as a key is the format itself. The two
-//! public-key forms the import requirements name are both read — the
-//! `key-type key-body [comment]` line `ssh-keygen` writes and the armoured "SSH public key
-//! file format as specified in RFC 4716".
+//! rather than by matching on the text: what counts as a key is the format itself. Both
+//! public-key forms the import requirements name are read — the `key-type key-body [comment]`
+//! line `ssh-keygen` writes and the armoured "SSH public key file format as specified in RFC
+//! 4716" — the material carries ONE key in one of them and nothing else, and which form a
+//! key may arrive in is the ALGORITHM's: an ED25519 public key is read in the OpenSSH form,
+//! which is the form EC2 names when it reports this algorithm's material unreadable, while
+//! the armoured file carries the RSA keys whose lengths the requirements publish beside it.
+//!
+//! What is STORED out of the material is the KEY: "the public key material"
+//! (`KeyPairInfo$PublicKey`) a later read reports is that key's one-line OpenSSH form under
+//! the key pair's own name, written by [`super::key_pair_material::openssh_public_key_line`]
+//! — so one key pair's public key has one spelling whichever form it was imported in and
+//! whatever comment the file it came out of carried.
 //!
 //! An IMPORTED key pair's fingerprint rule is not the GENERATED one
 //! ([`super::key_pair_material`], which fingerprints the private key EC2 made): "if you used
@@ -74,14 +83,15 @@ pub fn invalid_key_format<E>() -> crate::scaffolded::Scaffolded<E> {
 /// EC2's sentence for public key material it cannot read as a key.
 pub const UNREADABLE_PUBLIC_KEY_MESSAGE: &str = "Key is not in valid OpenSSH public key format";
 
-/// A public key an import can take: the one-line OpenSSH form it is stored as, the `KeyType`
-/// it reports, and the fingerprint EC2 publishes for an imported key of that type.
+/// A public key an import can take: the form it is stored as, the `KeyType` it reports, and
+/// the fingerprint EC2 publishes for an imported key of that type.
 #[derive(Debug, Clone)]
 pub struct ImportedPublicKey {
-    /// The key as the single-line OpenSSH public key, which is the form "the public key
-    /// material" (`KeyPairInfo$PublicKey`) takes — written by the key crate from the key it
-    /// parsed rather than copied out of the request, so one key reaches the store in one
-    /// spelling however the caller armoured it.
+    /// "The public key material" (`KeyPairInfo$PublicKey`): the key the material carried, as
+    /// the one-line OpenSSH public key commented with the key PAIR's name
+    /// ([`openssh_public_key_line`]) — the algorithm and the body are the imported key's own,
+    /// whichever of the forms it arrived in, and the comment is the name the pair is held
+    /// under rather than whatever the file it was read out of happened to carry.
     pub public_key: String,
     /// The pair's `KeyType`: [`KEY_TYPE_RSA`] or [`KEY_TYPE_ED25519`], a word out of the
     /// modelled catalog rather than anything the request said.
@@ -95,34 +105,62 @@ pub struct ImportedPublicKey {
 /// take.
 ///
 /// Exactly two algorithms are read, because `ImportKeyPair` imports "the public key from an
-/// RSA or ED25519 key pair", and an RSA key's length must be one the requirements list
-/// ([`IMPORTABLE_RSA_KEY_BITS`]). Anything else — material that is not UTF-8, is longer than
-/// [`MAX_PUBLIC_KEY_MATERIAL_BYTES`], is no key at all, is a key of another algorithm, or is
-/// an RSA key of an unlisted length — is not a key this operation can take, and its caller
-/// answers [`invalid_key_format`].
-pub fn read_public_key_material(material: &[u8]) -> Option<ImportedPublicKey> {
+/// RSA or ED25519 key pair", and the key must be a real key OF that algorithm: an RSA key of
+/// one of the lengths the requirements list ([`IMPORTABLE_RSA_KEY_BITS`]) and with a modulus
+/// and exponent an RSA key has, an ED25519 key whose bytes encode a point on that curve.
+/// Which FORM each is read in is the algorithm's too ([`PublicKeyForm`]). Anything else —
+/// material that is not UTF-8, is longer than [`MAX_PUBLIC_KEY_MATERIAL_BYTES`], is no key at
+/// all, is more than one key or a key with anything else beside it ([`parse_public_key`]), is
+/// a key of another algorithm, or carries bytes of the right shape that are not a key of its
+/// own algorithm — is not a key this operation can take, and its caller answers
+/// [`invalid_key_format`].
+///
+/// Only the END of the material is trimmed, so the key begins at its first byte: the line
+/// terminator the file a caller read the key out of ended with is not part of the key, while
+/// anything BEFORE it — a blank line, an indent, a line of prose — leaves material that is not
+/// one key in one of those forms.
+pub fn read_public_key_material(material: &[u8], key_name: &str) -> Option<ImportedPublicKey> {
     if material.len() > MAX_PUBLIC_KEY_MATERIAL_BYTES {
         return None;
     }
     let text = ::std::str::from_utf8(material).ok()?;
-    let key = parse_public_key(text.trim())?;
+    let (form, key) = parse_public_key(text.trim_end())?;
     let key_type = match key.key_data() {
         ::ssh_key::public::KeyData::Rsa(rsa) => {
-            if !IMPORTABLE_RSA_KEY_BITS.contains(&integer_bits(rsa.n.as_positive_bytes()?)) {
+            if !IMPORTABLE_RSA_KEY_BITS.contains(&integer_bits(rsa.n.as_positive_bytes()?))
+                || !is_rsa_public_key(rsa)?
+            {
                 return None;
             }
             KEY_TYPE_RSA
         }
-        ::ssh_key::public::KeyData::Ed25519(_) => KEY_TYPE_ED25519,
+        ::ssh_key::public::KeyData::Ed25519(ed25519) => {
+            // An ED25519 public key is read in the OpenSSH form: recorded behaviour is that
+            // EC2 refuses this algorithm's key presented in the armoured file, in the
+            // sentence that names the form it does read ([`UNREADABLE_PUBLIC_KEY_MESSAGE`]),
+            // while the armoured file the requirements name carries the RSA keys whose
+            // lengths they publish beside it.
+            if form != PublicKeyForm::OpenSshLine {
+                return None;
+            }
+            // The 32 bytes have to BE a public key of that curve — the encoding of a point
+            // on it — and not merely 32 bytes in the place one goes: a key body a caller
+            // mangled keeps its length and its algorithm name while standing for no key at
+            // all, and a pair whose fingerprint stood for that could never be used to reach
+            // anything.
+            ::ed25519_dalek::VerifyingKey::from_bytes(&ed25519.0).ok()?;
+            KEY_TYPE_ED25519
+        }
         // Every other algorithm the OpenSSH formats carry (ECDSA, DSA, the security-key
         // variants): a readable key, but not one of the two an import takes.
         _ => return None,
     };
     Some(ImportedPublicKey {
-        // The key crate writes the stored spelling, so one key reaches the store in one
-        // form however the caller armoured it — through the same helper a GENERATED pair's
-        // public key is written with.
-        public_key: openssh_public_key_line(&key)?,
+        // The imported KEY, under the name the pair is held as: EC2 reports a stored public
+        // key as the OpenSSH line of the key it holds ([`openssh_public_key_line`]), so the
+        // armoured file and the line of one key are reported the same way and the comment is
+        // the pair's name.
+        public_key: openssh_public_key_line(&key, key_name)?,
         key_type,
         key_fingerprint: imported_key_fingerprint(&key)?,
     })
@@ -180,6 +218,22 @@ fn rsa_subject_public_key_info(rsa: &::ssh_key::public::RsaPublicKey) -> Option<
     .ok()
 }
 
+/// Whether the RSA public key `rsa` carries the integers an RSA public key does: a modulus
+/// that is odd, under a public exponent that is odd and greater than one.
+///
+/// A necessary condition rather than a primality proof — the modulus of a real RSA key is the
+/// product of two odd primes, so it is odd, and this rejects the integers that cannot be one
+/// without factoring anything. `None` only when the key's integers cannot be read at all. The
+/// counterpart of the point check an ED25519 key goes through in [`read_public_key_material`],
+/// which is a full decode: bytes of the right shape in the right place are not yet a key of
+/// the algorithm that names them.
+fn is_rsa_public_key(rsa: &::ssh_key::public::RsaPublicKey) -> Option<bool> {
+    let modulus = rsa.n.as_positive_bytes()?;
+    let exponent = rsa.e.as_positive_bytes()?;
+    let odd = |integer: &[u8]| integer.last().is_some_and(|last| last % 2 == 1);
+    Some(odd(modulus) && odd(exponent) && integer_bits(exponent) > 1)
+}
+
 /// How many bits the big-endian unsigned integer `bytes` holds — an RSA modulus's key
 /// length, which is what the import requirements list.
 fn integer_bits(bytes: &[u8]) -> usize {
@@ -203,13 +257,42 @@ const RFC4716_BEGIN: &str = "---- BEGIN SSH2 PUBLIC KEY ----";
 /// Its closing line.
 const RFC4716_END: &str = "---- END SSH2 PUBLIC KEY ----";
 
-/// `text` as a public key, in either of the two public-key forms the import requirements
-/// name: the single-line OpenSSH form first, then the RFC 4716 armoured file.
-fn parse_public_key(text: &str) -> Option<::ssh_key::PublicKey> {
-    if let Ok(key) = ::ssh_key::PublicKey::from_openssh(text) {
-        return Some(key);
+/// The form the material presented its key in — which of the two the import requirements name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicKeyForm {
+    /// The single `key-type key-body [comment]` line `ssh-keygen` writes, the form an
+    /// `authorized_keys` entry is.
+    OpenSshLine,
+    /// The armoured "SSH public key file format as specified in RFC 4716": the begin and end
+    /// lines around optional headers and the key's base64 body.
+    Rfc4716File,
+}
+
+/// `text` as ONE public key, with the form it came in: the single-line OpenSSH form, or the
+/// RFC 4716 armoured file.
+///
+/// The material carries one key and nothing else. The OpenSSH form is a single LINE —
+/// `key-type key-body [comment]`, the line `ssh-keygen` writes and `authorized_keys` holds
+/// one of per line — so material whose key is followed by anything on a line of its own (a
+/// second key, a fingerprint line, prose pasted after it) is not that form. The armoured file
+/// is the multi-line form, and it is read only between its own begin and end lines.
+fn parse_public_key(text: &str) -> Option<(PublicKeyForm, ::ssh_key::PublicKey)> {
+    if is_single_line(text) {
+        return Some((
+            PublicKeyForm::OpenSshLine,
+            ::ssh_key::PublicKey::from_openssh(text).ok()?,
+        ));
     }
-    ::ssh_key::PublicKey::from_bytes(&rfc4716_body(text)?).ok()
+    Some((
+        PublicKeyForm::Rfc4716File,
+        ::ssh_key::PublicKey::from_bytes(&rfc4716_body(text)?).ok()?,
+    ))
+}
+
+/// Whether `text` is one line: it carries no line break of any of the three spellings a
+/// caller's platform writes one in (LF, CR, CRLF).
+fn is_single_line(text: &str) -> bool {
+    !text.contains(['\n', '\r'])
 }
 
 /// The binary key blob an RFC 4716 armoured public key file carries, or `None` when `text`

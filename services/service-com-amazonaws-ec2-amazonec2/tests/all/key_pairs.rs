@@ -345,6 +345,17 @@ async fn create_key_pair_generates_the_asked_for_key_and_stores_its_public_half(
         let public_key = described(case, &described_body, "publicKey");
         let parsed_public = parsed_public_key(case, &public_key);
 
+        // "The public key material" a read reports is this key pair's public key under the
+        // pair's own NAME: the key decides the algorithm and the body, and the pair it
+        // belongs to is what comments it — the same rule an imported pair's public key is
+        // reported under ([`super::import_key_pair_material`]).
+        assert_eq!(
+            parsed_public.comment(),
+            key_name,
+            "case {case:?}: the reported public key must be commented with the key pair's \
+             name, got {public_key:?}"
+        );
+
         match expected_type {
             "ed25519" => {
                 assert_eq!(
@@ -428,8 +439,8 @@ async fn create_key_pair_generates_the_asked_for_key_and_stores_its_public_half(
                     },
                 );
                 assert_eq!(
-                    private.public_key().to_openssh().unwrap_or_default().trim_end(),
-                    public_key,
+                    private.public_key().key_data(),
+                    parsed_public.key_data(),
                     "case {case:?}: the stored public key must be the public half of the \
                      private key the caller was handed"
                 );

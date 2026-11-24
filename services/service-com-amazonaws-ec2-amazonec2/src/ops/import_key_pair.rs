@@ -179,7 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "imports the public key from an RSA or ED25519 key pair that you created using a
         // third-party tool", and material that is not such a key is refused rather than
         // stored as a pair whose fingerprint stands for nothing.
-        let Some(imported) = state::read_public_key_material(&input.public_key_material) else {
+        let Some(imported) = state::read_public_key_material(&input.public_key_material, key_name)
+        else {
             return Err(state::invalid_key_format());
         };
 
