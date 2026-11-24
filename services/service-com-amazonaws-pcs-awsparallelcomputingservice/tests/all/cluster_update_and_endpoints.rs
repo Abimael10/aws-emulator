@@ -38,6 +38,10 @@ mod accounting_purge_time;
 #[path = "cluster_update_and_endpoints/idempotent_update_retry.rs"]
 mod idempotent_update_retry;
 
+// What `UpdateQueue` does to a cluster's queues is its own suite, declared the same way.
+#[path = "cluster_update_and_endpoints/queue_update.rs"]
+mod queue_update;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 

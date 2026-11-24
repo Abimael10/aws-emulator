@@ -76,8 +76,7 @@ use crate::ops::types::{
     ScalingConfigurationRequest, Scheduler, SchedulerRequest, ServiceQuotaExceededException,
     SlurmRest, SlurmRestRequest, SpotOptions, UpdateClusterSlurmConfigurationRequest,
     UpdateComputeNodeGroupSlurmConfigurationRequest, UpdateNodeLifecycleActionsRequest,
-    ValidationException,
-    ValidationExceptionField,
+    UpdateQueueSlurmConfigurationRequest, ValidationException, ValidationExceptionField,
 };
 
 /// The `ClusterStatus`/`QueueStatus`/`ComputeNodeGroupStatus` member a just-created
@@ -1698,6 +1697,21 @@ pub fn apply_compute_node_group_slurm_update(
     }
     if let Some(settings) = update.gres_custom_settings {
         merged.gres_custom_settings = Some(settings);
+    }
+    merged
+}
+
+/// The stored Slurm configuration an `UpdateQueue` leaves behind: a member the request
+/// carries replaces the stored one, a member it omits leaves the stored one alone — the
+/// queue counterpart of [`apply_slurm_update`]. `UpdateQueueSlurmConfigurationRequest`
+/// declares one member today, so this merge is the same rule over that one member.
+pub fn apply_queue_slurm_update(
+    stored: Option<QueueSlurmConfiguration>,
+    update: UpdateQueueSlurmConfigurationRequest,
+) -> QueueSlurmConfiguration {
+    let mut merged = stored.unwrap_or_default();
+    if let Some(settings) = update.slurm_custom_settings {
+        merged.slurm_custom_settings = Some(settings);
     }
     merged
 }

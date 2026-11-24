@@ -13,7 +13,7 @@
 //! 1. every client-error refusal carries ONE status, the service's
 //!    [`CLIENT_ERROR_STATUS`], whatever `@httpError` the error shape declares — the class a
 //!    client branches on travels in the body's `__type`. A server-side failure keeps its own
-//!    status, which the scaffold channel's 501 shows.
+//!    status instead.
 //! 2. the cluster is the authorization boundary of every resource nested in one, so a
 //!    cluster-scoped operation whose `clusterIdentifier` resolves to no cluster of this
 //!    account is refused `AccessDeniedException`, stating the IAM sentence (the caller, the
@@ -239,19 +239,11 @@ async fn every_client_error_carries_one_status_and_names_its_class_in_the_body()
         }
     }
 
-    // A failure that is NOT the client's keeps its own status: an operation that is
-    // scaffolded and not implemented answers the scaffold channel's 501.
-    let (status, not_implemented) = call(
-        &router,
-        "UpdateQueue",
-        &json!({"clusterIdentifier": "boundary-cluster", "queueIdentifier": "work"}),
-    )
-    .await;
-    assert_eq!(
-        status, 501,
-        "case a scaffolded operation: expected a server-side status to be kept, got \
-         {status} with {not_implemented}"
-    );
+    // A failure that is NOT the client's keeps its own status. PCS carries no scaffolded
+    // operation any more — every one of them computes its answer from this service's state —
+    // so there is no 501 left to drive over the wire here; that half of the rule is pinned
+    // on the mapping itself, in `service::wire`'s own test over every status these error
+    // shapes declare, the scaffold channel's 501 included.
 }
 
 /// RULE: a cluster-scoped operation whose `clusterIdentifier` resolves to no cluster of this

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the configuration members a request carries to the stored queue of the cluster it
+//! names, leaves every member it omits at its stored value, and answers from the STORED
+//! record — so the update and a later read cannot differ.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The caller-sized lists this update would PERSIST, bounded for the same reason the
+        // create's are: the model bounds neither of them, so one request could otherwise
+        // size one stored record arbitrarily.
+        let slurm = input.slurm_configuration.as_ref();
+        let stored_lists: [(&str, usize); 2] = [
+            (
+                "computeNodeGroupConfigurations",
+                input
+                    .compute_node_group_configurations
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+            (
+                "slurmConfiguration.slurmCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+        ];
+        for (member, entries) in stored_lists {
+            if let Some(constraint) = crate::state::stored_list_violation(entries) {
+                return Err(UpdateQueueErrorModeled::ValidationException(
+                    crate::state::field_validation(member, constraint),
+                )
+                .into());
+            }
+        }
+
+        // The principal a refusal of the CALLER names, read before this service's store is
+        // locked so the session registry is never reached while the guard is held.
+        let caller = crate::state::cluster_authorization::caller_principal_arn(&*self.engine, ctx);
+
+        let mut state = state.lock();
+        state.settle();
+
+        // The cluster this update is scoped to has to resolve, and WHICH refusal an
+        // identifier that resolves to none earns is decided by its FORM: a generated cluster
+        // id names a cluster that is not there, a cluster NAME is a permissions failure; see
+        // `crate::state::cluster_authorization`.
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
+            return Err(match crate::state::cluster_authorization::unresolved_cluster(
+                &input.cluster_identifier,
+            ) {
+                crate::state::cluster_authorization::UnresolvedCluster::NotFound => {
+                    UpdateQueueErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                        crate::state::CLUSTER,
+                        &input.cluster_identifier,
+                    ))
+                }
+                crate::state::cluster_authorization::UnresolvedCluster::Denied => {
+                    UpdateQueueErrorModeled::AccessDeniedException(
+                        crate::state::cluster_authorization::cluster_denied(
+                            &caller,
+                            Self::NAME,
+                            &input.cluster_identifier,
+                        ),
+                    )
+                }
+            }
+            .into());
+        };
+
+        // The queue the update is addressed to, resolved by its generated id or by its name
+        // — the two forms `QueueIdentifier` allows.
+        let Some(queue_id) = state
+            .clusters
+            .get(&cluster_id)
+            .and_then(|cluster| cluster.queue(&input.queue_identifier))
+            .map(|queue| queue.id.clone())
+        else {
+            return Err(UpdateQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::QUEUE, &input.queue_identifier),
+            )
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has NO further
+        // effect, so the stored record is answered without applying the change a second
+        // time. The token is remembered with the queue the first call changed, so the same
+        // token naming another queue is a conflict rather than a second update.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            if remembered.cluster_id.as_deref() != Some(cluster_id.as_str())
+                || remembered.resource_id != queue_id
+            {
+                return Err(UpdateQueueErrorModeled::ConflictException(
+                    crate::state::client_token_conflict(
+                        "update",
+                        crate::state::QUEUE,
+                        &remembered.resource_id,
+                    ),
+                )
+                .into());
+            }
+            let Some(replayed) = state
+                .clusters
+                .get(&cluster_id)
+                .and_then(|cluster| cluster.queues.get(&queue_id))
+            else {
+                return Err(UpdateQueueErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the queue disappeared while it was being read".to_string(),
+                    },
+                )
+                .into());
+            };
+            return Ok(UpdateQueueOutput {
+                queue: Some(replayed.to_api()),
+            });
+        }
+
+        let Some(cluster) = state.clusters.get(&cluster_id) else {
+            return Err(UpdateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being read".to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(stored_queue) = cluster.queues.get(&queue_id) else {
+            return Err(UpdateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the queue disappeared while it was being read".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only a settled queue takes an update: one still provisioning, already updating, or
+        // on its way out has an operation of its own in flight.
+        if stored_queue.status != crate::state::STATUS_ACTIVE {
+            return Err(UpdateQueueErrorModeled::ConflictException(
+                crate::state::not_active(crate::state::QUEUE, &stored_queue.id),
+            )
+            .into());
+        }
+
+        // A queue assigns jobs to compute node groups of its OWN cluster, so a configuration
+        // naming one the cluster does not hold — or one whose delete this service has already
+        // accepted, and therefore is not going to hold — cannot be stored: such a reference
+        // would dangle as soon as the record is forgotten, and no later call could repair it.
+        // This is the rule the create path holds a stored reference to as well.
+        if let Some(configurations) = input.compute_node_group_configurations.as_ref() {
+            for configuration in configurations {
+                let Some(named) = configuration.compute_node_group_id.as_deref() else {
+                    continue;
+                };
+                if cluster.available_compute_node_group(named).is_none() {
+                    return Err(UpdateQueueErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(crate::state::COMPUTE_NODE_GROUP, named),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let Some(queue) = state
+            .clusters
+            .get_mut(&cluster_id)
+            .and_then(|cluster| cluster.queues.get_mut(&queue_id))
+        else {
+            return Err(UpdateQueueErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the queue disappeared while it was being written".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A member the request carries is applied; one it omits leaves the stored value
+        // alone. A request that asks for no change leaves the queue where it is rather than
+        // moving its status for nothing.
+        let mut changed = false;
+        if let Some(configurations) = input.compute_node_group_configurations {
+            // `computeNodeGroupConfigurations` states WHICH groups the queue assigns jobs to
+            // ("Use this API to change the compute node groups that the queue can send jobs
+            // to"), so the request's list is the WHOLE association set: it replaces the
+            // stored one rather than being added to it.
+            queue.compute_node_group_configurations = configurations;
+            changed = true;
+        }
+        if let Some(slurm) = input.slurm_configuration {
+            let stored = queue.slurm_configuration.take();
+            queue.slurm_configuration = Some(crate::state::apply_queue_slurm_update(stored, slurm));
+            changed = true;
+        }
+        if changed {
+            // PCS reports the queue as UPDATING while it applies the change; the service
+            // owes it ACTIVE again from the next request on.
+            queue.status = crate::state::STATUS_UPDATING.to_string();
+            queue.modified_at = crate::state::now_date_time();
+            queue.pending = Some(crate::state::PendingChange::Activate);
+        }
+        // Answered from the STORED record, so the update and a later read cannot differ.
+        let updated = queue.to_api();
+        let queue_name = queue.name.clone();
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &queue_id,
+            &queue_name,
+        );
+
+        Ok(UpdateQueueOutput {
+            queue: Some(updated),
+        })
     }
 }
