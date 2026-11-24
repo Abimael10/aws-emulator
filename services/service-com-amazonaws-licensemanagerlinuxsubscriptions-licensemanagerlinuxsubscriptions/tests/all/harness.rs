@@ -182,6 +182,19 @@ fn build_harness(with_secrets_manager: bool) -> Harness {
 /// (`POST /` with `X-Amz-Target: secretsmanager.<Operation>`), which is a different wire
 /// protocol from this service's `restJson1` — hence its own request builder here.
 pub async fn create_secret(h: &Harness, name: &str, members: &Value) -> String {
+    create_secret_in(h, REGION, name, members).await
+}
+
+/// [`create_secret`], addressed to `region`: the secret is stored in THAT Region, so the
+/// ARN Secrets Manager mints — and therefore the `SecretArn` a registration then names —
+/// carries it in its Region field.
+///
+/// A suite whose rule is about WHERE a secret is read needs a secret in a Region of its
+/// own choosing, which is the only part of this request that varies: Secrets Manager reads
+/// the Region a request is addressed to off its SigV4 credential scope, so the scope and
+/// the host-style endpoint both name `region` here, exactly as a client addressing that
+/// Region's endpoint sends them.
+pub async fn create_secret_in(h: &Harness, region: &str, name: &str, members: &Value) -> String {
     let mut body = json!({ "Name": name });
     for (member, value) in members
         .as_object()
@@ -205,14 +218,14 @@ pub async fn create_secret(h: &Harness, name: &str, members: &Value) -> String {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
-            "https://secretsmanager.{REGION}.amazonaws.com/"
+            "https://secretsmanager.{region}.amazonaws.com/"
         ))
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", "secretsmanager.CreateSecret")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{REGION}/secretsmanager\
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{region}/secretsmanager\
                  /aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
             ),
         )
