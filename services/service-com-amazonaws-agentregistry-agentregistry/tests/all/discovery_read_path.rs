@@ -816,6 +816,97 @@ async fn batch_get_reports_each_unresolvable_record_without_failing_the_call() {
 }
 
 #[tokio::test]
+async fn batch_get_error_entries_carry_only_the_members_the_service_populates() {
+    let router = seeded_router();
+    let unknown_arn =
+        format!("arn:aws:agent-registry:us-east-1:000000000000:registry/{REGISTRY}/record/zzz999999999");
+    // An existing record id, but under a registry the entry does not name.
+    let foreign_arn =
+        format!("arn:aws:agent-registry:us-east-1:000000000000:registry/{BULK_REGISTRY}/record/rec000000001");
+    // (case, the registry the entry names, the record ids it asks for, the ids
+    // reported in `errors`) — the class spans why a record does not resolve (unknown
+    // id, unknown ARN, an ARN scoped to another registry, a status that keeps the
+    // record off the discovery surface, a registry exposing no record at all), the two
+    // identifier forms `RecordIdentifier` admits, and how many entries one call
+    // reports.
+    let cases: [(&str, &str, Vec<&str>, Vec<&str>); 6] = [
+        (
+            "one unknown id",
+            REGISTRY,
+            vec!["zzz999999999"],
+            vec!["zzz999999999"],
+        ),
+        (
+            "an unknown id in ARN form",
+            REGISTRY,
+            vec![unknown_arn.as_str()],
+            vec![unknown_arn.as_str()],
+        ),
+        (
+            "an existing record scoped to another registry",
+            REGISTRY,
+            vec![foreign_arn.as_str()],
+            vec![foreign_arn.as_str()],
+        ),
+        (
+            // rec000000003 is DEPRECATED: stored, but not discoverable.
+            "a stored record that is not discoverable",
+            REGISTRY,
+            vec!["rec000000003"],
+            vec!["rec000000003"],
+        ),
+        (
+            "several unresolvable ids beside a resolvable one",
+            REGISTRY,
+            vec!["rec000000001", "zzz999999999", "rec000000003", "yyy888888888"],
+            vec!["zzz999999999", "rec000000003", "yyy888888888"],
+        ),
+        (
+            "a registry exposing no discoverable record",
+            EMPTY_REGISTRY,
+            vec!["rec000000001"],
+            vec!["rec000000001"],
+        ),
+    ];
+    for (case, registry_id, requested, unresolvable) in cases {
+        let (status, body) = post(
+            &router,
+            "/discoverable-records-batch",
+            &json!({ "entries": [{ "registryId": registry_id, "recordIds": requested }] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status}: {body}");
+        let errors = body["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: errors must be a list, got {body}"));
+        // A per-record error reports the echoed registryId, the echoed recordId and
+        // the machine-readable errorCode, and NOTHING else: the optional
+        // human-readable `message` is a detail this service does not add, so the
+        // serialized entry's member set is these three for every such record.
+        let expected: Vec<Value> = unresolvable
+            .iter()
+            .map(|record_id| {
+                json!({
+                    "registryId": registry_id,
+                    "recordId": record_id,
+                    "errorCode": "RESOURCE_NOT_FOUND",
+                })
+            })
+            .collect();
+        assert_eq!(
+            errors, &expected,
+            "case {case:?}: expected exactly {expected:?}, got {errors:?}"
+        );
+        for error in errors {
+            assert!(
+                error.get("message").is_none(),
+                "case {case:?}: a per-record error must carry no message member, got {error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn batch_get_serializes_both_required_lists_even_when_one_is_empty() {
     let router = seeded_router();
     // (case, the registry the entry names, the record ids it asks for, records, errors)

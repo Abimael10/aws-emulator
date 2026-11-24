@@ -233,17 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .flatten();
                 match record {
                     Some(record) => registry_records.push(record.summary()),
-                    None => errors.push(BatchGetDiscoverableRegistryRecordError2 {
-                        registry_id: entry.registry_id.clone(),
-                        // Echoed in the format the caller supplied (ARN or record
-                        // id), as the model's `recordId` doc requires.
-                        record_id: requested.clone(),
-                        error_code: ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
-                        message: Some(
-                            "No discoverable registry record was found for this identifier."
-                                .to_string(),
-                        ),
-                    }),
+                    None => errors.push(record_not_found(&entry.registry_id, requested)),
                 }
             }
         }
@@ -260,6 +250,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// [`BATCH_GET_DISCOVERABLE_REGISTRY_RECORD_ERROR_CODE_VALUES`] for the model's
 /// full value list.
 const ERROR_CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
+
+/// The per-record error reported for a requested record this registry does not
+/// expose.
+///
+/// The entry carries exactly the members the service has a value for: the echoed
+/// `registryId`, the echoed `recordId` and the machine-readable `errorCode`. The
+/// optional `message` is a human-readable DETAIL the service does not add for this
+/// class — there is nothing to say about it beyond the code — so the member is left
+/// absent rather than filled with a restatement of the code, and the serialized
+/// entry's member set is the same for every record that could not be retrieved.
+fn record_not_found(registry_id: &str, requested: &str) -> BatchGetDiscoverableRegistryRecordError2 {
+    BatchGetDiscoverableRegistryRecordError2 {
+        registry_id: registry_id.to_string(),
+        // Echoed in the format the caller supplied (ARN or record id), as the
+        // model's `recordId` doc requires.
+        record_id: requested.to_string(),
+        error_code: ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
+        message: None,
+    }
+}
 
 /// `BatchGetDiscoverableRegistryRecordRequest$entries` is modelled
 /// `@length{min:1,max:1}` — "Currently, you can specify exactly one entry".
