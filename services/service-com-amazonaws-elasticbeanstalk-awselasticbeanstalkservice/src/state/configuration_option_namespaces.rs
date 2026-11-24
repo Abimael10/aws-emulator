@@ -22,10 +22,12 @@
 //! platform version's namespaces hold: the namespaces whose option names the
 //! CALLER chooses carry no description at all, and the ones belonging to a
 //! resource this emulator does not provision carry none here either. Whether an
-//! individual option NAME inside a namespace the platform defines is one the
-//! catalog publishes a description of is therefore a different question, and
-//! not one this resolution answers — answering it from these tables would
-//! refuse settings the real service accepts.
+//! individual option NAME is one the namespace holds is therefore a different
+//! question, and one this resolution does not answer — it is asked of the
+//! catalog a platform version PUBLISHES, by the evaluation in
+//! [`super::configuration_setting_validation`], and only of a namespace that
+//! catalog states the names of: a namespace it describes no option of states
+//! none, so asking it there would refuse settings the real service accepts.
 //!
 //! Split out of [`super`] so the one walk over every option table any platform
 //! version can publish lives beside the namespaces those tables do not carry.

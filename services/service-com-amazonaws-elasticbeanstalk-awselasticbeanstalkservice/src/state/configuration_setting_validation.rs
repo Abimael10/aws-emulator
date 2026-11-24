@@ -11,7 +11,10 @@
 //! OptionName)` pair whose namespace no platform version defines
 //! ([`super::configuration_option_namespaces`]) names no configuration option,
 //! so it is reported as an unknown configuration setting rather than having a
-//! value of it compared with a restriction that does not exist.
+//! value of it compared with a restriction that does not exist. The same holds
+//! of the option NAME inside a namespace whose names the platform itself states
+//! — one the catalog below publishes options of: a name that is not among them
+//! names no configuration option of that namespace either.
 //!
 //! The published description of an option states what values it takes — a
 //! numeric range, a length, a regular expression, a value set — and
@@ -23,10 +26,13 @@
 //!
 //! One restriction is stated in terms of ANOTHER option rather than of a
 //! constant: `MinSize` is "minimum number of instances you want running. Must be
-//! a positive integer no greater than MaxSize". A bound like that is resolved
-//! against the configuration the desired settings put IN FORCE, which is what
-//! makes an inverted pair of Auto Scaling group sizes two defects — a minimum
-//! above the maximum in force, and that maximum below the minimum in force.
+//! a positive integer no greater than MaxSize". A requirement like that is a
+//! CO-REQUIREMENT between the two options rather than a bound of either one, so
+//! it is resolved against the configuration the desired settings put IN FORCE
+//! and reported as the co-requirement it is — which is what makes an inverted
+//! pair of Auto Scaling group sizes two defects, a minimum above the maximum and
+//! that maximum below the minimum, neither of them a value outside the range the
+//! option's own published description states.
 //!
 //! Split out of [`super`] so the evaluation lives beside the option tables it
 //! reads, and so every operation that takes option settings has one place to
@@ -102,6 +108,19 @@ fn unknown_specification_message(namespace: &str, option_name: &str) -> String {
 /// it cannot be compared with.
 const NOT_A_NUMBER_REQUIREMENT: &str = "Value is not a number";
 
+/// The co-requirement the Auto Scaling group's minimum size breaks when the
+/// maximum in force is below it: `MinSize` is "minimum number of instances you
+/// want running. Must be a positive integer no greater than MaxSize", so the
+/// defect is the ORDER of the pair rather than the value being outside the range
+/// that option's published description states. FIXED text, naming the two
+/// options the requirement relates; the value it is reported for is the one the
+/// request sent.
+const MIN_SIZE_ABOVE_MAX_SIZE_REQUIREMENT: &str = "MinSize is greater than MaxSize";
+
+/// The SAME co-requirement read from the other side — the maximum size, with a
+/// minimum above it in force. See [`MIN_SIZE_ABOVE_MAX_SIZE_REQUIREMENT`].
+const MAX_SIZE_BELOW_MIN_SIZE_REQUIREMENT: &str = "MaxSize is less than MinSize";
+
 /// The option that names the IAM instance profile the instances a configuration
 /// launches are given — "an instance profile enables Amazon EC2 instances to
 /// access other Amazon Web Services resources" — in the launch-configuration
@@ -164,18 +183,17 @@ pub const CONFIGURATION_VALIDATION_PREFIX: &str = "Configuration validation exce
 ///
 /// The same evaluation `ValidateConfigurationSettings` reports, so a value that
 /// operation calls an error is one a write refuses, asked of the request's OWN
-/// settings alone: a write is refused for a value the option itself does not
-/// take, which is the value its caller supplied and can correct. A bound one
-/// option states in terms of another is a property of the whole configuration
-/// rather than of a value in the request, so it is reported by the operation
-/// whose answer is that evaluation. The first message is what the refusal
-/// states, so a request carrying several defective values names the first one it
-/// sent.
+/// settings alone: a write is refused for a specification the platform does not
+/// resolve and for a value the option itself does not take, which is what its
+/// caller supplied and can correct. A co-requirement between two options is
+/// resolved against those same settings, so a request that inverts the pair it
+/// sends is refused for it. The first message is what the refusal states, so a
+/// request carrying several defective values names the first one it sent.
 pub fn configuration_validation_refusal(
     catalog: &[&'static ConfigurationOption],
     desired: &[ConfigurationOptionSetting],
 ) -> Option<String> {
-    configuration_validation_messages(catalog, desired, &[])
+    configuration_validation_messages(catalog, desired, desired)
         .into_iter()
         .find_map(|reported| reported.message)
         .map(|message| format!("{CONFIGURATION_VALIDATION_PREFIX}{message}"))
@@ -244,9 +262,10 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 /// ANOTHER option is resolved against.
 ///
 /// Each setting is RESOLVED first and evaluated second: a specification naming a
-/// namespace no platform version defines names no configuration option, so it is
-/// reported as an unknown configuration setting instead of having a value of it
-/// evaluated (see [`super::configuration_option_namespaces`]).
+/// namespace no platform version defines, or an option name a namespace whose
+/// names the platform states does not hold, names no configuration option — so
+/// it is reported as an unknown configuration setting instead of having a value
+/// of it evaluated (see [`super::configuration_option_namespaces`]).
 ///
 /// One message per defective setting, in the order the request listed them, so a
 /// caller sending several settings is told about each of them rather than only
@@ -278,17 +297,31 @@ pub fn configuration_validation_messages(
             ));
             continue;
         }
-        // An option the catalog publishes no description for carries no
-        // restriction to evaluate: inside a namespace the platform DOES define,
-        // a configuration legitimately sets options whose description is not
-        // part of this catalog — the environment properties passed to the
-        // application, whose names the caller chooses, and a setting scoped to a
-        // resource of its own — so a setting with no published description
-        // contributes no message.
+        // The option NAME is resolved the same way, where the namespace STATES
+        // its names: a namespace the catalog publishes options of holds the
+        // platform's own option names, and the catalog
+        // `DescribeConfigurationOptions` publishes for this platform version is
+        // the set of them — so a name that is not among them names no
+        // configuration option of that namespace, whatever value it carries.
+        //
+        // A namespace the catalog publishes NO option of states no names, so a
+        // setting in one of those is resolved whatever it is called and carries
+        // no published description to evaluate: a configuration legitimately
+        // sets options whose names the CALLER chooses (the environment
+        // properties passed to the application, the template parameters),
+        // options scoped to a resource of their own, and options of a resource
+        // this service describes none of.
         let Some(option) = catalog
             .iter()
             .find(|option| option.namespace == namespace && option.name == option_name)
         else {
+            if catalog_states_option_names(catalog, namespace) {
+                messages.push(invalid_setting(
+                    namespace,
+                    option_name,
+                    unknown_specification_message(namespace, option_name),
+                ));
+            }
             continue;
         };
         // A setting carrying no value, or the empty one, states no desired value
@@ -309,14 +342,28 @@ pub fn configuration_validation_messages(
     messages
 }
 
+/// Whether the published catalog `catalog` STATES the option names of the
+/// namespace `namespace` — true where it publishes a description of any option
+/// in it, which is what makes the set of names it publishes for that namespace
+/// the platform's own set.
+fn catalog_states_option_names(
+    catalog: &[&'static ConfigurationOption],
+    namespace: &str,
+) -> bool {
+    catalog.iter().any(|option| option.namespace == namespace)
+}
+
 /// The requirement `value` fails of the ones `option`'s published description
 /// carries — `None` where the option takes the value.
 ///
 /// The four restrictions are the four members the description publishes: the
 /// value set a selection draws from, the range a numeric option lies in, the
-/// length a string option is inside, and the regular expression it matches. They
-/// are checked in that order, and the FIRST one failed is reported: one setting
-/// earns one message, naming the requirement it did not meet.
+/// length a string option is inside, and the regular expression it matches. A
+/// fifth is the co-requirement a description states in terms of ANOTHER option's
+/// value, which is asked of the configuration `in_force` once the value is
+/// inside the option's own published range. They are checked in that order, and
+/// the FIRST one failed is reported: one setting earns one message, naming the
+/// requirement it did not meet.
 fn unmet_requirement(
     option: &ConfigurationOption,
     value: &str,
@@ -341,7 +388,11 @@ fn unmet_requirement(
             ));
         }
     }
-    let (minimum, maximum) = required_range(option, in_force);
+    // The range is the one the option's OWN published description states, so a
+    // bound this reports is one `DescribeConfigurationOptions` publishes for the
+    // same option — never a value read off another option.
+    let minimum = option.min_value.map(i64::from);
+    let maximum = option.max_value.map(i64::from);
     if minimum.is_some() || maximum.is_some() {
         // A range is published only for an option whose value IS a number, so a
         // value that is not one meets no bound of it.
@@ -357,6 +408,9 @@ fn unmet_requirement(
             if number > maximum {
                 return Some(format!("Value exceeds maximum allowed value: {maximum}"));
             }
+        }
+        if let Some(requirement) = unmet_co_requirement(option, number, in_force) {
+            return Some(requirement.to_string());
         }
     }
     if let Some(max_length) = option.max_length {
@@ -402,48 +456,38 @@ fn published_expression(pattern: &'static str) -> Option<&'static ::regex::Regex
         .map(|(_, compiled)| compiled)
 }
 
-/// The range `option`'s value has to lie in, given the configuration `in_force`:
-/// the range its published description carries, narrowed by any bound that
-/// description states in terms of ANOTHER option's value.
+/// The co-requirement the desired `value` of `option` breaks against the
+/// configuration `in_force` — `None` where the option's published description
+/// states none, or where the configuration in force keeps it.
 ///
-/// The one such pair is the Auto Scaling group's: `MinSize` is "minimum number
-/// of instances you want running. Must be a positive integer no greater than
-/// MaxSize", so the maximum in force caps the minimum and — the same constraint
-/// read from the other side — the minimum in force floors the maximum. That is
-/// what makes an inverted pair two defects, one on each half, each reported
-/// against the bound the other half puts in force.
+/// The one such requirement this catalog publishes is the Auto Scaling group's:
+/// `MinSize` is "minimum number of instances you want running. Must be a
+/// positive integer no greater than MaxSize", which relates the two sizes rather
+/// than bounding either one — so a minimum above the maximum in force breaks it,
+/// and so does a maximum below the minimum in force, the same requirement read
+/// from the other side. That is what makes an inverted pair two defects, one on
+/// each half, each naming the requirement the pair broke instead of a limit the
+/// option does not publish.
 ///
-/// A platform version whose catalog does not publish the pair has no such group,
-/// and a bound set to something that is not a number states no bound at all (it
-/// fails its own option's published range instead, which is where it is
-/// reported).
-fn required_range(
+/// A configuration that puts no number in force for the other half states no
+/// such requirement (a half set to something that is not a number fails its own
+/// option's published range, which is where that is reported).
+fn unmet_co_requirement(
     option: &ConfigurationOption,
+    value: i64,
     in_force: &[ConfigurationOptionSetting],
-) -> (Option<i64>, Option<i64>) {
-    let mut minimum = option.min_value.map(i64::from);
-    let mut maximum = option.max_value.map(i64::from);
-    if option.namespace == NAMESPACE_AUTOSCALING_ASG {
-        if option.name == OPTION_MIN_SIZE {
-            maximum = narrowest(maximum, group_size(in_force, OPTION_MAX_SIZE), i64::min);
-        } else if option.name == OPTION_MAX_SIZE {
-            minimum = narrowest(minimum, group_size(in_force, OPTION_MIN_SIZE), i64::max);
-        }
+) -> Option<&'static str> {
+    if option.namespace != NAMESPACE_AUTOSCALING_ASG {
+        return None;
     }
-    (minimum, maximum)
-}
-
-/// The tighter of a published bound and one another option's value states,
-/// `narrower` deciding which of two bounds that is — whichever of the two is
-/// present.
-fn narrowest(
-    published: Option<i64>,
-    stated: Option<i64>,
-    narrower: impl Fn(i64, i64) -> i64,
-) -> Option<i64> {
-    match (published, stated) {
-        (Some(published), Some(stated)) => Some(narrower(published, stated)),
-        (bound, None) | (None, bound) => bound,
+    if option.name == OPTION_MIN_SIZE {
+        let maximum = group_size(in_force, OPTION_MAX_SIZE)?;
+        (value > maximum).then_some(MIN_SIZE_ABOVE_MAX_SIZE_REQUIREMENT)
+    } else if option.name == OPTION_MAX_SIZE {
+        let minimum = group_size(in_force, OPTION_MIN_SIZE)?;
+        (value < minimum).then_some(MAX_SIZE_BELOW_MIN_SIZE_REQUIREMENT)
+    } else {
+        None
     }
 }
 
@@ -565,8 +609,9 @@ mod tests {
     }
 
     /// RULE: the group's minimum may be no greater than its maximum, so an
-    /// inverted pair is reported on BOTH halves — each against the bound the
-    /// other one puts in force.
+    /// inverted pair is reported on BOTH halves — each naming the
+    /// co-requirement the pair broke rather than a limit of the option itself,
+    /// whose published range both values are inside.
     #[test]
     fn an_inverted_group_size_pair_is_reported_on_both_halves() {
         let desired = vec![
@@ -581,18 +626,46 @@ mod tests {
                     OPTION_MIN_SIZE.to_string(),
                     format!(
                         "Invalid option value: '4' (Namespace: '{NAMESPACE_AUTOSCALING_ASG}', \
-                         OptionName: '{OPTION_MIN_SIZE}'): Value exceeds maximum allowed value: 2"
+                         OptionName: '{OPTION_MIN_SIZE}'): \
+                         {MIN_SIZE_ABOVE_MAX_SIZE_REQUIREMENT}"
                     )
                 ),
                 (
                     OPTION_MAX_SIZE.to_string(),
                     format!(
                         "Invalid option value: '2' (Namespace: '{NAMESPACE_AUTOSCALING_ASG}', \
-                         OptionName: '{OPTION_MAX_SIZE}'): Value is below minimum allowed value: 4"
+                         OptionName: '{OPTION_MAX_SIZE}'): \
+                         {MAX_SIZE_BELOW_MIN_SIZE_REQUIREMENT}"
                     )
                 ),
             ],
             "case \"an inverted pair\": expected a message on each half, got {messages:?}"
+        );
+    }
+
+    /// RULE: an option name a namespace whose names the catalog states does not
+    /// hold names no configuration option, so it earns the same unknown-setting
+    /// message an unresolved namespace does; a namespace the catalog states no
+    /// names of resolves whatever the option is called.
+    #[test]
+    fn an_option_name_the_namespace_does_not_hold_is_reported_as_unknown() {
+        let unknown = "NotAnOptionInThisNamespace";
+        let desired = vec![
+            setting(NAMESPACE_AUTOSCALING_ASG, unknown, "2"),
+            setting(NAMESPACE_APPLICATION_ENVIRONMENT, unknown, "2"),
+        ];
+        let messages = configuration_validation_messages(&catalog(), &desired, &desired);
+        assert_eq!(
+            reported(&messages),
+            vec![(
+                unknown.to_string(),
+                format!(
+                    "Invalid option specification (Namespace: '{NAMESPACE_AUTOSCALING_ASG}', \
+                     OptionName: '{unknown}'): Unknown configuration setting."
+                )
+            )],
+            "case \"a name the namespace does not publish\": expected one message, about the \
+             namespace whose names the catalog states, got {messages:?}"
         );
     }
 

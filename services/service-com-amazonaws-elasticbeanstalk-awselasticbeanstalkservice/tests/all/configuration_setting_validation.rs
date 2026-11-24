@@ -26,11 +26,14 @@
 //!   than a value to correct — each a warning-severity `ValidationMessage` scoped
 //!   to the option the advice is about, reported after the errors, and a
 //!   configuration that carries none is reported with none;
-//! * a bound one option states in terms of ANOTHER (`MinSize` must be "no
-//!   greater than MaxSize") is resolved against the configuration the desired
-//!   settings put IN FORCE, so an inverted pair is reported on both halves, and
-//!   a request that raises only the minimum is reported against the maximum the
-//!   configuration set already carries;
+//! * a requirement one option states in terms of ANOTHER (`MinSize` must be "no
+//!   greater than MaxSize") is a co-requirement between the two, resolved
+//!   against the configuration the desired settings put IN FORCE: an inverted
+//!   pair is reported on both halves, each naming the co-requirement the pair
+//!   broke rather than a bound of its own option, and a request that raises only
+//!   the minimum is reported against the maximum the configuration set already
+//!   carries (`all/configuration_option_specification_resolution.rs` is the
+//!   suite that spans that class);
 //! * the configuration set the evaluation is made for is the one the request
 //!   names — a stored template or a stored running environment, never both and
 //!   never neither — and a request naming one this account does not hold is
@@ -480,12 +483,34 @@ async fn one_message_is_reported_per_defective_setting() {
     );
 }
 
+/// The two clauses the Auto Scaling group's size co-requirement is reported
+/// with, one per side of the pair — word for word as the service states them.
+const MIN_ABOVE_MAX: &str = "MinSize is greater than MaxSize";
+/// See [`MIN_ABOVE_MAX`].
+const MAX_BELOW_MIN: &str = "MaxSize is less than MinSize";
+
 #[tokio::test]
 async fn an_inverted_auto_scaling_group_pair_is_reported_on_both_halves() {
     let emulator = emulator_with_configuration_sets().await;
 
-    // Both halves sent, inverted: each one is outside the bound the other puts
-    // in force, so each one is reported.
+    // Both halves of the published range admit both values, so neither of them
+    // is outside a bound of its own option: what the pair breaks is the
+    // requirement BETWEEN the two options.
+    let min_size = published(ASG, MIN_SIZE);
+    let max_size = published(ASG, MAX_SIZE);
+    for (option, value) in [(min_size, 4), (max_size, 2)] {
+        assert!(
+            option.min_value.is_none_or(|minimum| value >= minimum)
+                && option.max_value.is_none_or(|maximum| value <= maximum),
+            "case {:?}: expected {value} to be inside the published range {:?}..{:?}",
+            option.name,
+            option.min_value,
+            option.max_value
+        );
+    }
+
+    // Both halves sent, inverted: each one is reported against the
+    // co-requirement the pair broke, read from its own side.
     let answer = validated(
         &emulator,
         &[(ASG, MIN_SIZE, "4", ""), (ASG, MAX_SIZE, "2", "")],
@@ -499,40 +524,32 @@ async fn an_inverted_auto_scaling_group_pair_is_reported_on_both_halves() {
                 namespace: ASG.to_string(),
                 option_name: MIN_SIZE.to_string(),
                 severity: "error".to_string(),
-                message: invalid_value(
-                    ASG,
-                    MIN_SIZE,
-                    "4",
-                    "Value exceeds maximum allowed value: 2"
-                ),
+                message: invalid_value(ASG, MIN_SIZE, "4", MIN_ABOVE_MAX),
             },
             ReportedMessage {
                 namespace: ASG.to_string(),
                 option_name: MAX_SIZE.to_string(),
                 severity: "error".to_string(),
-                message: invalid_value(
-                    ASG,
-                    MAX_SIZE,
-                    "2",
-                    "Value is below minimum allowed value: 4"
-                ),
+                message: invalid_value(ASG, MAX_SIZE, "2", MAX_BELOW_MIN),
             },
         ],
-        "case \"an inverted pair\": expected an error on each half of the pair, each against the \
-         bound the other half puts in force, got {reported:?}"
+        "case \"an inverted pair\": expected an error on each half of the pair, each naming the \
+         co-requirement the pair broke, got {reported:?}"
     );
 
     // Only the minimum sent, above the maximum the TEMPLATE carries (9): the
-    // bound comes from the configuration in force, so the half the request sent
-    // is the one reported.
+    // other half of the requirement comes from the configuration in force, so
+    // the half the request sent is the one reported.
     let answer = validated(&emulator, &[(ASG, MIN_SIZE, "12", "")]).await;
     let reported = reported_errors(&answer);
     assert_eq!(
-        reported
-            .iter()
-            .map(|message| message.option_name.clone())
-            .collect::<Vec<String>>(),
-        vec![MIN_SIZE.to_string()],
+        reported,
+        vec![ReportedMessage {
+            namespace: ASG.to_string(),
+            option_name: MIN_SIZE.to_string(),
+            severity: "error".to_string(),
+            message: invalid_value(ASG, MIN_SIZE, "12", MIN_ABOVE_MAX),
+        }],
         "case \"above the stored maximum\": expected one message about the option the request \
          set, got {reported:?}"
     );
