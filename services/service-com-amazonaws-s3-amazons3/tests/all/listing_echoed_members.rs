@@ -1289,6 +1289,24 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
             keys: &["notes/may.txt"],
             reports: &["notes/may.txt"],
         },
+        // The two rows one byte either side of the position, so what the cursor names is a
+        // position in the KEY ORDER rather than an offset into the bucket: a key that sorts
+        // immediately past it is reported and one that sorts immediately before it is not.
+        Resumed {
+            case: "a bucket holding one key one byte past the position",
+            keys: &["notes/may.txt.bak"],
+            reports: &["notes/may.txt.bak"],
+        },
+        Resumed {
+            case: "a bucket holding one key one byte before the position",
+            keys: &["notes/may.tx"],
+            reports: &[],
+        },
+        Resumed {
+            case: "a bucket holding nothing at all reports no entry",
+            keys: &[],
+            reports: &[],
+        },
     ];
 
     for (index, row) in rows.iter().enumerate() {
@@ -1335,6 +1353,26 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
             row.case,
             text(&resumed)
         );
+        // "KeyCount is the number of keys returned with this request", and the page carries
+        // every key of this bucket at or after the position, so nothing is left for a
+        // further one.
+        assert_eq!(
+            (
+                listing.field("KeyCount"),
+                listing.field("IsTruncated"),
+                listing.field("NextContinuationToken")
+            ),
+            (
+                row.reports.len().to_string(),
+                "false".to_string(),
+                String::new()
+            ),
+            "case {:?}: expected an untruncated page of {} key(s) handing back no token, got \
+             {:?}",
+            row.case,
+            row.reports.len(),
+            text(&resumed)
+        );
     }
 
     // The CONTROL: only a value this service minted for an object listing names a position,
@@ -1360,4 +1398,112 @@ async fn an_object_listing_token_names_a_position_and_resumes_whichever_bucket_i
             assert_token_refused(&format!("{addressed}/{why}"), &refused, true);
         }
     }
+}
+
+/// RULE, carried across PAGES and in BOTH directions: a token one bucket's listing issued
+/// keeps walking the addressed bucket page by page — each page of that bucket hands back its
+/// own token, which continues the SAME bucket — and a token the second bucket issued walks
+/// the first just the same, so neither bucket owns the tokens its listings minted.
+#[tokio::test]
+async fn an_issued_token_walks_the_addressed_bucket_page_by_page_either_way() {
+    let router = router();
+    let issuer = "token-walk-issuer";
+    bucket(&router, issuer).await;
+    store_keys(&router, issuer, TOKEN_POSITION_KEYS).await;
+    // The addressed bucket holds keys on BOTH sides of the issued position and more of them
+    // than one page carries, so the walk has something to report and something to leave.
+    let addressed = "token-walk-addressed";
+    let addressed_keys: &[&str] = &["aaa.txt", "notes/may.txt", "notes/zulu.txt", "zzz.txt"];
+    bucket(&router, addressed).await;
+    store_keys(&router, addressed, addressed_keys).await;
+
+    let first = list_objects_v2(&router, issuer, "&max-keys=1").await;
+    let token = element(&first, "NextContinuationToken").unwrap_or_else(|| {
+        panic!(
+            "case \"the issuing bucket\": a truncated page hands back a token, got {:?}",
+            text(&first)
+        )
+    });
+
+    // One key per page, starting from the token the OTHER bucket's listing issued: the walk
+    // reports the addressed bucket's keys at or after that position, in order.
+    let mut walked: Vec<String> = Vec::new();
+    let mut carried = token.clone();
+    for step in 0..addressed_keys.len() {
+        let case = format!("step {step} of the walk");
+        let answer = list_objects_v2(
+            &router,
+            addressed,
+            &format!(
+                "&max-keys=1&continuation-token={}",
+                handed_back_in_query(&carried)
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: each page of the walk is served, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let page = listing_of(&answer);
+        walked.extend(page.keys());
+        let next = page.field("NextContinuationToken");
+        assert_eq!(
+            page.field("IsTruncated"),
+            match next.is_empty() {
+                true => "false",
+                false => "true",
+            },
+            "case {case:?}: a page is truncated exactly when it hands back a token, got {:?}",
+            text(&answer)
+        );
+        if next.is_empty() {
+            break;
+        }
+        carried = next;
+    }
+    assert_eq!(
+        walked,
+        vec![
+            "notes/may.txt".to_string(),
+            "notes/zulu.txt".to_string(),
+            "zzz.txt".to_string(),
+        ],
+        "the walk from the other bucket's token must report the addressed bucket's keys at or \
+         after the issued position, got {walked:?}"
+    );
+
+    // And back: a token the ADDRESSED bucket's own listing issued names a position in the
+    // ISSUING bucket, which is where its listing resumes.
+    let from_addressed = element(
+        &list_objects_v2(&router, addressed, "&max-keys=1").await,
+        "NextContinuationToken",
+    )
+    .unwrap_or_else(|| panic!("the addressed bucket's bounded page hands back a token"));
+    let back = list_objects_v2(
+        &router,
+        issuer,
+        &format!(
+            "&continuation-token={}",
+            handed_back_in_query(&from_addressed)
+        ),
+    )
+    .await;
+    assert_eq!(
+        back.status,
+        200,
+        "the other bucket's token must resume this listing, got {} with body {:?}",
+        back.status,
+        text(&back)
+    );
+    // That token names "notes/may.txt" — the addressed bucket's second key — so the issuing
+    // bucket resumes at its own keys from there on.
+    assert_eq!(
+        listing_of(&back).keys(),
+        vec!["notes/may.txt".to_string(), "plain.txt".to_string()],
+        "expected the issuing bucket's keys at or after the position, got {:?}",
+        listing_of(&back).keys()
+    );
 }
