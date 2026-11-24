@@ -38,7 +38,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
-    blank_reference_id_message, unknown_reference_message, CHANNEL_CONTAINS_ERRORS_MESSAGE,
+    blank_reference_id_message, missing_reference_id_message, unknown_reference_message,
+    CHANNEL_CONTAINS_ERRORS_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -55,11 +56,6 @@ const UNMINTED_CLUSTER_ID: &str = "8009999";
 /// (`FIRST_CHANNEL_PLACEMENT_GROUP_ID` and up), that no
 /// `CreateChannelPlacementGroup` ever minted in the account under test.
 const UNMINTED_GROUP_ID: &str = "9009999";
-
-/// An id of the shape this service mints for an input, that no `CreateInput`
-/// ever minted in the account under test — for the row that carries a problem in
-/// another member of the same configuration.
-const UNMINTED_INPUT_ID: &str = "9999999";
 
 /// One problem a refusal reports: the element path it was found at, and the
 /// message that says what it is.
@@ -235,13 +231,13 @@ fn no_group() -> Problem {
     )
 }
 
-/// The problem an `inputAttachments` entry at `index` naming the unresolvable id
-/// `id` carries — the reference member this rule already applied to, here to pin
-/// that one request carrying both reports both.
-fn unresolvable_attachment(index: usize, id: &str) -> Problem {
+/// The problem an `inputAttachments` entry at `index` naming no input at all
+/// carries — another reference member of the same configuration, here to pin that
+/// one request carrying a problem in each reports both.
+fn nameless_attachment(index: usize) -> Problem {
     (
         format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("Input", id),
+        missing_reference_id_message("inputAttachments"),
     )
 }
 
@@ -367,18 +363,19 @@ async fn a_create_refuses_a_placement_it_cannot_resolve() {
         (
             // Two reference members of one configuration, so the refusal reports
             // every problem the configuration carries rather than the first one
-            // it meets.
-            "an unresolvable attachment and an unresolvable cluster",
+            // it meets. The attachment names NO input: an attachment that names
+            // an input this account does not hold is a problem with the request
+            // itself, answered before this rule runs
+            // (`crate::channel_configuration_validation`).
+            "an attachment naming no input and an unresolvable cluster",
             json!({
                 "name": "both-members",
                 "encoderSettings": channel_encoder_settings(),
-                "inputAttachments": [
-                    { "inputAttachmentName": "ghost", "inputId": UNMINTED_INPUT_ID },
-                ],
+                "inputAttachments": [{ "inputAttachmentName": "nameless" }],
                 "anywhereSettings": { "clusterId": UNMINTED_CLUSTER_ID },
             }),
             vec![
-                unresolvable_attachment(0, UNMINTED_INPUT_ID),
+                nameless_attachment(0),
                 unresolvable_cluster(UNMINTED_CLUSTER_ID),
             ],
         ),

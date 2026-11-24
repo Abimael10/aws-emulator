@@ -378,16 +378,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refusal for a member the request never supplied.
             held: Some(stored),
         };
-        // An attachment this update ADDS may name an input whose delete this
-        // service has already accepted: a real, identified input in a state no
-        // channel can ingest through, so the request itself is what cannot be
-        // served — the same modelled client error, with the same wording,
-        // `CreateChannel` answers such an attachment with.
-        if let Some((input_id, input_state)) = state.unusable_attached_input(&configuration) {
-            return Err(bad_request(&crate::state::attached_input_state_message(
-                &input_id,
-                &input_state,
-            )));
+        // An attachment this update ADDS may name an input this account holds no
+        // input for, or one whose delete this service has already accepted: a
+        // request naming an input no channel can ingest through is what cannot
+        // be served — the same modelled client error, through the same rule and
+        // with the same wording, `CreateChannel` answers such an attachment
+        // with.
+        if let Some(message) = state.attached_input_refusal(&configuration) {
+            return Err(bad_request(&message));
         }
         let mut problems = state.channel_configuration_problems(&configuration);
         // The channel's schedule resolves its channel-scoped references —

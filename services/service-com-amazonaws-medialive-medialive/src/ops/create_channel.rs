@@ -201,12 +201,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `RoleArn` is "the role to assume when running the Channel", and a
+        // value that is not the ARN of an IAM role at all names no role: the
+        // MEMBER is malformed, which is a fact about the request itself, so it
+        // is reported here — with the request-shape rules, ahead of the rules
+        // about what the request LEAVES OUT and ahead of the IAM resolution
+        // below, which can only resolve a value that names a role.
+        let named_role = input.role_arn.as_deref().filter(|arn| !arn.is_empty());
+        if let Some(role_arn) = named_role {
+            crate::state::role_arn_syntax(role_arn).map_err(|message| bad_request(&message))?;
+        }
+
         // `InputAttachments` is a caller-chosen list, and every later read that
         // walks it (an input's `AttachedChannels`, a signal map's discovery)
         // costs work per entry, so its length is bounded here: a longer list is
         // out of bounds for this emulator and gets the operation's own modelled
         // client error rather than a channel nothing can read cheaply.
         let attachment_count = input.input_attachments.as_ref().map_or(0, Vec::len);
+        // A channel INGESTS through the inputs it attaches, so a create that
+        // attaches none describes no channel at all: its own structure is what
+        // cannot be served, and it earns the operation's modelled 400 here,
+        // with the request-shape rules around it and BEFORE any resource the
+        // request merely REFERENCES is resolved — the role it would run under
+        // included. A caller is told about the member it left out of the
+        // request rather than about the first reference the service happened to
+        // resolve, which is a different diagnosis of a different class.
+        if attachment_count == 0 {
+            return Err(bad_request(crate::state::MISSING_INPUT_ATTACHMENT_MESSAGE));
+        }
         if attachment_count > crate::state::MAX_INPUT_ATTACHMENTS {
             return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::too_many_channel_entries_message(
@@ -288,21 +310,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // `RoleArn` is "the role to assume when running the Channel", so a
-        // channel can only run under a role this account holds and this service
-        // is trusted to assume. The member is judged in two steps, which are two
-        // different refusals: a value that is not the ARN of an IAM role at all
-        // names no role and is a MALFORMED member, the operation's modelled 400;
-        // one that IS such an ARN is then resolved against this account's IAM
-        // and, where IAM answers that it does not name a role this service may
-        // assume, reported as a problem at the member the request spelled it in,
-        // in the operation's modelled 422. Both are answered BEFORE the channel
-        // is stored, and the resolution is asked with no store held, because it
-        // is a call into this emulator's own IAM.
-        let named_role = input.role_arn.as_deref().filter(|arn| !arn.is_empty());
-        if let Some(role_arn) = named_role {
-            crate::state::role_arn_syntax(role_arn).map_err(|message| bad_request(&message))?;
+        // The channel configuration this request WOULD store, assembled once:
+        // every rule below is a refusal class over the same configuration, so
+        // they are judged on one description of it rather than on several. A
+        // create holds no stored channel yet, so every reference it names is one
+        // it ADDS and each is resolved.
+        let configuration = crate::state::ChannelConfiguration {
+            encoder_settings: input.encoder_settings.as_ref(),
+            input_attachments: input.input_attachments.as_deref().unwrap_or_default(),
+            channel_security_groups: input
+                .channel_security_groups
+                .as_deref()
+                .unwrap_or_default(),
+            anywhere_settings: input.anywhere_settings.as_ref(),
+            held: None,
+        };
+
+        // The inputs the request attaches are resolved as part of the REQUEST:
+        // an `InputAttachment`'s `InputId` is "The ID of the input", so an id
+        // this account holds no input for names no input, and one whose delete
+        // this service has already accepted names a real input in a state no
+        // channel can ingest through. Either way the request itself is what
+        // cannot be served — this operation's modelled `BadRequestException`,
+        // naming the input the caller supplied and what is wrong with it — and
+        // it is answered BEFORE the role below is resolved, so a caller is told
+        // about the input it named rather than about the first reference the
+        // service happened to resolve. Asked in a scope of its own, so the store
+        // is not held while that resolution runs.
+        let attachment_refusal = {
+            let mut state = state.lock();
+            state.settle(now);
+            state.attached_input_refusal(&configuration)
+        };
+        if let Some(message) = attachment_refusal {
+            return Err(bad_request(&message));
         }
+
+        // `RoleArn` names "the role to assume when running the Channel", so a
+        // channel can only run under a role this account holds and this service
+        // is trusted to assume. The value's own SYNTAX was judged with the
+        // request's shape above; what is left is the RESOLUTION of the role it
+        // names against this account's IAM, and where IAM answers that it does
+        // not name a role this service may assume, that is reported as a
+        // problem at the member the request spelled it in, in the operation's
+        // modelled 422. Answered BEFORE the channel is stored, and asked with
+        // no store held, because it is a call into this emulator's own IAM.
         let role_problem = match named_role {
             Some(role_arn)
                 if ::service_common::iam_role::role_is_unassumable(
@@ -323,37 +375,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         state.settle(now);
-
-        // The channel configuration this request WOULD store, assembled once:
-        // the two rules below are two refusal classes over the same
-        // configuration, so they are judged on one description of it rather than
-        // on two. A create holds no stored channel yet, so every reference it
-        // names is one it ADDS and each is resolved.
-        let configuration = crate::state::ChannelConfiguration {
-            encoder_settings: input.encoder_settings.as_ref(),
-            input_attachments: input.input_attachments.as_deref().unwrap_or_default(),
-            channel_security_groups: input
-                .channel_security_groups
-                .as_deref()
-                .unwrap_or_default(),
-            anywhere_settings: input.anywhere_settings.as_ref(),
-            held: None,
-        };
-
-        // An attachment may name an input this account holds whose delete this
-        // service has already accepted: the input is identified and real, it is
-        // simply in a state no channel can ingest through, so the request itself
-        // is what cannot be served — this operation's modelled
-        // `BadRequestException`, naming the input and its state — rather than
-        // one more unresolvable-reference entry in the 422 below. Answered
-        // first, so a caller is told which input is unusable instead of being
-        // told that input does not exist.
-        if let Some((input_id, input_state)) = state.unusable_attached_input(&configuration) {
-            return Err(bad_request(&crate::state::attached_input_state_message(
-                &input_id,
-                &input_state,
-            )));
-        }
 
         // The whole channel configuration is validated BEFORE anything is
         // stored, so a request that does not describe a channel this service

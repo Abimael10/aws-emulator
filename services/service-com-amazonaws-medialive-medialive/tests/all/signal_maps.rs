@@ -78,6 +78,10 @@ async fn channels_with_links(
 
 /// One row of the discovery table: a graph to build and what discovery must
 /// find when it is entered from one of its channels.
+///
+/// A channel ingests through the inputs it attaches, so every channel this suite
+/// creates attaches one and discovery finds that input beside the channel: a row's
+/// counts are over the channels it reaches AND their inputs.
 struct Topology {
     case: &'static str,
     /// The channels to create, in order.
@@ -86,9 +90,11 @@ struct Topology {
     links: &'static [(usize, usize)],
     /// Which channel the signal map's discovery entry point names.
     entry: usize,
-    /// How many resources discovery must find.
+    /// How many resources discovery must find: the channels it reaches and the
+    /// input each of them attaches.
     resources: usize,
-    /// The entry point's source and destination neighbour counts.
+    /// The entry point's source and destination neighbour counts — the input it
+    /// attaches is one of its sources.
     neighbors: (usize, usize),
 }
 
@@ -111,40 +117,40 @@ async fn signal_map_discovery_maps_the_graph_its_entry_point_reaches() {
             names: &["solo"],
             links: &[],
             entry: 0,
-            resources: 1,
-            neighbors: (0, 0),
+            resources: 2,
+            neighbors: (1, 0),
         },
         Topology {
             case: "follower entered",
             names: &["lead", "follower"],
             links: &[(1, 0)],
             entry: 1,
-            resources: 2,
-            neighbors: (1, 0),
+            resources: 4,
+            neighbors: (2, 0),
         },
         Topology {
             case: "primary entered",
             names: &["lead", "follower"],
             links: &[(1, 0)],
             entry: 0,
-            resources: 2,
-            neighbors: (0, 1),
+            resources: 4,
+            neighbors: (1, 1),
         },
         Topology {
             case: "two followers",
             names: &["lead", "first", "second"],
             links: &[(1, 0), (2, 0)],
             entry: 0,
-            resources: 3,
-            neighbors: (0, 2),
+            resources: 6,
+            neighbors: (1, 2),
         },
         Topology {
             case: "unlinked channel left out",
             names: &["solo", "unrelated"],
             links: &[],
             entry: 0,
-            resources: 1,
-            neighbors: (0, 0),
+            resources: 2,
+            neighbors: (1, 0),
         },
     ];
 
@@ -264,8 +270,9 @@ async fn signal_map_discovery_maps_the_graph_its_entry_point_reaches() {
         );
         for key in discovered.keys() {
             assert!(
-                arns.contains(key),
-                "case {case:?}: expected every discovered key to be a created channel's ARN, got {key:?}"
+                arns.contains(key) || key.contains(&format!(":{ACCOUNT}:input:")),
+                "case {case:?}: expected every discovered key to be a created channel's ARN or \
+                 one of the inputs they attach, got {key:?}"
             );
         }
         // A neighbour a discovered resource names is itself discovered: the map
@@ -816,16 +823,18 @@ struct Graph {
 /// The rows differ along how many inputs a channel attaches and how far from
 /// the entry point the attachment is — which is what the rule generalises over.
 /// No row shares one input between two channels: an input is attached to at most
-/// one channel at a time, so that graph cannot be created; a channel reached
-/// through another channel is covered by the linked-channel row instead. The
-/// issue's recorded case (one channel, one attached input, entered at the
-/// channel) is the first row.
+/// one channel at a time, so that graph cannot be created; nor does any row carry
+/// a channel that attaches NOTHING, which this service refuses to create
+/// (`crate::channel_create_structure`) — the first row carries an input no channel
+/// attaches instead, which discovery must leave out. A channel reached through
+/// another channel is covered by the linked-channel row. The issue's recorded case
+/// (one channel, one attached input, entered at the channel) is the first row.
 #[tokio::test]
 async fn signal_map_discovery_traces_a_channel_to_the_inputs_it_attaches() {
     let table = [
         Graph {
-            case: "one attached input",
-            inputs: &["feed"],
+            case: "one attached input beside an input nothing attaches",
+            inputs: &["feed", "unused"],
             channels: &[Node {
                 name: "live",
                 attaches: &[0],
@@ -846,18 +855,6 @@ async fn signal_map_discovery_traces_a_channel_to_the_inputs_it_attaches() {
             entry: 0,
             resources: 3,
             neighbors: (2, 0),
-        },
-        Graph {
-            case: "no attached input",
-            inputs: &["unused"],
-            channels: &[Node {
-                name: "live",
-                attaches: &[],
-                follows: None,
-            }],
-            entry: 0,
-            resources: 1,
-            neighbors: (0, 0),
         },
         Graph {
             case: "the followed channel's input too",

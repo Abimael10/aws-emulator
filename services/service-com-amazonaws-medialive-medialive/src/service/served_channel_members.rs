@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `maintenanceStatus` member a recorded MediaLive channel body carries, on the
-//! channel-returning shapes whose model snapshot does not declare it.
+//! The `maintenanceWindow` and `maintenanceStatus` members a recorded MediaLive channel
+//! body carries, on the channel-returning shapes whose model snapshot does not declare
+//! them.
 //!
 //! # The gap this closes
 //!
@@ -9,9 +10,19 @@
 //! `Maintenance` (jsonName `maintenance`, target `MaintenanceStatus` = {maintenanceDay,
 //! maintenanceStartTime, maintenanceDeadline, maintenanceScheduledDate}), which every
 //! channel-returning shape binds and this service already serves out of the channel record,
-//! and — beside it — the flat `maintenanceStatus` member.
+//! and — beside it — the flat `maintenanceWindow` and `maintenanceStatus` members.
 //!
-//! That flat member is declared by exactly one shape of this model snapshot:
+//! Those flat members are the window the service SELECTED for the channel and the state of
+//! its scheduling, and the recorded wire carries both beside the sub-structure they are read
+//! out of: a recorded `DescribeChannel`, `DeleteChannel` and `CreateChannel`'s `$.channel`
+//! each carry `maintenanceWindow` as a present value and `maintenanceStatus` as the empty
+//! string. The window is the channel's own selected day and start time — `MaintenanceDay` is
+//! "The currently selected maintenance day" and `MaintenanceStartTime` "The currently
+//! selected maintenance start time. Time is in UTC" — so it is composed out of the two
+//! members of the sub-structure the body being answered carries, and reports the window that
+//! channel's own record selected rather than anything of this module's own.
+//!
+//! The scheduling member is declared by exactly one shape of this model snapshot:
 //! `smithy_query(query="operation",operation="RestartChannelPipelines")` reports
 //! `MaintenanceStatus`, jsonName `maintenanceStatus`, target `__string`, documented as the
 //! time in milliseconds by when a pipeline-VM restart must occur. A recorded `DescribeChannel`
@@ -20,12 +31,14 @@
 //! on the wire with no deadline in it, which is a value a client reads rather than a missing
 //! key.
 //!
-//! What this module writes is therefore exactly that: the member, holding no deadline. This
+//! What this module writes is therefore exactly that: the window the channel's own settings
+//! select, and the scheduling member holding no deadline. This
 //! emulator runs no maintenance scheduler and schedules no pipeline-VM restart for any
 //! channel, so no channel has a deadline to report — the same reason the one handler whose
 //! shape DOES declare the member gives for the value it answers
-//! ([`crate::ops::restart_channel_pipelines`]). Nothing is invented to fill the key: no form
-//! beyond the empty string is grounded in the model or in a recording, and a channel's
+//! ([`crate::ops::restart_channel_pipelines`]). Nothing is invented to fill either key: the
+//! window is read out of the channel's own record and no form beyond the empty string is
+//! grounded in the model or in a recording for the scheduling member, and a channel's
 //! scheduled date and deadline are reported where the model declares them, in the
 //! `maintenance` sub-structure.
 //!
@@ -36,10 +49,11 @@
 //! runs every answer through ([`super::error_envelope::ErrorEnvelopeOperation`]).
 //!
 //! `RestartChannelPipelines` is deliberately NOT one of the operations below: its own shape
-//! declares the member, so its handler owns what that response reports and this rewrite must
-//! not reverse it. The crate holds one rule for the member — no event scheduled, no deadline —
-//! and each response renders it where the shape that carries it decides. Every OTHER
-//! channel-returning shape is covered, because the member belongs to the channel body rather
+//! declares the scheduling member, so its handler owns what that response reports and this
+//! rewrite must not reverse it. The crate holds one rule for that member — no event
+//! scheduled, no deadline — and each response renders it where the shape that carries it
+//! decides. Every OTHER
+//! channel-returning shape is covered, because the members belong to the channel body rather
 //! than to one operation: a recording covers the describe, the delete and the create's
 //! `$.channel`, and the remaining four answer that same channel object, so a channel read
 //! through one of them cannot report differently from a describe of it.
@@ -51,9 +65,9 @@
 //! for byte, and a response this rule owns nothing about (a failure, a streamed body, another
 //! operation's answer) is left exactly as the renderer wrote it.
 //!
-//! REMOVE this rewrite when the model is refreshed to a snapshot that declares the member on
-//! every channel-returning shape: it is then a field of each output shape like any other, and
-//! `tests/all/channel_maintenance_and_egress.rs` pins the wire form either way.
+//! REMOVE this rewrite when the model is refreshed to a snapshot that declares the members
+//! on every channel-returning shape: they are then fields of each output shape like any
+//! other, and `tests/all/channel_maintenance_and_egress.rs` pins the wire form either way.
 
 use ::aws_smithy_runtime_api::http::Response as RtResponse;
 use ::serde_json::value::RawValue;
@@ -63,7 +77,8 @@ use ::service_common::success_body_members::{raw_value, with_rewritten_success_b
 /// responses, which carry one member set between them
 /// (`smithy_query(query="operation",operation="DescribeChannel,DeleteChannel,StartChannel,StopChannel")`).
 ///
-/// A recording covers the first two (`$.maintenanceStatus` on a describe and on a delete);
+/// A recording covers the first two (`$.maintenanceWindow` and `$.maintenanceStatus` on a
+/// describe and on a delete);
 /// the start and the stop answer that same object, so a channel read through one of them
 /// reports what a describe of it reports.
 ///
@@ -80,7 +95,8 @@ const CHANNEL_BODY_OPERATIONS: [&str; 4] = [
 /// their output is `{Channel -> "channel"}`
 /// (`smithy_query(query="operation",operation="CreateChannel,UpdateChannel,UpdateChannelClass")`).
 ///
-/// A recording covers the create (`$.channel.maintenanceStatus`); the two updates answer the
+/// A recording covers the create (`$.channel.maintenanceWindow` and
+/// `$.channel.maintenanceStatus`); the two updates answer the
 /// same object, and this service's own suites compare an update's answer against a describe
 /// of the same channel member by member, so the two cannot report a channel differently.
 const CHANNEL_MEMBER_OPERATIONS: [&str; 3] =
@@ -92,8 +108,17 @@ const CHANNEL_MEMBER: &str = "channel";
 /// The modelled maintenance sub-structure, which is what makes a body a channel's.
 const MAINTENANCE: &str = "maintenance";
 
-/// The flat member the wire carries beside that sub-structure.
+/// The flat member the wire carries beside that sub-structure for the scheduling state.
 const MAINTENANCE_STATUS: &str = "maintenanceStatus";
+
+/// The flat member the wire carries beside it for the window itself.
+const MAINTENANCE_WINDOW: &str = "maintenanceWindow";
+
+/// The two members of the sub-structure that window is selected by: the day
+/// (`MaintenanceDay`, "The currently selected maintenance day") and the hour it starts at
+/// (`MaintenanceStartTime`, "The currently selected maintenance start time. Time is in
+/// UTC").
+const WINDOW_MEMBERS: [&str; 2] = ["maintenanceDay", "maintenanceStartTime"];
 
 /// What a channel with no pipeline-VM restart scheduled reports as its maintenance status:
 /// the member is on the wire, and holds no deadline.
@@ -107,27 +132,47 @@ fn is_a_channel(channel: &RawValue) -> bool {
         .is_ok_and(|object| object.contains_key(MAINTENANCE))
 }
 
-/// The channel object `channel` as this service sends it — its maintenance status on the
-/// wire — or `None` when this rule owns nothing about it: a value that is not a channel, or
-/// one already carrying the member.
+/// The window the channel's own maintenance settings select, as the flat member reports it:
+/// the day the window falls on and the time it starts at, in that order, read out of the
+/// two members of the sub-structure that SELECT the window — or `None` for settings that
+/// select neither, which name no window to report.
+fn selected_window(maintenance: &RawValue) -> Option<String> {
+    let settings: RawObject = ::serde_json::from_str(maintenance.get()).ok()?;
+    let selected: Vec<String> = WINDOW_MEMBERS
+        .iter()
+        .filter_map(|member| settings.get(*member))
+        .filter_map(|value| ::serde_json::from_str::<String>(value.get()).ok())
+        .filter(|value| !value.is_empty())
+        .collect();
+    (!selected.is_empty()).then(|| selected.join(" "))
+}
+
+/// The channel object `channel` as this service sends it — its maintenance window and
+/// status on the wire — or `None` when this rule owns nothing about it: a value that is not
+/// a channel, or one already carrying either member.
 fn served_channel(channel: &RawValue) -> Option<Vec<u8>> {
     if !is_a_channel(channel) {
         return None;
     }
-    // The member's own bytes, rendered before the object that borrows them is built.
-    let reported = ::serde_json::to_string(NO_DEADLINE).ok()?;
     let mut object: RawObject = ::serde_json::from_str(channel.get()).ok()?;
-    if object.contains_key(MAINTENANCE_STATUS) {
+    if object.contains_key(MAINTENANCE_STATUS) || object.contains_key(MAINTENANCE_WINDOW) {
         return None;
     }
+    // Each member's own bytes, rendered before the object that borrows them is built.
+    let reported = ::serde_json::to_string(NO_DEADLINE).ok()?;
+    let window = selected_window(object.get(MAINTENANCE).copied()?)
+        .and_then(|window| ::serde_json::to_string(&window).ok());
     object.insert(MAINTENANCE_STATUS.to_string(), raw_value(reported.as_bytes())?);
+    if let Some(window) = window.as_deref() {
+        object.insert(MAINTENANCE_WINDOW.to_string(), raw_value(window.as_bytes())?);
+    }
     ::serde_json::to_vec(&object).ok()
 }
 
-/// `body` as this service sends it for `operation` — the maintenance status on the channel
-/// the body carries — or `None` when this rule owns nothing about it: an operation whose
-/// recording does not cover the member, a body that carries no channel, or one already
-/// carrying the member.
+/// `body` as this service sends it for `operation` — the maintenance window and status on
+/// the channel the body carries — or `None` when this rule owns nothing about it: an
+/// operation whose recording does not cover the members, a body that carries no channel, or
+/// one already carrying them.
 #[must_use]
 pub fn served_success_body(operation: &str, body: &[u8]) -> Option<Vec<u8>> {
     if CHANNEL_BODY_OPERATIONS.contains(&operation) {
@@ -168,28 +213,37 @@ mod tests {
         format!(r#"{{"id":"1000000","maintenance":{maintenance},"pipelinesRunningCount":0}}"#)
     }
 
-    /// RULE: the member is on the wire holding no deadline, whatever the channel's modelled
-    /// maintenance settings say — this emulator schedules no pipeline-VM restart for any
-    /// channel, so none has a deadline to report — and the modelled sub-structure is left
-    /// exactly as the renderer wrote it. The rows differ along what those settings carry,
-    /// including a scheduled date and a deadline, which the sub-structure reports and this
-    /// member does not.
+    /// RULE: the window member is on the wire holding the day and start time the channel's
+    /// own settings select, and the scheduling member holding no deadline, whatever those
+    /// settings say — this emulator schedules no pipeline-VM restart for any channel, so
+    /// none has a deadline to report — and the modelled sub-structure is left exactly as
+    /// the renderer wrote it. The rows differ along what those settings carry, including a
+    /// scheduled date and a deadline, which the sub-structure reports and these members do
+    /// not, and settings that select no window at all.
     #[test]
-    fn the_member_is_on_the_wire_holding_no_deadline() {
-        for (case, maintenance) in [
+    fn the_members_are_on_the_wire_reporting_the_channels_own_window() {
+        for (case, maintenance, window) in [
             (
                 "a window and nothing scheduled",
                 r#"{"maintenanceDay":"THURSDAY","maintenanceStartTime":"02:00"}"#,
+                Some("THURSDAY 02:00"),
             ),
             (
                 "maintenance scheduled",
                 r#"{"maintenanceDay":"FRIDAY","maintenanceStartTime":"15:00","maintenanceScheduledDate":"2031-02-03"}"#,
+                Some("FRIDAY 15:00"),
             ),
             (
                 "a deadline the sub-structure reports",
                 r#"{"maintenanceDay":"SUNDAY","maintenanceStartTime":"00:00","maintenanceDeadline":"2031-02-10T00:00:00Z"}"#,
+                Some("SUNDAY 00:00"),
             ),
-            ("settings naming no window at all", "{}"),
+            (
+                "a day and no start time",
+                r#"{"maintenanceDay":"WEDNESDAY"}"#,
+                Some("WEDNESDAY"),
+            ),
+            ("settings naming no window at all", "{}", None),
         ] {
             let body = channel(maintenance);
             let rewritten = served_success_body("DescribeChannel", body.as_bytes())
@@ -200,6 +254,11 @@ mod tests {
                 document[MAINTENANCE_STATUS].as_str(),
                 Some(NO_DEADLINE),
                 "case {case:?}: expected the member to hold no deadline, got {document}"
+            );
+            assert_eq!(
+                document[MAINTENANCE_WINDOW].as_str(),
+                window,
+                "case {case:?}: expected the window {window:?}, got {document}"
             );
             let settings: Value =
                 ::serde_json::from_str(maintenance).expect("the row's settings are JSON");
@@ -215,10 +274,10 @@ mod tests {
         }
     }
 
-    /// RULE: the member goes ON the channel, wherever the body carries it — at the root for
+    /// RULE: both members go ON the channel, wherever the body carries it — at the root for
     /// the channel-description responses, and under the `channel` member for the create.
     #[test]
-    fn the_member_is_reported_on_the_channel_the_body_carries() {
+    fn the_members_are_reported_on_the_channel_the_body_carries() {
         let maintenance = r#"{"maintenanceDay":"TUESDAY","maintenanceStartTime":"21:00"}"#;
 
         for operation in CHANNEL_BODY_OPERATIONS {
@@ -231,6 +290,11 @@ mod tests {
                 document[MAINTENANCE_STATUS].as_str(),
                 Some(NO_DEADLINE),
                 "case {operation:?}: expected the member at the root, got {document}"
+            );
+            assert_eq!(
+                document[MAINTENANCE_WINDOW].as_str(),
+                Some("TUESDAY 21:00"),
+                "case {operation:?}: expected the window at the root, got {document}"
             );
         }
 
@@ -245,9 +309,14 @@ mod tests {
                 Some(NO_DEADLINE),
                 "case {operation:?}: expected the member on the channel, got {document}"
             );
+            assert_eq!(
+                document[CHANNEL_MEMBER][MAINTENANCE_WINDOW].as_str(),
+                Some("TUESDAY 21:00"),
+                "case {operation:?}: expected the window on the channel, got {document}"
+            );
             assert!(
-                document[MAINTENANCE_STATUS].is_null(),
-                "case {operation:?}: the member belongs to the channel, not beside it, got \
+                document[MAINTENANCE_STATUS].is_null() && document[MAINTENANCE_WINDOW].is_null(),
+                "case {operation:?}: the members belong to the channel, not beside it, got \
                  {document}"
             );
         }
@@ -287,8 +356,9 @@ mod tests {
 
     /// Nothing to rewrite: an operation this rule does not cover — the listing, whose
     /// entries are a summary shape of their own, and the pipeline restart, whose own shape
-    /// declares the member so that its handler owns it — a body carrying no channel, one
-    /// that already carries the member, one that is not an object, and one that is not JSON.
+    /// declares the scheduling member so that its handler owns it — a body carrying no
+    /// channel, one that already carries either member, one that is not an object, and one
+    /// that is not JSON.
     #[test]
     fn a_body_this_rule_does_not_own_is_left_alone() {
         let channel = channel(r#"{"maintenanceDay":"MONDAY","maintenanceStartTime":"02:00"}"#);
@@ -305,6 +375,11 @@ mod tests {
                 "already served",
                 "DescribeChannel",
                 r#"{"maintenance":{"maintenanceDay":"MONDAY"},"maintenanceStatus":""}"#,
+            ),
+            (
+                "already carrying the window",
+                "DescribeChannel",
+                r#"{"maintenance":{"maintenanceDay":"MONDAY"},"maintenanceWindow":"MONDAY"}"#,
             ),
             ("not an object", "DescribeChannel", "[]"),
             ("not JSON", "DescribeChannel", "<Error/>"),

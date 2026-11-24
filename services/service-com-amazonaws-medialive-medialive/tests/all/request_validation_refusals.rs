@@ -31,11 +31,11 @@ use crate::support::channel_encoder_settings;
 use crate::wire::{call, call_raw, error_code, error_message, medialive, DEFAULT_REGION};
 
 /// The service principal a channel's role has to let assume it.
-const MEDIALIVE_PRINCIPAL: &str = "medialive.amazonaws.com";
+pub(crate) const MEDIALIVE_PRINCIPAL: &str = "medialive.amazonaws.com";
 
 /// A service principal that is NOT this service, for a role that exists and
 /// trusts somebody else.
-const OTHER_PRINCIPAL: &str = "lambda.amazonaws.com";
+pub(crate) const OTHER_PRINCIPAL: &str = "lambda.amazonaws.com";
 
 /// A channel create body that carries everything EXCEPT the member a row is
 /// about, so a refusal is about that member and nothing else.
@@ -505,7 +505,7 @@ async fn a_paging_parameter_outside_what_the_listing_serves_is_refused() {
 /// MediaLive and IAM on ONE engine, plus an IAM client over the router's own
 /// in-process callback — the seam a channel's `RoleArn` resolution reaches IAM
 /// through.
-fn medialive_with_iam() -> (MultiServiceRouter, ::aws_sdk_iam::Client) {
+pub(crate) fn medialive_with_iam() -> (MultiServiceRouter, ::aws_sdk_iam::Client) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -538,7 +538,11 @@ fn medialive_with_iam() -> (MultiServiceRouter, ::aws_sdk_iam::Client) {
 
 /// Create a role trusting `principal` through IAM itself, and answer the ARN IAM
 /// minted for it.
-async fn role_trusting(iam: &::aws_sdk_iam::Client, role_name: &str, principal: &str) -> String {
+pub(crate) async fn role_trusting(
+    iam: &::aws_sdk_iam::Client,
+    role_name: &str,
+    principal: &str,
+) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{

@@ -498,22 +498,29 @@ pub async fn attachable_input(router: &MultiServiceRouter, name: &str) -> String
 /// run.
 ///
 /// A channel configuration has to declare the encoder settings the channel
-/// encodes through, and every id it names has to resolve to a resource this
-/// account holds, so a suite's row says only what ITS rule is about and this
-/// helper supplies the rest — exactly as [`resolved_input_body`] does for an
-/// input's configuration: the encoder settings for a body that declares none,
-/// and one input behind every `inputId` spelling that names no input this
-/// account holds, and one input security group behind every
-/// `channelSecurityGroups` spelling that names no group this account holds.
-/// Keyed by the spelling, so one spelling resolves to the SAME resource however
-/// often a body repeats it, and a body that already names resources this account
-/// holds (or already declares its own encoder settings) is left exactly as it
-/// is, and one cluster (with one group inside it) behind an `anywhereSettings`
-/// that names no cluster this account holds.
+/// encodes through, a channel ingests through the inputs it attaches (so a
+/// create that attaches none is refused — `crate::channel_create_structure` is
+/// the suite about THAT rule), and every id it names has to resolve to a
+/// resource this account holds, so a suite's row says only what ITS rule is
+/// about and this helper supplies the rest — exactly as [`resolved_input_body`]
+/// does for an input's configuration: the encoder settings for a body that
+/// declares none, one attachment for a body that declares none, and one input
+/// behind every `inputId` spelling that names no input this account holds, and
+/// one input security group behind every `channelSecurityGroups` spelling that
+/// names no group this account holds. Keyed by the spelling, so one spelling
+/// resolves to the SAME resource however often a body repeats it, and a body
+/// that already names resources this account holds (or already declares its own
+/// encoder settings, or its own attachments — an EMPTY list included, which is
+/// a row about attaching nothing) is left exactly as it is, and one cluster
+/// (with one group inside it) behind an `anywhereSettings` that names no cluster
+/// this account holds.
 pub async fn resolved_channel_body(router: &MultiServiceRouter, body: Value) -> Value {
     let mut body = body;
     if body.get("encoderSettings").is_none() {
         body["encoderSettings"] = channel_encoder_settings();
+    }
+    if body.get("inputAttachments").is_none() {
+        body["inputAttachments"] = json!([{ "inputAttachmentName": "ingest" }]);
     }
     resolved_channel_references(router, body).await
 }

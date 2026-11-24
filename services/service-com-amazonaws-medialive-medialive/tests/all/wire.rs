@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region [`call`] signs for, and so the region every ARN those requests
@@ -121,7 +121,22 @@ pub async fn call_raw(
     body: Option<Value>,
     request_headers: &[(&str, &str)],
 ) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let body = with_attached_input(router, region, method, uri, body).await;
     let body = with_idempotency_token(method, uri, body);
+    dispatch(router, region, method, uri, body, request_headers).await
+}
+
+/// Build one request, dispatch it and read back its status, its raw body and its response
+/// headers — what [`call_raw`] does once the body carries the members a client's own request
+/// would carry.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    request_headers: &[(&str, &str)],
+) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
     });
@@ -201,9 +216,92 @@ fn with_idempotency_token(method: &str, uri: &str, body: Option<Value>) -> Optio
 /// A token no other request of this process uses, so two creates the harness
 /// filled are never read as a retry of one another.
 fn fresh_token() -> String {
+    format!("harness-token-{}", minted())
+}
+
+/// A serial no other resource this harness mints shares.
+fn minted() -> u64 {
     static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let minted = MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("harness-token-{minted}")
+    MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The member a channel's create attaches its inputs through, as the wire spells it.
+const INPUT_ATTACHMENTS: &str = "inputAttachments";
+
+/// `body` with the input attachment a client's own create would carry.
+///
+/// A channel INGESTS through the inputs it attaches, so MediaLive refuses a create that
+/// attaches none (`crate::channel_create_structure` is the suite about THAT rule) — a client
+/// therefore never sends such a create, and the harness sends them the way a client does,
+/// exactly as it fills the `@idempotencyToken` an SDK would fill
+/// ([`with_idempotency_token`]). Every suite then says only what ITS rule is about, and a
+/// suite that wants particular attachments still names them: a list the body already
+/// carries, including an EMPTY one, is left exactly as it is.
+///
+/// A suite whose rule IS the absent list says so with an explicit JSON `null`, which is
+/// dropped here so the request truly carries no member.
+async fn with_attached_input(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Option<Value> {
+    let path = uri.split('?').next().unwrap_or(uri);
+    if method != "POST" || path != "/prod/channels" {
+        return body;
+    }
+    let mut object = match body {
+        Some(Value::Object(members)) => members,
+        other => return other,
+    };
+    match object.get(INPUT_ATTACHMENTS) {
+        Some(Value::Null) => {
+            object.remove(INPUT_ATTACHMENTS);
+        }
+        Some(_) => {}
+        None => {
+            let input = minted_input(router, region).await;
+            object.insert(
+                INPUT_ATTACHMENTS.to_string(),
+                json!([{ "inputAttachmentName": "ingest", "inputId": input }]),
+            );
+        }
+    }
+    Some(Value::Object(object))
+}
+
+/// One input of `region` this account holds, for a create that attaches none of its own,
+/// answering its minted `Id`.
+///
+/// `URL_PULL` is the type that needs no other resource in the account, just the redundant
+/// pair of source URLs every PULL-type input needs — the same input
+/// `crate::support::attachable_input` mints for a suite that resolves its OWN attachment
+/// list.
+async fn minted_input(router: &MultiServiceRouter, region: &str) -> String {
+    let path = "/prod/inputs";
+    let body = with_idempotency_token(
+        "POST",
+        path,
+        Some(json!({
+            "name": format!("harness-input-{}", minted()),
+            "type": "URL_PULL",
+            "sources": [
+                { "url": "https://example.com/a.m3u8" },
+                { "url": "https://example.com/b.m3u8" },
+            ],
+        })),
+    );
+    let (status, bytes, _headers) = dispatch(router, region, "POST", path, body, &[]).await;
+    let created: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 201,
+        "the harness could not mint an input to attach: {status}: {created}"
+    );
+    created["input"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One response header, read as a client reads it (header names are

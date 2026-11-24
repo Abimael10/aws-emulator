@@ -284,6 +284,7 @@ async fn every_channel_response_reports_the_configuration_collections_as_collect
             "two output groups of different kinds",
             json!({
                 "name": "channel-output-groups",
+                "inputAttachments": [{ "inputId": "input-a", "inputAttachmentName": "a" }],
                 "encoderSettings": encoder_settings(json!([
                     {
                         "name": "hls-plain",
@@ -330,6 +331,7 @@ async fn every_channel_response_reports_the_configuration_collections_as_collect
                 ])),
             }),
             &[
+                ("inputAttachments[0].logicalInterfaceNames", 0),
                 ("encoderSettings.captionDescriptions", 0),
                 ("encoderSettings.outputGroups[0].outputGroupSettings.hlsGroupSettings.adMarkers", 0),
                 ("encoderSettings.outputGroups[0].outputGroupSettings.hlsGroupSettings.captionLanguageMappings", 0),
@@ -440,6 +442,7 @@ async fn an_update_stores_the_rewritten_configuration_just_as_complete() {
             "an update that rewrites the destinations",
             json!({ "destinations": [{ "id": "d1" }, { "id": "d2" }] }),
             &[
+                ("inputAttachments[0].logicalInterfaceNames", 0),
                 ("destinations[0].mediaPackageSettings", 0),
                 ("destinations[0].settings", 0),
                 ("destinations[0].srtSettings", 0),
@@ -463,6 +466,7 @@ async fn an_update_stores_the_rewritten_configuration_just_as_complete() {
                 }])),
             }),
             &[
+                ("inputAttachments[0].logicalInterfaceNames", 0),
                 ("encoderSettings.captionDescriptions", 0),
                 ("encoderSettings.outputGroups[0].outputGroupSettings.hlsGroupSettings.adMarkers", 0),
                 ("encoderSettings.outputGroups[0].outputGroupSettings.hlsGroupSettings.captionLanguageMappings", 0),

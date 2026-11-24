@@ -221,7 +221,7 @@ async fn an_action_the_channel_cannot_execute_is_refused_and_nothing_is_written(
 
     // (case, channel class, attachment names, encoder settings, created actions,
     //  the element path the refusal must name)
-    let table: [RefusedCase; 11] = [
+    let table: [RefusedCase; 10] = [
         (
             "input switch to an attachment the channel does not have",
             "STANDARD",
@@ -230,17 +230,6 @@ async fn an_action_the_channel_cannot_execute_is_refused_and_nothing_is_written(
             vec![action(
                 "switch1",
                 json!({ "inputSwitchSettings": { "inputAttachmentNameReference": "does-not-exist" } }),
-            )],
-            "creates/scheduleActions/0/scheduleActionSettings/inputSwitchSettings/inputAttachmentNameReference",
-        ),
-        (
-            "input switch on a channel that declares no attachment at all",
-            "STANDARD",
-            &[],
-            None,
-            vec![action(
-                "switch1",
-                json!({ "inputSwitchSettings": { "inputAttachmentNameReference": "primary" } }),
             )],
             "creates/scheduleActions/0/scheduleActionSettings/inputSwitchSettings/inputAttachmentNameReference",
         ),

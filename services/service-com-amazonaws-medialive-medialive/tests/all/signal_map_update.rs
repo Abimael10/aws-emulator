@@ -11,6 +11,8 @@
 //! in `wire`, the signal-map readers are the monitor-deployment suite's and the
 //! clock wait is the channel suite's — reused, not copied.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,6 +59,22 @@ async fn create_group(router: &MultiServiceRouter, uri: &str, name: &str) -> Str
     created["id"].as_str().unwrap_or_default().to_string()
 }
 
+/// The ARN of the input the channel `channel_arn` names attaches, read back out
+/// of the channel itself — the resource discovery finds beside the channel,
+/// because a channel ingests through the inputs it attaches.
+async fn attached_input(router: &MultiServiceRouter, channel_arn: &str) -> String {
+    let id = channel_arn.rsplit(':').next().unwrap_or_default();
+    let (status, channel) = call(router, "GET", &format!("/prod/channels/{id}"), None).await;
+    assert_eq!(
+        status, 200,
+        "setup: DescribeChannel {id}: got {status}: {channel}"
+    );
+    let input = channel["inputAttachments"][0]["inputId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup: the channel {id} must attach an input: {channel}"));
+    format!("arn:aws:medialive:{DEFAULT_REGION}:{ACCOUNT}:input:{input}")
+}
+
 /// The store every row starts from: a signal map whose discovery has settled, a
 /// follower of its entry point created AFTER that discovery (so only a
 /// rediscovery finds it), and an unrelated channel to move the entry point to.
@@ -67,13 +85,17 @@ struct Fixture {
     created_at: String,
     /// The `LastDiscoveredAt` the settled create left behind.
     last_discovered_at: String,
-    /// The channel the signal map was created on — the single resource its
-    /// stored graph holds.
+    /// The channel the signal map was created on — the resource its stored graph
+    /// holds, beside the input that channel ingests through.
     stored_entry: String,
     /// The follower of `stored_entry`, created after the signal map.
     follower: String,
-    /// An unrelated channel, whose graph is exactly itself.
+    /// An unrelated channel, whose graph is itself and its own input.
     other_entry: String,
+    /// The input each of those three channels attaches, by channel ARN: a channel
+    /// ingests through the inputs it attaches, so discovery finds that input
+    /// beside the channel (`crate::signal_maps` is the suite about that walk).
+    inputs: BTreeMap<String, String>,
 }
 
 /// The description every fixture is created with, so a row that sends no
@@ -137,6 +159,17 @@ async fn fixture(router: &MultiServiceRouter, case: &str, name: &str) -> Fixture
         .unwrap_or_default()
         .to_string();
     let other_entry = entry_point(router, &format!("{name}-other")).await;
+    // The input each of those channels ingests through, which discovery finds
+    // beside it.
+    let mut inputs: BTreeMap<String, String> = BTreeMap::new();
+    for channel in [&stored_entry, &follower, &other_entry] {
+        inputs.insert(channel.clone(), attached_input(router, channel).await);
+    }
+    let entry_graph = {
+        let mut graph = vec![stored_entry.clone(), inputs[&stored_entry].clone()];
+        graph.sort();
+        graph
+    };
 
     wait_for_the_clock();
     let (status, settled) = get_signal_map(router, &id).await;
@@ -152,8 +185,9 @@ async fn fixture(router: &MultiServiceRouter, case: &str, name: &str) -> Fixture
     );
     assert_eq!(
         graph_keys(case, &settled),
-        vec![stored_entry.clone()],
-        "case {case:?}: expected the stored graph to hold the entry point alone"
+        entry_graph,
+        "case {case:?}: expected the stored graph to hold the entry point and the input it \
+         ingests through"
     );
 
     Fixture {
@@ -168,6 +202,7 @@ async fn fixture(router: &MultiServiceRouter, case: &str, name: &str) -> Fixture
         stored_entry,
         follower,
         other_entry,
+        inputs,
     }
 }
 
@@ -223,17 +258,23 @@ struct Update {
     graph: &'static [&'static str],
 }
 
-/// The ARNs the fixture's channel aliases name.
+/// The ARNs the fixture's channel aliases name, each beside the input that
+/// channel attaches: discovery walks a channel to the inputs it ingests through,
+/// so a graph holding a channel holds that input too.
 fn aliased(fixture: &Fixture, aliases: &[&str]) -> Vec<String> {
-    let mut arns: Vec<String> = aliases
-        .iter()
-        .map(|alias| match *alias {
+    let mut arns: Vec<String> = Vec::new();
+    for alias in aliases {
+        let channel = match *alias {
             "entry" => fixture.stored_entry.clone(),
             "follower" => fixture.follower.clone(),
             "other" => fixture.other_entry.clone(),
             unknown => panic!("the table names no channel {unknown:?}"),
-        })
-        .collect();
+        };
+        if let Some(input) = fixture.inputs.get(&channel) {
+            arns.push(input.clone());
+        }
+        arns.push(channel);
+    }
     arns.sort();
     arns
 }
@@ -498,7 +539,7 @@ async fn an_update_replaces_the_members_the_request_carried_and_keeps_the_rest()
         // completed discovery found, discovered at the instant it completed.
         assert_eq!(
             graph_keys(case, &started),
-            vec![fixture.stored_entry.clone()],
+            aliased(&fixture, &["entry"]),
             "case {case:?}: expected the graph to be the one the create discovered while the \
              update runs"
         );
@@ -843,7 +884,7 @@ async fn a_refused_update_leaves_the_signal_map_as_it_was() {
         );
         assert_eq!(
             graph_keys(case, &untouched),
-            vec![fixture.stored_entry.clone()],
+            aliased(&fixture, &["entry"]),
             "case {case:?}: expected the stored graph to be untouched"
         );
     }

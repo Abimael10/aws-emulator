@@ -15,18 +15,22 @@
 //!   encodes through (`EncoderSettings` is "Encoder Settings"), so a request that
 //!   declares none describes no channel this service could run;
 //! * every id the write ADDS to the configuration has to resolve to a resource
-//!   this account holds — an `InputAttachment`'s `InputId` is "The ID of the
-//!   input", a `ChannelSecurityGroups` entry is one of the "IDs for all the Input
-//!   Security Groups attached to the channel", and `AnywhereSettings` carries
-//!   "The ID of the cluster for the channel" and "The ID of the channel placement
-//!   group for the channel" — and an id no such resource of this account answers
-//!   to would
+//!   this account holds — a `ChannelSecurityGroups` entry is one of the "IDs for
+//!   all the Input Security Groups attached to the channel", and
+//!   `AnywhereSettings` carries "The ID of the cluster for the channel" and "The
+//!   ID of the channel placement group for the channel" — and an id no such
+//!   resource of this account answers to would
 //!   leave the channel claiming a resource no read of the account can show (and
 //!   the resource-side derivation of the channels using it —
 //!   [`super::ComAmazonawsMedialiveMedialiveState::channels_using_security_group`],
 //!   [`super::ComAmazonawsMedialiveMedialiveState::channels_in_cluster`],
 //!   [`super::ComAmazonawsMedialiveMedialiveState::channels_in_channel_placement_group`]
 //!   — matching nothing);
+//! * an `InputAttachment` that names NO input at all
+//!   (`InputAttachment$InputId` is "The ID of the input") attaches nothing, so it
+//!   declares no ingest the channel could run; the input an attachment DOES name
+//!   is resolved beside this rule, as a fact about the request itself
+//!   ([`super::ComAmazonawsMedialiveMedialiveState::attached_input_refusal`]);
 //! * a reference that is only reachable THROUGH another is resolved against the
 //!   resource that one names: a channel placement group is named by
 //!   (`ClusterId`, `ChannelPlacementGroupId`) together
@@ -42,9 +46,9 @@
 //! (`BatchUpdateSchedule`, `CreateChannelPlacementGroup`).
 
 use super::{
-    blank_reference_id_message, missing_reference_id_message,
-    required_channel_configuration_message, unknown_reference_message, validation_problem,
-    ChannelRecord, ComAmazonawsMedialiveMedialiveState,
+    attached_input_state_message, blank_reference_id_message, missing_reference_id_message,
+    not_found_message, required_channel_configuration_message, unknown_reference_message,
+    validation_problem, ChannelRecord, ComAmazonawsMedialiveMedialiveState,
 };
 use crate::ops::types::{AnywhereSettings, EncoderSettings, InputAttachment, ValidationError};
 
@@ -172,23 +176,21 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
 
         for (index, attachment) in configuration.input_attachments.iter().enumerate() {
-            let path = format!("{INPUT_ATTACHMENTS}/{index}/inputId");
-            match attachment.input_id.as_deref().filter(|id| !id.is_empty()) {
-                // An attachment that names no input at all attaches nothing, so
-                // it is the same problem as one naming an id this account does
-                // not hold, reported the way every other reference list reports
-                // an entry with no id.
-                None => problems.push(validation_problem(
-                    &path,
+            // An attachment that names no input at all attaches nothing, so the
+            // configuration declares an ingest it could not run, reported the
+            // way every other reference list reports an entry with no id. The
+            // input an attachment DOES name is resolved by
+            // [`Self::attached_input_refusal`] instead, as a problem with the
+            // REQUEST, so it is never also an entry here.
+            if attachment
+                .input_id
+                .as_deref()
+                .is_none_or(|id| id.is_empty())
+            {
+                problems.push(validation_problem(
+                    &format!("{INPUT_ATTACHMENTS}/{index}/inputId"),
                     &missing_reference_id_message(INPUT_ATTACHMENTS),
-                )),
-                Some(id) if self.live_input(id).is_none() && !configuration.holds_input(id) => {
-                    problems.push(validation_problem(
-                        &path,
-                        &unknown_reference_message(INPUT, id),
-                    ));
-                }
-                Some(_) => {}
+                ));
             }
         }
 
@@ -216,41 +218,48 @@ impl ComAmazonawsMedialiveMedialiveState {
         problems
     }
 
-    /// The input one of `configuration`'s attachments names that is no longer
-    /// one a channel can ingest through, as the id the request named and the
-    /// `InputState` that input reports — `None` when every attachment names an
-    /// input a channel may still be fed by.
+    /// The refusal the inputs `configuration`'s attachments name earn, worded as
+    /// this service words a problem with the REQUEST — `None` when every
+    /// attachment names an input a channel may be fed by.
     ///
-    /// An id this account holds a record for and whose delete this service has
-    /// ACCEPTED is a different fact from an id this account never held: the
-    /// input EXISTS and is identified, it is just being (or has been) torn down,
-    /// so the attachment names a real input in a state no channel can ingest
-    /// through. It is reported as a problem with the REQUEST — the operation's
-    /// modelled `BadRequestException`, naming the input and the state it is in
-    /// ([`super::attached_input_state_message`]) — rather than as one more
-    /// `ValidationErrors` entry about an unresolvable reference, so a caller
-    /// branching on the status is told to fix the request rather than handed a
-    /// semantic validation report, and the message says WHICH input is unusable
-    /// and WHY.
+    /// An `InputAttachment`'s `InputId` is "The ID of the input", so the
+    /// attachment list is resolved as part of the request itself: an id this
+    /// account holds no input for names no input at all
+    /// ([`super::not_found_message`]), and an id it DOES hold a record for whose
+    /// delete this service has ACCEPTED names a real, identified input in a
+    /// state no channel can ingest through
+    /// ([`super::attached_input_state_message`]). Both are facts about the
+    /// request rather than about the configuration it would store, so both are
+    /// answered as the operation's modelled `BadRequestException`, naming the
+    /// input the caller supplied and what is wrong with it, rather than as one
+    /// more `ValidationErrors` entry: a caller branching on the status is told
+    /// to fix the request instead of being handed a semantic validation report.
     ///
     /// Only the attachments the write ADDS are resolved, for the same reason
     /// [`Self::channel_configuration_problems`] resolves only those: an
     /// attachment the stored channel already holds is part of the configuration
     /// that channel already claims, so an edit of another member is not refused
     /// for it.
-    pub fn unusable_attached_input(
+    ///
+    /// ONE helper, so `CreateChannel` and `UpdateChannel` — which attach inputs
+    /// under the same rule — cannot answer the same request two ways.
+    pub fn attached_input_refusal(
         &self,
         configuration: &ChannelConfiguration<'_>,
-    ) -> Option<(String, String)> {
+    ) -> Option<String> {
         configuration.input_attachments.iter().find_map(|attachment| {
             let id = attachment.input_id.as_deref().filter(|id| !id.is_empty())?;
             if configuration.holds_input(id) {
                 return None;
             }
-            let input = self.inputs.get(id)?;
-            input
-                .is_delete_accepted()
-                .then(|| (id.to_string(), self.input_state(input).to_string()))
+            match self.inputs.get(id) {
+                None => Some(not_found_message(INPUT, id)),
+                Some(input) if input.is_delete_accepted() => Some(attached_input_state_message(
+                    id,
+                    self.input_state(input),
+                )),
+                Some(_) => None,
+            }
         })
     }
 

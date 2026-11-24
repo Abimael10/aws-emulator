@@ -38,6 +38,9 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` suite, so the single integration
+# test target at `tests/all/main.rs` picks a new suite up with nothing to declare.
+automod = { workspace = true }
 # `time` for the one case that lets the clock move between two failures.
 tokio = { workspace = true, features = ["time"] }
 # The role suite mounts IAM beside MediaLive on one engine, because a channel

@@ -687,6 +687,10 @@ async fn an_update_that_attaches_a_deleted_input_is_refused() {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    // The attachments the created channel INGESTS through, which a refused update
+    // must leave exactly as they are (a channel that attaches nothing is refused,
+    // so the create carries one — `crate::channel_create_structure`).
+    let attached = created["channel"]["inputAttachments"].clone();
 
     let input = pullable_input(&router, "doomed").await;
     let (status, deleted) = call(&router, "DELETE", &format!("/prod/inputs/{input}"), None).await;
@@ -731,8 +735,7 @@ async fn an_update_that_attaches_a_deleted_input_is_refused() {
     let (status, after) = describe_channel(&router, &id).await;
     assert_eq!(status, 200, "DescribeChannel: got {status}: {after}");
     assert_eq!(
-        after["inputAttachments"],
-        json!([]),
+        after["inputAttachments"], attached,
         "expected the refused update to write nothing, got {:?}",
         after["inputAttachments"]
     );

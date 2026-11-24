@@ -303,12 +303,15 @@ async fn an_update_replaces_only_the_members_the_request_names() {
         }
         // The flat `maintenanceStatus` member a recorded channel body carries beside the
         // modelled sub-structure is on the wire holding no deadline, whatever an update
-        // writes to that sub-structure.
+        // writes to that sub-structure, and the flat `maintenanceWindow` beside it reports
+        // the window that sub-structure selects, so an update that moves it moves this too.
         apply(
             &mut expected,
             "maintenanceStatus",
             &json!(crate::channel_maintenance_and_egress::NO_DEADLINE),
         );
+        let window = crate::channel_maintenance_and_egress::reported_window(&expected);
+        apply(&mut expected, "maintenanceWindow", &window);
 
         let (status, response) = update_channel(&router, &id, patch.clone()).await;
         assert_eq!(

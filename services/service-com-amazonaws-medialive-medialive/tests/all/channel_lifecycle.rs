@@ -654,9 +654,32 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
     use service_com_amazonaws_medialive_medialive::state::{MAX_CHANNELS, MAX_LIST_PAGE_SIZE};
 
     let router = medialive();
+    // Each channel ingests through an input of its own, so the first one's is
+    // noted: the store is full once every channel is stored, and the create that
+    // proves the bound has to attach an input this account holds, which is that
+    // one once the channel attaching it is gone.
+    let mut first = Value::Null;
     for index in 0..MAX_CHANNELS {
-        create(&router, json!({ "name": format!("channel-{index}") })).await;
+        let created = create(&router, json!({ "name": format!("channel-{index}") })).await;
+        if index == 0 {
+            first = created;
+        }
     }
+
+    // One channel deleted frees the input it attached while its record stays in
+    // the account — a `DELETED` channel still counts against the bound — so the
+    // store is still full when the create below asks for one more.
+    let gone = first["id"].as_str().unwrap_or_default().to_string();
+    let freed = first["inputAttachments"][0]["inputId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    described_once_in(&router, "the full store", &gone, "IDLE").await;
+    let (status, deleted) = call(&router, "DELETE", &format!("/prod/channels/{gone}"), None).await;
+    assert_eq!(
+        status, 200,
+        "freeing one input: DeleteChannel: got {status}: {deleted}"
+    );
 
     let (status, body) = call(
         &router,
@@ -665,6 +688,7 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
         Some(json!({
             "name": "one too many",
             "encoderSettings": crate::support::channel_encoder_settings(),
+            "inputAttachments": [{ "inputAttachmentName": "ingest", "inputId": freed }],
         })),
     )
     .await;
@@ -936,15 +960,16 @@ async fn a_dry_run_create_writes_nothing_a_later_create_can_see() {
 /// refused with the operation's modelled `BadRequestException` (400), creating
 /// nothing.
 ///
-/// The rows span the published bound from both sides (none, one, the ceiling,
-/// one past it), because that is what a bound generalises over.
+/// The rows span the published bound from both sides (one, the ceiling, one past
+/// it), because that is what a bound generalises over. A create carrying NO
+/// attachment is refused for that instead (`crate::channel_create_structure`), so
+/// the bound's lower side is one entry.
 #[tokio::test]
 async fn the_attachment_list_of_one_channel_is_bounded() {
     use service_com_amazonaws_medialive_medialive::state::MAX_INPUT_ATTACHMENTS;
 
     // (case, how many attachments the request carries, expected status)
-    let table: [(&str, usize, u16); 4] = [
-        ("no attachment", 0, 201),
+    let table: [(&str, usize, u16); 3] = [
         ("one attachment", 1, 201),
         ("at the ceiling", MAX_INPUT_ATTACHMENTS, 201),
         ("one past the ceiling", MAX_INPUT_ATTACHMENTS + 1, 400),

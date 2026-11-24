@@ -3565,6 +3565,17 @@ pub fn too_many_channel_entries_message(member: &str, count: usize, limit: usize
     format!("{member} carries {count} entries; this emulator accepts at most {limit}")
 }
 
+/// The message a create that attaches NO input is refused with.
+///
+/// A channel ingests through the inputs it attaches (`InputAttachments` is
+/// "List of input attachments for channel"), so a create that attaches none
+/// describes no channel this service could run: the request's own structure is
+/// what cannot be served, and it is refused as the malformed request it is. The
+/// whole sentence is fixed — it names the member and the bound, and there is
+/// nothing of the request in it.
+pub const MISSING_INPUT_ATTACHMENT_MESSAGE: &str =
+    "At least one inputAttachment must be specified";
+
 /// The message a not-found refusal carries: the resource type, the identifier
 /// the request named, then `not found` — the phrasing the real service composes
 /// from the request. One helper, so no two operations word it two ways.
@@ -3783,7 +3794,7 @@ pub fn deleted_input_subject(input_id: &str) -> String {
 ///
 /// ONE helper, so `CreateChannel` and `UpdateChannel` — which attach inputs
 /// under the same rule
-/// ([`ComAmazonawsMedialiveMedialiveState::unusable_attached_input`]) — cannot
+/// ([`ComAmazonawsMedialiveMedialiveState::attached_input_refusal`]) — cannot
 /// word the refusal two ways.
 pub fn attached_input_state_message(input_id: &str, state: &str) -> String {
     format!("Input {input_id} is {state}")

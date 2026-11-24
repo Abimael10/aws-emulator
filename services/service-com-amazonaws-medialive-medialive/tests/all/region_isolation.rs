@@ -509,10 +509,10 @@ async fn a_tag_write_resolves_its_arn_in_the_region_it_was_signed_for() {
 /// exactly as an id nothing minted is — the resource is not one this endpoint
 /// holds.
 ///
-/// The rows are the two reference classes this service refuses differently: a
-/// channel's `InputAttachments`, whose unresolvable entry is one 422
-/// `ValidationErrors` problem, and an input's `InputSecurityGroups`, whose
-/// unresolvable entry is the 400 `BadRequestException` that names it.
+/// The rows are two reference classes of two families: a channel's
+/// `InputAttachments`, whose entry naming no input this endpoint holds is the 400
+/// `BadRequestException` that names it, and an input's `InputSecurityGroups`,
+/// whose unresolvable entry is refused the same way.
 #[tokio::test]
 async fn a_reference_resolves_in_the_region_the_request_was_signed_for() {
     let here = "eu-west-2";
@@ -529,28 +529,19 @@ async fn a_reference_resolves_in_the_region_the_request_was_signed_for() {
         call_in_region(&router, there, "POST", "/prod/channels", Some(body.clone())).await;
     let case = "a channel attaching another region's input";
     assert_eq!(
-        status, 422,
-        "case {case:?}: expected the 422 an unrunnable configuration earns, got {status}: {refused}"
+        status, 400,
+        "case {case:?}: expected the modelled 400 naming the input, got {status}: {refused}"
     );
     assert_eq!(
         error_code(status, &refused),
-        "UnprocessableEntityException",
-        "case {case:?}: expected UnprocessableEntityException, got {refused}"
-    );
-    let problems = refused["validationErrors"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: expected validationErrors, got {refused}"))
-        .clone();
-    assert_eq!(
-        problems.len(),
-        1,
-        "case {case:?}: expected one problem, got {refused}"
+        "BadRequestException",
+        "case {case:?}: expected BadRequestException, got {refused}"
     );
     assert_eq!(
-        problems[0]["errorMessage"],
-        json!(unknown_reference_message("Input", &input_id)),
+        error_message(&refused),
+        unknown_reference_message("Input", &input_id),
         "case {case:?}: expected the unresolved-reference message, got {:?}",
-        problems[0]
+        error_message(&refused)
     );
 
     // The same attachment is served by the region that holds the input, so the

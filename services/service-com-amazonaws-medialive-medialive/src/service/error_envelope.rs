@@ -387,10 +387,10 @@ impl ErasedOperation for ErrorEnvelopeOperation {
                             ),
                         );
                     }
-                    // A channel body also reports the flat `maintenanceStatus` member the
-                    // wire carries beside the modelled maintenance sub-structure, which
-                    // the model binds on one channel-returning shape only and so no output
-                    // serializer can write (see
+                    // A channel body also reports the flat `maintenanceWindow` and
+                    // `maintenanceStatus` members the wire carries beside the modelled
+                    // maintenance sub-structure, which the model binds on no
+                    // channel-returning shape and so no output serializer can write (see
                     // [`crate::service::served_channel_members`]).
                     with_request_id_and_envelope(
                         crate::service::served_channel_members::with_served_success_body(

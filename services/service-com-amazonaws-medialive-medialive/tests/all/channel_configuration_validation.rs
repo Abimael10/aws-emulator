@@ -9,8 +9,15 @@
 //! (422) carrying one `ValidationErrors` entry per problem — each naming the
 //! element path the problem was found at — leaving the store exactly as it was.
 //! Two problems make a configuration unrunnable: it declares no encoder settings
-//! (what the channel encodes), and an `InputAttachments` entry names an id no
-//! input of this account answers to.
+//! (what the channel encodes), and an `InputAttachments` entry names no input at
+//! all.
+//!
+//! The input an attachment DOES name is resolved as a fact about the REQUEST, so
+//! an entry naming an id no input of this account answers to is refused with the
+//! operation's modelled `BadRequestException` (400) naming that input, not as one
+//! more entry of the 422 — the suite below is about that rule too, and
+//! `crate::channel_create_structure` is about where it sits in the order a create
+//! judges a request in.
 //!
 //! Every test drives the service the way a client does — through
 //! `MultiServiceRouter::dispatch` with real HTTP requests — so what is asserted
@@ -20,13 +27,13 @@
 //! unminted id are ONE row each, and the other rows are what the rule
 //! generalises over — which member is missing, how many problems one request
 //! carries, where in the attachment list the bad entry sits, what makes the
-//! reference unresolvable (never minted, named at all) and
+//! reference unusable (never minted, named at all) and
 //! whether the request asked to be performed or only checked.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::{
-    missing_reference_id_message, required_channel_configuration_message,
-    unknown_reference_message, CHANNEL_CONTAINS_ERRORS_MESSAGE,
+    missing_reference_id_message, not_found_message, required_channel_configuration_message,
+    CHANNEL_CONTAINS_ERRORS_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -138,14 +145,6 @@ fn missing_encoder_settings() -> Problem {
     )
 }
 
-/// The problem an attachment at `index` naming the unresolvable id `id` carries.
-fn unresolvable_attachment(index: usize, id: &str) -> Problem {
-    (
-        format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("Input", id),
-    )
-}
-
 /// The problem an attachment at `index` naming no input at all carries.
 fn nameless_attachment(index: usize) -> Problem {
     (
@@ -154,17 +153,40 @@ fn nameless_attachment(index: usize) -> Problem {
     )
 }
 
+/// Assert `body` is the modelled 400 refusal naming the input `id` the request
+/// named and that this account holds no input for.
+fn assert_unknown_input(case: &str, status: u16, body: &Value, id: &str) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected status 400, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(status, body),
+        "BadRequestException",
+        "case {case:?}: expected the modelled BadRequestException, got {body}"
+    );
+    assert_eq!(
+        error_message(body),
+        not_found_message("Input", id),
+        "case {case:?}: expected the refusal to name the input, got {:?}",
+        error_message(body)
+    );
+}
+
 /// Rule: `CreateChannel` refuses a configuration it could not run with 422 and
 /// one `ValidationErrors` entry per problem, and creates NO channel.
 ///
 /// The table spans what makes a configuration unrunnable and how many problems
 /// one request carries: a body with no configuration member, a body that names
-/// only members outside the configuration, a missing reference at each position
-/// of the attachment list, an attachment that names no input at all, and a
-/// request carrying both classes of problem at once (whose entries come in the
-/// order the configuration declares its members). Every row names the channel,
-/// because a create with no name is refused for THAT before any configuration is
-/// read (`crate::request_validation_refusals`).
+/// only members outside the configuration, an attachment that names no input at
+/// all at each position of the list, and a request carrying both classes of
+/// problem at once (whose entries come in the order the configuration declares
+/// its members). Every row names the channel, because a create with no name is
+/// refused for THAT before any configuration is read
+/// (`crate::request_validation_refusals`), and every row that declares no
+/// attachment of its own is sent the one a client's own create carries
+/// (`crate::wire`), because a create that attaches nothing is refused for THAT
+/// first (`crate::channel_create_structure`).
 #[tokio::test]
 async fn a_create_refuses_a_configuration_it_could_not_run() {
     // Rows are built against one input this account really holds, so a row can
@@ -184,40 +206,28 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
             vec![missing_encoder_settings()],
         ),
         (
-            "an attachment naming an id nothing minted",
-            json!({
-                "name": "unminted-attachment",
-                "encoderSettings": channel_encoder_settings(),
-                "inputAttachments": [attachment("a", Some(UNMINTED_INPUT_ID))],
-            }),
-            vec![unresolvable_attachment(0, UNMINTED_INPUT_ID)],
-        ),
-        (
-            "a resolvable attachment and an unresolvable one after it",
+            "a resolvable attachment and a nameless one after it",
             json!({
                 "name": "one-of-each",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [
                     attachment("held", Some(&held)),
-                    attachment("ghost", Some(UNMINTED_INPUT_ID)),
+                    attachment("nameless", None),
                 ],
             }),
-            vec![unresolvable_attachment(1, UNMINTED_INPUT_ID)],
+            vec![nameless_attachment(1)],
         ),
         (
-            "two unresolvable attachments",
+            "two attachments naming no input",
             json!({
-                "name": "two-ghosts",
+                "name": "two-nameless",
                 "encoderSettings": channel_encoder_settings(),
                 "inputAttachments": [
-                    attachment("ghost", Some(UNMINTED_INPUT_ID)),
+                    attachment("nameless", None),
                     attachment("empty", Some("")),
                 ],
             }),
-            vec![
-                unresolvable_attachment(0, UNMINTED_INPUT_ID),
-                nameless_attachment(1),
-            ],
+            vec![nameless_attachment(0), nameless_attachment(1)],
         ),
         (
             "an attachment naming no input at all",
@@ -229,15 +239,12 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
             vec![nameless_attachment(0)],
         ),
         (
-            "no encoder settings and an unresolvable attachment",
+            "no encoder settings and an attachment naming no input",
             json!({
                 "name": "two-problems",
-                "inputAttachments": [attachment("a", Some(UNMINTED_INPUT_ID))],
+                "inputAttachments": [attachment("a", None)],
             }),
-            vec![
-                missing_encoder_settings(),
-                unresolvable_attachment(0, UNMINTED_INPUT_ID),
-            ],
+            vec![missing_encoder_settings(), nameless_attachment(0)],
         ),
     ];
 
@@ -266,9 +273,10 @@ async fn a_create_refuses_a_configuration_it_could_not_run() {
 /// is created, and the channel reads back through `DescribeChannel` carrying
 /// exactly the configuration the request declared.
 ///
-/// The table spans the attachment counts the rule generalises over — none, one
+/// The table spans the attachment counts the rule generalises over — one
 /// resolvable entry, two entries resolving to two different inputs, and two
-/// entries resolving to the same one.
+/// entries resolving to the same one. A create that attaches NOTHING is refused
+/// for that (`crate::channel_create_structure`), so it is not one of these rows.
 ///
 /// Each row gets an account of its own: an input is attached to at most one
 /// channel at a time, so a row's inputs are free only while no earlier row's
@@ -278,7 +286,6 @@ async fn a_create_accepts_a_configuration_it_can_run() {
     // Each entry is the attachment's name and WHICH of the row's two inputs it
     // names, so the ids are the ones that row's own account minted.
     let table: Vec<(&str, Vec<(&str, usize)>)> = vec![
-        ("no attachment at all", vec![]),
         ("one resolvable attachment", vec![("a", 0)]),
         ("two attachments on two inputs", vec![("a", 0), ("b", 1)]),
         ("two attachments on one input", vec![("a", 0), ("b", 0)]),
@@ -331,42 +338,64 @@ async fn a_create_accepts_a_configuration_it_can_run() {
     }
 }
 
-/// Rule: a reference resolves against the inputs this account HOLDS, so an id
-/// nothing ever minted is unresolvable — and a `DryRun` request, which asks for
-/// the create to be CHECKED rather than performed, earns exactly the same
+/// Rule: a reference resolves against the inputs this account HOLDS, so an
+/// attachment naming an id nothing ever minted names no input — a fact about the
+/// REQUEST, refused with the operation's modelled `BadRequestException` (400)
+/// naming that input, and never a channel — and a `DryRun` request, which asks
+/// for the write to be CHECKED rather than performed, earns exactly the same
 /// refusal.
+///
+/// The rows span the WRITE (the create, and the update of a channel that already
+/// holds an attachment), the position the unresolvable entry sits at, and whether
+/// the request asked to be performed or only checked.
 ///
 /// An id this account DOES hold a record for and whose delete has been accepted
 /// is a different fact — that input exists and is identified, it is simply in a
-/// state no channel can ingest through — so it is refused as a problem with the
-/// request itself rather than as an unresolvable reference;
-/// `crate::cross_field_refusals` is the suite about that rule.
+/// state no channel can ingest through — so it is refused in the same class with
+/// a message naming that state; `crate::cross_field_refusals` is the suite about
+/// that rule.
 #[tokio::test]
 async fn a_reference_resolves_against_the_inputs_the_account_holds() {
-    let router = medialive();
-
-    let table: Vec<(&str, bool, &str)> = vec![
-        ("an id nothing minted, performed", false, UNMINTED_INPUT_ID),
-        ("an id nothing minted, checked only", true, UNMINTED_INPUT_ID),
+    // (case, whether the request asked to be checked only, the attachments it
+    //  carries, built from the input the row's own account holds)
+    type Row = (&'static str, bool, fn(&str) -> Value);
+    let table: Vec<Row> = vec![
+        (
+            "a create naming an id nothing minted",
+            false,
+            |_held| json!([attachment("ghost", Some(UNMINTED_INPUT_ID))]),
+        ),
+        (
+            "a create naming an id nothing minted, checked only",
+            true,
+            |_held| json!([attachment("ghost", Some(UNMINTED_INPUT_ID))]),
+        ),
+        (
+            "a create whose second entry names an id nothing minted",
+            false,
+            |held| {
+                json!([
+                    attachment("held", Some(held)),
+                    attachment("ghost", Some(UNMINTED_INPUT_ID)),
+                ])
+            },
+        ),
     ];
 
-    for (case, dry_run, id) in table {
+    for (case, dry_run, build) in table {
+        let router = medialive();
+        let held = attachable_input(&router, "held").await;
         let (status, refused) = create(
             &router,
             json!({
                 "name": case,
                 "dryRun": dry_run,
                 "encoderSettings": channel_encoder_settings(),
-                "inputAttachments": [attachment("a", Some(id))],
+                "inputAttachments": build(&held),
             }),
         )
         .await;
-        assert_unprocessable(
-            case,
-            status,
-            &refused,
-            &[unresolvable_attachment(0, id)],
-        );
+        assert_unknown_input(case, status, &refused, UNMINTED_INPUT_ID);
         assert!(
             listed(&router).await.is_empty(),
             "case {case:?}: expected no channel to have been created, got {:?}",
@@ -375,25 +404,20 @@ async fn a_reference_resolves_against_the_inputs_the_account_holds() {
     }
 }
 
-/// Rule: `UpdateChannel` validates the configuration the update WOULD leave on
-/// the channel — the members its request names over the ones the channel already
-/// had — and a refused update leaves the stored channel exactly as it was.
+/// Rule (the same rule, through the other write): an update whose attachment
+/// names an id nothing minted earns the same modelled 400 naming that input, and
+/// the stored channel keeps the attachments it had.
 ///
-/// The table spans the update shapes the rule generalises over: an attachment
-/// list whose entries do not all resolve (at either position), an entry naming no
-/// input, and a `DryRun` update, which is checked by the same rule.
-///
-/// Each row seeds its baseline channel in an account of its own, because an
-/// input is attached to at most one channel at a time.
+/// The rows span the position the unresolvable entry sits at and whether the
+/// update asked to be performed or only checked.
 #[tokio::test]
-async fn an_update_refuses_a_configuration_it_could_not_run() {
-    // Each row builds its request from the id of the input ITS OWN account
-    // minted and its channel already holds, so no row depends on another's.
-    let table: Vec<UpdateRefusalRow> = vec![
+async fn an_update_naming_an_input_the_account_does_not_hold_is_refused() {
+    // (case, the update body, built from the input the row's own channel holds)
+    type Row = (&'static str, fn(&str) -> Value);
+    let table: Vec<Row> = vec![
         (
             "an attachment naming an id nothing minted",
             |_held| json!({ "inputAttachments": [attachment("ghost", Some(UNMINTED_INPUT_ID))] }),
-            vec![unresolvable_attachment(0, UNMINTED_INPUT_ID)],
         ),
         (
             "an unresolvable attachment after a resolvable one",
@@ -403,12 +427,6 @@ async fn an_update_refuses_a_configuration_it_could_not_run() {
                     attachment("ghost", Some(UNMINTED_INPUT_ID)),
                 ] })
             },
-            vec![unresolvable_attachment(1, UNMINTED_INPUT_ID)],
-        ),
-        (
-            "an attachment naming no input at all",
-            |_held| json!({ "inputAttachments": [attachment("nameless", None)] }),
-            vec![nameless_attachment(0)],
         ),
         (
             "a checked-only update whose attachment does not resolve",
@@ -418,7 +436,92 @@ async fn an_update_refuses_a_configuration_it_could_not_run() {
                     "inputAttachments": [attachment("ghost", Some(UNMINTED_INPUT_ID))],
                 })
             },
-            vec![unresolvable_attachment(0, UNMINTED_INPUT_ID)],
+        ),
+    ];
+
+    for (case, build) in table {
+        let router = medialive();
+        let held = attachable_input(&router, "held").await;
+        let (status, created) = create(
+            &router,
+            json!({
+                "name": "baseline",
+                "encoderSettings": channel_encoder_settings(),
+                "inputAttachments": [attachment("held", Some(&held))],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: seeding the channel: got {status}: {created}"
+        );
+        let id = created["channel"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // An update is accepted from a channel that has stopped, which is the
+        // `IDLE` the create's transient state settles into.
+        wait_for_the_clock();
+
+        let (status, refused) = update(&router, &id, build(&held)).await;
+        assert_unknown_input(case, status, &refused, UNMINTED_INPUT_ID);
+
+        let (status, read) = describe(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeChannel: got {status}: {read}"
+        );
+        assert_eq!(
+            read["inputAttachments"],
+            crate::support::stored_channel_member(
+                "inputAttachments",
+                &json!([attachment("held", Some(&held))])
+            ),
+            "case {case:?}: expected the refused update to leave the attachments alone, got {:?}",
+            read["inputAttachments"]
+        );
+    }
+}
+
+/// Rule: `UpdateChannel` validates the configuration the update WOULD leave on
+/// the channel — the members its request names over the ones the channel already
+/// had — and a refused update leaves the stored channel exactly as it was.
+///
+/// The table spans the update shapes the rule generalises over: an entry naming
+/// no input at either position of the list, and a `DryRun` update, which is
+/// checked by the same rule.
+///
+/// Each row seeds its baseline channel in an account of its own, because an
+/// input is attached to at most one channel at a time.
+#[tokio::test]
+async fn an_update_refuses_a_configuration_it_could_not_run() {
+    // Each row builds its request from the id of the input ITS OWN account
+    // minted and its channel already holds, so no row depends on another's.
+    let table: Vec<UpdateRefusalRow> = vec![
+        (
+            "an attachment naming no input at all",
+            |_held| json!({ "inputAttachments": [attachment("nameless", None)] }),
+            vec![nameless_attachment(0)],
+        ),
+        (
+            "a nameless attachment after a resolvable one",
+            |held| {
+                json!({ "inputAttachments": [
+                    attachment("held", Some(held)),
+                    attachment("nameless", None),
+                ] })
+            },
+            vec![nameless_attachment(1)],
+        ),
+        (
+            "a checked-only update whose attachment names no input",
+            |_held| {
+                json!({
+                    "dryRun": true,
+                    "inputAttachments": [attachment("nameless", None)],
+                })
+            },
+            vec![nameless_attachment(0)],
         ),
     ];
 

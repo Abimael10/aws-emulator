@@ -50,10 +50,6 @@ const UNMINTED_GROUP_ID: &str = "3999999";
 /// A second such id, for the row carrying two unresolvable entries at once.
 const OTHER_UNMINTED_GROUP_ID: &str = "3999998";
 
-/// An id of the shape this service mints for an input, that no `CreateInput`
-/// ever minted in the account under test.
-const UNMINTED_INPUT_ID: &str = "9999999";
-
 /// One problem a refusal reports: the element path it was found at, and the
 /// message that says what it is.
 type Problem = (String, String);
@@ -181,13 +177,13 @@ fn nameless_group(index: usize) -> Problem {
     )
 }
 
-/// The problem an `inputAttachments` entry at `index` naming the unresolvable id
-/// `id` carries — the reference member this rule already applied to, here to pin
-/// that one request carrying both reports both.
-fn unresolvable_attachment(index: usize, id: &str) -> Problem {
+/// The problem an `inputAttachments` entry at `index` naming no input at all
+/// carries — the other reference member this rule applies to, here to pin that
+/// one request carrying a problem in each reports both.
+fn nameless_attachment(index: usize) -> Problem {
     (
         format!("inputAttachments/{index}/inputId"),
-        unknown_reference_message("Input", id),
+        missing_reference_id_message("inputAttachments"),
     )
 }
 
@@ -253,18 +249,19 @@ async fn a_create_refuses_a_channel_security_group_it_cannot_resolve() {
         (
             // Both reference members of one configuration, so the refusal
             // reports every problem the configuration carries rather than the
-            // first one it meets.
-            "an unresolvable attachment and an unresolvable group",
+            // first one it meets. The attachment names NO input: an attachment
+            // that names an input this account does not hold is a problem with
+            // the request itself, answered before this rule runs
+            // (`crate::channel_configuration_validation`).
+            "an attachment naming no input and an unresolvable group",
             json!({
                 "name": "both-members",
                 "encoderSettings": channel_encoder_settings(),
-                "inputAttachments": [
-                    { "inputAttachmentName": "ghost", "inputId": UNMINTED_INPUT_ID },
-                ],
+                "inputAttachments": [{ "inputAttachmentName": "nameless" }],
                 "channelSecurityGroups": [UNMINTED_GROUP_ID],
             }),
             vec![
-                unresolvable_attachment(0, UNMINTED_INPUT_ID),
+                nameless_attachment(0),
                 unresolvable_group(0, UNMINTED_GROUP_ID),
             ],
         ),
