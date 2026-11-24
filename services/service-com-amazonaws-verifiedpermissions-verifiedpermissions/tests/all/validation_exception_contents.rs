@@ -59,6 +59,298 @@ fn clause(pointer: &str, requirement: &str) -> String {
     format!("Value at '{pointer}' failed to satisfy constraint: {requirement}")
 }
 
+/// `TagValue`'s modelled length maximum, as the model writes it
+/// (`smithy_query(query="shape", shape="TagMap")`: value `length 0..256`).
+const TAG_VALUE_MAX_LENGTH: usize = 256;
+
+/// The requirement a broken `@length` minimum of 1 states.
+const LENGTH_AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
+
+/// `EntityIdentifier$entityType`'s modelled `@length` minimum is 1
+/// (`smithy_query(query="shape", shape="EntityIdentifier")`), and an
+/// `AttributeValue` can carry an `entityIdentifier` — so an attribute value whose
+/// entity type is empty is refused by a constraint the model declares, from
+/// INSIDE the map entry that carries it.
+fn entity_identifier_without_a_type() -> Value {
+    json!({ "entityIdentifier": { "entityType": "", "entityId": "alice" } })
+}
+
+/// One well-formed entity item carrying nothing but its identifier.
+fn entity(id: &str) -> Value {
+    json!({ "identifier": { "entityType": "PhotoApp::Photo", "entityId": id } })
+}
+
+/// A well-formed `IsAuthorized` request against `store`, carrying `payload`
+/// under the member `name` (`context` or `entities`) — everything the call needs
+/// to be evaluated, so the only thing a refusal can be about is that payload.
+fn is_authorized(store: &str, name: &str, payload: Value) -> Value {
+    let mut request = json!({
+        "policyStoreId": store,
+        "principal": { "entityType": "PhotoApp::User", "entityId": "alice" },
+        "action": { "actionType": "PhotoApp::Action", "actionId": "viewPhoto" },
+        "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
+    });
+    request[name] = payload;
+    request
+}
+
+/// RULE: a pointer segment for a step from a collection into one of its elements
+/// spells the element the way the request body addresses it, decided by the TYPE
+/// the model declares for that collection and never by how the segment reads: an
+/// element of a LIST is named by its own 0-based position (RFC 6901), and an entry
+/// of a MAP by the key the caller sent — all digits or not — with `~` and `/`
+/// escaped. So every reported pointer resolves against the body that was sent,
+/// which is the one property `ValidationExceptionField$path` exists to have.
+///
+/// The rows span which kind of collection the step enters (a map whose values are
+/// scalar, a map whose values are structured, a list, a list inside a map entry, a
+/// map inside a map entry, a map inside a list element), how the key READS (an
+/// all-digit year, `1`, `0`, digits with a leading zero, a word, a key holding
+/// both characters a pointer escapes), which operation and member carries the map
+/// (`TagResource$tags`, `CreatePolicyStore$tags`, an authorization request's
+/// `context.contextMap`, an entity's `attributes` and `tags`, a Cedar `record`
+/// nested in an attribute value), and the constraint class that was broken (a
+/// length maximum, a length minimum).
+#[tokio::test]
+async fn a_refusal_names_a_collection_element_the_way_the_request_body_addresses_it() {
+    let router = router();
+    let store_id = store_with_mode(&router, "OFF").await;
+    let arn = ok(
+        &router,
+        "CreatePolicyStore",
+        &json!({ "validationSettings": { "mode": "OFF" } }),
+    )
+    .await["arn"]
+        .as_str()
+        .expect("arn is required on the CreatePolicyStore response")
+        .to_string();
+    let over_long_value = "v".repeat(TAG_VALUE_MAX_LENGTH + 1);
+    let too_long = format!("Member must have length less than or equal to {TAG_VALUE_MAX_LENGTH}");
+
+    // (case, operation, request, the pointer the clause must name, the
+    //  requirement it must state)
+    let cases: Vec<(&str, &str, Value, &str, String)> = vec![
+        (
+            // The member the issue names. A tag map's values are SCALAR, so the
+            // walk spells an entry's path with the key and no collection step —
+            // this row pins that spelling rather than changing it.
+            "an all-digit key on a tag map",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "2024": over_long_value } }),
+            "/tags/2024",
+            too_long.clone(),
+        ),
+        (
+            // The one key a 1-based count would renumber to the first element.
+            "the key 1 on a tag map",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "1": over_long_value } }),
+            "/tags/1",
+            too_long.clone(),
+        ),
+        (
+            "the key 0 on a tag map",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "0": over_long_value } }),
+            "/tags/0",
+            too_long.clone(),
+        ),
+        (
+            "digits with a leading zero on a tag map",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "007": over_long_value } }),
+            "/tags/007",
+            too_long.clone(),
+        ),
+        (
+            "a word key on a tag map",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "env": over_long_value } }),
+            "/tags/env",
+            too_long.clone(),
+        ),
+        (
+            // The same member name on a different operation's map.
+            "an all-digit key on a create's tag map",
+            "CreatePolicyStore",
+            json!({
+                "validationSettings": { "mode": "OFF" },
+                "tags": { "2024": over_long_value },
+            }),
+            "/tags/2024",
+            too_long.clone(),
+        ),
+        (
+            // A map whose VALUES are structured, so the refusal is reported from
+            // inside the entry and the clause addresses a member reached THROUGH
+            // it — the step a key that reads like a position is spelled by.
+            "an all-digit key on an authorization request's context map",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": { "2024": entity_identifier_without_a_type() } }),
+            ),
+            "/context/contextMap/2024/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // The one key a 1-based count would renumber to the first element.
+            "the key 1 on a context map",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": { "1": entity_identifier_without_a_type() } }),
+            ),
+            "/context/contextMap/1/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // A word key: the spelling that was always kept, so the rows that
+            // keep a digit key and this one are the same shape.
+            "a word key on a context map",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": { "tenant": entity_identifier_without_a_type() } }),
+            ),
+            "/context/contextMap/tenant/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // Both characters a pointer segment gives a meaning of its own.
+            "a context-map key holding the two characters a pointer escapes",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": { "a/b~c": entity_identifier_without_a_type() } }),
+            ),
+            "/context/contextMap/a~1b~0c/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // A map inside a map entry: two keyed steps in one pointer.
+            "an all-digit field name of a record nested in a context value",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": {
+                    "42": { "record": { "7": entity_identifier_without_a_type() } } } }),
+            ),
+            "/context/contextMap/42/record/7/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // A LIST inside a map entry: the key is kept and the element is
+            // renumbered, in the same pointer.
+            "the second element of a set inside a context-map entry",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "context",
+                json!({ "contextMap": { "5": { "set": [
+                    { "string": "first" },
+                    entity_identifier_without_a_type(),
+                ] } } }),
+            ),
+            "/context/contextMap/5/set/1/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // A map inside a LIST element: the element is renumbered and the
+            // attribute name is kept.
+            "an all-digit attribute name on the second entity of a list",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "entities",
+                json!({ "entityList": [
+                    entity("first"),
+                    {
+                        "identifier": { "entityType": "PhotoApp::Photo", "entityId": "second" },
+                        "attributes": { "2024": entity_identifier_without_a_type() },
+                    },
+                ] }),
+            ),
+            "/entities/entityList/1/attributes/2024/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // The same rule on an entity's Cedar TAG map, whose values are a
+            // different union of the same shape.
+            "an all-digit tag name on an entity of a list",
+            "IsAuthorized",
+            is_authorized(
+                &store_id,
+                "entities",
+                json!({ "entityList": [
+                    {
+                        "identifier": { "entityType": "PhotoApp::Photo", "entityId": "only" },
+                        "tags": { "2024": entity_identifier_without_a_type() },
+                    },
+                ] }),
+            ),
+            "/entities/entityList/0/tags/2024/entityIdentifier/entityType",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+        (
+            // The other side of the rule: a plain list element, which a pointer
+            // numbers from 0.
+            "a member inside the third element of a list",
+            "BatchIsAuthorized",
+            json!({
+                "policyStoreId": store_id,
+                "requests": [
+                    {
+                        "principal": { "entityType": "PhotoApp::User", "entityId": "alice" },
+                        "action": { "actionType": "PhotoApp::Action", "actionId": "viewPhoto" },
+                        "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
+                    },
+                    {
+                        "principal": { "entityType": "PhotoApp::User", "entityId": "bob" },
+                        "action": { "actionType": "PhotoApp::Action", "actionId": "viewPhoto" },
+                        "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
+                    },
+                    {
+                        "principal": { "entityType": "PhotoApp::User", "entityId": "" },
+                        "action": { "actionType": "PhotoApp::Action", "actionId": "viewPhoto" },
+                        "resource": { "entityType": "PhotoApp::Photo", "entityId": "vacation" },
+                    },
+                ],
+            }),
+            "/requests/2/principal/entityId",
+            LENGTH_AT_LEAST_ONE.to_string(),
+        ),
+    ];
+
+    for (case, operation, request, pointer, requirement) in cases {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(status, 400, "case {case:?}: expected HTTP 400, got {body}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected the ValidationException code, got {body}"
+        );
+        let expected = format!("1 validation error detected. {}", clause(pointer, &requirement));
+        let stated = fault_message(&body);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected message {expected:?}, got {stated:?}"
+        );
+        // "The path to the specific element": resolved against the body that was
+        // sent, the pointer must land on a member that body really has.
+        assert!(
+            request.pointer(pointer).is_some(),
+            "case {case:?}: the reported pointer {pointer:?} does not resolve against the \
+             request body that was sent"
+        );
+    }
+}
+
 /// RULE: a request that broke a constraint the model declares is refused 400
 /// `ValidationException`, and the message is
 /// `N validation error(s) detected. <clause>; …` — a PERIOD after the count, each

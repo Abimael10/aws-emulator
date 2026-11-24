@@ -46,7 +46,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use aws_smithy_schema::{Schema, ShapeType};
 use aws_smithy_schema_server::Violation;
+
+use crate::ops::types;
 
 /// The error code this service answers a boundary constraint refusal with — the
 /// `ValidationException` its model declares on every operation, which is also the
@@ -54,48 +57,76 @@ use aws_smithy_schema_server::Violation;
 /// message below, so a reworded refusal never loses its matching code.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// The segment the framework's dotted member path puts between a collection and
-/// one of its elements (`requests.1.member.principal`). A JSON pointer names the
-/// position itself, so this step has no counterpart in one.
-const COLLECTION_STEP: &str = "member";
+/// Every shape of this REQUEST surface that declares a member the model makes a
+/// MAP — the shapes a violation path can carry a caller-chosen key out of.
+///
+/// A step from a collection into one of its elements reaches the dotted path as
+/// `<position-or-key>.member` whichever kind of collection it was, so what that
+/// step is spelled by is decided by the TYPE the model declares for the member
+/// one step up, read off that member's own schema below. These are the schemas
+/// the model generated, so no member's type is restated here: a shape is listed,
+/// and [`declares_map_member`] keeps the members whose declared type is a map.
+///
+/// The path names every member it descended through, a union's arm included
+/// (`context.contextMap.<key>.member.…`), so the member one step up is always a
+/// member of one of these shapes. One list covers every operation because that
+/// member is addressed by NAME and no member name this service declares a map is
+/// a list anywhere in its model — `tags`, `encryptionContext`, `attributes`,
+/// `contextMap` and `record` are maps wherever they appear, and `entityList`,
+/// `parents`, `set`, `requests`, `clientIds` and `audiences` are lists wherever
+/// they do (`smithy_query(query="shape", shape="TagMap")` and the shapes below).
+const SHAPES_DECLARING_A_MAP: &[&Schema] = &[
+    // `TagResource$tags` and `CreatePolicyStore$tags`: a resource's tag set,
+    // keyed by tag key.
+    types::TAG_RESOURCE_INPUT_SCHEMA,
+    types::CREATE_POLICY_STORE_INPUT_SCHEMA,
+    // `KmsEncryptionSettings$encryptionContext`: the encryption context a
+    // policy store is created or updated with, keyed by context key.
+    types::KMS_ENCRYPTION_SETTINGS_SCHEMA,
+    // `EntityItem$attributes` and `EntityItem$tags`: one entity's attributes and
+    // Cedar tags, keyed by attribute and tag name.
+    types::ENTITY_ITEM_SCHEMA,
+    // `ContextDefinition$contextMap`: an authorization request's context, keyed
+    // by context key.
+    types::CONTEXT_DEFINITION_SCHEMA,
+    // `AttributeValue$record` and `CedarTagValue$record`: a Cedar record nested
+    // inside an attribute or a tag value, keyed by field name.
+    types::ATTRIBUTE_VALUE_SCHEMA,
+    types::CEDAR_TAG_VALUE_SCHEMA,
+];
+
+/// Whether the member a dotted path segment names is one the model declares a
+/// MAP, so a step into one of its entries is addressed by the key the caller
+/// sent rather than by a position.
+///
+/// The segment is compared against the member name spelled the way the framework
+/// spells it in the path it walks constraints with
+/// ([`aws_smithy_schema_server::constraints::path::member`]), so the two cannot
+/// drift into different casings of one member.
+fn declares_map_member(segment: &str) -> bool {
+    SHAPES_DECLARING_A_MAP.iter().any(|shape| {
+        shape.members().iter().any(|member| {
+            matches!(member.shape_type(), ShapeType::Map)
+                && member.member_name().is_some_and(|name| {
+                    aws_smithy_schema_server::constraints::path::member(name) == segment
+                })
+        })
+    })
+}
 
 /// One member of the request as a JSON pointer rooted at the request body, built
 /// from the dotted path the framework walks its constraints with.
 ///
-/// Each dotted segment becomes one pointer segment. A step from a collection into
-/// one of its elements arrives as `<position-or-key>.member`, which a pointer
-/// spells as the position alone: an element's position is renumbered from the
-/// framework's 1-based count to the 0-based index RFC 6901 gives an array
-/// element, and a map entry's key — a value the caller chose rather than a model
-/// name — is kept as sent, with the two characters a pointer segment escapes
-/// (`~` and `/`) escaped. A numeric map key is therefore indistinguishable from a
-/// list position here and is renumbered as one; the dotted form carries nothing
-/// that tells the two apart.
+/// The spelling itself — a pointer segment per dotted segment, a collection step
+/// spelled by the element alone, a list element renumbered to the 0-based index
+/// RFC 6901 gives an array element, a map entry's key kept as sent with `~` and
+/// `/` escaped — is the one every service of this tree shares
+/// ([`service_common::json_pointer`]). The one fact the dotted path does not
+/// carry is whether a collection step entered a list or a map, so this service
+/// answers that from its own model ([`declares_map_member`]) and the shared rule
+/// turns it into the spelling.
 fn json_pointer(dotted: &str) -> String {
-    let mut pointer = String::with_capacity(dotted.len() + 1);
-    let mut segments = dotted.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        pointer.push('/');
-        if segments.peek() == Some(&COLLECTION_STEP) {
-            // The step into the element is spelled by the position alone, so the
-            // `member` segment that followed it is consumed here.
-            segments.next();
-            match segment.parse::<usize>() {
-                Ok(position) => pointer.push_str(&position.saturating_sub(1).to_string()),
-                Err(_) => pointer.push_str(&escaped_segment(segment)),
-            }
-        } else {
-            pointer.push_str(&escaped_segment(segment));
-        }
-    }
-    pointer
-}
-
-/// One pointer segment with the two characters a JSON pointer gives a meaning of
-/// its own escaped: `~` as `~0` and `/` as `~1` (RFC 6901), so a caller-chosen
-/// key holding either still names one member instead of splitting into two.
-fn escaped_segment(segment: &str) -> String {
-    segment.replace('~', "~0").replace('/', "~1")
+    service_common::json_pointer::json_pointer_keyed(dotted, declares_map_member)
 }
 
 /// The clause one violation states: the member it is about, addressed as a JSON

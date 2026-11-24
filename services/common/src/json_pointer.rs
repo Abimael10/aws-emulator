@@ -13,7 +13,10 @@
 //!
 //! This module judges only the SPELLING of a member path. Which violations a refusal
 //! states, and in what words, is the service's own
-//! (see [`crate::validation`] for the collecting half).
+//! (see [`crate::validation`] for the collecting half). What a collection step is
+//! spelled by does depend on one fact the dotted path does not carry — whether the
+//! collection is a list or a map — so a service that has maps a caller keys supplies
+//! that fact through [`json_pointer_keyed`]; the spelling it is turned into stays here.
 //!
 //! Services still carrying their own copy: this rule predates this module and is inlined
 //! in the service crates that needed it before there was anywhere shared to put it —
@@ -23,39 +26,64 @@
 //! new should inline the rule again — call this module.
 
 /// The segment the framework's dotted member path puts between a collection and one of
-/// its elements (`vectors.1.member.data`). A JSON pointer names the position itself, so
+/// its elements (`vectors.1.member.data`). A JSON pointer names the element itself, so
 /// this step has no counterpart in one.
 const COLLECTION_STEP: &str = "member";
 
 /// One member of the request as a JSON pointer rooted at the request body, built from
 /// the dotted path the framework walks its constraints with
-/// (`aws_smithy_schema_server::constraints::path`).
+/// (`aws_smithy_schema_server::constraints::path`), for a request surface whose every
+/// collection step is a step into a LIST.
 ///
-/// Each dotted segment becomes one pointer segment. A step from a collection into one of
-/// its elements arrives as `<position-or-key>.member`, which a pointer spells as the
-/// position alone: an element's position is renumbered from the framework's 1-based count
-/// to the 0-based index RFC 6901 gives an array element, and a map entry's key — a value
-/// the caller chose rather than a model name — is kept as sent, with the two characters a
-/// pointer segment escapes (`~` and `/`) escaped. A numeric map key is therefore
-/// indistinguishable from a list position here and is renumbered as one; the dotted form
-/// carries nothing that tells the two apart.
+/// [`json_pointer_keyed`] states the whole rule and this is that rule with no map
+/// declared, which is the right answer for a surface that has no map a caller keys, and
+/// for one whose maps hold SCALAR values: the walk spells a scalar map value's path with
+/// the key alone, so no collection step arrives for it. A surface with a map whose values
+/// are structured — a structure, a union or another collection — reaches a step this
+/// cannot tell from a list position and must call [`json_pointer_keyed`] instead.
 #[must_use]
 pub fn json_pointer(dotted: &str) -> String {
+    json_pointer_keyed(dotted, |_| false)
+}
+
+/// One member of the request as a JSON pointer rooted at the request body, with each
+/// step into a collection spelled by what the MODEL declares that collection to be.
+///
+/// Each dotted segment becomes one pointer segment. A step from a collection into one of
+/// its elements arrives as `<position-or-key>.member` whichever kind of collection it
+/// was, and a pointer spells it as the element alone — but what names that element
+/// differs: an element of a list is renumbered from the framework's 1-based count to the
+/// 0-based index RFC 6901 gives an array element, while a map entry's key — a value the
+/// caller chose rather than a model name — is kept exactly as sent, with the two
+/// characters a pointer segment escapes (`~` and `/`) escaped. The dotted form carries
+/// nothing that tells the two apart, so `declares_map` is asked about the member one step
+/// up (the segment before the element, which is the collection being stepped into) and
+/// answers whether the model declares that member a MAP. A key that reads like a position
+/// is therefore still the caller's key, and the pointer resolves against the body the
+/// caller sent either way.
+#[must_use]
+pub fn json_pointer_keyed(dotted: &str, declares_map: impl Fn(&str) -> bool) -> String {
     let mut pointer = String::with_capacity(dotted.len() + 1);
     let mut segments = dotted.split('.').peekable();
+    // The member one step up: the collection a `<position-or-key>.member` step steps
+    // into is the member the segment before it names.
+    let mut enclosing = "";
     while let Some(segment) = segments.next() {
         pointer.push('/');
         if segments.peek() == Some(&COLLECTION_STEP) {
-            // The step into the element is spelled by the position alone, so the
+            // The step into the element is spelled by the element alone, so the
             // `member` segment that followed it is consumed here.
             segments.next();
             match segment.parse::<usize>() {
-                Ok(position) => pointer.push_str(&position.saturating_sub(1).to_string()),
-                Err(_) => pointer.push_str(&escaped_segment(segment)),
+                Ok(position) if !declares_map(enclosing) => {
+                    pointer.push_str(&position.saturating_sub(1).to_string());
+                }
+                _ => pointer.push_str(&escaped_segment(segment)),
             }
         } else {
             pointer.push_str(&escaped_segment(segment));
         }
+        enclosing = segment;
     }
     pointer
 }
@@ -122,6 +150,83 @@ mod tests {
 
         for (case, dotted, expected) in rows {
             let actual = json_pointer(dotted);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A step into a collection the caller KEYS keeps that key, however it reads, while a
+    /// step into a list is still renumbered — the one fact the dotted path does not carry,
+    /// supplied by the caller of [`json_pointer_keyed`].
+    #[test]
+    fn a_step_into_a_declared_map_keeps_the_key_the_caller_sent() {
+        // `attributes` and `context` are the maps in these rows; every other member is a
+        // list, so each row also pins that a list position is unaffected by the answer.
+        let declares_map = |member: &str| matches!(member, "attributes" | "context");
+
+        // The rows differ along how the key READS (a year, the position a first element
+        // renumbers to, zero, digits with a leading zero, a word, a key carrying the two
+        // characters a segment escapes), along which kind of collection the step enters,
+        // and along what the step is nested in — so the rows that keep a key and the rows
+        // that renumber one are the same shape.
+        let rows: [(&str, &str, &str); 11] = [
+            (
+                "an all-digit key on a map",
+                "attributes.2024.member.ipaddr",
+                "/attributes/2024/ipaddr",
+            ),
+            (
+                "the key a 1-based count would renumber to the first element",
+                "attributes.1.member.ipaddr",
+                "/attributes/1/ipaddr",
+            ),
+            ("the key zero", "attributes.0.member.ipaddr", "/attributes/0/ipaddr"),
+            (
+                "digits with a leading zero",
+                "attributes.007.member.ipaddr",
+                "/attributes/007/ipaddr",
+            ),
+            (
+                "a word key",
+                "attributes.team.member.ipaddr",
+                "/attributes/team/ipaddr",
+            ),
+            (
+                "a key carrying both characters a segment escapes",
+                "attributes.a/b~c.member.ipaddr",
+                "/attributes/a~1b~0c/ipaddr",
+            ),
+            (
+                "an entry whose value is what failed",
+                "attributes.2024.member",
+                "/attributes/2024",
+            ),
+            (
+                "a list inside a map entry",
+                "attributes.2024.member.set.2.member",
+                "/attributes/2024/set/1",
+            ),
+            (
+                "a map inside a list element",
+                "entities.2.member.attributes.2024.member.ipaddr",
+                "/entities/1/attributes/2024/ipaddr",
+            ),
+            (
+                "a map inside a map entry",
+                "context.42.member.attributes.7.member",
+                "/context/42/attributes/7",
+            ),
+            (
+                "a plain list element, which no declared map covers",
+                "requests.3.member.principal.entityId",
+                "/requests/2/principal/entityId",
+            ),
+        ];
+
+        for (case, dotted, expected) in rows {
+            let actual = json_pointer_keyed(dotted, declares_map);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
