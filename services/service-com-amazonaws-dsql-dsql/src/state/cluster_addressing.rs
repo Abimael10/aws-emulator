@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHERE a cluster's connection endpoint is ANNOUNCED — the one value `CreateCluster`
-//! persists on a cluster and every read of that cluster reports.
+//! WHERE a cluster's connection endpoints are ANNOUNCED — the value `CreateCluster`
+//! publishes and every read of that cluster reports, and the VPC connection endpoint
+//! `GetVpcEndpointServiceName` reports beside the endpoint service's name.
 //!
 //! `Endpoint` is "The connection endpoint for the created cluster"
-//! (`smithy_query(query="operation", operation="CreateCluster")`): not a label a client
-//! reads, but the host it then DIALS to reach that cluster's data plane. So the only thing
-//! the member may carry is an address THIS emulator answers on — the host of the one
+//! (`smithy_query(query="operation", operation="CreateCluster")`) and `ClusterVpcEndpoint`
+//! is "The VPC connection endpoint for the cluster": neither is a label a client reads, but
+//! a host it then DIALS to reach that cluster's data plane. So the only thing either member
+//! may carry is an address THIS emulator answers on — the host of the one
 //! endpoint it serves its whole surface at ([`addressing::served_endpoint_authority`]).
 //!
 //! A name in a zone Amazon Web Services publishes its own endpoints in
@@ -16,12 +18,19 @@
 //! emulator's OWN invention is no better: nothing answers for a sub-name of the host this
 //! process is reached at, so a client that resolves one reaches nothing either.
 //!
-//! ONE host therefore answers for every cluster here, where Amazon Web Services gives each
-//! cluster a dedicated name: this process serves its whole surface at a single endpoint, and
+//! ONE host therefore answers for every cluster here, and for every access path to it, where
+//! Amazon Web Services gives each cluster — and each path — a dedicated name: this process
+//! serves its whole surface at a single endpoint, and
 //! which cluster a session is on is what the connection itself carries. The member is a
 //! HOSTNAME and nothing else — no scheme, no path and no port, which is also all
-//! `Endpoint`'s `^[a-zA-Z0-9.-]+$` admits ([`is_endpoint_host`]) — so a client dials it on
+//! `Endpoint`'s and `ClusterVpcEndpoint`'s `^[a-zA-Z0-9.-]+$` admit ([`is_endpoint_host`]) —
+//! so a client dials it on
 //! the database's own port, exactly as it does the name Amazon Web Services publishes.
+//!
+//! What the two members do NOT share is a NAME: which endpoint service fronts a cluster is a
+//! name and not an address, so it is derived from the cluster's own stored endpoint-service
+//! suffix ([`crate::state::vpc_endpoint_service_name`]) rather than from where this process
+//! answers.
 //!
 //! Nothing of a request moves the answer: where this emulator is served is a property of the
 //! PROCESS and not of the host a request happened to carry, so the address the create
@@ -29,9 +38,15 @@
 
 use ::service_common::data_plane_addressing as addressing;
 
-/// The DNS name a cluster's connection endpoint is announced at, for the emulator serving
+/// The DNS name a cluster's connection endpoints are announced at, for the emulator serving
 /// `ctx`: the host of the one endpoint this process answers on, with no port and no path
 /// ([`announced_host`]).
+///
+/// The reading for EVERY address of a cluster this service reports — `CreateCluster`'s and
+/// `GetCluster`'s `endpoint`, and `GetVpcEndpointServiceName`'s `clusterVpcEndpoint`, which
+/// is likewise a host a client resolves and then dials (see this module's docs) — so the
+/// access paths Amazon Web Services gives dedicated names cannot drift onto addresses this
+/// process does not answer on.
 ///
 /// What it is read from is the tree's one statement of where this emulator answers
 /// ([`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request

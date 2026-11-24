@@ -460,6 +460,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // work the clock owes, so the member reports it as arriving until then
         // (`crate::state::initial_encryption_status`).
         let encryption_status = crate::state::initial_encryption_status(customer_key);
+        // The endpoint service that fronts this cluster is named once, here, and
+        // read back by `GetVpcEndpointServiceName` from the record: a read reports
+        // the endpoint service, it does not name it.
+        let vpc_endpoint_service_suffix = state.mint_vpc_endpoint_service_suffix();
         let mut cluster = crate::state::Cluster {
             arn,
             status: crate::state::STATUS_CREATING.to_string(),
@@ -479,6 +483,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             streams: std::collections::BTreeMap::new(),
             pending: None,
             identifier: identifier.clone(),
+            vpc_endpoint_service_suffix,
         };
         // The clock, not a later caller, owes this cluster the status its
         // configuration settles into: `ACTIVE` for a single-Region cluster, and

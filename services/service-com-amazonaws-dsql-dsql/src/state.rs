@@ -363,6 +363,16 @@ impl Stream {
 pub struct Cluster {
     /// The 26-character lowercase identifier (`ClusterId`).
     pub identifier: String,
+    /// The SHORT endpoint-service suffix this cluster's VPC endpoint service is
+    /// qualified by, minted ONCE when the cluster was created
+    /// ([`ComAmazonawsDsqlDsqlState::mint_vpc_endpoint_service_suffix`]) and
+    /// stored here because it is part of the cluster's identity rather than of
+    /// the call that reads it: `GetVpcEndpointServiceName` names the endpoint
+    /// service from it ([`vpc_endpoint_service_name`]), so two reads of one
+    /// cluster name one endpoint service. It is not derived from
+    /// [`Self::identifier`]: the endpoint service has a name of its own, and the
+    /// recorded service carries a short token there and not the cluster id.
+    pub vpc_endpoint_service_suffix: String,
     /// The cluster ARN, as [`cluster_arn`] builds it.
     pub arn: String,
     /// The current `ClusterStatus`.
@@ -1329,6 +1339,29 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
+    /// Mint a fresh, unused per-cluster endpoint-service suffix.
+    ///
+    /// The shape comes from [`new_vpc_endpoint_service_suffix`]; the loop
+    /// re-draws rather than ever handing back a suffix a cluster this store holds
+    /// — live or retired — already carries, so the endpoint service of one
+    /// cluster is never the endpoint service another is reported under. At most
+    /// [`MAX_CLUSTERS`] live and [`MAX_RETIRED_CLUSTERS`] retired clusters hold
+    /// one, out of the 32 to the power of
+    /// [`VPC_ENDPOINT_SERVICE_SUFFIX_LENGTH`] a draw can land on, so the re-draw
+    /// is the rare path and the walk it costs is bounded by those ceilings.
+    pub fn mint_vpc_endpoint_service_suffix(&self) -> String {
+        let taken = |suffix: &str| {
+            let carried = |cluster: &Cluster| cluster.vpc_endpoint_service_suffix == suffix;
+            self.clusters.values().any(carried) || self.retired_clusters.values().any(carried)
+        };
+        loop {
+            let candidate = new_vpc_endpoint_service_suffix();
+            if !taken(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
     /// Drop every idempotency token recorded against `resource` in the ledgers
     /// whose record is about a resource that is still there, so such a token
     /// never outlives the resource it names. The ledger of the call that removes
@@ -1704,37 +1737,54 @@ fn is_arn_region_segment(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// The per-cluster suffix the VPC endpoint service of a cluster is QUALIFIED by.
+/// How many characters the endpoint-service suffix of a cluster is written with.
 ///
-/// It IS the cluster's own identifier — a value the mint already drew once per
-/// cluster, so nothing second has to be minted or stored for a suffix to be
-/// stable across reads and distinct per cluster. What this function is for is the
-/// SEAM: an interface VPC endpoint service is named
-/// `com.amazonaws.{region}.{service}`, and Aurora DSQL qualifies that PER
-/// CLUSTER — `GetVpcEndpointServiceName` is keyed by a cluster id and answers
-/// `ResourceNotFoundException` for an unknown one, and `ServiceName`'s pattern
-/// (`smithy_query(query="shape", shape="ServiceName")`:
+/// An interface VPC endpoint service is named `com.amazonaws.{region}.{service}`,
+/// and Aurora DSQL qualifies that PER CLUSTER with a SHORT token of its own —
+/// recorded replies carry four characters after `dsql-`, and `ServiceName`'s
+/// pattern (`smithy_query(query="shape", shape="ServiceName")`:
 /// `^com\.amazonaws\.[a-z0-9-]+\.dsql[a-z0-9-]*$`) admits exactly such a suffix
-/// after `dsql` — so the NAME of the service is a label built around the cluster,
-/// where the HOST the same reply reports is an address a client dials and is
-/// therefore read from where this emulator answers ([`cluster_endpoint`]).
+/// after `dsql`. The token is the endpoint service's own name and not the
+/// cluster's, so it is drawn independently of the identifier rather than cut
+/// from it ([`new_vpc_endpoint_service_suffix`]) — the NAME of the service is a
+/// label of its own, where the HOST the same reply reports is an address a
+/// client dials and is therefore read from where this emulator answers
+/// ([`cluster_endpoint`]).
+pub const VPC_ENDPOINT_SERVICE_SUFFIX_LENGTH: usize = 4;
+
+/// A fresh per-cluster endpoint-service suffix: [`VPC_ENDPOINT_SERVICE_SUFFIX_LENGTH`]
+/// characters of the alphabet this service writes an identifier in
+/// ([`CROCKFORD_SYMBOLS`]), which is what `ServiceName`'s `[a-z0-9-]*` and one
+/// DNS label both admit.
+///
+/// Drawn from the entropy of a fresh identifier draw ([`new_resource_identifier`],
+/// whose low-order symbols are its 80 entropy bits rather than its leading
+/// timestamp), so two clusters minted in one millisecond get different suffixes
+/// and a suffix reveals nothing of the cluster it fronts. The draw is short, so
+/// it can repeat: [`ComAmazonawsDsqlDsqlState::mint_vpc_endpoint_service_suffix`]
+/// re-draws rather than ever handing back a suffix this store already has.
 #[must_use]
-pub fn vpc_endpoint_service_suffix(identifier: &str) -> &str {
-    identifier
+pub fn new_vpc_endpoint_service_suffix() -> String {
+    let drawn = new_resource_identifier();
+    let start = drawn
+        .len()
+        .saturating_sub(VPC_ENDPOINT_SERVICE_SUFFIX_LENGTH);
+    drawn[start..].to_string()
 }
 
 /// The VPC endpoint service that fronts one cluster:
-/// `com.amazonaws.{region}.dsql-{suffix}`, for that cluster's own endpoint-service
-/// suffix ([`vpc_endpoint_service_suffix`]).
+/// `com.amazonaws.{region}.dsql-{suffix}`, for that cluster's own stored
+/// endpoint-service suffix ([`Cluster::vpc_endpoint_service_suffix`]).
 ///
-/// `region` is at most 20 characters and the suffix is the cluster's 26-character
-/// identifier, so the result is at most 66 characters — inside `ServiceName`'s
-/// `@length(1, 128)`.
-pub fn vpc_endpoint_service_name(region: &str, identifier: &str) -> String {
-    format!(
-        "com.amazonaws.{region}.dsql-{}",
-        vpc_endpoint_service_suffix(identifier)
-    )
+/// The suffix is read off the CLUSTER and never derived from the call, so two
+/// reads of one cluster name one endpoint service, and the endpoint service of
+/// one cluster is never the endpoint service another is reported under.
+///
+/// `region` is at most 20 characters and the suffix is
+/// [`VPC_ENDPOINT_SERVICE_SUFFIX_LENGTH`] characters, so the result is well
+/// inside `ServiceName`'s `@length(1, 128)`.
+pub fn vpc_endpoint_service_name(region: &str, suffix: &str) -> String {
+    format!("com.amazonaws.{region}.dsql-{suffix}")
 }
 
 /// The customer-managed key a `kmsEncryptionKey` names, if it names one at all.

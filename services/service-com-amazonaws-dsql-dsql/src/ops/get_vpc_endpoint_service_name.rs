@@ -8,12 +8,12 @@
 //! cluster. `@readonly`: the only write it performs is settling a status change the
 //! clock already owed at this instant.
 //!
-//! The service NAME is derived from the persisted cluster — its region and its
-//! identifier — through [`crate::state::vpc_endpoint_service_name`], so two reads of one
-//! cluster agree and a read invents nothing. The connection ENDPOINT beside it is an
-//! address a client dials, so it is the host this emulator answers on
-//! ([`crate::state::cluster_endpoint`]), the same value every report of the cluster's own
-//! `endpoint` carries.
+//! The endpoint service's NAME is DERIVED from the persisted cluster — its region and
+//! the endpoint-service suffix it was minted with — through
+//! [`crate::state::vpc_endpoint_service_name`], so two reads of one cluster agree and a
+//! read invents nothing. The connection ENDPOINT beside it is an ADDRESS a client dials,
+//! so it is the host this emulator answers on ([`crate::state::cluster_endpoint`]), the
+//! same value every report of the cluster's own `endpoint` carries.
 //!
 //! ## Shape of an operation
 //!
@@ -193,7 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::resource_region(&cluster.arn, &request_region);
 
         Ok(GetVpcEndpointServiceNameOutput {
-            service_name: crate::state::vpc_endpoint_service_name(&region, &cluster.identifier),
+            service_name: crate::state::vpc_endpoint_service_name(
+                &region,
+                &cluster.vpc_endpoint_service_suffix,
+            ),
             // "The VPC connection endpoint for the cluster": an address a client
             // DIALS, so the only thing it may carry is the host this emulator
             // answers on — the very value every report of this cluster's

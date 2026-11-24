@@ -23,8 +23,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::state::{
-    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, RecordedCall, TokenScope, MAX_CLUSTERS,
-    MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS, STATUS_DELETED,
+    new_vpc_endpoint_service_suffix, Cluster, ComAmazonawsDsqlDsqlState, PendingTransition,
+    RecordedCall, TokenScope, MAX_CLUSTERS, MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS,
+    STATUS_DELETED,
 };
 use service_common::data_plane_addressing::{AWS_ENDPOINT_DNS_SUFFIXES, LOOPBACK_ZONE};
 
@@ -301,7 +302,7 @@ async fn create_persists_a_cluster_that_get_reports_back() {
 }
 
 /// The endpoint bases this emulator can be served at, with the host a cluster's
-/// connection endpoint is announced at when it is served there.
+/// connection endpoints are announced at when it is served there.
 ///
 /// The rows span the forms that address takes: a loopback literal with a port, a name
 /// with another port, a name with no port at all, a bracketed IPv6 literal (a host
@@ -1135,6 +1136,7 @@ pub fn cluster_id_for(n: usize) -> String {
 pub fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
     Cluster {
         identifier: identifier.to_string(),
+        vpc_endpoint_service_suffix: new_vpc_endpoint_service_suffix(),
         arn: expected_arn("us-east-1", identifier),
         status: "DELETING".to_string(),
         creation_time: due_at,

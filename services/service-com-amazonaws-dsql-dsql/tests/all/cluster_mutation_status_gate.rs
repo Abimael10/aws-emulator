@@ -28,8 +28,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::json;
 use service_com_amazonaws_dsql_dsql::ops::types::CLUSTER_STATUS_VALUES;
 use service_com_amazonaws_dsql_dsql::state::{
-    Cluster, ClusterPolicy, ComAmazonawsDsqlDsqlState, PendingTransition, STATUS_ACTIVE,
-    STATUS_DELETED, STATUS_DELETING, STATUS_IDLE, STATUS_PENDING_DELETE, STATUS_UPDATING,
+    new_vpc_endpoint_service_suffix, Cluster, ClusterPolicy, ComAmazonawsDsqlDsqlState,
+    PendingTransition, STATUS_ACTIVE, STATUS_DELETED, STATUS_DELETING, STATUS_IDLE,
+    STATUS_PENDING_DELETE, STATUS_UPDATING,
 };
 
 use crate::cluster_lifecycle::cluster_id_for;
@@ -117,6 +118,7 @@ fn stored_cluster(identifier: &str, status: &str) -> Cluster {
     };
     Cluster {
         identifier: identifier.to_string(),
+        vpc_endpoint_service_suffix: new_vpc_endpoint_service_suffix(),
         arn: expected_arn(REGION, identifier),
         status: status.to_string(),
         creation_time: SystemTime::now(),

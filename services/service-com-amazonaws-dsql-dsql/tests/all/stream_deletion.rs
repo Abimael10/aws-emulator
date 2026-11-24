@@ -36,9 +36,9 @@ use service_com_amazonaws_dsql_dsql::ops::types::{
     KinesisTargetDefinition, TargetDefinition, CLUSTER_STATUS_VALUES, STREAM_STATUS_VALUES,
 };
 use service_com_amazonaws_dsql_dsql::state::{
-    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, Stream, CLIENT_TOKEN_MISMATCH_MESSAGE,
-    STATUS_ACTIVE, STATUS_DELETED, STATUS_DELETING, STATUS_IDLE, STREAM_STATUS_ACTIVE,
-    STREAM_STATUS_CREATING, STREAM_STATUS_DELETED, STREAM_STATUS_DELETING,
+    new_vpc_endpoint_service_suffix, Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, Stream,
+    CLIENT_TOKEN_MISMATCH_MESSAGE, STATUS_ACTIVE, STATUS_DELETED, STATUS_DELETING, STATUS_IDLE,
+    STREAM_STATUS_ACTIVE, STREAM_STATUS_CREATING, STREAM_STATUS_DELETED, STREAM_STATUS_DELETING,
 };
 
 use crate::cluster_lifecycle::cluster_id_for;
@@ -418,6 +418,7 @@ fn seeded_cluster(region: &str, identifier: &str, status: &str, stream: Stream) 
     };
     Cluster {
         identifier: identifier.to_string(),
+        vpc_endpoint_service_suffix: new_vpc_endpoint_service_suffix(),
         arn: expected_arn(region, identifier),
         status: status.to_string(),
         creation_time: SystemTime::now(),
