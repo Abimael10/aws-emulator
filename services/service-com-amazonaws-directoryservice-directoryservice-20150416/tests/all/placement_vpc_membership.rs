@@ -742,6 +742,51 @@ fn stated_sentence(status: u16, parsed: &Value, row: &PickCase, case: &str) -> S
     message.replace(&request_id, "")
 }
 
+/// Every operation of this service that places a directory's servers in a VPC of its own
+/// request: the three creates, and the add that replicates a directory into another Region.
+const PLACING_OPERATIONS: [&str; 4] = [
+    "CreateDirectory",
+    "CreateMicrosoftAD",
+    "ConnectDirectory",
+    "AddRegion",
+];
+
+/// Drive `row`'s pick through every operation that places directory servers — the creates under
+/// the directory name `name`, the add replicating `replicated` — and assert each one refuses it
+/// with the row's class and the one FIXED sentence of the rule it broke.
+///
+/// One driver for every table of unservable picks in this suite, so a row cannot be asserted one
+/// way here and another way there.
+async fn every_placement_refuses(
+    router: &MultiServiceRouter,
+    replicated: &str,
+    row: &PickCase,
+    name: &str,
+) {
+    for operation in PLACING_OPERATIONS {
+        let case = format!("{operation} with {}", row.case);
+        let body = if operation == "AddRegion" {
+            json!({
+                "DirectoryId": replicated,
+                "RegionName": REGION,
+                "VPCSettings": { "VpcId": &row.vpc, "SubnetIds": &row.subnets },
+            })
+        } else {
+            create_body(operation, name, &row.vpc, &row.subnets)
+        };
+        let (status, parsed) = call(router, operation, body).await;
+        let stated = stated_sentence(status, &parsed, row, &case);
+        // One sentence per rule: with the call's own request id taken out, nothing of the
+        // message differs between two calls that broke the same rule, whichever operation
+        // they called and however they broke it.
+        assert_eq!(
+            stated,
+            format!("{}{REQUEST_ID_SEPARATOR}", row.sentence),
+            "case {case:?}: expected the rule's one fixed sentence, got {stated:?}"
+        );
+    }
+}
+
 /// RULE: every operation that places a directory's servers in a VPC refuses an unservable pick
 /// with the one FIXED sentence the rule that pick broke is stated in, followed by the call's own
 /// request id — and stores nothing. The three rules carry three DIFFERENT sentences, all opened
@@ -776,38 +821,13 @@ async fn every_placement_states_the_rule_its_pick_broke_in_one_fixed_sentence() 
 
     let before = stored_count(router, "before any refused placement").await;
     for (index, row) in rows.iter().enumerate() {
-        for operation in [
-            "CreateDirectory",
-            "CreateMicrosoftAD",
-            "ConnectDirectory",
-            "AddRegion",
-        ] {
-            let case = format!("{operation} with {}", row.case);
-            let body = if operation == "AddRegion" {
-                json!({
-                    "DirectoryId": &replicated,
-                    "RegionName": REGION,
-                    "VPCSettings": { "VpcId": &row.vpc, "SubnetIds": &row.subnets },
-                })
-            } else {
-                create_body(
-                    operation,
-                    &format!("wording{index}.example.com"),
-                    &row.vpc,
-                    &row.subnets,
-                )
-            };
-            let (status, parsed) = call(router, operation, body).await;
-            let stated = stated_sentence(status, &parsed, row, &case);
-            // One sentence per rule: with the call's own request id taken out, nothing of the
-            // message differs between two calls that broke the same rule, whichever operation
-            // they called and however they broke it.
-            assert_eq!(
-                stated,
-                format!("{}{REQUEST_ID_SEPARATOR}", row.sentence),
-                "case {case:?}: expected the rule's one fixed sentence, got {stated:?}"
-            );
-        }
+        every_placement_refuses(
+            router,
+            &replicated,
+            row,
+            &format!("wording{index}.example.com"),
+        )
+        .await;
     }
 
     // The three rules are DISTINGUISHABLE, and each names the subnet pick as the invalid part of
@@ -1014,5 +1034,177 @@ async fn a_replica_naming_a_subnet_the_account_does_not_have_is_refused() {
         vec![REGION.to_string()],
         "case {case:?}: expected the directory to keep the one Region it was created in, got \
          {regions:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: the membership rule holds between ANY two VPCs the account holds, in either
+// direction, and states its own sentence — not the zone rule's — whichever VPC the
+// placement names.
+// ---------------------------------------------------------------------------
+
+/// The block a SECOND VPC of the client's own is cut from here, outside the block the shared
+/// network's VPC carries, so the two VPCs overlap in nothing.
+const SECOND_VPC_BLOCK: &str = "10.185.0.0/16";
+
+/// The blocks the second VPC's subnets carry: two bases and two prefix lengths inside
+/// [`SECOND_VPC_BLOCK`], so a row naming one of them differs from the shared network's subnets
+/// in the block as well as in the VPC.
+const SECOND_SUBNET_BLOCKS: [&str; 2] = ["10.185.0.0/24", "10.185.1.0/25"];
+
+/// Mint a SECOND VPC of the account's, with one subnet in each of `zones`, through EC2's own
+/// API — so every identifier a row below names is one the owner of subnets really holds, in a
+/// VPC the owner of VPCs really reports.
+async fn second_vpc(
+    router: &MultiServiceRouter,
+    zones: &[String],
+    case: &str,
+) -> (String, Vec<String>) {
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+    let vpc = ec2
+        .create_vpc()
+        .cidr_block(SECOND_VPC_BLOCK)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: EC2 must create the second VPC: {error:?}"))
+        .vpc()
+        .and_then(::aws_sdk_ec2::types::Vpc::vpc_id)
+        .unwrap_or_else(|| panic!("case {case:?}: CreateVpc must report the VPC it minted"))
+        .to_string();
+
+    let mut subnets = Vec::with_capacity(SECOND_SUBNET_BLOCKS.len());
+    for (block, zone) in SECOND_SUBNET_BLOCKS.iter().zip(zones) {
+        let id = ec2
+            .create_subnet()
+            .vpc_id(&vpc)
+            .cidr_block(*block)
+            .availability_zone(zone)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: EC2 must create a subnet for {block}: {error:?}")
+            })
+            .subnet()
+            .and_then(::aws_sdk_ec2::types::Subnet::subnet_id)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: CreateSubnet must report the subnet it minted for {block}")
+            })
+            .to_string();
+        subnets.push(id);
+    }
+    (vpc, subnets)
+}
+
+/// RULE: a placement is servable only when the owner of subnets reports EVERY subnet it names in
+/// the VPC the request names, so a pick naming a subnet of any OTHER VPC the account holds is
+/// refused — `ClientException`, HTTP 400 — with the one fixed sentence of the membership rule,
+/// whichever of the two VPCs is the one named and whichever operation places the servers.
+///
+/// The rows differ along what the rule generalises over: WHICH held VPC the placement names (so
+/// the rule is asserted in both directions, not only against the account's default VPC), which
+/// position in the list the foreign subnet takes, how many of the named subnets are foreign, and
+/// which operation places the servers — with the second VPC's own subnets as the positive
+/// control, so what refuses a row is the membership and not the VPC or the subnets themselves.
+/// Every row's subnets span two Availability Zones, ASKED of the owner of subnets, so the
+/// sibling zone rule cannot be what fires.
+#[tokio::test]
+async fn a_placement_naming_a_subnet_of_any_other_held_vpc_is_refused() {
+    let network = network().await;
+    let router = &network.router;
+    let case = "two VPCs of the account";
+
+    // The zones come back from the owner of subnets, so the second VPC's subnets sit in the same
+    // two zones the shared network's first two do — and no row can pass for the zone rule.
+    let first = vec![network.client[0].id.clone(), network.client[1].id.clone()];
+    let zones = zones_reported_for(router, &first, case).await;
+    assert_eq!(
+        zones.len(),
+        2,
+        "case {case:?}: the rows need a pair EC2 reports in two zones, got {zones:?}"
+    );
+    let (other_vpc, other) = second_vpc(router, &zones, case).await;
+
+    // The same row type and the same driver the suite's other tables of unservable picks use, so
+    // these rows are asserted exactly as those are — only the pick differs.
+    let rows: Vec<PickCase> = vec![
+        (
+            "the first VPC named, its own subnet first and a foreign subnet second",
+            network.vpc.clone(),
+            vec![first[0].clone(), other[1].clone()],
+        ),
+        (
+            "the first VPC named, the foreign subnet first",
+            network.vpc.clone(),
+            vec![other[0].clone(), first[1].clone()],
+        ),
+        (
+            "the first VPC named, both subnets foreign",
+            network.vpc.clone(),
+            vec![other[0].clone(), other[1].clone()],
+        ),
+        (
+            "the second VPC named, its own subnet first and a foreign subnet second",
+            other_vpc.clone(),
+            vec![other[0].clone(), first[1].clone()],
+        ),
+        (
+            "the second VPC named, both subnets foreign",
+            other_vpc.clone(),
+            vec![first[0].clone(), first[1].clone()],
+        ),
+    ]
+    .into_iter()
+    .map(|(pick, vpc, subnets)| PickCase {
+        case: pick.to_string(),
+        vpc,
+        subnets,
+        code: NETWORK_REFUSAL,
+        sentence: SUBNETS_OUTSIDE_THE_VPC,
+    })
+    .collect();
+
+    // The positive control: the second VPC's own subnets carry a directory, so the VPC and the
+    // subnets the rows above name are a servable placement when they are named TOGETHER.
+    let served = ok(
+        router,
+        "CreateMicrosoftAD",
+        create_body(
+            "CreateMicrosoftAD",
+            "membership-second-vpc.example.com",
+            &other_vpc,
+            &other,
+        ),
+        "the second VPC's own subnets",
+    )
+    .await;
+    let replicated = string(&served, "DirectoryId", "the second VPC's own subnets");
+
+    let before = stored_count(router, "before any refused placement").await;
+    for (index, row) in rows.iter().enumerate() {
+        // ASKED of the owner: the row's subnets really do span two zones, so the refusal below
+        // cannot be the zone rule's.
+        let spanned = zones_reported_for(router, &row.subnets, &row.case).await;
+        assert_eq!(
+            spanned.len(),
+            2,
+            "case {:?}: the row must span two zones, EC2 reports {spanned:?}",
+            row.case
+        );
+        // The membership rule's OWN sentence, from every operation that places directory
+        // servers: a client reading it is told to re-pick inside the named VPC, not to re-zone,
+        // and the whole message is that sentence, so the refusal quotes neither VPC nor either
+        // subnet.
+        every_placement_refuses(
+            router,
+            &replicated,
+            row,
+            &format!("membership-two-vpcs{index}.example.com"),
+        )
+        .await;
+    }
+    assert_eq!(
+        stored_count(router, "after every refused placement").await,
+        before,
+        "case {case:?}: expected a refused placement to store nothing"
     );
 }
