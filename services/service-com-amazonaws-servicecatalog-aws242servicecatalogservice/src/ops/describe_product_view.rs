@@ -162,11 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|product| !state.launch_path_portfolios(&product.id).is_empty())
             .ok_or_else(|| {
                 // One sentence for both reasons this read can fail, so a refusal cannot be
-                // read as "this product exists but you may not see it"; the identifier the
-                // request carried is its only variable part.
+                // read as "this product exists but you may not see it"; it names the
+                // member the request addressed the view by, and the value that member
+                // carried is its only variable part.
                 DescribeProductViewErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::access_or_existence_message(&input.id)),
+                        message: Some(crate::state::product_view_not_found_message(&input.id)),
                     },
                 )
             })?;

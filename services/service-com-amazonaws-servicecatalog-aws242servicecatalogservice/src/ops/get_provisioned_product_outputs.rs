@@ -80,7 +80,7 @@ use super::types::*;
 
 // The shared reading of the id-or-name pair the provisioned product this request names
 // is addressed by, and the sentence this service refuses an unresolved one with.
-use crate::state::{Addressed, KIND_PROVISIONED_PRODUCT};
+use crate::state::Addressed;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -183,10 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Addressed::Name(name) => state.provisioned_product_by_name(name, now),
             }
             .ok_or_else(|| {
-                not_found(crate::state::not_found_message(
-                    KIND_PROVISIONED_PRODUCT,
-                    addressed.identifier(),
-                ))
+                // What this read answers lives in the provisioned product's
+                // CloudFormation stack, so an identifier that resolves no provisioned
+                // product resolves no stack either: the refusal is the STACK LOOKUP's,
+                // naming the identifier the request addressed it by.
+                not_found(crate::state::no_stack_named_message(addressed.identifier()))
             })?;
 
             // The outputs of a provisioned product are the outputs of its LAST
@@ -234,10 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(outputs) => outputs,
                 Err(reason) => {
                     ::tracing::debug!(%stack, %reason, "this launch's stack could not be read");
-                    return Err(not_found(crate::state::not_found_message(
-                        crate::state::KIND_CLOUDFORMATION_STACK,
-                        stack,
-                    )));
+                    return Err(not_found(crate::state::no_stack_named_message(stack)));
                 }
             },
         };
@@ -317,10 +315,10 @@ fn invalid_parameters(message: String) -> GetProvisionedProductOutputsError {
     .into()
 }
 
-/// This operation's not-found error for an identifier that resolves to nothing: the
-/// message names the KIND of resource the request addressed and the identifier it used,
-/// the shape every not-found in this service reports
-/// ([`crate::state::not_found_message`]).
+/// This operation's not-found error for a stack lookup that resolves nothing: the
+/// message is CloudFormation's own sentence for a stack name that names no stack
+/// ([`crate::state::no_stack_named_message`]), because that lookup is where this read's
+/// answer comes from.
 fn not_found(message: String) -> GetProvisionedProductOutputsError {
     GetProvisionedProductOutputsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),

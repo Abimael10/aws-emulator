@@ -5,9 +5,11 @@
 //!
 //! The rule under test: an end-user read reaches a product only through a LAUNCH PATH, so
 //! an identifier naming a product no portfolio carries is refused exactly as one naming
-//! nothing stored is — HTTP 400, `ResourceNotFoundException`, and the one sentence that
-//! covers both reasons: the identifier the request carried followed by the fixed text
-//! `" does not exist or access was denied"`. That holds for every product, WHATEVER
+//! nothing stored is — HTTP 400, `ResourceNotFoundException`, and the sentence that read
+//! words its not-found with: for `DescribeProduct` the identifier the request carried
+//! followed by the fixed text `" does not exist or access was denied"`, for the sibling
+//! product-view read the fixed text `"Product not found for ProductViewId: "` followed by
+//! it. That holds for every product, WHATEVER
 //! minted it — a create, a copy into a new product, a copy into a product that already
 //! carried versions — and once a portfolio carries the product the same read reports the
 //! product's OWN stored versions and the launch path it was reached through.
@@ -32,9 +34,22 @@ use crate::harness::{
     message,
 };
 
-/// The fixed text of the end-user sentence: everything but the identifier the request
-/// carried.
+/// The fixed text of the product read's sentence: everything but the identifier the
+/// request carried.
 const END_USER_SENTENCE: &str = " does not exist or access was denied";
+
+/// The fixed text of the product VIEW read's sentence, which precedes the identifier:
+/// each end-user read words its own not-found for the resource it addresses, so the two
+/// templates are not shared.
+const VIEW_NOT_FOUND_PREFIX: &str = "Product not found for ProductViewId: ";
+
+/// The sentence `operation` words its refusal of `identifier` with.
+fn expected_refusal(operation: &str, identifier: &str) -> String {
+    match operation {
+        "DescribeProductView" => format!("{VIEW_NOT_FOUND_PREFIX}{identifier}"),
+        _ => format!("{identifier}{END_USER_SENTENCE}"),
+    }
+}
 
 /// How long a poll keeps looking for a condition the emulator's clock owes before it
 /// gives up. Generous: it bounds nothing this suite asserts, only how long a wait may
@@ -163,7 +178,8 @@ async fn copy_succeeds(router: &MultiServiceRouter, case: &str, token: &str) -> 
     }
 }
 
-/// Assert one end-user read of `identifier` is refused with the one end-user sentence.
+/// Assert one end-user read of `identifier` is refused with the sentence that read words
+/// its not-found with.
 async fn assert_end_user_refusal(
     router: &MultiServiceRouter,
     case: &str,
@@ -184,7 +200,7 @@ async fn assert_end_user_refusal(
     let reported = message(&refused);
     assert_eq!(
         reported,
-        format!("{identifier}{END_USER_SENTENCE}"),
+        expected_refusal(operation, identifier),
         "case {case:?}: {operation} unexpected message, got {reported:?}"
     );
 }
@@ -199,9 +215,9 @@ struct Row {
     version_ids: BTreeSet<String>,
 }
 
-/// A product no portfolio carries is refused by the end-user reads with the one end-user
-/// sentence, whatever minted it, and the grant that puts it on a launch path is what
-/// brings it into view with its own versions.
+/// A product no portfolio carries is refused by the end-user reads with the sentence each
+/// words its not-found with, whatever minted it, and the grant that puts it on a launch
+/// path is what brings it into view with its own versions.
 ///
 /// Rows differ along the way the product came into existence — a create, a copy into a
 /// freshly minted product, and a copy into a product that already carried a version of
@@ -305,8 +321,8 @@ async fn a_product_out_of_view_is_refused_whatever_minted_it() {
         rows[2].version_ids
     );
 
-    // Out of view, every end-user read of every row is refused with the one sentence,
-    // whichever member addressed the product.
+    // Out of view, every end-user read of every row is refused with the sentence that
+    // read words its not-found with, whichever member addressed the product.
     for row in &rows {
         for (operation, member, identifier) in [
             ("DescribeProduct", "Id", row.product_id.clone()),

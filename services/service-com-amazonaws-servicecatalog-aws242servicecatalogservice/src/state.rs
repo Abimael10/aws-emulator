@@ -289,17 +289,38 @@ pub fn not_found_message(kind: &str, identifier: &str) -> String {
     format!("{kind} not found: {identifier}")
 }
 
+/// The sentence a read whose answer lives in a provisioned product's CloudFormation
+/// stack refuses an identifier with: that read resolves the stack the launch stood up,
+/// so an identifier naming no stack is refused as the STACK LOOKUP failed, in
+/// CloudFormation's own words. All of it is fixed text except the name the lookup used,
+/// which is the identifier the request carried.
+pub fn no_stack_named_message(stack_name: &str) -> String {
+    format!("No stack named {stack_name} exists.")
+}
+
+/// The sentence the END-USER product VIEW read refuses an `Id` that resolves no visible
+/// product view with: it names the member the request addressed the view by and echoes
+/// the value it carried, which is the only variable part.
+///
+/// Worded on its own rather than shared with the end-user product read
+/// ([`access_or_existence_message`]), because Service Catalog words each read's not-found
+/// for the resource that read addresses: this one addresses a product VIEW by
+/// `ProductViewId`, and the two templates must not be shared.
+pub fn product_view_not_found_message(product_view_id: &str) -> String {
+    format!("Product not found for ProductViewId: {product_view_id}")
+}
+
 /// The sentence the END-USER product views refuse an identifier with: one sentence that
 /// covers both reasons such a read can fail — nothing stored carries the identifier, and
 /// a stored product this view cannot reach through any launch path — so a caller cannot
 /// learn from the refusal that a product it has no access to exists. The identifier the
 /// request addressed the product by is the only variable part.
 ///
-/// Shared by every end-user read of a product (`DescribeProduct`, which addresses it by
-/// `Id` or `Name`, and `DescribeProductView`, which addresses its product view by `Id`),
-/// so the deliberate ambiguity cannot be worded two ways. The ADMIN views see every
-/// stored product and so report [`not_found_message`] instead; the two are deliberately
-/// not shared.
+/// The end-user read of a PRODUCT (`DescribeProduct`, which addresses it by `Id` or
+/// `Name`) words its refusal this way. The end-user read of a product VIEW addresses a
+/// different resource and words its own ([`product_view_not_found_message`]), and the
+/// ADMIN views see every stored product and so report [`not_found_message`] instead;
+/// the three are deliberately not shared.
 pub fn access_or_existence_message(identifier: &str) -> String {
     format!("{identifier} does not exist or access was denied")
 }
@@ -316,10 +337,6 @@ pub const KIND_PROVISIONED_PRODUCT: &str = "Provisioned product";
 
 /// The resource kind a request operation's record is, as its not-found names it.
 pub const KIND_RECORD: &str = "Record";
-
-/// The resource kind a provisioned product's CloudFormation stack is, as a refusal that
-/// cannot read it names it.
-pub const KIND_CLOUDFORMATION_STACK: &str = "CloudFormation stack";
 
 /// The resource kind a product version is, as its not-found names it.
 pub const KIND_PROVISIONING_ARTIFACT: &str = "Provisioning artifact";

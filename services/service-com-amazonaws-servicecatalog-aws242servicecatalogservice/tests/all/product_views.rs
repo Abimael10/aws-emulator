@@ -7,9 +7,10 @@
 //! its `Id` addresses — by the identifier the view itself carries or by the id of the
 //! product it shows, since this service keeps one view per product — together with every
 //! provisioning artifact that product holds, and it reaches a product only through a
-//! LAUNCH PATH, so an identifier that resolves no reachable product is refused with the
-//! one sentence that covers both a product nothing stored carries and a stored product
-//! this view cannot see.
+//! LAUNCH PATH, so an identifier that resolves no reachable product — one nothing stored
+//! carries and a stored product this view cannot see alike — is refused with this
+//! operation's own not-found sentence, which names the member the request addressed the
+//! view by and echoes the value it carried.
 //!
 //! Every assertion is about STORED state: the summary and the versions a view reports are
 //! checked against what an earlier create, copy or association persisted, read back
@@ -27,10 +28,16 @@ use crate::harness::{
     error_code, is_catalog_id, message, ACCOUNT_ID, DEFAULT_REGION,
 };
 
-/// The fixed text of the end-user sentence: everything but the identifier the request
-/// carried. The same sentence `DescribeProduct` words its own refusal with — both are
-/// end-user reads of a product — pinned here for this operation too.
-const END_USER_SENTENCE: &str = " does not exist or access was denied";
+/// The fixed text of this operation's not-found sentence: everything but the identifier
+/// the request carried, which follows it. `DescribeProduct` words its own refusal
+/// differently (`" does not exist or access was denied"`, pinned in
+/// `end_user_product_view_messages`), so the two templates are not shared and this one is
+/// pinned here.
+const VIEW_NOT_FOUND_PREFIX: &str = "Product not found for ProductViewId: ";
+
+/// The fixed text of the sibling end-user read's sentence, which this operation must NOT
+/// answer with.
+const PRODUCT_SENTENCE: &str = " does not exist or access was denied";
 
 /// The modelled upper bound on an error message: `ResourceNotFoundException$Message`
 /// targets `ErrorMessage`, `@length 1..1024`
@@ -381,9 +388,9 @@ async fn a_product_view_reports_the_stored_product_and_its_versions() {
     }
 }
 
-/// An identifier that resolves no reachable product view is refused with the one
-/// end-user sentence, whatever shape it has and whether it names nothing at all or a
-/// stored product this view cannot reach.
+/// An identifier that resolves no reachable product view is refused with this
+/// operation's own sentence, whatever shape it has and whether it names nothing at all or
+/// a stored product this view cannot reach.
 ///
 /// Rows span the identifier shapes the modelled `Id` admits (`@length 1..100`, pattern
 /// `^[a-zA-Z0-9_\-]*$`, `smithy_query query="operation" operation="DescribeProductView"`):
@@ -391,7 +398,7 @@ async fn a_product_view_reports_the_stored_product_and_its_versions() {
 /// a product carries, one of another resource kind, and one carrying each admitted
 /// punctuation. Anything outside those constraints never reaches the handler.
 #[tokio::test]
-async fn an_unreachable_view_is_refused_with_the_one_end_user_sentence() {
+async fn an_unreachable_view_is_refused_with_the_product_view_sentence() {
     let router = emulator();
     // A product that IS in view, so every refusal below is about the identifier the
     // request carried rather than about an empty catalog.
@@ -461,8 +468,13 @@ async fn an_unreachable_view_is_refused_with_the_one_end_user_sentence() {
         let reported = message(&refused);
         assert_eq!(
             reported,
-            format!("{identifier}{END_USER_SENTENCE}"),
+            format!("{VIEW_NOT_FOUND_PREFIX}{identifier}"),
             "case {case:?}: unexpected message, got {reported:?}"
+        );
+        assert!(
+            !reported.contains(PRODUCT_SENTENCE),
+            "case {case:?}: this read must not answer the product read's sentence, got \
+             {reported:?}"
         );
         assert!(
             !reported.is_empty() && reported.len() <= MAX_ERROR_MESSAGE,
@@ -563,7 +575,7 @@ async fn a_copied_product_comes_into_view_with_its_own_versions() {
         );
         assert_eq!(
             message(&refused),
-            format!("{identifier}{END_USER_SENTENCE}"),
+            format!("{VIEW_NOT_FOUND_PREFIX}{identifier}"),
             "case {case:?}: unexpected message, got {:?}",
             message(&refused)
         );
