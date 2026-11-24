@@ -280,12 +280,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked against the result of this call and the snapshot is left untouched when
         // the call would exceed it. A value already present is not counted twice:
         // `restore` is a SET of accounts, so authorizing the same account again changes
-        // nothing.
+        // nothing. The OWNER of the snapshot is no grantee of it either — it already copies
+        // and restores its own snapshots — so its own account id authorizes nothing and is
+        // not stored ([`crate::state::snapshot_attribute_grantees`]), which is why it
+        // counts toward no quota.
         let mut authorized = record.restore_attribute.clone();
         for value in &to_remove {
             authorized.remove(value);
         }
-        authorized.extend(to_add.iter().cloned());
+        authorized.extend(crate::state::snapshot_attribute_grantees(&to_add).map(str::to_string));
         if authorized.len() > crate::state::MAX_SNAPSHOT_SHARED_ACCOUNTS {
             return Err(
                 ModifyDBClusterSnapshotAttributeErrorModeled::SharedSnapshotQuotaExceededFault(

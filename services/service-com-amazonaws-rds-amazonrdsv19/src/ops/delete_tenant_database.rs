@@ -214,9 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Tenant databases "only appl[y] to RDS for Oracle container database (CDB)
+        // engines", so a single-tenant DB instance does not serve this operation at all: the
+        // request is refused as unsupported FOR THAT INSTANCE — before the tenant name is
+        // looked up — rather than as a tenant database that could not be found in it, which
+        // is how this front door answers an operation addressed at an instance whose
+        // configuration has no place for it
+        // ([`crate::state::tenant_operation_unsupported_message`]).
         if !crate::state::is_multi_tenant_engine(&instance.engine) {
             return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
-                crate::state::TENANT_DATABASE_NOT_FOUND_IN_INSTANCE,
+                crate::state::tenant_operation_unsupported_message(Self::NAME, &identifier),
             ));
         }
         // An instance already on its way out cannot have a tenant database deleted from

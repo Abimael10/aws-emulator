@@ -16,6 +16,15 @@
 //!   possible whatever the parameter says. `ApplyImmediately` enabled applies "the
 //!   modifications in this request and any pending modifications" at once, and so does the
 //!   restart `RebootDBInstance` performs.
+//! * `PendingModifiedValues` reports "changes that will be applied", so a value the instance
+//!   is ALREADY running under is never pending: naming it WITHDRAWS what an earlier
+//!   modification queued for that setting, leaves every other queued setting alone, and
+//!   starts no work on the instance.
+//! * `DBInstanceStatus` reports `modifying` only while the instance is applying a
+//!   modification the caller asked to apply AT ONCE. A modification left for the maintenance
+//!   window applies nothing the instance must go out of service for — neither the values
+//!   staged for that window nor the settings applied without an outage — so the instance
+//!   stays `available` and every call that needs it in that state is accepted.
 //! * `PerformanceInsightsRetentionPeriod` is held to the values the member publishes (7,
 //!   `month * 31` for 1-23 months, and 731) and reads back from the instance it was set on.
 //! * `PreferredMaintenanceWindow` is stored with its day names folded to lower case,
@@ -533,6 +542,187 @@ async fn a_modification_asked_for_at_once_is_pending_until_the_instance_is_avail
     }
 }
 
+/// One row of the WITHDRAWAL table: a change staged for the window, and the value the
+/// instance is already running under, which a second modification names to take it back.
+struct WithdrawCase {
+    case: &'static str,
+    identifier: &'static str,
+    /// The member the request carries the value in.
+    member: &'static str,
+    /// The value the first modification stages.
+    staged: &'static str,
+    /// The value the instance is running under, which the second modification names.
+    live: &'static str,
+    /// The member of `PendingModifiedValues` the staged value is reported under.
+    pending_as: &'static str,
+}
+
+/// The same classes of value the deferral table spans — a string setting, an integer, a
+/// boolean and the identifier a rename stages — each staged and then withdrawn.
+const WITHDRAWN: &[WithdrawCase] = &[
+    WithdrawCase {
+        case: "the DB instance class",
+        identifier: "emu-withdraw-class",
+        member: "DBInstanceClass",
+        staged: "db.t3.small",
+        live: "db.t3.micro",
+        pending_as: "DBInstanceClass",
+    },
+    WithdrawCase {
+        case: "allocated storage",
+        identifier: "emu-withdraw-storage",
+        member: "AllocatedStorage",
+        staged: "40",
+        live: "20",
+        pending_as: "AllocatedStorage",
+    },
+    WithdrawCase {
+        case: "a Multi-AZ deployment",
+        identifier: "emu-withdraw-multi-az",
+        member: "MultiAZ",
+        staged: "true",
+        live: "false",
+        pending_as: "MultiAZ",
+    },
+    WithdrawCase {
+        case: "a rename",
+        identifier: "emu-withdraw-rename",
+        member: "NewDBInstanceIdentifier",
+        staged: "emu-withdraw-renamed",
+        live: "emu-withdraw-rename",
+        pending_as: "DBInstanceIdentifier",
+    },
+];
+
+#[tokio::test]
+async fn naming_the_value_the_instance_already_runs_withdraws_what_was_queued() {
+    let router = emulator();
+    for case in WITHDRAWN {
+        an_instance(&router, case.identifier, &[]).await;
+        // One change staged for the window, which the instance reports as pending.
+        let modified = expect_ok(
+            case.case,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &params![
+                    "DBInstanceIdentifier" => case.identifier,
+                    "ApplyImmediately" => false,
+                    case.member => case.staged,
+                ],
+            )
+            .await,
+        );
+        let answered = the_one_instance(case.case, &modified);
+        let queued = pending(&answered).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: the staged change must be reported as pending, got {answered}",
+                case.case
+            )
+        });
+        let reported = optional_text(&queued, case.pending_as);
+        assert_eq!(
+            reported.as_deref(),
+            Some(case.staged),
+            "case {:?}: expected {} staged as {:?}, got {reported:?}",
+            case.case,
+            case.pending_as,
+            case.staged
+        );
+
+        // And then the value the instance is ALREADY running under: that identifies no
+        // change, so it replaces nothing and leaves nothing pending — the queued change is
+        // withdrawn rather than kept for the window to apply.
+        let withdrawn = expect_ok(
+            case.case,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &params![
+                    "DBInstanceIdentifier" => case.identifier,
+                    "ApplyImmediately" => false,
+                    case.member => case.live,
+                ],
+            )
+            .await,
+        );
+        let answered = the_one_instance(case.case, &withdrawn);
+        let still_pending = pending(&answered);
+        assert!(
+            still_pending.is_none(),
+            "case {:?}: naming the live value must leave nothing pending, got \
+             {still_pending:?}",
+            case.case
+        );
+        // A read says the same, and the instance is untouched: it stayed available on the
+        // value it was running under, so the window has nothing to resize.
+        let read_back = settled_instance(&router, case.case, case.identifier).await;
+        let still_pending = pending(&read_back);
+        assert!(
+            still_pending.is_none(),
+            "case {:?}: a later read must report nothing pending, got {still_pending:?}",
+            case.case
+        );
+        let status = optional_text(&read_back, "DBInstanceStatus");
+        assert_eq!(
+            status.as_deref(),
+            Some("available"),
+            "case {:?}: withdrawing a queued change starts no work, got {status:?}",
+            case.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn withdrawing_one_queued_value_leaves_the_others_pending() {
+    let router = emulator();
+    an_instance(&router, "emu-withdraw-one", &[]).await;
+    // Two settings staged for the window at once.
+    expect_ok(
+        "stage a class and a storage change",
+        call(
+            &router,
+            "ModifyDBInstance",
+            &params![
+                "DBInstanceIdentifier" => "emu-withdraw-one",
+                "ApplyImmediately" => false,
+                "DBInstanceClass" => "db.t3.small",
+                "AllocatedStorage" => 40,
+            ],
+        )
+        .await,
+    );
+    // Only the class is named back at its live value, so only the class is withdrawn.
+    let withdrawn = expect_ok(
+        "withdraw the class change",
+        call(
+            &router,
+            "ModifyDBInstance",
+            &params![
+                "DBInstanceIdentifier" => "emu-withdraw-one",
+                "ApplyImmediately" => false,
+                "DBInstanceClass" => "db.t3.micro",
+            ],
+        )
+        .await,
+    );
+    let answered = the_one_instance("withdraw the class change", &withdrawn);
+    let queued = pending(&answered).unwrap_or_else(|| {
+        panic!("the storage change must still be pending, got {answered}")
+    });
+    let storage = optional_text(&queued, "AllocatedStorage");
+    assert_eq!(
+        storage.as_deref(),
+        Some("40"),
+        "the staged storage must survive another member's withdrawal, got {storage:?}"
+    );
+    let class = optional_text(&queued, "DBInstanceClass");
+    assert_eq!(
+        class, None,
+        "the withdrawn class must not be pending any more, got {class:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_log_export_configuration_is_pending_and_then_lists_the_types_it_enabled() {
     let router = emulator();
@@ -803,6 +993,17 @@ async fn a_setting_pending_modified_values_cannot_report_is_applied_at_once() {
             pending(&answered).is_none(),
             "case {case:?}: a setting the structure cannot report leaves nothing pending, \
              got {answered}"
+        );
+        // And the instance is not out of service for it: the caller did not ask for anything
+        // to be applied at once, and a setting applied without an outage leaves the instance
+        // running — so a wait-for-available loop started here returns at once and the reboot
+        // a pending change waits for is accepted.
+        let status = optional_text(&answered, "DBInstanceStatus");
+        assert_eq!(
+            status.as_deref(),
+            Some("available"),
+            "case {case:?}: a change applied without an outage leaves the instance available, \
+             got {status:?}"
         );
         // And a read of the instance says the same, once every transition this row's
         // modification owed has settled — read until it holds, not waited out.

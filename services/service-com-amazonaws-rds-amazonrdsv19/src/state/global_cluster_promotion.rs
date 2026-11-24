@@ -90,6 +90,21 @@ pub fn global_cluster_promotion_target_missing_message(
     )
 }
 
+/// What a promotion of a global database's primary refuses a `TargetDbClusterIdentifier`
+/// that names the cluster that IS already its primary with.
+///
+/// "Promotes the specified SECONDARY DB cluster": the current primary is not a cluster this
+/// call can promote, so the two members the request carried cannot hold together. The
+/// sentence states that outcome and nothing else — no identifier of either the cluster or the
+/// global database is in it — and names the kind of target the request asked for
+/// ([`GlobalPromotionKind`]), as the missing-target sentence beside it does.
+pub fn global_cluster_promotion_target_is_primary_message(asked: GlobalPromotionKind) -> String {
+    format!(
+        "The specified {} target is already the primary DB cluster.",
+        asked.target_word()
+    )
+}
+
 /// Why a promotion was refused, in terms of the FAULT the handler answers it with: each/// variant is a modelled error both operations declare, carrying the sentence for it.
 #[derive(Debug, Clone)]
 pub enum PromotionRejection {
@@ -192,10 +207,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         // primary has nothing to be promoted to, so the global database is left as it is
         // rather than reporting a promotion that moved nothing.
         if members.first() == Some(&target_arn) {
-            return Err(PromotionRejection::Combination(format!(
-                "DB cluster {target_identifier} is already the primary cluster of global \
-                 cluster {global_identifier}"
-            )));
+            return Err(PromotionRejection::Combination(
+                global_cluster_promotion_target_is_primary_message(asked),
+            ));
         }
         // A secondary that is not running cannot take over the writes, so the promotion is
         // refused for the state that cluster is in. The status the clock has yet to settle is

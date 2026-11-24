@@ -509,6 +509,25 @@ impl DbInstanceRecord {
         }
     }
 
+    /// Drop every value a modification staged that the instance is ALREADY running under,
+    /// and the whole staged record when nothing is left of it.
+    ///
+    /// `PendingModifiedValues` reports "changes that will be applied", so a staged value the
+    /// instance already carries belongs in it no more than a setting nobody asked about:
+    /// applying it would change nothing. Naming the live value is therefore how a caller
+    /// WITHDRAWS a change an earlier modification queued for that setting, and an instance
+    /// left with nothing staged keeps no record at all
+    /// ([`DeferredModification::withdraw_values_already_live`]).
+    pub fn withdraw_pending_values_already_live(&mut self) {
+        let Some(mut staged) = self.deferred_modification.take() else {
+            return;
+        };
+        staged.withdraw_values_already_live(self);
+        if !staged.is_empty() {
+            self.deferred_modification = Some(staged);
+        }
+    }
+
     /// The instance's database engine comes UP: the run every parameter value the engine is
     /// serving is read against, which is what `pg_postmaster_start_time()` reports.
     ///

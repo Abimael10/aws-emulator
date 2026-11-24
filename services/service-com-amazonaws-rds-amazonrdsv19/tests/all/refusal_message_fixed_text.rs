@@ -33,8 +33,9 @@
 //! * `DBProxyTargetGroupNotFoundFault` (404) is the proxy API's own not-found wording: the
 //!   resource type and the requested name, and nothing of the proxy it was looked for under.
 //! * `InvalidParameterCombination` (400) for a tenant-database call against a DB instance
-//!   that does not use the multi-tenant configuration reports what could not be resolved,
-//!   not the engine the instance runs.
+//!   that does not use the multi-tenant configuration states that the OPERATION is not
+//!   supported for that DB instance, naming the instance the request addressed and not the
+//!   engine it runs or the tenant name the request carried.
 //!
 //! Each table spans what the rule generalises over: the value past the bound (below, above,
 //! far above, negative) and which operation carries it; how far past the sharing quota the
@@ -43,8 +44,9 @@
 //! the engine family behind it; which operation minted the colliding snapshot; which status
 //! blocked the failover; how many members and which engine blocked the delete; which
 //! reserved prefix on which tag member against which resource type; which proxy operation
-//! resolved the target group name; and which single-tenant engine the instance runs. The
-//! recorded request is ONE row of each.
+//! resolved the target group name; and which operation of the tenant-database front door is
+//! addressed at which single-tenant engine under which tenant name. The recorded request is
+//! ONE row of each.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
 //! reads the XML the emulator itself answered with.
@@ -1062,58 +1064,76 @@ async fn a_target_group_name_no_proxy_has_is_reported_as_a_missing_resource() {
 // A tenant database of an instance that holds none
 // ---------------------------------------------------------------------------
 
-/// The sentence the model publishes for a tenant database a request could not resolve
-/// (`smithy_query(query="shape",shape="TenantDatabaseNotFoundFault")`).
-const TENANT_DATABASE_NOT_FOUND_SENTENCE: &str =
-    "The specified tenant database wasn't found in the DB instance.";
+/// The sentence a tenant-database operation answers a DB instance that does not use the
+/// multi-tenant configuration with, spelled out here so the test pins the wording rather
+/// than reading it from the code under test.
+///
+/// Tenant databases "only appl[y] to RDS for Oracle container database (CDB) engines", so
+/// such an instance holds none and can hold none: the OPERATION is not supported for it, and
+/// the identifier the request named is the sentence's only variable part.
+fn tenant_operation_unsupported_sentence(operation: &str, identifier: &str) -> String {
+    format!("The {operation} operation isn't supported for DB instance {identifier}.")
+}
+
+/// Every operation of the tenant-database front door that is addressed AT a DB instance,
+/// with the members the model requires beside the instance and the tenant name: the rule is
+/// one for all of them.
+const TENANT_OPERATIONS: &[(&str, Members)] = &[
+    ("CreateTenantDatabase", &[("MasterUsername", "tenantadmin")]),
+    ("ModifyTenantDatabase", &[("NewTenantDBName", "tenant2")]),
+    ("DeleteTenantDatabase", &[("SkipFinalSnapshot", "true")]),
+];
 
 #[tokio::test]
-async fn a_tenant_database_of_a_single_tenant_instance_is_reported_as_unresolved() {
+async fn a_tenant_database_call_against_a_single_tenant_instance_is_unsupported_for_it() {
     let router = emulator();
 
     // Every single-tenant engine in this table holds no tenant database at all: tenant
-    // databases "only appl[y] to RDS for Oracle container database (CDB) engines".
+    // databases "only appl[y] to RDS for Oracle container database (CDB) engines". No
+    // identifier names its engine, so the leak assertions below are about the sentence.
     let rows: [(&str, &str, &str); 3] = [
-        ("a PostgreSQL instance", "emu-msg-tenant-pg", "postgres"),
-        ("a MySQL instance", "emu-msg-tenant-mysql", "mysql"),
+        ("a PostgreSQL instance", "emu-msg-tenant-one", "postgres"),
+        ("a MySQL instance", "emu-msg-tenant-two", "mysql"),
         (
             "an Oracle instance outside the CDB engines",
-            "emu-msg-tenant-oracle",
+            "emu-msg-tenant-three",
             "oracle-se2",
         ),
     ];
 
     for (case, identifier, engine) in rows {
         create_available_instance(&router, identifier, engine, &[]).await;
-        for tenant in ["tenant1", "emu-msg-tenant-absent"] {
-            let case = format!("{case}, tenant {tenant:?}");
-            let body = expect_error(
-                &case,
-                call(
-                    &router,
-                    "DeleteTenantDatabase",
-                    &[
-                        ("DBInstanceIdentifier", identifier),
-                        ("TenantDBName", tenant),
-                        ("SkipFinalSnapshot", "true"),
-                    ],
-                )
-                .await,
-                400,
-                INVALID_PARAMETER_COMBINATION,
-            );
-            let message = text(&body, "Message");
-            assert_eq!(
-                message, TENANT_DATABASE_NOT_FOUND_SENTENCE,
-                "case {case:?}: expected {TENANT_DATABASE_NOT_FOUND_SENTENCE:?}, got \
-                 {message:?}"
-            );
-            // Neither the instance, nor the engine it runs, nor the tenant name is in it.
-            for leaked in [identifier, engine, tenant] {
-                assert!(
-                    !message.contains(leaked),
-                    "case {case:?}: the sentence must not carry {leaked:?}, got {message:?}"
+        for (action, extra) in TENANT_OPERATIONS {
+            // The tenant name is the one thing that could have been looked up inside the
+            // instance, so both a name nothing created and the plainest one are driven: the
+            // refusal is about the INSTANCE, so neither resolves anything.
+            for tenant in ["tenant1", "emu-msg-tenant-absent"] {
+                let case = format!("{case}, {action} of tenant {tenant:?}");
+                let mut params: Vec<(&str, &str)> = vec![
+                    ("DBInstanceIdentifier", identifier),
+                    ("TenantDBName", tenant),
+                ];
+                params.extend_from_slice(extra);
+                let body = expect_error(
+                    &case,
+                    call(&router, action, &params).await,
+                    400,
+                    INVALID_PARAMETER_COMBINATION,
                 );
+                let message = text(&body, "Message");
+                let expected = tenant_operation_unsupported_sentence(action, identifier);
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?}"
+                );
+                // The sentence states the operation and the instance, and nothing else the
+                // request carried: neither the engine the instance runs nor the tenant name.
+                for leaked in [engine, tenant] {
+                    assert!(
+                        !message.contains(leaked),
+                        "case {case:?}: the sentence must not carry {leaked:?}, got {message:?}"
+                    );
+                }
             }
         }
     }

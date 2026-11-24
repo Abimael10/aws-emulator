@@ -25,6 +25,10 @@
 //!   says outright, and where the request omits it "allowing data loss triggers a global
 //!   failover operation" while "if you don't specify AllowDataLoss, the global database
 //!   cluster operation defaults to a switchover".
+//! * a promotion whose target IS already that primary is a bad parameter COMBINATION (400
+//!   `InvalidParameterCombination`) worded `The specified <kind> target is already the
+//!   primary DB cluster.` — fixed text naming the kind the request asked for and none of the
+//!   identifiers it carried.
 //!
 //! The status and the code of each are the modelled pair
 //! (`smithy_query(query="operation", operation="PromoteReadReplica,RebootDBCluster,FailoverGlobalCluster")`):
@@ -38,8 +42,10 @@
 //! is ONE row of each.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
-//! reads the XML the emulator itself answered with. Nothing waits for a transition: every row
-//! is a refusal decided on the request and the stored records as they already are.
+//! reads the XML the emulator itself answered with. Every row is a refusal decided on the
+//! request and the stored records as they already are; where a fixture needs a resource the
+//! clock owes a transition, the suite READS it until it reports the state the row needs
+//! ([`crate::lifecycle_poll_loops::poll_until`]) rather than waiting a span of wall-clock.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -424,4 +430,132 @@ async fn a_promotion_names_the_kind_of_target_the_request_asked_for() {
             );
         }
     }
+}
+
+/// The sentence a promotion of a global database's primary answers a target that IS already
+/// that primary with, spelled out here so the test pins the wording rather than reading it
+/// from the code under test.
+///
+/// Fixed text, naming the kind of promotion the request asked for and NOTHING of the
+/// request's identifiers: neither the cluster it named nor the global database it addressed
+/// is in it.
+fn promotion_target_is_primary_sentence(kind: &str) -> String {
+    format!("The specified {kind} target is already the primary DB cluster.")
+}
+
+#[tokio::test]
+async fn a_promotion_whose_target_is_already_the_primary_states_that_and_names_no_resource() {
+    let router = emulator();
+    // A global database holding ONE member DB cluster, which is therefore its primary: the
+    // target of every row below is that cluster, so each row is a decision about the target
+    // being the primary and never about a cluster or a global database that is missing.
+    expect_ok(
+        "a global database",
+        call(
+            &router,
+            "CreateGlobalCluster",
+            &[
+                ("GlobalClusterIdentifier", "emu-gcp-global"),
+                ("Engine", "aurora-mysql"),
+            ],
+        )
+        .await,
+    );
+    expect_ok(
+        "its one member cluster",
+        call(
+            &router,
+            "CreateDBCluster",
+            &[
+                ("DBClusterIdentifier", "emu-gcp-primary"),
+                ("Engine", "aurora-mysql"),
+                ("GlobalClusterIdentifier", "emu-gcp-global"),
+            ],
+        )
+        .await,
+    );
+    // The create owes the cluster `available`; the member is READ until it reports that, the
+    // way a client's waiter does, so nothing here depends on how fast the host runs.
+    crate::lifecycle_poll_loops::poll_until(
+        "the member cluster",
+        "the member cluster reaching available",
+        || {
+            call(
+                &router,
+                "DescribeDBClusters",
+                &[("DBClusterIdentifier", "emu-gcp-primary")],
+            )
+        },
+        |status, body| status == 200 && text(body, "Status") == "available",
+    )
+    .await;
+
+    // The same two forms the member publishes for a target that resolves in the signed
+    // Region: "Use the Amazon Resource Name (ARN) for the identifier so that Aurora can
+    // locate the cluster in its Amazon Web Services Region", and the bare identifier.
+    let targets = [
+        ("an ARN", cluster_arn(REGION, "emu-gcp-primary")),
+        ("a bare identifier", "emu-gcp-primary".to_string()),
+    ];
+
+    // The kinds of promotion a request can ask for are the ones the missing-target table
+    // spans, so the same rows drive this refusal: the sentence names the kind the request
+    // asked for.
+    for row in TARGET_MISSING_CASES {
+        for (shape, target) in &targets {
+            let case = format!("{}, {shape}", row.case);
+            let mut params: Vec<(&str, String)> = vec![
+                ("GlobalClusterIdentifier", "emu-gcp-global".to_string()),
+                ("TargetDbClusterIdentifier", target.clone()),
+            ];
+            for (member, value) in row.flags {
+                params.push((member, (*value).to_string()));
+            }
+            let body = expect_error(
+                &case,
+                call(&router, row.action, &params).await,
+                400,
+                "InvalidParameterCombination",
+            );
+            let message = text(&body, "Message");
+            let expected = promotion_target_is_primary_sentence(row.kind);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            for leaked in ["emu-gcp-primary", "emu-gcp-global"] {
+                assert!(
+                    !message.contains(leaked),
+                    "case {case:?}: the sentence must not carry {leaked:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    // Nothing was promoted: the global database still reports the same primary, which is
+    // what makes the refusals above refusals.
+    let reported = expect_ok(
+        "the global database after the refusals",
+        call(
+            &router,
+            "DescribeGlobalClusters",
+            &[("GlobalClusterIdentifier", "emu-gcp-global")],
+        )
+        .await,
+    );
+    assert_eq!(
+        text(&reported, "Status"),
+        "available",
+        "a refused promotion leaves the global database available, got {reported}"
+    );
+    assert_eq!(
+        text(&reported, "DBClusterArn"),
+        cluster_arn(REGION, "emu-gcp-primary"),
+        "a refused promotion leaves the same cluster its primary, got {reported}"
+    );
+    assert_eq!(
+        text(&reported, "IsWriter"),
+        "true",
+        "the unchanged primary is still the writer, got {reported}"
+    );
 }

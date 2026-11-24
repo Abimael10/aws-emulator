@@ -910,10 +910,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .backup_retention_period
             .is_some_and(|period| period != 0 && record.backup_retention_period != 0);
         let staged = crate::state::DeferredModification {
-            // A rename to the identifier the instance already has changes nothing, so it
-            // stages nothing: "an instance reboot occurs immediately if you enable
-            // ApplyImmediately, or will occur during the next maintenance window".
-            identifier: renamed_to.filter(|renamed| *renamed != record.identifier),
+            // A rename is staged as the request wrote it; one to the identifier the instance
+            // already has is WITHDRAWN below with every other value the instance already
+            // carries, which is what makes naming the live value the way to take a queued
+            // change back.
+            identifier: renamed_to,
             db_instance_class: input.db_instance_class,
             engine: input.engine,
             engine_version: resolved_engine_version,
@@ -971,11 +972,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance reboot occurs immediately if you enable ApplyImmediately, or will occur
         // during the next maintenance window if you disable ApplyImmediately" — the rename
         // itself is what the reboot follows, so the instance is renamed here and is reported
-        // under its new identifier from this answer on.
+        // under its new identifier from this answer on. A rename to the identifier the
+        // instance already has renames nothing, so it is not a change the instance is busy
+        // with either.
         if apply_immediately {
             if let Some(renamed) = staged.identifier.take() {
-                changed = true;
-                record.identifier = renamed;
+                if renamed != record.identifier {
+                    changed = true;
+                    record.identifier = renamed;
+                }
             }
         }
         // WHEN the staged settings land: `ApplyImmediately` "specifies whether the
@@ -996,12 +1001,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if apply_immediately {
                 pending.apply_at = Some(accepted_at + crate::state::STATUS_TRANSITION_DELAY);
             }
-            // A request that asked for an immediate application while nothing at all is
-            // staged has nothing to apply: the instance keeps no empty pending record, which
-            // `PendingModifiedValues` is "returned only when there are pending changes" for.
-            if pending.is_empty() {
-                record.deferred_modification = None;
-            } else if apply_immediately {
+            // A staged value the instance is ALREADY running under identifies no change, so
+            // it is not kept pending and a request that names the live value WITHDRAWS what
+            // an earlier one staged for that setting. A request that asked for an immediate
+            // application while nothing at all is left staged has nothing to apply: the
+            // instance keeps no empty pending record, which `PendingModifiedValues`
+            // reporting "changes that will be applied" is what matters for
+            // ([`crate::state::DbInstanceRecord::withdraw_pending_values_already_live`]).
+            record.withdraw_pending_values_already_live();
+            if apply_immediately && record.deferred_modification.is_some() {
                 // Those settings are being applied FROM NOW, so this modification is one the
                 // instance is busy with. A modification left for the maintenance window is
                 // NOT: see the status block below for why only the former moves the status.
@@ -1171,20 +1179,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if changed {
+        if changed && apply_immediately {
             // RDS answers a modification that is APPLYING something with the instance in
             // `modifying`; it settles back to `available` on its own, at the instant the
             // settings it staged are applied (`accepted_at` above).
             //
-            // A modification whose every setting waits for the maintenance window applies
-            // nothing yet — "changes to the DB instance are applied during the next
-            // maintenance window" — so it does not reach here: `DBInstanceStatus` reports
-            // what the instance is doing NOW, the instance goes on running under the
-            // settings it has, and the staged ones are reported as pending until the window
-            // comes round or a reboot applies them. That is what leaves the instance in a
-            // state a caller can act on, so the reboot a deferred change waits for —
-            // rotating a CA certificate is one — is accepted straight after the
-            // modification is staged.
+            // `ApplyImmediately` is what decides whether the instance is applying anything
+            // at all. A modification the caller did NOT ask to apply at once applies nothing
+            // the instance has to go out of service for — the settings
+            // `PendingModifiedValues` reports "will be applied during the next maintenance
+            // window", and the settings it carries no member for are the ones whose own
+            // documentation says the change "is asynchronously applied as soon as possible",
+            // without an outage — so it leaves `DBInstanceStatus` alone: the instance goes on
+            // running, and the staged values are reported as pending until the window comes
+            // round or a reboot applies them. That is what leaves the instance in a state a
+            // caller can act on, so the reboot a deferred change waits for — rotating a CA
+            // certificate is one — is accepted straight after the modification is staged.
             record.status = "modifying".to_string();
             record.pending_status = Some(crate::state::PendingStatus::in_a_moment_after(
                 accepted_at,

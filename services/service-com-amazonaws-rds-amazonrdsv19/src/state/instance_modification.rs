@@ -288,6 +288,61 @@ impl DeferredModification {
         }
     }
 
+    /// Drop every staged value the instance is ALREADY running under, since such a value
+    /// identifies no change: `PendingModifiedValues` reports "changes that will be applied
+    /// during the next maintenance window", and applying a setting the instance already has
+    /// would change nothing. A request that names the value the instance is running under
+    /// therefore WITHDRAWS what an earlier request staged for that setting, and the
+    /// modification it leaves queued is only what still differs.
+    ///
+    /// `MasterUserPassword` is exempt: the credential is `@sensitive` and is held as the
+    /// digests a login is verified against, so there is no value to compare and re-setting
+    /// one is a change to make.
+    pub fn withdraw_values_already_live(&mut self, record: &DbInstanceRecord) {
+        withdraw_live(&mut self.identifier, &record.identifier);
+        withdraw_live(&mut self.db_instance_class, &record.db_instance_class);
+        withdraw_live(&mut self.engine, &record.engine);
+        withdraw_live_optional(&mut self.engine_version, &record.engine_version);
+        withdraw_live_optional(&mut self.allocated_storage, &record.allocated_storage);
+        withdraw_live(
+            &mut self.backup_retention_period,
+            &record.backup_retention_period,
+        );
+        withdraw_live(&mut self.multi_az, &record.multi_az);
+        withdraw_live(&mut self.storage_type, &record.storage_type);
+        withdraw_live_optional(&mut self.iops, &record.iops);
+        withdraw_live(&mut self.storage_throughput, &record.storage_throughput);
+        withdraw_live_optional(&mut self.license_model, &record.license_model);
+        // `Port` is the port the instance's engine listens on, which the record keeps as the
+        // endpoint's own.
+        withdraw_live(&mut self.port, &record.endpoint_port);
+        withdraw_live_optional(&mut self.db_subnet_group_name, &record.db_subnet_group_name);
+        withdraw_live(
+            &mut self.ca_certificate_identifier,
+            &record.ca_certificate_identifier,
+        );
+        withdraw_live(
+            &mut self.iam_database_authentication_enabled,
+            &record.iam_database_authentication_enabled,
+        );
+        withdraw_live(&mut self.dedicated_log_volume, &record.dedicated_log_volume);
+        // `PendingCloudwatchLogsExports` is a DELTA rather than a value: "the log types that
+        // are being enabled" and "being disabled", so what identifies no change is a type
+        // already in the state the delta would move it to. A delta left with neither list is
+        // no pending change at all.
+        if let Some(exports) = &mut self.cloudwatch_logs_exports {
+            exports
+                .enable
+                .retain(|log_type| !record.enabled_cloudwatch_logs_exports.contains(log_type));
+            exports
+                .disable
+                .retain(|log_type| record.enabled_cloudwatch_logs_exports.contains(log_type));
+            if exports.enable.is_empty() && exports.disable.is_empty() {
+                self.cloudwatch_logs_exports = None;
+            }
+        }
+    }
+
     /// Project the staged settings onto the modelled `PendingModifiedValues`.
     ///
     /// The master user password is `@sensitive`, so the member carries the stand-in every
@@ -334,5 +389,22 @@ impl DeferredModification {
 fn replace<T>(held: &mut Option<T>, staged: Option<T>) {
     if staged.is_some() {
         *held = staged;
+    }
+}
+
+/// Drop a staged value that is the one the resource already carries: there is nothing to
+/// apply for it ([`DeferredModification::withdraw_values_already_live`]).
+fn withdraw_live<T: PartialEq>(staged: &mut Option<T>, live: &T) {
+    if staged.as_ref() == Some(live) {
+        *staged = None;
+    }
+}
+
+/// The same for a setting the resource carries OPTIONALLY: a staged value equal to the one
+/// it holds is withdrawn, while one staged for a setting the resource holds none of is a
+/// change and stays.
+fn withdraw_live_optional<T: PartialEq>(staged: &mut Option<T>, live: &Option<T>) {
+    if staged.is_some() && staged == live {
+        *staged = None;
     }
 }

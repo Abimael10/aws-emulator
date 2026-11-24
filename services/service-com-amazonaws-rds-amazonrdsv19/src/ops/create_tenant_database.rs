@@ -322,13 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The same rule the other operations of this front door answer with: an instance
+        // outside the CDB engines holds no tenant databases and can hold none, so the
+        // operation is not supported for it
+        // ([`crate::state::tenant_operation_unsupported_message`]).
         if !crate::state::is_multi_tenant_engine(&instance.engine) {
             return Err(CreateTenantDatabaseError::invalid_parameter_combination(
-                format!(
-                    "DB instance {identifier} runs engine {} and does not use the \
-                     multi-tenant configuration, so it holds no tenant databases",
-                    instance.engine
-                ),
+                crate::state::tenant_operation_unsupported_message(Self::NAME, &identifier),
             ));
         }
         if instance.status != "available" {

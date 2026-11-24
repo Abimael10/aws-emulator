@@ -293,8 +293,8 @@ pub use tags::{
 };
 pub use tenant_databases::{
     is_multi_tenant_engine, mint_tenant_database_resource_id, tenant_database_key,
-    tenant_database_master_user_secret_name, TenantDatabaseRecord, MULTI_TENANT_ENGINE,
-    TENANT_DATABASE_NOT_FOUND_IN_INSTANCE, TENANT_DATABASE_QUOTA_PER_INSTANCE,
+    tenant_database_master_user_secret_name, tenant_operation_unsupported_message,
+    TenantDatabaseRecord, MULTI_TENANT_ENGINE, TENANT_DATABASE_QUOTA_PER_INSTANCE,
     TENANT_DATABASE_STATUS_AVAILABLE, TENANT_DATABASE_STATUS_CREATING,
     TENANT_DATABASE_STATUS_DELETING,
 };
@@ -2930,6 +2930,30 @@ pub fn restore_attribute_to_wire(
             attribute_values: Some(record.restore_attribute.iter().cloned().collect()),
         }]),
     }
+}
+
+/// The values a `restore` attribute request really authorizes: `values` less the account
+/// that OWNS the snapshot.
+///
+/// `restore` is "the list of Amazon Web Services accounts that have permission to copy or
+/// restore the manual DB cluster snapshot", and the way to grow it is "to share a manual DB
+/// cluster snapshot with OTHER Amazon Web Services accounts … use the ValuesToAdd parameter
+/// to add a list of IDs of the Amazon Web Services accounts that are authorized to restore
+/// the manual DB cluster snapshot". An account already copies and restores its own
+/// snapshots by owning them, so it is never a grantee of one: naming it is ACCEPTED — there
+/// is nothing wrong with the request — and grants nothing, so the value is not stored and
+/// the attribute every later read reports is the one the snapshot already had.
+///
+/// Every snapshot this emulator holds belongs to the one account it serves
+/// ([`emulator_server::emulator_account_id`]), which is therefore the owner of the snapshot
+/// a request addresses. One rule for both snapshot kinds, so the DB snapshot's attribute
+/// call and the DB cluster snapshot's cannot drift apart.
+pub fn snapshot_attribute_grantees(values: &[String]) -> impl Iterator<Item = &str> {
+    let owner = emulator_server::emulator_account_id();
+    values
+        .iter()
+        .map(String::as_str)
+        .filter(move |value| *value != owner)
 }
 
 /// Refuse a `restore` attribute value that is neither an Amazon Web Services account id

@@ -267,10 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // place for it.
             if !crate::state::is_multi_tenant_engine(&instance.engine) {
                 return Err(ModifyTenantDatabaseError::invalid_parameter_combination(
-                    format!(
-                        "The {} operation isn't supported for DB instance {identifier}.",
-                        Self::NAME
-                    ),
+                    crate::state::tenant_operation_unsupported_message(Self::NAME, &identifier),
                 ));
             }
             // An instance already on its way out cannot have a tenant database modified:
