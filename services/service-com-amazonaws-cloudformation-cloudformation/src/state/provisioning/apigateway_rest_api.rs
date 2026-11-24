@@ -973,6 +973,17 @@ async fn create_resource(
 // AWS::ApiGateway::Method
 // ---------------------------------------------------------------------------
 
+/// The operations the `AWS::ApiGateway::Method` provider CALLS — the method itself, the
+/// integration behind it, and the responses either side of it — stated with the call for the
+/// reason the api's own are ([`CREATE_REST_API`]): the name is what says which of this
+/// service's providers made the call, and so which diagnostic shape the exception its SDK
+/// raised carries ([`super::sdk_diagnostics::SDK_PROVIDER_SHAPES`]).
+const PUT_METHOD: &str = "PutMethod";
+const UPDATE_METHOD: &str = "UpdateMethod";
+const PUT_INTEGRATION: &str = "PutIntegration";
+const PUT_INTEGRATION_RESPONSE: &str = "PutIntegrationResponse";
+const PUT_METHOD_RESPONSE: &str = "PutMethodResponse";
+
 /// Every property `AWS::ApiGateway::Method` publishes.
 const METHOD_PROPERTIES: &[&str] = &[
     "ApiKeyRequired",
@@ -1128,10 +1139,11 @@ async fn put_method(
     request
         .entry("authorizationType".to_string())
         .or_insert_with(|| Value::String(NO_AUTHORIZATION.to_string()));
-    call_rest_json(
+    call_rest_json_named(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
+        PUT_METHOD,
         "PUT",
         &uri,
         Some(&Value::Object(request)),
@@ -1145,10 +1157,11 @@ async fn put_method(
                 request.insert((*member).to_string(), member_value(property, value)?);
             }
         }
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            PUT_INTEGRATION,
             "PUT",
             &format!("{uri}/integration"),
             Some(&Value::Object(request)),
@@ -1157,10 +1170,11 @@ async fn put_method(
         for response in entries(integration.get(INTEGRATION_RESPONSES)) {
             let status = required_member(APIGATEWAY_METHOD, INTEGRATION_RESPONSES, response)?;
             let request = response_request(response, INTEGRATION_RESPONSE_MEMBERS)?;
-            call_rest_json(
+            call_rest_json_named(
                 ctx,
                 API_GATEWAY_SIGNING_NAME,
                 region,
+                PUT_INTEGRATION_RESPONSE,
                 "PUT",
                 &format!(
                     "{uri}/integration/responses/{}",
@@ -1175,10 +1189,11 @@ async fn put_method(
     for response in entries(stated(resource, METHOD_RESPONSES)) {
         let status = required_member(APIGATEWAY_METHOD, METHOD_RESPONSES, response)?;
         let request = response_request(response, METHOD_RESPONSE_MEMBERS)?;
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            PUT_METHOD_RESPONSE,
             "PUT",
             &format!("{uri}/responses/{}", percent_encoded(&status)),
             Some(&request),

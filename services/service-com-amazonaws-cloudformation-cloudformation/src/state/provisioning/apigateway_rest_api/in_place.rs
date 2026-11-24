@@ -364,10 +364,11 @@ async fn update_method(
     if !patches.is_empty() {
         let mut request = Map::new();
         request.insert("patchOperations".to_string(), Value::Array(patches));
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            UPDATE_METHOD,
             "PATCH",
             &uri,
             Some(&Value::Object(request)),
@@ -393,10 +394,11 @@ async fn update_method(
                 &[STATUS_CODE],
             )?;
             let request = response_request(response, METHOD_RESPONSE_MEMBERS)?;
-            call_rest_json(
+            call_rest_json_named(
                 ctx,
                 API_GATEWAY_SIGNING_NAME,
                 region,
+                PUT_METHOD_RESPONSE,
                 "PUT",
                 &format!("{uri}/responses/{}", percent_encoded(&status)),
                 Some(&request),
@@ -428,10 +430,11 @@ async fn put_integration(
             request.insert((*member).to_string(), member_value(property, value)?);
         }
     }
-    call_rest_json(
+    call_rest_json_named(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
+        PUT_INTEGRATION,
         "PUT",
         &format!("{uri}/integration"),
         Some(&Value::Object(request)),
@@ -447,10 +450,11 @@ async fn put_integration(
             &[STATUS_CODE],
         )?;
         let request = response_request(response, INTEGRATION_RESPONSE_MEMBERS)?;
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            PUT_INTEGRATION_RESPONSE,
             "PUT",
             &format!("{uri}/integration/responses/{}", percent_encoded(&status)),
             Some(&request),

@@ -58,8 +58,8 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // parenthesis). This signing name is SHARED with API Gateway v2, whose own surface is
     // bound under a URI prefix of its own and is therefore named by its own SDK rather than
     // by this entry ([`SDK_SHARED_NAME_PREFIXES`]); this one answers for the REST control
-    // plane's types ([`provisioning::apigateway_rest_api`]). The provider of the api ITSELF
-    // words the ATTEMPT-counting shape, which is recorded per provider
+    // plane's types ([`provisioning::apigateway_rest_api`]). The providers of the api ITSELF
+    // and of a METHOD on it word the ATTEMPT-counting shape, which is recorded per provider
     // ([`SDK_PROVIDER_SHAPES`]).
     (
         crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
@@ -643,6 +643,43 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
     (
         crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
         "UpdateRestApi",
+        SdkDiagnostic::Attempts,
+    ),
+    // The `AWS::ApiGateway::Method` type's provider — the method, the integration behind it and
+    // the responses either side of it ([`provisioning::apigateway_rest_api::put_method`]) — words
+    // the ATTEMPT-counting shape too, where that service's entry above carries the bare envelope
+    // its DEPLOYMENT provider words. Read from the recorded `ResourceStatusReason` of an
+    // `AWS::ApiGateway::Method` whose declared `RequestModels` names a model the api does not
+    // hold (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `apigateway__cloudformation.cfn-method-request-model-reference-rejected`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service: ApiGateway, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // InvalidRequest)`). The rows beside it are the same provider's other calls — the integration,
+    // the two kinds of response and the patch a changed declaration is applied through — which
+    // word the shape it words; a recording of one of them is what would correct them.
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "PutMethod",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "UpdateMethod",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "PutIntegration",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "PutIntegrationResponse",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "PutMethodResponse",
         SdkDiagnostic::Attempts,
     ),
     // The `AWS::ApiGateway::Authorizer` type's provider ([`provisioning::apigateway_rest_api::
