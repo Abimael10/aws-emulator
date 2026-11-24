@@ -20,8 +20,9 @@
 //!    metric — and the values are derived from the observations the case published rather than
 //!    written out.
 //! 3. "A minimum of 24 hours of data is required to create the initial forecasts"
-//!    (`GetPredictiveScalingForecast`): a policy whose metric the store holds fewer hours of
-//!    reports an EMPTY load and capacity series rather than an invented one.
+//!    (`GetPredictiveScalingForecast`): what the data decides is each hour's VALUE, so a
+//!    policy whose metric the store holds fewer hours of is still reported over every hour of
+//!    the range asked for, carrying NO VALUE for them rather than an invented load.
 //! 4. The forecast is held to the group's `MaxSize` while the policy honours it
 //!    (`PredictiveScalingConfiguration$MaxCapacityBreachBehavior`: "HonorMaxCapacity"), and
 //!    is not when the policy may raise it ("IncreaseMaxCapacity").

@@ -20,6 +20,10 @@
 //! the day and not others — where the observed hours carry the mean of what was published
 //! for them in the same answer as the unobserved ones carry nothing.
 //!
+//! Where the requested window SITS relative to the hour of the read, and the form of the name
+//! an absent-policy refusal states, are the subject of the sibling suites that reuse this
+//! one's harness (`predictive_forecast_window_grid.rs` and `predictive_scaling_forecast.rs`).
+//!
 //! Beside `predictive_scaling_forecast.rs`, which pins what a forecast computed from a full
 //! history IS: this suite is about the hours such a pattern says nothing about.
 
@@ -37,7 +41,7 @@ use crate::support::{
 };
 
 /// How wide one forecast period is: the hour the operation forecasts in.
-const PERIOD: Duration = Duration::from_secs(60 * 60);
+pub(crate) const PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// How many periods one day holds.
 const PERIODS_PER_DAY: i64 = 24;
@@ -76,7 +80,7 @@ const RESOURCE_LABEL: &str = "app/web-alb/0123456789abcdef/targetgroup/web-tg/fe
 
 /// One emulator with Amazon EC2 Auto Scaling and CloudWatch on ONE engine: the observations a
 /// forecast is computed from are the account's own CloudWatch metrics.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine = new_engine();
     seed_launch_templates(&engine, &[LAUNCH_TEMPLATE]);
     let mut router = MultiServiceRouter::new();
@@ -87,7 +91,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Create one group and assert the create succeeded.
-async fn create_group(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_group(router: &MultiServiceRouter, name: &str) {
     let (status, body) = query(
         router,
         "CreateAutoScalingGroup",
@@ -147,7 +151,7 @@ fn specification_forms() -> Vec<(&'static str, Vec<(String, String)>)> {
 
 /// The customized-load-metric form: a metric data query naming the client's own series,
 /// totalled over the hour.
-fn customized_load_metric() -> Vec<(String, String)> {
+pub(crate) fn customized_load_metric() -> Vec<(String, String)> {
     let prefix = format!("{SPEC}.CustomizedLoadMetricSpecification.MetricDataQueries.member.1");
     vec![
         p(&format!("{prefix}.Id"), "load"),
@@ -172,7 +176,12 @@ fn customized_load_metric() -> Vec<(String, String)> {
 }
 
 /// Put one predictive scaling policy carrying `specification` and assert the put succeeded.
-async fn put_policy(router: &MultiServiceRouter, group: &str, policy: &str, specification: &[(String, String)]) {
+pub(crate) async fn put_policy(
+    router: &MultiServiceRouter,
+    group: &str,
+    policy: &str,
+    specification: &[(String, String)],
+) {
     let mut params = vec![
         p("AutoScalingGroupName", group),
         p("PolicyName", policy),
@@ -218,7 +227,7 @@ async fn publish(router: &MultiServiceRouter, hours: &[SystemTime], load: f64) {
 }
 
 /// Post one `GetPredictiveScalingForecast` and answer its status and body.
-async fn get_forecast(
+pub(crate) async fn get_forecast(
     router: &MultiServiceRouter,
     group: &str,
     policy: &str,
@@ -259,7 +268,7 @@ fn epoch_secs(at: SystemTime) -> f64 {
 }
 
 /// `at` rounded DOWN to the whole hour it falls in.
-fn whole_hour(at: SystemTime) -> SystemTime {
+pub(crate) fn whole_hour(at: SystemTime) -> SystemTime {
     let secs = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     UNIX_EPOCH + Duration::from_secs(secs - secs % PERIOD.as_secs())
 }
@@ -272,7 +281,7 @@ fn period_of_day(at: SystemTime) -> i64 {
 
 /// One series the answer reports: its instants, as the epoch seconds a client reads them in,
 /// beside its values.
-type ReportedSeries = (Vec<i64>, Vec<f64>);
+pub(crate) type ReportedSeries = (Vec<i64>, Vec<f64>);
 
 /// The `(timestamps, values)` of one reported series, as a client reads them.
 fn series_of(block: &str) -> ReportedSeries {
@@ -300,7 +309,7 @@ fn series_of(block: &str) -> ReportedSeries {
 }
 
 /// The load forecast and the capacity forecast one answer reports.
-fn forecasts(body: &str) -> (ReportedSeries, ReportedSeries) {
+pub(crate) fn forecasts(body: &str) -> (ReportedSeries, ReportedSeries) {
     (
         series_of(&tag_value(body, "LoadForecast")),
         series_of(&tag_value(body, "CapacityForecast")),
@@ -308,7 +317,7 @@ fn forecasts(body: &str) -> (ReportedSeries, ReportedSeries) {
 }
 
 /// The whole hours of `[start, end)`, as the epoch seconds the answer reports them in.
-fn hours_of(start: SystemTime, end: SystemTime) -> Vec<i64> {
+pub(crate) fn hours_of(start: SystemTime, end: SystemTime) -> Vec<i64> {
     let mut at = start;
     let mut hours = Vec::new();
     while at < end {
