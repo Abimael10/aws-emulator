@@ -1525,6 +1525,34 @@ pub const SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE: &str =
 pub const SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE: &str =
     "Cluster must be in available state in order to create a snapshot.";
 
+/// How ElastiCache refuses taking a snapshot of a REPLICATION GROUP that is not
+/// `available`: the same sentence as [`SNAPSHOT_SOURCE_NOT_AVAILABLE_MESSAGE`]
+/// about the other source a snapshot may be taken of, because it is the same
+/// rule — the status this class of call admits — stated about the resource the
+/// model names. `InvalidReplicationGroupStateFault` is "the requested
+/// replication group is not in the available state".
+pub const SNAPSHOT_SOURCE_GROUP_NOT_AVAILABLE_MESSAGE: &str =
+    "Replication group must be in available state in order to create a snapshot.";
+
+/// How ElastiCache refuses a snapshot of a cache running on the node type that
+/// supports none, as `SnapshotFeatureNotSupportedFault` names it ("Creating a
+/// snapshot of a Valkey or Redis OSS cluster running on a cache.t1.micro cache
+/// node").
+///
+/// `resource` is the source the way its own shape spells it (`Cache cluster`,
+/// `Replication group`) and `id` the source this service stores, so the one
+/// sentence serves every call that would take such a snapshot — asked for
+/// directly, or as a delete's final snapshot.
+pub fn snapshot_node_type_unsupported_message(resource: &str, id: &str) -> String {
+    format!("{resource} {id} runs on {UNSNAPSHOTTABLE_NODE_TYPE}, which does not support snapshots.")
+}
+
+/// The source a snapshot is taken OF, as [`snapshot_node_type_unsupported_message`]
+/// names it: a cache cluster.
+pub const SNAPSHOT_SOURCE_CLUSTER: &str = "Cache cluster";
+/// See [`SNAPSHOT_SOURCE_CLUSTER`]: a replication group.
+pub const SNAPSHOT_SOURCE_GROUP: &str = "Replication group";
+
 /// How ElastiCache words a service update its published catalogue does not hold:
 /// `ServiceUpdate <name> not found.`
 ///

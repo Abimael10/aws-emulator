@@ -357,3 +357,71 @@ impl SnapshotRecord {
         }
     }
 }
+
+/// A snapshot of the replication group `group_id`, as that group stands at
+/// `now`, taken from the PRIMARY of each of its shards.
+///
+/// The ONE place a group's snapshot is built, so the two calls that take one —
+/// `CreateSnapshot$ReplicationGroupId` ("the identifier of an existing
+/// replication group; the snapshot is created from this replication group") and
+/// `DeleteReplicationGroup$FinalSnapshotIdentifier` — cannot disagree about what
+/// it captures: the group's own description, shard count and failover setting,
+/// one `NodeSnapshot` per captured node naming the shard it came from, the VPC of
+/// the group's subnet group, and the DATA SET the group holds at this instant.
+///
+/// `None` for a group this store holds no record of, and for one no shard of
+/// which has a primary member cluster to copy; see
+/// [`SnapshotRecord::from_replication_group`].
+pub fn snapshot_of_replication_group(
+    store: &ComAmazonawsElasticacheAmazonelasticachev9State,
+    group_id: &str,
+    snapshot_name: String,
+    kms_key_id: Option<String>,
+    tags: Vec<(String, String)>,
+    now: SystemTime,
+) -> Option<SnapshotRecord> {
+    let group = store.replication_groups.get(group_id)?;
+    let shards: Vec<(&NodeGroupRecord, &CacheClusterRecord)> = group
+        .node_groups
+        .iter()
+        .filter_map(|shard| {
+            let primary = shard
+                .members
+                .iter()
+                .find(|member| member.current_role == ROLE_PRIMARY)?;
+            Some((shard, store.cache_clusters.get(&primary.cache_cluster_id)?))
+        })
+        .collect();
+    // The VPC the snapshot reports is the source's subnet group's, which is
+    // another record of this store.
+    let vpc_id = group.cache_subnet_group_name.as_ref().and_then(|name| {
+        store
+            .cache_subnet_groups
+            .get(&name.to_ascii_lowercase())
+            .map(|subnets| subnets.vpc_id.clone())
+    });
+    // The keyspace the group serves is the one its primaries share, so a cache
+    // created from this snapshot later answers what the group held when it was
+    // taken. A group with no shard to copy carries no data, and
+    // `from_replication_group` answers `None` for one anyway.
+    let data = shards
+        .first()
+        .map(|(_, primary)| captured_cache_cluster_data(store, &primary.cache_cluster_id, now))
+        .unwrap_or_else(empty_keyspace);
+    SnapshotRecord::from_replication_group(
+        group,
+        &shards,
+        NewSnapshot {
+            snapshot_name,
+            // A snapshot a caller asked for by name is a MANUAL one, whichever
+            // operation's parameter named it.
+            source: SNAPSHOT_SOURCE_MANUAL.to_string(),
+            kms_key_id,
+            vpc_id,
+            data,
+            tags,
+            now,
+        },
+    )
+}
+

@@ -52,3 +52,36 @@ Ownership evidence: the report lists this check with neither an "ALREADY FILED" 
 5. Check both <src> and <cpy> are present at once. DeleteSnapshot(SnapshotName=<src>) and poll <src> to absence (404 SnapshotNotFoundFault / empty list); <cpy> must still be present and 'available'. DeleteSnapshot(SnapshotName=<cpy>) and poll to absence. DeleteCacheCluster(CacheClusterId=<id>) and poll to absence (404 CacheClusterNotFound).
 6. Expect the whole sequence to complete in seconds, every wait satisfied by its first poll once the transition is due, with the create/copy/delete RESPONSES still reporting their transient statuses. Observe instead that each of the six waits misses on its first read and sleeps 15 s, and the check is killed at the 60 s per-check budget with none of the assertions above reached.
 7. Re-replay elasticache.snapshot-of-a-single-node-cluster-copies-and-deletes: it must reach and pass its own assertions instead of dying at the per-check budget.
+
+## Resolution
+
+The whole round trip is served, and two suites of the owning crate now drive it over the wire
+and fail if any of it regresses:
+
+- `services/service-com-amazonaws-elasticache-amazonelasticachev9/tests/all/lifecycle_convergence.rs`
+  (`the_snapshot_round_trip_converges_by_polling_each_wait_out`) drives the recorded flow the way
+  a client drives it — cluster available, snapshot `available` with the source `CacheClusterId`
+  and exactly one `NodeSnapshot`, the copy's `creating` answer, the copy `available` recording the
+  SOURCE cluster, both snapshots coexisting, the source removed and the copy still `available`,
+  the copy removed, the cluster removed and then 404 `CacheClusterNotFound`.
+- `services/service-com-amazonaws-elasticache-amazonelasticachev9/tests/all/snapshot_source_projection.rs`
+  spans the same rule over the sources `CreateSnapshot` accepts (a cache cluster, a replication
+  group, a group partitioned across shards), which is where this fix found a real divergence:
+  `CreateSnapshot` naming an EXISTING replication group was refused 404
+  `ReplicationGroupNotFoundFault`, so half of the one rule the flow rests on was unreachable.
+  It now mints that snapshot from the primary of each shard.
+
+What the report attributes the budget expiry to is not a defect of this emulator. A record whose
+transition instant has passed is materialised by the FIRST call that reports it
+(`src/state/store.rs` `settled_snapshot_mut` / `settled_cluster_mut` / `purge_deleted_snapshots`,
+pinned by `tests/all/first_read_sees_the_settled_state.rs`). The replayed check still reports
+`Check timed out after 60.0s` because it sleeps its own poll interval once per transition it
+starts: six waits at `interval_s=15` is 90 s of sleep against a 60 s budget, whatever the
+emulator's span is. Making the poll issued microseconds after the starting call report the
+settled value would need a zero-length transient span, which would delete the `creating` /
+`modifying` / `deleting` windows the recording itself shows and the state gates that go with them
+— the direction open issue
+`20261114T131431Z-elasticache-transient-lifecycle-windows-are-not-observable-creating.md` files
+against — and a report materialising a change the clock does not yet owe would be a read that
+writes.
+

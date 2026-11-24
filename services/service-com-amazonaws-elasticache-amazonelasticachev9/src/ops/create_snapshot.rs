@@ -134,6 +134,131 @@ impl From<CreateSnapshotErrorModeled> for CreateSnapshotError {
     }
 }
 
+/// The source a `CreateSnapshot` names, resolved to the id its record is stored
+/// under: "the identifier of an existing cluster" or "the identifier of an
+/// existing replication group", the two sources this operation takes a copy of.
+enum SnapshotSource {
+    CacheCluster(String),
+    ReplicationGroup(String),
+}
+
+/// Take the snapshot `CreateSnapshot$ReplicationGroupId` asks for: a copy of the
+/// group `group_key` as it stands at `now`, stored beside the cluster snapshots
+/// this service holds and reported by the same `DescribeSnapshots`.
+///
+/// `requested` is the id as the REQUEST spelled it, which a not-found refusal
+/// names. The gates are the ones the model declares for this source — the group
+/// has to exist (`ReplicationGroupNotFoundFault`), to run an engine and a node
+/// type that support snapshots (`SnapshotFeatureNotSupportedFault`) and to be
+/// `available` (`InvalidReplicationGroupStateFault`) — and what the snapshot
+/// captures is built by the one state helper both this call and a delete's final
+/// snapshot go through (`crate::state::snapshot_of_replication_group`).
+fn group_snapshot(
+    store: &mut crate::state::ComAmazonawsElasticacheAmazonelasticachev9State,
+    group_key: &str,
+    requested: &str,
+    snapshot_name: String,
+    kms_key_id: Option<String>,
+    tags: Vec<(String, String)>,
+    now: ::std::time::SystemTime,
+) -> Result<Snapshot, CreateSnapshotError> {
+    let Some(group) = store.settled_replication_group_mut(group_key, now) else {
+        return Err(CreateSnapshotErrorModeled::ReplicationGroupNotFoundFault(
+            ReplicationGroupNotFoundFault {
+                message: Some(crate::state::replication_group_not_found_message(requested)),
+            },
+        )
+        .into());
+    };
+    // Read off the record, so the gates below hold no borrow of the store while
+    // the snapshot is built out of it.
+    let engine = group.engine.clone();
+    let cache_node_type = group.cache_node_type.clone();
+    let status = group.status.clone();
+
+    // The two sources ElastiCache cannot snapshot, as
+    // `SnapshotFeatureNotSupportedFault` names them: a cache that runs Memcached
+    // rather than Valkey or Redis OSS, and one running on the node type that
+    // supports no snapshot. The same pair of gates the cluster source carries,
+    // stated about the group.
+    if !crate::state::engine_speaks_resp(&engine) {
+        return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
+            SnapshotFeatureNotSupportedFault {
+                message: Some(crate::state::SNAPSHOT_ENGINE_UNSUPPORTED_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    if cache_node_type.as_deref().is_some_and(|node_type| {
+        node_type.eq_ignore_ascii_case(crate::state::UNSNAPSHOTTABLE_NODE_TYPE)
+    }) {
+        return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
+            SnapshotFeatureNotSupportedFault {
+                message: Some(crate::state::snapshot_node_type_unsupported_message(
+                    crate::state::SNAPSHOT_SOURCE_GROUP,
+                    group_key,
+                )),
+            },
+        )
+        .into());
+    }
+    // A group can only be copied while it is settled: one still `creating`,
+    // `modifying`, `deleting` or already `snapshotting` from an earlier call is
+    // refused with the modelled state fault, whose sentence states the status
+    // this class of call ADMITS rather than the one the group carries now.
+    if status != crate::state::STATUS_AVAILABLE {
+        return Err(
+            CreateSnapshotErrorModeled::InvalidReplicationGroupStateFault(
+                InvalidReplicationGroupStateFault {
+                    message: Some(
+                        crate::state::SNAPSHOT_SOURCE_GROUP_NOT_AVAILABLE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into(),
+        );
+    }
+
+    let Some(record) = crate::state::snapshot_of_replication_group(
+        store,
+        group_key,
+        snapshot_name,
+        kms_key_id,
+        tags,
+        now,
+    ) else {
+        // Unreachable: the group resolved under this same lock, and a stored
+        // group has a member cluster record per shard. Refused rather than
+        // served, because a 200 here would have answered with a snapshot the
+        // store does not hold.
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::STORE_UNAVAILABLE,
+        ));
+    };
+    // The group answers `snapshotting` — one of `ReplicationGroup$Status`'s own
+    // values — until the clock owes it `available` again, the same way the
+    // cluster source does.
+    if let Some(group) = store.replication_groups.get_mut(group_key) {
+        group.begin_transition(crate::state::STATUS_SNAPSHOTTING, now);
+    }
+
+    // The snapshot is NOT ready: it answers `creating`, and the clock owes it
+    // `available` once the transition span has passed. The answer is read back
+    // out of the store, so it reports the persisted record.
+    let stored = store.insert_snapshot(record);
+    let snapshot_name = stored.snapshot_name.clone();
+    let snapshot = stored.to_modeled(true);
+    // Taking a snapshot is one of the events this service records, under the
+    // source it was taken of; see `crate::state::EventRecord`.
+    store.record_event(
+        crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+        group_key,
+        format!("Snapshot {snapshot_name} created"),
+        now,
+    );
+    Ok(snapshot)
+}
+
 /// The `CreateSnapshot` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -199,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster. The snapshot is created from this cluster" or "The
         // identifier of an existing replication group". Naming both, or
         // neither, names no source to copy.
-        let cache_cluster_id = match (
+        let source = match (
             input.cache_cluster_id.as_deref(),
             input.replication_group_id.as_deref(),
         ) {
@@ -231,18 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 )
             }
-            // A replication group can only be snapshotted if it exists, and
-            // none can: every replication-group operation in this service is
-            // still a scaffolded 501, so there is nothing to copy.
-            (None, Some(group)) => {
-                return Err(CreateSnapshotErrorModeled::ReplicationGroupNotFoundFault(
-                    ReplicationGroupNotFoundFault {
-                        message: Some(crate::state::replication_group_not_found_message(group)),
-                    },
-                )
-                .into())
-            }
-            (Some(id), None) => id.to_ascii_lowercase(),
+            // Either source is resolved under its lowercased id: both members
+            // are "stored as a lowercase string".
+            (None, Some(group)) => SnapshotSource::ReplicationGroup(group.to_ascii_lowercase()),
+            (Some(id), None) => SnapshotSource::CacheCluster(id.to_ascii_lowercase()),
         };
 
         let tags = match crate::state::tag_pairs(input.tags) {
@@ -311,6 +428,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The source the request named decides WHAT is captured and which record
+        // the clock then owes a status change: a cluster snapshot is a copy of
+        // that one cluster, a group snapshot a copy of the primary of each of
+        // the group's shards.
+        let cache_cluster_id = match source {
+            SnapshotSource::ReplicationGroup(group_key) => {
+                let snapshot = group_snapshot(
+                    &mut store,
+                    &group_key,
+                    input.replication_group_id.as_deref().unwrap_or_default(),
+                    snapshot_name,
+                    kms_key_id,
+                    tags,
+                    now,
+                )?;
+                return Ok(CreateSnapshotOutput {
+                    snapshot: Some(snapshot),
+                });
+            }
+            SnapshotSource::CacheCluster(id) => id,
+        };
+
         // The DATA SET this snapshot captures: a copy of what the source cluster
         // holds at this instant (`crate::state::captured_cache_cluster_data`),
         // taken before the source record is read so no borrow of it is held while
@@ -357,10 +496,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
                 SnapshotFeatureNotSupportedFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} runs on {}, which does not support \
-                         snapshots.",
-                        crate::state::UNSNAPSHOTTABLE_NODE_TYPE
+                    message: Some(crate::state::snapshot_node_type_unsupported_message(
+                        crate::state::SNAPSHOT_SOURCE_CLUSTER,
+                        &cache_cluster_id,
                     )),
                 },
             )

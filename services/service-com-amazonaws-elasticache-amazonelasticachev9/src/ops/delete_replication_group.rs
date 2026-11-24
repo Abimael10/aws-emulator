@@ -353,11 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             DeleteReplicationGroupErrorModeled::SnapshotFeatureNotSupportedFault(
                                 SnapshotFeatureNotSupportedFault {
-                                    message: Some(format!(
-                                        "Replication group {key} runs on {}, which does not \
-                                         support snapshots.",
-                                        crate::state::UNSNAPSHOTTABLE_NODE_TYPE
-                                    )),
+                                    message: Some(
+                                        crate::state::snapshot_node_type_unsupported_message(
+                                            crate::state::SNAPSHOT_SOURCE_GROUP,
+                                            &key,
+                                        ),
+                                    ),
                                 },
                             )
                             .into(),
@@ -505,6 +506,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// creates the snapshot from the primary node in the cluster, rather than one of
 /// the replicas."
 ///
+/// Built by the one state helper every call that takes a group's snapshot goes
+/// through (`crate::state::snapshot_of_replication_group`), so this delete and
+/// `CreateSnapshot` cannot disagree about what one captures. This request carries
+/// no tags of its own.
+///
 /// `None` for a group no shard of which has a primary cluster to copy, which is a
 /// group this store holds no member record for.
 fn final_snapshot_of(
@@ -514,55 +520,13 @@ fn final_snapshot_of(
     kms_key_id: Option<String>,
     now: ::std::time::SystemTime,
 ) -> Option<crate::state::SnapshotRecord> {
-    let group = store.replication_groups.get(key)?;
-    let shards: Vec<(&crate::state::NodeGroupRecord, &crate::state::CacheClusterRecord)> = group
-        .node_groups
-        .iter()
-        .filter_map(|shard| {
-            let primary = shard
-                .members
-                .iter()
-                .find(|member| member.current_role == crate::state::ROLE_PRIMARY)?;
-            Some((shard, store.cache_clusters.get(&primary.cache_cluster_id)?))
-        })
-        .collect();
-    // The VPC the snapshot reports is the source's subnet group's, which is
-    // another record of this store.
-    let vpc_id = group.cache_subnet_group_name.as_ref().and_then(|name| {
-        store
-            .cache_subnet_groups
-            .get(&name.to_ascii_lowercase())
-            .map(|subnets| subnets.vpc_id.clone())
-    });
-    crate::state::SnapshotRecord::from_replication_group(
-        group,
-        &shards,
-        crate::state::NewSnapshot {
-            snapshot_name,
-            // A snapshot a caller asked for by name is a MANUAL one, whichever
-            // operation's parameter named it.
-            source: crate::state::SNAPSHOT_SOURCE_MANUAL.to_string(),
-            kms_key_id,
-            vpc_id,
-            // The DATA SET the snapshot captures: what the group holds at this
-            // instant, read off the keyspace its members share — so a cache
-            // created from this snapshot later answers what the group held when
-            // it was deleted. A group with no shard to copy carries no data, and
-            // `from_replication_group` answers `None` for one anyway.
-            data: shards
-                .first()
-                .map(|(_, primary)| {
-                    crate::state::captured_cache_cluster_data(
-                        store,
-                        &primary.cache_cluster_id,
-                        now,
-                    )
-                })
-                .unwrap_or_else(crate::state::empty_keyspace),
-            // This request carries no tags of its own.
-            tags: Vec::new(),
-            now,
-        },
+    crate::state::snapshot_of_replication_group(
+        store,
+        key,
+        snapshot_name,
+        kms_key_id,
+        Vec::new(),
+        now,
     )
 }
 
