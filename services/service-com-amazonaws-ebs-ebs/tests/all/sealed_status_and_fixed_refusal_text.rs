@@ -31,7 +31,8 @@ const FAILED_TO_READ_BLOCK_DATA: &str = "Failed to read block data";
 /// The fixed sentence `StartSnapshot` answers with when a request asks for both a parent
 /// snapshot and encryption, mirroring
 /// `crate::state::PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE`.
-const PARENT_AND_ENCRYPT_REFUSAL: &str = "ParentSnapshotId and Encrypt cannot be specified together";
+pub(crate) const PARENT_AND_ENCRYPT_REFUSAL: &str =
+    "ParentSnapshotId and Encrypt cannot be specified together";
 
 /// The `SnapshotId` of a 201 `StartSnapshot`, with the status it reported.
 async fn started_snapshot(

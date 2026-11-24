@@ -201,9 +201,9 @@ impl SnapshotEncryption {
 ///   it starts from a parent — the child of an encrypted parent is re-encrypted under the
 ///   key the request named;
 /// * otherwise a snapshot started from a parent has the parent's encryption WHOLE — whether
-///   it is encrypted, its type and its key together — which is why asking for encryption
-///   beside a parent is refused ([`PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE`]): the parent
-///   decides it;
+///   it is encrypted, its type and its key together — which is why SPECIFYING `Encrypted`
+///   beside a parent is refused at all, whatever value it carries
+///   ([`PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE`]): the parent decides it;
 /// * otherwise `Encrypted` asks for the EBS-managed key;
 /// * and a request that carries none of the three creates an unencrypted snapshot: the
 ///   account-level "encryption by default" setting the same sentence names is held by
@@ -832,9 +832,9 @@ pub fn invalid_volume_size_message(volume_size: i64) -> String {
     format!("Invalid volume size: {volume_size}")
 }
 
-/// The message `StartSnapshot` answers with when a request asks for a snapshot taken
-/// from a parent AND for encryption: a snapshot inherits its parent's encryption, so the
-/// two cannot be requested together.
+/// The message `StartSnapshot` answers with when a request SPECIFIES both a parent
+/// snapshot and `Encrypted`: a snapshot inherits its parent's encryption, so the two
+/// members cannot be specified together, whatever value `Encrypted` carries.
 ///
 /// FIXED and request-independent: the sentence names the two input members and
 /// interpolates nothing — not the parent id, not the volume, not any other value the

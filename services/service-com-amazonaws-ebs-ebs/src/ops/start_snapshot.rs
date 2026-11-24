@@ -265,9 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Encrypted`: "You can't specify Encrypted and ParentSnapshotId in the same
         // request. If you specify both parameters, the request fails with
-        // ValidationException." The refusal's sentence is fixed text naming the two
-        // members, stated once in `crate::state`.
-        if input.encrypted == Some(true) && input.parent_snapshot_id.is_some() {
+        // ValidationException." What conflicts is SPECIFYING the two members, not the
+        // value either one carries: an optional member is specified when the request
+        // carried it (`Some`, `false` included) and absent only when it did not (`None`),
+        // so `Encrypted: false` beside a parent is both parameters and is refused like
+        // any other pair. The refusal's sentence is fixed text naming the two members,
+        // stated once in `crate::state`.
+        if input.encrypted.is_some() && input.parent_snapshot_id.is_some() {
             return Err(validation(
                 "INVALID_PARAMETER_VALUE",
                 PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE.to_string(),
@@ -527,31 +531,46 @@ fn quota_exceeded(message: String) -> StartSnapshotError {
 fn request_fingerprint(input: &StartSnapshotInput) -> String {
     let mut canonical = String::new();
     canonical.push_str(&format!("VolumeSize={}\n", input.volume_size));
-    canonical.push_str(&format!(
-        "ParentSnapshotId={}\n",
-        input.parent_snapshot_id.as_deref().unwrap_or_default()
-    ));
-    canonical.push_str(&format!(
-        "Description={}\n",
-        input.description.as_deref().unwrap_or_default()
-    ));
-    canonical.push_str(&format!(
-        "Encrypted={}\n",
-        input.encrypted.unwrap_or(false)
-    ));
-    canonical.push_str(&format!(
-        "KmsKeyArn={}\n",
-        input.kms_key_arn.as_deref().unwrap_or_default()
-    ));
-    canonical.push_str(&format!("Timeout={}\n", input.timeout.unwrap_or_default()));
+    push_optional_member(
+        &mut canonical,
+        "ParentSnapshotId",
+        input.parent_snapshot_id.as_deref(),
+    );
+    push_optional_member(&mut canonical, "Description", input.description.as_deref());
+    push_optional_member(
+        &mut canonical,
+        "Encrypted",
+        input
+            .encrypted
+            .map(|encrypted| encrypted.to_string())
+            .as_deref(),
+    );
+    push_optional_member(&mut canonical, "KmsKeyArn", input.kms_key_arn.as_deref());
+    push_optional_member(
+        &mut canonical,
+        "Timeout",
+        input.timeout.map(|timeout| timeout.to_string()).as_deref(),
+    );
     for tag in input.tags.iter().flatten() {
-        canonical.push_str(&format!(
-            "Tag={}={}\n",
-            tag.key.as_deref().unwrap_or_default(),
-            tag.value.as_deref().unwrap_or_default()
-        ));
+        push_optional_member(&mut canonical, "TagKey", tag.key.as_deref());
+        push_optional_member(&mut canonical, "TagValue", tag.value.as_deref());
     }
     fingerprint_hex_sha256(canonical.as_bytes())
+}
+
+/// Append one OPTIONAL request member to a canonical form, so that a member the request
+/// did not carry and one it carried can never canonicalise to the same text: a request
+/// specifying `Encrypted` as `false` is a different request from one specifying no
+/// `Encrypted` at all, and the same holds for every other optional member.
+///
+/// A specified value is written behind its own byte length, so no value a member may
+/// carry can spell out another member's line (`Description`'s pattern `^[\S\s]+$` admits
+/// newlines).
+fn push_optional_member(canonical: &mut String, name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => canonical.push_str(&format!("{name}={}:{value}\n", value.len())),
+        None => canonical.push_str(&format!("{name}=absent\n")),
+    }
 }
 
 /// Render the stored snapshot as this operation's output.
