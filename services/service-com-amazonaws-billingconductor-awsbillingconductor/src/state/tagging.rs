@@ -226,6 +226,23 @@ impl TaggableResourceKind {
         }
     }
 
+    /// Whether the resource segment of an ARN of this kind may run the type segment
+    /// straight into the id, with no `/` between them.
+    ///
+    /// The separator is part of how a resource segment is SPELLED, and this service's
+    /// modelled ARNs write it optional in exactly one alternative: the tagging `Arn`
+    /// (`smithy_query(query="shape",shape="Arn")`) spells a billing group
+    /// `billinggroup/?[0-9]{12}` and the other three kinds `pricingplan/[a-zA-Z0-9]{10}`,
+    /// `pricingrule/[a-zA-Z0-9]{10}` and `(customlineitem/)?[a-zA-Z0-9]{10}` — the `?`
+    /// there governs the whole ARN prefix, not the separator — and every per-kind ARN
+    /// shape agrees (`BillingGroupArn`, `PricingRuleArn`, `CustomLineItemArn`,
+    /// `PricingPlanFullArn`). So a separator-less spelling names a resource of this
+    /// service for a billing group alone; for any other kind it names nothing, however
+    /// closely it resembles a stored resource's ARN.
+    pub fn separator_is_optional(self) -> bool {
+        matches!(self, Self::BillingGroup)
+    }
+
     /// How many characters an id this service mints for this kind carries: a width every
     /// modelled member that spells this kind's id admits, by the same intersection
     /// [`Self::id_alphabet`] follows — the tagging `Arn` fixes a billing group at 12
@@ -281,8 +298,11 @@ pub struct TaggableResource {
 /// resource of this service at all.
 ///
 /// The modelled `Arn` accepts the full ARN of any of the four taggable kinds — with the
-/// `billinggroup` separator OPTIONAL — or a bare custom-line-item id, so one value has
-/// several spellings and they must all resolve to the one key the maps use. The
+/// `billinggroup` separator OPTIONAL, and ONLY that one
+/// ([`TaggableResourceKind::separator_is_optional`]) — or a bare custom-line-item id, so
+/// one value has several spellings and they must all resolve to the one key the maps use;
+/// a spelling the grammar does not define names no resource, so nothing is read or
+/// written under it. The
 /// partition and account segments are KEPT: another account's (or another partition's)
 /// ARN names a resource this emulator does not hold, which is a not-found rather than a
 /// hit on the same-id local resource. A region segment is kept the same way: this
@@ -319,10 +339,16 @@ pub fn parse_taggable_arn(value: &str) -> Option<TaggableResource> {
     let kind = TaggableResourceKind::ALL
         .into_iter()
         .find(|kind| resource.starts_with(kind.segment()))?;
-    // `billinggroup/?` — the separator the pattern makes optional, so both spellings of
-    // one resource resolve to the same id.
     let rest = &resource[kind.segment().len()..];
-    let id = rest.strip_prefix('/').unwrap_or(rest);
+    // The `/` between the type segment and the id, which the grammar makes optional for
+    // ONE kind ([`TaggableResourceKind::separator_is_optional`]): both spellings of a
+    // billing group resolve to the same id, while a kind whose grammar spells the
+    // separator mandatory resolves to nothing without it.
+    let id = match rest.strip_prefix('/') {
+        Some(id) => id,
+        None if kind.separator_is_optional() => rest,
+        None => return None,
+    };
     if id.is_empty() {
         return None;
     }
