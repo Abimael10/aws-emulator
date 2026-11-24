@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod association_periods;
+mod item_associations;
 mod refusals;
 mod billing_period_checks;
 mod pagination;
@@ -3740,39 +3741,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             PeriodsRemoval::Unchanged => return Some(BoundedRemoval::Unchanged),
             PeriodsRemoval::AtSpanLimit => return Some(BoundedRemoval::AtSpanLimit),
         }
-        // The associations the item itself holds: in a period the item applies in in no
-        // generation, the item is not there to hold a resource associated at all.
-        if remove_association_periods(&mut item.associated_resources, removed, |_| true)
+        // Every resource association keyed on the item loses the same billing periods —
+        // the ones the item itself holds and the ones other percentage items hold TO it —
+        // because a period the item applies in in no generation holds no association of
+        // it either ([`Self::take_item_association_periods`], the rule every write that
+        // takes billing periods away from an item keeps).
+        if self.take_item_association_periods(item_arn, &mut item, std::slice::from_ref(removed))
             == PeriodsRemoval::AtSpanLimit
         {
             return Some(BoundedRemoval::AtSpanLimit);
         }
-        // The associations OTHER percentage items hold to this one.
-        let mut holders: Vec<(String, CustomLineItemRecord)> = Vec::new();
-        for (arn, holder) in &self.custom_line_items {
-            if arn == item_arn
-                || !holder
-                    .associated_resources
-                    .iter()
-                    .any(|association| association.arn == item_arn)
-            {
-                continue;
-            }
-            let mut holder = holder.clone();
-            let outcome = remove_association_periods(
-                &mut holder.associated_resources,
-                removed,
-                |association| association.arn == item_arn,
-            );
-            if outcome == PeriodsRemoval::AtSpanLimit {
-                return Some(BoundedRemoval::AtSpanLimit);
-            }
-            holders.push((arn.clone(), holder));
-        }
 
-        for (arn, holder) in holders {
-            self.custom_line_items.insert(arn, holder);
-        }
         if item.is_empty() {
             // Nothing of the item is left for a read to report, so the stored record
             // goes — and with it everything that only existed because of it, including
@@ -3807,6 +3786,15 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// generations the OLDEST is dropped, which reads back as a history — and an item —
     /// that starts later, never as a lost current generation, which a later caller must
     /// still see.
+    ///
+    /// A write BOUNDED to a range of billing periods leaves the item applying in none
+    /// from that range's exclusive end on, and a resource association is in effect only in
+    /// billing periods the resource it names applies in — so the billing periods this
+    /// write takes away from the item come out of every association keyed on it, the ones
+    /// the item itself holds and the ones other percentage items hold TO it, exactly as
+    /// the bounded delete takes them ([`Self::end_associations_outside_item_periods`]). No
+    /// read of a billing period can then report an association to an item it reports no
+    /// version of.
     pub fn put_custom_line_item(
         &mut self,
         mut updated: CustomLineItemRecord,
@@ -3814,12 +3802,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         takes_effect_from: Option<&str>,
     ) {
         let arn = updated.arn.clone();
-        let previous = self.custom_line_items.get(&arn).map(|previous| {
-            (
-                previous.superseded_versions.clone(),
-                previous.current_version(),
-            )
-        });
+        // The item as the store holds it before this write: the billing periods it applies
+        // in in EVERY generation of it — what the write takes away is what these cover and
+        // the generations it leaves do not — and the generations themselves, read in the
+        // one lookup.
+        let (applied_before, previous) = match self.custom_line_items.get(&arn) {
+            Some(stored) => (
+                stored.applied_periods(),
+                Some((stored.superseded_versions.clone(), stored.current_version())),
+            ),
+            None => (Vec::new(), None),
+        };
         if let Some((mut kept, mut replaced)) = previous {
             match takes_effect_from {
                 // The billing periods a write APPLIED FROM a period takes over: that
@@ -3862,6 +3855,16 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             }
             updated.superseded_versions = kept;
         }
+        // The billing periods the item applies in once this write lands — in every
+        // generation of it — so the ones it no longer applies in anywhere come out of
+        // every association keyed on it before the record goes in.
+        let applied_after = updated.applied_periods();
+        self.end_associations_outside_item_periods(
+            &arn,
+            &mut updated,
+            &applied_before,
+            &applied_after,
+        );
         self.custom_line_items.insert(arn, updated);
     }
 
