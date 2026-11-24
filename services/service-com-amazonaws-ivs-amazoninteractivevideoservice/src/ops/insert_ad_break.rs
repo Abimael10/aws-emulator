@@ -4,9 +4,13 @@
 //!
 //! Marks an ad break in the playlist of a channel's ACTIVE stream, so it acts on the
 //! ingest rather than on the channel record: the channel must exist (else
-//! `ResourceNotFoundException`) and must be ingesting (else `ChannelNotBroadcasting`).
-//! Whether a channel is ingesting is read through [`crate::state::is_broadcasting`], the
-//! one place this service answers that question.
+//! `ResourceNotFoundException`), must have a valid ad configuration associated (else
+//! `ValidationException`, because the member that named the channel is what fails) and
+//! must be ingesting (else `ChannelNotBroadcasting`), in that order — the request's own
+//! members are validated before the channel's transient live state is consulted.
+//! Whether the channel has an ad configuration associated is read through
+//! [`crate::state::check_channel_ad_configuration`]; whether it is ingesting through
+//! [`crate::state::is_broadcasting`], the one place this service answers that question.
 //!
 //! What it writes is the marker itself — [`crate::state::insert_ad_break`] records the
 //! break against the live broadcast, with the channel's own ad configuration and a
@@ -177,6 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.channel_arn,
             ));
         }
+        // The channel's ad configuration is a precondition on the REQUEST member that
+        // named the channel — an insert uses "the ad configuration associated with the
+        // channel", so a channel with none associated carries nothing to insert the
+        // break with — and a member the service refuses is a `ValidationException`.
+        // It is answered before the channel's live state is consulted, so this refusal
+        // stands whether or not the channel happens to be ingesting.
+        crate::state::check_channel_ad_configuration(&store, &input.channel_arn).map_err(
+            |message| {
+                crate::state::validation(InsertAdBreakErrorModeled::ValidationException, message)
+            },
+        )?;
         if !crate::state::is_broadcasting(&store, &input.channel_arn) {
             return Err(crate::state::channel_not_broadcasting(
                 InsertAdBreakErrorModeled::ChannelNotBroadcasting,
