@@ -19,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    missing_thing_message, thing_version_conflict_message, ComAmazonawsIotAwsiotserviceState,
-    RegisteredThing, ThingRegistrationRefusal,
+    thing_version_conflict_message, thing_write_not_found_message,
+    ComAmazonawsIotAwsiotserviceState, RegisteredThing, ThingRegistrationRefusal,
 };
 
 /// The attribute list one update provides, and what the registry does with it.
@@ -119,7 +119,10 @@ impl ThingUpdateRefusal {
     /// What the refusal reports, in the wording AWS IoT states each of these in.
     pub fn message(&self) -> String {
         match self {
-            Self::MissingThing(thing_name) => missing_thing_message(thing_name),
+            // The WRITE half of the thing family's not-found wording
+            // ([`thing_write_not_found_message`]): a write of the record states the thing
+            // name alone, where a read of one states the account-qualified sentence.
+            Self::MissingThing(thing_name) => thing_write_not_found_message(thing_name),
             Self::VersionConflict { thing_name, .. } => {
                 thing_version_conflict_message(thing_name)
             }

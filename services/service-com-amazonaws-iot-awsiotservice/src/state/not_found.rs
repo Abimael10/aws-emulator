@@ -27,13 +27,17 @@
 //! cannot word the same miss three ways — which is the whole reason these sentences live
 //! here rather than in each handler.
 //!
-//! TWO families are SPLIT, because the service itself words their halves differently, and a
+//! THREE families are SPLIT, because the service itself words their halves differently, and a
 //! split one is stated here too so both halves stay in this one place:
 //!
 //! * the FLEET METRIC family, whose read states the registry families' account-qualified
 //!   sentence ([`missing_fleet_metric_message`]) while its write states the name alone
 //!   ([`fleet_metric_write_not_found_message`]) — `FleetMetric <metricName> doesn't exist`,
 //!   which is what `UpdateFleetMetric` answers;
+//! * the THING family, split the same way: every READ of a thing states the
+//!   account-qualified sentence ([`missing_thing_message`]), while the operation that
+//!   WRITES the thing record addressed by name — `UpdateThing` — states the thing name
+//!   alone ([`thing_write_not_found_message`]);
 //! * the THING GROUP family, whose operations addressing the GROUP state the registry
 //!   families' sentence ([`missing_thing_group_message`]), while the operations addressing a
 //!   resource by ARN alone — the tagging plane — state
@@ -63,9 +67,27 @@ fn plane_not_found(family: &str, id: &str) -> String {
     format!("{family} {id} cannot be found.")
 }
 
-/// How this service states that a `thingName` names no thing in the registry.
+/// How this service states that a `thingName` names no thing in the registry to a READ of
+/// one (`DescribeThing`, and every other operation that reports on a thing record).
+///
+/// A thing is a REGISTRY resource of this account, so a read states the miss the way the
+/// registry families state one: the family noun, the account the record would belong to,
+/// and the name the request asked about. The WRITE of a thing record states it in the
+/// family's other wording ([`thing_write_not_found_message`]).
 pub fn missing_thing_message(thing_name: &str) -> String {
     registry_not_found("Thing", thing_name)
+}
+
+/// How this service states that a `thingName` names no thing in the registry to the
+/// operation that WRITES that record addressed by name (`UpdateThing`): the family noun,
+/// the name the request asked about, and ` not found.`, with the account NOT named — the
+/// other half of [`missing_thing_message`], the way the fleet-metric family's write half
+/// ([`fleet_metric_write_not_found_message`]) is the other half of its read's sentence.
+///
+/// The thing name the request sent is the sentence's ONLY variable part, so nothing of
+/// the serving account appears in it.
+pub fn thing_write_not_found_message(thing_name: &str) -> String {
+    format!("Thing {thing_name} not found.")
 }
 
 /// How this service states that a `thingGroupName` names no thing group this account

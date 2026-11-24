@@ -88,7 +88,22 @@ impl Emulator {
     }
 
     /// `CreateDynamicThingGroup`: `POST /dynamic-thing-groups/{thingGroupName}`.
+    ///
+    /// A dynamic group is a view of the fleet index, so the index it queries has to exist
+    /// before one can be created: the setup brings it up with
+    /// `UpdateIndexingConfiguration` (`POST /indexing/config`), the way the other suites
+    /// of this crate that need a dynamic group do.
     async fn create_dynamic_thing_group(&self, case: &str, group_name: &str) {
+        let indexed = self
+            .dispatch(
+                "POST",
+                "/indexing/config",
+                Some(&json!({
+                    "thingIndexingConfiguration": { "thingIndexingMode": "REGISTRY" },
+                })),
+            )
+            .await;
+        indexed.expect_ok(case, "UpdateIndexingConfiguration");
         let reply = self
             .dispatch(
                 "POST",

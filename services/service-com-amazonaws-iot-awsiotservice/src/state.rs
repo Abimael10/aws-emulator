@@ -3460,7 +3460,8 @@ pub use not_found::{
     missing_command_message, missing_fleet_metric_message, missing_job_execution_job_message,
     missing_job_execution_message, missing_job_message, missing_job_template_message,
     missing_thing_group_message, missing_thing_message, missing_thing_type_message,
-    tagged_thing_group_not_found_message, unauthorized_topic_rule_message,
+    tagged_thing_group_not_found_message, thing_write_not_found_message,
+    unauthorized_topic_rule_message,
     unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
