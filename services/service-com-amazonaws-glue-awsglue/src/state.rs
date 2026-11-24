@@ -1516,10 +1516,13 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// run's script ([`hand_off_job_script`]) and an interactive session's statement — kept so
     /// an execution this service began is reachable, and so abortable, rather than detached.
     ///
-    /// Bounded by construction: a hand-off takes one of its path's permits BEFORE it spawns
-    /// ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], [`MAX_CONCURRENT_STATEMENT_RUNS`]), so at most that
-    /// many executions are ever in flight, and the handles of the ones that have ended are
-    /// dropped whenever another is recorded ([`Self::record_handed_off_execution`]).
+    /// Bounded by construction: an execution is handed off once per CLAIMED run or statement,
+    /// and the runs a job keeps are themselves bounded ([`MAX_RUNS_PER_JOB`]), so the list
+    /// holds the executions running a script — at most
+    /// [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] / [`MAX_CONCURRENT_STATEMENT_RUNS`] of them at a
+    /// time, which is what those permits bound — beside the ones still waiting for an
+    /// interpreter of their own; the handles of the ones that have ended are dropped whenever
+    /// another is recorded ([`Self::record_handed_off_execution`]).
     pub handed_off_executions: Vec<::tokio::task::JoinHandle<()>>,
 }
 

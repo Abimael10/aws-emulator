@@ -51,9 +51,10 @@
 //! # Bounds
 //!
 //! A script is caller-supplied code, so every bound is this emulator's and none of them is
-//! reachable from the script: how many scripts run at once and how many handed-off executions
-//! can be in flight at a time ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], whose permit is taken
-//! before anything is spawned, with no wait), how many executions one call hands off
+//! reachable from the script: how many scripts run AT ONCE
+//! ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], whose permit a handed-off execution WAITS for rather
+//! than giving its run back unperformed, [`JOB_SCRIPT_INTERPRETER_WAIT`]), how many executions
+//! one call hands off
 //! ([`MAX_JOB_SCRIPT_RUNS_PER_CALL`] over at most [`MAX_JOBS_PER_SCRIPT_CALL`] jobs), how long
 //! one script's own run may last ([`JOB_SCRIPT_RUN_CEILING`], which also clamps the job's own
 //! `Timeout`), how much of THIS HOST's time one run may take ([`JOB_SCRIPT_HOST_CEILING`],
@@ -198,27 +199,44 @@ pub const JOB_SCRIPT_HOST_WAIT: Duration =
 /// once; this is what the task allows for it before it stops waiting.
 pub const JOB_SCRIPT_STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// How many job scripts run at once in this process, which is also how many handed-off
-/// executions can be in flight at a time.
+/// How many job scripts run AT ONCE in this process.
 ///
 /// CHOSEN: a script runs per job run, and a script that WAITS holds its interpreter for as
 /// long as it waits, so without this the bounds above would be multiplied by the number of
 /// runs an account starts. This many scripts run at a time — enough for the runs a client
 /// starts beside each other (a job and the job its trigger chains, an allowed run beside a
 /// refused one, a workflow's actions) to be in flight together while a run that waits holds
-/// one of them — and a run that finds no free interpreter is handed off by NOBODY: the permit
-/// is taken before anything is spawned ([`hand_off_job_script`]), so the run stays
-/// [`JobRunEntry::awaiting_script`] and a later call hands it off. Nothing waits for a permit,
-/// so neither a task nor a buffered script accumulates behind this bound.
+/// one of them.
+///
+/// It bounds how many scripts run at a time and NOT whether a run is performed: the ONE
+/// execution a run is owed is owed from the instant the run was recorded, so an execution that
+/// finds every interpreter held WAITS for one ([`JOB_SCRIPT_INTERPRETER_WAIT`]) rather than
+/// giving the run back unperformed — otherwise a client that waits on the run through
+/// EventBridge, and so makes no further Glue call, would wait on a run nothing ever runs. What
+/// waits is one task per CLAIMED run, holding that run's plan and no script bytes (a script is
+/// read under the permit), and the runs a store holds are themselves bounded
+/// ([`MAX_RUNS_PER_JOB`]).
 pub const MAX_CONCURRENT_JOB_SCRIPT_RUNS: usize = 8;
+
+/// How long a handed-off execution waits for an interpreter of its own before it gives its
+/// run's claim back.
+///
+/// The longest ONE run can hold an interpreter is the host time one run may take plus the
+/// grace its stop needs ([`JOB_SCRIPT_HOST_WAIT`]), and the permits are handed out in the
+/// order they were asked for — so an execution still without one after that span is behind
+/// runs this emulator has itself given up on. It then releases the claim rather than waiting
+/// on, so the run stays [`JobRunEntry::awaiting_script`] and a later call hands it off, and no
+/// task of this process waits without end.
+pub const JOB_SCRIPT_INTERPRETER_WAIT: Duration = JOB_SCRIPT_HOST_WAIT;
 
 /// The permits [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] hands out, for the whole process: the
 /// bound is on how many scripts this emulator runs at once, whichever job or caller asked.
 ///
-/// Taken with no wait at all, BEFORE an execution is handed off, and held as an owned permit
-/// MOVED INTO the thread that runs the script — so it is given back when that thread really
-/// ends, including for a run the caller has already given up waiting for, which would
-/// otherwise take this bound past its count while its thread was still going.
+/// Taken by the handed-off execution ITSELF, which waits for one
+/// ([`JOB_SCRIPT_INTERPRETER_WAIT`]), and held as an owned permit MOVED INTO the thread that
+/// runs the script — so it is given back when that thread really ends, including for a run the
+/// caller has already given up waiting for, which would otherwise take this bound past its
+/// count while its thread was still going.
 static JOB_SCRIPT_RUN_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync::Semaphore>> =
     ::std::sync::LazyLock::new(|| {
         ::std::sync::Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_JOB_SCRIPT_RUNS))
@@ -783,19 +801,23 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
 /// each other through, and the credential the run's own calls are signed with — so the task
 /// holds nothing of the request.
 ///
-/// What bounds the hand-off is the INTERPRETER PERMIT, taken HERE and before anything is
-/// spawned: at most [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] executions exist at a time for the whole
-/// process, whichever job or caller asked, so neither the tasks in flight nor the script bytes
-/// they buffer grow with the number of runs an account starts. The permit is OWNED and travels
-/// with the execution into the thread its script runs on, so it is given back when that thread
-/// ends. The task's handle is kept on the store
+/// What bounds the execution is the INTERPRETER PERMIT, which the TASK takes and WAITS for
+/// ([`JOB_SCRIPT_INTERPRETER_WAIT`]): at most [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] scripts run at
+/// a time for the whole process, whichever job or caller asked, and a run started while every
+/// interpreter is held is performed as soon as one frees rather than being left for a later
+/// call — the execution was owed the instant the run was recorded, and a client that waits on
+/// the run through EventBridge makes no later call for it to be owed to. Nothing of the script
+/// is read before that permit is held, so a waiting task buffers no script, and the tasks that
+/// can wait are bounded by the runs a store holds, one claim each. The permit is OWNED and
+/// travels with the execution into the thread its script runs on, so it is given back when
+/// that thread ends. The task's handle is kept on the store
 /// ([`ComAmazonawsGlueAwsglueState::record_handed_off_execution`]), so an execution this
 /// service began stays reachable rather than detached.
 ///
-/// `false` where the execution was NOT handed off — no async runtime to run it on, or no free
-/// interpreter — in which case the claim goes straight back, so the run stays owed its script
-/// and a later call hands it off rather than this one reporting an outcome no execution
-/// produced.
+/// `false` where the execution was NOT handed off — there is no async runtime to run it on —
+/// in which case the claim goes straight back, so the run stays owed its script and a later
+/// call hands it off rather than this one reporting an outcome no execution produced. The same
+/// happens inside the task for an interpreter that never frees.
 fn hand_off_job_script(
     state: &::engine::ServiceState<ComAmazonawsGlueAwsglueState>,
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -808,19 +830,30 @@ fn hand_off_job_script(
         release_script_claim(state, region, &plan);
         return false;
     };
-    let Ok(permit) = ::std::sync::Arc::clone(&JOB_SCRIPT_RUN_PERMITS).try_acquire_owned() else {
-        ::tracing::debug!(
-            job = %plan.job_name,
-            run = %plan.run_id,
-            "a Glue job run found no free interpreter for its script, so it stays owed one"
-        );
-        release_script_claim(state, region, &plan);
-        return false;
-    };
     let performed = ::engine::ServiceState::clone(state);
     let callback = callback.clone();
     let region = region.to_string();
     let handle = runtime.spawn(async move {
+        // The interpreter this execution runs in: waited for, because the execution is owed
+        // from the instant the run was recorded and nothing else will perform it. A wait that
+        // ran out means every interpreter is held by a run this emulator has given up on, so
+        // the claim goes back and a later call hands this one off.
+        let permits = ::std::sync::Arc::clone(&JOB_SCRIPT_RUN_PERMITS);
+        let waited = ::tokio::time::timeout(
+            JOB_SCRIPT_INTERPRETER_WAIT,
+            permits.acquire_owned(),
+        )
+        .await;
+        let Ok(Ok(permit)) = waited else {
+            ::tracing::warn!(
+                job = %plan.job_name,
+                run = %plan.run_id,
+                "a Glue job run's script found no interpreter free inside the span one run may \
+                 hold one for, so it stays owed one"
+            );
+            release_script_claim(&performed, &region, &plan);
+            return;
+        };
         perform_handed_off_job_script(
             &performed, &callback, &region, &plan, identity, access, permit,
         )
@@ -907,10 +940,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// that have ENDED.
     ///
     /// An execution this service began stays reachable while it runs — so it can be abandoned
-    /// deliberately rather than merely forgotten — and what is kept is bounded by the permits
-    /// a hand-off has to take first ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], and the statement
-    /// path's own): the handles of finished executions are dropped on every record, so the
-    /// list holds the ones in flight and nothing else.
+    /// deliberately rather than merely forgotten — and what is kept is bounded by the runs a
+    /// store holds, one claim each ([`MAX_RUNS_PER_JOB`] per job): the handles of finished
+    /// executions are dropped on every record, so the list holds the ones in flight — the ones
+    /// running a script, and the ones still waiting for an interpreter
+    /// ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`]) — and nothing else.
     pub fn record_handed_off_execution(&mut self, handle: ::tokio::task::JoinHandle<()>) {
         self.handed_off_executions
             .retain(|running| !running.is_finished());
@@ -928,8 +962,8 @@ impl ComAmazonawsGlueAwsglueState {
 /// `identity` is the session of the job's execution role the script is fetched and run as,
 /// `access` the seam its own AWS calls travel this emulator over — both built by the call that
 /// claimed this execution, where the request's own context is ([`perform_owed_job_runs`]) — and
-/// `permit` this execution's share of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], taken before it was
-/// handed off, which travels into the thread the script runs on.
+/// `permit` this execution's share of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], which the execution
+/// itself waited for and which travels into the thread the script runs on.
 async fn perform_job_script(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,

@@ -416,9 +416,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // process is spawned, no shell is involved, no host path is resolved and the script
         // can reach no host socket, process, library, file or environment variable: the only
         // destination its AWS SDK calls have is this same emulator, over the in-process
-        // callback. What one run spends is bounded before anything runs: one script at a time
-        // out of [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], whose permit is taken
-        // before anything is handed off, at
+        // callback. What one run spends is bounded before anything runs: at most
+        // [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`] scripts run at a time, an execution
+        // that finds every interpreter held waiting for one rather than leaving its run
+        // unperformed, at
         // most [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] handed off per call, each
         // script stopped at [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's
         // own `Timeout` down) and inside the step, memory, recursion and output ceilings the
