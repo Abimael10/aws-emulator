@@ -28,7 +28,11 @@
 //!
 //! This decision is NOT the IAM one: whether the caller's policies allow the action is
 //! [`super::identity_authorization`], asked first and about every caller. What is asked here
-//! is who the caller IS, which no policy can grant.
+//! is who the caller IS, which no policy can grant. The two are therefore refused in different
+//! words: an identity-based refusal carries IAM's "is not authorized to perform" sentence,
+//! while this one carries Systems Manager's own ([`not_the_node_message`]), so a caller can
+//! tell a policy that denies the call from credentials that are not the node's — the first is
+//! resolved by widening a policy and the second never is.
 
 use ::service_common::iam_role;
 
@@ -76,20 +80,18 @@ fn entity_name(role: &str) -> &str {
     role.rsplit('/').next().unwrap_or(role)
 }
 
-/// How a caller that is not the node it named is refused: IAM's own sentence for a request no
-/// grant covers ([`::service_common::iam_authorization::not_authorized_to_perform`]), naming
-/// the principal that signed, the action it asked for and the node it asked about.
+/// How a caller that is not the node it named is refused: Systems Manager's OWN sentence for
+/// that refusal, which names the node the request asked about and nothing else.
 ///
-/// NO reason clause follows it, which is the form that sentence takes where no rule of the
-/// caller's own documents withheld the grant: those documents are asked first
-/// ([`super::identity_authorization`]) and had already allowed this call. What refused it is
-/// the identity itself, which is a fact about the caller rather than about a policy, so there
-/// is no rule to name.
+/// It is not IAM's "is not authorized to perform" sentence, and deliberately so. Whether any
+/// grant covers the call is a DIFFERENT decision, taken first and about every caller
+/// ([`super::identity_authorization`]), and it had already allowed this one; what refused this
+/// request is that the credentials it was signed with are not the named node's, which no policy
+/// can grant and no policy withheld. So the sentence blames neither a principal nor an action:
+/// the only fact it carries is the node id the request asked about, echoed from the request,
+/// because that is the one thing the caller may be told — a caller that is not the node learns
+/// nothing from it about which nodes the account holds.
 #[must_use]
-pub fn not_the_node_message(caller_arn: &str, operation: &str, resource: &str) -> String {
-    ::service_common::iam_authorization::not_authorized_to_perform(
-        caller_arn,
-        &super::identity_authorization::action_for(operation),
-        resource,
-    )
+pub fn not_the_node_message(instance_id: &str) -> String {
+    format!("Instance Id {instance_id} doesn't match the credentials")
 }

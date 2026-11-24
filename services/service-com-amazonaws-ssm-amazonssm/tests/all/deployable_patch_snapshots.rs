@@ -7,7 +7,10 @@
 //! caller has to be that node, which it is when the principal it signed with is a session of
 //! the node's registration role named for the node (the credentials that node's guest is
 //! served), and every other principal, a client's own credentials included, is refused the
-//! modelled `AccessDeniedException` carrying IAM's own sentence and writing nothing. The node
+//! modelled `AccessDeniedException` saying so in Systems Manager's own words — "Instance Id
+//! <InstanceId> doesn't match the credentials", the request's own id interpolated — and writing
+//! nothing, while a refusal by the caller's own identity-based policies is a different decision
+//! and keeps IAM's own sentence. The node
 //! itself is answered the snapshot of the patch baseline in force for it — the id it asked
 //! with, the product of its own operating system release, and a URL of this emulator the
 //! snapshot is downloadable from — which is FROZEN at the instant it was first taken, so a
@@ -108,6 +111,27 @@ fn node_role_trust() -> String {
 /// never IAM's default deny: what is under test is WHO the caller is.
 const ALLOW_SSM: &str = r#"{"Version":"2012-10-17","Statement":[
     {"Effect":"Allow","Action":"ssm:*","Resource":"*"}]}"#;
+
+/// An identity-based policy that allows this service and then DENIES this one read: what puts
+/// a caller's refusal back in the hands of its own documents, so the sentence it carries can be
+/// told apart from the one a credential mismatch carries.
+const DENY_SNAPSHOT_READ: &str = r#"{"Version":"2012-10-17","Statement":[
+    {"Effect":"Allow","Action":"ssm:*","Resource":"*"},
+    {"Effect":"Deny","Action":"ssm:GetDeployablePatchSnapshotForInstance","Resource":"*"}]}"#;
+
+/// The rule clause IAM's sentence ends with where one of the caller's own documents denies the
+/// call explicitly.
+const EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
+
+/// Node ids of EVERY form the modelled `InstanceId` admits — `smithy_query(query="shape",
+/// shape="com.amazonaws.ssm#InstanceId")` gives the pattern
+/// `^(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)$`: an Amazon EC2 instance id of eight characters, one of
+/// seventeen, and a hybrid machine id. The account holds no node of any of them.
+const UNHELD_NODE_FORMS: &[(&str, &str)] = &[
+    ("an eight-character Amazon EC2 instance id", "i-1a2b3c4d"),
+    ("a seventeen-character Amazon EC2 instance id", UNHELD_NODE),
+    ("a hybrid machine id", "mi-0f1e2d3c4b5a69788"),
+];
 
 /// What a principal a case signs as is: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
@@ -261,15 +285,26 @@ fn instance_arn(instance_id: &str) -> String {
     )
 }
 
-/// The sentence a caller that is not the node it named is refused with: IAM's own, naming the
-/// principal that signed, the action and the node it asked about.
-fn not_authorized(principal: &Principal, instance_id: &str) -> String {
+/// The sentence a refusal by the CALLER'S OWN identity-based policies carries: IAM's own,
+/// naming the principal that signed, the action and the node it asked about, with the rule
+/// that withheld the grant at the end.
+fn not_authorized(principal: &Principal, instance_id: &str, reason: &str) -> String {
     format!(
         "User: {} is not authorized to perform: \
-         ssm:GetDeployablePatchSnapshotForInstance on resource: {}",
+         ssm:GetDeployablePatchSnapshotForInstance on resource: {} {reason}",
         principal.arn,
         instance_arn(instance_id)
     )
+}
+
+/// The sentence a caller whose credentials are not the NAMED node's is refused with: Systems
+/// Manager's own, whose fixed text is "Instance Id "/" doesn't match the credentials" and whose
+/// only variable part is the `InstanceId` the request carried.
+///
+/// It is not IAM's sentence above, and the two must stay distinguishable: widening a policy
+/// resolves the one and never the other.
+fn credentials_mismatch(instance_id: &str) -> String {
+    format!("Instance Id {instance_id} doesn't match the credentials")
 }
 
 /// The same address with its last path segment — the key component this endpoint minted for
@@ -354,8 +389,8 @@ async fn a_snapshot_is_served_to_the_node_itself_and_refused_to_every_other_prin
             );
             assert_eq!(
                 answered["Message"].as_str().unwrap_or_default(),
-                not_authorized(&principal, &node),
-                "case {why:?}: the refusal names the principal, the action and the node, got \
+                credentials_mismatch(&node),
+                "case {why:?}: the refusal names the node the credentials did not match, got \
                  {answered}"
             );
             assert_eq!(
@@ -384,8 +419,135 @@ async fn a_read_of_a_node_the_account_does_not_hold_is_refused() {
     );
     assert_eq!(
         answered["Message"].as_str().unwrap_or_default(),
-        not_authorized(&principal, UNHELD_NODE),
-        "case {case:?}: the refusal names the principal, the action and the node, got {answered}"
+        credentials_mismatch(UNHELD_NODE),
+        "case {case:?}: the refusal names the node the credentials did not match, got {answered}"
+    );
+    assert_eq!(
+        snapshots_held(&emulator),
+        0,
+        "case {case:?}: a refused read takes no snapshot"
+    );
+}
+
+/// RULE: a caller whose credentials are not the named node's is told THAT, in Systems Manager's
+/// own words — the fixed text with the request's own `InstanceId` interpolated — for every form
+/// of node id the model admits and whether the account holds a node of that id or not; and the
+/// decision is taken BEFORE anything about an operating system is looked at, so a request
+/// carrying an override of another operating system is still refused the credentials rather
+/// than `UnsupportedOperatingSystem`.
+#[tokio::test]
+async fn a_caller_that_is_not_the_node_is_refused_the_credential_mismatch() {
+    let case = "the credential-mismatch table";
+    let emulator = Emulator::new();
+    let node = registered_node(&emulator, case, "snapshot-mismatch", AL2023_NAME_PATTERN).await;
+    role(&emulator, case, "snapshot-mismatch-other").await;
+
+    // A client's own local credentials, and a session of ANOTHER role named for the node this
+    // account does hold: two principals that are not that node.
+    let client = Principal::account(&emulator, case).await;
+    let other = session_of(&emulator, case, "snapshot-mismatch-other", &node).await;
+    // An override of an operating system no node here is of: what would be refused
+    // `UnsupportedOperatingSystem` if the caller WERE the node.
+    let foreign_override = json!({
+        "OperatingSystem": "WINDOWS",
+        "ApprovedPatches": ["KB2124261"],
+    });
+
+    // (what the case is, the principal that signs, the node id named, the override carried)
+    let mut rows: Vec<(String, &Principal, String, Option<Value>)> = vec![
+        (
+            "a client's own credentials, for a node this account holds".to_string(),
+            &client,
+            node.clone(),
+            None,
+        ),
+        (
+            "a session of another role, named for that node".to_string(),
+            &other,
+            node.clone(),
+            None,
+        ),
+        (
+            "a client's own credentials, with an override of another operating system".to_string(),
+            &client,
+            node.clone(),
+            Some(foreign_override.clone()),
+        ),
+    ];
+    for (form, unheld) in UNHELD_NODE_FORMS {
+        rows.push((
+            format!("a client's own credentials, for {form} the account holds no node of"),
+            &client,
+            (*unheld).to_string(),
+            None,
+        ));
+        rows.push((
+            format!("an override of another operating system, for {form}"),
+            &client,
+            (*unheld).to_string(),
+            Some(foreign_override.clone()),
+        ));
+    }
+
+    for (why, principal, instance_id, overridden) in rows {
+        let before = snapshots_held(&emulator);
+        let (status, answered) =
+            snapshot_as(&emulator, principal, &instance_id, SNAPSHOT, overridden).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "AccessDeniedException"),
+            "case {why:?}: expected the read to be refused the credentials, got {status}: \
+             {answered}"
+        );
+        assert_eq!(
+            answered["Message"].as_str().unwrap_or_default(),
+            credentials_mismatch(&instance_id),
+            "case {why:?}: expected Systems Manager's credential-mismatch sentence for \
+             {instance_id:?}, got {answered}"
+        );
+        assert_eq!(
+            snapshots_held(&emulator),
+            before,
+            "case {why:?}: a refused read takes no snapshot"
+        );
+    }
+}
+
+/// RULE: a refusal by the CALLER'S OWN identity-based policies is a different decision and
+/// keeps IAM's own sentence — so a caller can tell a policy that denies the call, which
+/// widening a policy resolves, from credentials that are not the node's, which it never does.
+#[tokio::test]
+async fn a_policy_refusal_of_the_same_read_keeps_iams_own_sentence() {
+    let case = "a policy that denies this read";
+    let emulator = Emulator::new();
+    role(&emulator, case, "snapshot-denied-role").await;
+    emulator
+        .iam(
+            case,
+            "PutRolePolicy",
+            &[
+                ("RoleName", "snapshot-denied-role"),
+                ("PolicyName", "inline"),
+                ("PolicyDocument", DENY_SNAPSHOT_READ),
+            ],
+        )
+        .await;
+    // The session is named for the node it asks about, so WHO the caller is cannot be what
+    // refuses this call: only the caller's own documents can.
+    let principal = session_of(&emulator, case, "snapshot-denied-role", UNHELD_NODE).await;
+
+    let (status, answered) =
+        snapshot_as(&emulator, &principal, UNHELD_NODE, SNAPSHOT, None).await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "AccessDeniedException"),
+        "case {case:?}: expected the denied read to be refused, got {status}: {answered}"
+    );
+    assert_eq!(
+        answered["Message"].as_str().unwrap_or_default(),
+        not_authorized(&principal, UNHELD_NODE, EXPLICIT_DENY),
+        "case {case:?}: a refusal by the caller's own policies names the principal, the action \
+         and the node, got {answered}"
     );
     assert_eq!(
         snapshots_held(&emulator),

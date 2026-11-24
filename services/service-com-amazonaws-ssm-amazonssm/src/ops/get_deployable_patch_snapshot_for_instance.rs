@@ -260,14 +260,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A node this account holds none of cannot be the caller either, so that request is
         // refused the same way and says no more: a caller that is not the node learns nothing
-        // about which nodes the account holds.
+        // about which nodes the account holds. The refusal is decided here, BEFORE anything of
+        // the node's operating system is looked at, so a caller that is not the node is told
+        // that and never told instead what would be unsupported on a node it cannot read.
         let Some(node) =
             held_node.filter(|node| node_identity::request_is_from_node(&caller, node))
         else {
             return Err(denied(node_identity::not_the_node_message(
-                &caller,
-                Self::NAME,
-                &resource,
+                &input.instance_id,
             )));
         };
 
