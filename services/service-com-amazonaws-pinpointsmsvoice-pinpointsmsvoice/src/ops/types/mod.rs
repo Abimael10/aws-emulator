@@ -23,6 +23,11 @@ pub mod create_configuration_set_event_destination_types;
 pub mod create_configuration_set_types;
 pub mod delete_configuration_set_event_destination_types;
 pub mod delete_configuration_set_types;
+/// The one member-for-member mapping between each nested destination shape of an event
+/// destination and its stored record — not a modelled shape, so it carries no `_types`
+/// suffix and is NOT glob-re-exported: it declares only `From` impls, which are in scope
+/// wherever both types are.
+pub mod event_destination_records;
 pub mod get_configuration_set_event_destinations_types;
 pub mod list_configuration_sets_types;
 /// How this service words a refusal of a parameter it cannot use — not a modelled shape,

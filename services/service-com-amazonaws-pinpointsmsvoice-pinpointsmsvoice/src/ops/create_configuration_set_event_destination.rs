@@ -283,28 +283,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Store what the caller sent, member for member: an omitted member stays
-        // omitted so the reader reports the destination as it was defined.
+        // omitted so the reader reports the destination as it was defined. The
+        // per-member mapping of the three nested destination shapes is the one in
+        // `types::event_destination_records`, shared with the update handler, so a
+        // destination created here and one rewritten there read back the same way.
         set.event_destinations.insert(
             destination_name.clone(),
             crate::state::EventDestinationRecord {
                 name: destination_name,
                 enabled: definition.enabled,
                 matching_event_types,
-                cloud_watch_logs: definition.cloud_watch_logs_destination.map(|dest| {
-                    crate::state::CloudWatchLogsDest {
-                        iam_role_arn: dest.iam_role_arn,
-                        log_group_arn: dest.log_group_arn,
-                    }
-                }),
-                kinesis_firehose: definition.kinesis_firehose_destination.map(|dest| {
-                    crate::state::KinesisFirehoseDest {
-                        delivery_stream_arn: dest.delivery_stream_arn,
-                        iam_role_arn: dest.iam_role_arn,
-                    }
-                }),
-                sns: definition.sns_destination.map(|dest| crate::state::SnsDest {
-                    topic_arn: dest.topic_arn,
-                }),
+                cloud_watch_logs: definition.cloud_watch_logs_destination.map(Into::into),
+                kinesis_firehose: definition.kinesis_firehose_destination.map(Into::into),
+                sns: definition.sns_destination.map(Into::into),
             },
         );
 

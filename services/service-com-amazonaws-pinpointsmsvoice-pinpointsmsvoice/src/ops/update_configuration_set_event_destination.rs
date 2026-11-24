@@ -229,7 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // definition is optional, so a member the request carries replaces the stored one
         // and a member it omits states nothing about that member and leaves it as it was
         // — the destination's own `Name`, which is its key inside the set, is not a member
-        // of the definition at all and never changes here.
+        // of the definition at all and never changes here. WHAT each of the three nested
+        // destination shapes maps onto is `types::event_destination_records`', shared with
+        // the create handler; this handler decides only WHICH members are written.
         if let Some(enabled) = definition.enabled {
             destination.enabled = Some(enabled);
         }
@@ -237,21 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination.matching_event_types = Some(matching_event_types);
         }
         if let Some(cloud_watch_logs) = definition.cloud_watch_logs_destination {
-            destination.cloud_watch_logs = Some(crate::state::CloudWatchLogsDest {
-                iam_role_arn: cloud_watch_logs.iam_role_arn,
-                log_group_arn: cloud_watch_logs.log_group_arn,
-            });
+            destination.cloud_watch_logs = Some(cloud_watch_logs.into());
         }
         if let Some(kinesis_firehose) = definition.kinesis_firehose_destination {
-            destination.kinesis_firehose = Some(crate::state::KinesisFirehoseDest {
-                delivery_stream_arn: kinesis_firehose.delivery_stream_arn,
-                iam_role_arn: kinesis_firehose.iam_role_arn,
-            });
+            destination.kinesis_firehose = Some(kinesis_firehose.into());
         }
         if let Some(sns) = definition.sns_destination {
-            destination.sns = Some(crate::state::SnsDest {
-                topic_arn: sns.topic_arn,
-            });
+            destination.sns = Some(sns.into());
         }
 
         Ok(UpdateConfigurationSetEventDestinationOutput {})

@@ -192,7 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // A set that exists but has no destinations reports an empty list; only a set
-        // that does not exist is a `NotFoundException`.
+        // that does not exist is a `NotFoundException`. The three nested destination
+        // shapes are projected back by the one mapping in
+        // `types::event_destination_records`, the reverse of the one the writers use.
         let event_destinations = set
             .event_destinations
             .values()
@@ -200,21 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: Some(record.name.clone()),
                 enabled: record.enabled,
                 matching_event_types: record.matching_event_types.clone(),
-                cloud_watch_logs_destination: record.cloud_watch_logs.as_ref().map(|dest| {
-                    CloudWatchLogsDestination {
-                        iam_role_arn: dest.iam_role_arn.clone(),
-                        log_group_arn: dest.log_group_arn.clone(),
-                    }
-                }),
-                kinesis_firehose_destination: record.kinesis_firehose.as_ref().map(|dest| {
-                    KinesisFirehoseDestination {
-                        delivery_stream_arn: dest.delivery_stream_arn.clone(),
-                        iam_role_arn: dest.iam_role_arn.clone(),
-                    }
-                }),
-                sns_destination: record.sns.as_ref().map(|dest| SnsDestination {
-                    topic_arn: dest.topic_arn.clone(),
-                }),
+                cloud_watch_logs_destination: record.cloud_watch_logs.as_ref().map(Into::into),
+                kinesis_firehose_destination: record.kinesis_firehose.as_ref().map(Into::into),
+                sns_destination: record.sns.as_ref().map(Into::into),
             })
             .collect();
 
