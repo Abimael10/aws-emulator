@@ -96,7 +96,7 @@ const UPDATED_PROPERTY_VALUE: &str = "hello again";
 /// The `EnvironmentTier$Type` of the worker tier, from that member's own
 /// documentation ("For Worker tier — `SQS/HTTP`"): the type a manifest declares
 /// beside `EnvironmentTier$Name` `Worker`.
-const WORKER_TIER_TYPE: &str = "SQS/HTTP";
+pub(crate) const WORKER_TIER_TYPE: &str = "SQS/HTTP";
 
 /// The namespace and the option that name the IAM instance profile an
 /// environment's instances are given, as Elastic Beanstalk's published
@@ -136,7 +136,7 @@ fn other_solution_stack() -> String {
 ///
 /// Built here rather than held as a constant because the solution stack a
 /// manifest names is read off the service's own published catalogue.
-fn manifest(
+pub(crate) fn manifest(
     environment_name: &str,
     solution_stack: Option<&str>,
     tier: Option<(&str, &str)>,
@@ -172,7 +172,7 @@ fn manifest(
 }
 
 /// Create the application every version below is created under.
-async fn given_application(emulator: &Emulator, case: &str) {
+pub(crate) async fn given_application(emulator: &Emulator, case: &str) {
     let created = emulator
         .call("CreateApplication", &[("ApplicationName", APPLICATION)])
         .await;
@@ -238,7 +238,7 @@ async fn given_sampled_version(emulator: &Emulator, case: &str, version_label: &
 /// version has been successfully processed — the way a client that is about to
 /// compose does, since a composition reads the manifest that pre-processing
 /// validated.
-async fn given_version(
+pub(crate) async fn given_version(
     emulator: &Emulator,
     case: &str,
     version_label: &str,
@@ -278,7 +278,11 @@ async fn given_version(
 
 /// Compose the group the `version_labels` describe, with `group_name` when the
 /// request carries one.
-async fn compose(emulator: &Emulator, group_name: Option<&str>, version_labels: &[&str]) -> Answer {
+pub(crate) async fn compose(
+    emulator: &Emulator,
+    group_name: Option<&str>,
+    version_labels: &[&str],
+) -> Answer {
     let mut params: Vec<(String, String)> = vec![(
         "ApplicationName".to_string(),
         APPLICATION.to_string(),
@@ -302,7 +306,7 @@ async fn compose(emulator: &Emulator, group_name: Option<&str>, version_labels: 
 /// The environments `DescribeEnvironments` reports for this application, as the
 /// elements they were read from, so a round trip asserts on the STORED record
 /// rather than on what the composition answered.
-async fn described_environments(emulator: &Emulator, case: &str) -> (Vec<Answer>, Answer) {
+pub(crate) async fn described_environments(emulator: &Emulator, case: &str) -> (Vec<Answer>, Answer) {
     let described = emulator
         .call(
             "DescribeEnvironments",

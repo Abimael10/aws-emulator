@@ -8,6 +8,15 @@ Issue-Commit: dac70573d94ca20489dac9623e5401c47c25359d
 
 # Elastic Beanstalk ComposeEnvironments materializes environments for a two-tier env.yaml manifest set where AWS answers with an empty Environments list and creates none
 
+> **CLOSED WITH ITS ONE CAUSE DECLINED — THE REPLAYED SYMPTOM REMAINS.** This report sits
+> under `things-that-now-work/` because it has been worked and needs no further fixer, not
+> because the recorded check passes: ComposeEnvironments STILL composes one environment per
+> supplied version label for the manifest set below, so the check's `assert composed == {}`
+> still fails. What the emulator owns was verified correct against the model and pinned by
+> test; why the recorded empty answer cannot be turned into a rule is stated under
+> "## Resolution" at the end of this file. Do not re-open it as a service defect without
+> new recorded evidence of the kind named there.
+
 > _Note: this issue was identified against the code base at commit `dac70573d94ca20489dac9623e5401c47c25359d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
@@ -53,3 +62,62 @@ Positive control in the same check: eb.create_environment on the identical Solut
    -> emulator: resp['Environments'] has one entry per version label.
 8. eb.describe_environments(ApplicationName=APP, EnvironmentNames=['front-<group>', 'worker-<group>'], IncludeDeleted=False)
    -> AWS (recorded): 'Environments' == [].
+
+## Resolution
+
+DECLINED: what the emulator answers IS the modelled behaviour, and no rule that is not
+keyed to this one recording's instance produces the recorded empty answer.
+
+The model (`smithy_query` on `com.amazonaws.elasticbeanstalk#ComposeEnvironments`) states
+that the operation "create[s] or update[s] a group of environments that each run a separate
+component of a single application", "takes a list of version labels that specify
+application source bundles for each of the environments to create or update", that "the
+name of each environment and other required information must be included in the source
+bundles in an environment manifest named env.yaml", that each bundle's manifest
+"optionally can specify environment links to create", and that `GroupName` is to be given
+"only if the environment name defined in each target environment's manifest ends with a +
+(plus) character". The request recorded here — `+`-named manifests, a GroupName, a web and
+a worker tier, links wiring the two, a published solution stack — is that documented
+workflow exactly, and `services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice/src/ops/compose_environments.rs`
+implements it: one environment per version label whose manifest names one, named by the
+manifest with a `+` completed by the group, carrying that manifest's solution stack, tier,
+option settings and links with each link target completed the same way.
+
+Why no discriminator exists. The same operation's other recorded runs in this corpus — the
+three carried by `issues/things-that-do-not-work/20261123T140417Z-elasticbeanstalk-elastic-beanstalk-composeenvironments-is-a-no-op-it.md`
+(`e2e-compose-environments-then-terminate-cleans-up`,
+`compose-environments-creates-envs-from-versions-lifecycle`,
+`e2e-compose-environments-from-templates-produces-linked-envs`) and
+`compose-environments-insufficient-privileges-denied` — show AWS COMPOSING environments for
+manifest sets that share every property of this one that a handler can read: the same
+`AWSConfigurationTemplateVersion: 1.1.0.0`, the same `+`-terminated names with a GroupName,
+the same WebServer/Standard plus Worker/SQS-HTTP tier pair, successfully PROCESSED versions,
+bundles whose only entry is the manifest, and current Amazon Linux 2023 stacks taken from
+`ListAvailableSolutionStacks`. The only property left is the presence of `EnvironmentLinks`,
+which the model documents as something this operation CREATES — so making a link-bearing
+manifest set compose nothing turns the documented primary workflow into a success-shaped
+discarded write (200 with an empty list and no stored record), which is why two attempts at
+such a rule (first "any declared link composes nothing", then "a link's target must already
+be running") were rejected at review. The recorded empty answer is AWS withholding a
+documented capability for a reason this recording does not expose; the check that owns it
+says as much, asserting "the withdrawal" and calling its own contract stale if support "has
+been restored".
+
+What was verified and pinned instead
+(`services/service-com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice/tests/all/composed_environment_links.rs`,
+beside the composition rules the `composed_environments` suite already pins):
+
+* A composition creates the links its manifests declare, over a table that varies which
+  manifest declares them, how many it declares, whether a target is a group template or a
+  plain name, and whether the target is composed by the same call or by an earlier one.
+* Each link is reported by the composition AND stored on the environment, read back through
+  `DescribeEnvironments`, with every expected environment name and link target written out
+  as literal table data rather than recomputed from the service.
+* A manifest that declares no link composes an environment that reports none.
+
+What would have to change for this report to be actionable: recorded evidence of a property
+a handler can read — a manifest member, a version attribute, a platform-branch or
+solution-stack attribute — that separates this run from the composing runs above. With such
+a property the rule becomes implementable in
+`src/ops/compose_environments.rs`; without it, any change that satisfies this check breaks
+those three.
