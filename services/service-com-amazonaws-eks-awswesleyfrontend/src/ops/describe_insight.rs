@@ -20,7 +20,9 @@
 //! * a cluster `RegisterCluster` connected has no insights analysis at all — the
 //!   permanent `ClientException` refusal this service's EKS-managed plane gives;
 //! * an `id` that is not one of that cluster's insights is the missing insight, a
-//!   `ResourceNotFoundException` for the child resource rather than an empty answer.
+//!   `ResourceNotFoundException` for the child resource rather than an empty answer,
+//!   carrying the refusal of the plane the checks are run by WRAPPED
+//!   ([`crate::state::insight_not_found`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -198,15 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // The resource this reports is the INSIGHT, not the cluster, so the
             // missing one is reported without naming the cluster in the payload — the
-            // rule every child-resource read of this service follows. The sentence
-            // states the two identifiers of the analysis that was asked for as
-            // `key=value` pairs: the insight id the request carried and the id of the
-            // cluster it was asked for.
+            // rule every child-resource read of this service follows. The read is
+            // served out of the plane that runs the checks
+            // ([`state::CLUSTER_INSIGHTS_MANAGER`]), so what reaches the caller is
+            // that plane's own sentence followed by the tail naming the call it came
+            // from ([`state::insight_not_found`]).
             return Err(DescribeInsightErrorModeled::ResourceNotFoundException(
-                state::child_resource_not_found(format!(
-                    "Cannot find insight insightId={} clusterId={cluster_id}",
-                    input.id
-                )),
+                state::insight_not_found(&input.id, &cluster_id),
             )
             .into());
         };

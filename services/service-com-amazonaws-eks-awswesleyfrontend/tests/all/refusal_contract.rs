@@ -35,9 +35,12 @@
 //!   differ along the member the update asks to change and along the status the
 //!   cluster is in.
 //! * AN `insightId` THE CLUSTER HAS NO INSIGHT FOR is `ResourceNotFoundException`
-//!   (404) stating the analysis asked for as `key=value` pairs: the requested
-//!   insight id and the cluster's OWN id. Rows differ along the shape of the id and
-//!   along the cluster, whose id is what the sentence's second half tracks.
+//!   (404) stating the analysis asked for as `key=value` pairs — the requested
+//!   insight id and the cluster's OWN id — followed by the tail naming the call to
+//!   the plane the checks are run by, which is everything but the id of that call
+//!   (`tests/all/insight_read_refusal.rs` holds the rule over that plane). Rows
+//!   differ along the shape of the id and along the cluster, whose id is what the
+//!   sentence's second half tracks.
 //! * A `certificateAuthorityId` THE CLUSTER DOES NOT HOLD is
 //!   `ResourceNotFoundException` (404) naming the id and the cluster, while the id
 //!   it DOES hold and that signs for it is `ResourceInUseException` (409) in the
@@ -1066,8 +1069,35 @@ fn assert_not_updatable(case: &str, answer: &Answer, cluster: &str, expected: &s
 // ---------------------------------------------------------------------------
 // RULE: an `insightId` the cluster has no insight for is 404
 // ResourceNotFoundException stating the analysis asked for as `key=value` pairs —
-// the requested insight id, and the id of the CLUSTER rather than its name.
+// the requested insight id, and the id of the CLUSTER rather than its name —
+// followed by the tail that names the call to the plane the insights are served
+// out of, whose only variable part is that call's own id.
 // ---------------------------------------------------------------------------
+
+/// The tail the refusal of a read served out of an internal plane closes with, from
+/// the opening of that plane's clause to the attempt count. Written out here rather
+/// than composed from the service's own constants, so a change to the wording cannot
+/// keep this suite green.
+const INSIGHT_PLANE_CLAUSE: &str =
+    " (Service: EksClusterInsights, Status Code: 404, Request ID: ";
+
+/// What closes it: how many attempts were made to reach that plane.
+const INSIGHT_PLANE_TAIL: &str = ") (SDK Attempt Count: 1)";
+
+/// Asserts `actual` is `sentence` followed by that tail, and answers the id of the
+/// relayed call it carries.
+fn insight_plane_request_id(case: &str, sentence: &str, actual: &str) -> String {
+    let head = format!("{sentence}{INSIGHT_PLANE_CLAUSE}");
+    assert!(
+        actual.starts_with(&head),
+        "case {case:?}: expected the refusal to begin {head:?}, got {actual:?}"
+    );
+    assert!(
+        actual.ends_with(INSIGHT_PLANE_TAIL),
+        "case {case:?}: expected the refusal to end {INSIGHT_PLANE_TAIL:?}, got {actual:?}"
+    );
+    actual[head.len()..actual.len() - INSIGHT_PLANE_TAIL.len()].to_string()
+}
 
 /// `DescribeInsight`: `GET /clusters/{clusterName}/insights/{id}`.
 async fn describe_insight(router: &MultiServiceRouter, cluster: &str, id: &str) -> Answer {
@@ -1188,10 +1218,7 @@ async fn an_unknown_insight_id_is_refused_naming_the_insight_and_the_cluster_id(
         );
         let actual = refused.message();
         let expected = format!("Cannot find insight insightId={id} clusterId={cluster_id}");
-        assert_eq!(
-            actual, expected,
-            "case {case:?}: expected the insight-not-found sentence, got {actual:?}"
-        );
+        insight_plane_request_id(case, &expected, &actual);
         assert!(
             !actual.contains(CLUSTER),
             "case {case:?}: the sentence reports the cluster's ID, not the name the \
@@ -1209,10 +1236,10 @@ async fn an_unknown_insight_id_is_refused_naming_the_insight_and_the_cluster_id(
     let case = "the same unknown id on another cluster";
     let refused = describe_insight(&router, OTHER, "not-an-insight").await;
     let actual = refused.message();
-    assert_eq!(
-        actual,
-        format!("Cannot find insight insightId=not-an-insight clusterId={other_id}"),
-        "case {case:?}: expected the other cluster's id, got {actual:?}"
+    insight_plane_request_id(
+        case,
+        &format!("Cannot find insight insightId=not-an-insight clusterId={other_id}"),
+        &actual,
     );
 }
 
