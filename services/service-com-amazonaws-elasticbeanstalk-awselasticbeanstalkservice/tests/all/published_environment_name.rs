@@ -1,20 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The NAME an environment publishes, over the service's own HTTP surface.
+//! The ADDRESS an environment publishes, over the service's own HTTP surface.
 //!
 //! The rule under test: an environment's published CNAME
 //! (`EnvironmentDescription$CNAME`, "the URL to the CNAME for this environment")
-//! is a DNS NAME — its first label is the environment's CNAME prefix, its second
-//! its Region, and the rest is a domain — so a client recovers the prefix an
-//! environment holds as the first dot-label of that value and can hand it
-//! straight back to `CheckDNSAvailability`; the value carries no path and no
-//! delimiter a name cannot hold, and it is an address this emulator ANSWERS at,
-//! so a plain HTTP request for it is served by the application the environment
-//! runs. Beside it, `EndpointURL` is the ADDRESS that answers behind the name
-//! ("the URL to the LoadBalancer", "the IP address of the instance"), which is
-//! this emulator's own socket. `SwapEnvironmentCNAMEs` exchanges the NAMES, which
-//! exchanges which application answers at each of them, and leaves each
-//! environment's own address where it was.
+//! is an address a CLIENT OF THIS EMULATOR CAN DIAL — the `host:port` of one of
+//! the emulator's own listeners, followed by the path naming the environment's
+//! Region and CNAME prefix — so a plain HTTP request for it is served by the
+//! application the environment runs, and the prefix an environment holds is
+//! recovered from the value and handed straight back to `CheckDNSAvailability`.
+//! (The DNS NAME a prefix forms is a different value, reported where the service
+//! reports on a name: `CheckDNSAvailability$FullyQualifiedCNAME`, which
+//! `dns_availability.rs` holds the service to.) Beside it, `EndpointURL` is the
+//! ADDRESS that answers behind the name ("the URL to the LoadBalancer", "the IP
+//! address of the instance"), which names the environment by its own id.
+//! `SwapEnvironmentCNAMEs` exchanges the NAMES, which exchanges which application
+//! answers at each of them, and leaves each environment's own address where it
+//! was.
+//!
+//! The table spans what the rule generalises over: the Region the environment is
+//! launched in, whether the launch supplies the CNAME prefix or leaves it to be
+//! generated from the environment's own name, and the prefix's length at both
+//! ends of the `DNSCnamePrefix` `@length(4, 63)` bound and in mixed case (a CNAME
+//! prefix is a host name label, and DNS compares labels case-insensitively).
+//!
+//! The HTTP harness (the router, the form encoder, the XML element reader, the
+//! object-storage upload and the unsigned GET) is the one `lifecycle.rs` owns in
+//! this same test binary.
 //!
 //! The table spans what the rule generalises over: the Region the environment is
 //! launched in, whether the launch supplies the CNAME prefix or leaves it to be
@@ -124,13 +136,13 @@ async fn ok_in(
     answer
 }
 
-/// RULE: the address an environment publishes is a DNS name whose first label is
-/// its CNAME prefix and whose second is its Region, followed by a domain — with
-/// no path and no character a name cannot carry — so the prefix is what the first
-/// dot-label of the value is, and `CheckDNSAvailability` reports that recovered
-/// prefix as taken.
+/// RULE: the address an environment publishes is one a client of this emulator can
+/// DIAL — the `host:port` of a listener this emulator answers on, then the path
+/// naming the environment's Region and its CNAME prefix — so the prefix is what
+/// the last segment of that path is, and `CheckDNSAvailability` reports that
+/// recovered prefix as taken.
 #[tokio::test]
-async fn an_environment_publishes_the_dns_name_its_prefix_forms() {
+async fn an_environment_publishes_an_address_a_client_can_dial() {
     let emulator = Emulator::new();
     ok(
         &emulator,
@@ -165,9 +177,9 @@ async fn an_environment_publishes_the_dns_name_its_prefix_forms() {
             )
         });
 
-        // The FORM, as the harness spells it: the prefix label, the Region label,
-        // this service's label and the zone this emulator announces in, on the
-        // port its environment plane answers at.
+        // The FORM, as the harness spells it: the authority of the socket the
+        // environment plane answers on, then the path naming the Region and the
+        // prefix.
         assert_eq!(
             cname,
             emulator.published_cname(row.region, &prefix),
@@ -176,39 +188,47 @@ async fn an_environment_publishes_the_dns_name_its_prefix_forms() {
         );
 
         // And the properties a client reads it for, asserted on the value itself
-        // rather than on the form the harness composed.
-        let (host, port) = cname
-            .rsplit_once(':')
-            .unwrap_or_else(|| panic!("case {case:?}: expected a dialable address, got {cname:?}"));
+        // rather than on the form the harness composed: an authority it can open a
+        // connection to, on the loopback interface this emulator binds, and a path
+        // under it.
+        let (authority, path) = cname
+            .split_once('/')
+            .unwrap_or_else(|| panic!("case {case:?}: expected an address with a path, got {cname:?}"));
+        let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+            panic!("case {case:?}: expected a dialable authority, got {authority:?}")
+        });
         assert!(
             port.parse::<u16>().is_ok(),
             "case {case:?}: expected the port the plane answers at, got {port:?} in {cname:?}"
         );
         assert!(
-            !host.contains('/') && !host.contains(':'),
-            "case {case:?}: a DNS name carries no path and no port inside it, got {host:?}"
+            host.parse::<std::net::IpAddr>().is_ok() || host == "localhost",
+            "case {case:?}: expected a host this emulator answers on, got {host:?}"
         );
-        let labels: Vec<&str> = host.split('.').collect();
+        let segments: Vec<&str> = path.split('/').collect();
         assert_eq!(
-            labels.first().copied(),
-            Some(prefix.as_str()),
-            "case {case:?}: the first label must be the environment's CNAME prefix, got {host:?}"
+            segments.first().copied(),
+            Some("_aws"),
+            "case {case:?}: expected the emulator's data-plane namespace, got {path:?}"
         );
         assert_eq!(
-            labels.get(1).copied(),
+            segments.get(2).copied(),
             Some(row.region),
-            "case {case:?}: the second label must be the environment's Region, got {host:?}"
-        );
-        assert!(
-            labels.len() >= 4 && labels[2..].iter().all(|label| !label.is_empty()),
-            "case {case:?}: the labels must be followed by a domain carrying a dot, got {host:?}"
+            "case {case:?}: the path must name the environment's Region, got {path:?}"
         );
 
-        // The documented way back to the prefix — the first dot-label — is a
-        // prefix `CheckDNSAvailability` accepts (at least the 4 characters
-        // `DNSCnamePrefix` admits) and reports as taken, because this
+        // The documented way back to the prefix — the segment the address names it
+        // in — is a prefix `CheckDNSAvailability` accepts (at least the 4
+        // characters `DNSCnamePrefix` admits) and reports as taken, because this
         // environment holds it.
-        let recovered = labels[0];
+        let recovered = segments
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a prefix segment in {path:?}"));
+        assert_eq!(
+            recovered, prefix,
+            "case {case:?}: the last segment must be the environment's CNAME prefix, got {path:?}"
+        );
         assert!(
             recovered.chars().count() >= 4 && eb::state::is_legal_cname_prefix(recovered),
             "case {case:?}: the recovered prefix must be a usable CNAME prefix, got \
@@ -233,7 +253,7 @@ async fn an_environment_publishes_the_dns_name_its_prefix_forms() {
         // URL to the LoadBalancer" or "the IP address of the instance", not the
         // name — and a later read reports the identical pair: both are the
         // environment's, not the reading caller's.
-        let served_at = emulator.environment_address(row.region, &prefix);
+        let served_at = emulator.published_endpoint_url(row.region, &environment_id);
         assert_eq!(
             launched.expect("EndpointURL", case),
             served_at,
@@ -339,11 +359,14 @@ async fn served(emulator: &Emulator, case: &str, cname: &str) -> String {
 /// resolver answers a name under the loopback zone with (RFC 6761), so what is
 /// under test is the addressing and not the host's own resolver.
 async fn dialled(case: &str, cname: &str) -> String {
-    let port: u16 = cname
+    let (authority, path) = cname
+        .split_once('/')
+        .unwrap_or_else(|| panic!("case {case:?}: expected an address with a path, got {cname:?}"));
+    let port: u16 = authority
         .rsplit_once(':')
         .and_then(|(_host, port)| port.parse().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a port in {cname:?}"));
-    dialled_request(case, port, cname, "/").await
+    dialled_request(case, port, authority, &format!("/{path}")).await
 }
 
 /// One request written on a fresh connection to the plane socket at `port`,
@@ -549,7 +572,11 @@ async fn an_invented_host_decides_nothing_the_socket_relays() {
     wait_for_status(&emulator, case, "blue-env", eb::state::STATUS_READY).await;
 
     let blue = published(&emulator, case, "blue-env").await;
-    let port: u16 = blue
+    let authority = blue
+        .split_once('/')
+        .map(|(authority, _path)| authority.to_string())
+        .unwrap_or_else(|| panic!("case {case:?}: expected an address with a path, got {blue:?}"));
+    let port: u16 = authority
         .rsplit_once(':')
         .and_then(|(_host, port)| port.parse().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a port in {blue:?}"));

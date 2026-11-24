@@ -115,12 +115,12 @@ const MAX_CONCURRENT_RUNS: usize = 6;
 /// server is built on into a fresh interpreter, which is seconds of work
 /// ([`super::python_application`]), so a wait shorter than that would drop a
 /// request that only arrived while another was being served.
-const RUN_PERMIT_WAIT: Duration = Duration::from_secs(15);
+pub(super) const RUN_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 /// The run slots [`MAX_CONCURRENT_RUNS`] declares, over every environment of this
 /// process: the bound is on what the ENGINE may hold at once, which is a property
 /// of the process rather than of one environment or one request.
-fn application_runs() -> &'static ::tokio::sync::Semaphore {
+pub(super) fn application_runs() -> &'static ::tokio::sync::Semaphore {
     static RUNS: ::std::sync::OnceLock<::tokio::sync::Semaphore> = ::std::sync::OnceLock::new();
     RUNS.get_or_init(|| ::tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS))
 }
@@ -342,6 +342,14 @@ pub struct DeployedApplication {
     /// The environment variables the application reads out of its own process
     /// environment.
     pub environment: Vec<(String, String)>,
+    /// What the bundle's own `.ebextensions` declare
+    /// ([`super::ebextensions`]), which the deployment applies to the instance
+    /// before the application is started.
+    pub configuration: BundleConfiguration,
+    /// WHICH process of the environment's instance runs it, which is what makes
+    /// consecutive requests reach the same one
+    /// ([`super::application_process`]).
+    pub process: ProcessIdentity,
 }
 
 /// What serving ONE request produced: the response the client is answered with,
@@ -360,22 +368,27 @@ pub struct Served {
 }
 
 impl DeployedApplication {
-    /// START the application: evaluate its entry point with no request to serve,
-    /// which is what writes its start-up log.
+    /// START the application: run its entry point with no request to serve, which
+    /// is what applies the deployment's own configuration to the instance and
+    /// starts the bundle's web process on it.
     ///
-    /// `None` when the bundle carries no entry point this emulator has an engine
-    /// for — such an environment's application writes no log of its own.
+    /// A process that is already up is NOT started again: starting one is what the
+    /// first run in a process does ([`super::application_process`]), so this
+    /// answers what that run produced — nothing at all for an application already
+    /// running, exactly as a second deployment of the same version to a running
+    /// instance writes no second start-up log.
     pub async fn start(&self) -> Option<GuestRun> {
         self.run(None).await
     }
 
     /// What STARTING the application wrote to its own output: the lines the
-    /// instance's standard-output log file carries once the deployment has
-    /// started the application, which is what an environment streaming its
-    /// instance logs delivers.
+    /// instance's standard-output log file gains when the deployment starts the
+    /// application, which is what an environment streaming its instance logs
+    /// delivers.
     ///
-    /// Empty for an environment running no application this emulator starts — no
-    /// output means no event, rather than a line nobody wrote.
+    /// Empty for an environment running no application this emulator starts, and
+    /// for one whose process was already up — no output means no event, rather
+    /// than a line nobody wrote.
     pub async fn startup_output(&self) -> Vec<String> {
         let Some(run) = self.start().await else {
             return Vec::new();
@@ -384,6 +397,19 @@ impl DeployedApplication {
             .into_iter()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The instance's standard-output log FILE: everything the process running
+    /// this application has written since it started, which is what the
+    /// environment information a `RequestEnvironmentInfo` compiles carries.
+    ///
+    /// The process is started if it is not up yet — an instance that has been
+    /// deployed to is running the application whether or not anybody has dialled
+    /// its address — and what is answered is the file that process has written,
+    /// never a second run of the program ([`super::application_process`]).
+    pub async fn instance_log(&self) -> Vec<String> {
+        self.start().await;
+        process_log(&self.process)
     }
 
     /// What the application answers `request` with, and what it WROTE while
@@ -438,58 +464,31 @@ impl DeployedApplication {
         }
     }
 
-    /// [`Self::run`] for a bundle the JavaScript engine runs.
-    ///
-    /// The permit is held by the RUN rather than by the waiting task: a blocking
-    /// task cannot be cancelled, so a request that stopped waiting for its run
-    /// would otherwise give the slot back while the engine was still holding its
-    /// own heap on that thread.
+    /// [`Self::run`] for a bundle the JavaScript engine runs: the run happens in
+    /// the PROCESS the environment's instance runs the application as
+    /// ([`super::javascript_process`]), so the entry point is evaluated on the
+    /// first run of that process and the server it started answers every later
+    /// one.
     async fn run_javascript(
         &self,
         file: &str,
         request: Option<&GuestRequest>,
     ) -> Option<GuestRun> {
-        let entry = self.bundle.source(file)?.to_string();
-        let environment = self.environment.clone();
-        let request = request.cloned();
-        let permit = ::tokio::time::timeout(RUN_PERMIT_WAIT, application_runs().acquire()).await;
-        let permit = match permit {
-            Ok(Ok(permit)) => permit,
-            _ => {
-                ::tracing::warn!(
-                    "the deployed application was not run: every run slot this emulator holds \
-                     was taken",
-                );
-                return None;
-            }
-        };
-        let run = ::tokio::task::spawn_blocking(move || {
-            // Held for as long as the run lasts, whoever is still waiting for it.
-            let _permit = permit;
-            run_application(&entry, &environment, request.as_ref())
-        })
-        .await;
-        match run {
-            Ok(run) => Some(run),
-            Err(failure) => {
-                ::tracing::warn!(
-                    detail = %failure,
-                    "the thread the deployed application ran on did not finish",
-                );
-                None
-            }
-        }
+        let entry = self.bundle.source(file)?;
+        javascript_process::served_by_the_javascript_process(
+            &self.process,
+            entry,
+            &self.environment,
+            request,
+        )
+        .await
     }
 
-    /// [`Self::run`] for a bundle the Python interpreter runs: the interpreter is
-    /// synchronous and its stop lands at the next traced event, so the run happens
-    /// on a THREAD of its own with a stack of its own
-    /// ([`PYTHON_APPLICATION_STACK_BYTES`]) and the task waits for it only as long
-    /// as the engine's own spans allow ([`PYTHON_APPLICATION_HOST_WAIT`]).
-    ///
-    /// One of [`MAX_CONCURRENT_RUNS`] slots is held for the run, by the THREAD
-    /// rather than by the waiting task, so what the engines hold at once is
-    /// bounded even where a request stopped waiting for its run.
+    /// [`Self::run`] for a bundle the Python interpreter runs: the run happens in
+    /// the PROCESS the environment's instance runs the application as
+    /// ([`super::application_process::served_by_the_process`]), so the module the
+    /// entry point names is imported on the first run of that process and stays
+    /// imported for every later one.
     async fn run_python(
         &self,
         entry: &PythonEntry,
@@ -499,34 +498,40 @@ impl DeployedApplication {
         if modules.is_empty() {
             return None;
         }
-        let entry = entry.clone();
-        let environment = self.environment.clone();
-        let request = request.cloned();
-        run_on_interpreter(move || {
-            run_python_application(&entry, &modules, &environment, request.as_ref())
-        })
-        .await
+        let run = python_application_run(
+            entry,
+            &modules,
+            &provisioning_document(&self.configuration),
+            request,
+        );
+        self.served(run).await
     }
 
     /// [`Self::run`] for a deployment the platform starts as a PROGRAM: the same
-    /// interpreter, the same bounds and the same thread of its own
-    /// ([`Self::run_python`]) — what differs is that the program starts a server
-    /// of its own and the request is handed to THAT server
-    /// ([`super::python_program`]).
+    /// interpreter, the same process and the same bounds ([`Self::run_python`]) —
+    /// what differs is that the program starts a server of its own and the request
+    /// is handed to THAT server ([`super::python_program`]).
     async fn run_program(
         &self,
         program: &PythonProgram,
         request: Option<&GuestRequest>,
     ) -> Option<GuestRun> {
-        let source = self.bundle.source(&program.file)?.to_string();
+        let source = self.bundle.source(&program.file)?;
         let modules = python_modules(&self.bundle);
-        let program = program.clone();
-        let environment = self.environment.clone();
-        let request = request.cloned();
-        run_on_interpreter(move || {
-            run_python_program(&program, &source, &modules, &environment, request.as_ref())
-        })
-        .await
+        let run = python_program_run(
+            program,
+            source,
+            &modules,
+            &provisioning_document(&self.configuration),
+            request,
+        );
+        self.served(run).await
+    }
+
+    /// Perform one run of the deployed application in the process the
+    /// environment's instance runs it as.
+    async fn served(&self, run: PlatformRun) -> Option<GuestRun> {
+        served_by_the_process(&self.process, run, self.environment.clone()).await
     }
 
     /// The file of the bundle a request path addresses: the path with its leading
@@ -548,64 +553,6 @@ impl DeployedApplication {
     }
 }
 
-/// Perform `run` on a thread of its OWN, with a stack of its own
-/// ([`PYTHON_APPLICATION_STACK_BYTES`]): the Python interpreter is synchronous and
-/// its stop lands at the next traced event, so the task waits for the run only as
-/// long as the engine's own spans allow ([`PYTHON_APPLICATION_HOST_WAIT`]).
-///
-/// One of [`MAX_CONCURRENT_RUNS`] slots is held for the run, by the THREAD rather
-/// than by the waiting task, so what the engines hold at once is bounded even
-/// where a request stopped waiting for its run.
-///
-/// `None` for a run this emulator did not perform at all — one it had no slot or
-/// no thread for, and one that had still not answered a grace period past the
-/// spans the engine allows it.
-async fn run_on_interpreter<R>(run: R) -> Option<GuestRun>
-where
-    R: FnOnce() -> GuestRun + Send + 'static,
-{
-    let permit = ::tokio::time::timeout(RUN_PERMIT_WAIT, application_runs().acquire()).await;
-    let permit = match permit {
-        Ok(Ok(permit)) => permit,
-        _ => {
-            ::tracing::warn!(
-                "the deployed application was not run: every run slot this emulator holds \
-                 was taken",
-            );
-            return None;
-        }
-    };
-    let (sender, receiver) = ::tokio::sync::oneshot::channel();
-    let spawned = ::std::thread::Builder::new()
-        .name("eb-python-application".to_string())
-        .stack_size(PYTHON_APPLICATION_STACK_BYTES)
-        .spawn(move || {
-            // Held for as long as the run lasts, whoever is still waiting for it.
-            let _permit = permit;
-            let _ = sender.send(run());
-        });
-    if let Err(error) = spawned {
-        ::tracing::warn!(
-            detail = %error,
-            "the thread the deployed application runs on could not be started",
-        );
-        return None;
-    }
-    match ::tokio::time::timeout(PYTHON_APPLICATION_HOST_WAIT, receiver).await {
-        Ok(Ok(run)) => Some(run),
-        // The run has still not answered a grace period past the spans the engine
-        // itself allows, which it has by then been stopped on: it is given up on
-        // and reported as an application that produced nothing.
-        _ => {
-            ::tracing::warn!(
-                "the deployed application's own run did not answer inside the spans this \
-                 emulator allows it",
-            );
-            None
-        }
-    }
-}
-
 /// The lines one run of the application wrote to its own log: its standard output
 /// then its standard error, with the empty trailing line a text stream ends in
 /// dropped — byte for byte as the application wrote them, so non-ASCII text
@@ -622,6 +569,12 @@ pub fn application_log_lines(run: &GuestRun) -> Vec<&str> {
 /// The environment variables the deployed application reads: every setting of the
 /// environment-properties namespace, plus the port the platform tells the
 /// application to listen on.
+///
+/// `option_settings` is the configuration the application runs UNDER, which is the
+/// environment's own settings over the ones its bundle carries
+/// ([`deployed_option_settings`]): a variable set only in the bundle's
+/// `.ebextensions` is in the process environment, and one the API set for the same
+/// option is the value the process reads.
 pub fn application_environment(
     option_settings: &[ConfigurationOptionSetting],
 ) -> Vec<(String, String)> {
@@ -638,6 +591,26 @@ pub fn application_environment(
         environment.push((name.to_string(), value.to_string()));
     }
     environment
+}
+
+/// The configuration a deployment of `configuration`'s bundle RUNS UNDER on an
+/// environment whose own settings are `written`.
+///
+/// An `option_settings:` block in a `.ebextensions/*.config` file "is merged into
+/// the environment's configuration at deploy time", and Elastic Beanstalk's
+/// documented precedence puts a value set directly on the environment above one a
+/// configuration file sets — so the bundle's settings are the BASE and the
+/// environment's own are applied over them. An option only the bundle sets is
+/// therefore in effect, and one both set is the environment's.
+#[must_use]
+pub fn deployed_option_settings(
+    configuration: &BundleConfiguration,
+    written: &[ConfigurationOptionSetting],
+) -> Vec<ConfigurationOptionSetting> {
+    if configuration.option_settings.is_empty() {
+        return written.to_vec();
+    }
+    merge_option_settings(&configuration.option_settings, written)
 }
 
 /// Read the source bundle at `location` out of object storage, in process: the

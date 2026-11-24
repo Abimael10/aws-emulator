@@ -48,6 +48,7 @@ use crate::ops::types::{
     PlatformSummary, S3Location, SingleInstanceHealth, StatusCodes, Tag,
 };
 pub mod application_runtime;
+pub mod application_process;
 pub mod caller_archive;
 pub mod composed_environments;
 pub mod configuration_option_catalog;
@@ -55,6 +56,7 @@ pub mod configuration_option_descriptions;
 pub mod configuration_option_namespaces;
 pub mod configuration_setting_validation;
 pub mod deployed_application;
+pub mod ebextensions;
 pub mod environment_health;
 pub mod environment_launch;
 /// Why a launch this service ACCEPTED can still fail, and what the environment
@@ -63,6 +65,8 @@ pub mod environment_launch_failure;
 pub mod environment_plane_endpoint;
 pub mod event_notifications;
 pub mod instance_log_streaming;
+pub mod instance_provisioning;
+pub mod javascript_process;
 pub mod managed_action_schedule;
 /// The account's object storage — the Elastic Beanstalk storage bucket and
 /// everything this service writes into or reads out of it.
@@ -76,9 +80,11 @@ pub mod python_program;
 /// store (an inherent `impl`), which every caller already reaches through the
 /// store itself, so there is no name to re-export.
 pub mod running_environment;
+pub mod served_requests;
 pub mod version_processing;
 
 pub use application_runtime::*;
+pub use application_process::*;
 pub use caller_archive::*;
 pub use composed_environments::*;
 pub use configuration_option_catalog::*;
@@ -86,17 +92,20 @@ pub use configuration_option_descriptions::*;
 pub use configuration_option_namespaces::*;
 pub use configuration_setting_validation::*;
 pub use deployed_application::*;
+pub use ebextensions::*;
 pub use environment_health::*;
 pub use environment_launch::*;
 pub use environment_launch_failure::*;
 pub use environment_plane_endpoint::*;
 pub use event_notifications::*;
 pub use instance_log_streaming::*;
+pub use instance_provisioning::*;
 pub use managed_action_schedule::*;
 pub use object_storage::*;
 pub use platform_build::*;
 pub use platform_catalog::*;
 pub use procfile::*;
+pub use served_requests::*;
 pub use python_application::*;
 pub use python_program::*;
 pub use version_processing::*;
@@ -838,78 +847,156 @@ pub fn environment_plane_path(region: &str, cname_prefix: &str) -> String {
 }
 
 /// The address an environment is reached at — `EnvironmentDescription$CNAME`,
-/// "the URL to the CNAME for this environment", and the `EndpointURL` beside it.
+/// "the URL to the CNAME for this environment".
 ///
-/// A CNAME is a DNS NAME, and its leading labels are what a client reads back
-/// out of it: the first label is the environment's CNAME prefix and the second
-/// its Region, which is how a client recovers the prefix an environment holds
-/// (`CNAME.split('.')[0]`) and re-checks it with `CheckDNSAvailability`. So the
-/// value carries no port in a label and no path at all — neither is part of a
-/// name — and the labels are followed by a DOMAIN.
-///
-/// That domain is this emulator's own, not Elastic Beanstalk's: a client READS
-/// this address and dials it, and a name under the service's public zone
+/// A client READS this address and DIALS it, so the value has to be an address a
+/// client of THIS emulator can reach: the `host:port` of one of the emulator's
+/// own listeners ([`environment_plane_endpoint::environment_plane_authority`],
+/// the socket the environment plane answers on), followed by the path that names
+/// WHICH environment the request is for ([`environment_plane_path`]). A name
+/// under Elastic Beanstalk's public zone
 /// (`<prefix>.<region>.elasticbeanstalk.com`) resolves to nothing on the machine
-/// this emulator runs on, which would make the one address the API publishes the
-/// one address nobody can reach. So the name is minted in the zone this emulator
-/// may announce in (`announced_zone_of_authority`, the workspace's one reading of
-/// that question — the loopback zone RFC 6761 reserves for the interface the core
-/// binds its listeners on, where this emulator is reached at an address), with
-/// this service's own label between the Region and that zone, exactly as every
-/// other published host of this tree is built.
+/// this emulator runs on, and a name this emulator minted under the loopback
+/// zone is not an address either: nothing resolves it, and it is not one of the
+/// hosts this emulator serves on — so either would make the one address the API
+/// publishes the one address nobody can reach. The DNS NAME a prefix forms is a
+/// different question, asked and answered where the service reports on a name
+/// rather than on an address ([`fully_qualified_cname`],
+/// `CheckDNSAvailability$FullyQualifiedCNAME`).
 ///
-/// The PORT of `authority` — the socket the environment plane is served on
-/// ([`environment_plane_endpoint::environment_plane_authority`]) — is kept on the
-/// authority, after the name. The member is "the URL to the CNAME for this
-/// environment", and a URL's authority is `host[:port]`: AWS leaves the port out
-/// because its environments answer on the default HTTP port, which THIS process
-/// cannot bind (it is privileged, and the core hands out ports from its own
-/// range), so a value without it would name an address nothing answers at — the
-/// defect an address no client can reach is. The name is therefore published with
-/// the port the socket really answers on, the same reading every other address
-/// this tree announces for a plane on a core listener takes. Everything the name
-/// cannot carry — WHICH environment a request is for — is in the leading labels,
-/// which [`environment_address_labels`] reads back and
-/// [`crate::service::environment_plane`] serves the request by.
-///
-/// The CNAME PREFIX is what identifies the name, inside its Region: it is what
-/// `CheckDNSAvailability` reports on and what at most one live environment may
-/// hold.
+/// The CNAME PREFIX and the Region are what the address CARRIES, in the two
+/// segments [`environment_plane_path`] writes, and what
+/// [`environment_address_parts`] reads back out of it: the prefix inside its
+/// Region is what identifies the name, so it is what `CheckDNSAvailability`
+/// reports on, what at most one live environment may hold, and what a
+/// `SwapEnvironmentCNAMEs` moves between two environments — which is why a
+/// request addressed this way is served by the environment carrying that prefix
+/// NOW ([`crate::service::environment_plane`]).
 pub fn environment_cname(authority: &str, region: &str, cname_prefix: &str) -> String {
-    let host = environment_address_host(authority, region, cname_prefix);
-    match ::service_common::data_plane_addressing::addressed_port(Some(authority))
-        .and_then(|port| u16::try_from(port).ok())
-    {
-        Some(port) => ::service_common::data_plane_addressing::host_port_authority(&host, port),
-        None => host,
-    }
+    format!("{authority}{}", environment_plane_path(region, cname_prefix))
 }
 
-/// The HOST of that address, without the port: `<prefix>.<region>.<service
-/// label>.<zone>`.
+/// The segment that names an environment's OWN address, ahead of its
+/// `EnvironmentId` ([`environment_own_plane_path`]).
 ///
-/// The REGION ends up in a host here, so it is taken only as a Region LABEL
-/// (`service_common::arn::region_label`, this tree's one statement of that
-/// grammar) and anything else falls back to [`DEFAULT_REGION`]: a value carrying
-/// a host or path delimiter would name an authority the caller chose. The PREFIX
-/// is already a host name label wherever it comes from — a caller-supplied one is
-/// refused unless it is ([`is_legal_cname_prefix`]), and a generated one is built
-/// from the environment's own name and id.
-fn environment_address_host(authority: &str, region: &str, cname_prefix: &str) -> String {
-    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
-    let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(authority);
-    format!("{cname_prefix}.{region}.{DATA_PLANE_SEGMENT}.{zone}")
+/// It begins with `_`, which no CNAME prefix may ([`is_legal_cname_prefix`]: a
+/// prefix is a host name label), so an environment's own address can never be
+/// read as the published NAME of a prefix, however an environment is named.
+pub const OWN_ADDRESS_SEGMENT: &str = "_environment";
+
+/// The path an environment's OWN address is served at:
+/// `/_aws/elasticbeanstalk/<region>/_environment/<environment id>`, which a
+/// request path then follows.
+///
+/// Keyed by the `EnvironmentId` rather than by a CNAME prefix, because this
+/// address belongs to the ENVIRONMENT and no swap moves it: the prefix an
+/// environment carries can change, its id cannot.
+pub fn environment_own_plane_path(region: &str, environment_id: &str) -> String {
+    format!(
+        "/{}/{DATA_PLANE_SEGMENT}/{region}/{OWN_ADDRESS_SEGMENT}/{environment_id}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// WHAT a request addressed to this service's data plane names: the published
+/// NAME of a CNAME prefix, or ONE environment's own address.
+///
+/// The two are different questions, which is why the path says which one it is
+/// ([`OWN_ADDRESS_SEGMENT`]): a NAME is answered by whichever environment carries
+/// it NOW — the point of `SwapEnvironmentCNAMEs`, where the names move and the
+/// environments do not — and an environment's own address by that environment,
+/// which no swap moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressedEnvironment<'r> {
+    /// The published name of `cname_prefix` in `region`.
+    Name {
+        region: &'r str,
+        cname_prefix: &'r str,
+    },
+    /// The own address of the environment `environment_id` in `region`.
+    OwnAddress {
+        region: &'r str,
+        environment_id: &'r str,
+    },
+}
+
+/// What the data-plane PATH `path` addresses, beside the application's own
+/// request path under it — and `None` for a path that addresses no environment of
+/// this service at all.
+///
+/// The ONE reading of the two paths this service publishes
+/// ([`environment_plane_path`], [`environment_own_plane_path`]), so the address
+/// the API hands a client and the requests the plane serves cannot drift apart.
+pub fn addressed_environment_path(path: &str) -> Option<(AddressedEnvironment<'_>, &str)> {
+    use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
+
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    if plane != DATA_PLANE_SEGMENT {
+        return None;
+    }
+    let (region, rest) = first_segment(rest)?;
+    if region.is_empty() {
+        return None;
+    }
+    let (named, rest) = first_segment(rest)?;
+    if named == OWN_ADDRESS_SEGMENT {
+        let (environment_id, rest) = first_segment(rest)?;
+        return (!environment_id.is_empty()).then_some((
+            AddressedEnvironment::OwnAddress {
+                region,
+                environment_id,
+            },
+            rest,
+        ));
+    }
+    (!named.is_empty()).then_some((
+        AddressedEnvironment::Name {
+            region,
+            cname_prefix: named,
+        },
+        rest,
+    ))
+}
+
+/// The Region and the CNAME PREFIX the published address `address` names, or
+/// `None` for a value that names no published environment name of this service.
+///
+/// The reading of [`environment_cname`]: an address is `host:port` followed by the
+/// path naming the Region and the prefix, so the PATH is what carries them. A
+/// value with no path at all is read as a HOST instead
+/// ([`environment_address_labels`]), which is how a request that named the
+/// environment in its `Host` is served.
+pub fn environment_address_parts(address: &str) -> Option<(&str, &str)> {
+    match address.find('/') {
+        Some(start) => match addressed_environment_path(&address[start..])? {
+            (
+                AddressedEnvironment::Name {
+                    region,
+                    cname_prefix,
+                },
+                _,
+            ) => Some((region, cname_prefix)),
+            (AddressedEnvironment::OwnAddress { .. }, _) => None,
+        },
+        None => environment_address_labels(address),
+    }
 }
 
 /// The Region and the CNAME PREFIX the published host `host` names, or `None` for
 /// a host that names no environment address of this service.
 ///
-/// The reading of [`environment_cname`]: the prefix label, the Region label, this
-/// service's own label, and then the domain the name sits in — which carries at
-/// least one label of its own, since a name is a name only with a domain under it.
-/// Any userinfo, the port and a trailing root dot are not part of the name and are
-/// dropped first, and the comparison of this service's label ignores case, the way
-/// DNS compares names.
+/// A client on another machine may still RESOLVE the DNS name a prefix forms
+/// ([`fully_qualified_cname`]) to this emulator and send it as the request's
+/// `Host`, in which case the leading labels are what name the environment: the
+/// prefix label, the Region label, this service's own label, and then the domain
+/// the name sits in — which carries at least one label of its own, since a name is
+/// a name only with a domain under it. Any userinfo, the port and a trailing root
+/// dot are not part of the name and are dropped first, and the comparison of this
+/// service's label ignores case, the way DNS compares names.
 pub fn environment_address_labels(host: &str) -> Option<(&str, &str)> {
     let named = ::service_common::data_plane_addressing::host_only(host).trim_end_matches('.');
     let mut labels = named.split('.');
@@ -929,19 +1016,23 @@ pub fn environment_address_labels(host: &str) -> Option<(&str, &str)> {
 /// environments, the URL to the LoadBalancer. For single-instance environments,
 /// the IP address of the instance".
 ///
-/// A DIFFERENT value from the CNAME, and not a name at all: what this member
-/// carries is the ADDRESS of the thing answering behind the name — on AWS a load
-/// balancer's own host, or, for a single-instance environment, the instance's IP
-/// ADDRESS. Here that thing is this emulator's own socket, so the member is that
-/// socket's `host:port` with the environment's plane path on it
-/// ([`environment_plane_path`]): the address a client reaches the environment at
-/// without resolving anything.
+/// A DIFFERENT value from the CNAME: what this member carries is the ADDRESS of
+/// the thing answering behind the name — on AWS a load balancer's own host, or,
+/// for a single-instance environment, the instance's IP ADDRESS. Here that thing
+/// is this emulator's own socket, so the member is that socket's `host:port` with
+/// the environment's OWN plane path on it ([`environment_own_plane_path`]): the
+/// address a client reaches THIS environment at, whatever name points at it.
 ///
 /// It stays with its environment when a `SwapEnvironmentCNAMEs` moves the NAMES,
 /// exactly as a load balancer does: the swap exchanges which name points at which
-/// environment, not which address each environment is served at.
-pub fn environment_endpoint_url(authority: &str, region: &str, cname_prefix: &str) -> String {
-    format!("{authority}{}", environment_plane_path(region, cname_prefix))
+/// environment, not which address each environment is served at. That is why it
+/// names the environment by its `EnvironmentId` and the CNAME names it by the
+/// prefix it carries.
+pub fn environment_endpoint_url(authority: &str, region: &str, environment_id: &str) -> String {
+    format!(
+        "{authority}{}",
+        environment_own_plane_path(region, environment_id)
+    )
 }
 
 /// The DNS zone an environment CNAME sits in, under its own Region:
@@ -1812,6 +1903,18 @@ pub struct PendingStatus {
     /// call asked for is informational ([`SEVERITY_INFO`]), and one that reports
     /// work this service could not carry out is a failure ([`SEVERITY_ERROR`]).
     pub completion_severity: &'static str,
+    /// Whether the change DEPLOYS the application to the environment's
+    /// instances: the deployment an update, a rebuild or a managed action started
+    /// has reached them, so each instance starts the application again and the
+    /// process it was running is replaced
+    /// ([`Environment::app_process_generation`]).
+    ///
+    /// `false` for a change that lands no deployment — the cancellation
+    /// `AbortEnvironmentUpdate` starts, which "cancels in-progress environment
+    /// configuration update" and therefore leaves the instances running the
+    /// process they were running, and the return to its own status an application
+    /// server restart owes, which has already replaced that process.
+    pub deploys_the_application: bool,
 }
 
 impl PendingStatus {
@@ -1835,11 +1938,31 @@ impl PendingStatus {
             request_id: request_id.to_string(),
             completion_message: completion_message.into(),
             completion_severity: SEVERITY_INFO,
+            // A completion DEPLOYS nothing unless the caller says it does: the
+            // cancellation an abort completes lands no deployment, and the one an
+            // update completes does ([`Self::deploying_the_application`]).
+            deploys_the_application: false,
         }
     }
 
+    /// The same move, for a change that DEPLOYS the application to the
+    /// environment's instances: the update, the rebuild and the managed action
+    /// whose completion puts a new process on each instance.
+    #[must_use]
+    pub fn deploying_the_application(mut self) -> Self {
+        self.deploys_the_application = true;
+        self
+        }
+
     /// The move CreateEnvironment owes: `Launching` -> `Ready`, recording that
     /// the launch the call started has finished.
+    /// The move CreateEnvironment owes: `Launching` -> `Ready`, recording that
+    /// the launch the call started has finished.
+    ///
+    /// It lands no deployment of its own: the launch IS this environment's first
+    /// deployment, and the process its instances run is the first one
+    /// ([`Environment::app_process_generation`] starts there), so the completion
+    /// does not replace it.
     pub fn launch_completion(request_id: &str, environment_name: &str) -> Self {
         Self::completion_to_ready(
             request_id,
@@ -2290,6 +2413,21 @@ pub struct Environment {
     /// redeploys the environment, and a managed action Elastic Beanstalk carries
     /// out on its instances — is the next number.
     pub deployment_id: i64,
+    /// WHICH process this environment's instances run the application as now.
+    ///
+    /// An instance runs the deployed application as ONE long-lived process, so
+    /// what that application holds in memory is there for the next request until
+    /// the process is REPLACED — which is what an application server restart,
+    /// a deployment that lands on the instances, a rebuild and a replacement of
+    /// the instances themselves each do. The number moves exactly then, and a
+    /// request is served by the process it names
+    /// ([`application_process::ProcessIdentity`]); an update that is ABORTED
+    /// lands nothing, so it leaves this where it was and the instances keep the
+    /// process they were running.
+    pub app_process_generation: u64,
+    /// The requests this environment's application has ANSWERED, which is what
+    /// the enhanced-health reports observe of it ([`served_requests`]).
+    pub served_answers: Vec<ServedAnswer>,
 }
 
 impl Environment {
@@ -2362,8 +2500,19 @@ impl Environment {
         if let Some(resources) = self.resources.as_mut() {
             resources.replace_instances();
         }
+        // Each instance is a NEW instance, which starts the application for
+        // itself: the process the replaced instances were running is gone.
+        self.restart_the_application_process();
         self.instances_replaced_at = at;
         self.date_updated = at;
+    }
+
+    /// Start the application again on this environment's instances: the process
+    /// they were running is replaced, so what it held in memory is gone and
+    /// whatever the application mints when it starts is minted again
+    /// ([`Self::app_process_generation`]).
+    fn restart_the_application_process(&mut self) {
+        self.app_process_generation = self.app_process_generation.saturating_add(1);
     }
 
     /// Start the managed action `action_description` on this environment:
@@ -2394,7 +2543,7 @@ impl Environment {
         self.pending_status = Some(PendingStatus::completion_to_ready(
             request_id,
             format!("{action_description} completed successfully."),
-        ));
+        ).deploying_the_application());
     }
 
     /// Whether this environment is in the one status the model documents as
@@ -2437,6 +2586,9 @@ impl Environment {
             request_id: request_id.to_string(),
             completion_message: "terminateEnvironment completed successfully.".to_string(),
             completion_severity: SEVERITY_INFO,
+            // A termination deploys nothing: the instances the process ran on are
+            // gone with the environment.
+            deploys_the_application: false,
         });
     }
 
@@ -2461,10 +2613,13 @@ impl Environment {
         // environment": every resource the environment reported is replaced by
         // the one created in its place.
         self.provision_resources();
-        self.pending_status = Some(PendingStatus::completion_to_ready(
-            request_id,
-            "rebuildEnvironment completed successfully.",
-        ));
+        self.pending_status = Some(
+            PendingStatus::completion_to_ready(
+                request_id,
+                "rebuildEnvironment completed successfully.",
+            )
+            .deploying_the_application(),
+        );
     }
 
     /// Start an application-server restart: Elastic Beanstalk is working on an
@@ -2489,7 +2644,16 @@ impl Environment {
             request_id: request_id.to_string(),
             completion_message: "restartAppServer completed successfully.".to_string(),
             completion_severity: SEVERITY_INFO,
+            // The process is replaced HERE, by the restart itself, not when the
+            // environment comes back: "causes the environment to restart the
+            // application container server running on each Amazon EC2 instance",
+            // which the restart does to the instances it already has.
+            deploys_the_application: false,
         };
+        // The application container server on each instance is restarted: the
+        // process those instances were running is replaced, while the instances
+        // themselves are not.
+        self.restart_the_application_process();
         self.status = STATUS_UPDATING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
@@ -2569,10 +2733,13 @@ impl Environment {
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
         self.abortable_operation_in_progress = true;
         self.date_updated = now();
-        self.pending_status = Some(PendingStatus::completion_to_ready(
-            request_id,
-            "updateEnvironment completed successfully.",
-        ));
+        self.pending_status = Some(
+            PendingStatus::completion_to_ready(
+                request_id,
+                "updateEnvironment completed successfully.",
+            )
+            .deploying_the_application(),
+        );
     }
 
     /// Bring the Amazon Web Services resources this environment runs on in line
@@ -2635,6 +2802,14 @@ impl Environment {
         self.health_status = pending.health_status;
         self.abortable_operation_in_progress = pending.abortable_operation_in_progress;
         self.date_updated = pending.due_date;
+        if pending.deploys_the_application {
+            // The deployment has reached the instances, so each of them starts
+            // the application again: the process they were running is replaced,
+            // which is what a client sees in whatever the application mints at
+            // start-up. A cancelled deployment lands nothing and so says
+            // nothing here.
+            self.restart_the_application_process();
+        }
         if self.status == STATUS_READY {
             // The environment is available again, so the deployment that was in
             // flight has landed: a configuration waiting to be deployed is the
@@ -2782,6 +2957,12 @@ struct CompletedTransition {
 macro_rules! environment_description {
     ($ty:path, $env:expr) => {{
         let env: &$crate::state::Environment = $env;
+        // The health this environment REPORTS: the record's own, and the one the
+        // health agent's observation of the application's request failures
+        // amounts to over a running environment
+        // ([`$crate::state::served_requests`]) — one reading, so every operation
+        // that reports an environment's health reports the same health.
+        let (health, health_status) = env.reported_health();
         $ty {
             environment_name: Some(env.environment_name.clone()),
             environment_id: Some(env.environment_id.clone()),
@@ -2797,8 +2978,8 @@ macro_rules! environment_description {
             date_updated: Some(env.date_updated),
             status: Some(env.status.clone()),
             abortable_operation_in_progress: Some(env.abortable_operation_in_progress),
-            health: Some(env.health.clone()),
-            health_status: env.health_status.clone(),
+            health: Some(health),
+            health_status,
             // `EnvironmentDescription$Resources` carries the environment's load
             // balancer by its DNS `Domain` and its `Listeners`, which this
             // emulator serves no traffic on and so reports no `EndpointURL` for
@@ -2898,6 +3079,17 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// the first address is needed. `None` until then, and on an engine that
     /// vends no listeners at all. See [`EnvironmentPlaneEndpoint`].
     pub environment_plane: Option<EnvironmentPlaneEndpoint>,
+    /// What tells THIS store's environments from another store's, in the
+    /// registers the application PROCESSES are held in
+    /// ([`application_process`]).
+    ///
+    /// Those registers — the standing interpreters, the log each process has
+    /// written and the request in flight in each — are this PROCESS's, while a
+    /// store is one ENGINE's: two engines in one process hold two accounts' worth
+    /// of environments and may mint the same `EnvironmentId` in each. So every
+    /// key into them carries this value, which is minted once per store and never
+    /// changes, and no request of one store can reach a process of another's.
+    process_scope: ::std::sync::OnceLock<String>,
 }
 
 /// The store a fresh engine starts from: no applications, versions, custom
@@ -2933,6 +3125,9 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             // No environment has an address yet, so there is no socket to serve
             // one on.
             environment_plane: None,
+            // Minted on the first read, which is the first time a process of this
+            // store is reached ([`Self::process_scope`]).
+            process_scope: ::std::sync::OnceLock::new(),
         }
     }
 }
@@ -3931,6 +4126,42 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         )
     }
 
+    /// What tells THIS store's environments from another store's in the registers
+    /// the application processes are held in ([`application_process`]).
+    ///
+    /// Minted on the first read and never changed, so every process key of this
+    /// store carries one value and no key of another store carries it: the
+    /// registers are this process's, and two engines in one process may mint the
+    /// same `EnvironmentId` in each.
+    pub fn process_scope(&self) -> &str {
+        self.process_scope.get_or_init(new_request_id)
+    }
+
+    /// What the `.ebextensions` of the version the environment `environment_id`
+    /// deploys DECLARE ([`super::ebextensions`]) — the configuration that
+    /// deployment carries with it.
+    ///
+    /// Empty for an environment that deploys no version, one whose version this
+    /// service holds no readable bundle for, one whose bundle declares nothing,
+    /// and one that is not running at all.
+    pub fn deployed_bundle_configuration(&self, environment_id: &str) -> BundleConfiguration {
+        let Some(environment) = self
+            .environments
+            .get(environment_id)
+            .filter(|environment| !environment.is_terminated())
+        else {
+            return BundleConfiguration::default();
+        };
+        let Some(version_label) = environment.version_label.clone() else {
+            return BundleConfiguration::default();
+        };
+        self.application_versions
+            .get(&(environment.application_name.clone(), version_label))
+            .and_then(|version| version.bundle.as_ref())
+            .map(bundle_configuration)
+            .unwrap_or_default()
+    }
+
     /// The application the environment `environment_id` is running: the bundle of
     /// the version it reports deployed, with the process environment its own
     /// configuration gives that application.
@@ -3958,11 +4189,26 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environment.platform_arn.as_deref(),
         )
         .map(|version| version.stack.platform_category);
+        // The configuration the deployment RUNS UNDER: what the bundle's own
+        // `.ebextensions` set, under the settings the environment itself carries
+        // ([`deployed_option_settings`]).
+        let configuration = bundle_configuration(&bundle);
+        let option_settings =
+            deployed_option_settings(&configuration, &environment.option_settings);
+        let environment_variables = application_environment(&option_settings);
+        // WHICH process of this environment's instance runs it: the process the
+        // instance is running NOW ([`ProcessIdentity`]), which is what a request
+        // is served by — never a process started from a deployment the clock has
+        // not landed on the instances, and never one of another account's or
+        // another store's environments.
+        let process = ProcessIdentity::of(environment, self.process_scope());
         Some(DeployedApplication {
             version_label,
-            entry: application_entry(&bundle, platform_category, &environment.option_settings),
+            entry: application_entry(&bundle, platform_category, &option_settings),
             bundle,
-            environment: application_environment(&environment.option_settings),
+            environment: environment_variables,
+            configuration,
+            process,
         })
     }
 
@@ -4496,11 +4742,9 @@ pub fn environment_serving_cname_prefix<'store>(
     })
 }
 
-/// The live environment in `store` whose OWN ADDRESS carries the CNAME prefix
-/// `cname_prefix` in `region` — the one the name that prefix forms was MINTED
-/// for, which is the environment served at that address
+/// The live environment in `store` whose OWN ADDRESS names it —
 /// ([`environment_endpoint_url`], "the URL to the LoadBalancer", "the IP address
-/// of the instance").
+/// of the instance"), which names the environment by its `EnvironmentId`.
 ///
 /// DELIBERATELY not the question [`environment_serving_cname_prefix`] answers: a
 /// `SwapEnvironmentCNAMEs` moves the NAMES between two environments and moves
@@ -4510,24 +4754,33 @@ pub fn environment_serving_cname_prefix<'store>(
 pub fn environment_at_own_address<'store>(
     store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     region: &str,
-    cname_prefix: &str,
+    environment_id: &str,
 ) -> Option<&'store Environment> {
-    store.environments.values().find(|environment| {
-        !environment.is_terminated() && addresses(&environment.reserved_cname, region, cname_prefix)
-    })
+    store
+        .environments
+        .get(environment_id)
+        .filter(|environment| {
+            !environment.is_terminated()
+                && ::service_common::arn::region_label(&environment.region)
+                    .unwrap_or(DEFAULT_REGION)
+                    .eq_ignore_ascii_case(
+                        ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION),
+                    )
+        })
 }
 
 /// Whether the published address `cname` is the one the prefix `cname_prefix`
-/// forms in `region`: its leading labels, compared the way DNS compares names —
+/// forms in `region`: the Region and the prefix it carries
+/// ([`environment_address_parts`]), compared the way DNS compares names —
 /// case-insensitively, since a CNAME prefix is a host name label and
 /// `TAKEN-PREFIX` names the name `taken-prefix` names.
 ///
-/// The Region is read through the same label grammar the address was built with
-/// ([`environment_address_host`]), so a request's Region and the stored name
-/// cannot disagree about which Region's zone the name sits in.
+/// The Region is read through the same label grammar the address was built with,
+/// so a request's Region and the stored name cannot disagree about which Region
+/// the name sits in.
 fn addresses(cname: &str, region: &str, cname_prefix: &str) -> bool {
     let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
-    environment_address_labels(cname).is_some_and(|(named_region, named_prefix)| {
+    environment_address_parts(cname).is_some_and(|(named_region, named_prefix)| {
         named_region.eq_ignore_ascii_case(region) && named_prefix.eq_ignore_ascii_case(cname_prefix)
     })
 }

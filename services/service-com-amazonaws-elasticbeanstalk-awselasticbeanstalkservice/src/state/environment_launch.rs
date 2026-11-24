@@ -123,7 +123,7 @@ impl Environment {
             endpoint_url: Some(environment_endpoint_url(
                 plane_authority,
                 region,
-                &cname_prefix,
+                &environment_id,
             )),
             tier,
             option_settings,
@@ -147,6 +147,14 @@ impl Environment {
             // until a managed replacement of them is due starts; the field is
             // dated with the launch so the record never carries no date at all.
             instances_replaced_at: created,
+            // The process those instances run the application as: the launch
+            // starts the FIRST one, and the number moves when it is replaced
+            // ([`Environment::app_process_generation`]).
+            app_process_generation: 1,
+            // Nothing has dialled this environment's address yet, so its
+            // application has answered no request for the health agent to report
+            // on ([`super::served_requests`]).
+            served_answers: Vec::new(),
             // "This number increases by one each time that you deploy source
             // code or change instance configuration settings": the launch is
             // this environment's first deployment, which is what its instances

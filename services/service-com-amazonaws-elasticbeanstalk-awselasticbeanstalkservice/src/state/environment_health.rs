@@ -46,24 +46,6 @@ impl<'a> RequestedHealthAttributes<'a> {
 /// the metrics cover (usually 10 seconds)."
 pub const METRICS_DURATION_SECONDS: i32 = 10;
 
-/// The request metrics over the last [`METRICS_DURATION_SECONDS`], for the
-/// environment as a whole and for one of its instances alike. This emulator
-/// serves no application traffic, so the window holds no request: the counts are
-/// zero and there are no latency percentiles to report over zero requests.
-pub fn application_metrics() -> ApplicationMetrics {
-    ApplicationMetrics {
-        duration: Some(METRICS_DURATION_SECONDS),
-        request_count: 0,
-        status_codes: Some(StatusCodes {
-            status2xx: Some(0),
-            status3xx: Some(0),
-            status4xx: Some(0),
-            status5xx: Some(0),
-        }),
-        latency: None,
-    }
-}
-
 /// The per-instance health statuses, which are also the
 /// `InstanceHealthSummary` buckets an instance reporting one is counted in.
 ///
@@ -199,15 +181,21 @@ pub const INSTANCE_DEPLOYMENT_DEPLOYED: &str = "Deployed";
 /// "Descriptions of the data that contributed to the environment's current
 /// health status", which are also the causes "that provide more information
 /// about the current health status" of one of its instances: a healthy
-/// environment has none, and one whose health checks are suspended or not yet
-/// started reports the state that suspended them.
+/// environment has none, one whose health checks are suspended or not yet
+/// started reports the state that suspended them, and one the agent is reporting
+/// request failures for reports what it is reporting
+/// ([`Environment::request_failure_cause`]).
 pub fn environment_health_causes(environment: &Environment) -> Vec<String> {
-    if environment.health == HEALTH_GREEN {
+    let (health, _) = environment.reported_health();
+    if health == HEALTH_GREEN {
         return Vec::new();
     }
+    if let Some(failing) = environment.request_failure_cause() {
+        return vec![failing];
+    }
     vec![format!(
-        "Environment health is {}: the environment's status is {}.",
-        environment.health, environment.status
+        "Environment health is {health}: the environment's status is {}.",
+        environment.status
     )]
 }
 
@@ -221,10 +209,14 @@ pub fn environment_instance_health(environment: &Environment) -> Vec<SingleInsta
     let Some(resources) = environment.resources.as_ref() else {
         return Vec::new();
     };
-    let health_status = instance_health_status(&environment.health);
+    // The health the environment REPORTS, which over a running environment is
+    // what the agent observes of the application ([`super::served_requests`]).
+    let (health, status) = environment.reported_health();
+    let health_status = status.unwrap_or_else(|| instance_health_status(&health).to_string());
     let instance_type = environment_instance_type(&environment.option_settings);
     let causes = environment_health_causes(environment);
     let deployment = environment.current_deployment();
+    let metrics = environment.application_metrics();
     resources
         .instances
         .iter()
@@ -233,17 +225,17 @@ pub fn environment_instance_health(environment: &Environment) -> Vec<SingleInsta
             // "The ID of the Amazon EC2 instance" — the one the environment's
             // inventory holds, which `DescribeEnvironmentResources` reports.
             instance_id: Some(instance_id.clone()),
-            health_status: Some(health_status.to_string()),
+            health_status: Some(health_status.clone()),
             // "The color indicator that gives you information about the health
             // of the EC2 instance", which is the colour of the bucket that
             // status falls in.
-            color: Some(environment.health.clone()),
+            color: Some(health.clone()),
             causes: Some(causes.clone()),
             // "The time at which the EC2 instance was launched": when the
             // instances this environment runs NOW were launched, which a
             // rebuild and a managed instance replacement move.
             launched_at: Some(environment.instances_replaced_at),
-            application_metrics: Some(application_metrics()),
+            application_metrics: Some(metrics.clone()),
             // "Operating system metrics from the instance" — CPU utilization and
             // load average, which the enhanced-health agent reads from the
             // running operating system. No instance runs here, so there are no

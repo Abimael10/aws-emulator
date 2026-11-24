@@ -258,12 +258,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // afterwards, and that delivery calls another service and RUNS the
         // deployed application, so the guard cannot be held across it.
         let launched = self.launch(&input, &region, &plane_authority, ctx)?;
-        if let Some(streaming) = launched.streaming {
-            let started = match launched.deployed {
-                Some(deployed) => deployed.startup_output().await,
-                None => Vec::new(),
-            };
-            crate::state::stream_instance_logs(ctx, &streaming, &started).await;
+        // "Launches an environment for the specified application using the
+        // specified configuration": the launch DEPLOYS that version to the
+        // environment's instances, which starts the application's web process on
+        // them — so the process is started by the launch, while the launch the
+        // clock owes is still running, rather than by whichever request first
+        // reaches the address.
+        match (launched.streaming, launched.deployed) {
+            (Some(streaming), deployed) => {
+                let started = match deployed {
+                    Some(deployed) => deployed.startup_output().await,
+                    None => Vec::new(),
+                };
+                crate::state::stream_instance_logs(ctx, &streaming, &started).await;
+            }
+            // Nothing of this launch is delivered anywhere, so the caller is not
+            // kept waiting for the instance to come up: the process starts beside
+            // this call, exactly as a real instance comes up beside the launch
+            // that asked for it.
+            (None, Some(deployed)) => {
+                ::tokio::spawn(async move {
+                    deployed.start().await;
+                });
+            }
+            (None, None) => {}
         }
         Ok(launched.output)
     }
@@ -647,9 +665,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         let streaming = (!refused)
             .then(|| store.instance_log_streaming(&region, &environment_id))
             .flatten();
-        let deployed = streaming
-            .as_ref()
-            .and_then(|_| store.deployed_application(&environment_id));
+        // The application this launch DEPLOYS, read while the store is held: the
+        // launch starts its web process on the environment's instances, and that
+        // run happens with no guard taken ([`crate::state::DeployedApplication`]).
+        // A launch that could not be provisioned starts none.
+        let deployed = (!refused)
+            .then(|| store.deployed_application(&environment_id))
+            .flatten();
         drop(store);
 
         Ok(Launched {

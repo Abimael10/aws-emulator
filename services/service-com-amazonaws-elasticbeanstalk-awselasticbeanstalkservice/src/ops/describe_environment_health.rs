@@ -91,10 +91,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The environment's request metrics and one of its instances' cover the same
-// window and are reported the same way, so the derivation they share lives in
-// `crate::state` rather than here.
-use crate::state::application_metrics;
 
 /// The `EnvironmentHealthAttribute` values this operation's response members are
 /// selected by (the full set is
@@ -221,33 +217,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested =
             crate::state::RequestedHealthAttributes::of(input.attribute_names.as_deref());
+        // The health this environment REPORTS: the record's own colour and
+        // status, and the one the agent's observation of the application's
+        // request failures amounts to over a running environment
+        // (`crate::state::served_requests`).
+        let (health, health_status) = environment.reported_health();
         Ok(DescribeEnvironmentHealthOutput {
             // "If no attribute names are specified, returns the name of the
             // environment" — so the name is always reported.
             environment_name: Some(environment.environment_name.clone()),
             // "The health status of the environment. For example, Ok."
-            health_status: requested
-                .wants(HEALTH_STATUS)
-                .then(|| environment.health_status.clone())
-                .flatten(),
+            health_status: requested.wants(HEALTH_STATUS).then_some(health_status).flatten(),
             // "The environment's operational status. Ready, Launching,
             // Updating, Terminating, or Terminated." The member's shape is the
             // `EnvironmentHealth` enum, which its own documentation contradicts:
             // the health colour is reported in `Color` below, and this member
             // carries the environment's status.
             status: requested.wants(STATUS).then(|| environment.status.clone()),
-            // "The health color of the environment" — the stored
-            // `EnvironmentHealth` value.
-            color: requested.wants(COLOR).then(|| environment.health.clone()),
+            // "The health color of the environment" — the `EnvironmentHealth`
+            // value it reports.
+            color: requested.wants(COLOR).then_some(health),
             // "Descriptions of the data that contributed to the environment's
             // current health status."
             causes: requested
                 .wants(CAUSES)
                 .then(|| crate::state::environment_health_causes(environment)),
-            // Request metrics over "the most recent time slice of 10 seconds".
-            // This emulator serves no application traffic, so the slice is
-            // empty: no requests, and no latency percentiles over zero requests.
-            application_metrics: requested.wants(APPLICATION_METRICS).then(application_metrics),
+            // Request metrics over "the most recent time slice of 10 seconds":
+            // the requests the application really answered in it, and the status
+            // codes it answered them with.
+            application_metrics: requested
+                .wants(APPLICATION_METRICS)
+                .then(|| environment.application_metrics()),
             // "Summary health information for the instances in the environment"
             // — counted over the very per-instance health
             // `DescribeInstancesHealth` reports for this environment, so the

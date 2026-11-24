@@ -52,8 +52,8 @@ application = None
 /// standard library's servers are built on, and the header parser they read a
 /// request's headers through — so a program the platform starts can serve HTTP
 /// with the library it was written against.
-#[test]
-fn the_interpreter_carries_what_a_deployed_server_is_built_on() {
+#[tokio::test]
+async fn the_interpreter_carries_what_a_deployed_server_is_built_on() {
     let bundle = eb::state::ApplicationBundle {
         files: [("application.py".to_string(), PROBE.as_bytes().to_vec())]
             .into_iter()
@@ -64,15 +64,26 @@ fn the_interpreter_carries_what_a_deployed_server_is_built_on() {
         module: "application".to_string(),
         callable: None,
     };
-    // The interpreter is synchronous and its recursion limit is above what a test
-    // thread's own stack holds, so the run happens on a thread of its own with the
-    // stack this crate gives one ([`eb::state::PYTHON_APPLICATION_STACK_BYTES`]).
-    let run = std::thread::Builder::new()
-        .stack_size(eb::state::PYTHON_APPLICATION_STACK_BYTES)
-        .spawn(move || eb::state::run_python_application(&entry, &modules, &[], None))
-        .expect("a thread for the run")
-        .join()
-        .expect("the run's own thread finished");
+    // The run happens in a PROCESS of its own, which is where this crate runs a
+    // deployment: the interpreter it stands on is the one every request to an
+    // environment's address is served by.
+    let process = eb::state::ProcessIdentity {
+        environment_id: "e-probe".to_string(),
+        region: "us-west-2".to_string(),
+        application_name: "the interpreter probe".to_string(),
+        owner: "the interpreter probe's own store".to_string(),
+        generation: 1,
+    };
+    let declared = eb::state::BundleConfiguration::default();
+    let platform_run = eb::state::python_application_run(
+        &entry,
+        &modules,
+        &eb::state::provisioning_document(&declared),
+        None,
+    );
+    let run = eb::state::served_by_the_process(&process, platform_run, Vec::new())
+        .await
+        .expect("the run was performed");
     let reported: Vec<&str> = eb::state::application_log_lines(&run);
     for name in [
         "socketserver: StreamRequestHandler found",

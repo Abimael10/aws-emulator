@@ -170,9 +170,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// The address an environment with the CNAME prefix `prefix` publishes, which is
-/// the address a client dials: the DNS name whose first labels are that prefix
-/// and the environment's Region, on the port the socket this emulator serves the
-/// environment plane on answers.
+/// the address a client dials: the `host:port` of the socket this emulator serves
+/// the environment plane on, then the path naming the environment's Region and
+/// that prefix.
 fn published_address(emulator: &Emulator, prefix: &str) -> String {
     emulator.published_cname(TEST_REGION, prefix)
 }
@@ -243,12 +243,12 @@ async fn deployed(emulator: &Emulator, case: &str, prefix: &str, bundle: Bundle)
     assert_eq!(
         launched.expect("CNAME", case),
         address,
-        "case {case:?}: the environment must publish the name its prefix forms, got body {}",
+        "case {case:?}: the environment must publish the address its prefix names, got body {}",
         launched.body
     );
     assert_eq!(
         launched.expect("EndpointURL", case),
-        emulator.environment_address(TEST_REGION, prefix),
+        emulator.published_endpoint_url(TEST_REGION, launched.expect("EnvironmentId", case)),
         "case {case:?}: the EndpointURL must be the address it is served at, got body {}",
         launched.body
     );
@@ -857,16 +857,14 @@ async fn retrieved_once_compiled(emulator: &Emulator, case: &str, environment: &
 
 /// RULE: the address an environment publishes is one a client really DIALS, as it
 /// stands: the socket this emulator serves the environment plane on speaks
-/// HTTP/1.1 on the port that name is published with, and a plain HTTP request for
-/// `/` of that address — the one `EnvironmentDescription$CNAME` carries, with the
-/// environment named in the request's `Host` and nothing in its path — is answered
-/// by the deployed application, with no credential of any kind.
+/// HTTP/1.1 on the port that address is published with, and a plain HTTP request
+/// for the path it carries — the address `EnvironmentDescription$CNAME` publishes,
+/// with the environment named in that path and no credential of any kind — is
+/// answered by the deployed application.
 ///
-/// The connection is opened to the LOOPBACK literal, which is the interface the
-/// core binds its listeners on and the one a resolver answers a name under the
-/// loopback zone with (RFC 6761): what is under test is that the plane resolves
-/// the environment out of the published authority the request STATES, not the
-/// host's own resolver.
+/// The connection is opened to the authority the published address names, which is
+/// the one a client was handed: what is under test is that the plane resolves the
+/// environment out of the published address the request STATES.
 #[tokio::test]
 async fn the_published_address_answers_a_plain_http_request() {
     let row = PythonRow {
@@ -880,12 +878,16 @@ async fn the_published_address_answers_a_plain_http_request() {
     deployed_python(&emulator, &row, "deployed-env-1").await;
 
     let address = published_address(&emulator, "deployed-env-1");
-    let port: u16 = address
+    let (authority, path) = address.split_once('/').unwrap_or_else(|| {
+        panic!("case {case:?}: expected an address with a path, got {address:?}")
+    });
+    let port: u16 = authority
         .rsplit_once(':')
         .and_then(|(_host, port)| port.parse().ok())
         .unwrap_or_else(|| panic!("case {case:?}: expected a port in {address:?}"));
-    let request =
-        format!("GET / HTTP/1.1\r\nHost: {address}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
     let mut connection = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .unwrap_or_else(|error| {

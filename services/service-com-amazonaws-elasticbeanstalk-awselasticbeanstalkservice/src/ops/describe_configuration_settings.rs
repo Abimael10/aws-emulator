@@ -283,11 +283,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // catalog at its defaults with the settings deployed to this
                 // environment over them — so an option nobody set is reported
                 // at the default it is running at rather than left out.
+                //
+                // The settings DEPLOYED to the environment are what the
+                // deployment put in force: the `option_settings:` the deployed
+                // version's own `.ebextensions` carry, "merged into the
+                // environment's configuration at deploy time", with the values
+                // set directly on the environment over them
+                // ([`crate::state::deployed_option_settings`]) — the same
+                // configuration the application's process runs under.
+                let in_force = crate::state::deployed_option_settings(
+                    &store.deployed_bundle_configuration(&environment.environment_id),
+                    &environment.option_settings,
+                );
                 let deployed_settings = store.resolved_configuration_settings(
                     &region,
                     environment.solution_stack_name.as_deref(),
                     environment.platform_arn.as_deref(),
-                    &environment.option_settings,
+                    &in_force,
                 );
                 // Where each of those options got its effective value: the
                 // settings deployed to this environment came from the API, the
@@ -296,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     environment.solution_stack_name.as_deref(),
                     environment.platform_arn.as_deref(),
-                    &environment.option_settings,
+                    &in_force,
                 );
                 // The tier this configuration set is for is the environment's
                 // own, which an update cannot change.

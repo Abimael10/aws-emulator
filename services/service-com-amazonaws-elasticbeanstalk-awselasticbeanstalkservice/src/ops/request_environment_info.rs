@@ -246,18 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Compiles the last lines from the application server log files of
         // every Amazon EC2 instance in your environment": the application's own
-        // log is what the application WROTE, so the environment's deployed code
-        // is run and the lines it wrote are the lines compiled. Nothing is
-        // compiled for an environment running no application of this emulator's
-        // engine.
-        let started = match deployed.as_ref() {
-            Some(deployed) => deployed.start().await,
-            None => None,
+        // log is the file the process running it has WRITTEN since it started,
+        // so the instance's log file is what the lines come from — and the
+        // process is started if it is not up yet, since an instance that has
+        // been deployed to is running the application. Nothing is compiled for
+        // an environment running no application of this emulator's engines.
+        let application_log = match deployed.as_ref() {
+            Some(deployed) => deployed.instance_log().await,
+            None => Vec::new(),
         };
-        let application_log = started
-            .as_ref()
-            .map(crate::state::application_log_lines)
-            .unwrap_or_default();
+        let application_log: Vec<&str> = application_log.iter().map(String::as_str).collect();
         let log = crate::state::compiled_environment_information(
             &activity,
             &application_log,

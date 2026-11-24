@@ -38,7 +38,6 @@ use super::*;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::INIT_PHASE_LIMIT;
-use ::service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_ARCHITECTURE;
 
 /// The configuration-option namespace holding the Python platform's own container options.
 pub const NAMESPACE_PYTHON_CONTAINER: &str = "aws:elasticbeanstalk:container:python";
@@ -232,10 +231,14 @@ fn bundle_module(bundle: &ApplicationBundle, module: &str) -> Option<String> {
 /// file of either name cannot replace the server side of the platform with its own.
 #[must_use]
 pub fn python_modules(bundle: &ApplicationBundle) -> Vec<PackageModule> {
-    let supplied: Vec<String> = [SERVE_MODULE, super::python_program::SERVE_MODULE]
-        .iter()
-        .map(|module| format!("{module}{PYTHON_SUFFIX}"))
-        .collect();
+    let supplied: Vec<String> = [
+        SERVE_MODULE,
+        super::python_program::SERVE_MODULE,
+        super::instance_provisioning::PROVISIONING_MODULE,
+    ]
+    .iter()
+    .map(|module| format!("{module}{PYTHON_SUFFIX}"))
+    .collect();
     bundle
         .files
         .iter()
@@ -262,75 +265,40 @@ pub(super) fn application_budget() -> python::Budget {
     }
 }
 
-/// RUN the deployed Python application: import the module its entry point names and, for a
-/// run carrying `request`, hand that request to the WSGI callable in it.
+/// RUN the deployed Python application: what the platform hands the interpreter to import the
+/// module its entry point names and, for a run carrying `request`, hand that request to the
+/// WSGI callable in it.
 ///
-/// SYNCHRONOUS, and called on a thread of its own with no state guard held: the interpreter
-/// is synchronous, and its own stop is what ends code with no exit.
+/// The import happens on the FIRST run of a process and the module stays imported for every
+/// later one ([`SERVE_SOURCE`]), which is what makes an instance's process serve request after
+/// request.
 #[must_use]
-pub fn run_python_application(
+pub fn python_application_run(
     entry: &PythonEntry,
     modules: &[PackageModule],
-    environment: &[(String, String)],
+    provisioning: &::serde_json::Value,
     request: Option<&GuestRequest>,
-) -> GuestRun {
-    let mut supplied = vec![PackageModule {
-        path: format!("{SERVE_MODULE}{PYTHON_SUFFIX}"),
-        source: SERVE_SOURCE.to_string(),
-    }];
+) -> PlatformRun {
+    let mut supplied = vec![
+        PackageModule {
+            path: format!("{SERVE_MODULE}{PYTHON_SUFFIX}"),
+            source: SERVE_SOURCE.to_string(),
+        },
+        super::instance_provisioning::provisioning_module(),
+    ];
     supplied.extend_from_slice(modules);
     let event = ::serde_json::json!({
         "module": entry.module,
         "callable": entry.callable,
+        "provisioning": provisioning,
         "request": request.map(request_document),
     })
     .to_string();
-    run_guest(
-        &supplied,
-        &format!("{SERVE_MODULE}.{SERVE_FUNCTION}"),
-        &event,
-        environment,
-    )
-}
-
-/// Run `handler` of the modules `supplied` over `event`, under the bounds and the containment
-/// one run of a deployed application has.
-///
-/// The one place this crate starts the embedded interpreter, so a deployment started by the
-/// platform's own server ([`run_python_application`]) and one started as a program
-/// ([`super::python_program::run_python_program`]) cannot be run under different bounds, in a
-/// different environment or with a different seam.
-pub(super) fn run_guest(
-    supplied: &[PackageModule],
-    handler: &str,
-    event: &str,
-    environment: &[(String, String)],
-) -> GuestRun {
-    let environment: BTreeMap<String, String> = environment.iter().cloned().collect();
-    let finished = python::run(&python::Run {
-        modules: supplied,
-        handler,
-        environment: &environment,
-        // The instruction set the environment the application runs in has, which the run
-        // reports as its own machine: an Elastic Beanstalk environment names none, so it is
-        // the one the engine reports when none is named.
-        architecture: DEFAULT_ARCHITECTURE,
-        event: Some(event),
-        request_id: "",
-        invoked_function_arn: "",
-        client_context: None,
-        tenant_id: None,
-        budget: application_budget(),
-        // A deployed application is handed no AWS SDK seam of this emulator's: nothing of
-        // this environment's own configuration vends it a credential to make calls with, so
-        // a call it tries is reported to it as one that was not made rather than signed as
-        // an identity nobody gave it.
-        aws: None,
-        // No durable execution: an environment's application is no execution's run, so it
-        // takes no step of one and checkpoints nothing onto one.
-        durable: None,
-    });
-    guest_run(finished)
+    PlatformRun {
+        supplied,
+        handler: format!("{SERVE_MODULE}.{SERVE_FUNCTION}"),
+        event,
+    }
 }
 
 /// One request, as the JSON the WSGI environment — or the request bytes a program's own
@@ -356,7 +324,7 @@ pub(super) fn request_document(request: &GuestRequest) -> ::serde_json::Value {
 /// What the finished run produced, in the form every engine of this crate reports a run in:
 /// the output the application wrote, the response it answered, and the account of a run that
 /// answered none.
-fn guest_run(finished: python::Finished) -> GuestRun {
+pub(super) fn guest_run(finished: python::Finished) -> GuestRun {
     let (answered, failure) = match &finished.completion {
         python::Completion::Returned(payload) => (
             ::serde_json::from_str::<::serde_json::Value>(payload).ok(),
@@ -451,10 +419,18 @@ import importlib
 import io
 import sys
 
+import __eb_instance
+
 # The name a WSGI application is found under when the configuration states no
 # `module:callable`: the `application` Elastic Beanstalk's Python platform documents for the
 # file its `WSGIPath` names.
 _CALLABLE_NAMES = ("application",)
+
+# The PROCESS this module is the serving layer of: whether the deployment's own configuration
+# has been applied to this instance yet. Module state, so it is the same from one request to
+# the next for as long as the process stands.
+_STARTED = {}
+
 
 # What the platform's server reports to the application about itself when the request carries
 # no host of its own.
@@ -518,7 +494,16 @@ def _status_code(status):
 
 
 def serve(event, context):
-    """Import the application and, for a run carrying a request, answer that request."""
+    """Import the application and, for a run carrying a request, answer that request.
+
+    The import happens on the FIRST run of a process — after what the deployment's own
+    configuration declares has been applied to the instance — and the module stays imported in
+    `sys.modules` for every later run, so what the application holds in memory is there for the
+    next request.
+    """
+    if not _STARTED.get("started"):
+        _STARTED["started"] = True
+        __eb_instance.provisioned(event.get("provisioning"))
     module = importlib.import_module(event["module"])
     request = event.get("request")
     if request is None:

@@ -15,12 +15,12 @@
 
 use crate::harness::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
-/// The label every environment address this service derives carries between the
-/// Region and the zone it is announced in — an environment's CNAME is a DNS name
-/// whose first label is its CNAME prefix and whose second is its Region, so the
-/// marker below is the label that names this service in it and the prefix is read
-/// off the value rather than repeated here.
-const CNAME_SERVICE_LABEL: &str = ".elasticbeanstalk.";
+/// The segment every environment address this service derives carries ahead of
+/// the Region and the CNAME prefix — an environment's address is the `host:port`
+/// this emulator answers on followed by the path naming this service's plane, the
+/// Region and the prefix, so the marker below is the segment that names this
+/// service in it and the prefix is read off the value rather than repeated here.
+const CNAME_SERVICE_SEGMENT: &str = "/elasticbeanstalk/";
 
 /// The awsQuery error envelope's `<Message>`, or `""` on an answer that carries
 /// none. Read through the shared harness's element reader, so this suite adds no
@@ -193,21 +193,22 @@ async fn the_two_selected_environments_exchange_their_cnames() {
 
         let source_before = stored_cname(&emulator, &source_id, &case).await;
         let destination_before = stored_cname(&emulator, &destination_id, &case).await;
-        // Both CNAMEs are this service's own DNS form, so the swap is asserted
-        // against values the emulator derived rather than values typed here.
+        // Both CNAMEs are this service's own published form, so the swap is
+        // asserted against values the emulator derived rather than values typed
+        // here.
         for (label, cname, prefix) in [
             ("source", &source_before, row.source_prefix),
             ("destination", &destination_before, row.destination_prefix),
         ] {
             assert!(
-                cname.contains(CNAME_SERVICE_LABEL),
-                "case {case:?}: the {label} CNAME must be a name this emulator announces for \
+                cname.contains(CNAME_SERVICE_SEGMENT),
+                "case {case:?}: the {label} CNAME must be an address this emulator serves for \
                  this service, got {cname:?}"
             );
             if let Some(prefix) = prefix {
                 assert!(
-                    cname.starts_with(&format!("{prefix}.")),
-                    "case {case:?}: the {label} CNAME must start at its prefix {prefix:?}, got {cname:?}"
+                    cname.ends_with(&format!("/{prefix}")),
+                    "case {case:?}: the {label} CNAME must name its prefix {prefix:?}, got {cname:?}"
                 );
             }
         }

@@ -119,50 +119,81 @@ fn module_program(bundle: &ApplicationBundle, module: &str) -> Option<PythonProg
     .map(|file| PythonProgram { file })
 }
 
-/// RUN the deployed program: execute `source` as `__main__`, the way the start command runs
-/// it, and hand `request` — where the run carries one — to the server it started.
+/// What the platform hands the interpreter for ONE run of a deployed
+/// application: the modules it supplies, the entry point in them the engine
+/// calls, and the document that run carries.
 ///
-/// SYNCHRONOUS, and called on a thread of its own with no state guard held, for the reasons
-/// [`super::python_application::run_python_application`] states.
+/// Built per request and handed to the PROCESS the environment's instance runs
+/// ([`super::application_process::served_by_the_process`]), which is where the
+/// run happens.
+#[derive(Debug, Clone)]
+pub struct PlatformRun {
+    /// The modules the interpreter is handed: the platform's own serving layer
+    /// and the deployment's own files.
+    pub supplied: Vec<PackageModule>,
+    /// The entry point in them the engine calls.
+    pub handler: String,
+    /// What this run carries, as the JSON document the serving layer reads.
+    pub event: String,
+}
+
+/// RUN the deployed program: what the platform hands the interpreter to execute
+/// `source` as `__main__` — the way the start command runs it — and hand
+/// `request`, where the run carries one, to the server it started.
+///
+/// The program is run on the FIRST run of a process and the server it started is
+/// kept for every later one ([`SERVE_SOURCE`]), which is what makes an
+/// instance's process serve request after request.
 #[must_use]
-pub fn run_python_program(
+pub fn python_program_run(
     program: &PythonProgram,
     source: &str,
     modules: &[PackageModule],
-    environment: &[(String, String)],
+    provisioning: &::serde_json::Value,
     request: Option<&GuestRequest>,
-) -> GuestRun {
-    let mut supplied = vec![PackageModule {
-        path: format!("{SERVE_MODULE}{PYTHON_SUFFIX}"),
-        source: SERVE_SOURCE.to_string(),
-    }];
+) -> PlatformRun {
+    let mut supplied = vec![
+        PackageModule {
+            path: format!("{SERVE_MODULE}{PYTHON_SUFFIX}"),
+            source: SERVE_SOURCE.to_string(),
+        },
+        super::instance_provisioning::provisioning_module(),
+    ];
     supplied.extend_from_slice(modules);
     let event = ::serde_json::json!({
         "program": { "path": program.file, "source": source },
+        "provisioning": provisioning,
         "request": request.map(request_document),
     })
     .to_string();
-    run_guest(
-        &supplied,
-        &format!("{SERVE_MODULE}.{SERVE_FUNCTION}"),
-        &event,
-        environment,
-    )
+    PlatformRun {
+        supplied,
+        handler: format!("{SERVE_MODULE}.{SERVE_FUNCTION}"),
+        event,
+    }
 }
 
 /// The module this emulator hands the interpreter: the serving layer a program that starts a
 /// server of its own runs on, and nothing else.
 ///
-/// It runs the program as `__main__` and keeps the server that program starts, then hands one
-/// request to that server through the server's own accept path — so the request is parsed, the
-/// handler is called and the response is written by the standard library's own HTTP server and
-/// the program's own code. What comes back is the bytes that server wrote, read as the status,
-/// the headers and the body the client is answered with.
+/// It applies what the deployment's own configuration declares on the instance, runs the
+/// program as `__main__` and KEEPS the server that program started, then hands one request to
+/// that server through the server's own accept path — so the request is parsed, the handler is
+/// called and the response is written by the standard library's own HTTP server and the
+/// program's own code. What comes back is the bytes that server wrote, read as the status, the
+/// headers and the body the client is answered with.
+///
+/// The program runs ONCE per process: the module state below is the process's, so the first
+/// run of a process starts the application and every later one reaches the server it started —
+/// which is what makes an in-memory counter, a cache or a boot identity the application minted
+/// survive from one request to the next.
 const SERVE_SOURCE: &str = r#"
-"""Running the program an Elastic Beanstalk platform starts, and serving one request with it."""
+"""Running the program an Elastic Beanstalk platform starts, and serving requests with it."""
 
 import io
 import sys
+
+import __eb_instance
 
 # Everything else this module needs it imports where it uses it: the modules of the standard
 # library the serving layer is built on are imported while the run SERVES, rather than while
@@ -194,7 +225,10 @@ class _Serving(BaseException):
     """
 
 
-# The server the program started, filled by the serving call below.
+# The PROCESS this module is the serving layer of: the server the program started, and whether
+# the program has been started at all. Module state, so it is the same from one request to the
+# next for as long as the process stands — exactly what makes the application's own in-memory
+# state outlive the request that wrote it.
 _STARTED = {}
 
 
@@ -239,6 +273,33 @@ def _install():
         socket.getfqdn("")
     except Exception:
         socket.getfqdn = _hostname
+
+
+def _start(event):
+    """Start the process: apply the deployment's configuration, then run the program.
+
+    Performed ONCE per process, whatever the program then does: a program that raised is not
+    run again by every later request, exactly as a process that died is not re-run by the
+    request that arrives next.
+    """
+    _install()
+    program = event["program"]
+    filename = _TASK_ROOT + "/" + program["path"]
+    scope = {
+        "__name__": "__main__",
+        "__file__": filename,
+        "__doc__": None,
+        "__package__": None,
+        "__spec__": None,
+        "__loader__": None,
+    }
+    try:
+        __eb_instance.provisioned(event.get("provisioning"))
+        exec(compile(program["source"], filename, "exec"), scope)
+    except _Serving:
+        pass
+    finally:
+        _STARTED["started"] = True
 
 
 class _Connection(object):
@@ -385,22 +446,9 @@ def _answer(server, request):
 
 
 def serve(event, context):
-    """Run the program the platform starts and, for a run carrying a request, answer it."""
-    _install()
-    program = event["program"]
-    filename = _TASK_ROOT + "/" + program["path"]
-    scope = {
-        "__name__": "__main__",
-        "__file__": filename,
-        "__doc__": None,
-        "__package__": None,
-        "__spec__": None,
-        "__loader__": None,
-    }
-    try:
-        exec(compile(program["source"], filename, "exec"), scope)
-    except _Serving:
-        pass
+    """Serve one request with the process the platform started, starting it if it is not up."""
+    if not _STARTED.get("started"):
+        _start(event)
     server = _STARTED.get("server")
     request = event.get("request")
     if server is None or request is None:

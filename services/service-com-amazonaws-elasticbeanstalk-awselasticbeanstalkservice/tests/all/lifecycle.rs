@@ -260,20 +260,30 @@ impl Emulator {
     }
 
     /// The address an environment with the CNAME prefix `prefix` in `region`
-    /// PUBLISHES — its `CNAME` and `EndpointURL`.
+    /// PUBLISHES as its `CNAME`.
     ///
     /// The FORM is spelled out here rather than read off the crate, so a suite
-    /// that asserts the published value holds the service to it: the prefix
-    /// label, the Region label, this service's own label and the loopback zone
-    /// the core binds its listeners in, on the plane socket's own port. Only the
-    /// PORT is read off that socket, because the port is the core's to choose.
+    /// that asserts the published value holds the service to it: an address a
+    /// client of this emulator can DIAL — the `host:port` of the socket the
+    /// environment plane answers on, then the emulator's data-plane namespace,
+    /// this service's own segment, the Region and the CNAME prefix. Only the
+    /// authority is read off that socket, because the port is the core's to
+    /// choose.
     pub(crate) fn published_cname(&self, region: &str, prefix: &str) -> String {
-        let authority = self.plane_authority();
-        let port = authority
-            .rsplit_once(':')
-            .map(|(_host, port)| port.to_string())
-            .unwrap_or_else(|| panic!("the environment plane socket is open: {authority:?}"));
-        format!("{prefix}.{region}.elasticbeanstalk.localhost:{port}")
+        format!(
+            "{}/_aws/elasticbeanstalk/{region}/{prefix}",
+            self.plane_authority()
+        )
+    }
+
+    /// The address an environment PUBLISHES as its `EndpointURL`: the same socket,
+    /// then the path naming the environment's own id — the address that reaches
+    /// THIS environment whatever name points at it.
+    pub(crate) fn published_endpoint_url(&self, region: &str, environment_id: &str) -> String {
+        format!(
+            "{}/_aws/elasticbeanstalk/{region}/_environment/{environment_id}",
+            self.plane_authority()
+        )
     }
 
     /// Dispatch a request the caller built itself, for a suite that drives

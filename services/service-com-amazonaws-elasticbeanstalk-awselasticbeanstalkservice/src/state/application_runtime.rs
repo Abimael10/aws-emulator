@@ -24,10 +24,9 @@
 //! modules a web application's entry point uses to START
 //! ([`RUNTIME_PRELUDE`]) — anything else throws, the way a missing module does.
 //!
-//! The run happens on a BLOCKING thread (`tokio::task::spawn_blocking`) at the
-//! call sites in [`super::deployed_application`], never on the async executor:
-//! the engine is synchronous, and the interrupt handler is what stops a script
-//! with no exit.
+//! The run happens on a THREAD of its own, held for as long as the process stands
+//! ([`super::javascript_process`]), never on the async executor: the engine is
+//! synchronous, and the interrupt handler is what stops a script with no exit.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -42,6 +41,11 @@ use rquickjs::{CatchResultExt, Context, Ctx, Runtime, Value};
 /// with no exit would otherwise hold a thread for ever. Long enough for an
 /// application's entry point to start and answer one request.
 const RUN_WALL_CLOCK: Duration = Duration::from_secs(2);
+
+/// The same span, under the name the thread a process stands on reads it by
+/// ([`super::javascript_process`]): how long one run of a deployed JavaScript
+/// application may take, which is what the wait for its answer is built from.
+pub(super) const JAVASCRIPT_RUN_WALL_CLOCK: Duration = RUN_WALL_CLOCK;
 
 /// How many times the engine may ask whether to keep going before one run is
 /// stopped — the STEP bound beside the wall-clock one, and the one that does not
@@ -161,71 +165,130 @@ fn captured(capture: &Arc<Mutex<Capture>>) -> ::std::sync::MutexGuard<'_, Captur
     capture.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Run the deployed application's entry point `entry`, with `env` as its process
-/// environment, and hand it `request` when there is one to serve.
+/// The PROCESS a deployed JavaScript bundle runs as: the engine with the bundle's
+/// entry point already evaluated, ready to serve a request.
 ///
-/// Called on a blocking thread with no state guard held. Every bound this module
-/// declares is set on the engine before anything is evaluated, so the code
-/// cannot outrun them.
-pub fn run_application(
-    entry: &str,
-    env: &[(String, String)],
-    request: Option<&GuestRequest>,
-) -> GuestRun {
-    let capture = Arc::new(Mutex::new(Capture::default()));
-    let failure = evaluate(&capture, entry, env, request).err();
-    let captured = captured(&capture);
-    GuestRun {
-        stdout: captured.stdout.clone(),
-        stderr: captured.stderr.clone(),
-        served: captured.served.clone(),
-        response: captured.response.clone(),
-        failure,
+/// Built ONCE and then handed request after request
+/// ([`super::javascript_process`]), because an Elastic Beanstalk instance runs the
+/// application as one long-lived process: the server the entry point started, and
+/// everything the application holds in memory, is there for the next request.
+///
+/// It is NOT `Send`: every object here belongs to the one engine and the one
+/// thread it was built on, so a process is reached by handing a request to that
+/// thread.
+pub struct JavaScriptProcess {
+    /// The engine itself. Never read after the build: it is held because dropping
+    /// it ends the process.
+    _runtime: Runtime,
+    /// The context the entry point was evaluated in, which is what a request is
+    /// served by.
+    context: Context,
+    /// What the code running in it writes and answers, read off after each run.
+    capture: Arc<Mutex<Capture>>,
+    /// What the run IN FLIGHT may spend, reset before each one: the engine's
+    /// interrupt handler is installed once with the process and reads this.
+    spending: Arc<Mutex<Spending>>,
+}
+
+/// What ONE run of a deployed application may spend: the asks the engine has
+/// already made of its interrupt handler, and the instant that run is stopped at.
+#[derive(Debug)]
+struct Spending {
+    steps: u64,
+    deadline: Instant,
+}
+
+impl Spending {
+    /// A fresh budget: no step spent, and the wall clock one run is allowed.
+    fn fresh() -> Self {
+        Self {
+            steps: 0,
+            deadline: Instant::now() + RUN_WALL_CLOCK,
+        }
     }
 }
 
-/// Build the engine, install the host functions and the runtime prelude over
-/// them, evaluate the entry point and — for a run that carries one — hand the
-/// request to whatever server the entry point started.
-fn evaluate(
-    capture: &Arc<Mutex<Capture>>,
-    entry: &str,
-    env: &[(String, String)],
-    request: Option<&GuestRequest>,
-) -> Result<(), String> {
-    let runtime = Runtime::new().map_err(|error| format!("the engine did not start: {error}"))?;
-    runtime.set_memory_limit(RUN_MEMORY_BYTES);
-    runtime.set_max_stack_size(RUN_STACK_BYTES);
-    let deadline = Instant::now() + RUN_WALL_CLOCK;
-    // The only thing that can stop code with no exit: a timeout cannot preempt a
-    // loop running on this thread, but the engine asks this handler as it works
-    // — so the handler counts the asks (the step bound) and checks the clock.
-    let mut steps: u64 = 0;
-    runtime.set_interrupt_handler(Some(Box::new(move || {
-        steps += 1;
-        steps > RUN_STEP_BUDGET || Instant::now() >= deadline
-    })));
-    let context =
-        Context::full(&runtime).map_err(|error| format!("the engine did not start: {error}"))?;
-
-    context.with(|ctx| {
-        install_host_functions(&ctx, capture)?;
-        set_json(&ctx, "__ebEnv", &environment_object(env))?;
-        run_one(&ctx, RUNTIME_PRELUDE)?;
-        // The application's own entry point. Whatever it logs while starting is
-        // what its log carries, and whatever server it starts is what answers
-        // below.
-        run_one(&ctx, entry)?;
-        let Some(request) = request else {
-            return Ok(());
+impl JavaScriptProcess {
+    /// START the process: build the engine under every bound this module declares,
+    /// install the host surface and the runtime prelude over it, and evaluate the
+    /// bundle's entry point `entry` with `env` as the process environment.
+    ///
+    /// What the entry point wrote while starting, and the account of a start that
+    /// raised, are what this answers beside the process itself. `None` for an
+    /// engine that could not be stood up at all.
+    pub fn start(entry: &str, env: &[(String, String)]) -> Option<(Self, GuestRun)> {
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let spending = Arc::new(Mutex::new(Spending::fresh()));
+        let runtime = Runtime::new().ok()?;
+        runtime.set_memory_limit(RUN_MEMORY_BYTES);
+        runtime.set_max_stack_size(RUN_STACK_BYTES);
+        // The only thing that can stop code with no exit: a timeout cannot preempt
+        // a loop running on this thread, but the engine asks this handler as it
+        // works — so the handler counts the asks (the step bound) and checks the
+        // clock, both of them the RUN's own ([`Spending`]) rather than the
+        // process's, so a process that has served many requests is not stopped for
+        // what the earlier ones spent.
+        let spent = Arc::clone(&spending);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            let mut spending = spent.lock().unwrap_or_else(PoisonError::into_inner);
+            spending.steps += 1;
+            spending.steps > RUN_STEP_BUDGET || Instant::now() >= spending.deadline
+        })));
+        let context = Context::full(&runtime).ok()?;
+        let process = Self {
+            _runtime: runtime,
+            context,
+            capture,
+            spending,
         };
-        set_json(&ctx, "__ebRequest", &request_object(request))?;
-        // Everything written from here on was written while SERVING this
-        // request, which is what makes the output one request produced
-        // attributable to it.
-        captured(capture).serving = true;
-        run_one(&ctx, DISPATCH_PRELUDE)
-    })
+        let started = process.run(|ctx| {
+            install_host_functions(ctx, &process.capture)?;
+            set_json(ctx, "__ebEnv", &environment_object(env))?;
+            run_one(ctx, RUNTIME_PRELUDE)?;
+            // The application's own entry point. Whatever it logs while starting
+            // is what its log carries, and whatever server it starts is what
+            // answers every request below.
+            run_one(ctx, entry)
+        });
+        Some((process, started))
+    }
+
+    /// Hand `request` to the server this process's entry point started, and answer
+    /// what it answered and wrote while answering it.
+    pub fn serve(&self, request: &GuestRequest) -> GuestRun {
+        self.run(|ctx| {
+            set_json(ctx, "__ebRequest", &request_object(request))?;
+            // Everything written from here on was written while SERVING this
+            // request, which is what makes the output one request produced
+            // attributable to it.
+            captured(&self.capture).serving = true;
+            run_one(ctx, DISPATCH_PRELUDE)
+        })
+    }
+
+    /// Perform one run of this process's code: a fresh budget, a fresh capture,
+    /// and what the run left in that capture.
+    fn run<R>(&self, run: R) -> GuestRun
+    where
+        R: FnOnce(&Ctx<'_>) -> Result<(), String>,
+    {
+        *self
+            .spending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Spending::fresh();
+        // The capture is the RUN's: what the process wrote for an earlier request
+        // was reported with that request.
+        *captured(&self.capture) = Capture::default();
+        let failure = self.context.with(|ctx| run(&ctx)).err();
+        let captured = captured(&self.capture);
+        GuestRun {
+            stdout: captured.stdout.clone(),
+            stderr: captured.stderr.clone(),
+            served: captured.served.clone(),
+            response: captured.response.clone(),
+            failure,
+        }
+    }
 }
 
 /// Evaluate one script in `ctx`, turning an uncaught exception into the text the

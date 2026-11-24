@@ -139,6 +139,8 @@ impl Environment {
             request_id: request_id.to_string(),
             completion_message: LAUNCH_FAILED_EVENT.to_string(),
             completion_severity: SEVERITY_ERROR,
+            // A launch that failed deploys nothing to any instance.
+            deploys_the_application: false,
         });
     }
 }

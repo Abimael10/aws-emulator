@@ -288,13 +288,13 @@ async fn a_stack_is_complete_only_once_its_environment_is_ready() {
              {environments}"
         );
 
-        // And it really holds its address: the prefix the published CNAME's first label
-        // names is taken for as long as the environment carries it.
+        // And it really holds its address: the prefix the published address names is
+        // taken for as long as the environment carries it.
         let cname = element(&environments, "CNAME");
         let prefix = cname
-            .split('.')
+            .rsplit('/')
             .next()
-            .unwrap_or_else(|| panic!("case {case:?}: no CNAME label in {environments}"));
+            .unwrap_or_else(|| panic!("case {case:?}: no CNAME prefix in {environments}"));
         let checked = elasticbeanstalk(
             &router,
             case,
@@ -312,7 +312,7 @@ async fn a_stack_is_complete_only_once_its_environment_is_ready() {
         if let Some(declared) = row.cname_prefix {
             assert_eq!(
                 prefix, declared,
-                "case {case:?}: the published CNAME must start at the declared prefix, got \
+                "case {case:?}: the published address must name the declared prefix, got \
                  {cname:?}"
             );
         }

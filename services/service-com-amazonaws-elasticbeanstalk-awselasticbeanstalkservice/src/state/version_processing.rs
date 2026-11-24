@@ -60,11 +60,11 @@ pub const ENVIRONMENT_MANIFEST: &str = "env.yaml";
 /// The folder in the source bundle whose configuration files pre-processing
 /// validates, as `CreateApplicationVersion$Process` names it: the `.ebextensions`
 /// folder.
-const EBEXTENSIONS_FOLDER: &str = ".ebextensions/";
+pub const EBEXTENSIONS_FOLDER: &str = ".ebextensions/";
 
 /// The extension of a configuration file in that folder, as
 /// `CreateApplicationVersion$Process` names it: `*.config`.
-const CONFIG_FILE_EXTENSION: &str = ".config";
+pub const CONFIG_FILE_EXTENSION: &str = ".config";
 
 /// What pre-processing a source bundle concluded about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
