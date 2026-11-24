@@ -19,6 +19,10 @@
 //!   `InvalidPolicyException` with HTTP 400 and one sentence whose only variable part
 //!   is that resource type; a template naming only actions it supports is stored and
 //!   reads back.
+//! * That refusal happens before anything is written, so a refused version create
+//!   leaves the permission's stored versions exactly as they were: the same version
+//!   numbers, the same one of them flagged default, and the same document under the
+//!   default version.
 //!
 //! So the rows vary along what the rules generalise over:
 //!
@@ -36,7 +40,11 @@
 //!   a resource of that very type (created, deleted, updated, put over, named in the
 //!   singular or the plural), it belongs to another service's namespace, or it names no
 //!   namespace at all — against actions of the same services that ARE supported, over
-//!   several resource types of the catalog.
+//!   several resource types of the catalog;
+//! * HOW MANY versions the permission already carries when a version create for it is
+//!   refused: from the one version its create wrote up to one below the published
+//!   maximum, so the refusal is read against a permission whose version set is longer
+//!   than one entry too.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ram_amazonresourcesharing::state::{
@@ -828,6 +836,213 @@ async fn every_action_a_published_permission_grants_is_supported_for_its_resourc
             member(case, &read, "permission"),
             template,
             "case {case:?}: the create stored another document, got {read:?}"
+        );
+    }
+}
+
+async fn list_permission_versions(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        "/listpermissionversions",
+        Some(&json!({"permissionArn": arn})),
+    )
+    .await
+}
+
+/// The `(version, defaultVersion)` pairs `ListPermissionVersions` reports for `arn`, in
+/// the order it reports them: the whole version set of one permission, which is what a
+/// write either extends or leaves alone.
+async fn stored_versions(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Vec<(String, bool)> {
+    let (status, reported) = list_permission_versions(router, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: listing the versions expected 200, got {status} with {reported:?}"
+    );
+    reported
+        .get("permissions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the version list reported no permissions, got {reported:?}")
+        })
+        .iter()
+        .map(|permission| {
+            (
+                permission
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: a reported version carried none, got {permission:?}")
+                    })
+                    .to_string(),
+                permission
+                    .get("defaultVersion")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: a reported version carried no defaultVersion, got \
+                             {permission:?}"
+                        )
+                    }),
+            )
+        })
+        .collect()
+}
+
+/// Write `count` further versions of `arn`, each granting a wildcard over the resource
+/// type's own service namespace — which names a SET of actions rather than one, so it is
+/// supported for every resource type and each write differs only in the document stored.
+async fn add_supported_versions(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    service: &str,
+    count: usize,
+) {
+    const WILDCARDS: [&str; 4] = ["*", "Get*", "List*", "Describe*"];
+    for step in 0..count {
+        let template = template_allowing(&json!([format!(
+            "{service}:{}",
+            WILDCARDS[step % WILDCARDS.len()]
+        )]));
+        let (status, written) = create_permission_version(
+            router,
+            &json!({"permissionArn": arn, "policyTemplate": template}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: writing version {} expected 200, got {status} with {written:?}",
+            step + 2
+        );
+    }
+}
+
+/// One row of the untouched-version-set table: the disallowed action a refused version
+/// create names, and how many versions the permission already carries when it does.
+struct UntouchedCase {
+    case: &'static str,
+    resource_type: &'static str,
+    action: Value,
+    prior_versions: usize,
+}
+
+#[tokio::test]
+async fn a_refused_version_create_leaves_the_stored_versions_untouched() {
+    let router = emulator();
+    // The published maximum is 5 versions, so every row stays below it: what is pinned
+    // here is the policy refusal, not the versions-limit one.
+    let cases = vec![
+        UntouchedCase {
+            case: "a delete of the shared type, over one stored version",
+            resource_type: "codebuild:Project",
+            action: json!(["codebuild:DeleteProject"]),
+            prior_versions: 1,
+        },
+        UntouchedCase {
+            case: "an update of the shared type, over two stored versions",
+            resource_type: "ssm-incidents:ResponsePlan",
+            action: json!(["ssm-incidents:UpdateResponsePlan"]),
+            prior_versions: 2,
+        },
+        UntouchedCase {
+            case: "an action of another service's namespace, over three stored versions",
+            resource_type: "codebuild:Project",
+            action: json!(["s3:GetObject"]),
+            prior_versions: 3,
+        },
+        UntouchedCase {
+            case: "a create of the shared type, over four stored versions",
+            resource_type: "resource-groups:Group",
+            action: json!(["resource-groups:CreateGroup"]),
+            prior_versions: 4,
+        },
+        UntouchedCase {
+            case: "a supported action beside an unsupported one, over two stored versions",
+            resource_type: "glue:Database",
+            action: json!(["glue:CreateTable", "glue:CreateDatabase"]),
+            prior_versions: 2,
+        },
+    ];
+    for (
+        index,
+        UntouchedCase {
+            case,
+            resource_type,
+            action,
+            prior_versions,
+        },
+    ) in cases.into_iter().enumerate()
+    {
+        let service = resource_type
+            .split(':')
+            .next()
+            .expect("every resource type names a service code");
+        let subject =
+            version_subject(&router, case, &format!("Untouched{index}"), resource_type).await;
+        add_supported_versions(&router, case, &subject, service, prior_versions - 1).await;
+
+        // What the permission holds before the refused call: every version written for
+        // it, in version order, the last of them the default.
+        let before = stored_versions(&router, case, &subject).await;
+        let expected: Vec<(String, bool)> = (1..=prior_versions)
+            .map(|version| (version.to_string(), version == prior_versions))
+            .collect();
+        assert_eq!(
+            before, expected,
+            "case {case:?}: the subject was not set up with {prior_versions} versions, got \
+             {before:?}"
+        );
+        let (status, read_before) = get_permission(&router, &subject).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading the subject expected 200, got {status} with {read_before:?}"
+        );
+
+        let (status, refused) = create_permission_version(
+            &router,
+            &json!({"permissionArn": subject, "policyTemplate": template_allowing(&action)}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, "InvalidPolicyException".to_string()),
+            "case {case:?}: expected 400 InvalidPolicyException, got {status} with {refused:?}"
+        );
+        let expected_message = action_not_allowed(resource_type);
+        assert_eq!(
+            error_message(&refused),
+            expected_message,
+            "case {case:?}: expected the message {expected_message:?}, got {refused:?}"
+        );
+
+        // Nothing was written: the same version numbers, the same default among them,
+        // and the same document under the default version.
+        let after = stored_versions(&router, case, &subject).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: the refused version create changed the stored versions, got {after:?}"
+        );
+        let (status, read_after) = get_permission(&router, &subject).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: re-reading the subject expected 200, got {status} with {read_after:?}"
+        );
+        assert_eq!(
+            (
+                member(case, &read_after, "version"),
+                member(case, &read_after, "permission"),
+            ),
+            (
+                member(case, &read_before, "version"),
+                member(case, &read_before, "permission"),
+            ),
+            "case {case:?}: the refused version create moved the default version, got \
+             {read_after:?}"
         );
     }
 }

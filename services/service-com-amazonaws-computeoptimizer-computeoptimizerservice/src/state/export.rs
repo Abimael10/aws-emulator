@@ -830,12 +830,12 @@ fn row_matches_filters(
 ///
 /// Stated as the READERS state it. A recommendation reader carries this same instant in the
 /// epoch-seconds number the modelled timestamp form is, so the file states the instant that
-/// number denotes: formatting the unrounded value instead lets one stored instant read two
-/// ways, because a sub-microsecond tick does not survive that number's precision and the
-/// file would then sit a tick away from the answer the API gave for the same record.
+/// number denotes: ONE conversion of that number, the conversion a client reading the number
+/// performs, because converting it again through the number a second time lands on a
+/// neighbouring tick and the file would then sit a tick away from the answer the API gave for
+/// the same record.
 fn timestamp(at: f64) -> String {
-    let on_the_wire = ::aws_smithy_types::DateTime::from_secs_f64(at).as_secs_f64();
-    ::aws_smithy_types::DateTime::from_secs_f64(on_the_wire)
+    ::aws_smithy_types::DateTime::from_secs_f64(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }
