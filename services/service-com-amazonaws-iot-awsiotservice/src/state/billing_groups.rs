@@ -280,3 +280,91 @@ impl ComAmazonawsIotAwsiotserviceState {
         Ok(group.clone())
     }
 }
+
+/// Why a billing group record cannot be REMOVED — what
+/// [`ComAmazonawsIotAwsiotserviceState::delete_billing_group`] answers instead of removing it.
+///
+/// There is exactly one reason, because the delete models no not-found error: a name the
+/// registry does not hold is the state the caller asked for, so the only way the removal is
+/// refused is the optimistic concurrency the versioned record is written under — the same
+/// reason [`BillingGroupUpdateRefusal::VersionConflict`] states for a write of one.
+#[derive(Debug, Clone)]
+pub enum BillingGroupDeleteRefusal {
+    /// `expectedVersion` does not match the version the record holds, so the caller is
+    /// deleting a record it has not seen.
+    ///
+    /// The two versions are carried for DIAGNOSTICS alone, for the reason
+    /// [`BillingGroupUpdateRefusal::VersionConflict`] carries them: this family's refusal
+    /// sentence reports neither of them, only the group the request addressed.
+    VersionConflict {
+        /// The group the request addressed.
+        billing_group_name: String,
+        /// The version the request expected.
+        expected: i64,
+        /// The version the registry holds.
+        registered: i64,
+    },
+}
+
+impl BillingGroupDeleteRefusal {
+    /// What the refusal reports, in the wording this service states it in — the versioned
+    /// families' shared conflict sentence with this family's noun.
+    pub fn message(&self) -> String {
+        match self {
+            Self::VersionConflict {
+                billing_group_name, ..
+            } => billing_group_version_conflict_message(billing_group_name),
+        }
+    }
+}
+
+impl ComAmazonawsIotAwsiotserviceState {
+    /// Remove the billing group registered as `billing_group_name` from the registry: the ONE
+    /// registry write that makes a billing group stop existing, answering the record it
+    /// removed, or `None` when the registry held no group under that name.
+    ///
+    /// A name the registry does not hold removes nothing and is NOT a refusal: the delete
+    /// models no not-found error at all
+    /// (`smithy_query(query="operation",operation="DeleteBillingGroup")` lists
+    /// InternalFailure, InvalidRequest, Throttling and VersionConflict), so it is idempotent
+    /// and a repeat of it leaves the registry in the state the caller asked for.
+    ///
+    /// `expectedVersion` is read BEFORE anything is removed, so a refused delete leaves the
+    /// group — and its version — exactly as it was, which is the point of the parameter.
+    ///
+    /// Membership is a relation that only exists while the group does: a thing's
+    /// `billingGroupName` names a group this registry holds
+    /// ([`ComAmazonawsIotAwsiotserviceState::register_thing`] refuses one it does not), so the
+    /// removal also clears that name off every thing that carried it rather than leaving a
+    /// reader of the thing reporting a group nothing holds. A thing's own registry version is
+    /// NOT advanced by it: the write was to the group, not to the thing.
+    pub fn delete_billing_group(
+        &mut self,
+        billing_group_name: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Option<RegisteredBillingGroup>, BillingGroupDeleteRefusal> {
+        let Some(group) = self.billing_groups.get(billing_group_name) else {
+            return Ok(None);
+        };
+        if let Some(expected) = expected_version {
+            if group.version != expected {
+                return Err(BillingGroupDeleteRefusal::VersionConflict {
+                    billing_group_name: group.billing_group_name.clone(),
+                    expected,
+                    registered: group.version,
+                });
+            }
+        }
+
+        // The name is the group's identity and its key in the registry, so removing that entry
+        // is what makes every later reader — the describe path, the listings, and a
+        // `CreateThing` resolving a `billingGroupName` — stop seeing it.
+        let removed = self.billing_groups.remove(billing_group_name);
+        for thing in self.things.values_mut() {
+            if thing.configuration.billing_group_name.as_deref() == Some(billing_group_name) {
+                thing.configuration.billing_group_name = None;
+            }
+        }
+        Ok(removed)
+    }
+}

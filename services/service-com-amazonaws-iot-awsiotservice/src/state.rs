@@ -3473,9 +3473,9 @@ pub use scheduled_audits::{
 // are re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod billing_groups;
 pub use billing_groups::{
-    billing_group_arn, BillingGroupConfiguration, BillingGroupUpdate, BillingGroupUpdateRefusal,
-    RegisteredBillingGroup, FIRST_BILLING_GROUP_VERSION, MAX_BILLING_GROUPS,
-    MAX_BILLING_GROUP_TAGS,
+    billing_group_arn, BillingGroupConfiguration, BillingGroupDeleteRefusal, BillingGroupUpdate,
+    BillingGroupUpdateRefusal, RegisteredBillingGroup, FIRST_BILLING_GROUP_VERSION,
+    MAX_BILLING_GROUPS, MAX_BILLING_GROUP_TAGS,
 };
 
 // How a request that named a resource this service does not hold is REFUSED — the fixed

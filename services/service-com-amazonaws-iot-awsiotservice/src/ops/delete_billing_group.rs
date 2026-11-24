@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the billing group the request names from the billing-group registry
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::billing_groups`]), so a later
+//! `DescribeBillingGroup` of that name is the modelled 404, the name is free for a new
+//! create, and no thing reports membership of it any more.
+//!
+//! A name the registry does not hold removes nothing and still succeeds, which is why this
+//! operation models no `ResourceNotFoundException` at all
+//! (`smithy_query(query="operation",operation="DeleteBillingGroup")` lists InternalFailure,
+//! InvalidRequest, Throttling and VersionConflict): the delete is idempotent.
+//!
+//! `expectedVersion` is read before anything is removed: a value the record is not at is the
+//! modelled `VersionConflictException` (409) and leaves the group — and its version — exactly
+//! as they were, the same optimistic concurrency `UpdateBillingGroup` runs under.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +111,34 @@ impl From<DeleteBillingGroupErrorModeled> for DeleteBillingGroupError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the request
+/// PRESENTED (the SigV4 access key id, a public identifier and never a secret), the request
+/// target, the group the call named and how the call ended.
+///
+/// A delete is the one call that makes a billing group stop existing, so without a record
+/// nothing about it is observable afterwards — the group it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it and
+/// strips the control characters that would otherwise forge a second record; the subscriber
+/// supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    billing_group_name: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteBillingGroup",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        billing_group_name = %crate::state::audit_field(billing_group_name),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteBillingGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -142,18 +175,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBillingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteBillingGroupErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The whole decision and the whole removal happen under ONE lock, so no caller can
+        // observe the registry between the version check and the record going away.
+        let removal = state
+            .lock()
+            // The ONE registry write that makes a billing group stop existing
+            // (`crate::state::ComAmazonawsIotAwsiotserviceState::delete_billing_group`): it
+            // reads `expectedVersion` before it removes anything, and answers the record it
+            // removed — or nothing at all, for a name the registry does not hold.
+            .delete_billing_group(&input.billing_group_name, input.expected_version);
+
+        match removal {
+            Ok(Some(_)) => audit(ctx, &input.billing_group_name, "deleted"),
+            // What the call DID is the one thing a later reader cannot recover, and "the
+            // registry held no such group" is as much of that as a removal is.
+            Ok(None) => audit(ctx, &input.billing_group_name, "no-such-billing-group"),
+            Err(refusal) => {
+                audit(ctx, &input.billing_group_name, "version-conflict");
+                // `expectedVersion` naming a version the record is not at is the modelled
+                // `VersionConflictException` (HTTP 409), worded the way this family words a
+                // version conflict, and nothing was removed.
+                return Err(DeleteBillingGroupErrorModeled::VersionConflictException(
+                    VersionConflictException {
+                        message: Some(refusal.message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `DeleteBillingGroup` models no output members at all, so a successful delete is an
+        // empty 200; that the group is gone is read back through `DescribeBillingGroup`.
+        Ok(DeleteBillingGroupOutput {})
     }
 }
+
