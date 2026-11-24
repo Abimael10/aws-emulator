@@ -2,12 +2,13 @@
 
 //! What a `SearchVectors` result carries of the VECTOR the index found the item by.
 //!
-//! RULE under test: **a result "contains the projected attributes and a similarity score"
-//! (`SearchVectors$SearchResults`), and the vector attribute is one of the projected
-//! attributes — it is the index's own key attribute, and "the primary key attributes and
-//! index key attributes … are automatically projected" (`Projection`) — so every result
-//! carries it, in the form the INDEX holds it in: "each element is a 32-bit IEEE-754
-//! floating point number" (`SearchVectors$SearchVector`, the shape
+//! RULE under test: **the vector attribute an index finds an item by is retrieved only
+//! where the request NAMES it — "a string that identifies one or more attributes to
+//! retrieve from the index … if not specified, the operation returns all attributes
+//! projected into the vector index" (`SearchVectors$ProjectionExpression`) — so a default
+//! retrieval answers the entry's other attributes and a `ProjectionExpression` naming the
+//! vector hands it back in the form the INDEX holds it in: "each element is a 32-bit
+//! IEEE-754 floating point number" (`SearchVectors$SearchVector`, the shape
 //! `VectorIndex$VectorAttribute` names on an item), so a coordinate no such float
 //! represents exactly comes back as the one it rounds to. The TABLE's own item is
 //! untouched: a `GetItem` of it answers the decimals the write carried.**
@@ -45,7 +46,8 @@ struct Row {
     written: &'static [&'static str],
     /// The coordinates the index HOLDS, as the decimals a result carries them in.
     held: &'static [&'static str],
-    /// The attribute names a result is expected to carry, sorted.
+    /// The attribute names a result of a DEFAULT retrieval is expected to carry, sorted —
+    /// the entry's attributes without the vector the index finds the item by.
     reported: &'static [&'static str],
 }
 
@@ -62,7 +64,7 @@ fn rows() -> Vec<Row> {
             projection: || json!({"ProjectionType": "ALL"}),
             written: &["1", "0"],
             held: &["1.0", "0.0"],
-            reported: &["emb", "note", "pk"],
+            reported: &["note", "pk"],
         },
         Row {
             case: "a EUCLIDEAN index projecting its keys alone",
@@ -73,7 +75,7 @@ fn rows() -> Vec<Row> {
             projection: || json!({"ProjectionType": "KEYS_ONLY"}),
             written: &["0.5", "-1.25", "2"],
             held: &["0.5", "-1.25", "2.0"],
-            reported: &["features", "pk"],
+            reported: &["pk"],
         },
         Row {
             case: "a DOT_PRODUCT index over a coordinate no 32-bit float holds",
@@ -84,7 +86,7 @@ fn rows() -> Vec<Row> {
             projection: || json!({"ProjectionType": "INCLUDE", "NonKeyAttributes": ["note"]}),
             written: &["16777217"],
             held: &["16777216.0"],
-            reported: &["note", "pk", "v"],
+            reported: &["note", "pk"],
         },
         Row {
             case: "a coordinate with more decimal digits than the type carries",
@@ -95,7 +97,7 @@ fn rows() -> Vec<Row> {
             projection: || json!({"ProjectionType": "ALL"}),
             written: &["1.2345678901234567", "16777218"],
             held: &["1.2345679", "16777218.0"],
-            reported: &["emb", "note", "pk"],
+            reported: &["note", "pk"],
         },
     ]
 }
@@ -188,7 +190,7 @@ fn reported_attributes(answered: &Value) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_search_reports_the_indexed_vector_as_the_index_holds_it() {
+async fn a_default_retrieval_leaves_out_the_vector_the_index_finds_items_by() {
     let router = emulator();
     let rows = rows();
     // Every table is created first, so the spans the clock owes their transitions run
@@ -222,18 +224,16 @@ async fn a_search_reports_the_indexed_vector_as_the_index_holds_it() {
         assert_eq!(
             reported,
             row.reported.to_vec(),
-            "case {:?}: expected a result to carry {:?}, got {reported:?} from {answered}",
+            "case {:?}: expected a default retrieval to carry {:?}, got {reported:?} from \
+             {answered}",
             row.case,
             row.reported
         );
-        let carried = answered["SearchResults"][0]["Item"][row.attribute]["L"].clone();
+        let carried = answered["SearchResults"][0]["Item"].get(row.attribute);
         assert_eq!(
-            carried,
-            row.held_vector(),
-            "case {:?}: the result carries the coordinates the index holds ({:?}), got \
-             {carried} from {answered}",
-            row.case,
-            row.held
+            carried, None,
+            "case {:?}: a request naming no projection retrieves no vector, got {answered}",
+            row.case
         );
 
         // The item the TABLE holds keeps the decimals the write carried: what a search hands

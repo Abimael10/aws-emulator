@@ -12,11 +12,12 @@
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
 //! 2. a result carries what the index PROJECTS of its item — "only attributes projected
 //!    into the vector index can be retrieved" (`SearchVectors$ProjectionExpression`), so the
-//!    attributes its `Projection` copies into it beside the table's key, its search schema's
-//!    attributes and the vector attribute it is keyed by, all of which are projected
-//!    automatically ("the primary key attributes and index key attributes, which are
-//!    automatically projected", `Projection`) — narrowed further by a
-//!    `ProjectionExpression`, which reports nothing for a name the index does not project;
+//!    attributes its `Projection` copies into it beside the table's key and its search
+//!    schema's attributes, all of which are projected automatically ("the primary key
+//!    attributes and index key attributes, which are automatically projected",
+//!    `Projection`) — narrowed further by a `ProjectionExpression`, which reports nothing for
+//!    a name the index does not project, and which is what it takes to retrieve the vector
+//!    attribute the index finds the item by;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
 //!    attributes, each PINNED by `=`, and may reference no others;
 //! 4. a request that addresses no searchable index is refused: a table that is not serving
@@ -24,8 +25,9 @@
 //!    search for — one it declares no vector index for, and one whose index has not
 //!    finished building — together with a `SearchVector` that is not the index's shape,
 //!    with `ValidationException`;
-//! 5. `ConsumedCapacity` reports the data the search handed back, in bytes — held to the
-//!    one-kilobyte per-request floor — and only when the request asked for it.
+//! 5. `ConsumedCapacity` reports the work the search did, in bytes — the vector each result
+//!    was scored by and the attributes it handed back, held to the one-kilobyte per-request
+//!    floor — and only when the request asked for it.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -357,26 +359,22 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // its `Projection` copies there, beside "the primary key attributes and index key
     // attributes, which are automatically projected" (`Projection`) — the table's key, the
     // attributes its search schema is keyed and filtered by, and the vector attribute `emb`
-    // itself, which is the index's own key attribute — so every row reports `emb` unless the
-    // request narrows it away.
+    // itself, which is the index's own key attribute. Of those, `emb` is retrieved only
+    // where the request NAMES it: "if not specified, the operation returns all attributes
+    // projected into the vector index", and the embedding is not in that default set.
     let cases: [(&str, Value, Value, &[&str]); 9] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "note", "pk", "tenant"],
+            &["brand", "note", "pk", "tenant"],
         ),
-        (
-            "keys-index",
-            Value::Null,
-            Value::Null,
-            &["emb", "pk", "tenant"],
-        ),
+        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "pk", "tenant"],
+            &["brand", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -997,13 +995,10 @@ async fn consumed_capacity_reports_the_index_data_the_search_read() {
         "every search over the same index must read the same bytes, got {reported:?}"
     );
 
-    // The figure is the data the search HANDED BACK, held to the one-kilobyte per-request
-    // floor, so rows that hand back less are charged less — down to that floor. The rows
+    // The figure is the work the search DID, held to the one-kilobyte per-request floor, so
+    // rows that score and hand back less are charged less — down to that floor. The rows
     // differ in how much the search reports: the index that projects less, and a `TopK`
-    // that asks for fewer results. What a `ProjectionExpression` does to the figure is NOT
-    // pinned here: whether narrowing a result to its key takes the charge all the way down
-    // to the floor is the one part of this meter still open, so no row asserts it either
-    // way.
+    // that asks for fewer results.
     let smaller: [(&str, Value); 2] = [
         (
             "a KEYS_ONLY index over the same items",

@@ -357,17 +357,13 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
     );
 }
 
-/// RULE 1 at the item-size CEILING: WHO answers for a change that would leave the item past
-/// the documented 400 KB ceiling follows WHERE the bytes came from. An `Update` whose own
-/// payload — the key it addresses plus what its clauses write — does not fit in an item asks
-/// for something no table could hold whatever the store holds, so the CALL is refused with the
-/// sentence the update path words that quota with, grading no action and reporting no reason
-/// list. An `Update` whose payload fits and whose result crosses the ceiling only over what the
-/// STORED item already held is "an item size becomes too large (larger than 400 KB) [...]
-/// because of changes made by the transaction", one of the circumstances
-/// `TransactionCanceledException` documents, so the transaction is CANCELLED and the reason
-/// list names that action with the same sentence, every blameless action beside it reporting
-/// `None`.
+/// RULE 1 at the item-size CEILING: a change an `Update` action would leave past the
+/// documented 400 KB ceiling is found by applying that action against the item its key holds,
+/// which makes it "an item size becomes too large (larger than 400 KB) [...] or a similar
+/// validation error occurs because of changes made by the transaction" — one of the
+/// circumstances `TransactionCanceledException` documents — so the transaction is CANCELLED
+/// and the reason list names that action with the sentence the update path words that quota
+/// with, every blameless action beside it reporting `None`.
 ///
 /// The rows differ along what the rule generalises over: HOW the ceiling is crossed (one
 /// oversized value, two clauses that only cross together, a value the update COMPUTES from
@@ -376,21 +372,23 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
 /// beside an action whose condition does not hold).
 ///
 /// The other side of the rule is driven beside them: an item a `Put` CARRIES past the ceiling
-/// is too large as SUBMITTED, so it earns the sentence for an item that was carried.
+/// is too large as SUBMITTED — a fact of the REQUEST, settled before any of the transaction is
+/// applied — so it refuses the CALL with the sentence for an item that was carried.
 #[tokio::test]
-async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_class() {
+async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_that_action() {
     let router = seeded().await;
 
     // Past the documented 400 KB item ceiling in one value, and in two clauses that only
     // cross it together.
     let oversize = "x".repeat(400 * 1024);
     let half = "y".repeat(210 * 1024);
-    // Each row: the case and the actions the transaction carries. Every one of them asks for
-    // an item no table could hold, so every one refuses the CALL.
-    let refused: Vec<(&str, Value)> = vec![
+    // Each row: the case, the actions the transaction carries, and the reason every action
+    // reports in request order.
+    let crossings: Vec<CancellationRow> = vec![
         (
             "the oversized action alone",
             json!([update("SET big = :v", json!({":v": {"S": oversize.clone()}}))]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action before one that would succeed",
@@ -398,6 +396,7 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_c
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}})),
                 put("after-the-ceiling")
             ]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG)), ("None", None)],
         ),
         (
             "the oversized action after one that would succeed",
@@ -405,6 +404,7 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_c
                 put("before-the-ceiling"),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
+            vec![("None", None), ("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action beside a condition that does not hold",
@@ -412,6 +412,10 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_c
                 failing_check(),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
+            vec![
+                ("ConditionalCheckFailed", Some(CONDITION_FAILED)),
+                ("ValidationError", Some(UPDATE_TOO_BIG)),
+            ],
         ),
         (
             "two clauses that cross the ceiling together",
@@ -419,6 +423,7 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_c
                 "SET one = :a, two = :b",
                 json!({":a": {"S": half.clone()}, ":b": {"S": half.clone()}})
             )]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             // The value the update COMPUTES crosses the ceiling, and both operands are the
@@ -428,30 +433,19 @@ async fn an_update_the_transaction_grows_past_the_item_ceiling_takes_its_bytes_c
                 "SET joined = list_append(:a, :b)",
                 json!({":a": {"L": [{"S": half.clone()}]}, ":b": {"L": [{"S": half.clone()}]}})
             )]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
     ];
 
-    for (case, actions) in refused {
-        let (status, answered) = call(
-            &router,
-            "TransactWriteItems",
-            json!({"TransactItems": actions}),
-        )
-        .await;
+    for (case, actions, expected) in crossings {
+        let reported = cancellation(&router, case, json!({"TransactItems": actions})).await;
+        let expected: Vec<(String, Option<String>)> = expected
+            .iter()
+            .map(|(code, stated)| ((*code).to_string(), stated.map(str::to_string)))
+            .collect();
         assert_eq!(
-            (
-                status,
-                error_code(&answered).as_str(),
-                message(&answered).as_str()
-            ),
-            (400, "ValidationException", UPDATE_TOO_BIG),
-            "case {case:?}: expected the call refused with the update path's ceiling sentence, \
-             got {status} with {answered}"
-        );
-        assert!(
-            answered.get("CancellationReasons").is_none(),
-            "case {case:?}: a refused call grades no action, so it reports no reason list, got \
-             {answered}"
+            reported, expected,
+            "case {case:?}: expected the reasons {expected:?}, got {reported:?}"
         );
     }
 

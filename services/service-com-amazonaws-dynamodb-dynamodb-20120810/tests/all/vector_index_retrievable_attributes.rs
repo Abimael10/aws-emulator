@@ -10,9 +10,11 @@
 //! key, the attributes its `SearchSchema` is keyed and filtered by ("an attribute
 //! projected into the vector index for filtering at the storage layer during search",
 //! `SearchSchemaElement$SearchSchemaElementType`), and the VECTOR attribute, which is the
-//! index's own key attribute. So a search hands the vector back like every other projected
-//! attribute — in the form the index holds it in — and hands back nothing the table holds
-//! outside what the index projects.
+//! index's own key attribute. So a search hands back nothing the table holds outside what
+//! the index projects — and of what it projects, the vector attribute is retrieved only
+//! where a `ProjectionExpression` NAMES it: "if not specified, the operation returns all
+//! attributes projected into the vector index", and the embedding the index finds an item by
+//! is not part of that default retrieval set.
 //!
 //! The table spans what the rule generalises over: every `ProjectionType` the model
 //! declares, an `INCLUDE` that names the vector attribute and one that does not, a search
@@ -118,7 +120,8 @@ async fn search(
 }
 
 /// One row: the index, whether it partitions by `tenant`, and the attributes a search
-/// through it reports — with no `ProjectionExpression`, and narrowed to `vec, note`.
+/// through it reports — with no `ProjectionExpression` (where the vector is withheld), and
+/// narrowed to `vec, note` (where naming it retrieves it).
 struct Row {
     index: &'static str,
     partitioned: bool,
@@ -192,31 +195,31 @@ async fn a_search_hands_back_only_what_the_vector_index_projects() {
         Row {
             index: "all",
             partitioned: false,
-            whole: &["extra", "note", "pk", "tenant", "tier", "vec"],
+            whole: &["extra", "note", "pk", "tenant", "tier"],
             narrowed: &["note", "vec"],
         },
         Row {
             index: "keys-only",
             partitioned: false,
-            whole: &["pk", "vec"],
+            whole: &["pk"],
             narrowed: &["vec"],
         },
         Row {
             index: "include-note",
             partitioned: false,
-            whole: &["note", "pk", "vec"],
+            whole: &["note", "pk"],
             narrowed: &["note", "vec"],
         },
         Row {
             index: "include-the-vector",
             partitioned: false,
-            whole: &["pk", "vec"],
+            whole: &["pk"],
             narrowed: &["vec"],
         },
         Row {
             index: "include-note-filtered",
             partitioned: true,
-            whole: &["note", "pk", "tenant", "tier", "vec"],
+            whole: &["note", "pk", "tenant", "tier"],
             narrowed: &["note", "vec"],
         },
     ];
@@ -317,9 +320,16 @@ async fn a_composite_key_is_projected_into_a_vector_index_whole() {
     let reported = reported_attributes(&answered);
     assert_eq!(
         reported,
+        vec!["pk".to_string(), "sk".to_string()],
+        "case \"a composite key\": both key attributes are projected automatically, and \
+         nothing else is retrieved by default, got {reported:?} from {answered}"
+    );
+    let narrowed = search(&router, table, "keys-only", false, Some("pk, sk, vec")).await;
+    let reported = reported_attributes(&narrowed);
+    assert_eq!(
+        reported,
         vec!["pk".to_string(), "sk".to_string(), "vec".to_string()],
-        "case \"a composite key\": both key attributes are projected automatically, beside \
-         the vector the index is keyed by, and nothing else is, got {reported:?} from \
-         {answered}"
+        "case \"a composite key narrowed to the vector beside it\": naming the vector \
+         retrieves it beside both key attributes, got {reported:?} from {narrowed}"
     );
 }

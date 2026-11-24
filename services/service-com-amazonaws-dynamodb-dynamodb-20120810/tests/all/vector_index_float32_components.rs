@@ -13,14 +13,14 @@
 //! the rounding does.
 //!
 //! The held copy is observed twice over: a search answers "the similarity score for this
-//! item relative to the search vector" (`SearchResultItem$Score`) beside the attributes the
-//! index PROJECTS of the item (`SearchResultItem$Item`), the vector attribute among them —
-//! it is the index's own key attribute, and "the primary key attributes and index key
-//! attributes … are automatically projected" (`Projection`) — so a result carries the
-//! coordinates as the index holds them. Over `DOT_PRODUCT` against the all-ones search
-//! vector the score is the sum of the held coordinates, so a coordinate the type cannot
-//! represent and the coordinate it rounds to score IDENTICALLY while every neighbour of them
-//! scores apart — which is the rounding, observed.
+//! item relative to the search vector" (`SearchResultItem$Score`) beside the attributes it
+//! RETRIEVES of the item (`SearchResultItem$Item`), the vector attribute among them wherever
+//! the request's `ProjectionExpression` names it — "a string that identifies one or more
+//! attributes to retrieve from the index" (`SearchVectors$ProjectionExpression`) — so such a
+//! result carries the coordinates as the index holds them. Over `DOT_PRODUCT` against the
+//! all-ones search vector the score is the sum of the held coordinates, so a coordinate the
+//! type cannot represent and the coordinate it rounds to score IDENTICALLY while every
+//! neighbour of them scores apart — which is the rounding, observed.
 //!
 //! The rows span what the rule generalises over: a coordinate a 32-bit float holds exactly
 //! (a whole number, a power of two, a half), the first whole number it does NOT hold
@@ -208,6 +208,27 @@ async fn search_every_row(router: &smithy_server_runtime::MultiServiceRouter) ->
     .await
 }
 
+/// The same search, retrieving the key BESIDE the vector the index found each item by:
+/// "a string that identifies one or more attributes to retrieve from the index. Separate
+/// attribute names with commas" (`SearchVectors$ProjectionExpression`), which is what it
+/// takes to see the coordinates the index holds.
+async fn search_every_row_retrieving_the_vector(
+    router: &smithy_server_runtime::MultiServiceRouter,
+) -> Value {
+    ok(
+        router,
+        "SearchVectors",
+        json!({
+            "TableName": TABLE,
+            "IndexName": INDEX,
+            "SearchVector": [{"N": COMPANION}, {"N": COMPANION}],
+            "TopK": rows().len(),
+            "ProjectionExpression": "pk, emb",
+        }),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
     let router = emulator();
@@ -267,13 +288,14 @@ async fn a_vector_index_scores_each_coordinate_as_the_float32_it_is_held_as() {
 async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
     let router = emulator();
     stored_rows(&router).await;
-    let answered = search_every_row(&router).await;
+    let answered = search_every_row_retrieving_the_vector(&router).await;
 
     // A result "contains the projected attributes and a similarity score"
-    // (`SearchVectors$SearchResults`), and the vector attribute is projected into the index
-    // as its own key attribute ("the primary key attributes and index key attributes … are
-    // automatically projected", `Projection`) — so every result carries it, in the form the
-    // INDEX holds it in: the 32-bit float each written decimal rounds to.
+    // (`SearchVectors$SearchResults`), and a `ProjectionExpression` naming the vector
+    // attribute retrieves it — in the form the INDEX holds it in: the 32-bit float each
+    // written decimal rounds to. A request naming no projection retrieves no vector at all,
+    // which is the default half of this rule.
+    let whole = search_every_row(&router).await;
     for (at, row) in rows().iter().enumerate() {
         let result = result_for(&answered, &key_of(at));
         assert_eq!(
@@ -281,6 +303,14 @@ async fn a_search_reports_the_vector_attribute_as_the_index_holds_it() {
             json!(row.held),
             "case {:?}: a search hands the coordinate back as the float32 the index holds, \
              got {result} of {answered}",
+            row.case
+        );
+        let default = result_for(&whole, &key_of(at));
+        assert_eq!(
+            default["Item"].get("emb"),
+            None,
+            "case {:?}: a request naming no projection retrieves no vector, got {default} of \
+             {whole}",
             row.case
         );
         // Read back off the TABLE's item, the coordinate is the decimal the write carried:

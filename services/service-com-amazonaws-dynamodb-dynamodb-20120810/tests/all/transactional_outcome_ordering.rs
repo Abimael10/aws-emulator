@@ -215,9 +215,9 @@ async fn an_actions_condition_is_read_before_the_change_it_states_is_applied() {
         );
     }
 
-    // An item past the documented ceiling is the one defect of an applied change that
-    // refuses the CALL rather than cancelling it — and it, too, is only reached once the
-    // condition holds.
+    // An item past the documented ceiling is a defect of the applied change like the others,
+    // so it too is only reached once the condition holds — and then it is that action's own
+    // cancellation reason.
     let oversize = json!({":v": {"S": "x".repeat(400 * 1024)}});
     let (reported, said) = cancellation(
         &router,
@@ -240,25 +240,26 @@ async fn an_actions_condition_is_read_before_the_change_it_states_is_applied() {
         "case a change past the item ceiling with the condition failing: expected the \
          condition named, got {said:?}"
     );
-    let (status, answered) = call(
+    let (reported, said) = cancellation(
         &router,
-        "TransactWriteItems",
+        "a change past the item ceiling with the condition holding",
         json!({"TransactItems": [guarded_update("SET big = :v", oversize, "ON")]}),
     )
     .await;
     assert_eq!(
-        (
-            status,
-            error_code(&answered).as_str(),
-            message(&answered).as_str()
-        ),
-        (
-            400,
-            "ValidationException",
-            "Item size to update has exceeded the maximum allowed size"
-        ),
-        "case a change past the item ceiling with the condition holding: expected the call \
-         refused, got {status} with {answered}"
+        reported,
+        vec![(
+            "ValidationError".to_string(),
+            Some("Item size to update has exceeded the maximum allowed size".to_string())
+        )],
+        "case a change past the item ceiling with the condition holding: expected that \
+         action's reason to word the ceiling, got {reported:?}"
+    );
+    assert_eq!(
+        said,
+        cancelled_message(&["ValidationError"]),
+        "case a change past the item ceiling with the condition holding: expected the \
+         validation code named, got {said:?}"
     );
 
     // NOTHING any of those transactions carried was applied: the seeded item is exactly as

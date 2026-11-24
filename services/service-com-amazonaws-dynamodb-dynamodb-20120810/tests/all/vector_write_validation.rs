@@ -21,7 +21,7 @@
 //! 4. an accepted `Create` adds the index it describes — the table is `UPDATING` while the
 //!    index is `CREATING`, the description reports the configuration the request named, and
 //!    once it is `ACTIVE` a `SearchVectors` through it answers the table's items, each
-//!    carrying the attributes the new index projects.
+//!    carrying the attributes the new index retrieves.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -555,10 +555,11 @@ async fn a_created_vector_index_becomes_a_searchable_index_of_the_table() {
     );
 
     // The new index holds the items the table carries under its own attribute, so a search
-    // through it answers them — each with the attributes the index PROJECTS, which is what
-    // can be retrieved through it (`SearchVectors$ProjectionExpression`): the table's key,
-    // the non-key attributes its `Projection` names and the vector it finds them by, which
-    // is projected automatically as the index's own key attribute.
+    // through it answers them — each with the attributes it RETRIEVES, which is what the
+    // index projects ("only attributes projected into the vector index can be retrieved",
+    // `SearchVectors$ProjectionExpression`): the table's key and the non-key attributes its
+    // `Projection` names, the vector it finds them by coming back only where a
+    // `ProjectionExpression` names it.
     ok(
         &router,
         "PutItem",
@@ -603,8 +604,8 @@ async fn a_created_vector_index_becomes_a_searchable_index_of_the_table() {
     attributes.sort();
     assert_eq!(
         attributes,
-        vec!["emb2".to_string(), "note".to_string(), "pk".to_string()],
+        vec!["note".to_string(), "pk".to_string()],
         "case \"a search through the created index\": expected the attributes the index \
-         projects, got {found}"
+         retrieves by default, got {found}"
     );
 }

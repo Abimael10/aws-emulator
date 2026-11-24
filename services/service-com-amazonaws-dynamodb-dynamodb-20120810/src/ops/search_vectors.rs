@@ -9,14 +9,15 @@
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
 //! index covers, carrying a vector of the index's dimensions), and each result item is the
-//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]), narrowed by
-//! the `ProjectionExpression` the request sent — "only attributes projected into the vector
-//! index can be retrieved" (`SearchVectors$ProjectionExpression`), so a search reports the
-//! attributes the index projects and nothing the table holds outside them. The vector
-//! attribute is one of those attributes: it is the index's own key attribute, and "the
-//! primary key attributes and index key attributes … are automatically projected"
-//! (`Projection`), so a result carries it as the INDEX holds it — a list of 32-bit floats
-//! ([`crate::state::stored_vector`]) — beside the score computed from it.
+//! entry the index HOLDS for it ([`crate::state::VectorIndex::index_entry`]), narrowed to
+//! what the request RETRIEVES — "only attributes projected into the vector index can be
+//! retrieved" (`SearchVectors$ProjectionExpression`), so a search reports the attributes the
+//! index projects and nothing the table holds outside them. The vector attribute the index
+//! finds an item by is the one attribute a default retrieval leaves out: a
+//! `ProjectionExpression` that NAMES it retrieves it, as the INDEX holds it — a list of
+//! 32-bit floats ([`crate::state::stored_vector`]) — and a request that names no projection
+//! is answered the entry's other attributes beside the score
+//! ([`retrieved_attributes`]).
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -456,37 +457,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let top_k = usize::try_from(input.top_k).unwrap_or(0);
         let mut search_results: Vec<SearchResultItem> = Vec::new();
         let mut reported_bytes: i64 = 0;
-        // What the search METERS is the index ENTRIES it READ:
-        // `VectorSearchRequestBytes` is "the number of vector search request bytes
-        // consumed" (`VectorCapacity$VectorSearchRequestBytes`), and a similarity search
-        // walks the index to the most similar entries rather than reading every one of
-        // them — so the figure is what those entries carry, each sized as the index holds
-        // it ([`crate::state::Table::metered_item_size`], a vector at four bytes per
-        // dimension), whether or not the response hands every attribute back; it grows
-        // with the `TopK` the request asked for, with the index's `Dimensions` and with
-        // the attributes the projection reads, never with how many items the table
+        // What a search METERS is the work it did: `VectorSearchRequestBytes` is "the
+        // number of vector search request bytes consumed"
+        // (`VectorCapacity$VectorSearchRequestBytes`), and the work of one result is the
+        // VECTOR the index was walked to and scored by — four bytes a dimension, the form
+        // the index holds it in ([`crate::state::BYTES_PER_VECTOR_DIMENSION`]) — plus the
+        // attributes that result HANDS BACK, sized as this table meters an item
+        // ([`crate::state::Table::metered_item_size`]). So the figure grows with the
+        // `TopK` the request asked for, with the index's `Dimensions` and with the
+        // attributes the projection retrieves, and never with how many items the table
         // happens to hold.
         let mut metered_bytes: i64 = 0;
+        let scored_bytes = index
+            .dimensions
+            .saturating_mul(crate::state::BYTES_PER_VECTOR_DIMENSION);
         for (score, item) in ranked.into_iter().take(top_k) {
             if !search_results.is_empty() && page_budget_spent(reported_bytes) {
                 break;
             }
             // The entry the index HOLDS for the item is what this search read, with the
             // vector as the index holds it — a list of 32-bit floats
-            // ([`crate::state::VectorIndex::index_entry`]) — narrowed by the projection
-            // the request named.
+            // ([`crate::state::VectorIndex::index_entry`]) — narrowed to what this request
+            // RETRIEVES.
             let entry = index.index_entry(item, &table.key_schema);
-            // What the search read IS what it hands back: a result "contains the projected
-            // attributes and a similarity score" (`SearchVectors$SearchResults`), and the
-            // vector attribute is projected into the index as its own key attribute ("the
-            // primary key attributes and index key attributes … are automatically
-            // projected", `Projection`), so it comes back like every other attribute the
-            // index holds — in the float32 form the index holds it in, beside the score.
-            let reported = match requested_attributes.as_ref() {
-                Some(requested) => crate::state::project_paths(&entry, requested),
-                None => entry,
-            };
-            metered_bytes = metered_bytes.saturating_add(table.metered_item_size(&reported));
+            let reported = retrieved_attributes(
+                entry,
+                requested_attributes.as_ref(),
+                &index.vector_attribute.attribute_name,
+            );
+            metered_bytes = metered_bytes
+                .saturating_add(scored_bytes)
+                .saturating_add(table.metered_item_size(&reported));
             reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&reported));
             search_results.push(SearchResultItem {
                 item: Some(reported),
@@ -648,15 +649,47 @@ fn projected_attributes(
     .map_err(lift)
 }
 
+/// What ONE result RETRIEVES of the entry the index holds for it: the attributes the
+/// request asked to retrieve, or — where it asked for none — the entry WITHOUT the vector
+/// attribute the index finds an item by.
+///
+/// "A string that identifies one or more attributes to retrieve from the index … If not
+/// specified, the operation returns all attributes projected into the vector index. Only
+/// attributes projected into the vector index can be retrieved"
+/// (`SearchVectors$ProjectionExpression`): the vector attribute IS projected into the index
+/// — it is the index's own key attribute, and a condition filters on the entry carrying it
+/// — so a `ProjectionExpression` that names it retrieves it, in the float32 form the index
+/// holds it in ([`crate::state::stored_vector`]). It is not part of the DEFAULT retrieval
+/// set, though: a search of an index answers the attributes a client searches BY the vector
+/// for, and the embedding itself comes back only where the request asked for it by name.
+///
+/// So the vector is withheld from a default retrieval whatever the index's `Projection`
+/// stores, and every other attribute of the entry is reported exactly as the index holds
+/// it.
+fn retrieved_attributes(
+    entry: crate::state::Item,
+    requested: Option<&Vec<crate::state::DocumentPath>>,
+    vector_attribute: &str,
+) -> crate::state::Item {
+    match requested {
+        Some(requested) => crate::state::project_paths(&entry, requested),
+        None => entry
+            .into_iter()
+            .filter(|(name, _)| name != vector_attribute)
+            .collect(),
+    }
+}
+
 /// What a search consumed, as this operation reports it, or `None` when the request asked
 /// for `NONE` (or did not ask at all).
 ///
 /// `VectorCapacity` denominates a search in BYTES ("ConsumedCapacity … Contains
 /// VectorSearchRequestBytes, which represents the vector search capacity consumed" —
-/// `SearchVectors$ConsumedCapacity`), so what is reported is the data this search HANDED
-/// BACK: the bytes of each result as the index holds it, a vector at the four bytes per
-/// dimension it is stored as, held to the same one-kilobyte floor a vector write is held to
-/// ([`crate::state::MIN_VECTOR_REQUEST_BYTES`]) — a small search costs that minimum rather
+/// `SearchVectors$ConsumedCapacity`), so what is reported is the work this search did: for
+/// each result, the vector it was scored by — four bytes a dimension, the form the index
+/// holds it in ([`crate::state::BYTES_PER_VECTOR_DIMENSION`]) — plus the attributes it
+/// handed back, held to the same one-kilobyte floor a vector write is held to
+/// ([`crate::state::MIN_VECTOR_REQUEST_BYTES`]): a small search costs that minimum rather
 /// than its own few bytes. Nothing was written, so the write figure is left out.
 fn consumed_vector_capacity(requested: Option<&str>, metered_bytes: i64) -> Option<VectorCapacity> {
     match requested {
