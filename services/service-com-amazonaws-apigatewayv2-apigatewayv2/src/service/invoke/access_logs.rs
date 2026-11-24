@@ -109,7 +109,7 @@ fn planned<Eng: Send + Sync + 'static>(
     let store = state.lock();
     let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
     let api = resolved.api;
-    let (stage, route) = super::routed_target(api, resolved.invoke_path)?;
+    let (stage, route) = super::routed_target(api, &resolved.invoke_path)?;
     let settings = stage.access_log_settings.as_ref()?;
     let destination = settings.destination_arn.as_deref()?;
     let format = settings.format.as_deref()?;

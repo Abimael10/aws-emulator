@@ -402,7 +402,21 @@ fn addressed_to_this_domain_name(domain_name: &str, parts: &::http::request::Par
     if host.is_empty() {
         return false;
     }
-    if ::emulator_server::is_loopback_host(host) || host.eq_ignore_ascii_case(domain_name) {
+    ::emulator_server::is_loopback_host(host) || host_names_domain_name(domain_name, host)
+}
+
+/// Whether `host` is the name the record `domain_name` stands for: the name itself, compared
+/// case-insensitively as a DNS name is (RFC 4343), or ONE label under the suffix of a wildcard
+/// record — `*.example.com` is the name `shop.example.com` resolves, and `a.b.example.com` is
+/// not under it (`DomainName$DomainName` admits a wildcard name).
+///
+/// `pub(super)` because both front doors of a custom domain name ask it: this socket, of the
+/// one record its address was published for, and the data plane that looks a record up by the
+/// host a request addressed ([`super::invoke::custom_domain_arrival`]). `host` is a host with
+/// no userinfo or port.
+pub(super) fn host_names_domain_name(domain_name: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case(domain_name) {
         return true;
     }
     // A wildcard domain name stands for ONE label under its own suffix: `*.example.com` is the
@@ -413,10 +427,12 @@ fn addressed_to_this_domain_name(domain_name: &str, parts: &::http::request::Par
     if suffix.is_empty() {
         return false;
     }
-    let under = host
-        .strip_suffix(suffix)
-        .and_then(|label| label.strip_suffix('.'));
-    under.is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    let under = host.to_ascii_lowercase();
+    let suffix = suffix.to_ascii_lowercase();
+    under
+        .strip_suffix(&suffix)
+        .and_then(|label| label.strip_suffix('.'))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
 }
 
 /// The leading label a wildcard custom domain name stands for every single label with.
@@ -433,15 +449,11 @@ fn addressed_mapping(record: &crate::state::DomainName, target: &::http::Uri) ->
     let Some((mapping, under)) = matching_mapping(record, target.path()) else {
         return Addressed::Refused(FORBIDDEN, FORBIDDEN_MESSAGE);
     };
-    // The STAGE the mapping names, as the api's own invoke path spells it: a named stage is
-    // reached with its name as the first path segment, and the stage that serves the api's
-    // root ([`crate::state::DEFAULT_STAGE_NAME`]) with no stage segment at all — its name is
-    // a reserved word of this service, never a path segment of a deployment.
-    let stage = if mapping.stage == crate::state::DEFAULT_STAGE_NAME {
-        String::new()
-    } else {
-        format!("/{}", mapping.stage)
-    };
+    // The path WITHIN the api that the mapping selects — the stage it names, then what the
+    // client carried under the base path — read through the ONE statement of that composition
+    // both front doors of a custom domain name share
+    // ([`super::invoke::custom_domain_arrival::invoke_path`]).
+    let within_api = super::invoke::custom_domain_arrival::invoke_path(&mapping.stage, under);
     let prefix = format!(
         "/{marker}/{label}/{api}",
         marker = crate::state::LOCAL_ENDPOINT_PREFIX,
@@ -452,16 +464,7 @@ fn addressed_mapping(record: &crate::state::DomainName, target: &::http::Uri) ->
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    // What the client carried UNDER the base path, with its separator — and nothing at all
-    // where it carried nothing: the api's own endpoint was addressed at the stage's root, and
-    // a `/` written here would be one more segment of the path the api reports than the client
-    // sent (`crate::service::invoke::Target` counts the empty segment a trailing `/` makes).
-    let within = if under.is_empty() {
-        String::new()
-    } else {
-        format!("/{under}")
-    };
-    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{stage}{within}{query}");
+    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{within_api}{query}");
     // READ BACK off the rendered target: the path under the base path is the CLIENT's own, so
     // this is the assertion that nothing it carried moved the request to another api, another
     // plane of this process or another service.
@@ -490,10 +493,16 @@ fn addressed_mapping(record: &crate::state::DomainName, target: &::http::Uri) ->
 /// an api the mapping does not name. The reading is the tree's one
 /// (`service_common::data_plane_addressing::carries_a_dot_segment`), which resolves the
 /// escapes before it splits the path, so a separator hidden in an escape is seen too.
-fn matching_mapping<'r>(
+///
+/// `pub(super)` because BOTH front doors of a custom domain name read its mappings: this
+/// socket, which re-addresses the request it accepted, and the data plane that resolves a
+/// request addressed to the domain NAME at this emulator's own endpoint
+/// ([`super::invoke::custom_domain_arrival`]). One reading, so the two cannot disagree about
+/// which mapping answers a path.
+pub(super) fn matching_mapping<'r, 'p>(
     record: &'r crate::state::DomainName,
-    path: &'r str,
-) -> Option<(&'r crate::state::ApiMapping, &'r str)> {
+    path: &'p str,
+) -> Option<(&'r crate::state::ApiMapping, &'p str)> {
     if ::service_common::data_plane_addressing::carries_a_dot_segment(path) {
         return None;
     }

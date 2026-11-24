@@ -583,10 +583,14 @@ async fn a_deployed_http_api_serves_its_default_lambda_route_with_the_apis_cors_
     }
 
     // 5. The stack is torn down, and the endpoint stops serving: an `execute-api` address
-    // whose api id resolves to no api is refused by the endpoint space itself, with `403`
-    // `{"message": "Forbidden"}`, whether the api behind it was deleted or never existed at
-    // all — nothing of an api is read for such an address, so it is not the `404` an api
-    // answers for a route it does not carry.
+    // whose api id resolves to no api is answered by the endpoint space itself, whether the api
+    // behind it was deleted or never existed at all — the gateway's own `404`
+    // `{"message": "Not Found"}` at the api's ROOT, which is the url an HTTP api publishes and
+    // which names no stage to place, and `403` `{"message": "Forbidden"}` for a path that does
+    // name one. (The rule over both, and over every addressing, is
+    // `apigateway_unresolved_execute_api_endpoint.rs` and
+    // `services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/\
+    // http_api_unresolved_endpoint_root.rs`.)
     let deleted = cloudformation(&router, "DeleteStack", &[("StackName", stack)]).await;
     assert_eq!(
         deleted.status, 200,
@@ -623,21 +627,27 @@ async fn a_deployed_http_api_serves_its_default_lambda_route_with_the_apis_cors_
         ),
     ];
     for (case, gone_host, prefix) in gone {
-        for path in ["/", "/anything"] {
+        // The ROOT of the endpoint names no stage at all, so it is the gateway's own
+        // not-found; a path that names one is the endpoint space's refusal.
+        for (path, expected) in [
+            ("/", (404, "Not Found")),
+            ("/anything", (403, "Forbidden")),
+        ] {
+            let (status, message) = expected;
             let addressed = format!("{prefix}{path}");
             let answered =
                 dispatch(&router, "GET", &gone_host, &addressed, &[], Bytes::new()).await;
             assert_eq!(
-                answered.status, 403,
-                "case {case:?}: expected HTTP 403 from GET {gone_host}{addressed}, got {} \
+                answered.status, status,
+                "case {case:?}: expected HTTP {status} from GET {gone_host}{addressed}, got {} \
                  with {:?}",
                 answered.status,
                 answered.text()
             );
             assert_eq!(
                 answered.json(),
-                json!({ "message": "Forbidden" }),
-                "case {case:?}: expected the endpoint space's own refusal body from GET \
+                json!({ "message": message }),
+                "case {case:?}: expected the endpoint space's own body from GET \
                  {gone_host}{addressed}, got {:?}",
                 answered.text()
             );

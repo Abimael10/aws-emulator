@@ -68,7 +68,11 @@ pub(crate) const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The handler every row is served by: it reports the api, the stage and the path the event
 /// says it was invoked for, which is what tells one stage's answer from another's.
-const ECHO: &str = "import json\n\
+///
+/// `pub(crate)` for the suite that drives the OTHER front door of a custom domain name — the
+/// domain name as the `Host` of a request made at this emulator's own endpoint
+/// (`custom_domain_front_door_invoke`) — so both are judged by the same handler's report.
+pub(crate) const ECHO: &str = "import json\n\
      def lambda_handler(event, context):\n\
      \x20   return {\n\
      \x20       'statusCode': 200,\n\
@@ -82,7 +86,10 @@ const ECHO: &str = "import json\n\
      \x20   }\n";
 
 /// One control-plane request against this service, signed for [`REGION`].
-async fn control(
+///
+/// `pub(crate)` with the two setup helpers below, for the suite that drives the same records
+/// through this emulator's own endpoint (`custom_domain_front_door_invoke`).
+pub(crate) async fn control(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -119,7 +126,11 @@ async fn control(
 }
 
 /// Create the custom domain name and answer the address it published.
-async fn given_domain_name(emulator: &MultiServiceRouter, case: &str, domain: &str) -> String {
+pub(crate) async fn given_domain_name(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    domain: &str,
+) -> String {
     let (status, created) = control(
         emulator,
         "POST",
@@ -154,7 +165,7 @@ async fn given_domain_name(emulator: &MultiServiceRouter, case: &str, domain: &s
 }
 
 /// Map `api`'s `stage` onto `key` of the domain name, and answer the mapping's id.
-async fn given_mapping(
+pub(crate) async fn given_mapping(
     emulator: &MultiServiceRouter,
     case: &str,
     domain: &str,

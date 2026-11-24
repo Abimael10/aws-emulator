@@ -1236,7 +1236,10 @@ async fn an_api_this_service_does_not_serve_on_that_host_is_not_claimed() {
     // an endpoint whose api id resolves to no api of this emulator — the address a client
     // keeps calling after the api behind it was deleted. Nothing of an api is read for it,
     // so the shared `execute-api` endpoint space refuses it itself, with `403`
-    // `{"message":"Forbidden"}` rather than leaving it to nothing.
+    // `{"message":"Forbidden"}` rather than leaving it to nothing. The ROOT of such an
+    // endpoint, which names no stage to place at all, is the one address of it answered
+    // `404` `{"message":"Not Found"}` instead
+    // (`http_api_unresolved_endpoint_root.rs`).
     answered(
         "an execute-api host whose api id no api of this emulator has",
         &send(

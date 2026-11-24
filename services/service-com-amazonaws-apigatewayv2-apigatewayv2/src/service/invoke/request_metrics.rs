@@ -185,7 +185,7 @@ fn planned<Eng: Send + Sync + 'static>(
     let store = state.lock();
     let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
     let api = resolved.api;
-    let (stage, route) = routed(api, resolved.invoke_path, req.method())?;
+    let (stage, route) = routed(api, &resolved.invoke_path, req.method())?;
     let mut series = vec![api_series(&api.api_id)];
     let mut stage_series = api_series(&api.api_id);
     stage_series.insert(STAGE_DIMENSION.to_string(), stage.stage_name.clone());

@@ -165,6 +165,11 @@
 //! `crate::service`'s own docs state that rule.
 
 mod dispatch;
+/// What a request addressed to a CUSTOM DOMAIN NAME of this account reaches: the record its
+/// `Host` names, the api mapping that answers its path, and the path within the api that
+/// mapping selects. `pub(super)` so the socket a domain name publishes and this plane can be
+/// read as the one front door they are.
+pub(super) mod custom_domain_arrival;
 /// What an `HTTP_PROXY` route ANSWERS: the upstream its integration resolved, and the
 /// redirect that sends the caller there rather than this emulator relaying a request to a
 /// destination an api's own configuration names.
@@ -200,6 +205,7 @@ pub(crate) mod request_authorizer;
 mod response_parameters;
 mod service_action;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -411,19 +417,34 @@ impl<'r> Addressed<'r> {
     }
 }
 
-/// What a request addresses, as this service's records resolve it: the api, and the path
-/// WITHIN that api — the part that names a stage and a route.
+/// What a request addresses, as this service's records resolve it: the api, the path
+/// WITHIN that api — the part that names a stage and a route — and the custom domain name the
+/// request arrived on, where it arrived on one.
+///
+/// The path is a [`Cow`] because most addressings carry it as a SLICE of the request, while a
+/// request that arrived on a custom domain name has it COMPOSED from the api mapping that
+/// answered it ([`custom_domain_arrival`]).
 #[derive(Debug)]
 struct Resolved<'s, 'r> {
     api: &'s Api,
-    invoke_path: &'r str,
+    invoke_path: Cow<'r, str>,
+    /// The custom domain name the request arrived on, or `None` for one addressed at the
+    /// api's own default `execute-api` endpoint. What it decides is the one thing that
+    /// endpoint's own switch governs: "to require that clients use a custom domain name to
+    /// invoke your API, disable the default endpoint" (`Api$DisableExecuteApiEndpoint`), so a
+    /// request that came through a domain name is served while the default endpoint is off.
+    custom_domain: Option<&'s str>,
 }
 
 /// The HTTP api `addressed` addresses, or `None` when this data plane serves it not at all.
 ///
-/// THREE addressings resolve, because a client reaches this emulator at a different address
+/// FOUR addressings resolve, because a client reaches this emulator at a different address
 /// than it reaches AWS at:
 ///
+/// * CUSTOM DOMAIN NAME, a host of the CALLER's own choosing: the `Host` names a `DomainName`
+///   of this account and the api mapping whose base path the request's path begins with names
+///   the api and the stage ([`custom_domain_arrival`]). It is read FIRST, because such a host
+///   names no api itself and every reading below would read it as something it is not;
 /// * HOST-STYLE, the addressing `Api$ApiEndpoint` documents: the host's first label names
 ///   the api and the whole path is the invoke path. A host that IS an `execute-api`
 ///   endpoint but whose api id this service does not hold resolves to nothing at all —
@@ -481,14 +502,29 @@ fn resolve<'s, 'r>(
     {
         return None;
     }
-    // LOCAL-ENDPOINT style first, because its marker is unambiguous on any host.
+    // A CUSTOM DOMAIN NAME first: such a host is a name the caller chose, so it names no api
+    // of its own, and every addressing below would read its path as something it is not — the
+    // api and the stage are the mapping's to name.
+    if let Some(arrival) = custom_domain_arrival::arrival(store, addressed) {
+        return servable(store.apis.get(arrival.api_id)).map(|api| Resolved {
+            api,
+            invoke_path: Cow::Owned(arrival.invoke_path),
+            custom_domain: Some(arrival.domain_name),
+        });
+    }
+    // LOCAL-ENDPOINT style next, because its marker is unambiguous on any host.
     if let Some((api_id, invoke_path)) = local_endpoint_path(addressed.path) {
-        return servable(store.apis.get(api_id)).map(|api| Resolved { api, invoke_path });
+        return servable(store.apis.get(api_id)).map(|api| Resolved {
+            api,
+            invoke_path: Cow::Borrowed(invoke_path),
+            custom_domain: None,
+        });
     }
     if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
         return servable(store.apis.get(api_id)).map(|api| Resolved {
             api,
-            invoke_path: addressed.path,
+            invoke_path: Cow::Borrowed(addressed.path),
+            custom_domain: None,
         });
     }
     let (first, rest) = split_first_segment(addressed.path)?;
@@ -506,7 +542,8 @@ fn resolve<'s, 'r>(
     if let Some(api) = servable(store.apis.get(first)) {
         return Some(Resolved {
             api,
-            invoke_path: rest,
+            invoke_path: Cow::Borrowed(rest),
+            custom_domain: None,
         });
     }
     if host_service.is_some() {
@@ -522,7 +559,8 @@ fn resolve<'s, 'r>(
     let api = holding.next()?;
     holding.next().is_none().then_some(Resolved {
         api,
-        invoke_path: addressed.path,
+        invoke_path: Cow::Borrowed(addressed.path),
+        custom_domain: None,
     })
 }
 
@@ -615,8 +653,8 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 ///
 /// AWS serves one `execute-api` endpoint space, and an endpoint whose api id resolves to no
 /// api is answered there rather than by nothing: nothing of an api is read for such an
-/// address, so the endpoint space itself refuses it `403` `{"message": "Forbidden"}`
-/// ([`resolved`]). The endpoint space is SHARED by the two data
+/// address, so the endpoint space itself answers it
+/// ([`unresolved_endpoint_answer`]). The endpoint space is SHARED by the two data
 /// planes of API Gateway — a REST api is reached on the same host shape, and that service's
 /// own data plane claims a request it resolves — so an id neither of them holds is claimed by
 /// exactly one of them, which is this one. The REST data plane is asked through its OWN claim
@@ -661,10 +699,68 @@ fn addressed_endpoint_api_id<'r>(addressed: &Addressed<'r>) -> Option<&'r str> {
         .or_else(|| addressed.host.and_then(api_id_of_host))
 }
 
+/// The INVOKE PATH an endpoint-addressed request carries — what follows the api id, which is
+/// where a stage is named — or `None` for an address that names no endpoint of the
+/// `execute-api` space at all.
+///
+/// The two addressings that NAME an endpoint, read exactly as [`addressed_endpoint_api_id`]
+/// reads the id off them, so the id and the path beneath it are read off one address: the
+/// emulator's own rewriting behind the [`LOCAL_ENDPOINT_PREFIX`] marker carries the invoke
+/// path after the api id, and on the host AWS documents the whole path is the invoke path.
+fn addressed_endpoint_invoke_path<'r>(addressed: &Addressed<'r>) -> Option<&'r str> {
+    if let Some((_api_id, invoke_path)) = local_endpoint_path(addressed.path) {
+        return Some(invoke_path);
+    }
+    addressed
+        .host
+        .and_then(api_id_of_host)
+        .map(|_api_id| addressed.path)
+}
+
+/// What the `execute-api` endpoint space answers an address whose api id resolves to NO api of
+/// this emulator — a deleted api's endpoint, and one whose id was never minted, which are the
+/// same fact to an endpoint space that reads nothing of an api for either.
+///
+/// The space answers it ITSELF, and which of its two answers depends on whether the address
+/// names a STAGE to place:
+///
+/// * a path carrying a segment names one, and placing `(api, stage)` is what fails — so the
+///   space turns the request away with `403` `{"message":"Forbidden"}` ([`forbidden`]),
+///   saying nothing about whether either exists;
+/// * the endpoint's ROOT carries no segment at all, so it names no stage anywhere: what is
+///   addressed is the endpoint itself, which holds nothing, and that is the endpoint's own
+///   `404` `{"message":"Not Found"}` ([`not_found`]) — the same answer a LIVE api's root
+///   gives when no stage of it serves there ([`stage_of`]). It is what a client polling the
+///   invoke URL of an api it has just deleted is answered, since an HTTP api's url is that
+///   root.
+///
+/// An address that names no endpoint of the space at all (a stage-only path whose api was
+/// deleted between the claim and now) names a stage in its first segment like any invoke
+/// path, so it takes the first answer.
+fn unresolved_endpoint_answer(addressed: &Addressed<'_>) -> RtResponse {
+    let names_a_stage = addressed_endpoint_invoke_path(addressed)
+        .map(|invoke_path| first_segment(invoke_path).is_some())
+        .unwrap_or(true);
+    if names_a_stage {
+        return forbidden();
+    }
+    not_found()
+}
+
 /// Whether this data plane serves `addressed`.
+///
+/// Either the request RESOLVES to an api of this plane ([`resolve`]), or it is addressed to a
+/// custom domain name of this account whose mappings answer nothing at its path
+/// ([`custom_domain_arrival::addresses_a_domain_name`]): the front door of such a name is the
+/// account's, so the request is this plane's to answer — with the refusal a request that
+/// reaches no api of the account earns ([`unresolved_endpoint_answer`]) — rather than left for
+/// the emulator to decline an address the account itself created.
 fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> bool {
-    crate::state::service_state(engine)
-        .is_some_and(|state| resolve(&state.lock(), addressed).is_some())
+    crate::state::service_state(engine).is_some_and(|state| {
+        let store = state.lock();
+        resolve(&store, addressed).is_some()
+            || custom_domain_arrival::addresses_a_domain_name(&store, addressed)
+    })
 }
 
 /// Whether the request presents a SigV4 credential at all — in the `Authorization` header a
@@ -1034,13 +1130,13 @@ fn resolved<Eng: Send + Sync + 'static>(
     // Either this endpoint resolves to no api of this emulator at all — the address a client
     // keeps calling after the api behind it was deleted, which this data plane owns
     // ([`claims_an_unresolved_endpoint`]) — or the api was deleted between the claim and
-    // now, which is the same fact arriving a moment later. The `execute-api` endpoint space
-    // answers an address whose api id names no api `403` `{"message": "Forbidden"}`
-    // ([`forbidden`]): nothing of an api was read for it, so it is refused by the endpoint
-    // space itself, and an endpoint that resolves to nothing has no CORS configuration to
-    // decorate it with.
+    // now, which is the same fact arriving a moment later. Such an address is answered by
+    // the endpoint space itself ([`unresolved_endpoint_answer`]): `403`
+    // `{"message":"Forbidden"}` for a path that names a stage to place, and `404`
+    // `{"message":"Not Found"}` for the endpoint's ROOT, which names none. An endpoint that
+    // resolves to nothing has no CORS configuration to decorate its answer with either.
     let Some(resolved) = resolve(&store, &addressed) else {
-        return Err(Box::new(forbidden()));
+        return Err(Box::new(unresolved_endpoint_answer(&addressed)));
     };
     // The DEFAULT endpoint this request was addressed at serves nothing while the api turned
     // it off ([`super::data_plane::serves_default_endpoint`]), so the refusal is answered
@@ -1050,7 +1146,13 @@ fn resolved<Eng: Send + Sync + 'static>(
     // endpoint, so what the endpoint answers is the SAME answer as for a path of the api that
     // serves nothing ([`not_found`]): a client probing the default endpoint cannot tell a
     // disabled one from a route the api does not carry, which is the point of the member.
-    if !super::data_plane::serves_default_endpoint(resolved.api) {
+    //
+    // A request that arrived on a CUSTOM DOMAIN NAME was not addressed at that endpoint at
+    // all, and the member exists to make exactly that the only way in: "to require that
+    // clients use a custom domain name to invoke your API, disable the default endpoint"
+    // (`Api$DisableExecuteApiEndpoint`), so such a request is served while the member is set.
+    if resolved.custom_domain.is_none() && !super::data_plane::serves_default_endpoint(resolved.api)
+    {
         tracing::debug!(
             api_id = %resolved.api.api_id,
             "this api's default execute-api endpoint is disabled, so it serves nothing"
@@ -1099,7 +1201,7 @@ fn resolve_answer(
     // key, the path parameters captured off it and the path the event reports — reads the
     // decoded path. A target no decoding pass could read is refused with the gateway's own
     // envelope instead, since there is nothing to match a route key against.
-    let Ok(target) = Target::of(resolved.invoke_path) else {
+    let Ok(target) = Target::of(&resolved.invoke_path) else {
         tracing::debug!(
             api_id = %api.api_id,
             path = %resolved.invoke_path,

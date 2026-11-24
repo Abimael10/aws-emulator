@@ -50,8 +50,17 @@ pub(crate) const REGION: &str = "us-east-1";
 pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 
+/// The status and sentence the `execute-api` endpoint space answers an address whose api id
+/// it holds no api for, at a path that NAMES a stage to place: nothing of an api is read for
+/// it, so the space turns it away itself rather than saying whether the api or the stage
+/// exists (`apigateway_unresolved_execute_api_endpoint`).
+const FORBIDDEN: u16 = 403;
+const FORBIDDEN_MESSAGE: &str = "Forbidden";
+
 /// The refusal an HTTP api's `execute-api` endpoint gives a request it serves nothing for,
-/// which is what an api that turned its default endpoint off is on that endpoint.
+/// which is what an api that turned its default endpoint off is on that endpoint — and what
+/// the endpoint space answers at the ROOT of an address whose api id it holds no api for,
+/// which names no stage to place at all.
 const NOT_FOUND: u16 = 404;
 const NOT_FOUND_MESSAGE: &str = "Not Found";
 
@@ -525,10 +534,12 @@ async fn assert_every_endpoint(
 
 /// The whole point of the member: a client probing the default endpoint of a disabled api
 /// cannot tell it from a route that api does not carry. An api id the `execute-api` endpoint
-/// space holds NO api for is a different fact — nothing of an api is read for it, so the
-/// space refuses it itself with `403` `{"message":"Forbidden"}`
-/// (`apigateway_unresolved_execute_api_endpoint`) — and what is asserted for it here is that
-/// the endpoint space answers it at every addressing.
+/// space holds NO api for is a different fact — nothing of an api is read for it, so the space
+/// answers it itself: `403` `{"message":"Forbidden"}` at a path that names a stage to place,
+/// and the gateway's own `404` `{"message":"Not Found"}` at the endpoint ROOT, which names no
+/// stage anywhere (`apigateway_unresolved_execute_api_endpoint`) — so at the ROOT the two facts
+/// read alike, which is as fine-grained as the endpoint space itself is there. What is asserted
+/// for it here is that the endpoint space answers it at every addressing.
 async fn assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(
     router: &MultiServiceRouter,
     phase: &str,
@@ -546,6 +557,14 @@ async fn assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(
     );
     let disabled = addressings(api_id, invoke_path);
     let unheld = addressings(UNHELD_API_ID, invoke_path);
+    // What the endpoint space owes the unheld id at THIS address: its refusal where the path
+    // names a stage to place, and the gateway's own not-found at the endpoint root, which names
+    // none.
+    let expected = if invoke_path.trim_matches('/').is_empty() {
+        (NOT_FOUND, json!({ "message": NOT_FOUND_MESSAGE }))
+    } else {
+        (FORBIDDEN, json!({ "message": FORBIDDEN_MESSAGE }))
+    };
     for ((addressing, host, path), (_, unheld_host, unheld_path)) in
         disabled.into_iter().zip(unheld)
     {
@@ -557,8 +576,8 @@ async fn assert_an_api_nothing_holds_is_refused_by_the_endpoint_space(
         let unserved = request(router, &unheld_host, &unheld_path).await;
         assert_eq!(
             (unserved.status, unserved.json()),
-            (403, json!({ "message": "Forbidden" })),
-            "case {case:?}: expected the endpoint space's own refusal, got {} {:?}",
+            expected.clone(),
+            "case {case:?}: expected the endpoint space's own answer {expected:?}, got {} {:?}",
             unserved.status,
             unserved.text()
         );

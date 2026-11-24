@@ -8,10 +8,13 @@
 //! > AWS serves ONE `execute-api` endpoint space for both kinds of API Gateway api, and an
 //! > address in it whose api id names no api is answered by API Gateway itself — not by the
 //! > front door's "no service claimed this" refusal, and not by an api's own protocol, since
-//! > nothing of an api is read for it. The answer is `403` `{"message":"Forbidden"}`,
-//! > whichever addressing carried the id and whether the id was deleted or never minted. An
-//! > api the space DOES resolve keeps answering from its own records, so a path that api
-//! > serves nothing at is its own answer and not this one.
+//! > nothing of an api is read for it. WHICH answer it gets follows whether the address names
+//! > a STAGE to place: a path carrying a segment names one, and that request is turned away
+//! > with `403` `{"message":"Forbidden"}` whichever addressing carried the id and whether the
+//! > id was deleted or never minted, while the endpoint's ROOT names no stage anywhere and is
+//! > answered `404` `{"message":"Not Found"}`. An api the space DOES resolve keeps answering
+//! > from its own records, so a path that api serves nothing at is its own answer and not this
+//! > one.
 //!
 //! Only a cross-service suite can pin it: the endpoint space is shared by API Gateway (REST)
 //! and API Gateway V2, each of which holds its own apis, so an id neither holds is claimed by
@@ -20,8 +23,9 @@
 //! The rows differ along what the rule generalises over: how the address carries the api id
 //! (the `execute-api` host AWS documents, and the reserved path prefix a client that resolves
 //! that host nowhere uses), why the id resolves to nothing (a REST api deleted, an HTTP api
-//! deleted, an id nothing ever minted), and — as the contrast rows — a live REST stage that
-//! serves the request and a path of that same api that serves nothing.
+//! deleted, an id nothing ever minted), whether the path names a stage or is the endpoint's
+//! own root, and — as the contrast rows — a live REST stage that serves the request and a path
+//! of that same api that serves nothing.
 //!
 //! Assembling the router costs stack, so it runs on an explicitly sized thread for the same
 //! reason `boot_serve.rs` does.
@@ -47,8 +51,15 @@ const LOCAL_ENDPOINT: &str = "127.0.0.1:9297";
 /// What the live api's `MOCK` method answers.
 const SERVED_BODY: &str = r#"{"at":"root"}"#;
 
-/// The answer the endpoint space owes an api id it resolves to nothing.
+/// The answer the endpoint space owes an api id it resolves to nothing at an address that
+/// NAMES a stage to place.
 const FORBIDDEN: (u16, &str) = (403, "Forbidden");
+
+/// The answer it owes the ROOT of such an endpoint, which names no stage at all: an HTTP
+/// api's url is that root, so this is what a client polling the url of an api it deleted
+/// reads (`services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/
+/// http_api_unresolved_endpoint_root.rs` pins the rule over the addressings and methods).
+const NOT_FOUND: (u16, &str) = (404, "Not Found");
 
 /// The answer a LIVE api owes a path its deployment serves no resource for — the taxonomy
 /// `services/service-com-amazonaws-apigateway-backplanecontrolservice/tests/all/stage_invoke.rs`
@@ -252,7 +263,7 @@ async fn deleted_http_api(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 #[test]
-fn an_execute_api_address_whose_api_id_resolves_to_nothing_is_forbidden() {
+fn an_execute_api_address_whose_api_id_resolves_to_nothing_is_answered_by_the_space() {
     std::thread::Builder::new()
         .name("apigateway-unresolved-endpoint".to_string())
         .stack_size(BOOT_STACK_SIZE)
@@ -323,6 +334,32 @@ fn an_execute_api_address_whose_api_id_resolves_to_nothing_is_forbidden() {
                         endpoint_host(never_minted),
                         stage_path.clone(),
                         FORBIDDEN,
+                    ),
+                    (
+                        "the ROOT of a deleted REST api's endpoint".to_string(),
+                        endpoint_host(&gone),
+                        "/".to_string(),
+                        NOT_FOUND,
+                    ),
+                    (
+                        "the ROOT of a deleted HTTP api's endpoint".to_string(),
+                        endpoint_host(&gone_http),
+                        "/".to_string(),
+                        NOT_FOUND,
+                    ),
+                    (
+                        "the ROOT of a deleted HTTP api's endpoint, on the reserved path \
+                         prefix"
+                            .to_string(),
+                        LOCAL_ENDPOINT.to_string(),
+                        prefixed_path(&gone_http, "/"),
+                        NOT_FOUND,
+                    ),
+                    (
+                        "the ROOT of an endpoint whose api id nothing ever minted".to_string(),
+                        endpoint_host(never_minted),
+                        "/".to_string(),
+                        NOT_FOUND,
                     ),
                     (
                         "the live api's deployed stage".to_string(),
