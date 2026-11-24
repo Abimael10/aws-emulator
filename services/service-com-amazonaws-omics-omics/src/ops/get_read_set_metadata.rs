@@ -241,14 +241,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             files: read_set.files_output(),
             status_message: read_set.status_message.clone(),
             creation_type: Some(read_set.creation_type.clone()),
-            // `etag` is left out. The published ETag algorithm families are computed by
-            // the real service over the sequence records it ingests; this emulator holds
-            // the uploaded bytes without parsing a FASTQ, BAM or CRAM record out of them,
-            // so a hash of anything else would be indistinguishable on the wire from the
-            // service's own while never matching a client's — the member is omitted
-            // rather than filled with a digest of something else.
-            etag: None,
-            creation_job_id: Some(read_set.creation_job_id.clone()),
+            // The ETag the ingest computed for this read set's files, under the ETag
+            // algorithm family the store that holds it ingests under.
+            etag: read_set.e_tag_output(),
+            // Only an IMPORT job's read set carries a creation job: one a direct upload
+            // formed was produced by no job, so the member is absent for it.
+            creation_job_id: read_set.creation_job_id.clone(),
         };
         crate::state::audit(
             Self::NAME,

@@ -7079,6 +7079,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-fastq"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b749d3b5ce244ad38790b0d1193f199244bada983fd5316fb1d3bcda162b3e97"
+dependencies = [
+ "bstr",
+ "memchr",
+]
+
+[[package]]
 name = "noto-sans-mono-bitmap"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18654,8 +18664,11 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "flate2",
  "hex",
  "http",
+ "md-5 0.10.6",
+ "noodles-fastq",
  "percent-encoding",
  "serde_json",
  "service-common",

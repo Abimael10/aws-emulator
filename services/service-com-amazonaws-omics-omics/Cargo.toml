@@ -24,10 +24,20 @@ tracing = { workspace = true }
 # `date_time_json`: the restJson1 codec that carries a `@timestampFormat("date-time")`
 # timestamp as an RFC 3339 string, which every timestamp member of this model declares.
 service-common = { path = "../common" }
-# SHA-256 over a workflow definition, and the entropy behind each resource's UUID.
+# SHA-256 over a workflow definition, and the entropy behind each resource's UUID; the
+# SHA-256/SHA-512 ETag families a sequence store can be created with.
 sha2 = { workspace = true }
 # Hex for the `WorkflowDigest`, the UUID groups and the opaque page tokens.
 hex = { workspace = true }
+# `md-5`: the MD5 digest of an ingested read set file, and the `MD5up` ETag family a
+# sequence store ingests read sets under by default.
+md-5 = "0.10"
+# `flate2`: an ingested FASTQ read set file is a gzip stream, so the sequence records the
+# read and base counts are taken from are behind a gzip frame.
+flate2 = "1"
+# `noodles-fastq`: the FASTQ record reader the ingested file's reads and bases are counted
+# with, so no FASTQ parser is hand-written here.
+noodles-fastq = "0.24"
 
 [dev-dependencies]
 # Percent-encoding for the `@httpLabel` and `@httpQuery` values this crate's tagging

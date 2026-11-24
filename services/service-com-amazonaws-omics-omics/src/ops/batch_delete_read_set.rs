@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteReadSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteReadSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteReadSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the read sets the request names from the one sequence store that holds them,
+//! and reports the ids it could not delete.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteReadSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteReadSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every branch below records the call through `crate::state::audit`: a delete
+        // leaves the record it emptied behind as a tombstone, so the log is where the
+        // call itself stays attributable.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            BatchDeleteReadSetErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        // Settle first, so the read sets this call deletes are the ones every other
+        // reader would report at this instant.
+        registry.settle(now_ms);
+
+        // A read set is held BY a sequence store, so there is no read set to delete when
+        // the store the path names is not one this emulator holds — and that is a refusal
+        // of the whole call rather than a per-id error, because no id in it names
+        // anything.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(BatchDeleteReadSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Each id is deleted on its own and the ones that could not be deleted are
+        // reported in the error list, which is what this operation documents ("If there
+        // is an error with deleting one of the read sets, the operation returns an error
+        // list. If the operation successfully deletes only a subset of files, it will
+        // return an error list for the remaining files that fail to be deleted").
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteReadSet"))
+        // A read set this store holds is deleted where it is held: the record stays as
+        // the tombstone its id resolves to, in the terminal `DELETED` status, and its
+        // files go with it — so the store no longer holds it and the store's own delete
+        // is no longer refused for it. An id that names a read set already deleted is
+        // deleted again without an error, which is what the operation's `@idempotent`
+        // trait asks for; an id this store holds no read set for is the one failure a
+        // delete can report.
+        let mut errors: Vec<ReadSetBatchError> = Vec::new();
+        for id in &input.ids {
+            let Some(read_set) = registry.read_set_mut(&input.sequence_store_id, id) else {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(id),
+                );
+                errors.push(ReadSetBatchError {
+                    id: id.clone(),
+                    code: READ_SET_NOT_FOUND_CODE.to_string(),
+                    message: crate::state::READ_SET_NOT_FOUND_MESSAGE.to_string(),
+                });
+                continue;
+            };
+            read_set.delete();
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ReadSetDeleted,
+                Some(id),
+            );
+        }
+
+        // The modelled `errors` list is omitted when every id was deleted: there is no
+        // failure to report, and an empty list would read as one that was computed.
+        Ok(BatchDeleteReadSetOutput {
+            errors: (!errors.is_empty()).then_some(errors),
+        })
     }
 }
+
+/// The `code` of the one failure a read set delete reports: the identity of the modelled
+/// error a single-resource read of that id answers with, so a batch names the same
+/// failure the rest of this service names for a read set nothing holds.
+const READ_SET_NOT_FOUND_CODE: &str = "ResourceNotFoundException";

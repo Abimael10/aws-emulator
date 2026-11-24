@@ -159,15 +159,6 @@ pub struct VpcConfigResponse {
     pub vpc_owner_account_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.omics#FileInformation")]
-#[derive(Debug, Clone, Default)]
-pub struct FileInformation {
-    pub total_parts: Option<i32>,
-    pub part_size: Option<i64>,
-    pub content_length: Option<i64>,
-    pub s3_access: Option<ReadSetS3Access>,
-}
-
 #[smithy_macros::smithy(shape = "com.amazonaws.omics#ReadSetS3Access")]
 #[derive(Debug, Clone, Default)]
 pub struct ReadSetS3Access {

@@ -28,10 +28,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, FileInformation,
-    ReadSetFiles, SequenceInformation, SequenceStoreS3Access, ShareDetails, SseConfig,
-    WorkflowParameter,
+    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, ETag, FileInformation,
+    ReadSetFiles, ReadSetS3Access, SequenceInformation, SequenceStoreS3Access, ShareDetails,
+    SseConfig, WorkflowParameter,
 };
+
+/// What this service derives from the bytes of a read set it ingested: the per-file
+/// digests, the sequence counts, the alignment and the S3 location of each file.
+mod read_set_ingest;
+pub use read_set_ingest::*;
 
 /// The ARN service namespace for this service (`arnNamespace`/sigv4 name `omics`).
 pub const ARN_SERVICE: &str = "omics";
@@ -885,9 +890,20 @@ pub struct ReadSet {
     pub status_due_at_ms: Option<i64>,
     /// How this read set came to exist, from the modelled `CreationType` enum.
     pub creation_type: String,
-    /// The job that created it: for an uploaded read set, the multipart upload whose
-    /// completion formed it, which is the one job this emulator ran for it.
-    pub creation_job_id: String,
+    /// The IMPORT job that created it, when one did; `None` for a read set a direct
+    /// upload formed, which no import job produced.
+    pub creation_job_id: Option<String>,
+    /// The modelled `ETagAlgorithm` this read set's files were ingested under — the
+    /// format of its data joined to the ETag algorithm family of the store that holds it
+    /// — when that pair names a modelled value.
+    pub e_tag_algorithm: Option<String>,
+    /// How many reads the ingested files hold together, when the format is one whose
+    /// records this service reads.
+    pub total_read_count: Option<i64>,
+    /// How many bases those reads hold together, counted the same way.
+    pub total_base_count: Option<i64>,
+    /// The alignment setting the source format implies, from [`alignment`].
+    pub alignment: Option<String>,
     /// This read set's files, keyed by the modelled `ReadSetPartSource` their parts were
     /// uploaded from (`SOURCE1` / `SOURCE2`), so one source is held exactly once and the
     /// key order is the order `ReadSetFiles` lists them in.
@@ -916,6 +932,20 @@ impl ReadSet {
         self.status != READ_SET_STATUS_DELETED
     }
 
+    /// Delete this read set: the one move `BatchDeleteReadSet` makes, stated once so the
+    /// store's own delete and every read agree about what a deleted read set is.
+    ///
+    /// The record stays as the tombstone its id resolves to, in the terminal `DELETED`
+    /// status, and the files go with it: their bytes are no longer held by anything, so
+    /// the store stops counting them against its own ceiling and reports no file for the
+    /// read set. Nothing is owed to the clock afterwards — the status it lands on is
+    /// terminal.
+    pub fn delete(&mut self) {
+        self.status = READ_SET_STATUS_DELETED.to_string();
+        self.status_due_at_ms = None;
+        self.sources.clear();
+    }
+
     /// The bytes every file of this read set holds together.
     pub fn held_bytes(&self) -> usize {
         self.sources.values().map(|file| file.content.len()).sum()
@@ -925,9 +955,9 @@ impl ReadSet {
     /// holds.
     ///
     /// `index` is left out: HealthOmics builds a read set's index from the sequence data
-    /// it ingests, and this emulator stores the uploaded bytes without parsing a FASTQ,
-    /// BAM or CRAM record out of them, so there is no index file to report rather than one
-    /// standing for a file nothing produced.
+    /// it ingests, and this emulator holds the ingested files without building an index
+    /// beside them, so there is no index file to report rather than one standing for a
+    /// file nothing produced.
     pub fn files_output(&self) -> Option<ReadSetFiles> {
         let files = ReadSetFiles {
             source1: self.sources.get(READ_SET_PART_SOURCE1).map(file_information),
@@ -937,21 +967,50 @@ impl ReadSet {
         (files.source1.is_some() || files.source2.is_some()).then_some(files)
     }
 
-    /// `sequenceInformation` as the wire shapes want it.
+    /// `etag` as the wire shapes want it: the algorithm this read set's data was ingested
+    /// under and the digest of each source file's sequence data under it.
     ///
-    /// Only where the sequence came from is reported, because it is the one member the
-    /// upload itself carried. `totalReadCount`, `totalBaseCount` and `alignment` are read
-    /// by the real service out of the sequence records it ingests; nothing here parses
-    /// those records, so the members are omitted rather than filled with counts nothing
-    /// counted. The structure itself is omitted when the upload named no source.
+    /// Both are read off the stored record, where the ingest computed them, so a client
+    /// that digests the records it uploaded under the store's own family gets the same
+    /// value back. `source2` is omitted for a read set formed from one source file, and
+    /// the structure itself when nothing was ingested under a modelled algorithm.
+    pub fn e_tag_output(&self) -> Option<ETag> {
+        let e_tag = ETag {
+            algorithm: self.e_tag_algorithm.clone(),
+            source1: self.source_e_tag(READ_SET_PART_SOURCE1),
+            source2: self.source_e_tag(READ_SET_PART_SOURCE2),
+        };
+        (e_tag.algorithm.is_some() || e_tag.source1.is_some() || e_tag.source2.is_some())
+            .then_some(e_tag)
+    }
+
+    /// The ETag of one source file, when this read set holds that source and the ingest
+    /// computed a digest for it.
+    fn source_e_tag(&self, part_source: &str) -> Option<String> {
+        let e_tag = &self.sources.get(part_source)?.e_tag;
+        (!e_tag.is_empty()).then(|| e_tag.clone())
+    }
+
+    /// `sequenceInformation` as the wire shapes want it: what the ingest read out of the
+    /// sequence records, beside where the upload said the sequence came from.
+    ///
+    /// Every member is read off the stored record. A count is reported only where the
+    /// ingest really counted the records (see [`fastq_counts`]), so a format whose records
+    /// this service does not read carries the alignment its format implies and no counts
+    /// rather than numbers nothing counted. The structure itself is omitted when there is
+    /// nothing to report at all.
     pub fn sequence_information_output(&self) -> Option<SequenceInformation> {
-        let generated_from = self.generated_from.clone()?;
-        Some(SequenceInformation {
-            total_read_count: None,
-            total_base_count: None,
-            generated_from: Some(generated_from),
-            alignment: None,
-        })
+        let sequence_information = SequenceInformation {
+            total_read_count: self.total_read_count,
+            total_base_count: self.total_base_count,
+            generated_from: self.generated_from.clone(),
+            alignment: self.alignment.clone(),
+        };
+        (sequence_information.total_read_count.is_some()
+            || sequence_information.total_base_count.is_some()
+            || sequence_information.generated_from.is_some()
+            || sequence_information.alignment.is_some())
+        .then_some(sequence_information)
     }
 
     /// `tags` as the wire shapes want it: omitted when none were ever set.
@@ -960,8 +1019,8 @@ impl ReadSet {
     }
 }
 
-/// One file of a read set: the content uploaded from one `ReadSetPartSource`, and what
-/// `FileInformation` reports for it.
+/// One file of a read set: the content uploaded from one `ReadSetPartSource`, what
+/// `FileInformation` reports for it, and what the ingest derived from its bytes.
 #[derive(Debug, Clone, Default)]
 pub struct ReadSetSource {
     /// The modelled `ReadSetPartSource` this file's parts were uploaded from: this
@@ -972,9 +1031,18 @@ pub struct ReadSetSource {
     /// How many parts formed it, as the modelled `totalParts` reports it.
     pub total_parts: i32,
     /// The size of the part the file was uploaded in, as the modelled `partSize` reports
-    /// it: the FIRST part's length, which is the part size a multipart upload is made
-    /// with (only its last part may be shorter).
+    /// it: the part size the upload itself is conducted with
+    /// ([`READ_SET_UPLOAD_PART_SIZE`]), not the length of any part a caller sent.
     pub part_size: i64,
+    /// The MD5 digest of [`ReadSetSource::content`], from [`content_md5`]: the digest of
+    /// the file as it was ingested.
+    pub md5: String,
+    /// The digest of this file's sequence data under the ETag algorithm family of the
+    /// store that holds the read set, from [`e_tag_digest`]; empty when that family names
+    /// no digest this service computes.
+    pub e_tag: String,
+    /// The `s3Uri` this file was ingested to, from [`read_set_file_s3_uri`].
+    pub s3_uri: String,
 }
 
 impl ReadSetSource {
@@ -984,18 +1052,23 @@ impl ReadSetSource {
     }
 }
 
-/// `FileInformation` for one read set file.
+/// `FileInformation` for one read set file, every member read off that stored file.
 ///
-/// `s3Access` is omitted: it carries the S3 URI the real service exposes the file at, and
-/// this emulator serves no object store, so there is no location a client could reach and
-/// the member is left out rather than filled with an address nothing answers on \u2014 the
-/// same rule [`SequenceStore::s3_access_output`] applies to the store's own S3 access.
+/// `s3Access` carries the location the file was ingested to, which the ingest derived
+/// from the store's access point alias and the ids of the store and the read set, and
+/// `md5` the digest of the ingested bytes — the member the service reports for a file
+/// although this service's on-disk `FileInformation` does not declare it (see
+/// `types::read_set_file_information`). Either is omitted for a record that carries
+/// none, which is what a read set whose files are gone (a deleted one) holds.
 fn file_information(file: &ReadSetSource) -> FileInformation {
     FileInformation {
         total_parts: Some(file.total_parts),
         part_size: Some(file.part_size),
         content_length: Some(file.content_length()),
-        s3_access: None,
+        s3_access: (!file.s3_uri.is_empty()).then(|| ReadSetS3Access {
+            s3_uri: Some(file.s3_uri.clone()),
+        }),
+        md5: (!file.md5.is_empty()).then(|| file.md5.clone()),
     }
 }
 
@@ -2286,6 +2359,9 @@ pub enum AuditOutcome {
     /// A multipart read set upload was completed: its parts were formed into a read set
     /// held by the sequence store, and the upload itself is spent.
     ReadSetCreated,
+    /// A stored read set was deleted: it is in the terminal `DELETED` status and its
+    /// store no longer holds its files.
+    ReadSetDeleted,
     /// A run cache was minted and stored.
     RunCacheCreated,
     /// A run group was minted and stored.
@@ -2335,6 +2411,7 @@ impl AuditOutcome {
             Self::MultipartReadSetUploadCreated => "multipart-read-set-upload-created",
             Self::ReadSetUploadPartStored => "read-set-upload-part-stored",
             Self::ReadSetCreated => "read-set-created",
+            Self::ReadSetDeleted => "read-set-deleted",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::RunGroupUpdated => "run-group-updated",

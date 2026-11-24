@@ -184,11 +184,6 @@ fn matches(filter: Option<&ReadSetFilter>, read_set: &crate::state::ReadSet) -> 
 /// read from that record alone, so a listed read set reports exactly what its own
 /// `GetReadSetMetadata` reports and nothing is invented for a member the upload that
 /// formed it never carried.
-///
-/// `etag` is left out for the reason `GetReadSetMetadata` leaves it out: the published
-/// ETag algorithm families are computed over the sequence records the real service
-/// ingests, and nothing here parses a FASTQ, BAM or CRAM record out of the uploaded
-/// bytes, so a digest of anything else would never match a client's.
 fn reported(read_set: &crate::state::ReadSet) -> ReadSetListItem {
     ReadSetListItem {
         id: read_set.id.clone(),
@@ -205,7 +200,7 @@ fn reported(read_set: &crate::state::ReadSet) -> ReadSetListItem {
         creation_time: crate::state::timestamp(read_set.creation_time_ms),
         status_message: read_set.status_message.clone(),
         creation_type: Some(read_set.creation_type.clone()),
-        etag: None,
+        etag: read_set.e_tag_output(),
     }
 }
 

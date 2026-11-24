@@ -38,7 +38,7 @@ use service_com_amazonaws_omics_omics::state::{
     MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG,
     READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE, READ_SET_PAGE_TOKEN_TAG,
     READ_SET_STATUS_ACTIVE, READ_SET_STATUS_DELETED, READ_SET_STATUS_PROCESSING_UPLOAD,
-    RESOURCE_HAS_DEPENDENTS_MESSAGE, SEQUENCE_STORE_NOT_FOUND_MESSAGE,
+    READ_SET_UPLOAD_PART_SIZE, RESOURCE_HAS_DEPENDENTS_MESSAGE, SEQUENCE_STORE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1250,6 +1250,11 @@ struct CompleteCase {
     parts: Vec<(&'static str, i32, Vec<u8>)>,
     /// Every member `GetReadSetMetadata` must report with exactly this value.
     expected: Value,
+    /// The modelled `ETagAlgorithm` the read set's data must be reported under: the
+    /// format of that data joined to the store's ETag algorithm family.
+    e_tag_algorithm: &'static str,
+    /// The extension of the object each source file was ingested to.
+    extension: &'static str,
     /// Members it must NOT carry: nothing is invented for what the upload left out, and
     /// nothing is reported for what this emulator does not compute.
     absent: Vec<&'static str>,
@@ -1272,14 +1277,19 @@ fn complete_cases() -> Vec<CompleteCase> {
                 1,
                 b"@read1\nACGTACGTACGT\n+\n!!!!!!!!!!!!\n".to_vec(),
             )],
-            expected: json!({ "fileType": "FASTQ" }),
-            absent: vec![
-                "description",
-                "referenceArn",
-                "sequenceInformation",
-                "etag",
-                "statusMessage",
-            ],
+            expected: json!({
+                "fileType": "FASTQ",
+                // The records the ingested bytes hold, and the alignment the format
+                // implies: one read of twelve bases, unaligned.
+                "sequenceInformation": {
+                    "alignment": "UNALIGNED",
+                    "totalReadCount": 1,
+                    "totalBaseCount": 12,
+                },
+            }),
+            absent: vec!["description", "referenceArn", "statusMessage"],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq",
         },
         CompleteCase {
             case: "several parts from one source",
@@ -1293,8 +1303,13 @@ fn complete_cases() -> Vec<CompleteCase> {
             expected: json!({
                 "fileType": "FASTQ",
                 "description": "reads for the autumn cohort",
+                // The bytes are not FASTQ records, so nothing counted them: the
+                // alignment the format implies is all this read set reports.
+                "sequenceInformation": { "alignment": "UNALIGNED" },
             }),
-            absent: vec!["referenceArn", "sequenceInformation", "etag"],
+            absent: vec!["referenceArn"],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq",
         },
         CompleteCase {
             case: "a paired-end upload",
@@ -1307,9 +1322,14 @@ fn complete_cases() -> Vec<CompleteCase> {
             ],
             expected: json!({
                 "fileType": "FASTQ",
-                "sequenceInformation": { "generatedFrom": "1000 Genomes" },
+                "sequenceInformation": {
+                    "alignment": "UNALIGNED",
+                    "generatedFrom": "1000 Genomes",
+                },
             }),
-            absent: vec!["description", "referenceArn", "etag"],
+            absent: vec!["description", "referenceArn"],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq",
         },
         CompleteCase {
             case: "an aligned upload with a reference",
@@ -1326,8 +1346,12 @@ fn complete_cases() -> Vec<CompleteCase> {
                 "fileType": "CRAM",
                 "referenceArn": REFERENCE_ARN,
                 "description": "aligned reads",
+                // CRAM is one of the aligned source formats.
+                "sequenceInformation": { "alignment": "ALIGNED" },
             }),
-            absent: vec!["sequenceInformation", "etag"],
+            absent: vec![],
+            e_tag_algorithm: "CRAM_MD5up",
+            extension: "cram",
         },
         CompleteCase {
             case: "the highest part number the model admits",
@@ -1337,27 +1361,144 @@ fn complete_cases() -> Vec<CompleteCase> {
                 ("SOURCE1", 1, vec![0x42; 128]),
                 ("SOURCE1", last_number, vec![0x43; 5]),
             ],
-            expected: json!({ "fileType": "UBAM" }),
-            absent: vec!["description", "referenceArn", "sequenceInformation", "etag"],
+            expected: json!({
+                "fileType": "UBAM",
+                // uBAM is an UNALIGNED format.
+                "sequenceInformation": { "alignment": "UNALIGNED" },
+            }),
+            absent: vec!["description", "referenceArn"],
+            // A uBAM read set's data IS a BAM file, which is the format the modelled
+            // `ETagAlgorithm` names for it.
+            e_tag_algorithm: "BAM_MD5up",
+            extension: "bam",
         },
     ]
 }
 
-/// The `FileInformation` a source's parts must be reported as: how many parts formed the
-/// file, the size of its first part, and the total content length.
+/// The `FileInformation` members a source's parts must be reported as: how many parts
+/// formed the file, the part size the upload itself was conducted with, the total content
+/// length, and the digest of the bytes the ingest took in.
+///
+/// `s3Access` is asserted separately ([`assert_read_set_file_s3_uri`]): its bucket is the
+/// store's access point alias, which a client reads off the service rather than
+/// constructing.
 fn expected_file(parts: &[(&'static str, i32, Vec<u8>)], part_source: &str) -> Option<Value> {
+    let of_source = parts_of_source(parts, part_source);
+    if of_source.is_empty() {
+        return None;
+    }
+    let content = expected_content(parts, part_source);
+    Some(json!({
+        "totalParts": of_source.len(),
+        "partSize": READ_SET_UPLOAD_PART_SIZE,
+        "contentLength": content.len(),
+        "md5": md5_hex(&content),
+    }))
+}
+
+/// The parts of `parts` that came from `part_source`, in ascending part-number order.
+fn parts_of_source<'a>(
+    parts: &'a [(&'static str, i32, Vec<u8>)],
+    part_source: &str,
+) -> Vec<&'a (&'static str, i32, Vec<u8>)> {
     let mut of_source: Vec<&(&'static str, i32, Vec<u8>)> = parts
         .iter()
         .filter(|(source, _, _)| *source == part_source)
         .collect();
     of_source.sort_by_key(|(_, number, _)| *number);
-    let first = of_source.first()?;
-    let content_length: usize = of_source.iter().map(|(_, _, payload)| payload.len()).sum();
-    Some(json!({
-        "totalParts": of_source.len(),
-        "partSize": first.2.len(),
-        "contentLength": content_length,
-    }))
+    of_source
+}
+
+/// The MD5 digest of `content`, as a read set file's `md5` and an `MD5up` ETag report it:
+/// 32 lowercase hexadecimal characters, computed here from the bytes the case uploaded.
+pub(crate) fn md5_hex(content: &[u8]) -> String {
+    use md5::Digest;
+    hex::encode(md5::Md5::digest(content))
+}
+
+/// Every member reported for one file of an ingested read set.
+/// Source: `smithy_query(query="shape",shape="FileInformation")` -> totalParts, partSize,
+/// contentLength, s3Access; plus the `md5` the service reports for an ingested file.
+const READ_SET_FILE_MEMBERS: &[&str] = &[
+    "totalParts",
+    "partSize",
+    "contentLength",
+    "s3Access",
+    "md5",
+];
+
+/// Assert one reported file carries exactly the members above and nothing else, so a
+/// member asserted by value below is not joined by one nothing derived.
+fn assert_file_members(case: &str, member: &str, file: &Value) {
+    let mut reported: Vec<&str> = file
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a {member} object, got {file:?}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    reported.sort_unstable();
+    let mut expected = READ_SET_FILE_MEMBERS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected exactly the file members for {member}, got {file:?}"
+    );
+}
+
+/// The `ReadSetFiles` member one `ReadSetPartSource` is reported under.
+fn file_member(part_source: &str) -> &'static str {
+    match part_source {
+        "SOURCE1" => "source1",
+        _ => "source2",
+    }
+}
+
+/// Assert the `s3Uri` of one ingested read set file is the object that file lives at:
+/// the store's access point alias as the bucket, and then the account, the store, the read
+/// set, the read set's name, which source file it is and the format's extension.
+///
+/// The alias is environment-specific — S3 assigns the unique part of an access point
+/// alias — so what is asserted about it is its SHAPE (`<store id>-<discriminator>-s3alias`
+/// with a non-empty discriminator); every other segment is the one the request and the
+/// state name.
+pub(crate) fn assert_read_set_file_s3_uri(
+    case: &str,
+    s3_uri: &str,
+    sequence_store_id: &str,
+    read_set_id: &str,
+    read_set_name: &str,
+    part_source: &str,
+    extension: &str,
+) {
+    let address = s3_uri.strip_prefix("s3://").unwrap_or_else(|| {
+        panic!("case {case:?}: expected an s3:// URI, got {s3_uri:?}")
+    });
+    let (bucket, key) = address.split_once('/').unwrap_or_else(|| {
+        panic!("case {case:?}: expected a bucket and a key in {s3_uri:?}")
+    });
+    let discriminator = bucket
+        .strip_prefix(&format!("{sequence_store_id}-"))
+        .and_then(|rest| rest.strip_suffix("-s3alias"))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the store's access point alias as the bucket, \
+                 got {bucket:?} in {s3_uri:?}"
+            )
+        });
+    assert!(
+        !discriminator.is_empty() && discriminator.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "case {case:?}: expected an alphanumeric alias discriminator, got {discriminator:?}"
+    );
+    let source = file_member(part_source);
+    let expected_key = format!(
+        "{}/sequenceStore/{sequence_store_id}/readSet/{read_set_id}/\
+         {read_set_name}_{source}.{extension}",
+        engine::emulator_account_id()
+    );
+    assert_eq!(
+        key, expected_key,
+        "case {case:?}: expected the ingested file's key, got {s3_uri:?}"
+    );
 }
 
 /// The content a source's file must hold: its parts concatenated in ascending part-number
@@ -1434,11 +1575,12 @@ async fn completing_an_upload_forms_a_read_set_from_the_parts_it_lists() {
                 "sampleId": format!("sample for {case}"),
                 "name": case,
                 "creationType": CREATION_TYPE_UPLOAD,
-                // The upload whose completion formed it: the one job this service ran.
-                "creationJobId": upload,
             }),
             &metadata,
         );
+        // A read set a direct upload formed was produced by no import job, so it carries
+        // no creation job id for a caller to resolve.
+        assert_absent(case, &["creationJobId"], &metadata);
         assert_members(case, "GetReadSetMetadata", &row.expected, &metadata);
         assert_absent(case, &row.absent, &metadata);
         assert_timestamp(case, "creationTime", &metadata);
@@ -1453,22 +1595,63 @@ async fn completing_an_upload_forms_a_read_set_from_the_parts_it_lists() {
             &read_set_id,
         );
 
-        // One `FileInformation` per source the parts came from, read off those parts.
+        // The ETag of the read set's data: the algorithm is the format of that data
+        // joined to the store's own ETag algorithm family, and each source's digest is
+        // the digest of the bytes that source was ingested with.
+        let etag = metadata
+            .get("etag")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: response carried no etag, got {metadata:?}"));
+        assert_members(
+            case,
+            "GetReadSetMetadata",
+            &json!({ "algorithm": row.e_tag_algorithm }),
+            &etag,
+        );
+        for part_source in PART_SOURCES {
+            let content = expected_content(&row.parts, part_source);
+            let member = file_member(part_source);
+            let expected = (!content.is_empty()).then(|| Value::String(md5_hex(&content)));
+            assert_eq!(
+                etag.get(member),
+                expected.as_ref(),
+                "case {case:?}: expected the {member} ETag over that source's bytes, \
+                 got {etag:?}"
+            );
+        }
+
+        // One `FileInformation` per source the parts came from, read off those parts and
+        // off the bytes the ingest took in.
         let files = metadata
             .get("files")
             .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: response carried no files, got {metadata:?}"));
         for part_source in PART_SOURCES {
-            let member = match *part_source {
-                "SOURCE1" => "source1",
-                _ => "source2",
-            };
+            let member = file_member(part_source);
             match expected_file(&row.parts, part_source) {
-                Some(expected) => assert_eq!(
-                    files.get(member),
-                    Some(&expected),
-                    "case {case:?}: expected {member} = {expected}, got {files:?}"
-                ),
+                Some(expected) => {
+                    let file = files.get(member).unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a {member} file, got {files:?}")
+                    });
+                    assert_members(case, member, &expected, file);
+                    assert_file_members(case, member, file);
+                    let s3_uri = file
+                        .get("s3Access")
+                        .and_then(|access| access.get("s3Uri"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?}: expected an s3Access.s3Uri, got {file:?}")
+                        });
+                    assert_read_set_file_s3_uri(
+                        case,
+                        s3_uri,
+                        &store,
+                        &read_set_id,
+                        case,
+                        part_source,
+                        row.extension,
+                    );
+                }
                 None => assert!(
                     files.get(member).is_none(),
                     "case {case:?}: expected no {member}, got {files:?}"
@@ -2425,18 +2608,26 @@ async fn a_read_set_its_store_no_longer_holds_leaves_the_listing() {
     let ids = form_listed_read_sets(&router, &store).await;
     await_all_active(&router, &store, &ids).await;
 
-    // A read set reaches the terminal `DELETED` status through `BatchDeleteReadSet`, which
-    // is still a 501 in this crate, so the status is set on the stored record through the
-    // service's own state — the one record every read set operation reads — rather than
-    // through a call this emulator cannot answer yet.
+    // A read set reaches the terminal `DELETED` status through `BatchDeleteReadSet`,
+    // which is the call a client makes, so the status is reached the way a client reaches
+    // it rather than by writing the stored record from the test.
     let released = ids[1].clone();
+    let (status, body) = batch_delete_read_set(&router, &store, &[released.as_str()]).await;
+    assert_eq!(
+        status, 200,
+        "expected 200 from BatchDeleteReadSet, got {body:?}"
+    );
     {
         let state = service_state(&*engine).expect("the omics service state");
-        let mut registry = state.lock();
-        registry
-            .read_set_mut(&store, &released)
-            .unwrap_or_else(|| panic!("no read set {released} is stored"))
-            .status = READ_SET_STATUS_DELETED.to_string();
+        let registry = state.lock();
+        assert_eq!(
+            registry
+                .read_set(&store, &released)
+                .unwrap_or_else(|| panic!("no read set {released} is stored"))
+                .status,
+            READ_SET_STATUS_DELETED,
+            "the deleted read set must hold the terminal status"
+        );
     }
 
     let case = "a read set the store no longer holds";
@@ -2504,4 +2695,553 @@ async fn list_read_sets_refuses_a_sequence_store_nothing_holds() {
         "case {case:?}: expected an empty listing, got {body:?}"
     );
     assert_absent(case, &["nextToken"], &body);
+}
+
+// ---------------------------------------------------------------------------
+// The metadata an ingest derives, and the delete that releases a read set
+// ---------------------------------------------------------------------------
+//
+// The rules the cases below assert:
+//
+// * a read set formed by a direct upload is reported with the metadata the service
+//   derived from the bytes it ingested — the ETag of each source's sequence data under
+//   the store's own ETag algorithm family, the digest of each ingested file, the read and
+//   base counts of the records those files hold, the alignment the source format implies,
+//   the S3 location each file was ingested to, and the part size the upload itself was
+//   conducted with — and with NO creation job, because no import job produced it;
+// * a read set deleted through `BatchDeleteReadSet` stops being held by its store, so the
+//   store's own delete succeeds, while a store that still holds a read set is refused.
+
+/// A FASTQ file of one read of four bases.
+const ONE_READ_FASTQ: &[u8] = b"@read1\nACGT\n+\nIIII\n";
+
+/// A FASTQ file of three reads of five, seven and two bases.
+const THREE_READ_FASTQ: &[u8] =
+    b"@r1\nACGTA\n+\nIIIII\n@r2\nTTTTTTT\n+\nIIIIIII\n@r3\nGG\n+\nII\n";
+
+/// A FASTQ file of two reads of ten and two bases: one mate of a pair.
+const FORWARD_FASTQ: &[u8] = b"@a\nACGTACGTAC\n+\nIIIIIIIIII\n@b\nTT\n+\nII\n";
+
+/// Its other mate: two reads of four and five bases.
+const REVERSE_FASTQ: &[u8] = b"@a/2\nGGGG\n+\nIIII\n@b/2\nCCCCC\n+\nIIIII\n";
+
+/// Every value the modelled `ETagAlgorithmFamily` enum admits.
+/// Source: `smithy_query(query="shape",shape="ETagAlgorithmFamily")` -> MD5up | SHA256up
+/// | SHA512up.
+const E_TAG_ALGORITHM_FAMILIES: &[&str] = &["MD5up", "SHA256up", "SHA512up"];
+
+/// The ETag algorithm family a store created without one ingests under.
+/// Source: `CreateSequenceStoreRequest$eTagAlgorithmFamily` ("The default value is
+/// MD5up").
+const DEFAULT_FAMILY: &str = "MD5up";
+
+/// `content` as a gzip stream, which is how a FASTQ read set is uploaded compressed.
+fn gzipped(content: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(content)
+        .expect("the gzip encoder takes the FASTQ");
+    encoder.finish().expect("a complete gzip stream")
+}
+
+/// The digest `family` names, over `data`, rendered as lowercase hexadecimal: what the
+/// `<format>_<family>` ETag of a read set's source file must be.
+fn family_digest(family: &str, data: &[u8]) -> String {
+    use sha2::Digest;
+    match family {
+        "MD5up" => md5_hex(data),
+        "SHA256up" => hex::encode(sha2::Sha256::digest(data)),
+        "SHA512up" => hex::encode(sha2::Sha512::digest(data)),
+        other => panic!("unmodelled ETag algorithm family {other:?}"),
+    }
+}
+
+/// `POST /sequencestore`, naming the ETag algorithm family the store ingests under when
+/// the row asks for one.
+async fn create_store_ingesting_under(
+    router: &MultiServiceRouter,
+    name: &str,
+    family: Option<&str>,
+) -> String {
+    let mut request = json!({ "name": name });
+    if let Some(family) = family {
+        assert!(
+            E_TAG_ALGORITHM_FAMILIES.contains(&family),
+            "case {name:?}: {family:?} is not a modelled ETagAlgorithmFamily"
+        );
+        request["eTagAlgorithmFamily"] = json!(family);
+    }
+    let (status, body) = call(router, "POST", "/sequencestore", Some(&request)).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: expected 200 from CreateSequenceStore, got {body:?}"
+    );
+    body.get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {name:?}: response carried no id, got {body:?}"))
+        .to_string()
+}
+
+/// A row of the ingest table: what was uploaded, what sequence data those bytes hold, and
+/// what the service must therefore report for the read set.
+struct IngestCase {
+    /// How the row is reported in a failure, and the read set's name.
+    case: &'static str,
+    /// The ETag algorithm family the store is created with; `None` leaves it at the
+    /// service's default.
+    family: Option<&'static str>,
+    source_file_type: &'static str,
+    /// The parts uploaded: source file, part number, content.
+    parts: Vec<(&'static str, i32, Vec<u8>)>,
+    /// The sequence data each source's bytes hold — the content itself for a plaintext
+    /// upload, the uncompressed records for a gzipped one — which is what the ETag is
+    /// taken over and what the counts come from.
+    sequence_data: Vec<(&'static str, Vec<u8>)>,
+    /// The modelled `ETagAlgorithm` the read set must be reported under.
+    e_tag_algorithm: &'static str,
+    /// The extension of the object each source file was ingested to.
+    extension: &'static str,
+    /// The reads and bases the ingested records hold together.
+    counts: (i64, i64),
+}
+
+/// The table: one row per way the bytes a read set is formed from can differ, so the rule
+/// is asserted over the class and not over the one recorded upload. The rows differ along
+/// whether the ingested file is gzip-compressed, how many records it holds, how many
+/// bases those records hold, how many source files the read set has, how many parts
+/// formed a file, and which ETag algorithm family the store ingests under.
+fn ingest_cases() -> Vec<IngestCase> {
+    let split = gzipped(THREE_READ_FASTQ);
+    let (head, tail) = split.split_at(split.len() / 2);
+    vec![
+        IngestCase {
+            case: "a gzipped FASTQ of one read",
+            family: None,
+            source_file_type: "FASTQ",
+            parts: vec![("SOURCE1", 1, gzipped(ONE_READ_FASTQ))],
+            sequence_data: vec![("SOURCE1", ONE_READ_FASTQ.to_vec())],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq.gz",
+            counts: (1, 4),
+        },
+        IngestCase {
+            case: "a plaintext FASTQ of three reads",
+            family: Some("MD5up"),
+            source_file_type: "FASTQ",
+            parts: vec![("SOURCE1", 1, THREE_READ_FASTQ.to_vec())],
+            sequence_data: vec![("SOURCE1", THREE_READ_FASTQ.to_vec())],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq",
+            counts: (3, 14),
+        },
+        IngestCase {
+            case: "a store that ingests under SHA256up",
+            family: Some("SHA256up"),
+            source_file_type: "FASTQ",
+            parts: vec![("SOURCE1", 1, FORWARD_FASTQ.to_vec())],
+            sequence_data: vec![("SOURCE1", FORWARD_FASTQ.to_vec())],
+            e_tag_algorithm: "FASTQ_SHA256up",
+            extension: "fastq",
+            counts: (2, 12),
+        },
+        IngestCase {
+            case: "a store that ingests under SHA512up",
+            family: Some("SHA512up"),
+            source_file_type: "FASTQ",
+            parts: vec![("SOURCE1", 1, gzipped(FORWARD_FASTQ))],
+            sequence_data: vec![("SOURCE1", FORWARD_FASTQ.to_vec())],
+            e_tag_algorithm: "FASTQ_SHA512up",
+            extension: "fastq.gz",
+            counts: (2, 12),
+        },
+        IngestCase {
+            case: "a paired-end gzipped FASTQ",
+            family: None,
+            source_file_type: "FASTQ",
+            parts: vec![
+                ("SOURCE1", 1, gzipped(FORWARD_FASTQ)),
+                ("SOURCE2", 1, gzipped(REVERSE_FASTQ)),
+            ],
+            sequence_data: vec![
+                ("SOURCE1", FORWARD_FASTQ.to_vec()),
+                ("SOURCE2", REVERSE_FASTQ.to_vec()),
+            ],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq.gz",
+            // The reads and bases of both mates together.
+            counts: (4, 21),
+        },
+        IngestCase {
+            case: "one gzipped FASTQ split over two parts of different sizes",
+            family: None,
+            source_file_type: "FASTQ",
+            parts: vec![
+                ("SOURCE1", 1, head.to_vec()),
+                ("SOURCE1", 2, tail.to_vec()),
+            ],
+            sequence_data: vec![("SOURCE1", THREE_READ_FASTQ.to_vec())],
+            e_tag_algorithm: "FASTQ_MD5up",
+            extension: "fastq.gz",
+            counts: (3, 14),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_uploaded_read_set_reports_what_the_ingest_derived_from_its_bytes() {
+    let (router, _engine) = emulator_holding_its_engine();
+
+    for row in ingest_cases() {
+        let case = row.case;
+        let family = row.family.unwrap_or(DEFAULT_FAMILY);
+        let store = create_store_ingesting_under(&router, case, row.family).await;
+        let (status, body) = create_upload(
+            &router,
+            &store,
+            &json!({
+                "name": case,
+                "sourceFileType": row.source_file_type,
+                "subjectId": format!("subject for {case}"),
+                "sampleId": format!("sample for {case}"),
+            }),
+        )
+        .await;
+        let upload = created_upload_id(case, status, &body);
+        let listed = upload_all(&router, case, &store, &upload, &row.parts).await;
+        let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&listed)).await;
+        let read_set_id = completed_read_set_id(case, status, &body);
+
+        let (status, metadata) = read_set_metadata(&router, &store, &read_set_id).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {metadata:?}");
+
+        // The counts and the alignment the ingest read out of the records, and nothing
+        // generated from: the upload named no source.
+        let (reads, bases) = row.counts;
+        assert_eq!(
+            metadata.get("sequenceInformation"),
+            Some(&json!({
+                "alignment": "UNALIGNED",
+                "totalReadCount": reads,
+                "totalBaseCount": bases,
+            })),
+            "case {case:?}: expected the counts of the ingested records, got {metadata:?}"
+        );
+
+        // The ETag: the algorithm names the data's format and the store's family, and
+        // each source's digest is that family's digest of that source's SEQUENCE DATA —
+        // not of the compressed object, which is what `files.<source>.md5` reports.
+        let mut expected_e_tag = json!({ "algorithm": row.e_tag_algorithm });
+        for (part_source, sequence_data) in &row.sequence_data {
+            expected_e_tag[file_member(part_source)] =
+                json!(family_digest(family, sequence_data));
+        }
+        assert_eq!(
+            metadata.get("etag"),
+            Some(&expected_e_tag),
+            "case {case:?}: expected the ETag of the ingested sequence data, got {metadata:?}"
+        );
+
+        // And one file per source, each reporting the parts that formed it, the upload's
+        // own part size, the length and digest of the bytes ingested, and where the file
+        // was ingested to.
+        let files = metadata
+            .get("files")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: response carried no files, got {metadata:?}"));
+        for part_source in PART_SOURCES {
+            let member = file_member(part_source);
+            let content = expected_content(&row.parts, part_source);
+            if content.is_empty() {
+                assert!(
+                    files.get(member).is_none(),
+                    "case {case:?}: expected no {member}, got {files:?}"
+                );
+                continue;
+            }
+            let file = files
+                .get(member)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a {member}, got {files:?}"));
+            assert_file_members(case, member, file);
+            assert_eq!(
+                file.get("totalParts").and_then(Value::as_i64),
+                Some(parts_of_source(&row.parts, part_source).len() as i64),
+                "case {case:?}: expected the parts that formed {member}, got {file:?}"
+            );
+            assert_eq!(
+                file.get("partSize").and_then(Value::as_i64),
+                Some(READ_SET_UPLOAD_PART_SIZE),
+                "case {case:?}: expected the upload's own part size for {member}, \
+                 got {file:?}"
+            );
+            assert_eq!(
+                file.get("contentLength").and_then(Value::as_i64),
+                Some(content.len() as i64),
+                "case {case:?}: expected the length of the ingested {member}, got {file:?}"
+            );
+            assert_eq!(
+                file.get("md5").and_then(Value::as_str),
+                Some(md5_hex(&content).as_str()),
+                "case {case:?}: expected the digest of the ingested {member}, got {file:?}"
+            );
+            let s3_uri = file
+                .get("s3Access")
+                .and_then(|access| access.get("s3Uri"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected an s3Access.s3Uri for {member}, got {file:?}")
+                });
+            assert_read_set_file_s3_uri(
+                case,
+                s3_uri,
+                &store,
+                &read_set_id,
+                case,
+                part_source,
+                row.extension,
+            );
+        }
+
+        // No import job produced it, so there is no creation job id to resolve.
+        assert_absent(case, &["creationJobId"], &metadata);
+
+        // The listing reads the same record, so it reports the same ETag.
+        let (status, body) = list_read_sets(&router, &store, "", None).await;
+        let items = listed_read_sets(case, status, &body);
+        let item = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(read_set_id.as_str()))
+            .unwrap_or_else(|| panic!("case {case:?}: the read set is not listed, got {body:?}"));
+        assert_eq!(
+            item.get("etag"),
+            Some(&expected_e_tag),
+            "case {case:?}: expected the listing to report the same ETag, got {item:?}"
+        );
+        assert_eq!(
+            item.get("sequenceInformation"),
+            metadata.get("sequenceInformation"),
+            "case {case:?}: expected the listing to report the same sequence information, \
+             got {item:?}"
+        );
+    }
+}
+
+/// `POST /sequencestore/{store}/readset/batch/delete` with `ids` as the list.
+async fn batch_delete_read_set(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    ids: &[&str],
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/sequencestore/{sequence_store_id}/readset/batch/delete"),
+        Some(&json!({ "ids": ids })),
+    )
+    .await
+}
+
+/// Form one read set in `store` out of a single part, and answer its id.
+async fn form_read_set(router: &MultiServiceRouter, store: &str, name: &str) -> String {
+    let (status, body) = create_upload(router, store, &upload_request(name)).await;
+    let upload = created_upload_id(name, status, &body);
+    let listed = upload_all(
+        router,
+        name,
+        store,
+        &upload,
+        &[("SOURCE1", 1, ONE_READ_FASTQ.to_vec())],
+    )
+    .await;
+    let (status, body) = complete_upload(router, store, &upload, &parts_list(&listed)).await;
+    completed_read_set_id(name, status, &body)
+}
+
+#[tokio::test]
+async fn a_read_set_deleted_in_a_batch_releases_its_store() {
+    let (router, engine) = emulator_holding_its_engine();
+
+    // Each row is a way a batch can name read sets: one id, several at once, an id whose
+    // read set is already deleted (the delete is `@idempotent`), and an id the store
+    // holds no read set for, which is the one failure a batch reports.
+    struct DeleteCase {
+        case: &'static str,
+        /// How many read sets the store is given.
+        held: usize,
+        /// Which of those read sets the batch names, by index, and how many ids it
+        /// repeats.
+        named: Vec<usize>,
+        /// Whether the batch also names an id no read set carries.
+        unheld_id: Option<&'static str>,
+    }
+
+    for row in [
+        DeleteCase {
+            case: "one read set",
+            held: 1,
+            named: vec![0],
+            unheld_id: None,
+        },
+        DeleteCase {
+            case: "every read set the store holds",
+            held: 3,
+            named: vec![0, 1, 2],
+            unheld_id: None,
+        },
+        DeleteCase {
+            case: "an id named twice, which deletes it once",
+            held: 1,
+            named: vec![0, 0],
+            unheld_id: None,
+        },
+        DeleteCase {
+            case: "an id no read set carries, beside one that exists",
+            held: 1,
+            named: vec![0],
+            unheld_id: Some("9999999999"),
+        },
+    ] {
+        let case = row.case;
+        let store = create_store(&router, case).await;
+        let mut ids = Vec::new();
+        for index in 0..row.held {
+            ids.push(form_read_set(&router, &store, &format!("{case} {index}")).await);
+        }
+
+        let mut named: Vec<&str> = row.named.iter().map(|index| ids[*index].as_str()).collect();
+        if let Some(unheld) = row.unheld_id {
+            named.push(unheld);
+        }
+        let (status, body) = batch_delete_read_set(&router, &store, &named).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+        match row.unheld_id {
+            // Exactly one error, for the one id the store holds no read set for, carrying
+            // the identity and the sentence this service words for a read set nothing
+            // holds.
+            Some(unheld) => assert_eq!(
+                body.get("errors"),
+                Some(&json!([{
+                    "id": unheld,
+                    "code": "ResourceNotFoundException",
+                    "message": READ_SET_NOT_FOUND_MESSAGE,
+                }])),
+                "case {case:?}: expected the one unheld id to be reported, got {body:?}"
+            ),
+            // Every id was deleted, so there is no failure to report at all.
+            None => assert_absent(case, &["errors"], &body),
+        }
+
+        // Each read set the batch named is in the terminal DELETED status and holds no
+        // file any more, which is what a client reads back.
+        for index in &row.named {
+            let id = &ids[*index];
+            let (status, metadata) = read_set_metadata(&router, &store, id).await;
+            assert_eq!(status, 200, "case {case:?}: expected 200, got {metadata:?}");
+            assert_eq!(
+                metadata.get("status").and_then(Value::as_str),
+                Some(READ_SET_STATUS_DELETED),
+                "case {case:?}: expected a deleted read set, got {metadata:?}"
+            );
+            assert_absent(case, &["files"], &metadata);
+        }
+
+        // And the store no longer holds them: a store whose every read set is deleted is
+        // empty, so its own delete succeeds with an empty body; a store that still holds
+        // one is refused.
+        let still_held: Vec<usize> = (0..row.held).filter(|i| !row.named.contains(i)).collect();
+        let (status, body) = delete_sequence_store(&router, &store).await;
+        if still_held.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the emptied store to delete, got {body:?}"
+            );
+            assert_eq!(
+                body,
+                json!({}),
+                "case {case:?}: expected an empty body, got {body:?}"
+            );
+            let state = service_state(&*engine).expect("the omics service state");
+            let registry = state.lock();
+            assert!(
+                registry.sequence_store(&store).is_none(),
+                "case {case:?}: the store must be gone"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a store still holding a read set must be refused, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(RESOURCE_HAS_DEPENDENTS_MESSAGE),
+            "case {case:?}: expected the modelled message, got {body:?}"
+        );
+
+        // Deleting the rest empties it, and then it deletes.
+        let rest: Vec<&str> = still_held.iter().map(|index| ids[*index].as_str()).collect();
+        let (status, body) = batch_delete_read_set(&router, &store, &rest).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+        let (status, body) = delete_sequence_store(&router, &store).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the emptied store to delete, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_batch_delete_this_emulator_cannot_place_is_refused() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the batch delete destination").await;
+    let read_set_id = form_read_set(&router, &store, "the read set another store cannot reach")
+        .await;
+    let elsewhere = create_store(&router, "another store").await;
+
+    // A store this emulator does not hold is the modelled 404 for the whole call: no id
+    // in it names anything. So is a read set addressed through another store — it is not
+    // a read set that store holds — which the batch reports as that id's own failure.
+    for (case, sequence_store_id, expected_status) in [
+        ("a sequence store id no store holds", "9999999999", 404),
+        ("a read set addressed through another store", elsewhere.as_str(), 200),
+    ] {
+        let (status, body) = batch_delete_read_set(&router, sequence_store_id, &[&read_set_id])
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {body:?}"
+        );
+        if expected_status == 404 {
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            );
+            assert_eq!(
+                body.get("message").and_then(Value::as_str),
+                Some(SEQUENCE_STORE_NOT_FOUND_MESSAGE),
+                "case {case:?}: expected the modelled message, got {body:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            body.get("errors"),
+            Some(&json!([{
+                "id": read_set_id,
+                "code": "ResourceNotFoundException",
+                "message": READ_SET_NOT_FOUND_MESSAGE,
+            }])),
+            "case {case:?}: expected the id to be reported as not deleted, got {body:?}"
+        );
+    }
+
+    // And the read set its own store holds survived every refusal.
+    let (status, metadata) = read_set_metadata(&router, &store, &read_set_id).await;
+    assert_eq!(status, 200, "expected 200, got {metadata:?}");
+    assert_ne!(
+        metadata.get("status").and_then(Value::as_str),
+        Some(READ_SET_STATUS_DELETED),
+        "the read set must survive a batch addressed to another store, got {metadata:?}"
+    );
 }

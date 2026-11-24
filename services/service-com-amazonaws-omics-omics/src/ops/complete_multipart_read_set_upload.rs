@@ -183,7 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The read set is created IN the sequence store the request's path names, so
         // there is nothing to complete into until that store is one this emulator holds.
-        if registry.sequence_store(&input.sequence_store_id).is_none() {
+        // The store is also what decides the ETag algorithm family its read sets are
+        // ingested under, which is read off that record here.
+        let Some(store) = registry.sequence_store(&input.sequence_store_id) else {
             crate::state::audit(
                 Self::NAME,
                 ctx,
@@ -198,7 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
+        let e_tag_algorithm_family = store.e_tag_algorithm_family.clone();
 
         let Some(upload) =
             registry.multipart_read_set_upload(&input.sequence_store_id, &input.upload_id)
@@ -328,9 +331,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     part_source: part_source.clone(),
                     content: Vec::new(),
                     total_parts: 0,
-                    // The parts arrive here in ascending part-number order, so the first
-                    // one is the part size the upload was made with.
-                    part_size: part.part_size(),
+                    // The part size the upload itself is conducted with, which is what
+                    // the file reports however much the parts that formed it weighed.
+                    part_size: crate::state::READ_SET_UPLOAD_PART_SIZE,
+                    md5: String::new(),
+                    e_tag: String::new(),
+                    s3_uri: String::new(),
                 });
             file.content.extend_from_slice(&part.payload);
             file.total_parts += 1;
@@ -408,9 +414,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let (key, read_set_id) = registry.next_read_set_id();
+
+        // INGEST: what the service derives from the bytes it just took in, computed once
+        // here and stored on the read set, so every later read reports the same values.
+        //
+        // Per file: the MD5 of the file as ingested, the digest of its sequence data
+        // under the store's ETag algorithm family, and the S3 location the file was
+        // ingested to. Per read set: how many reads and bases those files hold together,
+        // which is read out of the records themselves, and the alignment the source
+        // format implies.
+        let mut total_read_count: Option<i64> = None;
+        let mut total_base_count: Option<i64> = None;
+        let mut counted_every_file = true;
+        for file in sources.values_mut() {
+            file.md5 = crate::state::content_md5(&file.content);
+            let sequence_data = crate::state::uncompressed_content(&file.content);
+            file.e_tag = crate::state::e_tag_digest(&e_tag_algorithm_family, &sequence_data)
+                .unwrap_or_default();
+            file.s3_uri = crate::state::read_set_file_s3_uri(
+                &upload.sequence_store_id,
+                &read_set_id,
+                &upload.name,
+                &file.part_source,
+                &upload.source_file_type,
+                &file.content,
+            );
+            match (upload.source_file_type == crate::state::FILE_TYPE_FASTQ)
+                .then(|| crate::state::fastq_counts(&sequence_data))
+                .flatten()
+            {
+                Some((reads, bases)) => {
+                    total_read_count = Some(total_read_count.unwrap_or(0) + reads);
+                    total_base_count = Some(total_base_count.unwrap_or(0) + bases);
+                }
+                None => counted_every_file = false,
+            }
+        }
+        // A count is reported only when every file of the read set was counted: a sum
+        // over some of them would be a number the read set does not hold.
+        if !counted_every_file {
+            total_read_count = None;
+            total_base_count = None;
+        }
+
         let read_set = crate::state::ReadSet {
             arn: crate::state::read_set_arn(&region, &upload.sequence_store_id, &read_set_id),
             id: read_set_id.clone(),
+            e_tag_algorithm: crate::state::e_tag_algorithm(
+                &upload.source_file_type,
+                &e_tag_algorithm_family,
+            ),
+            alignment: crate::state::alignment(&upload.source_file_type).map(str::to_string),
+            total_read_count,
+            total_base_count,
             sequence_store_id: upload.sequence_store_id,
             subject_id: upload.subject_id,
             sample_id: upload.sample_id,
@@ -427,9 +483,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time_ms: now_ms,
             status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
             creation_type: crate::state::CREATION_TYPE_UPLOAD.to_string(),
-            // The upload whose completion formed it: the one job this service ran for
-            // this read set.
-            creation_job_id: upload.upload_id,
+            // No creation job: a read set a direct upload formed was produced by no
+            // import job, so there is no job id for a caller to resolve.
+            creation_job_id: None,
             sources,
             tags: upload.tags,
         };

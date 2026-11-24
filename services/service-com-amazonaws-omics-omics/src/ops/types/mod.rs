@@ -102,6 +102,7 @@ pub mod list_variant_stores_types;
 pub mod list_workflow_versions_types;
 pub mod list_workflows_types;
 pub mod put_s3_access_policy_types;
+pub mod read_set_file_information;
 pub mod shared_types;
 pub mod start_annotation_import_job_types;
 pub mod start_read_set_activation_job_types;
@@ -299,6 +300,8 @@ pub use list_workflow_versions_types::*;
 pub use list_workflows_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_s3_access_policy_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use read_set_file_information::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
