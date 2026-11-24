@@ -152,6 +152,10 @@ pub use workflow::*;
 mod image_pipeline_listing;
 pub use image_pipeline_listing::*;
 
+/// What ONE PIPELINE's image listing asks for, and which stored build versions it reaches.
+mod pipeline_image_listing;
+pub use pipeline_image_listing::*;
+
 /// How a listing addresses ONE filter, and how it reports a filter missing a member.
 mod filter_parameters;
 pub use filter_parameters::*;
