@@ -63,3 +63,36 @@ Cause 2 (elasticache.e2e-user-group-access-revocation-flow):
 12. ModifyUserGroup(UserGroupId=<g>, UserIdsToRemove=[<u>]); poll DescribeUserGroups(<g>) until <u> is absent from UserIds and Status=='active', and DescribeReplicationGroups(<rg>) until Status=='available'. Repeat the identical AUTH — expect it to be refused by the engine.
 13. ModifyUserGroup(UserGroupId=<g>, UserIdsToAdd=[<u>]); poll until <u> is back in UserIds with Status=='active' and the replication group is 'available'; repeat the identical AUTH — expect success again. Observe that the check is instead killed at the per-check time budget with no assertion reached.
 14. Re-replay elasticache.e2e-cluster-snapshot-restore-data-persists and elasticache.e2e-user-group-access-revocation-flow: each must reach its own assertions (or an explicit endpoint/state verdict) instead of being killed at the budget.
+
+## What was fixed, and what still diverges
+
+ONE defect of this crate was found and fixed, the data-plane half of both causes: a cache placed in a
+cache subnet group published, for each of its nodes, an address derived from that node's port out of
+the `127.0.0.0/8` block whatever address the core had bound that node's socket on
+(`services/service-com-amazonaws-elasticache-amazonelasticachev9/src/state/cache_data_plane.rs`,
+`own_node_address`). With the core's default single-address bind no socket answers at that address, so
+the endpoint published in `CacheNodes[].Endpoint` and in `NodeGroups[].PrimaryEndpoint` was reachable
+only through the in-process register of served planes and refused every client that opened a socket
+to it. A node is now published at the address its own socket is bound on with the port of that
+socket, and a per-node spelling of the interface only where the bind accepts every local address of
+it. `tests/all/published_cache_endpoint_is_dialable.rs` dials every endpoint a cluster, a replication
+group, a shard and a serverless cache publishes, and drives both flows above over it: the
+snapshot→delete→restore round trip serves what the source held, and a withdrawn user's `AUTH` is
+refused `WRONGPASS` until the group holds it again.
+
+The control-plane half of both causes was already correct on this checkout and is pinned end to end
+by those tests: the create answers the transient status, the first read taken once the transition is
+due answers the settled one, `CreateCacheCluster(SnapshotName=...)` seeds the new cluster's keyspace
+from the snapshot, the deleted cluster answers 404 `CacheClusterNotFound`, and the attached user
+group's membership decides `AUTH`.
+
+STILL DIVERGING, recorded rather than claimed fixed: both checks are still killed at the replay
+harness's 60 s per-check budget with no assertion of their own reached. Every call of both flows is
+answered, and the whole of cause 1's control-plane sequence converges in about 9 s of wall clock
+(measured by the flow test above), because each transition this emulator owes is due 3 s after the
+call that starts it and no call sleeps for one. The checks' own waits poll on a 20 s interval with a
+900 s ceiling, and a caller acting straight after a create is answered the transient status — which
+other elasticache checks and this crate's suites require — so each wait costs the client a whole poll
+interval and three of them exhaust the 60 s budget in client sleeps alone, whatever the emulator
+answers. That remainder is the client's poll arithmetic against the transient phase, not an
+unanswered call or an unimplemented behaviour.

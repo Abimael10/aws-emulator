@@ -5,15 +5,18 @@
 //!
 //! RULE 1 — a cache placed in a cache subnet group runs in the account's VPC and is reachable
 //! only from INSIDE it, and each of its nodes is reached at an endpoint of its OWN: the
-//! address the control plane publishes for a node (`Endpoint$Address`, "the information
-//! required for client programs to connect to a cache node") is that node's own address on the
-//! interface this emulator's listeners are bound on, carrying the port the core assigned that
-//! node's socket — so a group created with N node groups publishes N node addresses that
-//! resolve to N different backends, and one address wearing every shard's name (the flat
-//! keyspace) is exactly what that rules out. Each node also holds one interface of its own in
-//! a subnet of the group it was placed in, which is its presence in the account's network. A
-//! cache in NO cache subnet group sits in no VPC of the account, so it keeps the address its
-//! own socket answers at.
+//! endpoint the control plane publishes for a node (`Endpoint$Address` / `Endpoint$Port`, "the
+//! information required for client programs to connect to a cache node") names the interface
+//! this emulator's listeners are bound on and the port the core assigned that node's own
+//! socket — so a group created with N node groups publishes N endpoints that reach N different
+//! backends, and one endpoint wearing every shard's name (the flat keyspace) is exactly what
+//! that rules out. Each node also holds one interface of its own in a subnet of the group it
+//! was placed in, which is its presence in the account's network. A cache in NO cache subnet
+//! group sits in no VPC of the account, so it keeps the address its own socket answers at.
+//!
+//! WHICH address a node's endpoint carries is the subject of
+//! [`crate::published_cache_endpoint_is_dialable`]: it is always one a connection to that
+//! node's socket is accepted at.
 //!
 //! RULE 2 — that presence does not outlive the cache. A `DeleteReplicationGroup` gives every
 //! member node's interface back as it begins the teardown, with the address it held, so the
@@ -251,8 +254,8 @@ async fn every_node_publishes_an_address_of_its_own_in_its_vpc() {
         created.status, created.body
     );
 
-    // Every address a PLACED node published, so no two nodes of the account share one.
-    let mut published_by: BTreeMap<String, String> = BTreeMap::new();
+    // Every endpoint a PLACED node published, so no two nodes of the account share one.
+    let mut published_by: BTreeMap<(String, String), String> = BTreeMap::new();
     for row in ROWS {
         let described = available_cache(&emulator, row).await;
         let members = members_of(row, &described);
@@ -265,7 +268,7 @@ async fn every_node_publishes_an_address_of_its_own_in_its_vpc() {
         );
 
         let placed = cache_interface_addresses(&emulator, &vpc).await;
-        let mut addresses: BTreeSet<String> = BTreeSet::new();
+        let mut endpoints: BTreeSet<(String, String)> = BTreeSet::new();
         for member in &members {
             let (address, port) = node_endpoint(&emulator, row.case, member).await;
             if row.placed {
@@ -277,9 +280,9 @@ async fn every_node_publishes_an_address_of_its_own_in_its_vpc() {
                     "case {:?}: {member} must hold an interface in {vpc}, got {placed:?}",
                     row.case
                 );
-                // And it is published at an address of its OWN on the interface this
-                // emulator's listeners are bound on — a loopback address, which is the one
-                // interface every spelling of names.
+                // And it is published on the interface this emulator's listeners are bound
+                // on — loopback, where the core binds them unless the operator names another
+                // address.
                 let parsed: ::std::net::IpAddr = address.parse().unwrap_or_else(|error| {
                     panic!(
                         "case {:?}: {member} must publish an address, got {address:?}: {error}",
@@ -303,16 +306,16 @@ async fn every_node_publishes_an_address_of_its_own_in_its_vpc() {
                 );
             }
             assert!(
-                addresses.insert(address.clone()),
-                "case {:?}: {member} must be reached at an address of its own, but {address} \
-                 is already published by another node of this cache",
+                endpoints.insert((address.clone(), port.clone())),
+                "case {:?}: {member} must be reached at an endpoint of its own, but \
+                 {address}:{port} is already published by another node of this cache",
                 row.case
             );
             if row.placed {
-                let owner = published_by.insert(address.clone(), member.clone());
+                let owner = published_by.insert((address.clone(), port.clone()), member.clone());
                 assert!(
                     owner.is_none(),
-                    "case {:?}: {address} is published by {member} and by {owner:?}",
+                    "case {:?}: {address}:{port} is published by {member} and by {owner:?}",
                     row.case
                 );
             }
@@ -332,10 +335,10 @@ async fn every_node_publishes_an_address_of_its_own_in_its_vpc() {
             );
         }
         assert_eq!(
-            addresses.len(),
+            endpoints.len(),
             row.nodes,
-            "case {:?}: the cache's {} nodes must resolve to {} distinct addresses, got \
-             {addresses:?}",
+            "case {:?}: the cache's {} nodes must publish {} distinct endpoints, got \
+             {endpoints:?}",
             row.case,
             row.nodes,
             row.nodes

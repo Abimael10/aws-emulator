@@ -94,11 +94,13 @@ pub(crate) async fn open_tls(case: &str, address: &str, port: &str) -> Session {
 /// Open a plaintext RESP session on the published endpoint of a cache placed in a VPC of the
 /// account, as a client INSIDE that VPC reaches it.
 ///
-/// Such a cache is reachable only from inside that VPC, and each of its NODES is published at
-/// an address of its own — so the vantage point the endpoint is reachable from is inside the
-/// VPC, and the connection is opened through the register of the data planes this emulator
-/// serves ([`service_common::dialable_data_planes`]), exactly as the code of a function
-/// attached to that VPC opens one.
+/// Such a cache is reachable only from inside that VPC, and each of its NODES is published at an
+/// endpoint of its own — the interface the core bound that node's socket on, carrying that
+/// socket's own port ([`crate::published_cache_endpoint_is_dialable`]) — so the vantage point
+/// the endpoint is reachable from is inside the VPC, and the connection is opened through the
+/// register of the data planes this emulator serves
+/// ([`service_common::dialable_data_planes`]), exactly as the code of a function attached to
+/// that VPC opens one.
 ///
 /// The EXACT published authority is what has to be open, asserted before the dial: the
 /// register also resolves another spelling of the same interface by port, so a session alone

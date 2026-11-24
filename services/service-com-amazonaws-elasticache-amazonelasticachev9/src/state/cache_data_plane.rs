@@ -33,13 +33,16 @@
 //! The socket's life is the cache's: the handle lives on the store under the cache's own
 //! key, and dropping it (the delete) closes the port and severs every connection on it.
 //!
-//! WHICH ADDRESS of that socket is published follows where the cache was placed. A cache in
-//! no VPC of the account is published at the address its socket answers on, which a client of
-//! this machine dials. A cache placed in a cache subnet group runs in the account's VPC and is
-//! reachable only from INSIDE it, and each of its nodes is reached there at an endpoint of its
-//! own — so each node is published at its OWN address on the interface the core bound
-//! ([`own_node_address`]), with the port of its own socket: a group of N nodes publishes N
-//! addresses, instead of one address wearing every shard's name.
+//! WHICH ADDRESS of that socket is published is always one a connection to the socket is
+//! ACCEPTED at. A cache in no VPC of the account is published at the address its socket answers
+//! on, which a client of this machine dials. A cache placed in a cache subnet group runs in the
+//! account's VPC and is reachable only from INSIDE it, and each of its nodes is reached there
+//! at an endpoint of its own — so each node is published with the port of its OWN socket, at
+//! its own address on the interface the core bound where that socket's bind accepts a
+//! connection there, and otherwise at the address that socket IS bound on
+//! ([`own_node_address`]): a group of N nodes publishes N endpoints a client really reaches N
+//! different backends at, instead of one endpoint wearing every shard's name or an address no
+//! connection is accepted at.
 //!
 //! The same RESP server also answers the connections an IN-PROCESS client of this emulator
 //! opens to the published address ([`::service_common::dialable_data_planes`]): a cache
@@ -69,9 +72,10 @@ use slow_log::{SlowLog, SlowLogDelivery, SlowLogPolicy};
 ///
 /// The port comes from the core listener and the host from the interface the core bound it
 /// on, never from a `format!` of a service hostname: it is an address a client of this
-/// emulator can reach the cache at. A cache placed in a VPC of the account is published at
-/// its NODE's own spelling of that same interface ([`own_node_address`]), because each node of
-/// such a cache is reached at an endpoint of its own.
+/// emulator can reach the cache at — one a connection to that socket is accepted at. A cache
+/// placed in a VPC of the account is published at its NODE's own spelling of that same
+/// interface where the socket's bind accepts a connection there ([`own_node_address`]),
+/// because each node of such a cache is reached at an endpoint of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedEndpoint {
     pub host: String,
@@ -919,15 +923,16 @@ fn group_member<'store>(
 ///
 /// `in_vpc` says whether the cache was placed in a VPC of the account (a cache subnet group).
 /// Such a cache is reachable only from INSIDE that VPC, and each of its nodes is reached at an
-/// endpoint of its own — so what the control plane publishes for it is that node's OWN
-/// spelling of the interface this emulator's listeners are bound on ([`own_node_address`]),
-/// with the port the core assigned that node's socket. Every spelling of that interface names
-/// the same socket and the register above resolves one by its PORT
+/// endpoint of its own — so what the control plane publishes for it carries the port the core
+/// assigned that node's socket, at that node's OWN spelling of the interface this emulator's
+/// listeners are bound on where that socket's bind accepts a connection there, and otherwise
+/// at the address the socket IS bound on ([`own_node_address`]). Both are recorded in the
+/// register above, which resolves a spelling of the interface by its PORT
 /// (`service_common::dialable_data_planes`), so a client inside the VPC that dials what it was
-/// told reaches THIS node's own RESP server — and a group of N nodes publishes N addresses
-/// instead of one address wearing every shard's name. A cache in no VPC of the account is
-/// published at the address its socket answers on, which is the address a client of this
-/// machine dials.
+/// told reaches THIS node's own RESP server — whether it dials through that register or over a
+/// socket of this machine, because the address it was told is one the socket accepts. A cache
+/// in no VPC of the account is published at the address its socket answers on, which is the
+/// address a client of this machine dials.
 pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
@@ -995,10 +1000,12 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
     // as the port goes with the listener.
     //
     // WHERE the cache answers: the socket's own address, and — for a cache placed in a VPC of
-    // the account — this node's own spelling of that same interface. Both are recorded,
-    // because a client reaching either is reaching this node.
+    // the account whose socket really answers at every address of its interface — this node's
+    // own spelling of that interface. Both are recorded, because a client reaching either is
+    // reaching this node, and the address the node is PUBLISHED at is one of them
+    // ([`own_node_address`]), never a third one no connection would be accepted at.
     let published = in_vpc
-        .then(|| own_node_address(&host, port))
+        .then(|| own_node_address(&listener.host(), &host, port))
         .flatten()
         .filter(|address| *address != host);
     let in_vpc_authority = published.as_deref().and_then(|address| {
@@ -1037,20 +1044,28 @@ pub async fn open_cache_data_plane<Eng: Send + Sync + 'static>(
 /// nodes is reached at an endpoint of its own — on AWS the address of the interface that node
 /// holds in the VPC. This emulator's listeners are all bound on the one interface the operator
 /// chose, so a node cannot be given a socket of its own on an address of its own; what it is
-/// given instead is its own address out of the `127.0.0.0/8` block RFC 1122 reserves for host
-/// loopback, derived from its own port so that it is unique per node and the same on every
-/// read. Every address of that block names the interface the core bound, and the register of
-/// served planes resolves one of them by its port
-/// (`service_common::data_plane_addressing::names_the_loopback_interface`), so a client inside
-/// the VPC that dials the published address reaches this node's own plane.
+/// given instead, WHERE its own socket would accept a connection there, is its own address out
+/// of the `127.0.0.0/8` block RFC 1122 reserves for host loopback, derived from its own port so
+/// that it is unique per node and the same on every read.
 ///
-/// `None` unless the socket is bound on an IPv4 loopback address: for an IPv6 or a routable
-/// bind this emulator has no second address of that same interface and family to publish — one
-/// of another family is an address the bound socket would not accept a connection at — so the
-/// socket's own address is what the node is reached at.
-fn own_node_address(host: &str, port: i32) -> Option<String> {
-    let bound: ::std::net::IpAddr = host.trim_matches(['[', ']']).parse().ok()?;
-    if !matches!(bound, ::std::net::IpAddr::V4(address) if address.is_loopback()) {
+/// `bound` is the address the CORE bound this node's socket on, as the core reports it
+/// (`emulator_server::ResourceListener::host`), and `host` the address that socket is dialable
+/// at. A socket bound on ONE address accepts a connection addressed to THAT address and to no
+/// other: a connection to a second spelling of the same interface is refused by the host, so
+/// such an address is not one this cache answers at and is not published for it — the node is
+/// published at the address its own socket is bound on, carrying its own port, which is what
+/// keeps one node's endpoint apart from another's. Only an UNSPECIFIED bind (`0.0.0.0`, `::`)
+/// accepts every local address of the interface, and that is what makes a per-node spelling of
+/// it an address the node really answers at: `None` for every other bind, and for a dialable
+/// address outside the IPv4 loopback block, where this emulator has no such second address of
+/// that same interface and family to publish.
+fn own_node_address(bound: &str, host: &str, port: i32) -> Option<String> {
+    let bound: ::std::net::IpAddr = bound.trim_matches(['[', ']']).parse().ok()?;
+    if !bound.is_unspecified() {
+        return None;
+    }
+    let dialable: ::std::net::IpAddr = host.trim_matches(['[', ']']).parse().ok()?;
+    if !matches!(dialable, ::std::net::IpAddr::V4(address) if address.is_loopback()) {
         return None;
     }
     let port = u16::try_from(port).ok()?;
@@ -1451,33 +1466,44 @@ mod tests {
     use super::*;
 
     /// RULE: a node of a cache placed in the account's VPC is published at an address of its
-    /// own in the IPv4 loopback block its socket is bound on, unique per node and the same on
-    /// every read — and at none at all when the socket is bound on another family or on an
-    /// address of another host, where this emulator has no such address to publish.
+    /// own in the IPv4 loopback block ONLY where its own socket would accept a connection
+    /// there — a bind that takes every local address of the interface — unique per node and
+    /// the same on every read; at none at all for a socket bound on ONE address, which accepts
+    /// a connection at that address and at no other, or where the dialable address is outside
+    /// that block.
     ///
-    /// The rows span what the reading generalises over: the two spellings of the IPv4 loopback
-    /// address a listener is bound on, two ports of one such interface, the IPv6 loopback
-    /// address (as written and bracketed), a wildcard bind and a routable one.
+    /// The rows span what the reading generalises over: which bind the core made (the IPv4
+    /// wildcard, the IPv6 wildcard, the loopback address it binds by default, another loopback
+    /// address, a routable one, and a value that is no address at all), two ports of one such
+    /// interface, and whether the address the socket is dialable at is in the IPv4 loopback
+    /// block.
     #[test]
-    fn a_node_of_a_vpc_placed_cache_is_published_at_its_own_loopback_address() {
-        let rows: &[(&str, &str, i32, Option<&str>)] = &[
-            ("the interface the core binds by default", "127.0.0.1", 38189, Some("127.0.149.45")),
-            ("another port of that same interface", "127.0.0.1", 38190, Some("127.0.149.46")),
-            ("a port in another high byte", "127.0.0.1", 1024, Some("127.0.4.0")),
-            ("another address of the same block", "127.0.0.5", 40000, Some("127.0.156.64")),
-            ("an IPv6 loopback bind", "::1", 38189, None),
-            ("an IPv6 loopback bind as a listener spells it", "[::1]", 38189, None),
-            ("a wildcard bind", "0.0.0.0", 38189, None),
-            ("a routable bind", "10.4.1.9", 38189, None),
-            ("a host that is no address at all", "localhost", 38189, None),
+    fn a_node_is_published_at_its_own_address_only_where_its_socket_accepts_one_there() {
+        let rows: &[(&str, &str, &str, i32, Option<&str>)] = &[
+            // A wildcard bind takes a connection to every local address of the interface, so
+            // the node's own spelling of the loopback block is an address it answers at.
+            ("a wildcard bind", "0.0.0.0", "127.0.0.1", 38189, Some("127.0.149.45")),
+            ("another port of that same bind", "0.0.0.0", "127.0.0.1", 38190, Some("127.0.149.46")),
+            ("a port in another high byte", "0.0.0.0", "127.0.0.1", 1024, Some("127.0.4.0")),
+            // Bound on ONE address: no second spelling of the interface is accepted there, so
+            // the node keeps the address its own socket is bound on.
+            ("the interface the core binds by default", "127.0.0.1", "127.0.0.1", 38189, None),
+            ("another address of the same block", "127.0.0.5", "127.0.0.5", 40000, None),
+            ("an IPv6 loopback bind", "::1", "[::1]", 38189, None),
+            ("a routable bind", "10.4.1.9", "10.4.1.9", 38189, None),
+            // The IPv6 wildcard is dialable at an address of another family, for which this
+            // emulator has no second address of that same interface to publish.
+            ("an IPv6 wildcard bind", "::", "[::1]", 38189, None),
+            ("a bind that is no address at all", "localhost", "localhost", 38189, None),
         ];
         let mut published: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (case, host, port, expected) in rows {
-            let address = own_node_address(host, *port);
+        for (case, bound, host, port, expected) in rows {
+            let address = own_node_address(bound, host, *port);
             assert_eq!(
                 address.as_deref(),
                 *expected,
-                "case {case:?}: expected {expected:?} for {host}:{port}, got {address:?}"
+                "case {case:?}: expected {expected:?} for a socket bound on {bound} and \
+                 dialable at {host}:{port}, got {address:?}"
             );
             if let Some(address) = address {
                 assert!(
