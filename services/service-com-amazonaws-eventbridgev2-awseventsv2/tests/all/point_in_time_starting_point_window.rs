@@ -52,7 +52,7 @@ use eventsv2::ops::put_events::PutEvents;
 use eventsv2::ops::types::{
     CreateEventBusInput, CreateSubscriberInput, CreateSubscriberOutput, DescribeEventBusInput,
     DescribeSubscriberInput, InvokeConfiguration, ListSubscribersInput, PointInTimeConfiguration,
-    PutEventsInput, PutEventsRequestEntry,
+    PutEventsInput, PutEventsRequestEntry, StorageConfiguration,
 };
 use eventsv2::scaffolded::Scaffolded;
 
@@ -146,10 +146,14 @@ fn invoke() -> InvokeConfiguration {
 /// Whole epoch seconds at the moment this is read, which every row's instant is
 /// expressed relative to.
 fn epoch_seconds_now() -> i64 {
+    epoch_seconds(SystemTime::now())
+}
+
+/// `at` as an epoch second, the unit every instant a row names is computed in.
+fn epoch_seconds(at: SystemTime) -> i64 {
     i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock is after the epoch")
+        at.duration_since(UNIX_EPOCH)
+            .expect("the instant is after the epoch")
             .as_secs(),
     )
     .expect("an epoch second of this era fits an i64")
@@ -195,13 +199,25 @@ impl Harness {
     }
 
     /// A bus that has finished provisioning, which is the state a subscriber can
-    /// be created against. The wait polls for `ACTIVE` rather than a duration.
+    /// be created against, retaining its events for this service's default
+    /// period.
     async fn active_bus(&self, name: &str) -> String {
+        self.active_bus_retaining(name, None).await
+    }
+
+    /// The same, for a create that states the `RetentionPeriodInDays` it wants —
+    /// the period the far side of the replayable window follows — or states none
+    /// when `days` is `None`. The wait polls for `ACTIVE` rather than a
+    /// duration.
+    async fn active_bus_retaining(&self, name: &str, days: Option<i32>) -> String {
         let arn = CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
                 CreateEventBusInput {
                     name: name.to_string(),
                     client_token: Some(format!("token-for-{name}")),
+                    storage_configuration: days.map(|days| StorageConfiguration {
+                        retention_period_in_days: Some(days),
+                    }),
                     ..Default::default()
                 },
                 &self.ctx(),
@@ -233,6 +249,25 @@ impl Harness {
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    /// Move a bus's stored creation instant back by `age`, and report where it
+    /// now sits.
+    ///
+    /// A bus older than its retention period is the only one whose reported
+    /// window starts at the retention period rather than at its own creation,
+    /// and moving the stored instant is how a test reaches one without waiting
+    /// for the clock.
+    fn age_bus(&self, case: &str, bus: &str, age: Duration) -> SystemTime {
+        let creation = SystemTime::now() - age;
+        let store = self.store();
+        let mut state = store.lock();
+        let stored = state
+            .event_buses
+            .get_mut(bus)
+            .unwrap_or_else(|| panic!("case {case:?}: the create must have stored the bus"));
+        stored.creation_time = creation;
+        creation
     }
 
     /// The bus's `StorageConfiguration.RetentionWindowStartTime` as a read
@@ -597,6 +632,7 @@ async fn a_point_inside_the_window_is_accepted_and_placed_on_the_log() {
 
     // The bus is made four hours old and its two events three hours old, so the
     // whole window — from the bus's creation to five minutes ago — is reachable.
+    harness.age_bus("inside-window-bus", &bus, Duration::from_secs(4 * 3_600));
     let moment = SystemTime::now();
     let (first_sequence, tip) = {
         let store = harness.store();
@@ -605,7 +641,6 @@ async fn a_point_inside_the_window_is_accepted_and_placed_on_the_log() {
             .event_buses
             .get_mut(&bus)
             .expect("the bus the create minted is in the store");
-        stored.creation_time = moment - Duration::from_secs(4 * 3_600);
         for event in &mut stored.events {
             event.received_at = moment - Duration::from_secs(3 * 3_600);
         }
@@ -779,6 +814,140 @@ async fn the_outside_window_refusal_names_only_the_requested_instant() {
                 "case {case:?}: the message must not carry {absent:?}, got {message:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The far side of the window: the bus's retention, not the bus's creation
+// ---------------------------------------------------------------------------
+
+/// RULE, on its far side: the earliest instant a `TIMESTAMP` point may name is
+/// the window the BUS reports — `StorageConfiguration.RetentionWindowStartTime`,
+/// which follows the `RetentionPeriodInDays` the bus holds — and NOT the instant
+/// the bus was created. For a bus older than its retention period those are two
+/// different instants, and every point between them is outside the window:
+/// "events older than this have expired from retention", so the log cannot
+/// answer for them and the create is refused.
+///
+/// The rows span the published range of `RetentionPeriodInDays` (`@range` 1..365
+/// on the member, per `smithy_query(query="shape",shape="RetentionPeriodInDays")`):
+/// each bound, one period between them, and the period a create that states none
+/// gets. Per bus they span where the point falls against THAT bus's window: an
+/// hour inside it, an hour before it, and a minute after the bus was created —
+/// the row a gate keyed on the creation instant instead of on the reported
+/// window would wrongly accept.
+///
+/// Nothing here waits on the clock: the bus's stored creation instant is moved
+/// back, and every point is a request VALUE.
+#[tokio::test]
+async fn the_far_side_of_the_window_is_the_bus_s_reported_retention_window() {
+    /// How far back each bus's creation is moved: beyond the longest retention
+    /// the member admits, so every bus below reports a window start strictly
+    /// later than its own creation.
+    const AGE: Duration = Duration::from_secs(400 * 86_400);
+
+    let harness = Harness::new();
+
+    for (case, days) in [
+        ("the minimum retention the member admits", Some(1)),
+        ("a retention between the bounds", Some(30)),
+        ("the maximum retention the member admits", Some(365)),
+        ("the retention a create states nothing about", None),
+    ] {
+        let label = days.map_or_else(|| "default".to_string(), |days| days.to_string());
+        let bus = harness
+            .active_bus_retaining(&format!("retention-{label}"), days)
+            .await;
+        let creation = epoch_seconds(harness.age_bus(case, &bus, AGE));
+        let window = harness.retention_window_start(case, &bus).await.secs();
+        assert!(
+            window > creation,
+            "case {case:?}: a bus older than its retention must report a window later than its \
+             creation, got window {window} and creation {creation}"
+        );
+
+        // (row, the name suffix, the instant asked for, whether it is accepted)
+        let rows = [
+            ("an hour inside the window", "inside", window + 3_600, true),
+            ("an hour before the window", "before", window - 3_600, false),
+            (
+                "a minute after the bus was created",
+                "atcreation",
+                creation + 60,
+                false,
+            ),
+        ];
+
+        for (row, suffix, requested, accepted) in rows {
+            let case = format!("{case}, {row}");
+            let name = format!("retention-{label}-{suffix}");
+            let answered = harness
+                .create_subscriber(CreateSubscriberInput {
+                    name: name.clone(),
+                    event_bus_arn: bus.clone(),
+                    invoke_configuration: invoke(),
+                    starting_position: Some(POINT_IN_TIME.to_string()),
+                    point_in_time_configuration: point(
+                        TIMESTAMP,
+                        Some(DateTime::from_secs(requested)),
+                    ),
+                    client_token: Some(format!("token-for-{name}")),
+                    ..Default::default()
+                })
+                .await;
+
+            if accepted {
+                let created = answered.unwrap_or_else(|e| {
+                    panic!("case {case:?}: CreateSubscriber must succeed, got {e:?}")
+                });
+                assert_eq!(
+                    created.starting_position.as_deref(),
+                    Some(POINT_IN_TIME),
+                    "case {case:?}: expected StartingPosition {POINT_IN_TIME:?}, got {:?}",
+                    created.starting_position
+                );
+                continue;
+            }
+
+            let error = answered
+                .err()
+                .unwrap_or_else(|| panic!("case {case:?}: CreateSubscriber must be refused"));
+            assert_eq!(
+                error.http_status(),
+                400,
+                "case {case:?}: expected HTTP 400, got {}",
+                error.http_status()
+            );
+            let expected = outside_window_message(&stamp_of(requested));
+            match &error {
+                Scaffolded::Modeled(CreateSubscriberErrorModeled::InvalidInputException(
+                    invalid,
+                )) => assert_eq!(
+                    invalid.message.as_deref(),
+                    Some(expected.as_str()),
+                    "case {case:?}: expected {expected:?}, got {:?}",
+                    invalid.message
+                ),
+                other => panic!("case {case:?}: expected InvalidInputException, got {other:?}"),
+            }
+            assert!(
+                harness
+                    .store()
+                    .lock()
+                    .subscriber_on_bus_by_name(&bus, &name)
+                    .is_none(),
+                "case {case:?}: a refused create must leave no subscriber behind"
+            );
+        }
+
+        // Read back through the enumeration a client would use: only the point
+        // inside this bus's own window minted anything.
+        let listed = harness.subscriber_names(case, &bus).await;
+        assert_eq!(
+            listed,
+            vec![format!("retention-{label}-inside")],
+            "case {case:?}: expected only the accepted subscriber, got {listed:?}"
+        );
     }
 }
 
