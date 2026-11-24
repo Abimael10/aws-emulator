@@ -158,20 +158,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // Two different failures, told apart by where the id resolves: an id
             // a DIFFERENT app environment owns is a request made in the wrong
-            // scope — the modelled `InvalidParameterException` (400), because the
-            // parameters do not name the component they address — while an id
-            // that names no component anywhere is absent, the modelled
-            // `ResourceNotFoundException` (404).
-            if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(GetComponentErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            // scope (the modelled `InvalidParameterException`, 400, because the
+            // parameters do not name the component they address), while an id
+            // that names no component anywhere is absent (the modelled
+            // `ResourceNotFoundException`, 404). The store draws that distinction
+            // for every resource addressed by the identifier triple; what is this
+            // operation's own is which error enum carries the two classes and,
+            // for a read, that the absent payload is the reading one.
+            return Err(store
+                .classify_component_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    GetComponentErrorModeled::InvalidParameterException,
+                    GetComponentErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(GetComponentErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         };
 
         Ok(GetComponentOutput {

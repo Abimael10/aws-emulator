@@ -225,21 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wrong-scope request (the modelled `InvalidParameterException`, 400) and an
         // id that names no theme anywhere is absent (the widened-in
         // `ResourceNotFoundException`, 404). Nothing is created either way — an
-        // update is not an upsert.
+        // update is not an upsert. The store classifies the miss; what is this
+        // operation's own is the error enum the two classes are carried in and,
+        // like a read, the reading not-found payload.
         if store
             .theme(&input.app_id, &input.environment_name, &input.id)
             .is_none()
         {
-            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(UpdateThemeErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            return Err(store
+                .classify_theme_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    UpdateThemeErrorModeled::InvalidParameterException,
+                    UpdateThemeErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(UpdateThemeErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         }
 
         // A theme name identifies a theme within its app environment, so a rename

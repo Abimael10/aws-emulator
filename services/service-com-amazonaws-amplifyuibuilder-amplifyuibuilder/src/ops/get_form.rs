@@ -151,23 +151,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(form) = store.form(&input.app_id, &input.environment_name, &input.id) else {
-            // Two different failures, told apart by where the id resolves — the same
-            // two `GetComponent` tells apart, because a form is addressed by
-            // (appId, environmentName, id) exactly as a component is: an id a
-            // DIFFERENT app environment owns is a request made in the wrong scope
-            // (the modelled `InvalidParameterException`, 400), while an id that names
-            // no form anywhere is absent (the modelled `ResourceNotFoundException`,
-            // 404).
-            if store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(GetFormErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            // The same two failures `GetComponent` tells apart, because a form is
+            // addressed by (appId, environmentName, id) exactly as a component is:
+            // an id a DIFFERENT app environment owns is a request made in the wrong
+            // scope (the modelled `InvalidParameterException`, 400), while an id
+            // that names no form anywhere is absent (the modelled
+            // `ResourceNotFoundException`, 404). The store classifies the miss; this
+            // names the error enum the two classes are carried in and, for a read,
+            // the reading not-found payload.
+            return Err(store
+                .classify_form_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    GetFormErrorModeled::InvalidParameterException,
+                    GetFormErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(GetFormErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         };
 
         Ok(GetFormOutput {

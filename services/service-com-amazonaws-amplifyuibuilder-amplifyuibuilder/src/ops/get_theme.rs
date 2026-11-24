@@ -159,17 +159,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is a request made in the wrong scope — the modelled
             // `InvalidParameterException` (400), because the parameters do not name the
             // theme they address — while an id that names no theme anywhere is absent,
-            // the modelled `ResourceNotFoundException` (404).
-            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(GetThemeErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            // the modelled `ResourceNotFoundException` (404). The store draws that
+            // distinction once for every resource addressed by the triple; what is
+            // this operation's own is the error enum the two classes are carried in
+            // and, for a read, the reading not-found payload.
+            return Err(store
+                .classify_theme_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    GetThemeErrorModeled::InvalidParameterException,
+                    GetThemeErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(GetThemeErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         };
 
         Ok(GetThemeOutput {

@@ -167,17 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // DIFFERENT app environment owns is a request made in the wrong scope
             // (the modelled `InvalidParameterException`, 400), while an id that names
             // no job anywhere is absent (the modelled `ResourceNotFoundException`,
-            // 404).
-            if store.codegen_job_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(GetCodegenJobErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            // 404). The store draws that distinction once for every resource
+            // addressed by the triple; what is this operation's own is the error
+            // enum the two classes are carried in and, for a read, the reading
+            // not-found payload.
+            return Err(store
+                .classify_codegen_job_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    GetCodegenJobErrorModeled::InvalidParameterException,
+                    GetCodegenJobErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(GetCodegenJobErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         };
 
         Ok(GetCodegenJobOutput {

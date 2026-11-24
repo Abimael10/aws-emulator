@@ -182,20 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // DIFFERENT app environment owns is a wrong-scope request (the modelled
             // `InvalidParameterException`, 400) and an id that names no theme
             // anywhere is absent (the modelled `ResourceNotFoundException`, 404).
-            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(DeleteThemeErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            // The store draws that distinction once for every resource addressed by
+            // the triple; what is this operation's own is the error enum the two
+            // classes are carried in and the not-found payload the delete path
+            // carries. The refusals name no error type, so the message is the only
+            // name the failure class has — and the delete path's not-found message is
+            // its OWN literal, not the read path's: that is what lets a client tell a
+            // failed delete from a failed read apart.
+            return Err(store
+                .classify_theme_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    DeleteThemeErrorModeled::InvalidParameterException,
+                    DeleteThemeErrorModeled::ResourceNotFoundException,
+                    crate::state::item_to_delete_not_found,
                 )
                 .into());
-            }
-            // The refusals carry no error type, so the message is the only name the
-            // failure class has — and the delete path's not-found message is its OWN
-            // literal, not the read path's: that is what lets a client tell a failed
-            // delete from a failed read apart.
-            return Err(DeleteThemeErrorModeled::ResourceNotFoundException(
-                crate::state::item_to_delete_not_found(),
-            )
-            .into());
         }
 
         // `DeleteThemeResponse` is `Unit`: the answer is the status alone.

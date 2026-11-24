@@ -201,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidParameterException`, 400) and an id that names no form anywhere
         // is absent (`ResourceNotFoundException`, 404 — widened in above, and the
         // same refusal `GetForm` answers for that id). Nothing is created either
-        // way: an update is not an upsert.
+        // way: an update is not an upsert. The store classifies the miss; what is
+        // this operation's own is the error enum the two classes are carried in
+        // and, like a read, the reading not-found payload.
         //
         // `clientToken` is an `@idempotencyToken`, but a merge of the same patch
         // into the same form leaves the same form behind however often it is
@@ -210,16 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .form(&input.app_id, &input.environment_name, &input.id)
             .is_some();
         if !addressed {
-            if store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(UpdateFormErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            return Err(store
+                .classify_form_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    UpdateFormErrorModeled::InvalidParameterException,
+                    UpdateFormErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(UpdateFormErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         }
 
         // A form name identifies a form within its app environment, so a rename

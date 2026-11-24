@@ -277,21 +277,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request (the modelled `InvalidParameterException`, 400) and an id that
         // names no component anywhere is absent (`ResourceNotFoundException`,
         // 404 — widened in above). Nothing is created either way: an update is
-        // not an upsert.
+        // not an upsert. The store classifies the miss; what is this operation's
+        // own is the error enum the two classes are carried in and, like a read,
+        // the reading not-found payload.
         if store
             .component(&input.app_id, &input.environment_name, &input.id)
             .is_none()
         {
-            if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
-                return Err(UpdateComponentErrorModeled::InvalidParameterException(
-                    crate::state::item_wrong_scope(),
+            return Err(store
+                .classify_component_miss(&input.app_id, &input.environment_name, &input.id)
+                .refusal(
+                    UpdateComponentErrorModeled::InvalidParameterException,
+                    UpdateComponentErrorModeled::ResourceNotFoundException,
+                    crate::state::item_not_found,
                 )
                 .into());
-            }
-            return Err(UpdateComponentErrorModeled::ResourceNotFoundException(
-                crate::state::item_not_found(),
-            )
-            .into());
         }
 
         // A component name identifies a component within its app environment, so

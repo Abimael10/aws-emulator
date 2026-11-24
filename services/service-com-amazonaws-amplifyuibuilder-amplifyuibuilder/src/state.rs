@@ -749,19 +749,19 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             .find(|component| component.id == id)
     }
 
-    /// Whether `id` names a component some OTHER app environment owns.
+    /// How a component lookup that found nothing MISSED.
     ///
     /// A component is addressed by (appId, environmentName, id), so an id that
     /// resolves outside the app environment the request named is a request made
     /// in the wrong scope — told apart here from an id that names no component at
     /// all, which is simply absent.
-    pub fn component_in_other_scope(
+    pub fn classify_component_miss(
         &self,
         app_id: &str,
         environment_name: &str,
         id: &str,
-    ) -> bool {
-        id_in_other_scope(&self.components, app_id, environment_name, id, |component| {
+    ) -> IdMiss {
+        classify_id_miss(&self.components, app_id, environment_name, id, |component| {
             &component.id
         })
     }
@@ -965,15 +965,15 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.form_tokens.insert((key, token), id);
     }
 
-    /// Whether `id` names a form some OTHER app environment owns.
+    /// How a form lookup that found nothing MISSED.
     ///
     /// A form is addressed by (appId, environmentName, id) exactly as a component
     /// is, so an id that resolves outside the app environment the request named is
     /// a request made in the wrong scope — told apart here from an id that names no
     /// form at all, which is simply absent. The component counterpart is
-    /// [`Self::component_in_other_scope`].
-    pub fn form_in_other_scope(&self, app_id: &str, environment_name: &str, id: &str) -> bool {
-        id_in_other_scope(&self.forms, app_id, environment_name, id, |form| &form.id)
+    /// [`Self::classify_component_miss`].
+    pub fn classify_form_miss(&self, app_id: &str, environment_name: &str, id: &str) -> IdMiss {
+        classify_id_miss(&self.forms, app_id, environment_name, id, |form| &form.id)
     }
 
     /// Remove the form `id` names from the app environment the request addressed,
@@ -1080,21 +1080,21 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             .find(|job| job.id == id)
     }
 
-    /// Whether `id` names a codegen job some OTHER app environment owns.
+    /// How a codegen job lookup that found nothing MISSED.
     ///
     /// A codegen job is addressed by (appId, environmentName, id) exactly as a
     /// component and a form are, so an id that resolves outside the app
     /// environment the request named is a request made in the wrong scope — told
     /// apart here from an id that names no job at all, which is simply absent.
-    /// The counterparts are [`Self::component_in_other_scope`] and
-    /// [`Self::form_in_other_scope`].
-    pub fn codegen_job_in_other_scope(
+    /// The counterparts are [`Self::classify_component_miss`] and
+    /// [`Self::classify_form_miss`].
+    pub fn classify_codegen_job_miss(
         &self,
         app_id: &str,
         environment_name: &str,
         id: &str,
-    ) -> bool {
-        id_in_other_scope(&self.codegen_jobs, app_id, environment_name, id, |job| {
+    ) -> IdMiss {
+        classify_id_miss(&self.codegen_jobs, app_id, environment_name, id, |job| {
             &job.id
         })
     }
@@ -1177,15 +1177,15 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             .find(|theme| theme.id == id)
     }
 
-    /// Whether `id` names a theme some OTHER app environment owns.
+    /// How a theme lookup that found nothing MISSED.
     ///
     /// A theme is addressed by (appId, environmentName, id) exactly as a component
     /// and a form are, so an id that resolves outside the app environment the
     /// request named is a request made in the wrong scope — told apart here from an
     /// id that names no theme at all, which is simply absent. The counterparts are
-    /// [`Self::component_in_other_scope`] and [`Self::form_in_other_scope`].
-    pub fn theme_in_other_scope(&self, app_id: &str, environment_name: &str, id: &str) -> bool {
-        id_in_other_scope(&self.themes, app_id, environment_name, id, |theme| {
+    /// [`Self::classify_component_miss`] and [`Self::classify_form_miss`].
+    pub fn classify_theme_miss(&self, app_id: &str, environment_name: &str, id: &str) -> IdMiss {
+        classify_id_miss(&self.themes, app_id, environment_name, id, |theme| {
             &theme.id
         })
     }
@@ -1475,25 +1475,75 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     }
 }
 
-/// Whether `id` names a record some OTHER app environment owns, in one of this
-/// store's (appId, environmentName)-keyed collections.
+/// How a lookup addressed by (appId, environmentName, id) MISSED: the one
+/// decision every resource of this service addressed by that triple makes when
+/// the id it was handed resolves to nothing in the app environment addressed.
 ///
-/// The one place the wrong-scope test lives: every resource of this service that
+/// The two answers are two different failures, and [`Self::refusal`] is the one
+/// place each is paired with the refusal class it is reported as, so a handler
+/// supplies only what is its own: the two variants of ITS modelled error enum
+/// and the not-found payload ITS path carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdMiss {
+    /// The id names a record some OTHER app environment owns: the parameters do
+    /// not name the resource they address, which this service reports as
+    /// `InvalidParameterException` (400).
+    WrongScope,
+    /// The id names no record of its kind anywhere: it is absent, which this
+    /// service reports as `ResourceNotFoundException` (404).
+    Absent,
+}
+
+impl IdMiss {
+    /// The refusal this miss is answered with, in the calling operation's own
+    /// modelled error: `wrong_scope` carries [`item_wrong_scope`], and
+    /// `not_found` carries what `absent` builds. A reporting or updating path
+    /// passes [`item_not_found`] and a delete its own
+    /// [`item_to_delete_not_found`], which is the only part of the answer that
+    /// belongs to the path rather than to the classification.
+    ///
+    /// Each operation of this service declares its errors as an enum of its own,
+    /// so the two variants are arguments; which of them answers is decided here.
+    pub fn refusal<E>(
+        self,
+        wrong_scope: impl FnOnce(InvalidParameterException) -> E,
+        not_found: impl FnOnce(ResourceNotFoundException) -> E,
+        absent: impl FnOnce() -> ResourceNotFoundException,
+    ) -> E {
+        match self {
+            Self::WrongScope => wrong_scope(item_wrong_scope()),
+            Self::Absent => not_found(absent()),
+        }
+    }
+}
+
+/// How a miss of `id` in one of this store's (appId, environmentName)-keyed
+/// collections is classified: [`IdMiss::WrongScope`] when some OTHER app
+/// environment owns a record carrying that id, [`IdMiss::Absent`] when none
+/// does.
+///
+/// The one place the classification lives: every resource of this service that
 /// is addressed by (appId, environmentName, id) classifies a miss the same way,
-/// so the per-kind methods above ([`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::component_in_other_scope`]
+/// so the per-kind methods above
+/// ([`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::classify_component_miss`]
 /// and its counterparts) differ only in which collection they search and where
 /// the record carries its id.
-fn id_in_other_scope<T>(
+fn classify_id_miss<T>(
     collections: &HashMap<EnvironmentKey, Vec<T>>,
     app_id: &str,
     environment_name: &str,
     id: &str,
     record_id: impl Fn(&T) -> &str,
-) -> bool {
-    collections
+) -> IdMiss {
+    let in_other_scope = collections
         .iter()
         .filter(|((app, environment), _)| app != app_id || environment != environment_name)
-        .any(|(_, records)| records.iter().any(|record| record_id(record) == id))
+        .any(|(_, records)| records.iter().any(|record| record_id(record) == id));
+    if in_other_scope {
+        IdMiss::WrongScope
+    } else {
+        IdMiss::Absent
+    }
 }
 
 /// The record called `name` among those one app environment holds, if there is
