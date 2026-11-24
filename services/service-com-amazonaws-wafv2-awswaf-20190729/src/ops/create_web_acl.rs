@@ -334,6 +334,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "Public suffixes aren't allowed. For example, you can't use gov.au or co.uk
+        // as token domains" (`TokenDomains`' own doc): a token this web ACL accepts is
+        // presented by every host under the domain it is scoped to, so a name nothing
+        // is registered under is refused rather than stored
+        // (`crate::state::refused_token_domain`, the one reading every member that
+        // takes token domains shares).
+        if let Some(refused) =
+            crate::state::refused_token_domain(input.token_domains.as_deref().unwrap_or_default())
+        {
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFInvalidParameterException",
+            );
+            return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_token_domain_exception(refused),
+            )
+            .into());
+        }
+
         // A rule group — managed or customer-owned — can only be run by a rule's own
         // top-level statement, which is judged before any reference is resolved.
         if let Some((field, reason)) = crate::state::misplaced_rule_group_statement(

@@ -3,9 +3,9 @@
 //! @op PutLoggingConfiguration
 //! Puts the logging configuration the request describes in front of the web ACL its
 //! `ResourceArn` names, replacing whatever that web ACL carried under the same
-//! `LogScope`, and answers it as stored. A `LogDestinationConfigs` entry whose
-//! destination name does not carry the `aws-waf-logs-` prefix is
-//! `WAFInvalidParameterException`. An `ResourceArn` naming no web ACL of this
+//! `LogScope`, and answers it as stored. A `LogDestinationConfigs` entry that is not a
+//! well-formed ARN, or whose destination name does not carry the `aws-waf-logs-`
+//! prefix, is `WAFInvalidParameterException`. An `ResourceArn` naming no web ACL of this
 //! account is `WAFNonexistentItemException` and one that is not a wafv2 ARN at all
 //! `WAFInvalidParameterException` (both HTTP 400). The configuration's own members
 //! are judged BEFORE the web ACL is resolved — the ARN's syntax first, then the
@@ -253,6 +253,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutLoggingConfigurationErrorModeled::WAFInvalidParameterException(
                     crate::state::invalid_log_destination_exception(refused),
+                )
+                .into(),
+            );
+        }
+
+        // A destination is addressed by an ARN, so a value WAF read a name off is
+        // then judged as the ARN it has to be: an ARN leaving out a segment its own
+        // form requires — the account id and the Region of a destination that lives in
+        // one — addresses no destination at all
+        // (`crate::state::is_well_formed_log_destination_arn`), and WAF refuses it as
+        // the malformed ARN it is, with the field member left out, because what is
+        // wrong is the value rather than the settings it was written in.
+        if let Some(refused) = configuration
+            .log_destination_configs
+            .iter()
+            .find(|destination| !crate::state::is_well_formed_log_destination_arn(destination))
+        {
+            crate::state::audit(
+                "PutLoggingConfiguration",
+                "",
+                "",
+                "",
+                "WAFInvalidParameterException",
+            );
+            return Err(
+                PutLoggingConfigurationErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_destination_arn_exception(refused),
                 )
                 .into(),
             );

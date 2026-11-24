@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         let filters = input.filters.as_deref().unwrap_or_default();
-        crate::state::validate_monetization_filters(filters)
+        crate::state::validate_monetization_filters(filters, Self::NAME)
             .map_err(GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException)?;
         let window = crate::state::monetization_window(&input.time_window)
             .map_err(GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException)?;

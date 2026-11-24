@@ -6,11 +6,11 @@
 //!
 //! Two things the call reports are computed here:
 //!
-//! * the WINDOW. The requested range is intersected with the sampling horizon that
-//!   ends at the call instant — "You can specify any time range in the previous three
-//!   hours. If you specify a start time that's earlier than three hours ago, WAF sets
-//!   it to three hours ago" — so the reported `TimeWindow` is the range WAF sampled
-//!   over, never a range outside the horizon ([`SAMPLING_HORIZON`]).
+//! * the WINDOW. A request may only ask about the sampling horizon that ends at the
+//!   call instant — "you can specify any time range in the previous three hours" — so
+//!   a window reaching back past it is REFUSED ([`window_outside_horizon`], recorded
+//!   behaviour) and the window the response reports is the requested one, carried no
+//!   further forward than the call instant ([`SAMPLING_HORIZON`]).
 //! * the SAMPLE. WAF draws it "from among the first 5,000 requests that your Amazon
 //!   Web Services resource received during the time range", capped at `MaxItems`, and
 //!   `PopulationSize` is the size of the population it drew from. The population is
@@ -136,6 +136,17 @@ use super::types::*;
 /// documented duration, so it keeps the value AWS documents.
 pub const SAMPLING_HORIZON: ::std::time::Duration = ::std::time::Duration::from_secs(3 * 60 * 60);
 
+/// What WAF answers a request whose `TimeWindow` reaches back past
+/// [`SAMPLING_HORIZON`], as the recorded WAF responses word it.
+///
+/// Wholly fixed text, naming no value the request supplied: the horizon it states is
+/// the same one for every caller, so there is nothing per-request to report. The
+/// sentence is the whole body of this refusal beside its `__type` — `Field`,
+/// `Parameter` and `Reason` are left out, because what is wrong is the RANGE the pair
+/// of members spans rather than one parameter's value.
+pub const WINDOW_OUTSIDE_HORIZON_MESSAGE: &str =
+    "Start time and end time must be strictly after current time - 3 hours";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -203,6 +214,35 @@ fn sampled_window(requested: &TimeWindow, now_secs: f64) -> TimeWindow {
     }
 }
 
+/// The refusal a `TimeWindow` reaching back past the sampling horizon earns, or
+/// `None` when both its ends lie inside the horizon that ends at `now_secs` (seconds
+/// since the Unix epoch).
+///
+/// WAF keeps samples for [`SAMPLING_HORIZON`] and answers a window it cannot sample
+/// over with the modelled `WAFInvalidParameterException` rather than with an empty
+/// sample of a range it never held (recorded behaviour, against the "WAF sets it to
+/// three hours ago" the member's own doc states for a start before the horizon): a
+/// caller that asked about a range outside the horizon is told so instead of reading
+/// "no matching traffic" off a window WAF never looked at. BOTH ends are judged — the
+/// window is the range between them, so an end inside the horizon does not make a
+/// start outside it answerable — and the bound is STRICT, as the sentence it is
+/// stated in says.
+fn window_outside_horizon(
+    requested: &TimeWindow,
+    now_secs: f64,
+) -> Option<WAFInvalidParameterException> {
+    let horizon_start = now_secs - SAMPLING_HORIZON.as_secs_f64();
+    let inside = |instant: &::aws_smithy_types::DateTime| instant.as_secs_f64() > horizon_start;
+    (!inside(&requested.start_time) || !inside(&requested.end_time)).then(|| {
+        WAFInvalidParameterException {
+            message: Some(WINDOW_OUTSIDE_HORIZON_MESSAGE.to_string()),
+            field: None,
+            parameter: None,
+            reason: None,
+        }
+    })
+}
+
 /// The `GetSampledRequests` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -253,6 +293,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The window the request asks about, against the horizon WAF retains samples
+        // for: a request's own member, so it is judged before anything the request
+        // names is resolved ([`window_outside_horizon`]).
+        let now_secs = now_epoch_seconds();
+        if let Some(refusal) = window_outside_horizon(&input.time_window, now_secs) {
+            return Err(
+                GetSampledRequestsErrorModeled::WAFInvalidParameterException(refusal).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSampledRequestsErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
@@ -295,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The window WAF sampled over, which is what the response reports.
-        let window = sampled_window(&input.time_window, now_epoch_seconds());
+        let window = sampled_window(&input.time_window, now_secs);
 
         // WAF draws the sample from the web requests it INSPECTED for the
         // `RuleMetricName` dimension inside that window — "the first 5,000 requests

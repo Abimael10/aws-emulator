@@ -10,7 +10,8 @@
 //! web ACL is associated, names the associated one once there is, names the REPLACEMENT
 //! after a second association, and is absent again after a disassociation — and it is
 //! keyed by the stage's ARN, so two apis carrying a stage of the same name each report
-//! their own.
+//! their own. A stage's ARN can only be bound once the stage EXISTS: WAF puts a web ACL
+//! in front of a resource it can retrieve.
 //!
 //! Each test asserts that rule over a TABLE of cases rather than one recorded call: the
 //! rows differ along what the rule generalises over — whether a web ACL is associated,
@@ -463,11 +464,28 @@ async fn every_reader_of_a_stage_reports_the_web_acl_waf_has_in_front_of_it() {
         "case {case}: expected every reader to report no web ACL, got {reports:?}"
     );
 
-    // Row 6: a stage whose ARN was bound BEFORE the stage was created reports the
-    // binding in the answer that creates it: the report is read from WAF's record, not
-    // written onto the stage when one is stored.
-    let case = "created after its ARN was bound";
-    associate(&edge, &first, &api, "fresh").await;
+    // Row 6: a stage's ARN names nothing until the stage exists, so WAF cannot retrieve
+    // the resource and refuses to put a web ACL in front of it; once the stage IS
+    // created, the same binding is made and every reader reports it — the report is read
+    // from WAF's record, not written onto the stage when one is stored.
+    let case = "bound before the stage exists";
+    let (status, refusal) = edge
+        .waf_call(
+            "AssociateWebACL",
+            json!({ "WebACLArn": &first, "ResourceArn": stage_arn(&api, "fresh") }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case}: expected the association to be refused, got {status} with {refusal}"
+    );
+    assert!(
+        refusal["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("WAFUnavailableEntityException"),
+        "case {case}: expected the resource WAF could not retrieve, got {refusal}"
+    );
     let created = edge
         .api_ok(
             "POST",
@@ -478,10 +496,12 @@ async fn every_reader_of_a_stage_reports_the_web_acl_waf_has_in_front_of_it() {
         .await;
     let reported_at_create = reported(&created);
     assert_eq!(
-        reported_at_create.as_deref(),
-        Some(first.as_str()),
-        "case {case}: expected CreateStage to report {first}, got {reported_at_create:?}"
+        reported_at_create, None,
+        "case {case}: a stage created with nothing in front of it must report no web \
+         ACL, got {reported_at_create:?}"
     );
+    let case = "bound once the stage exists";
+    associate(&edge, &first, &api, "fresh").await;
     let reports = Reports::of(&edge, &api, "fresh").await;
     assert_eq!(
         reports,

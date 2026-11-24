@@ -4,10 +4,13 @@
 //! Reports the web ACL that is in front of a protected resource.
 //!
 //! It reads the binding `AssociateWebACL` wrote and hands back the STORED web ACL
-//! shape, so the response is the same tree `GetWebACL` answers for it. A resource
-//! that carries no binding is reported with no web ACL at all — "if there is no
+//! shape, so the response is the same tree `GetWebACL` answers for it. A resource that
+//! exists and carries no binding is reported with no web ACL at all — "if there is no
 //! associated resource, WAF returns a null web ACL"
-//! (`GetWebACLForResourceResponse$WebACL`) — not as a refusal.
+//! (`GetWebACLForResourceResponse$WebACL`) — not as a refusal; a resource the service
+//! that owns it does not hold is `WAFNonexistentItemException`, because there is no
+//! such resource to report about
+//! ([`crate::service::protected_resources`]).
 //!
 //! A report: nothing here writes to the store.
 //!
@@ -175,15 +178,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A report: it reads the stored binding and writes nothing a later caller
-        // could see. `ctx` carries only request metadata, which this operation does
-        // not need.
-        let _ = ctx;
+        // could see. `ctx` carries the request's own metadata and the in-process
+        // channel the protected resource is resolved over.
 
         // The same judgement `AssociateWebACL` makes on this parameter: an ARN a web
         // ACL could never have been put in front of names no binding to report.
         if crate::state::protected_resource_type(&input.resource_arn).is_none() {
             return Err(GetWebACLForResourceErrorModeled::WAFInvalidParameterException(
                 crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // "Retrieves the WebACL for the specified resource": the resource is the one
+        // this call is about, so a resource the service that owns it does not hold is
+        // a resource that doesn't exist (recorded behaviour) — asked before the store
+        // is reached, since the hop awaits
+        // (`crate::service::protected_resources`).
+        if crate::service::protected_resources::retrieved(ctx, &input.resource_arn)
+            .await
+            .is_absent()
+        {
+            return Err(GetWebACLForResourceErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         }
@@ -199,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // The stored shape, so this call and `GetWebACL` report one web ACL the same
-        // way; `None` for a resource nothing was put in front of.
+        // way; `None` for a resource that exists and carries no binding — "if there is
+        // no associated resource, WAF returns a null web ACL"
+        // (`GetWebACLForResourceResponse$WebACL`), which is a different answer from the
+        // refusal above for a resource that is not there at all.
         Ok(GetWebACLForResourceOutput {
             web_acl: state
                 .web_acl_for_resource(&input.resource_arn)

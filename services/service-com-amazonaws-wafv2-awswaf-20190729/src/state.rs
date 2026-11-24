@@ -33,7 +33,7 @@ use crate::ops::types::{
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
     WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
     WAFNonexistentItemException, WAFOptimisticLockException, WAFSubscriptionNotFoundException,
-    WAFTagOperationException,
+    WAFTagOperationException, WAFUnavailableEntityException,
     WAFUnsupportedAggregateKeyTypeException, WebACL, BLOCKCHAIN_CHAIN_VALUES,
     CURRENCY_MODE_VALUES, CURRENCY_VALUES, PLATFORM_VALUES, SETTLEMENT_STATUS_VALUES,
 };
@@ -71,6 +71,8 @@ mod scope;
 /// What ONE rule statement has to satisfy on its own: where its kind may be
 /// written, and which values and components its own settings accept.
 mod statements;
+/// What a TOKEN DOMAIN has to be, for every member that takes one.
+mod token_domains;
 pub use api_keys::*;
 pub use capacity::*;
 pub use catalog::*;
@@ -84,6 +86,7 @@ pub use patterns::*;
 pub use rule_set::*;
 pub use scope::*;
 pub use statements::*;
+pub use token_domains::*;
 
 // ---------------------------------------------------------------------------
 // The exception messages: ONE constant sentence per exception type.
@@ -133,6 +136,17 @@ pub const OPTIMISTIC_LOCK_MESSAGE: &str = "AWS WAF couldn’t save your changes 
 /// [`DUPLICATE_ITEM_MESSAGE`].
 pub const NONEXISTENT_ITEM_MESSAGE: &str =
     "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
+
+/// The sentence `WAFUnavailableEntityException` carries, whatever the request named.
+///
+/// The wire wording WAF answers with, as the recorded wafv2 responses show it: the
+/// shape's own documented sentence
+/// (`smithy_query(query="shape",shape="WAFUnavailableEntityException")`, its advice
+/// about just-created resources flattened to the retry it ends on) prefixed with the
+/// service name, the way every other exception of this family words it (see
+/// [`DUPLICATE_ITEM_MESSAGE`]).
+pub const UNAVAILABLE_ENTITY_MESSAGE: &str = "AWS WAF couldn’t retrieve the resource \
+     that you requested. Retry your request.";
 
 /// The sentence `WAFAssociatedItemException` carries, whatever the request named.
 ///
@@ -196,6 +210,14 @@ pub fn managed_rules_not_found_exception(
             "ManagedRules with name {name} by vendor {vendor_name} does not exist. \
              Please check your inputs."
         )),
+    }
+}
+
+/// `WAFUnavailableEntityException` as WAF returns it: nothing but
+/// [`UNAVAILABLE_ENTITY_MESSAGE`].
+pub fn unavailable_entity_exception() -> WAFUnavailableEntityException {
+    WAFUnavailableEntityException {
+        message: Some(UNAVAILABLE_ENTITY_MESSAGE.to_string()),
     }
 }
 
@@ -841,16 +863,48 @@ pub fn monetization_filter_values(name: &str) -> Option<&'static [&'static str]>
     }
 }
 
+/// How a refusal of a repeated filter name words its `Reason`: the name that was
+/// written twice, and the operation the `Filters` list was given to.
+///
+/// Both variable parts come from the call — the name from the request's own list, the
+/// operation from the call that is being refused — and the text around them is fixed,
+/// as the recorded WAF responses word it.
+pub fn duplicate_filter_name_reason(name: &str, operation: &str) -> String {
+    format!("Duplicate filter name '{name}' for {operation}.")
+}
+
 /// Refuse a `Filters` list that names a filter this service does not have, or
 /// gives an enum-restricted filter a value outside its vocabulary, or gives the
-/// ARN-validated filter something that is not a web ACL ARN.
+/// ARN-validated filter something that is not a web ACL ARN, or names one filter
+/// TWICE.
+///
+/// A filter list is a set of conditions, one per field, that a transaction has to
+/// satisfy ([`monetization_filters_select`]), so a name written twice asks two
+/// questions about one field and WAF refuses the query rather than dropping one of
+/// them or answering the intersection: a client that meant to widen a filter adds
+/// values to it instead. `operation` is the call being refused, which that refusal's
+/// own `Reason` names ([`duplicate_filter_name_reason`]).
 ///
 /// The refusal is the modelled `WAFInvalidParameterException`: `Parameter` carries
 /// the value that was rejected, so a client reads which filter to correct.
 pub fn validate_monetization_filters(
     filters: &[MonetizationFilter],
+    operation: &str,
 ) -> Result<(), WAFInvalidParameterException> {
-    for filter in filters {
+    for (position, filter) in filters.iter().enumerate() {
+        if filters[..position]
+            .iter()
+            .any(|earlier| earlier.name == filter.name)
+        {
+            // Recorded behaviour words this one with the scope field token, which is
+            // what WAF reports for a query member it namespaces by rather than one of
+            // the resource settings `ParameterExceptionField` otherwise names.
+            return Err(invalid_parameter_exception(
+                FIELD_SCOPE_VALUE,
+                &filter.name,
+                &duplicate_filter_name_reason(&filter.name, operation),
+            ));
+        }
         if !MONETIZATION_FILTER_NAMES.contains(&filter.name.as_str()) {
             return Err(invalid_parameter_exception_without_field(
                 &filter.name,
@@ -3682,7 +3736,7 @@ pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
 pub const LOG_DESTINATION_NAME_PREFIX: &str = "aws-waf-logs-";
 
 /// The NAME of the logging destination `value` addresses, or `None` when `value` is
-/// not an ARN at all.
+/// not a well-formed ARN at all.
 ///
 /// Every destination kind a configuration can name — a CloudWatch Logs log group, an
 /// S3 bucket, a Firehose delivery stream — addresses the destination by its name in
@@ -3693,31 +3747,10 @@ pub const LOG_DESTINATION_NAME_PREFIX: &str = "aws-waf-logs-";
 /// the group still resolves to the group's name: the wildcard is not a name of its
 /// own.
 pub fn log_destination_name(value: &str) -> Option<&str> {
-    // An ARN's resource part is everything after the fifth colon and may itself
-    // contain colons, so the split stops there.
-    let mut segments = value.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(partition),
-        Some(service),
-        Some(_region),
-        Some(_account),
-        Some(resource),
-    ) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    )
-    else {
-        return None;
-    };
-    if partition.is_empty() || service.is_empty() {
-        return None;
-    }
-    let addressed = resource.strip_suffix(":*").unwrap_or(resource);
+    // The fields themselves come from the ONE parse this tree shares, which also holds
+    // every form to a non-empty partition, service and resource.
+    let arn = ::service_common::arn::parse(value)?;
+    let addressed = arn.resource.strip_suffix(":*").unwrap_or(arn.resource);
     let name = addressed.split([':', '/']).next_back()?;
     (!name.is_empty()).then_some(name)
 }
@@ -3735,6 +3768,50 @@ pub fn is_acceptable_log_destination(value: &str) -> bool {
 /// that is no ARN and a well-formed ARN WAF cannot use as a destination alike.
 pub fn invalid_log_destination_exception(destination: &str) -> WAFInvalidParameterException {
     invalid_parameter_exception(FIELD_LOG_DESTINATION, destination, ARN_NOT_VALID_REASON)
+}
+
+/// The ONE destination service whose ARN form carries neither a Region nor an
+/// account id: an Amazon S3 bucket is addressed in a global namespace
+/// (`arn:aws:s3:::<bucket>`), so those two segments of its ARN are empty, while a
+/// CloudWatch Logs log group and a Firehose delivery stream are each addressed in one
+/// account and one Region and carry both.
+pub const GLOBAL_NAMESPACE_DESTINATION_SERVICE: &str = "s3";
+
+/// `true` when `value` is a WELL-FORMED ARN for a logging destination: every segment
+/// the ARN form of the service it names requires is there.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource>`, and the
+/// fields themselves are read by the ONE parse this tree shares
+/// ([`::service_common::arn::parse`], which requires all six fields, the literal `arn`,
+/// and a non-empty partition, service and resource). What is left to WAF is which of
+/// the two optional fields the service that owns the destination requires: a
+/// destination in a global namespace carries neither a Region nor an account id
+/// ([`GLOBAL_NAMESPACE_DESTINATION_SERVICE`]), and every other destination is addressed
+/// in one account and one Region, so an ARN of one that leaves either out names no
+/// destination at all.
+///
+/// Separated from [`is_acceptable_log_destination`], which judges the destination's
+/// own NAME: the name is the requirement the API's own documentation states, so it is
+/// reported first, and a value whose name WAF accepted is then judged as the ARN it
+/// has to be ([`invalid_destination_arn_exception`] against
+/// [`invalid_log_destination_exception`]).
+pub fn is_well_formed_log_destination_arn(value: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse(value) else {
+        return false;
+    };
+    if arn.vendor == GLOBAL_NAMESPACE_DESTINATION_SERVICE {
+        return arn.region.is_empty() && arn.account.is_empty();
+    }
+    !arn.region.is_empty() && !arn.account.is_empty()
+}
+
+/// [`invalid_parameter_exception_without_field`] for a logging destination whose ARN
+/// is MALFORMED: `Parameter` the value as the request wrote it, `Reason`
+/// [`ARN_NOT_VALID_REASON`] and NO `Field` — recorded behaviour reports this one with
+/// the field member left out, which its message renders as `field: null`, because what
+/// is wrong is the ARN itself rather than the settings it was written in.
+pub fn invalid_destination_arn_exception(destination: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception_without_field(destination, ARN_NOT_VALID_REASON)
 }
 
 /// The `ErrorReason` WAF carries when a rule list costs more web ACL capacity

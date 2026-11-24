@@ -25,6 +25,7 @@
 //! the apigateway data plane and the web ACL the wafv2 control plane stored.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -40,6 +41,17 @@ const REGION: &str = "us-east-1";
 /// (`Scope`'s `CLOUDFRONT` value is for "a global resource type, such as a Amazon
 /// CloudFront distribution").
 const SCOPE: &str = "REGIONAL";
+
+/// The sampling window every `GetSampledRequests` below asks about: WAF retains samples
+/// for the three hours before the call and refuses a window reaching back past that, so
+/// a window that is to see every sample the case drove reaches as far back as it can
+/// without crossing that bound.
+fn sampling_window() -> Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    json!({ "StartTime": now - 3 * 3_600 + 60, "EndTime": now + 60 })
+}
 
 /// One emulator with API Gateway and WAFv2 mounted on a single shared engine.
 struct Edge {
@@ -1126,7 +1138,7 @@ async fn body_inspection_stops_at_the_limit_in_force_and_the_stage_answers_eithe
                     "RuleMetricName": metric,
                     "Scope": SCOPE,
                     "MaxItems": 100,
-                    "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                    "TimeWindow": sampling_window(),
                 }),
             )
             .await;
@@ -1603,7 +1615,7 @@ async fn a_managed_rule_group_decides_and_the_sample_names_the_rule_that_did() {
                 "RuleMetricName": "sql-database",
                 "Scope": SCOPE,
                 "MaxItems": 50,
-                "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                "TimeWindow": sampling_window(),
             }),
         )
         .await;
@@ -2124,7 +2136,7 @@ async fn a_counted_rules_custom_request_handling_reaches_the_origin_and_the_samp
                     "RuleMetricName": COUNTING_RULE,
                     "Scope": SCOPE,
                     "MaxItems": 500,
-                    "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                    "TimeWindow": sampling_window(),
                 }),
             )
             .await;

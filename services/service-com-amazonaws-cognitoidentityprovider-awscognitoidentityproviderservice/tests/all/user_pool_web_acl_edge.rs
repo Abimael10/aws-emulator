@@ -25,6 +25,7 @@
 //! what lets one request to the pool reach the web ACL the wafv2 control plane stored.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -39,6 +40,16 @@ const REGION: &str = "us-east-1";
 /// (`Scope`'s `CLOUDFRONT` value is for "a global resource type, such as a Amazon
 /// CloudFront distribution").
 const SCOPE: &str = "REGIONAL";
+
+/// The sampling window the `GetSampledRequests` below asks about: WAF retains samples
+/// for the three hours before the call and refuses a window reaching back past that, so
+/// this reaches as far back as it can without crossing that bound.
+fn sampling_window() -> Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    json!({ "StartTime": now - 3 * 3_600 + 60, "EndTime": now + 60 })
+}
 
 /// A request's SigV4 credential scope, which routes a call to this service. The
 /// signature is never checked here: the suite turns request authentication off.
@@ -1000,7 +1011,7 @@ async fn the_live_association_follows_the_rules_current_action() {
                 "WebAclArn": web_acl.arn,
                 "RuleMetricName": metric,
                 "Scope": SCOPE,
-                "TimeWindow": { "StartTime": 0, "EndTime": 4_102_444_800_i64 },
+                "TimeWindow": sampling_window(),
                 "MaxItems": 500,
             }),
         )

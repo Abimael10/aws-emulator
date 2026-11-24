@@ -62,6 +62,9 @@ pub mod logs;
 /// The `AWS/WAFV2` series the data plane publishes: the per-dimension counters a
 /// `VisibilityConfig$CloudWatchMetricsEnabled` asks WAF to send to CloudWatch.
 pub mod metrics;
+/// The resource of ANOTHER service a web ACL is put in front of, resolved with the
+/// service that owns it — which is the only place its existence is known.
+pub mod protected_resources;
 /// The judgement every operation makes about the request itself, before it resolves
 /// anything the request names: the `Scope` against the endpoint it was signed for.
 pub mod requests;

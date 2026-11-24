@@ -58,19 +58,47 @@ impl Waf {
         (Self { router }, engine)
     }
 
-    /// POST one awsJson1_1 call, credential-scoped for `region`, and answer its
-    /// HTTP status and parsed body.
-    async fn call_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLEWAFV2/20260101/{region}/wafv2/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=00"
+    /// [`Self::new`] with the service that OWNS a protected resource mounted beside
+    /// WAFv2 on the same engine, as the assembled emulator mounts them.
+    ///
+    /// For a suite about a resource of another service: an Amazon Cognito user pool is
+    /// one of the resource forms `AssociateWebACLRequest$ResourceArn` takes, and WAF
+    /// resolves such a resource with the service that owns it, so a suite about that
+    /// resolution needs that service to be there to answer.
+    pub(crate) fn mounting_user_pools() -> Self {
+        let (mut waf, engine) = Self::sharing_engine();
+        waf.router.register_service(
+            service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(
+                engine,
+            ),
         );
+        waf
+    }
+
+    /// POST one awsJson1_1 call to the service `signing_name`, whose `X-Amz-Target`
+    /// prefix is `target_prefix`, credential-scoped for `region`.
+    ///
+    /// Every call this harness makes goes through here, so a call to WAFv2 and one to
+    /// the service that owns a protected resource arrive the same way a client's do.
+    pub(crate) async fn call_service(
+        &self,
+        region: &str,
+        signing_name: &str,
+        target_prefix: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLEWAFV2/20260101/{region}/{signing_name}/\
+             aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+        );
+        let host = format!("{signing_name}.example.com");
         let request = ::http::Request::builder()
             .method("POST")
-            .uri("https://wafv2.example.com/")
-            .header("host", "wafv2.example.com")
+            .uri(format!("https://{host}/"))
+            .header("host", host)
             .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("AWSWAF_20190729.{operation}"))
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
             .header("authorization", authorization)
             .body(::bytes::Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),
@@ -86,6 +114,13 @@ impl Waf {
             })
         };
         (status, parsed)
+    }
+
+    /// POST one awsJson1_1 call, credential-scoped for `region`, and answer its
+    /// HTTP status and parsed body.
+    async fn call_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
+        self.call_service(region, "wafv2", "AWSWAF_20190729", operation, body)
+            .await
     }
 
     /// [`Self::call_in`] for the endpoint a conforming client would use: a request

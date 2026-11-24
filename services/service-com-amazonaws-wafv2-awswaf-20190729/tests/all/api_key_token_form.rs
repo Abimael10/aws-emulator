@@ -37,7 +37,7 @@ use service_com_amazonaws_wafv2_awswaf_20190729::state::{
     MAX_TOKEN_DOMAINS_PER_API_KEY, SCOPE_CLOUDFRONT, SCOPE_REGIONAL,
 };
 
-use crate::web_acl_lifecycle::Waf;
+use crate::web_acl_lifecycle::{create_web_acl, visibility, Waf};
 
 /// The bounds `APIKey` allows (`smithy_query(query="shape",shape="APIKey")` →
 /// `length 1..2048`, `pattern \S`).
@@ -50,6 +50,11 @@ const MAX_TOKEN_DOMAIN_LENGTH: usize = 253;
 
 /// The padding character base64 completes a rendering with.
 const BASE64_PAD: char = '=';
+
+/// The `ErrorReason` WAF carries for a parameter whose text is not in the form that
+/// parameter has to take, as recorded. Spelled out here rather than imported, so this
+/// suite pins the sentence and not merely its reuse.
+const FORMAT_NOT_VALID: &str = "The parameter contains formatting that is not valid.";
 
 /// One definition a key is minted over.
 struct Definition {
@@ -450,4 +455,216 @@ async fn a_key_decrypts_back_to_its_own_definition() {
         );
         minted.push(api_key);
     }
+}
+
+/// A token domain that IS a public suffix is refused by every member that takes one,
+/// and a registrable domain is accepted — the rule every `TokenDomains` member states:
+/// "public suffixes aren't allowed. For example, you can't use `gov.au` or `co.uk` as
+/// token domains" (`CreateAPIKey$TokenDomains`, and `TokenDomains` on a web ACL
+/// created or updated).
+///
+/// The refused rows span the shapes a public suffix takes rather than the one domain
+/// the report named: a single-label suffix, two-label ones, a suffix of the list's
+/// private section, and one written in another case — plus the position the bad domain
+/// takes in the list. The accepted rows span a registration under each of those
+/// suffixes, which is what makes the rule about the suffix and not about the text
+/// around it. Every row is run through all three members, so a domain one operation
+/// refuses cannot enter the store through another.
+#[tokio::test]
+async fn a_token_domain_that_is_a_public_suffix_is_refused_everywhere_one_is_taken() {
+    // `(case, the domains a request names, the domain WAF is expected to report)`.
+    // Each offending value is an entry of the Public Suffix List — the list that
+    // DEFINES a public suffix, read through the `psl` crate: `com`, `co.uk` and
+    // `gov.au` from its ICANN section and `github.io` from its private one. The list
+    // is matched without regard to case, and a name may be written fully qualified
+    // with the root's own trailing dot, so those rows are the same suffixes.
+    let refused: &[(&str, &[&str], &str)] = &[
+        ("a single-label suffix", &["com"], "com"),
+        ("a two-label suffix", &["co.uk"], "co.uk"),
+        ("another two-label suffix", &["gov.au"], "gov.au"),
+        ("a suffix in upper case", &["CO.UK"], "CO.UK"),
+        (
+            "a suffix of the list's private section",
+            &["github.io"],
+            "github.io",
+        ),
+        (
+            "a suffix written fully qualified, with the root's own dot",
+            &["co.uk."],
+            "co.uk.",
+        ),
+        (
+            "a registrable domain followed by a suffix",
+            &["store.abc.com", "co.uk"],
+            "co.uk",
+        ),
+        (
+            "a suffix followed by a registrable domain",
+            &["co.uk", "store.abc.com"],
+            "co.uk",
+        ),
+    ];
+    // The same suffixes with a registrable label in front of them, which is what a
+    // client application's domain is. Fewer rows than [`MAX_API_KEYS_PER_SCOPE`], the
+    // bound a mint is refused past.
+    let accepted: &[(&str, &[&str])] = &[
+        ("a registration under a single-label suffix", &["abc.com"]),
+        ("a registration under a two-label suffix", &["abc.co.uk"]),
+        ("a subdomain of one", &["store.abc.co.uk"]),
+        (
+            "a registration under a private-section suffix",
+            &["mysite.github.io"],
+        ),
+        ("two registrable domains", &["abc.com", "store.abc.co.uk"]),
+    ];
+    assert!(
+        accepted.len() <= MAX_API_KEYS_PER_SCOPE,
+        "the accepted table must stay within {MAX_API_KEYS_PER_SCOPE} keys per scope, \
+         got {}",
+        accepted.len()
+    );
+
+    let waf = Waf::new();
+    let (web_acl_id, _web_acl_arn, lock_token) =
+        create_web_acl(&waf, SCOPE_REGIONAL, "token-domain-acl", json!([])).await;
+
+    for (case, domains, offending) in refused {
+        for (operation, body) in token_domain_requests(domains, &web_acl_id, &lock_token) {
+            let refusal = waf
+                .refused(
+                    operation,
+                    body,
+                    "WAFInvalidParameterException",
+                    &format!("{operation}: {case}"),
+                )
+                .await;
+            assert_eq!(
+                refusal["Field"].as_str(),
+                Some("TOKEN_DOMAIN"),
+                "case {operation} {case:?}: the refusal must name the token-domain \
+                 field, got {refusal}"
+            );
+            assert_eq!(
+                refusal["Parameter"].as_str(),
+                Some(*offending),
+                "case {operation} {case:?}: the refusal must echo the domain at fault, \
+                 got {refusal}"
+            );
+            assert_eq!(
+                refusal["Reason"].as_str(),
+                Some(FORMAT_NOT_VALID),
+                "case {operation} {case:?}: expected the formatting reason, got {refusal}"
+            );
+            assert_eq!(
+                refusal["message"].as_str(),
+                Some(
+                    format!(
+                        "Error reason: {FORMAT_NOT_VALID}, field: TOKEN_DOMAIN, \
+                         parameter: {offending}"
+                    )
+                    .as_str()
+                ),
+                "case {operation} {case:?}: the message must be composed from Reason, \
+                 Field and Parameter, got {refusal}"
+            );
+        }
+    }
+
+    // Nothing a refusal named entered the store: the web ACL still carries no token
+    // domains at all, and no web ACL by the name a refused create asked for exists.
+    let read_back = waf
+        .ok(
+            "GetWebACL",
+            json!({ "Name": "token-domain-acl", "Scope": SCOPE_REGIONAL, "Id": &web_acl_id }),
+        )
+        .await;
+    assert!(
+        read_back["WebACL"]["TokenDomains"].is_null(),
+        "a refused save must leave the web ACL without token domains, got {read_back}"
+    );
+
+    // Each accepted row mints a key and saves the web ACL, which rotates its lock
+    // token: the row reads back what it stored, through the readers a client uses.
+    let mut lock_token = lock_token;
+    for (case, domains) in accepted {
+        let minted = waf
+            .ok(
+                "CreateAPIKey",
+                json!({ "Scope": SCOPE_REGIONAL, "TokenDomains": domains }),
+            )
+            .await;
+        assert!(
+            minted["APIKey"].as_str().is_some_and(|key| !key.is_empty()),
+            "case {case:?}: a registrable domain must mint a key, got {minted}"
+        );
+        let saved = waf
+            .ok(
+                "UpdateWebACL",
+                json!({
+                    "Name": "token-domain-acl",
+                    "Scope": SCOPE_REGIONAL,
+                    "Id": &web_acl_id,
+                    "LockToken": &lock_token,
+                    "DefaultAction": { "Allow": {} },
+                    "VisibilityConfig": visibility("token-domain-acl"),
+                    "TokenDomains": domains,
+                }),
+            )
+            .await;
+        lock_token = saved["NextLockToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: an accepted update answers a NextLockToken, got {saved}")
+            })
+            .to_string();
+        let read_back = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": "token-domain-acl", "Scope": SCOPE_REGIONAL, "Id": &web_acl_id }),
+            )
+            .await;
+        assert_eq!(
+            read_back["WebACL"]["TokenDomains"],
+            json!(domains),
+            "case {case:?}: the saved web ACL must carry the domains it accepted, got \
+             {read_back}"
+        );
+    }
+}
+
+/// One request per member that takes token domains, each naming `domains`: the API
+/// key's own, and a web ACL created and updated with them.
+fn token_domain_requests(
+    domains: &[&str],
+    web_acl_id: &str,
+    lock_token: &str,
+) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "CreateAPIKey",
+            json!({ "Scope": SCOPE_REGIONAL, "TokenDomains": domains }),
+        ),
+        (
+            "CreateWebACL",
+            json!({
+                "Name": "token-domain-created",
+                "Scope": SCOPE_REGIONAL,
+                "DefaultAction": { "Allow": {} },
+                "VisibilityConfig": visibility("token-domain-created"),
+                "TokenDomains": domains,
+            }),
+        ),
+        (
+            "UpdateWebACL",
+            json!({
+                "Name": "token-domain-acl",
+                "Scope": SCOPE_REGIONAL,
+                "Id": web_acl_id,
+                "LockToken": lock_token,
+                "DefaultAction": { "Allow": {} },
+                "VisibilityConfig": visibility("token-domain-acl"),
+                "TokenDomains": domains,
+            }),
+        ),
+    ]
 }

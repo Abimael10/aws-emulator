@@ -6,9 +6,11 @@
 //! The rule under test: a logging destination is named, not merely addressed — the
 //! name a destination carries in its ARN must begin with `aws-waf-logs-`
 //! (`smithy_query(query="doc",shape="LoggingConfiguration")`: "the name that you
-//! give the destination must start with `aws-waf-logs-`"), so WAF refuses a
-//! `PutLoggingConfiguration` whose `LogDestinationConfigs` carries a destination
-//! named otherwise with the parameter failure, writing nothing, and accepts one
+//! give the destination must start with `aws-waf-logs-`"), and the value that name is
+//! read off has to be a well-formed ARN of the service that owns the destination, so
+//! WAF refuses a `PutLoggingConfiguration` whose `LogDestinationConfigs` carries a
+//! destination named otherwise, or one addressed by an ARN that leaves out a segment
+//! its own form requires, with the parameter failure, writing nothing — and accepts one
 //! whose destinations are all named that way.
 //!
 //! Each half is asserted over a TABLE spanning the class rather than the one
@@ -211,6 +213,125 @@ async fn a_destination_named_without_the_waf_logs_prefix_is_refused() {
              {read_body}",
             row.case
         );
+    }
+}
+
+/// A destination ARN that leaves out a segment its own form requires is refused as the
+/// malformed ARN it is, with the field member left out — and the same ARN with that
+/// segment present is accepted.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource>`, and which of
+/// those segments may be empty belongs to the service that owns the resource: an Amazon
+/// S3 bucket is addressed in a global namespace and carries neither a Region nor an
+/// account id, while a CloudWatch Logs log group and a Firehose delivery stream are each
+/// addressed in one account and one Region. The rows span WHICH segment is missing (the
+/// account id, the Region, both) or present where that form carries none, WHICH
+/// destination kind the ARN is of, and the position of the bad entry in the list; each
+/// refused row is paired with the same ARN made whole, so what the row changes is the
+/// segment alone.
+///
+/// A value WAF can read no destination NAME off at all is the sibling refusal above,
+/// which names the `LOG_DESTINATION` settings: the name is the requirement the API's own
+/// documentation states, so it is reported first.
+///
+/// The refusal carries no `Field`: what is wrong is the value rather than the settings
+/// it was written in, so its message renders the field as `null` (recorded behaviour).
+#[tokio::test]
+async fn a_destination_arn_missing_a_required_segment_is_refused() {
+    // `(case, the destination a put names, the same destination made whole)`.
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "a delivery stream with no account id",
+            "arn:aws:firehose:us-west-2::deliverystream/aws-waf-logs-probe",
+            "arn:aws:firehose:us-west-2:000000000000:deliverystream/aws-waf-logs-probe",
+        ),
+        (
+            "a delivery stream with no Region",
+            "arn:aws:firehose::000000000000:deliverystream/aws-waf-logs-probe",
+            "arn:aws:firehose:us-west-2:000000000000:deliverystream/aws-waf-logs-probe",
+        ),
+        (
+            "a log group with no account id",
+            "arn:aws:logs:us-west-2::log-group:aws-waf-logs-probe",
+            "arn:aws:logs:us-west-2:000000000000:log-group:aws-waf-logs-probe",
+        ),
+        (
+            "a log group with neither Region nor account id",
+            "arn:aws:logs:::log-group:aws-waf-logs-probe",
+            "arn:aws:logs:us-west-2:000000000000:log-group:aws-waf-logs-probe",
+        ),
+        (
+            "a bucket with a Region an S3 bucket ARN does not carry",
+            "arn:aws:s3:us-west-2::aws-waf-logs-probe",
+            "arn:aws:s3:::aws-waf-logs-probe",
+        ),
+        (
+            "an acceptable destination followed by a malformed one",
+            "arn:aws:firehose:us-west-2::deliverystream/aws-waf-logs-second",
+            "arn:aws:firehose:us-west-2:000000000000:deliverystream/aws-waf-logs-second",
+        ),
+    ];
+
+    let waf = Waf::new();
+    let (_acl_id, acl_arn, _acl_lock) =
+        create_web_acl(&waf, "REGIONAL", "destination-arn-acl", json!([])).await;
+
+    for (case, malformed, whole) in rows {
+        // The last row puts the malformed entry behind an acceptable one, so the list
+        // the put names depends on the row.
+        let named: Vec<&str> = if case.starts_with("an acceptable destination") {
+            vec!["arn:aws:s3:::aws-waf-logs-first", malformed]
+        } else {
+            vec![malformed]
+        };
+        let (status, body) = waf
+            .call(
+                "PutLoggingConfiguration",
+                configuration(&acl_arn, &named),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for destinations {named:?}, got status {status} \
+             and body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "WAFInvalidParameterException",
+            "case {case:?}: expected WAFInvalidParameterException, got {body}"
+        );
+        assert!(
+            body["Field"].is_null(),
+            "case {case:?}: a malformed ARN carries no field, got {body}"
+        );
+        assert_eq!(
+            body["Parameter"].as_str(),
+            Some(*malformed),
+            "case {case:?}: Parameter must echo the rejected destination, got {body}"
+        );
+        assert_eq!(
+            body["Reason"].as_str(),
+            Some(ARN_NOT_VALID),
+            "case {case:?}: expected the ARN reason, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Error reason: {ARN_NOT_VALID}, field: null, parameter: {malformed}"),
+            "case {case:?}: the message must render the absent field as null, got {body}"
+        );
+
+        // The same ARN with the missing segment present is a destination WAF delivers
+        // to, so the row's refusal is about that segment and nothing else.
+        let put = waf
+            .ok("PutLoggingConfiguration", configuration(&acl_arn, &[whole]))
+            .await;
+        assert_eq!(
+            put["LoggingConfiguration"]["LogDestinationConfigs"],
+            json!([whole]),
+            "case {case:?}: the whole ARN must be stored, got {put}"
+        );
+        waf.ok("DeleteLoggingConfiguration", read_request(&acl_arn))
+            .await;
     }
 }
 

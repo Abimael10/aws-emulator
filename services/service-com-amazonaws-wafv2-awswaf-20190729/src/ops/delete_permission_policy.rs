@@ -2,7 +2,11 @@
 
 //! @op DeletePermissionPolicy
 //! Removes the IAM policy `PutPermissionPolicy` attached to the rule group its
-//! `ResourceArn` names. This is the ONLY file to touch for this operation.
+//! `ResourceArn` names. An ARN that is not a wafv2 resource ARN is
+//! `WAFInvalidParameterException`, and one naming no rule group of this account — or
+//! naming one that carries no policy, so there is no policy to remove — is
+//! `WAFNonexistentItemException` (both HTTP 400). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -183,11 +187,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Deleting the policy leaves the rule group sharing nothing. The call states
-        // the END state of a rule group this account owns, so a rule group that
-        // carries no policy is already in it: the delete is idempotent rather than a
-        // refusal, and only the rule group itself has to exist.
-        let removed = entry.permission_policy.take().is_some();
+        // Deleting the policy leaves the rule group sharing nothing. The POLICY is the
+        // resource this call acts on ("deletes an IAM policy from the specified rule
+        // group"), so a rule group that carries none holds nothing to delete and the
+        // call references a resource that doesn't exist — recorded behaviour, which is
+        // what lets a client tell "the policy is gone now" from "there was never a
+        // policy here".
+        if entry.permission_policy.is_none() {
+            let scope = entry.scope.clone();
+            let name = entry.rule_group.name.clone();
+            let id = entry.rule_group.id.clone();
+            crate::state::audit(
+                "DeletePermissionPolicy",
+                &scope,
+                &name,
+                &id,
+                "WAFNonexistentItemException",
+            );
+            return Err(
+                DeletePermissionPolicyErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        }
+        entry.permission_policy = None;
         // Read out of the entry before the audit record, so that record holds no
         // borrow of the store.
         let scope = entry.scope.clone();
@@ -198,11 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &scope,
             &name,
             &id,
-            if removed {
-                "policy deleted"
-            } else {
-                "no policy attached"
-            },
+            "policy deleted",
         );
 
         Ok(DeletePermissionPolicyOutput {})

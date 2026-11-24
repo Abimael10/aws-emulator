@@ -117,6 +117,176 @@ pub(crate) async fn web_acl_for_resource(waf: &Waf, resource_arn: &str) -> Optio
         .cloned()
 }
 
+/// WAF puts a web ACL in front of a resource it can RETRIEVE: a protected resource
+/// that the service which owns it does not hold is refused, and one it does hold is
+/// bound and read back.
+///
+/// The rule generalises over which service owns the resource; it is driven here
+/// through an Amazon Cognito user pool, one of the eight forms
+/// `AssociateWebACLRequest$ResourceArn` takes, with that service mounted on the same
+/// engine as the assembled emulator mounts it — so what answers about the pool is the
+/// service that owns it, and a pool that was never created cannot pass.
+///
+/// The rows span the ways a resource can fail to be there — a pool id no create
+/// minted, a pool whose id differs from a real one by a character, and a pool that
+/// existed and was deleted — against the controls that differ from them by that fact
+/// alone: the real pool, which binds, and the real pool before anything was put in
+/// front of it, which reports a null web ACL ("if there is no associated resource, WAF
+/// returns a null web ACL", `GetWebACLForResourceResponse$WebACL`) rather than a
+/// refusal.
+#[tokio::test]
+async fn a_protected_resource_the_owning_service_does_not_hold_is_refused() {
+    /// The sentence `WAFUnavailableEntityException` carries, as recorded. Spelled out
+    /// here rather than imported, so this suite pins the text and not merely its reuse.
+    const UNAVAILABLE_ENTITY: &str =
+        "AWS WAF couldn’t retrieve the resource that you requested. Retry your request.";
+    /// The sentence `WAFNonexistentItemException` carries, as recorded.
+    const NONEXISTENT_ITEM: &str =
+        "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
+
+    let waf = Waf::mounting_user_pools();
+    let (_id, web_acl_arn, _lock_token) =
+        create_web_acl(&waf, "REGIONAL", "retrievable-acl", json!([])).await;
+
+    // A user pool this account really holds, created through the wire of the service
+    // that owns it.
+    let pool = user_pool(&waf, "retrievable-pool").await;
+    // A second pool, created and then deleted: its ARN is well formed and names a
+    // resource nothing holds any more.
+    let deleted = user_pool(&waf, "deleted-pool").await;
+    let deleted_id = deleted
+        .rsplit('/')
+        .next()
+        .expect("a pool ARN carries its id")
+        .to_string();
+    let (status, body) = waf
+        .call_service(
+            "us-west-2",
+            "cognito-idp",
+            "AWSCognitoIdentityProviderService",
+            "DeleteUserPool",
+            json!({ "UserPoolId": deleted_id }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the setup delete of the user pool must succeed, got status {status} and body \
+         {body}"
+    );
+
+    // The real pool carries no web ACL yet: that is a null web ACL and an idempotent
+    // disassociation, not a refusal — the control for every refused row below.
+    let unbound = web_acl_for_resource(&waf, &pool).await;
+    assert!(
+        unbound.is_none(),
+        "a pool nothing was put in front of must report a null web ACL, got {unbound:?}"
+    );
+    waf.ok("DisassociateWebACL", json!({ "ResourceArn": &pool }))
+        .await;
+
+    // Every way the resource can fail to be there, through all three operations that
+    // name one.
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a pool id no create minted",
+            "arn:aws:cognito-idp:us-west-2:000000000000:userpool/us-west-2_aBcDeFgHi".to_string(),
+        ),
+        (
+            "a pool id one character from a real one",
+            format!("{pool}X"),
+        ),
+        ("a pool that was deleted", deleted.clone()),
+    ];
+    for (case, resource_arn) in &absent {
+        let refusal = waf
+            .refused(
+                "AssociateWebACL",
+                json!({ "ResourceArn": resource_arn, "WebACLArn": &web_acl_arn }),
+                "WAFUnavailableEntityException",
+                case,
+            )
+            .await;
+        assert_eq!(
+            refusal["Message"].as_str(),
+            Some(UNAVAILABLE_ENTITY),
+            "case {case:?}: the refusal must carry WAF's retrieve sentence, got {refusal}"
+        );
+        for operation in ["GetWebACLForResource", "DisassociateWebACL"] {
+            let refusal = waf
+                .refused(
+                    operation,
+                    json!({ "ResourceArn": resource_arn }),
+                    "WAFNonexistentItemException",
+                    &format!("{operation}: {case}"),
+                )
+                .await;
+            assert_eq!(
+                refusal["Message"].as_str(),
+                Some(NONEXISTENT_ITEM),
+                "case {operation} {case:?}: the refusal must carry the nonexistent-item \
+                 sentence, got {refusal}"
+            );
+        }
+    }
+
+    // None of those refusals bound anything.
+    let listed = listed_resources(&waf, &web_acl_arn, Some("COGNITO_USER_POOL")).await;
+    assert!(
+        listed.is_empty(),
+        "a refused association must bind nothing, yet the web ACL lists {listed:?}"
+    );
+
+    // The pool the owning service DOES hold binds, and the binding reads back.
+    waf.ok(
+        "AssociateWebACL",
+        json!({ "ResourceArn": &pool, "WebACLArn": &web_acl_arn }),
+    )
+    .await;
+    let bound = web_acl_for_resource(&waf, &pool)
+        .await
+        .expect("the pool must report its web ACL");
+    assert_eq!(
+        bound["ARN"].as_str(),
+        Some(web_acl_arn.as_str()),
+        "the pool must report the web ACL that was put in front of it, got {bound}"
+    );
+    let listed = listed_resources(&waf, &web_acl_arn, Some("COGNITO_USER_POOL")).await;
+    assert_eq!(
+        listed,
+        vec![pool.clone()],
+        "the web ACL must list the pool it is in front of, got {listed:?}"
+    );
+    waf.ok("DisassociateWebACL", json!({ "ResourceArn": &pool }))
+        .await;
+    let after = web_acl_for_resource(&waf, &pool).await;
+    assert!(
+        after.is_none(),
+        "a disassociated pool must report a null web ACL, got {after:?}"
+    );
+}
+
+/// Create the user pool `name` through the wire of the service that owns it, and
+/// answer its ARN — a protected-resource ARN whose resource really exists.
+async fn user_pool(waf: &Waf, name: &str) -> String {
+    let (status, created) = waf
+        .call_service(
+            "us-west-2",
+            "cognito-idp",
+            "AWSCognitoIdentityProviderService",
+            "CreateUserPool",
+            json!({ "PoolName": name }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the setup CreateUserPool must succeed, got status {status} and body {created}"
+    );
+    created["UserPool"]["Arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateUserPool must answer the pool's ARN, got {created}"))
+        .to_string()
+}
+
 /// Every documented resource form can be put in front of a web ACL, both
 /// association reads report the binding, and `DisassociateWebACL` takes it away.
 #[tokio::test]

@@ -551,10 +551,12 @@ async fn a_policy_outside_the_restrictions_is_refused_and_stores_nothing() {
     }
 }
 
-/// Deleting the permission policy leaves the rule group sharing nothing, and says so
-/// whether or not one was attached: the call names the rule group, "permanently
-/// deletes an IAM policy from the specified rule group", and a rule group carrying
-/// none is already in that state — so only the rule group itself has to exist.
+/// Deleting the permission policy leaves the rule group sharing nothing, and a rule
+/// group that carries none is refused: the call "permanently deletes an IAM policy
+/// from the specified rule group", so the POLICY is what has to be there, and a rule
+/// group that was never shared holds none to delete (recorded behaviour) — which is
+/// what lets a teardown tell "the policy is gone now" from "there was never a policy
+/// here".
 #[tokio::test]
 async fn deleting_the_policy_leaves_the_rule_group_sharing_nothing() {
     let waf = Waf::new();
@@ -574,21 +576,37 @@ async fn deleting_the_policy_leaves_the_rule_group_sharing_nothing() {
                 )
                 .await;
                 assert_stored_policy(&waf, &arn, &policy, &case).await;
-            }
 
-            // Twice: the second delete finds nothing left to take away and answers
-            // the same way, so the end state is what the call states.
-            for attempt in 1..=2 {
+                // The attached policy is taken away, and the call answers the empty
+                // response it models.
                 let deleted = waf
                     .ok("DeletePermissionPolicy", json!({ "ResourceArn": &arn }))
                     .await;
                 assert!(
                     deleted.as_object().is_none_or(|members| members.is_empty()),
-                    "case {case:?} attempt {attempt}: DeletePermissionPolicy models an \
-                     empty response, got {deleted}"
+                    "case {case:?}: DeletePermissionPolicy models an empty response, \
+                     got {deleted}"
                 );
                 assert_no_stored_policy(&waf, &arn, &case).await;
             }
+
+            // A rule group carrying no policy holds nothing to delete: the call is
+            // refused, whether it never had one or its policy has just been deleted.
+            let refusal = waf
+                .refused(
+                    "DeletePermissionPolicy",
+                    json!({ "ResourceArn": &arn }),
+                    "WAFNonexistentItemException",
+                    &case,
+                )
+                .await;
+            assert_eq!(
+                error_message(&refusal),
+                NONEXISTENT_ITEM,
+                "case {case:?}: the refusal must carry the nonexistent-item sentence, \
+                 got {refusal}"
+            );
+            assert_no_stored_policy(&waf, &arn, &case).await;
 
             // The rule group itself survives the delete, and can be shared again.
             waf.ok(

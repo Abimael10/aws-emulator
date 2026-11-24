@@ -1109,6 +1109,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-amplify"
+version = "1.133.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e3175999361dff8c2143c39a051bf2f105cffc01fb2cf5e38e366a02ab81e93"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-apigateway"
+version = "1.127.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c18795af322d3293567876c9b1865ee24b7e49c068535e153f1ecee4d91b1d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-apigatewayv2"
 version = "1.126.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1158,6 +1206,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-apprunner"
+version = "1.122.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80966e42bb6e5172d7673b051cacb1a9186ca1833497fb9ce5dd072d1380e41e"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-appsync"
+version = "1.135.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e029922ad9175aa1fe7778656251cf7081d871ac72fdf0fbe0467027405e45ad"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-autoscaling"
 version = "1.145.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1177,6 +1273,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-bedrockagentcorecontrol"
+version = "1.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0281b200335702fd9f764e88cd55f9b58276d32a5dc116b3f91aa33cc2e9b205"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
  "fastrand",
  "http",
  "regex-lite",
@@ -1356,6 +1477,29 @@ name = "aws-sdk-codepipeline"
 version = "1.133.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ee8f0d978b6eb3aec3822d0dd3c8b392fe7a3fb4b45a854f139a6985d1400d9"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-cognitoidentityprovider"
+version = "1.152.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b8726684d928296cb14b69b2026583a4ddfff9a372abc30944de75d166d89a"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -22432,6 +22576,7 @@ name = "service-com-amazonaws-wafv2-awswaf-20190729"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -22439,6 +22584,14 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-amplify",
+ "aws-sdk-apigateway",
+ "aws-sdk-apprunner",
+ "aws-sdk-appsync",
+ "aws-sdk-bedrockagentcorecontrol",
+ "aws-sdk-cognitoidentityprovider",
+ "aws-sdk-ec2",
+ "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-firehose",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
@@ -22454,6 +22607,7 @@ dependencies = [
  "http",
  "ipnet",
  "percent-encoding",
+ "psl",
  "regex",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

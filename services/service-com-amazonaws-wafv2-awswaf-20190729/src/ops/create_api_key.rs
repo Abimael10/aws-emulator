@@ -205,6 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
+        // "Public suffixes aren't allowed. For example, you can't use gov.au or co.uk
+        // as token domains" (`TokenDomains`' own doc): a name nothing is registered
+        // AS is no client application's domain, so the key is refused rather than
+        // minted for a domain its CAPTCHA integration could never present
+        // (`crate::state::refused_token_domain`).
+        if let Some(refused) = crate::state::refused_token_domain(&input.token_domains) {
+            crate::state::audit(
+                Self::NAME,
+                &input.scope,
+                "",
+                "",
+                "WAFInvalidParameterException",
+            );
+            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_token_domain_exception(refused),
+            )
+            .into());
+        }
+
         // "You can use a single key for up to 5 domains" (this operation's own doc),
         // so a request naming more domains than one key can be used for is refused
         // rather than stored: the key it asks for could not serve all of them.

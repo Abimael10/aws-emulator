@@ -27,6 +27,8 @@
 //! resource's endpoint — and the sample is then read over the wire, so what the table
 //! observes is what an SDK observes.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::service::edge::{self, InspectedRequest};
 
@@ -96,8 +98,16 @@ pub(crate) async fn declared_rule_names(waf: &Waf, group: &str) -> Vec<String> {
         .collect()
 }
 
+/// Seconds since the Unix epoch, now.
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
+}
+
 /// The samples `GetSampledRequests` holds for the `metric` dimension of `web_acl_arn`.
 pub(crate) async fn samples_of(waf: &Waf, web_acl_arn: &str, metric: &str) -> Vec<Value> {
+    let now = now_seconds();
     let answered = waf
         .ok(
             "GetSampledRequests",
@@ -106,9 +116,11 @@ pub(crate) async fn samples_of(waf: &Waf, web_acl_arn: &str, metric: &str) -> Ve
                 "RuleMetricName": metric,
                 "Scope": SCOPE,
                 "MaxItems": 50,
-                // The whole sampling horizon, so the window never decides which samples
-                // the row sees: that is `web_acl_edge_reports`'s own table.
-                "TimeWindow": { "StartTime": 0, "EndTime": 99_999_999_999_i64 },
+                // Nearly the whole sampling horizon WAF serves — a window reaching
+                // further back than that is refused rather than sampled — so the window
+                // never decides which samples the row sees: that is
+                // `web_acl_edge_reports`'s own table.
+                "TimeWindow": { "StartTime": now - 3 * 3_600 + 60, "EndTime": now + 60 },
             }),
         )
         .await;

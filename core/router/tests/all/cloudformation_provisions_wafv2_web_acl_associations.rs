@@ -50,6 +50,15 @@ const COMPOSITE_SEPARATOR: &str = "|";
 /// (500 ms) and an Amazon EKS cluster's.
 const PAST_THE_SPANS: Duration = Duration::from_millis(1_200);
 
+/// How long a stack transition is WAITED FOR before a case fails, while the condition
+/// itself is what is looked at ([`settled_at`]). Generous: far longer than the spans
+/// these services choose, so a loaded machine does not fail a case the clock would have
+/// served.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often such a condition is looked at while it is waited for.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
 
@@ -261,6 +270,31 @@ async fn create_and_settle(
     );
     tokio::time::sleep(PAST_THE_SPANS).await;
     describe_stack(router, case, stack_name).await
+}
+
+/// The `DescribeStacks` body for `stack_name` once its `StackStatus` is `status`.
+///
+/// The CONDITION, looked at until it holds, never a wait of a fixed length: a stack
+/// settles when the clock-owed spans of the resources it provisions come due, which is
+/// not a duration this suite may assume.
+async fn settled_at(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+    status: &str,
+) -> String {
+    let deadline = ::tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let body = describe_stack(router, case, stack_name).await;
+        if opt_element(&body, "StackStatus").as_deref() == Some(status) {
+            return body;
+        }
+        assert!(
+            ::tokio::time::Instant::now() < deadline,
+            "case {case:?}: expected the stack to reach {status}, got {body}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The `DescribeStacks` body for one stack.
@@ -696,12 +730,8 @@ async fn re_pointing_a_binding_replaces_it_and_the_new_ref_names_the_new_pair() 
         updated.status,
         updated.text
     );
-    tokio::time::sleep(PAST_THE_SPANS).await;
-    let body = describe_stack(&router, case, stack_name).await;
-    assert!(
-        opt_element(&body, "StackStatus").as_deref() == Some("UPDATE_COMPLETE"),
-        "case {case:?}: expected the re-pointing update to complete, got {body}"
-    );
+    // The CONDITION the update is waited on, looked at until it holds.
+    let body = settled_at(&router, case, stack_name, "UPDATE_COMPLETE").await;
     let after = outputs_of(&body).get("AssocRef").cloned().unwrap_or_default();
     assert!(
         after == format!("{pool_arn}{COMPOSITE_SEPARATOR}{acl_b}"),
@@ -725,8 +755,10 @@ async fn re_pointing_a_binding_replaces_it_and_the_new_ref_names_the_new_pair() 
          got {behind_old:?}"
     );
 
-    // Deleting the stack unbinds the pair the record carries, so nothing is in front of the
-    // pool any more.
+    // Deleting the stack takes the pool and the web ACLs with it, so the resource the
+    // binding named is gone: WAF reports about a resource it can retrieve, and there is
+    // no longer one to retrieve at that ARN. The CONDITION the delete is waited on is
+    // that answer, looked at until it holds.
     let deleted = cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
     assert!(
         deleted.status == 200,
@@ -734,12 +766,32 @@ async fn re_pointing_a_binding_replaces_it_and_the_new_ref_names_the_new_pair() 
         deleted.status,
         deleted.text
     );
-    tokio::time::sleep(PAST_THE_SPANS).await;
-    let in_front = web_acl_in_front_of(&router, case, &pool_arn).await;
-    assert!(
-        in_front.is_none(),
-        "case {case:?}: expected the stack's deletion to unbind the pool, got {in_front:?}"
-    );
+    let deadline = ::tokio::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let answer = wafv2(
+            &router,
+            "GetWebACLForResource",
+            &json!({ "ResourceArn": &pool_arn }),
+        )
+        .await;
+        let gone = answer.status == 400
+            && answer
+                .body
+                .get("__type")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code.ends_with("WAFNonexistentItemException"));
+        if gone {
+            break;
+        }
+        assert!(
+            ::tokio::time::Instant::now() < deadline,
+            "case {case:?}: expected the deleted pool to be a resource that doesn't \
+             exist, got {} with {}",
+            answer.status,
+            answer.text
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// One refusal row: the protected-resource ARN a template declares, and why AWS WAF will

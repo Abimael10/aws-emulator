@@ -46,6 +46,11 @@ base64 = "0.22"
 # and the allocating interface, so the crate pulls in no random-number backend of its
 # own — the key and the nonce come from this crate's own entropy source.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# Which names are PUBLIC SUFFIXES, for the token domains a key and a web ACL accept
+# ("public suffixes aren't allowed", `CreateAPIKey$TokenDomains`): the maintained
+# Public Suffix List, the same crate the sibling route53domains service reads a
+# registrable name with, rather than a hand-written table of suffixes.
+psl = "2"
 # The `HTML_ENTITY_DECODE` text transformation: the maintained decoder for HTML character
 # references, so a named, decimal or hexadecimal reference is decoded the way a browser
 # decodes it rather than by a hand-written table.
@@ -85,11 +90,31 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # record is handed to when the destination names a delivery stream, pinned at the version
 # every other service that delivers into a stream (cognito-idp, logs, cloudwatch) declares.
 aws-sdk-firehose = { version = "=1.126.0", default-features = false }
+# `service::protected_resources`: WAF puts a web ACL in front of a resource it can
+# RETRIEVE, and each kind of protected resource is retrieved from the service that owns
+# it ("WAF couldn't retrieve a resource that you specified for this operation",
+# `WAFUnavailableEntityException`) — over the emulator's own in-process transport, so
+# these are the generated CLIENTS of those services and not their emulated crates,
+# which is also why no dependency cycle is formed with the services that ask this one
+# for a decision. One per resource form `AssociateWebACLRequest$ResourceArn` documents.
+# Only the generated client is needed: the emulator supplies the transport, so the SDK's
+# own HTTPS stack is left out.
+aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false }
+aws-sdk-apigateway = { version = "1", default-features = false }
+aws-sdk-appsync = { version = "1", default-features = false }
+aws-sdk-cognitoidentityprovider = { version = "1", default-features = false }
+aws-sdk-apprunner = { version = "1", default-features = false }
+aws-sdk-ec2 = { version = "1", default-features = false }
+aws-sdk-amplify = { version = "1", default-features = false }
+aws-sdk-bedrockagentcorecontrol = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `tests/all/main.rs` declares one module per suite file under `tests/all/`, so a new
+# suite is picked up by being there.
+automod = { workspace = true }
 # `tests/all/logging_destination_delivery.rs` asserts where a web ACL's log records really
 # ARRIVE, so each destination is created through the wire of the service that OWNS it and
 # each delivered record is read back through that service's own reader: CloudWatch Logs for

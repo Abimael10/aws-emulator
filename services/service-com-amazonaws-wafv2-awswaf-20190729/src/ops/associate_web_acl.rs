@@ -201,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A mutation: it writes the binding the association reads report. `ctx`
-        // carries only request metadata, which this operation does not need.
-        let _ = ctx;
+        // A mutation: it writes the binding the association reads report. `ctx` carries
+        // the request's own metadata and the in-process channel the protected resource
+        // is resolved over.
 
         // "Your request references an ARN that is malformed, or corresponds to a
         // resource with which a web ACL can't be associated"
@@ -221,6 +221,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // "WAF couldn't retrieve a resource that you specified for this operation"
+        // (`WAFUnavailableEntityException`): a protected resource belongs to another
+        // service, so WAF asks THAT service for it before it writes a binding against
+        // it (`crate::service::protected_resources`) — a web ACL cannot be put in
+        // front of a resource nobody holds. Asked with no store guard held, since the
+        // hop awaits.
+        if crate::service::protected_resources::retrieved(ctx, &input.resource_arn)
+            .await
+            .is_absent()
+        {
+            crate::state::audit(
+                "AssociateWebACL",
+                "",
+                "",
+                "",
+                "WAFUnavailableEntityException",
+            );
+            return Err(AssociateWebACLErrorModeled::WAFUnavailableEntityException(
+                crate::state::unavailable_entity_exception(),
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AssociateWebACLErrorModeled::WAFInternalErrorException(

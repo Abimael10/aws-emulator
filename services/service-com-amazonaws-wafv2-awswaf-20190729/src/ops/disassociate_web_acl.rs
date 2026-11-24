@@ -8,10 +8,13 @@
 //! so `GetWebACLForResource` reports no web ACL for the resource afterwards and
 //! `ListResourcesForWebACL` no longer lists it.
 //!
-//! A resource that carries no binding is a SUCCESS, not a refusal: the operation
-//! "disassociates the specified resource from its web ACL association, IF IT HAS
-//! ONE" (its own doc), so the call is idempotent and what it reports is the state
-//! it leaves behind. `ResourceArn` is still judged against
+//! A resource that EXISTS and carries no binding is a SUCCESS, not a refusal: the
+//! operation "disassociates the specified resource from its web ACL association, IF IT
+//! HAS ONE" (its own doc), so the call is idempotent and what it reports is the state
+//! it leaves behind. A resource the service that owns it does not hold is a different
+//! case: there is no resource to disassociate, which is
+//! `WAFNonexistentItemException` ([`crate::service::protected_resources`]).
+//! `ResourceArn` is still judged against
 //! [`crate::state::PROTECTED_RESOURCE_FORMS`]: an ARN no web ACL could ever have
 //! been put in front of is `WAFInvalidParameterException`.
 //!
@@ -166,8 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A mutation: it removes the binding the association reads report. `ctx`
-        // carries only request metadata, which this operation does not need.
-        let _ = ctx;
+        // carries the request's own metadata and the in-process channel the protected
+        // resource is resolved over.
 
         // The same judgement `AssociateWebACL` makes on this parameter: an ARN that
         // is malformed, or that names a resource kind a web ACL is never put in
@@ -175,6 +178,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::protected_resource_type(&input.resource_arn).is_none() {
             return Err(DisassociateWebACLErrorModeled::WAFInvalidParameterException(
                 crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // "Disassociates the specified resource from its web ACL association": the
+        // resource is what this call acts on, so a resource the service that owns it
+        // does not hold is a resource that doesn't exist (recorded behaviour) — the
+        // only missing-resource error this operation models. Asked before the store is
+        // reached, since the hop awaits (`crate::service::protected_resources`).
+        if crate::service::protected_resources::retrieved(ctx, &input.resource_arn)
+            .await
+            .is_absent()
+        {
+            crate::state::audit(
+                "DisassociateWebACL",
+                "",
+                "",
+                "",
+                "WAFNonexistentItemException",
+            );
+            return Err(DisassociateWebACLErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
             )
             .into());
         }

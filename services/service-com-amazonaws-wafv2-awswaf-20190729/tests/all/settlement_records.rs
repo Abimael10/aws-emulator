@@ -956,6 +956,154 @@ async fn a_filter_outside_the_documented_vocabulary_is_refused() {
     }
 }
 
+/// A `Filters` list that names one filter TWICE is refused by every monetization
+/// query, and the same names used once each are accepted.
+///
+/// A filter list is a set of conditions, one per field, so a name written twice asks
+/// two questions about one field: WAF refuses the query rather than dropping one of
+/// them, and the refusal names the repeated filter. The rows span what the rule
+/// generalises over — WHICH filter name repeats (an enum-restricted one, the
+/// ARN-validated one, a free-text one), whether the two entries carry the same values
+/// or different ones, how far apart in the list they sit, and a name repeated three
+/// times — and every row is run through all three operations that take `Filters`, so
+/// one shared reading answers for each of them.
+#[tokio::test]
+async fn a_filter_name_written_twice_is_refused_by_every_monetization_query() {
+    let (waf, arn) = seeded().await;
+
+    // Every operation that takes `Filters`, with the members each one requires beside
+    // the list: the reason a refusal carries names the operation it refused.
+    let queries: &[(&str, Value)] = &[
+        (OPERATION, request(SCOPE_CLOUDFRONT, window(0, 3_600))),
+        (
+            "GetRevenueStatisticsSummary",
+            request(SCOPE_CLOUDFRONT, window(0, 3_600)),
+        ),
+        (
+            "GetRevenueStatisticsTimeSeries",
+            with(
+                request(SCOPE_CLOUDFRONT, window(0, 3_600)),
+                // The two members the series carries beyond the shared three:
+                // `StatisticType` and `Interval`, both `@required`.
+                json!({ "StatisticType": "DATE_HISTOGRAM", "Interval": "HOURLY" }),
+            ),
+        ),
+    ];
+
+    // `(case, the filters a request names, the name written twice)`.
+    let repeated: Vec<(&str, Value, &str)> = vec![
+        (
+            "the same enum-restricted filter twice, with the same value",
+            json!([
+                filter("SettlementStatus", &["SETTLED"]),
+                filter("SettlementStatus", &["SETTLED"]),
+            ]),
+            "SettlementStatus",
+        ),
+        (
+            "the same enum-restricted filter twice, with different values",
+            json!([
+                filter("SettlementStatus", &["SETTLED"]),
+                filter("SettlementStatus", &["PENDING"]),
+            ]),
+            "SettlementStatus",
+        ),
+        (
+            "another enum-restricted filter twice",
+            json!([
+                filter("CurrencyMode", &["REAL"]),
+                filter("CurrencyMode", &["TEST"]),
+            ]),
+            "CurrencyMode",
+        ),
+        (
+            "the ARN-validated filter twice",
+            json!([filter("WebACLArn", &[&arn]), filter("WebACLArn", &[&arn])]),
+            "WebACLArn",
+        ),
+        (
+            "a free-text filter twice",
+            json!([
+                filter("SourceName", &["probe-bot"]),
+                filter("SourceName", &["other-bot"]),
+            ]),
+            "SourceName",
+        ),
+        (
+            "a repeat with other filters between the two",
+            json!([
+                filter("SourceName", &["probe-bot"]),
+                filter("CurrencyMode", &["REAL"]),
+                filter("Intent", &["purchase"]),
+                filter("SourceName", &["other-bot"]),
+            ]),
+            "SourceName",
+        ),
+        (
+            "a name written three times",
+            json!([
+                filter("Intent", &["purchase"]),
+                filter("Intent", &["browse"]),
+                filter("Intent", &["purchase"]),
+            ]),
+            "Intent",
+        ),
+    ];
+
+    for (operation, base) in queries {
+        for (case, filters, name) in &repeated {
+            let case = format!("{operation}: {case}");
+            let refusal = waf
+                .refused(
+                    operation,
+                    with(base.clone(), json!({ "Filters": filters })),
+                    "WAFInvalidParameterException",
+                    &case,
+                )
+                .await;
+            let reason = format!("Duplicate filter name '{name}' for {operation}.");
+            assert_eq!(
+                refusal["Reason"].as_str(),
+                Some(reason.as_str()),
+                "case {case:?}: the reason must name the repeated filter and the \
+                 operation, got {refusal}"
+            );
+            assert_eq!(
+                refusal["Parameter"].as_str(),
+                Some(*name),
+                "case {case:?}: the refusal must carry the repeated filter name, got \
+                 {refusal}"
+            );
+            assert_eq!(
+                refusal["Field"].as_str(),
+                Some("SCOPE_VALUE"),
+                "case {case:?}: the refusal must name the field WAF reports this class \
+                 against, got {refusal}"
+            );
+            assert_eq!(
+                error_message(&refusal),
+                format!("Error reason: {reason}, field: SCOPE_VALUE, parameter: {name}"),
+                "case {case:?}: the message must be composed from Reason, Field and \
+                 Parameter, got {refusal}"
+            );
+        }
+
+        // The same filter names, each written once, are a selection every one of these
+        // operations answers: the rule is about the repeat, not about the names.
+        let accepted = json!([
+            filter("SettlementStatus", &["SETTLED"]),
+            filter("CurrencyMode", &["REAL", "TEST"]),
+            filter("SourceName", &["probe-bot"]),
+            filter("Intent", &["purchase"]),
+        ]);
+        waf.ok(
+            operation,
+            with(base.clone(), json!({ "Filters": accepted })),
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn a_member_outside_its_modelled_constraint_is_refused_by_the_request_validator() {
     let (waf, _arn) = seeded().await;
