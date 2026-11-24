@@ -175,57 +175,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
-        // `None` when the ARN names a resource a tagging call may address; otherwise WHY
-        // it does not, which is what decides the refusal.
-        let unresolved = {
-            let store = state.lock();
-            (!store.taggable(&input.resource_arn))
-                .then(|| store.unresolved_arn(&input.resource_arn))
-        };
-        if let Some(unresolved) = unresolved {
-            return Err(match unresolved {
-                // The AppInstance this ARN belongs to has been deleted, so it can no
-                // longer serve a write to its own tags or to a cascaded-away child's: the
-                // answer is the modelled permanent refusal.
-                crate::state::UnresolvedArn::DeletedAppInstance => {
-                    UntagResourceErrorModeled::ForbiddenException(ForbiddenException {
-                        code: Some("Forbidden".to_string()),
-                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
-                    })
-                    .into()
-                }
-                // This operation models no 404 shape, so an ARN that names no resource
-                // this service serves tagging for is refused with the modelled
-                // `BadRequestException` carrying the `NotFound` error code.
-                crate::state::UnresolvedArn::NeverExisted => {
+        // The same ONE rule `TagResource` resolves: whether a tagging call may address this
+        // ARN, and the class and wording of the refusal when it may not, decided in
+        // `crate::state::tagging_arn_refusal` for all three tagging handlers. Only the
+        // variant of this operation's own error enum is chosen here.
+        if let Some(refusal) =
+            crate::state::tagging_arn_refusal(&state, &directory, &input.resource_arn)
+        {
+            return Err(match refusal {
+                crate::state::TaggingArnRefusal::BadRequest { code, message } => {
                     UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!("resource {} does not exist", input.resource_arn)),
-                    })
-                    .into()
-                }
-            });
-        }
-        // An ARN whose OWNING member has deleted the resource it named is refused with
-        // that member's own class and wording: this service serves the family's shared
-        // tagging routes for every member's resource and cannot read a sibling's store, so
-        // the fact that the resource is gone is read from the shared directory its owner
-        // recorded it in, and each class is mapped onto the shape THIS model declares.
-        let withdrawn = directory
-            .lock()
-            .withdrawn_refusal(&input.resource_arn)
-            .map(|refusal| (refusal.class, refusal.message.to_string()));
-        if let Some((class, message)) = withdrawn {
-            return Err(match class {
-                ::service_common::chime_tags::WithdrawnClass::InvalidRequest => {
-                    UntagResourceErrorModeled::BadRequestException(BadRequestException {
-                        code: Some("BadRequest".to_string()),
+                        code: Some(code.to_string()),
                         message: Some(message),
                     })
                 }
-                ::service_common::chime_tags::WithdrawnClass::Forbidden => {
+                crate::state::TaggingArnRefusal::Forbidden { code, message } => {
                     UntagResourceErrorModeled::ForbiddenException(ForbiddenException {
-                        code: Some("Forbidden".to_string()),
+                        code: Some(code.to_string()),
                         message: Some(message),
                     })
                 }

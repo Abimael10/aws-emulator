@@ -46,6 +46,12 @@ use crate::ops::types::{
     ExpirationSettings,
 };
 
+/// The one rule that decides whether a tagging call may address an ARN, which all three
+/// generic tagging handlers resolve through rather than each stating it again.
+pub mod tagging_arn;
+
+pub use tagging_arn::{tagging_arn_refusal, TaggingArnRefusal};
+
 /// The region used for a minted ARN when the request carries no SigV4 credential
 /// scope to read one from (an unsigned or presigned request).
 pub const DEFAULT_REGION: &str = "us-east-1";
