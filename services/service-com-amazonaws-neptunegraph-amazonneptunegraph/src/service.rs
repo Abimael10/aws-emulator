@@ -27,7 +27,10 @@
 //!   — the shape that carries the `reason` the framework's refusal channel cannot — and
 //!   the three operations that ask this service to assume one of the caller's IAM roles
 //!   are served through [`pass_role::PassRoleGate`] as well, so that authorization
-//!   decision is reached ahead of the constraint walk.
+//!   decision is reached ahead of the constraint walk. The five operations reached at a
+//!   GRAPH's own endpoint are served through [`graph_endpoint::GraphEndpointGate`], which
+//!   refuses an address resolving to no graph as the authentication failure it is before
+//!   the operation behind it decides anything.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. Still the wording of last resort: a refusal that reaches
 //!   the framework's own channel rather than the gate above is worded there from the
@@ -57,12 +60,18 @@ use std::sync::Arc;
 /// same refusal, once its own decision is taken.
 pub mod constraints;
 
+/// The front door of the GRAPH's own data plane: how a request addressed to a graph
+/// endpoint that resolves to no graph is refused. Public because that refusal is the
+/// service's statement of what such an address answers.
+pub mod graph_endpoint;
+
 /// The authorization boundary in front of every operation that asks this service to
 /// assume one of the caller's IAM roles. Public because each such operation implements
 /// [`pass_role::PassesRole`] beside its own handler.
 pub mod pass_role;
 
 use constraints::ConstraintGate;
+use graph_endpoint::GraphEndpointGate;
 use pass_role::PassRoleGate;
 
 /// The error code this service answers an input-constraint violation with: the modelled
@@ -147,11 +156,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Every operation this service models, each the SAME operation the generated table
     /// holds, wrapped so a refusal found before its handler runs is answered with this
     /// service's own modelled shapes: [`ConstraintGate`] for a violated model
-    /// constraint, and [`PassRoleGate`] over that for the operations whose input carries
+    /// constraint, [`PassRoleGate`] over that for the operations whose input carries
     /// a role this service has to assume, so the pass-role authorization decision is
-    /// reached ahead of the constraint walk. Keyed by the routing key the protocol
-    /// resolves — the key the generated table uses — and built from the SAME shared
-    /// engine, so a wrapped operation reads and writes the one store.
+    /// reached ahead of the constraint walk, and [`GraphEndpointGate`] for the operations
+    /// reached at a GRAPH's own endpoint, so an address resolving to no graph is refused
+    /// at that door rather than reported as a missing resource by a handler. Keyed by the
+    /// routing key the protocol resolves — the key the generated table uses — and built
+    /// from the SAME shared engine, so a wrapped operation reads and writes the one store.
     gated: OperationRoutingTable,
 }
 
@@ -164,6 +175,25 @@ macro_rules! gate_pass_role_operations {
             $table.add_operation(
                 <crate::ops::$module::$operation<Eng> as Operation>::NAME,
                 ::std::boxed::Box::new(PassRoleGate::over(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`GraphEndpointGate`] and keyed by the same routing key [`gate_pass_role_operations`]
+/// keys by — the operation's shape name. The gate answers the constraint refusal itself,
+/// ahead of resolving the address, so an operation listed here is NOT listed in
+/// [`gate_constraint_operations`] as well.
+macro_rules! gate_graph_endpoint_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(GraphEndpointGate::over(
+                    ::std::sync::Arc::clone(&$engine),
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
@@ -207,38 +237,50 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             start_export_task::StartExportTask,
             start_import_task::StartImportTask,
         );
+        // EVERY operation the model reaches at the GRAPH's own endpoint rather than at
+        // the service's — each carries `@endpoint hostPrefix "{graphIdentifier}."`
+        // (`smithy_query(query="operation",operation="ExecuteQuery,GetGraphSummary,\
+        // ListQueries,GetQuery,CancelQuery")` -> endpoint) — because an address that
+        // resolves to no graph is refused at that door, identically whichever of them
+        // was called, ahead of every decision the operation itself takes. The gate
+        // answers the constraint refusal below itself, so these operations are listed
+        // HERE and not there.
+        gate_graph_endpoint_operations!(
+            gated,
+            engine,
+            cancel_query::CancelQuery,
+            execute_query::ExecuteQuery,
+            get_graph_summary::GetGraphSummary,
+            get_query::GetQuery,
+            list_queries::ListQueries,
+        );
         // Every OTHER operation this service models: a refusal of a modelled input
         // constraint is the service's own `ValidationException` whichever operation was
         // called, so the list is the whole modelled surface rather than a family of it
         // (the unit test below reads that surface off the model, so an operation missing
-        // from these two lists fails there rather than answering a constraint refusal in
-        // a shape that drops the modelled `reason`).
+        // from these three lists fails there rather than answering a constraint refusal
+        // in a shape that drops the modelled `reason`).
         gate_constraint_operations!(
             gated,
             engine,
             cancel_export_task::CancelExportTask,
             cancel_import_task::CancelImportTask,
-            cancel_query::CancelQuery,
             create_graph::CreateGraph,
             create_graph_snapshot::CreateGraphSnapshot,
             create_private_graph_endpoint::CreatePrivateGraphEndpoint,
             delete_graph::DeleteGraph,
             delete_graph_snapshot::DeleteGraphSnapshot,
             delete_private_graph_endpoint::DeletePrivateGraphEndpoint,
-            execute_query::ExecuteQuery,
             get_export_task::GetExportTask,
             get_graph::GetGraph,
             get_graph_snapshot::GetGraphSnapshot,
-            get_graph_summary::GetGraphSummary,
             get_import_task::GetImportTask,
             get_private_graph_endpoint::GetPrivateGraphEndpoint,
-            get_query::GetQuery,
             list_export_tasks::ListExportTasks,
             list_graph_snapshots::ListGraphSnapshots,
             list_graphs::ListGraphs,
             list_import_tasks::ListImportTasks,
             list_private_graph_endpoints::ListPrivateGraphEndpoints,
-            list_queries::ListQueries,
             list_tags_for_resource::ListTagsForResource,
             reset_graph::ResetGraph,
             restore_graph_from_snapshot::RestoreGraphFromSnapshot,
@@ -284,7 +326,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // envelope the framework's refusal channel can carry, and wrapped in
         // `PassRoleGate` on top of that for the three operations that ask this service
         // to assume one of the caller's roles, so that authorization decision is reached
-        // ahead of the constraint walk. An operation the model names and these lists do
+        // ahead of the constraint walk, and wrapped in `GraphEndpointGate` for the five
+        // reached at a GRAPH's own endpoint, so an address resolving to no graph is
+        // refused at that door. An operation the model names and these lists do
         // not resolves to `None` here and is served by the generated table unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.gated.get(key)
@@ -387,7 +431,7 @@ mod tests {
 
     /// RULE, over the whole modelled surface: every operation is served through a gate
     /// that answers a violated model constraint with this service's own
-    /// `ValidationException`. An operation left out of both lists in `new` fails here
+    /// `ValidationException`. An operation left out of every list in `new` fails here
     /// instead of silently answering such a refusal in the framework's code-and-message
     /// envelope, which carries no `reason`.
     #[test]
@@ -410,7 +454,7 @@ mod tests {
                 service.gated.get(operation).is_some(),
                 "case {operation}: every modelled operation is served behind a gate that \
                  answers a constraint refusal with the modelled ValidationException; this \
-                 one is missing from the lists in `new`"
+                 one is missing from every list in `new`"
             );
         }
     }

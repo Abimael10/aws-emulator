@@ -171,6 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: the sole write the lookup makes is materialising the status
         // transition the clock had already made due at this instant, which was owed
         // whether or not anybody asked for a summary.
+        //
+        // That the address resolves to a graph of this Region at all was settled at the
+        // front door of the graph's data plane ahead of this handler
+        // (`crate::service::graph_endpoint`), which refuses a host prefix naming no such
+        // graph as the authentication failure it is. What is left for this branch is a
+        // graph the clock reclaimed between that door and this lookup: the resource the
+        // request named is gone, which is what the modelled 404 reports.
         let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(GetGraphSummaryErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),

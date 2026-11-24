@@ -329,6 +329,10 @@ enum Expected {
     /// The modelled `ResourceNotFoundException` (404): the graph is gone for this
     /// request too, so every reference to it resolves to nothing.
     NotFound,
+    /// The graph data plane's own refusal (403 `AccessDeniedException`): the request is
+    /// addressed to the GRAPH's own endpoint, and a reclaimed graph has none, so the
+    /// address is refused at that door rather than reaching the operation behind it.
+    Unauthenticated,
     /// HTTP 201: the name the reclaimed graph held is free again.
     Created,
     /// HTTP 200 with the reclaimed graph absent from the named list.
@@ -386,9 +390,9 @@ fn reaped_rows(freed_name: &'static str) -> Vec<Reaped> {
             expected: Expected::NotFound,
         },
         Reaped {
-            case: "GetGraphSummary has no graph to summarise",
+            case: "GetGraphSummary has no graph endpoint to summarise at",
             probe: header_step("GET", "/summary", None),
-            expected: Expected::NotFound,
+            expected: Expected::Unauthenticated,
         },
         Reaped {
             case: "CreateGraphSnapshot has no graph to snapshot",
@@ -573,6 +577,23 @@ async fn every_operation_reads_a_store_whose_owed_deletion_was_carried_out_first
                     error_code(&answered),
                     "ResourceNotFoundException",
                     "case {case:?}: unexpected error code in {answered}"
+                );
+            }
+            Expected::Unauthenticated => {
+                assert_eq!(
+                    status, 403,
+                    "case {case:?}: expected 403 for the endpoint of a reclaimed graph, \
+                     got {status}: {answered}"
+                );
+                assert_eq!(
+                    answered["code"].as_str(),
+                    Some("AccessDeniedException"),
+                    "case {case:?}: unexpected error code in {answered}"
+                );
+                assert_eq!(
+                    answered["message"],
+                    json!("Authentication Failed"),
+                    "case {case:?}: unexpected message in {answered}"
                 );
             }
             Expected::Created => {

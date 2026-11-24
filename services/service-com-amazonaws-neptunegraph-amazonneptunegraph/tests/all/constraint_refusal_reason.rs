@@ -38,6 +38,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// A graph this store HOLDS and that is SERVING, so a request addressed to its own endpoint
+// reaches the operation behind that endpoint instead of being refused at the door for an
+// address that resolves to nothing: the sibling suite's helper, which creates the graph and
+// polls `GetGraph` until it reports itself in service, reached rather than copied so the
+// status and the poll are stated once for this crate's suites.
+use super::query_cancellation::graph_in_service;
+
 /// The region the test's SigV4 credential scope names.
 const REGION: &str = "us-east-1";
 
@@ -70,8 +77,11 @@ const MAX_GRAPH_NAME_CHARS: usize = 63;
 const MAX_TAG_KEY_CHARS: usize = 128;
 
 /// A well-formed `GraphIdentifier` (`^g-[a-z0-9]{10}$`) that names no stored graph: a
-/// request is validated before anything is looked up, so a call on it is still refused
-/// for the constraints it broke.
+/// request is validated against the model before anything is looked up, so a call on it
+/// is still refused for the modelled constraints it broke. A rule the HANDLER enforces is
+/// decided later, so a row about one of those names a graph the store holds instead — an
+/// identifier naming no graph of the Region addresses no graph endpoint at all, and the
+/// operations reached at one answer that address before their own arguments.
 const ABSENT_GRAPH_ID: &str = "g-0123456789";
 
 /// A KMS key ARN matching the modelled `KmsKeyArn` pattern
@@ -186,7 +196,7 @@ struct Row {
     case: &'static str,
     method: &'static str,
     path: String,
-    graph_identifier: Option<&'static str>,
+    graph_identifier: Option<String>,
     body: Option<Value>,
     members: Vec<&'static str>,
 }
@@ -194,7 +204,11 @@ struct Row {
 /// Every modelled constraint class, enforced by the walk in front of a handler, plus
 /// every constraint this service's handlers enforce themselves — each answered with the
 /// modelled shape and classified the same way.
-fn refusal_rows() -> Vec<Row> {
+///
+/// `stored_graph` is a graph this store HOLDS, which the rows about a handler-enforced
+/// rule on an operation reached at a graph's own endpoint address: that endpoint resolves
+/// the address before the operation behind it reads its arguments.
+fn refusal_rows(stored_graph: &str) -> Vec<Row> {
     let role_arn = passable_role_arn();
     vec![
         // ---- Caught by the model-driven walk in front of the handler. ----
@@ -269,7 +283,7 @@ fn refusal_rows() -> Vec<Row> {
             case: "a @pattern, in a header",
             method: "GET",
             path: "/queries?maxResults=1".to_string(),
-            graph_identifier: Some("not-a-valid-id"),
+            graph_identifier: Some("not-a-valid-id".to_string()),
             body: None,
             members: vec!["graphIdentifier"],
         },
@@ -290,10 +304,12 @@ fn refusal_rows() -> Vec<Row> {
             members: vec!["maxResults"],
         },
         Row {
+            // The modelled walk runs ahead of the address this request is sent to, so an
+            // identifier naming no graph is still refused for the enum value it carried.
             case: "an enum value set, in a query string",
             method: "GET",
             path: "/queries?maxResults=1&state=NOT_A_STATE".to_string(),
-            graph_identifier: Some(ABSENT_GRAPH_ID),
+            graph_identifier: Some(ABSENT_GRAPH_ID.to_string()),
             body: None,
             members: vec!["state"],
         },
@@ -328,10 +344,13 @@ fn refusal_rows() -> Vec<Row> {
         },
         // ---- Enforced by the handler, for a rule the model cannot express. ----
         Row {
+            // A rule the HANDLER enforces, so this row addresses a graph the store holds:
+            // an address resolving to no graph is refused ahead of the handler, and this
+            // row is about the argument rather than about the address.
             case: "a published minimum the model declares no range for",
             method: "GET",
             path: "/queries?maxResults=0".to_string(),
-            graph_identifier: Some(ABSENT_GRAPH_ID),
+            graph_identifier: Some(stored_graph.to_string()),
             body: None,
             members: vec!["maxResults"],
         },
@@ -388,14 +407,15 @@ fn refusal_rows() -> Vec<Row> {
 #[tokio::test]
 async fn every_refused_input_constraint_is_answered_with_the_modelled_reason() {
     let router = emulator();
+    let held = graph_in_service(&router, "constraint-rows-graph").await;
 
-    for row in refusal_rows() {
+    for row in refusal_rows(&held) {
         let case = row.case;
         let reply = call(
             &router,
             row.method,
             &row.path,
-            row.graph_identifier,
+            row.graph_identifier.as_deref(),
             row.body,
         )
         .await;
@@ -470,12 +490,13 @@ async fn every_refused_input_constraint_is_answered_with_the_modelled_reason() {
 #[tokio::test]
 async fn one_constraint_class_is_answered_the_same_whichever_side_catches_it() {
     let router = emulator();
+    let held = graph_in_service(&router, "one-class-graph").await;
 
     let handler_side = call(
         &router,
         "GET",
         "/queries?maxResults=0",
-        Some(ABSENT_GRAPH_ID),
+        Some(&held),
         None,
     )
     .await;
@@ -506,10 +527,13 @@ async fn one_constraint_class_is_answered_the_same_whichever_side_catches_it() {
 #[tokio::test]
 async fn a_refusal_that_is_not_a_constraint_violation_keeps_its_own_reason() {
     let router = emulator();
+    // A graph that is serving, so the query-id row below is answered by the operation
+    // rather than refused for an address or a plane that is not there.
+    let serving = graph_in_service(&router, "illegal-argument-graph").await;
 
     // (case, method, path, graphIdentifier header) — each a refusal of client input the
     // service classifies as an argument it does not accept: a pagination token it never
-    // issued, and a graph identifier that resolves to nothing.
+    // issued, and a query id that names no query in flight.
     let rows: [(&str, &str, String, Option<&str>); 3] = [
         (
             "a nextToken this service never issued",
@@ -524,10 +548,10 @@ async fn a_refusal_that_is_not_a_constraint_violation_keeps_its_own_reason() {
             None,
         ),
         (
-            "a well-formed graph identifier that names nothing",
+            "a queryId that names no query in flight",
             "GET",
-            "/queries?maxResults=1".to_string(),
-            Some(ABSENT_GRAPH_ID),
+            "/queries/6f3a1b2c-4d5e-4f60-8a91-b2c3d4e5f607".to_string(),
+            Some(&serving),
         ),
     ];
 

@@ -8,8 +8,9 @@
 //! text, the state it is in and the milliseconds it waited and has been running — in
 //! admission order, restricted to one state when the request names one rather than
 //! `ALL`, capped at the count of results the request asked for, and changing nothing a
-//! later caller sees; a graph this service does not hold is a refusal rather than an
-//! empty list, and a result count below the published minimum is refused too.
+//! later caller sees; a graph this service does not hold is refused at the data plane's
+//! front door, which is where an address resolving to no graph is answered, and a result
+//! count below the published minimum is refused too.
 //!
 //! So the tables below span what that rule generalises over: every value the state
 //! filter takes (absent, `ALL`, and each state a stored query can be in), result counts
@@ -329,25 +330,29 @@ async fn the_listing_is_of_one_graph_and_a_graph_this_service_does_not_hold_is_r
         );
     }
 
-    // A well-formed `graphIdentifier` this service holds no graph for is a failed lookup
-    // rather than an empty list. The operation declares no `ResourceNotFoundException`
-    // (`smithy_query(query="operation",operation="ListQueries")` -> errors), so the one
-    // client error it models is what the refusal carries.
+    // A well-formed `graphIdentifier` this service holds no graph for addresses no graph
+    // endpoint at all: the request is refused at the data plane's front door as the
+    // authentication failure it is (`tests/all/graph_data_plane_gate.rs` pins that
+    // refusal in full) rather than reaching this operation to be answered an empty list.
     for unknown in ["g-0000000000", "g-zzzzzzzzzz", "g-abcdefghij"] {
         let (status, body) = list_queries(&router, unknown, 100, None).await;
         assert_eq!(
-            status, 400,
-            "case {unknown:?}: expected 400 from ListQueries, got {status}: {body}"
+            status, 403,
+            "case {unknown:?}: expected 403 from ListQueries, got {status}: {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "ValidationException",
+            body["code"].as_str(),
+            Some("AccessDeniedException"),
             "case {unknown:?}: unexpected error code in {body}"
         );
-        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            body["message"],
+            json!("Authentication Failed"),
+            "case {unknown:?}: unexpected message in {body}"
+        );
         assert!(
-            message.contains(unknown),
-            "case {unknown:?}: the refusal must name the identifier, got {message:?}"
+            !body.to_string().contains(unknown),
+            "case {unknown:?}: the refusal must name nothing of the address, got {body}"
         );
     }
 

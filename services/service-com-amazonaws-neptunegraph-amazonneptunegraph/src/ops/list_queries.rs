@@ -191,11 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A query is addressed as a query OF a graph, so the identifier has to name a
         // graph of THIS Region: a listing of the queries of a graph that does not exist
-        // is a failed lookup rather than an empty list. This operation declares no
-        // `ResourceNotFoundException` (`smithy_query(query="operation",
-        // operation="ListQueries")` -> errors), so the failed lookup is reported with the
-        // one client error it does model, carrying the same sentence the 404 of the
-        // operations that do model it carries.
+        // is a failed lookup rather than an empty list. That the address resolves to a
+        // graph at all was settled at the front door of the graph's data plane ahead of
+        // this handler (`crate::service::graph_endpoint`), which refuses a host prefix
+        // naming no such graph as the authentication failure it is; what is left for this
+        // branch is a graph the clock reclaimed between that door and this lookup. This
+        // operation declares no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",operation="ListQueries")` -> errors), so that
+        // failed lookup is reported with the one client error it does model, carrying the
+        // same sentence the 404 of the operations that do model it carries.
         let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(ListQueriesErrorModeled::ValidationException(ValidationException {
                 message: crate::state::graph_not_found(&input.graph_identifier).message,

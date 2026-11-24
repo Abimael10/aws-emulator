@@ -8,7 +8,10 @@
 //! request that created it was signed for — and every later lookup, listing,
 //! mutation, tagging call and name-uniqueness check answers only within that Region;
 //! from any other Region the resource does not exist (404
-//! `ResourceNotFoundException`) and its name is free.
+//! `ResourceNotFoundException` for the operations addressed at the service's own
+//! endpoint, and the graph data plane's own 403 `AccessDeniedException` for the ones
+//! addressed at the GRAPH's host prefix, which names no endpoint there) and its name is
+//! free.
 //!
 //! The tables below span what that rule generalises over: which Region creates a
 //! resource, which Region reads it, how many resources a Region holds, which
@@ -666,8 +669,10 @@ async fn snapshots_and_tagging_are_scoped_to_the_region_too() {
 
 /// A query is addressed as a query OF a graph, and the graph is resolved in the Region
 /// of the request, so a query in flight on one Region's graph is unreachable from
-/// another — `GetQuery` and `CancelQuery` both answer 404 there, and the query keeps
-/// running.
+/// another: both operations are reached at the GRAPH's own host prefix, and that prefix
+/// addresses no endpoint in a Region that holds no such graph, so `GetQuery` and
+/// `CancelQuery` are both refused there as an authentication failure (403
+/// `AccessDeniedException` "Authentication Failed") and the query keeps running.
 #[tokio::test]
 async fn a_query_is_reachable_only_from_the_region_of_its_graph() {
     let (router, engine) = emulator_with_engine();
@@ -713,15 +718,21 @@ async fn a_query_is_reachable_only_from_the_region_of_its_graph() {
                 )
                 .await;
                 assert_eq!(
-                    status, 404,
-                    "case {case} on a {owner} graph's query from {caller}: expected 404, \
+                    status, 403,
+                    "case {case} on a {owner} graph's query from {caller}: expected 403, \
                      got {status}: {body}"
                 );
-                let code = error_code(&body);
                 assert_eq!(
-                    code, "ResourceNotFoundException",
+                    body["code"].as_str(),
+                    Some("AccessDeniedException"),
                     "case {case} on a {owner} graph's query from {caller}: expected \
-                     ResourceNotFoundException, got {code:?}: {body}"
+                     AccessDeniedException, got {body}"
+                );
+                assert_eq!(
+                    body["message"],
+                    json!("Authentication Failed"),
+                    "case {case} on a {owner} graph's query from {caller}: expected the \
+                     data plane's own refusal, got {body}"
                 );
             }
             // The cross-Region calls reached nothing: the query is still in flight in

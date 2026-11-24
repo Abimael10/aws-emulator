@@ -6,6 +6,14 @@
 //! AWS takes ahead of it: whether the caller's IAM policies allow a query at all, whether
 //! the graph's own data plane is serving, and whether the query text parses.
 //!
+//! The request arrives at the GRAPH's own endpoint (`@endpoint hostPrefix
+//! "{graphIdentifier}."`), so that the address resolves to a graph of this Region at all
+//! is settled at that plane's front door ahead of this handler
+//! (`crate::service::graph_endpoint`): a host prefix naming no such graph addresses no
+//! endpoint, and is refused there as an authentication failure rather than reported here
+//! as a missing resource — which this operation's modelled error set does not carry
+//! anyway.
+//!
 //! An accepted query is also ADMITTED to the store as a query in flight on its graph, so
 //! the three operations that report a graph's queries (`ListQueries`, `GetQuery`,
 //! `CancelQuery`) can see it, stop it and then refuse the id it has stopped under: the
@@ -100,10 +108,6 @@
 //!   authorization failure.
 //! * `ConflictException` (HTTP 409) — Raised when a conflict is encountered.
 //! * `InternalServerException` (HTTP 500) — A failure occurred on the server.
-//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
-//!   below): the request is addressed to the GRAPH's own endpoint, which exists only
-//!   while that graph is serving, so a `graphIdentifier` naming no serving graph reaches
-//!   nothing to query.
 //! * `ThrottlingException` (HTTP 429) — The exception was interrupted by throttling.
 //! * `UnprocessableException` (HTTP 422) — Request cannot be processed due to known reasons.
 //!   Eg. partition full.
@@ -124,22 +128,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-neptunegraph-amazonnept
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `ResourceNotFoundException` is widened in through `extra_errors`: this SERVICE models
-// the shape (every control-plane read of a graph declares it), and the request this
-// operation serves is addressed to the host prefix `{graphIdentifier}.` — the GRAPH's
-// own data plane, which exists only while that graph is serving — so a `graphIdentifier`
-// that names no serving graph of this Region reaches no endpoint at all, which is the
-// missing resource that shape reports and not a conflict with anything.
-#[smithy_macros::operation_error(
-    "com.amazonaws.neptunegraph#ExecuteQuery",
-    extra_errors = ["ResourceNotFoundException"]
-)]
+// Nothing is widened in through `extra_errors`: this operation's modelled error set is
+// what it may answer with, and `ResourceNotFoundException` is not in it
+// (`smithy_query(query="operation",operation="ExecuteQuery")` -> errors), unlike the
+// control-plane reads of a graph that do declare it. A `graphIdentifier` naming no graph
+// of this Region addresses no endpoint at all, and that is refused at the graph data
+// plane's front door (`crate::service::graph_endpoint`) before this handler runs.
+#[smithy_macros::operation_error("com.amazonaws.neptunegraph#ExecuteQuery")]
 #[derive(Debug)]
 pub enum ExecuteQueryErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
-    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     UnprocessableException(UnprocessableException),
     ValidationException(ValidationException),
@@ -243,18 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The query runs on the graph's OWN data endpoint — this operation is bound to
         // the host prefix `{graphIdentifier}.`
-        // (`smithy_query(query="operation",operation="ExecuteQuery")` -> endpoint). Two
-        // DIFFERENT facts can stop a query there, and each is reported as what it is:
+        // (`smithy_query(query="operation",operation="ExecuteQuery")` -> endpoint). That
+        // the address resolves to a graph of this Region at all was settled at the front
+        // door in front of this handler (`crate::service::graph_endpoint`): a host prefix
+        // naming no such graph is refused there as the authentication failure it is, so
+        // what is left to decide here is whether the graph that IS there is serving.
         //
-        // * this Region holds no graph under that identifier, so there is no graph to
-        //   address at all — the missing resource the 404 reports;
-        // * the graph EXISTS and its data plane is not serving (it is still coming up, is
-        //   reconfiguring, is stopping or is stopped). The graph is still there — a read of
-        //   it answers, and starting it brings the data plane back — so the query is
-        //   refused as the server-side "not serving right now" it is
-        //   (`crate::scaffolded::GRAPH_UNAVAILABLE_CODE`), which a client retries, rather
-        //   than as a resource that is gone, which it cleans up after. Nothing about the
-        //   graph is touched, so a start followed by the same query runs it.
+        // A graph that EXISTS and is not serving (it is still coming up, is
+        // reconfiguring, is stopping or is stopped) is still there — a read of it answers,
+        // and starting it brings the data plane back — so the query is refused as the
+        // server-side "not serving right now" it is
+        // (`crate::scaffolded::GRAPH_UNAVAILABLE_CODE`), which a client retries, rather
+        // than as a resource that is gone, which it cleans up after. Nothing about the
+        // graph is touched, so a start followed by the same query runs it. A graph the
+        // clock reclaimed between the door and this lookup has no data plane either and is
+        // answered the same way.
         //
         // The sole write the lookup makes is materialising the status transition the clock
         // had already made due, which was owed whether or not anybody queried.
@@ -266,15 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // again for its own evaluation (`crate::state::evaluate_query`).
         let (graph_id, data) = {
             let (mut store, now) = crate::state::locked_store_now(&state);
-            let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
-                return Err(ExecuteQueryErrorModeled::ResourceNotFoundException(
-                    crate::state::graph_not_found(&input.graph_identifier),
-                )
-                .into());
-            };
-            if !graph.status.is_serving() {
+            let serving = store
+                .settled_graph(&input.graph_identifier, &region, now)
+                .filter(|graph| graph.status.is_serving());
+            let Some(graph) = serving else {
                 return Err(crate::scaffolded::Scaffolded::graph_unavailable());
-            }
+            };
             (graph.id.clone(), graph.data.clone())
         };
 

@@ -28,13 +28,21 @@
 //! `tests/all/execute_query_data_plane.rs` instead. The queries under test here are
 //! admitted through the state constructors a query that is still in flight is held in;
 //! everything the assertions look at goes over the wire.
+//!
+//! The rule in front of THAT one, pinned by the last test here, is about the ADDRESS
+//! rather than about the graph's status: a host prefix naming no graph of the account and
+//! Region the request was signed for addresses no endpoint at all, so every operation on
+//! that endpoint — `ExecuteQuery` included — is refused there as an authentication
+//! failure (403 `AccessDeniedException` "Authentication Failed", in the data plane's own
+//! `code`/`requestId`/`message` envelope) before it decides anything of its own.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::graph_state_gate_messages::{graph_in_status, wait_for_status};
 use super::query_cancellation::{
     admit_query, call, cancel_query, emulator, error_code, get_query, graph_in_service,
-    termination_due,
+    termination_due, wait_until_reclaimed,
 };
 
 /// The query admitted on every graph under test, so the two operations that address one
@@ -314,4 +322,229 @@ async fn the_gate_opens_again_once_the_graph_is_serving_and_a_refusal_changed_no
         code, 200,
         "case a repeated cancel on a serving graph: expected 200, got {code}: {repeated}"
     );
+}
+
+/// The HTTP status a request addressed to a graph endpoint that resolves to no graph is
+/// refused with: the CALLER was not accepted at the address it dialled, which is neither
+/// a bad request (400) nor a resource that is missing (404).
+const UNRESOLVED_ENDPOINT_STATUS: u16 = 403;
+
+/// The error class that refusal names, in the body's `code` member and in the
+/// `x-amzn-errortype` header a `restJson1` client resolves an error shape from.
+const UNRESOLVED_ENDPOINT_CODE: &str = "AccessDeniedException";
+
+/// The WHOLE sentence it states — no variable part, so nothing about what the account
+/// holds reaches a caller refused at the door.
+///
+/// Written out here rather than reached from the service's own constant so this suite
+/// states the expectation independently of the code under test.
+const UNRESOLVED_ENDPOINT_MESSAGE: &str = "Authentication Failed";
+
+/// Every operation the model reaches at a graph's OWN endpoint, as (operation, method,
+/// path, body) — `ExecuteQuery` included this time: the refusal under test is the
+/// ADDRESS's own, so it cannot depend on which operation was attempted or on what else
+/// the request carries.
+///
+/// Source: the operations' `endpoint` traits and HTTP bindings
+/// (`smithy_query(query="operation",operation="ExecuteQuery,GetGraphSummary,ListQueries,GetQuery,CancelQuery")`;
+/// `ExecuteQuery` binds `queryString` as the body member `query`).
+fn host_prefixed_requests() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+    vec![
+        (
+            "GetGraphSummary",
+            "GET",
+            "/summary?mode=BASIC".to_string(),
+            None,
+        ),
+        (
+            "ListQueries",
+            "GET",
+            "/queries?maxResults=10".to_string(),
+            None,
+        ),
+        ("GetQuery", "GET", format!("/queries/{QUERY_ID}"), None),
+        ("CancelQuery", "DELETE", format!("/queries/{QUERY_ID}"), None),
+        (
+            "ExecuteQuery",
+            "POST",
+            "/queries".to_string(),
+            Some(json!({"query": QUERY_TEXT, "language": "OPEN_CYPHER"})),
+        ),
+    ]
+}
+
+/// Dispatch one request to a graph endpoint and answer the status, the
+/// `x-amzn-errortype` header and the parsed body.
+///
+/// The sibling `call` does not report headers, and the error CLASS of the refusal under
+/// test travels in one.
+async fn addressed_call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    graph_identifier: &str,
+    body: Option<Value>,
+) -> (u16, Option<String>, Value) {
+    let payload = body.map_or_else(Vec::new, |value| {
+        serde_json::to_vec(&value).expect("a JSON request body serializes")
+    });
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("graphIdentifier", graph_identifier)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{}/neptune-graph/\
+                 aws4_request, SignedHeaders=host, Signature=deadbeef",
+                super::query_cancellation::REGION
+            ),
+        )
+        .body(bytes::Bytes::from(payload))
+        .expect("a well-formed test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, error_type, parsed)
+}
+
+/// Delete `graph` and wait until the reclamation the clock owes it has been carried out,
+/// so the host prefix a client still holds for it addresses nothing.
+///
+/// The wait is the sibling suite's poll for that CONDITION — the record is gone — with
+/// room far past the span the clock owes, never a fixed time.
+async fn deleted_and_reclaimed(router: &MultiServiceRouter, graph: &str) {
+    let (code, deleting) = call(
+        router,
+        "DELETE",
+        &format!("/graphs/{graph}?skipSnapshot=true"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case deleting {graph}: expected 200 from DeleteGraph, got {code}: {deleting}"
+    );
+    wait_until_reclaimed(router, "the deleted graph", graph).await;
+}
+
+/// RULE: an operation reached at a graph's own endpoint whose host prefix names no graph
+/// of the account and Region the request was signed for addresses no endpoint at all, so
+/// it is refused as an authentication failure — 403, the error class
+/// `AccessDeniedException` in the header and in `code`, the fixed sentence
+/// "Authentication Failed" in `message`, and a `requestId` naming that one response —
+/// whichever of those operations was called and whatever else the request carried.
+///
+/// The rows span what the rule generalises over: the FORM of the identifier (both ends of
+/// the modelled `^g-[a-z0-9]{10}$` space and a mixed one), whether a graph ever existed
+/// under it (three that never did, and one whose graph was created, deleted and
+/// reclaimed), and the operation attempted (all five on that endpoint, two of them
+/// carrying a query id and one a body).
+#[tokio::test]
+async fn an_unresolvable_graph_host_prefix_is_refused_as_an_authentication_failure() {
+    let (router, engine) = emulator();
+
+    // A graph that IS serving, so no refusal below can come from an empty store: the
+    // same five requests are answered for this one at the end.
+    let serving = graph_in_service(&router, "front-door-serving").await;
+
+    // (case, the identifier the request addresses).
+    let mut unresolvable: Vec<(String, String)> = vec![
+        (
+            "an identifier no graph was ever created under".to_string(),
+            "g-0000000000".to_string(),
+        ),
+        (
+            "an identifier at the other end of the id space".to_string(),
+            "g-zzzzzzzzzz".to_string(),
+        ),
+        (
+            "a mixed identifier no graph holds".to_string(),
+            "g-a1b2c3d4e5".to_string(),
+        ),
+    ];
+    // And an address that DID resolve once: the graph is deleted and its record
+    // reclaimed, so the host prefix a client still holds now names nothing.
+    let reclaimed = graph_in_service(&router, "front-door-reclaimed").await;
+    deleted_and_reclaimed(&router, &reclaimed).await;
+    unresolvable.push((
+        "the host prefix of a graph that has been deleted".to_string(),
+        reclaimed,
+    ));
+
+    // Every refusal names its OWN response, so no two of them carry one id.
+    let mut request_ids: Vec<String> = Vec::new();
+    for (address, identifier) in &unresolvable {
+        for (operation, method, path, body) in host_prefixed_requests() {
+            let case = format!("{operation} on {address}");
+            let (code, error_type, answered) =
+                addressed_call(&router, method, &path, identifier, body).await;
+            assert_eq!(
+                code, UNRESOLVED_ENDPOINT_STATUS,
+                "case {case:?}: expected {UNRESOLVED_ENDPOINT_STATUS}, got {code}: {answered}"
+            );
+            assert_eq!(
+                error_type.as_deref(),
+                Some(UNRESOLVED_ENDPOINT_CODE),
+                "case {case:?}: expected the error class in x-amzn-errortype, got \
+                 {error_type:?}"
+            );
+            assert_eq!(
+                answered["code"].as_str(),
+                Some(UNRESOLVED_ENDPOINT_CODE),
+                "case {case:?}: expected code {UNRESOLVED_ENDPOINT_CODE:?}, got {answered}"
+            );
+            assert_eq!(
+                answered["message"].as_str(),
+                Some(UNRESOLVED_ENDPOINT_MESSAGE),
+                "case {case:?}: expected message {UNRESOLVED_ENDPOINT_MESSAGE:?}, got \
+                 {answered}"
+            );
+            // The sentence has no variable part: a caller refused at the door is told
+            // nothing about the identifier it sent or the account it was resolved in.
+            assert!(
+                !answered.to_string().contains(identifier.as_str()),
+                "case {case:?}: the refusal must name nothing of the address, got {answered}"
+            );
+            let request_id = answered["requestId"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a requestId naming the response, got {answered}")
+                })
+                .to_string();
+            assert!(
+                !request_id.is_empty(),
+                "case {case:?}: expected a requestId naming the response, got {answered}"
+            );
+            assert!(
+                !request_ids.contains(&request_id),
+                "case {case:?}: two refusals must not name one request, got {request_id} twice"
+            );
+            request_ids.push(request_id);
+        }
+    }
+
+    // The door is open for an address that DOES resolve: the same five requests are
+    // served for the graph that is there, so what was refused above is the address and
+    // not the operation. The query the two id-carrying operations name is admitted
+    // through the store, as everywhere else in this suite.
+    admit_query(&engine, &serving, QUERY_ID, QUERY_TEXT, true);
+    for (operation, method, path, body) in host_prefixed_requests() {
+        let (code, _, answered) = addressed_call(&router, method, &path, &serving, body).await;
+        assert_eq!(
+            code, 200,
+            "case {operation} on a graph that is serving: expected 200, got {code}: {answered}"
+        );
+    }
 }

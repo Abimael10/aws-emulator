@@ -493,12 +493,19 @@ async fn the_statistics_computation_time_moves_with_the_data_and_not_with_a_read
 async fn a_summary_is_refused_for_a_graph_that_is_not_serving() {
     let (router, _engine) = emulator();
 
-    // A graph nobody created names no data.
+    // A graph nobody created names no data — and no endpoint either: the request is
+    // refused at the data plane's front door as the authentication failure it is, which
+    // `tests/all/graph_data_plane_gate.rs` pins in full.
     let (status, body) = summary(&router, "g-0000000000", None).await;
-    assert_eq!(status, 404, "case an unknown graph: expected 404, got {status}: {body}");
+    assert_eq!(status, 403, "case an unknown graph: expected 403, got {status}: {body}");
     assert_eq!(
-        error_code(&body),
-        "ResourceNotFoundException",
+        body["code"].as_str(),
+        Some("AccessDeniedException"),
+        "case an unknown graph: got {body}"
+    );
+    assert_eq!(
+        body["message"],
+        json!("Authentication Failed"),
         "case an unknown graph: got {body}"
     );
 

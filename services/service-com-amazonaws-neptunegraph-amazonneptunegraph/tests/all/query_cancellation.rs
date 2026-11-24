@@ -5,11 +5,14 @@
 //! the same router the emulator serves from.
 //!
 //! The rule every assertion here is about: a query is addressed as a query OF one
-//! graph, so both operations resolve `graphIdentifier` first — answering
-//! `ResourceNotFoundException` (404) when it names no graph — and then `queryId` within
+//! graph, so both operations resolve `graphIdentifier` first — and then `queryId` within
 //! it, answering `ValidationException` (400) "Supplied queryId <id> is invalid" when that
 //! names nothing in flight: a query id is not a resource identifier a caller can hold on
 //! to, so once the query is over the id resolves to nothing at all.
+//! A `graphIdentifier` naming no graph of the Region names no endpoint either: both
+//! operations are reached at the GRAPH's own host prefix, so such a request is refused at
+//! that plane's front door as an authentication failure (403 `AccessDeniedException`
+//! "Authentication Failed"), which `tests/all/graph_data_plane_gate.rs` pins in full.
 //! `GetQuery` reports the stored record (its id, its text, its state and the
 //! milliseconds it waited and has been running) and changes none of it, while
 //! `CancelQuery` accepts the cancel with an empty 200, after which the query reports
@@ -140,6 +143,22 @@ pub(crate) fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// Poll `GetGraph` until the reclamation the clock owes a deleted graph has been carried
+/// out and the record is gone, so nothing of that graph is left for a later call to reach.
+///
+/// It waits for the CONDITION a read reports, with a deadline far past the span the
+/// deletion is owed, rather than for a fixed time.
+pub(crate) async fn wait_until_reclaimed(router: &MultiServiceRouter, case: &str, id: &str) {
+    for _ in 0..80 {
+        let (status, _) = call(router, "GET", &format!("/graphs/{id}"), None, None).await;
+        if status == 404 {
+            return;
+        }
+        tokio::time::sleep(DELETION_SPAN / 4).await;
+    }
+    panic!("case {case:?}: the graph {id} was never reclaimed");
 }
 
 /// Create a graph and wait until it is serving, returning its id.
@@ -513,8 +532,9 @@ async fn both_operations_refuse_a_graph_or_a_query_the_store_does_not_hold() {
         }
     }
 
-    // The GRAPH is resolved first and is a resource: a well-formed graph id the store
-    // does not hold is the 404 that names it, whatever query id the request carried.
+    // The ADDRESS is resolved first and a graph is what it names: a well-formed graph id
+    // the store does not hold addresses no graph endpoint at all, so the request is
+    // refused at the door as an authentication failure, whatever query id it carried.
     let absent_graphs: Vec<(&str, &str, &str)> = vec![
         (
             "graph id no graph holds",
@@ -532,13 +552,18 @@ async fn both_operations_refuse_a_graph_or_a_query_the_store_does_not_hold() {
             ),
         ] {
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404 from {operation}, got {status}: {body}"
+                status, 403,
+                "case {case:?}: expected 403 from {operation}, got {status}: {body}"
             );
             assert_eq!(
-                error_code(&body),
-                "ResourceNotFoundException",
+                body["code"].as_str(),
+                Some("AccessDeniedException"),
                 "case {case:?}: unexpected error code from {operation} in {body}"
+            );
+            assert_eq!(
+                body["message"],
+                json!("Authentication Failed"),
+                "case {case:?}: unexpected message from {operation} in {body}"
             );
         }
     }
@@ -561,7 +586,8 @@ async fn both_operations_refuse_a_graph_or_a_query_the_store_does_not_hold() {
         still_running["state"]
     );
 
-    // A `graphIdentifier` the modelled `^g-[a-z0-9]{10}$` refuses is a 400, not a 404.
+    // A `graphIdentifier` the modelled `^g-[a-z0-9]{10}$` refuses is a 400: a value the
+    // model's own pattern rejects is no address to resolve at all.
     for bad in ["not-a-graph-id", "g-TOOSHORT", "gs-0123456789", "g-123"] {
         for (operation, (status, body)) in [
             ("GetQuery", get_query(&router, bad, "1234567890").await),
@@ -755,13 +781,18 @@ async fn deleting_a_graph_takes_its_in_flight_queries_with_it() {
     );
 
     // Once the deletion the clock owes falls due the graph is gone, and its queries are
-    // gone with it — reported as the graph being absent, which is the first thing either
-    // operation resolves.
-    tokio::time::sleep(DELETION_SPAN + SETTLE_MARGIN).await;
+    // gone with it — reported as the host prefix of that graph no longer addressing an
+    // endpoint, which is the first thing either operation resolves.
+    wait_until_reclaimed(&router, "the deleted graph", &deleted).await;
     let (status, body) = get_query(&router, &deleted, "q-gone").await;
     assert_eq!(
-        status, 404,
-        "case query of a deleted graph: expected 404, got {status}: {body}"
+        status, 403,
+        "case query of a deleted graph: expected 403, got {status}: {body}"
+    );
+    assert_eq!(
+        body["message"],
+        json!("Authentication Failed"),
+        "case query of a deleted graph: unexpected message in {body}"
     );
     assert!(
         !engine

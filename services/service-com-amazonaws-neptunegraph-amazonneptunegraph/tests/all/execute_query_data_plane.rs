@@ -5,23 +5,26 @@
 //!
 //! The rules every assertion here is about, in the order the operation decides them:
 //!
-//! 1. **authorization first.** "The IAM user or role making the request must have a
+//! 1. **the address first.** The operation is bound to the host prefix
+//!    `{graphIdentifier}.` (`smithy_query(query="operation",operation="ExecuteQuery")` ->
+//!    endpoint), so a `graphIdentifier` naming no graph of the Region the request was
+//!    signed for addresses no endpoint at all and is refused as an authentication failure
+//!    (403 `AccessDeniedException` "Authentication Failed", in the data plane's
+//!    `code`/`requestId`/`message` envelope) whatever else the request says and whoever
+//!    sent it. That refusal belongs to the whole host-prefixed endpoint rather than to
+//!    this operation, so it is driven by `tests/all/graph_data_plane_gate.rs`.
+//! 2. **authorization next.** "The IAM user or role making the request must have a
 //!    policy attached that allows one of the following IAM actions in that cluster,
 //!    depending on the query: `neptune-graph:ReadDataViaQuery`
 //!    `neptune-graph:WriteDataViaQuery` `neptune-graph:DeleteDataViaQuery`"
 //!    (`smithy_query(query="doc",shape="ExecuteQuery")`), so a caller whose identity
 //!    policies allow none of them is refused `AccessDeniedException` (403) naming the
-//!    principal, the three actions and the graph ARN — whatever the query says, and
-//!    whether or not the graph exists.
-//! 2. **the endpoint next.** The operation is bound to the host prefix
-//!    `{graphIdentifier}.` (`smithy_query(query="operation",operation="ExecuteQuery")` ->
-//!    endpoint), and two different facts about that address are reported differently: a
-//!    `graphIdentifier` this Region holds NO graph under is answered
-//!    `ResourceNotFoundException` (404), while a graph that EXISTS and is not serving is
-//!    answered the service's own `InternalServerErrorException` (500, the sentence
+//!    principal, the three actions and the graph ARN — whatever the query says.
+//! 3. **then the graph's status.** A graph that EXISTS and is not serving is answered the
+//!    service's own `InternalServerErrorException` (500, the sentence
 //!    `crate::scaffolded::GRAPH_UNAVAILABLE_TEXT`) — the graph is still there, so starting
 //!    it serves the same query again.
-//! 3. **then the query.** A query text the openCypher parser cannot read is refused
+//! 4. **then the query.** A query text the openCypher parser cannot read is refused
 //!    `ValidationException` (400) with the modelled `MALFORMED_QUERY` reason, the
 //!    position the parser could not continue at and the alternatives the grammar admits
 //!    there; a query it can read is EVALUATED over the graph's stored nodes and edges —
@@ -657,25 +660,25 @@ async fn a_query_reaches_only_a_graph_whose_data_plane_is_serving() {
         );
     }
 
-    // And an identifier no graph holds at all is a DIFFERENT answer: there is no graph at
-    // that address to be unavailable.
+    // And an identifier no graph holds at all is a DIFFERENT answer: the host prefix
+    // addresses no endpoint, so there is nothing there to be unavailable and the request
+    // is refused as an authentication failure. The envelope that refusal carries, and
+    // the rest of the address space it holds over, are driven by
+    // `tests/all/graph_data_plane_gate.rs`.
     let absent = "g-0000000000";
     let (status, body) = execute_query(&router, absent, ANY_QUERY).await;
     assert_eq!(
-        status, 404,
-        "case \"an identifier no graph holds\": expected 404, got {status}: {body}"
+        status, 403,
+        "case \"an identifier no graph holds\": expected 403, got {status}: {body}"
     );
     assert_eq!(
-        error_code(&body),
-        "ResourceNotFoundException",
+        body["code"].as_str(),
+        Some("AccessDeniedException"),
         "case \"an identifier no graph holds\": unexpected error code in {body}"
     );
     assert_eq!(
         body["message"],
-        json!(format!(
-            "No graph found for customer [{}] with graph id [{absent}]",
-            engine::emulator_account_id()
-        )),
+        json!("Authentication Failed"),
         "case \"an identifier no graph holds\": unexpected message in {body}"
     );
 }
@@ -929,33 +932,59 @@ async fn a_query_naming_anything_outside_the_engines_surface_is_refused() {
 }
 
 #[tokio::test]
-async fn authorization_is_decided_before_the_graph_is_resolved() {
+async fn the_address_is_settled_first_and_authorization_before_the_query_is_read() {
     let (router, engine) = emulator();
-    let absent = "g-0000000000";
     let principal = hold_user(&engine, "analyst-early", "AKIAQUERYEARLY", None);
+    let (graph_id, _) = graph_in_service(&router, "query-early-decisions").await;
 
-    // No graph exists at all, so the only decision this call can meet is the one taken
-    // from the request alone: the caller learns it may not query, not what the account
-    // holds.
+    // The graph is there, so the first decision this call meets is the one taken from the
+    // request alone: the caller learns it may not query, whatever the query says.
+    let (status, body) = execute_query_as(&router, "AKIAQUERYEARLY", &graph_id, ANY_QUERY).await;
+    assert_eq!(
+        status, 403,
+        "case \"an unauthorized caller on a serving graph\": expected 403, got {status}: {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with(&format!("User: {principal} is not authorized to perform:"))
+            && message.ends_with(&format!(":graph/{graph_id}")),
+        "case \"an unauthorized caller on a serving graph\": expected the denial to name \
+         the principal and the graph the request addressed, got {message:?}"
+    );
+    // A malformed query is not read either: the decision is taken before the text.
+    let (syntax_status, syntax_body) =
+        execute_query_as(&router, "AKIAQUERYEARLY", &graph_id, "MATCH (n RETURN n").await;
+    assert_eq!(
+        syntax_status, 403,
+        "case \"an unauthorized caller sending a malformed query\": expected 403, got \
+         {syntax_status}: {syntax_body}"
+    );
+    assert_eq!(
+        syntax_body["message"].as_str(),
+        Some(message),
+        "case \"an unauthorized caller sending a malformed query\": expected the same \
+         denial, got {syntax_body}"
+    );
+
+    // And the ADDRESS is settled ahead of even that: an identifier no graph holds names
+    // no endpoint for the caller's policies to be evaluated at, so the refusal is the
+    // door's own and names no principal.
+    let absent = "g-0000000000";
     let (status, body) = execute_query_as(&router, "AKIAQUERYEARLY", absent, ANY_QUERY).await;
     assert_eq!(
         status, 403,
         "case \"an unauthorized caller naming no graph\": expected 403, got {status}: {body}"
     );
-    let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.starts_with(&format!("User: {principal} is not authorized to perform:"))
-            && message.ends_with(&format!(":graph/{absent}")),
-        "case \"an unauthorized caller naming no graph\": expected the denial to name the \
-         principal and the graph the request addressed, got {message:?}"
-    );
-    // A malformed query is not read either: the decision is taken before the text.
-    let (syntax_status, syntax_body) =
-        execute_query_as(&router, "AKIAQUERYEARLY", absent, "MATCH (n RETURN n").await;
     assert_eq!(
-        syntax_status, 403,
-        "case \"an unauthorized caller sending a malformed query\": expected 403, got \
-         {syntax_status}: {syntax_body}"
+        body["message"],
+        json!("Authentication Failed"),
+        "case \"an unauthorized caller naming no graph\": expected the door's own refusal, \
+         got {body}"
+    );
+    assert!(
+        !body.to_string().contains(&principal),
+        "case \"an unauthorized caller naming no graph\": a request refused at the door \
+         must learn nothing of the account, got {body}"
     );
 }
 
