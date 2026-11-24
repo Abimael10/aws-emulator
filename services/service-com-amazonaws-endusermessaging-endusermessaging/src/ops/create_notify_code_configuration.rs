@@ -179,6 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // A supplied template body has to be able to render a passcode, whichever
+        // channel it is for. Judged before anything is created, so a refused request
+        // leaves no configuration behind.
+        if let Some(channels) = input.channel_parameters.as_ref() {
+            crate::state::channel_templates_render_a_code(
+                crate::state::CHANNEL_PARAMETERS_MEMBER,
+                channels,
+            )
+            .map_err(CreateNotifyCodeConfigurationErrorModeled::ValidationException)?;
+        }
+
         // The parameters this request asks for, which is what a repeat of its
         // `clientToken` is compared against. Both parameter structures are kept exactly
         // as supplied: no value is applied for a member the request omits, and the

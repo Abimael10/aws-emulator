@@ -18,11 +18,18 @@
 //!   by its full ARN, and the ARN is
 //!   `arn:aws:end-user-messaging:<region>:<account>:notify-code-configuration/<id>`
 //!   for whatever region the request is signed for;
-//! * an identifier that names nothing is `ResourceNotFoundException` (404) carrying
-//!   this error class's templated sentence, and a value outside a modelled
-//!   constraint is `ValidationException` (400);
+//! * an identifier is CLASSIFIED before it is looked up: a WELL-FORMED identifier
+//!   that names nothing is `ResourceNotFoundException` (404) carrying this error
+//!   class's templated sentence, while a value that is neither a bare identifier nor
+//!   the ARN of one — so it can name a configuration in no state — is
+//!   `ValidationException` (400) reporting the format failure (the gates of that class
+//!   are the `identifier_and_template_gates` child suite), and a value outside a
+//!   modelled constraint is `ValidationException` (400);
 //! * a repeated `clientToken` reports the first configuration instead of creating
 //!   another;
+//! * `DeleteNotifyCodeConfiguration` removes the stored configuration — addressed by
+//!   either form of its identifier — unless deletion protection is on, in which case it
+//!   is `ConflictException` (409) and the configuration stays readable;
 //! * the bounded store refuses a create past its ceiling with
 //!   `ServiceQuotaExceededException` rather than growing without bound.
 
@@ -46,6 +53,11 @@ mod listing;
 // harness: a child module of this suite, declared the same way `listing` is.
 #[path = "notify_code_configuration_lifecycle/update.rs"]
 mod update;
+
+// The identifier-format and template-placeholder gates every operation of this surface
+// applies to a supplied value: another child module of this suite, declared the same way.
+#[path = "notify_code_configuration_lifecycle/identifier_and_template_gates.rs"]
+mod identifier_and_template_gates;
 
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
@@ -202,6 +214,15 @@ impl Emulator {
     async fn get(&self, id_or_arn: &str) -> Reply {
         self.call(
             "GET",
+            &format!("/v1/notify-code-configurations/{id_or_arn}"),
+            None,
+        )
+        .await
+    }
+
+    async fn delete(&self, id_or_arn: &str) -> Reply {
+        self.call(
+            "DELETE",
             &format!("/v1/notify-code-configurations/{id_or_arn}"),
             None,
         )
@@ -474,15 +495,16 @@ async fn an_identifier_that_names_nothing_is_a_404_with_the_templated_sentence()
     // One live configuration, so a miss is a miss rather than an empty store.
     em.create_named("live-one").await;
 
-    // The rows are identifiers a `NotifyCodeConfigurationIdOrArn` accepts that name
-    // nothing: a minted-shaped id, a short bare id, one carrying each punctuation
-    // the shape's `^[A-Za-z0-9_:/-]+$` pattern allows, the maximum length its
-    // `@length(1..256)` permits, and a well-formed ARN never issued.
+    // The rows are WELL-FORMED identifiers of this resource that name nothing: the
+    // minted shape at its documented maximum body, a short body, a body carrying each
+    // character the bare-identifier shape `NotifyCodeConfigurationId`
+    // (^[A-Za-z0-9_-]+$) allows, exactly the maximum length its @length(1..64)
+    // permits, and a well-formed ARN never issued.
     let unknown = vec![
         "ncc-00000000000000000".to_string(),
-        "x".to_string(),
-        "A_b-c:d/e".to_string(),
-        "z".repeat(256),
+        "ncc-1".to_string(),
+        "ncc-A_b-c9".to_string(),
+        format!("ncc-{}", "z".repeat(60)),
         format!(
             "arn:aws:{SIGNING_NAME}:us-east-1:{ACCOUNT_ID}:{CONFIGURATION_TYPE}/ncc-11111111111111111"
         ),
@@ -778,4 +800,128 @@ async fn the_store_is_bounded_and_refuses_a_create_past_its_ceiling() {
         "the reader must report the configuration asked for, got {:?}",
         still_there.body
     );
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_configuration_unless_deletion_protection_is_on() {
+    let em = Emulator::new();
+
+    // The rows differ in the form the delete addresses the configuration by —
+    // `NotifyCodeConfigurationIdOrArn` accepts either — and in whether protection was
+    // asked for at create time or switched on afterwards.
+    for (case, by_arn, protect_at_create) in [
+        ("the bare id, protected at create", false, true),
+        ("the full ARN, protected at create", true, true),
+        ("the bare id, protected by an update", false, false),
+    ] {
+        let created = em
+            .create(json!({
+                "notifyCodeConfigurationName": "delete-me",
+                "deletionProtectionEnabled": protect_at_create,
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+        let id = created.string("notifyCodeConfigurationId");
+        let arn = created.string("notifyCodeConfigurationArn");
+        let identifier = if by_arn { arn.clone() } else { id.clone() };
+        if !protect_at_create {
+            let protected = em
+                .call(
+                    "PUT",
+                    &format!("/v1/notify-code-configurations/{identifier}"),
+                    Some(json!({ "deletionProtectionEnabled": true })),
+                )
+                .await;
+            assert_eq!(
+                protected.status, 200,
+                "case {case}: switching protection on must succeed, got {} / {:?}",
+                protected.status, protected.body
+            );
+        }
+
+        // Deletion protection refuses the delete, and the configuration stays.
+        let refused = em.delete(&identifier).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case}: expected 409, got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ConflictException"),
+            "case {case}: unexpected error code, got {:?}",
+            refused.error
+        );
+        let expected = format!(
+            "Conflict occurred - Reason=\"DELETION_PROTECTION_ENABLED\" ResourceType=\"{CONFIGURATION_TYPE}\""
+        );
+        assert_eq!(
+            refused.top("message"),
+            expected,
+            "case {case}: expected message {expected:?}, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.top("resourceId"),
+            id,
+            "case {case}: resourceId must name the configuration, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            em.get(&id).await.status,
+            200,
+            "case {case}: a refused delete must leave the configuration readable"
+        );
+
+        // With protection off the delete goes through, and the record is gone: the
+        // reader answers the not-found class, and so does a repeat of the delete.
+        let released = em
+            .call(
+                "PUT",
+                &format!("/v1/notify-code-configurations/{identifier}"),
+                Some(json!({ "deletionProtectionEnabled": false })),
+            )
+            .await;
+        assert_eq!(
+            released.status, 200,
+            "case {case}: switching protection off must succeed, got {} / {:?}",
+            released.status, released.body
+        );
+        let deleted = em.delete(&identifier).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case}: the delete must succeed, got {} / {:?}",
+            deleted.status, deleted.body
+        );
+
+        for (read, reply) in [
+            ("the reader", em.get(&identifier).await),
+            ("a repeat of the delete", em.delete(&identifier).await),
+        ] {
+            assert_eq!(
+                reply.status, 404,
+                "case {case}: {read} must answer 404 once deleted, got {} / {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {case}: {read} unexpected error code, got {:?}",
+                reply.error
+            );
+            let expected = format!(
+                "Resource not found - ResourceType=\"{CONFIGURATION_TYPE}\" ResourceId=\"{identifier}\""
+            );
+            assert_eq!(
+                reply.top("message"),
+                expected,
+                "case {case}: {read} expected message {expected:?}, got {:?}",
+                reply.body
+            );
+        }
+    }
 }

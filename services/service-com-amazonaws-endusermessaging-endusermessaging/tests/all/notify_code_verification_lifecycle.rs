@@ -52,9 +52,10 @@ use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 const SIGNING_NAME: &str = "end-user-messaging";
 
 /// The channel parameters a send carries when it references no configuration: one
-/// route, the text one, with the template the passcode is rendered into.
+/// route, the text one, with the template the passcode is rendered into — which carries
+/// the code placeholder every supplied template body has to.
 fn text_channel_parameters() -> Value {
-    json!({ "text": { "inlineTemplateBody": "Your verification code is available." } })
+    json!({ "text": { "inlineTemplateBody": "Your verification code is {{code}}." } })
 }
 
 /// One response, reduced to what the assertions read.

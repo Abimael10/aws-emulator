@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNotifyCodeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNotifyCodeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNotifyCodeConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored notify code configuration this request names, unless
+//! deletion protection is on, and leaves the verifications already in progress alone.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +144,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNotifyCodeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNotifyCodeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteNotifyCodeConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // `NotifyCodeConfigurationIdOrArn` names the configuration by its bare id or by
+        // its full ARN. A value that is neither can name a configuration in no state, so
+        // it is refused as invalid input before any lookup; only a well-formed identifier
+        // this store holds no record for is not found.
+        let id = store
+            .resolve_notify_code_configuration_id(
+                crate::state::NOTIFY_CODE_CONFIGURATION_ID_MEMBER,
+                &input.notify_code_configuration_id,
+            )
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    DeleteNotifyCodeConfigurationErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    DeleteNotifyCodeConfigurationErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+
+        // Deletion protection refuses the delete and leaves the configuration in place:
+        // `ConflictException` is the modelled failure for a resource whose current state
+        // forbids the request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNotifyCodeConfiguration"))
+        // The resolution and these writes share one lock, so the record the identifier
+        // resolved to is still here; a state that disagreed is reported as this service's
+        // own failure rather than panicking the request.
+        let Some(record) = store.notify_code_configurations.get(&id) else {
+            return Err(
+                DeleteNotifyCodeConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        if record.deletion_protection_enabled {
+            return Err(DeleteNotifyCodeConfigurationErrorModeled::ConflictException(
+                crate::state::notify_code_configuration_deletion_protection_conflict(&id),
+            )
+            .into());
+        }
+
+        // The record carries this configuration's tags and the `clientToken` that minted
+        // it, so both go with it: a token never outlives the resource it names, and a
+        // later create reusing that token mints a new configuration rather than reporting
+        // a deleted one. A verification already in progress captured its policy when the
+        // passcode was sent, so it is left exactly as it is.
+        if store.notify_code_configurations.remove(&id).is_none() {
+            return Err(
+                DeleteNotifyCodeConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteNotifyCodeConfigurationOutput {})
     }
 }

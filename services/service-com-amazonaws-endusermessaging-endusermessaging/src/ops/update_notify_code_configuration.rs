@@ -168,6 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A supplied template body has to be able to render a passcode, whichever
+        // channel it is for. Judged ahead of everything else, so a refused update
+        // resolves nothing and leaves the stored channel parameters as they were.
+        if let Some(channels) = input.channel_parameters.as_ref() {
+            crate::state::update_channel_templates_render_a_code(
+                crate::state::CHANNEL_PARAMETERS_MEMBER,
+                channels,
+            )
+            .map_err(UpdateNotifyCodeConfigurationErrorModeled::ValidationException)?;
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateNotifyCodeConfigurationErrorModeled::InternalServerException(
@@ -181,20 +191,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // `NotifyCodeConfigurationIdOrArn` names the configuration by its bare id or by
-        // its full ARN; a value that reaches no stored configuration is not found.
-        let Some(id) = store
-            .resolve_notify_code_configuration_id(&input.notify_code_configuration_id)
+        // its full ARN. A value that is neither can name a configuration in no state, so
+        // it is refused as invalid input before any lookup; only a well-formed identifier
+        // this store holds no record for is not found.
+        let id = store
+            .resolve_notify_code_configuration_id(
+                crate::state::NOTIFY_CODE_CONFIGURATION_ID_MEMBER,
+                &input.notify_code_configuration_id,
+            )
             .map(str::to_string)
-        else {
-            return Err(
-                UpdateNotifyCodeConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::notify_code_configuration_not_found(
-                        &input.notify_code_configuration_id,
-                    ),
-                )
-                .into(),
-            );
-        };
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    UpdateNotifyCodeConfigurationErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    UpdateNotifyCodeConfigurationErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
         // The resolution and this write share one lock, so the record the identifier
         // resolved to is still here.
         let Some(record) = store.notify_code_configurations.get_mut(&id) else {

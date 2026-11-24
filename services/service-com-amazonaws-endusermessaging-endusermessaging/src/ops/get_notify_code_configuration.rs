@@ -157,15 +157,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let store = state.lock();
-        let Some(record) = store
-            .resolve_notify_code_configuration_id(&input.notify_code_configuration_id)
-            .and_then(|id| store.notify_code_configurations.get(id))
-        else {
+        // `NotifyCodeConfigurationIdOrArn` names the configuration by its bare id or by
+        // its full ARN. A value that is neither can name a configuration in no state, so
+        // it is refused as invalid input before any lookup; only a well-formed identifier
+        // this store holds no record for is not found.
+        let id = store
+            .resolve_notify_code_configuration_id(
+                crate::state::NOTIFY_CODE_CONFIGURATION_ID_MEMBER,
+                &input.notify_code_configuration_id,
+            )
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    GetNotifyCodeConfigurationErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    GetNotifyCodeConfigurationErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and this read share one lock, so the record the identifier
+        // resolved to is still here.
+        let Some(record) = store.notify_code_configurations.get(&id) else {
             return Err(
-                GetNotifyCodeConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::notify_code_configuration_not_found(
-                        &input.notify_code_configuration_id,
-                    ),
+                GetNotifyCodeConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
                 )
                 .into(),
             );

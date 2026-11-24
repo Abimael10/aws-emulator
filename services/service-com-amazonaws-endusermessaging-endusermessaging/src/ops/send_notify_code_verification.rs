@@ -201,24 +201,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counts only passcodes still inside their validity window.
         store.expire_verifications(now);
 
-        // `notifyCodeConfiguration` takes an id or an ARN; a value that names no
-        // stored configuration is this operation's `ResourceNotFoundException`.
+        // A supplied template body has to be able to render a passcode, whichever
+        // channel it is for — an override this request carries itself included.
+        if let Some(channels) = input.override_channel_parameters.as_ref() {
+            crate::state::channel_templates_render_a_code(
+                crate::state::OVERRIDE_CHANNEL_PARAMETERS_MEMBER,
+                channels,
+            )
+            .map_err(SendNotifyCodeVerificationErrorModeled::ValidationException)?;
+        }
+
+        // `notifyCodeConfiguration` takes an id or an ARN. A value that is neither can
+        // name a configuration in no state, so it is refused as invalid input before any
+        // lookup; only a well-formed identifier this store holds no record for is this
+        // operation's `ResourceNotFoundException`.
         let configuration_id = match input.notify_code_configuration.as_deref() {
             None => None,
-            Some(id_or_arn) => {
-                let Some(id) = store
-                    .resolve_notify_code_configuration_id(id_or_arn)
+            Some(id_or_arn) => Some(
+                store
+                    .resolve_notify_code_configuration_id(
+                        crate::state::NOTIFY_CODE_CONFIGURATION_MEMBER,
+                        id_or_arn,
+                    )
                     .map(str::to_string)
-                else {
-                    return Err(
-                        SendNotifyCodeVerificationErrorModeled::ResourceNotFoundException(
-                            crate::state::notify_code_configuration_not_found(id_or_arn),
-                        )
-                        .into(),
-                    );
-                };
-                Some(id)
-            }
+                    .map_err(|unreachable| match unreachable {
+                        crate::state::UnreachableResource::Invalid(invalid) => {
+                            SendNotifyCodeVerificationErrorModeled::ValidationException(invalid)
+                        }
+                        crate::state::UnreachableResource::NotFound(missing) => {
+                            SendNotifyCodeVerificationErrorModeled::ResourceNotFoundException(
+                                missing,
+                            )
+                        }
+                    })?,
+            ),
         };
 
         // `notifyCodeConfiguration` documents the one combination of members that

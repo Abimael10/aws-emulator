@@ -23,6 +23,15 @@ pub use tags::*;
 mod notify_code_configuration_updates;
 pub use notify_code_configuration_updates::*;
 
+/// Which values are identifiers of a notify code configuration, and how one that is
+/// not is refused.
+mod notify_code_configuration_ids;
+pub use notify_code_configuration_ids::*;
+
+/// What a supplied one-time-passcode template body has to carry.
+mod notify_code_configuration_templates;
+pub use notify_code_configuration_templates::*;
+
 /// The asynchronous jobs the registration-import operations start, and the terminal
 /// status the clock owes each one.
 mod jobs;
@@ -219,7 +228,7 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// ever handing back an id already in use.
     pub fn mint_notify_code_configuration_id(&mut self) -> String {
         loop {
-            let id = self.next_candidate_id("ncc");
+            let id = self.next_candidate_id(NOTIFY_CODE_CONFIGURATION_ID_PREFIX);
             if !self.notify_code_configurations.contains_key(&id) {
                 return id;
             }
@@ -320,16 +329,28 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
     /// configuration.
     ///
     /// The shape accepts either a bare id or the resource's full ARN, so every
-    /// operation taking one resolves both; an unknown value answers `None`, which
-    /// the caller renders as `ResourceNotFoundException`.
-    pub fn resolve_notify_code_configuration_id(&self, id_or_arn: &str) -> Option<&str> {
-        if let Some((id, _)) = self.notify_code_configurations.get_key_value(id_or_arn) {
-            return Some(id.as_str());
-        }
-        let id = resource_id_from_arn(id_or_arn, NOTIFY_CODE_CONFIGURATION_RESOURCE)?;
+    /// operation taking one resolves both. The two ways a value reaches no
+    /// configuration are different failures, so they are told apart before any
+    /// lookup: a value that is not an identifier of this resource at all cannot name
+    /// a configuration in any state, and is refused as invalid input against the
+    /// `member` it arrived on; an identifier of the documented form that this state
+    /// holds no record for is refused as not found.
+    pub fn resolve_notify_code_configuration_id(
+        &self,
+        member: &str,
+        id_or_arn: &str,
+    ) -> Result<&str, UnreachableResource> {
+        let Some(id) = notify_code_configuration_id_of(id_or_arn) else {
+            return Err(UnreachableResource::Invalid(
+                invalid_notify_code_configuration_id(member, id_or_arn),
+            ));
+        };
         self.notify_code_configurations
             .get_key_value(id)
             .map(|(id, _)| id.as_str())
+            .ok_or_else(|| {
+                UnreachableResource::NotFound(notify_code_configuration_not_found(id_or_arn))
+            })
     }
 
     /// The stored notify code configuration a previous create minted for `token`,
@@ -628,6 +649,18 @@ pub fn notify_code_configuration_not_found(
     id_or_arn: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
     resource_not_found(NOTIFY_CODE_CONFIGURATION_RESOURCE_TYPE, id_or_arn)
+}
+
+/// `ConflictException` for a notify-code-configuration request refused by that
+/// configuration's deletion protection.
+pub fn notify_code_configuration_deletion_protection_conflict(
+    notify_code_configuration_id: &str,
+) -> crate::ops::types::ConflictException {
+    resource_conflict(
+        DELETION_PROTECTION_ENABLED_REASON,
+        NOTIFY_CODE_CONFIGURATION_RESOURCE_TYPE,
+        notify_code_configuration_id,
+    )
 }
 
 /// The modelled `NotifyCodeConfiguration` resource, read back off a stored record.
