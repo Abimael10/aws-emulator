@@ -5,6 +5,9 @@
 //! Reports one run of one job definition: the record `StartJobRun` wrote in
 //! [`crate::state`], projected through [`crate::state::JobRunEntry::to_job_run`], so
 //! what this reports is what the start recorded and what the clock has since made of it.
+//! A run is addressed by its (`JobName`, `RunId`) pair and OUTLIVES the definition it was
+//! started of, so a `DeleteJob` of that definition leaves this read answering the run
+//! ([`crate::state::DeletedJobRuns`]).
 //!
 //! REPORTING, not mutating: the only state it writes is the state changes the CLOCK
 //! already owed this job's runs ([`crate::state::JobEntry::settle_due_runs`]) — changes
@@ -205,7 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what was asked, and it never blames the job for a stale run id. Naming the JOB
         // as the thing that is missing is the refusal of the operations that address a job
         // definition ([`crate::state::messages::JOB_NOT_FOUND`]), not of this one.
-        let Some(job) = store.job_mut(&region, &input.job_name) else {
+        //
+        // The pair is resolved through the RUN path: a run outlives the job definition it
+        // was started of, so a delete of that definition leaves this read answering the
+        // run it minted an id for ([`crate::state::ComAmazonawsGlueAwsglueState::job_runs_mut`]).
+        let Some(job) = store.job_runs_mut(&region, &input.job_name) else {
             return Err(not_found(
                 crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
             ));

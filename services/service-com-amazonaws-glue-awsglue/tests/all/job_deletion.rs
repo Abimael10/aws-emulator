@@ -5,11 +5,15 @@
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
-//! The rule under test: `DeleteJob` removes the job definition the request names from the
-//! Region it was created in, with everything held on that record — its tags and the runs
-//! started of it — and answers with the name it was given; the delete is idempotent, so a
-//! name the Region holds no job under is answered the same way ("if the job definition is
-//! not found, no exception is thrown") and leaves every other record standing.
+//! The rule under test: `DeleteJob` removes the job DEFINITION the request names from the
+//! Region it was created in, with the tags held on that record, and answers with the name it
+//! was given; the delete is idempotent, so a name the Region holds no job under is answered
+//! the same way ("if the job definition is not found, no exception is thrown") and leaves
+//! every other record standing. The runs already started of the deleted definition are
+//! records of their own and outlive it, which is the subject of
+//! `tests/all/job_run_outlives_its_definition.rs`; what this suite asserts of them is that
+//! the LISTING of a job's runs goes with the definition, like every other read that
+//! addresses it.
 //!
 //! The recorded case — one delete of a stored job — is ONE row of the tables below; the
 //! rows differ along the command kind, how many members the stored definition carries,
@@ -188,8 +192,8 @@ async fn start_runs(router: &MultiServiceRouter, case: &str, name: &str, count: 
     started
 }
 
-/// A delete removes the named definition and the whole record with it, answers with the
-/// name, leaves every other job standing, and frees the name for the next create.
+/// A delete removes the named definition with the tags held on it, answers with the name,
+/// leaves every other job standing, and frees the name for the next create.
 #[tokio::test]
 async fn a_delete_removes_the_named_definition_and_answers_with_its_name() {
     for row in rows() {
@@ -247,12 +251,13 @@ async fn a_delete_removes_the_named_definition_and_answers_with_its_name() {
              {missing:?}"
         );
 
-        // The runs started of the definition went with it: the history is not readable,
-        // and neither is any run of it.
+        // The LISTING of the job's runs is a read of the definition, so it goes with it —
+        // while each run the definition had started is still reported one by one under the
+        // id the start handed out (`tests/all/job_run_outlives_its_definition.rs`).
         let (status, body) = call(&router, "GetJobRuns", &json!({ "JobName": row.name })).await;
         assert_eq!(
             status, 400,
-            "case {case:?}: the deleted job's run history must be gone, got {status} with {body}"
+            "case {case:?}: the deleted job's run listing must be gone, got {status} with {body}"
         );
         assert!(
             error_code(&body).ends_with("EntityNotFoundException"),
@@ -267,13 +272,14 @@ async fn a_delete_removes_the_named_definition_and_answers_with_its_name() {
             )
             .await;
             assert_eq!(
-                status, 400,
-                "case {case:?}: run {run_id} must be gone with its job, got {status} with {body}"
+                status, 200,
+                "case {case:?}: run {run_id} must outlive its definition, got {status} with \
+                 {body}"
             );
-            assert!(
-                error_code(&body).ends_with("EntityNotFoundException"),
-                "case {case:?}: expected EntityNotFoundException for run {run_id}, got {}",
-                error_code(&body)
+            assert_eq!(
+                body["JobRun"]["Id"].as_str(),
+                Some(run_id.as_str()),
+                "case {case:?}: the read must report run {run_id}, got {body}"
             );
         }
 

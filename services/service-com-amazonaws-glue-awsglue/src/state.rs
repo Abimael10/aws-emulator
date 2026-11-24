@@ -1146,6 +1146,17 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// through that endpoint, and the same name is free in every other Region. The inner
     /// key is the name exactly as sent — the model documents no case fold for `Job$Name`.
     pub jobs: HashMap<String, HashMap<String, JobEntry>>,
+    /// The runs of the job definitions a delete removed, keyed by the REGION the job was
+    /// created in and then by its name, in name order.
+    ///
+    /// `DeleteJob` removes a job DEFINITION; a run already started of it is a record of its
+    /// own, so the paths that address a RUN keep resolving it here once the definition is
+    /// gone ([`DeletedJobRuns`] states the rule and what is kept). Reached only through
+    /// [`Self::job_runs_mut`], never through [`Self::job`] or [`Self::job_mut`], so a read
+    /// or a write of the definition is unaffected; dropped when a create takes the name
+    /// again ([`Self::insert_job`]) and bounded by
+    /// [`MAX_DELETED_JOB_RUN_HISTORIES`].
+    pub deleted_job_runs: HashMap<String, BTreeMap<String, DeletedJobRuns>>,
     /// Every trigger this emulator holds, keyed by the REGION it was created in and then
     /// by its name, in name order.
     ///
@@ -3079,8 +3090,35 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|jobs| jobs.get_mut(name))
     }
 
+    /// The record a RUN of `name` belongs to: the live job definition of that name, else —
+    /// once a delete has removed the definition — the history that delete retained
+    /// ([`DeletedJobRuns`]).
+    ///
+    /// This is what every path that addresses a job RUN resolves through, because a run
+    /// outlives the definition it was started of: `DeleteJob` deletes the definition, and
+    /// the run `StartJobRun` already minted an id for stays reportable under that id.
+    /// Mutable, because a run read materialises the states the clock had already made due
+    /// ([`JobEntry::settle_due_runs`]) and the execution path records what a run's script
+    /// came to. A read or a write of the DEFINITION goes through [`Self::job`] /
+    /// [`Self::job_mut`] instead and so still answers the modelled miss for a deleted job.
+    pub fn job_runs_mut(&mut self, region: &str, name: &str) -> Option<&mut JobEntry> {
+        if self.job(region, name).is_some() {
+            return self.job_mut(region, name);
+        }
+        self.deleted_job_runs
+            .get_mut(region)
+            .and_then(|histories| histories.get_mut(name))
+            .map(|history| &mut history.job)
+    }
+
     /// Store `entry` as the Region `region`'s job definition under its own name.
     pub fn insert_job(&mut self, region: &str, entry: JobEntry) {
+        // The name now names a NEW job definition, so the runs the delete of the previous
+        // one retained under it are dropped: a run of the definition that is gone is not a
+        // run of this one, and nothing can reach it again.
+        if let Some(histories) = self.deleted_job_runs.get_mut(region) {
+            histories.remove(&entry.name);
+        }
         self.jobs
             .entry(region.to_string())
             .or_default()
@@ -3090,16 +3128,76 @@ impl ComAmazonawsGlueAwsglueState {
     /// Remove the job definition `name` from the Region `region`, answering the record
     /// that was removed, or `None` when that Region holds no job under that name.
     ///
-    /// The whole record goes: a job's tags and the runs started of it are held ON the
-    /// entry ([`JobEntry::tags`], [`JobEntry::runs`]), so the name a delete frees carries
-    /// neither into the next create under it. The removed entry is handed back rather
-    /// than dropped, for symmetry with [`Self::remove_connection`] — today's caller only
-    /// needs to know WHETHER a record went. Matched by name and Region exactly as the
-    /// read path matches them ([`Self::job`]).
-    pub fn remove_job(&mut self, region: &str, name: &str) -> Option<JobEntry> {
-        self.jobs
+    /// The DEFINITION is what goes, with the tags held on that record — so the name a
+    /// delete frees carries no tag into the next create under it. The runs already started
+    /// of it do NOT go: they are records of their own, kept under the name the delete freed
+    /// ([`DeletedJobRuns`]) so the paths that address a run still resolve them, and dropped
+    /// when a create takes that name again. The removed entry is handed back rather than
+    /// dropped, for symmetry with [`Self::remove_connection`] — today's caller only needs
+    /// to know WHETHER a record went. Matched by name and Region exactly as the read path
+    /// matches them ([`Self::job`]).
+    pub fn remove_job(
+        &mut self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<JobEntry> {
+        let removed = self
+            .jobs
             .get_mut(region)
-            .and_then(|jobs| jobs.remove(name))
+            .and_then(|jobs| jobs.remove(name))?;
+        if !removed.runs.is_empty() {
+            self.retain_deleted_job_runs(region, &removed, now);
+        }
+        Some(removed)
+    }
+
+    /// Keep the runs of the job definition `job`, which a delete removed at `now`, for the
+    /// paths that address a run ([`Self::job_runs_mut`]).
+    ///
+    /// Bounded by [`MAX_DELETED_JOB_RUN_HISTORIES`]: past that many histories the one whose
+    /// delete is OLDEST is dropped, so one process holds a bounded number of them however
+    /// many jobs are created and deleted through it. The walk is over the histories held,
+    /// which that same bound limits.
+    fn retain_deleted_job_runs(&mut self, region: &str, job: &JobEntry, now: SystemTime) {
+        self.deleted_job_runs
+            .entry(region.to_string())
+            .or_default()
+            .insert(
+                job.name.clone(),
+                DeletedJobRuns {
+                    job: job.clone(),
+                    deleted_on: now,
+                },
+            );
+        while self.retained_job_run_histories() > MAX_DELETED_JOB_RUN_HISTORIES {
+            let Some((oldest_region, oldest_name)) = self
+                .deleted_job_runs
+                .iter()
+                .flat_map(|(region, histories)| {
+                    histories
+                        .iter()
+                        .map(move |(name, history)| (region, name, history.deleted_on))
+                })
+                .min_by_key(|(_, _, deleted_on)| *deleted_on)
+                .map(|(region, name, _)| (region.clone(), name.clone()))
+            else {
+                break;
+            };
+            if let Some(histories) = self.deleted_job_runs.get_mut(&oldest_region) {
+                histories.remove(&oldest_name);
+                if histories.is_empty() {
+                    self.deleted_job_runs.remove(&oldest_region);
+                }
+            }
+        }
+    }
+
+    /// How many deleted job definitions' run histories this store holds, across every
+    /// Region. The walk is over the Regions one process has been addressed in, so it is
+    /// bounded.
+    pub fn retained_job_run_histories(&self) -> usize {
+        self.deleted_job_runs.values().map(BTreeMap::len).sum()
     }
 
     /// Every job definition the Region `region` holds, in name order.

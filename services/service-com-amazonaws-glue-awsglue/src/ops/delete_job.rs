@@ -4,10 +4,12 @@
 //!
 //! Removes one job definition from the Region's job namespace
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::jobs`]) by the `JobName` it was stored
-//! under, so a later `GetJob` of that name finds nothing. The whole record goes with it —
-//! the job's tags and the runs `StartJobRun` started of it live on the stored entry — and
-//! the delete is IDEMPOTENT: "if the job definition is not found, no exception is thrown",
-//! so a name this Region holds no job under is answered exactly as one it did hold.
+//! under, so a later `GetJob` of that name finds nothing. The DEFINITION goes, with the
+//! tags held on the stored entry; the runs `StartJobRun` had already started of it are
+//! records of their own and stay reportable one by one under the ids it handed out
+//! ([`crate::state::DeletedJobRuns`]). The delete is IDEMPOTENT: "if the job definition is
+//! not found, no exception is thrown", so a name this Region holds no job under is
+//! answered exactly as one it did hold.
 //!
 //! ## Shape of an operation
 //!
@@ -156,9 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused at the boundary, so there is nothing left for this handler to validate.
         let region = crate::state::request_region(ctx.parts());
         // A job definition exists only in the Region it was created in, so a delete
-        // addressed to another Region's endpoint names no job. Removing the entry removes
-        // the WHOLE record — the job's tags and the runs started of it are held on it.
-        let removed = state.lock().remove_job(&region, &input.job_name).is_some();
+        // addressed to another Region's endpoint names no job. The DEFINITION is what is
+        // removed, with the tags held on it; the runs already started of it are records of
+        // their own and stay reportable under the name this delete freed
+        // ([`crate::state::DeletedJobRuns`]).
+        let removed = state
+            .lock()
+            .remove_job(&region, &input.job_name, ::std::time::SystemTime::now())
+            .is_some();
         ::tracing::info!(
             operation = "DeleteJob",
             job = %input.job_name,

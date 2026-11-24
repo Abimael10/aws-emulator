@@ -699,7 +699,13 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
             // released before anything is run.
             let plan = {
                 let mut store = state.lock();
-                let Some(job) = store.job_mut(region, job_name) else {
+                // The run is resolved through the RUN path, so a run admitted before its
+                // job definition was deleted still gets the ONE execution it was owed and
+                // comes to rest, rather than being reported as running while nothing runs
+                // it. The RETRY policy is the definition's, so only a job whose definition
+                // is still there owes a further attempt.
+                let definition_held = store.job(region, job_name).is_some();
+                let Some(job) = store.job_runs_mut(region, job_name) else {
                     break;
                 };
                 // Everything the clock already owed this job's runs is materialised first,
@@ -707,7 +713,9 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
                 // attempt the retry policy owes a run that came to rest in the failure
                 // state is recorded here, so it is performed like any other owed run.
                 job.settle_due_runs(SystemTime::now());
-                job.record_owed_attempts();
+                if definition_held {
+                    job.record_owed_attempts();
+                }
                 // The execution is CLAIMED under the guard, so two calls that find the same
                 // run owed its script cannot both run it.
                 let Some(run_id) = job.claim_run_awaiting_script() else {
@@ -848,7 +856,7 @@ async fn perform_handed_off_job_script(
     };
     {
         let mut store = state.lock();
-        let Some(job) = store.job_mut(region, &plan.job_name) else {
+        let Some(job) = store.job_runs_mut(region, &plan.job_name) else {
             return;
         };
         if let Some(run) = job.run_mut(&plan.run_id) {
@@ -889,7 +897,7 @@ fn release_script_claim(
     plan: &JobScriptPlan,
 ) {
     let mut store = state.lock();
-    if let Some(job) = store.job_mut(region, &plan.job_name) {
+    if let Some(job) = store.job_runs_mut(region, &plan.job_name) {
         job.release_script_claim(&plan.run_id);
     }
 }

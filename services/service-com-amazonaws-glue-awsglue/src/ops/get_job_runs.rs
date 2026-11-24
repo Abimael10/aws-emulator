@@ -214,6 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `JobName` is `@required` with `length 1..255`, so an absent or over-long one is
         // refused at the boundary: reaching here, the only question is whether THIS Region
         // holds a job of that name — a job of another Region has no run history here.
+        //
+        // This listing is the runs OF A JOB, so it is scoped to the job DEFINITION: a name
+        // this Region holds no definition under is the modelled miss, a job whose
+        // definition a delete removed included, even though the runs started of it stay
+        // reportable one by one through the read that addresses a run by its own id
+        // ([`crate::ops::get_job_run`]).
         let Some(job) = store.job_mut(&region, &input.job_name) else {
             return Err(GetJobRunsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {

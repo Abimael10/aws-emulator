@@ -1161,6 +1161,33 @@ pub const JOB_RUN_ID_PREFIX: &str = "jr_";
 /// OLDEST record is dropped first, so the runs a caller is most likely to read are kept.
 pub const MAX_RUNS_PER_JOB: usize = 100;
 
+/// How many DELETED job definitions' run histories one store keeps
+/// ([`super::ComAmazonawsGlueAwsglueState::deleted_job_runs`]).
+///
+/// CHOSEN: the store is resident memory and a delete is reachable by any caller, so the
+/// histories one process holds are bounded the way the live records are
+/// ([`super::MAX_JOBS`]). The history whose delete is OLDEST is dropped first, so the runs
+/// a caller is most likely to still be reading are the ones kept.
+pub const MAX_DELETED_JOB_RUN_HISTORIES: usize = 100;
+
+/// The runs a deleted job definition leaves behind.
+///
+/// `DeleteJob` "deletes a specified job definition", and a run `StartJobRun` already
+/// started of that definition is a record of its own: the reads that address a run by its
+/// job name and run id keep reporting it once the definition is gone. What is kept is the
+/// removed job's own record, because every member a run read reports is projected off it
+/// ([`JobRunEntry::to_job_run`], [`JobEntry::settle_due_runs`]) and because a run still
+/// owed its script's one execution is performed from it — and it is reached ONLY through
+/// the run paths ([`super::ComAmazonawsGlueAwsglueState::job_runs_mut`]), so every read and
+/// write that addresses the DEFINITION still answers the modelled miss.
+#[derive(Debug, Clone)]
+pub struct DeletedJobRuns {
+    /// The removed job record, held for the runs on it.
+    pub job: JobEntry,
+    /// WHEN the delete removed it, which is the order the oldest-first eviction follows.
+    pub deleted_on: SystemTime,
+}
+
 /// How many job run ids this process has minted. A nonce source for
 /// [`new_job_run_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
 pub(super) static MINTED_JOB_RUN_IDS: AtomicU64 = AtomicU64::new(0);

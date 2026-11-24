@@ -129,7 +129,10 @@ impl ComAmazonawsGlueAwsglueState {
     pub fn record_job_run_state_changes(&mut self, region: &str, job_names: &[String]) {
         let mut observed: Vec<JobRunStateChange> = Vec::new();
         for job_name in job_names {
-            let Some(job) = self.job_mut(region, job_name) else {
+            // Through the RUN path: a run that came to rest after its job definition was
+            // deleted is still a state change of that run, so it is announced like any
+            // other.
+            let Some(job) = self.job_runs_mut(region, job_name) else {
                 continue;
             };
             for run in &mut job.runs {
