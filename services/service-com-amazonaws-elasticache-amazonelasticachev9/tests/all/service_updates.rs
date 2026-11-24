@@ -573,13 +573,15 @@ async fn a_value_the_describe_cannot_serve_is_refused_with_invalid_parameter_val
 }
 
 #[tokio::test]
-async fn a_status_outside_the_modelled_enum_is_refused_at_the_boundary() {
+async fn a_status_outside_the_modelled_enum_is_refused_as_a_bad_parameter_value() {
     let emulator = Emulator::new();
 
     // `ServiceUpdateStatus`'s member is a modelled enum, so a filter naming a
     // value outside `available | cancelled | expired` — including a real value
-    // in the wrong case — never reaches the handler: the boundary validator
-    // refuses it. The axis is how the value misses the enum.
+    // in the wrong case — never reaches the handler: it is refused while the
+    // request is validated. ElastiCache states that as the bad parameter value
+    // it is, naming the status the request sent. The axis is how the value
+    // misses the enum.
     let rows = [
         ("status outside the enum", "pending"),
         ("status in the wrong case", "AVAILABLE"),
@@ -599,10 +601,16 @@ async fn a_status_outside_the_modelled_enum_is_refused_at_the_boundary() {
         );
         assert_eq!(
             reply.error_code(),
-            "ValidationError",
-            "case {case}: must be refused as a validation error, got {:?}: {}",
+            "InvalidParameterValue",
+            "case {case}: must be refused as a bad parameter value, got {:?}: {}",
             reply.error_code(),
             reply.body
+        );
+        assert_eq!(
+            reply.error_message(),
+            format!("The input service update status {status} is not valid."),
+            "case {case}: must name the status the request sent, got {:?}",
+            reply.error_message()
         );
     }
 }

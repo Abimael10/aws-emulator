@@ -77,7 +77,7 @@ use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtRespons
 use ::aws_smithy_schema_server::ProtocolError;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
-use ::smithy_server_runtime::{OperationContext, PreDispatchProtocol, Refused, Service};
+use ::smithy_server_runtime::{OperationContext, Refused, Service};
 
 /// The action namespace this service's operations are published under, which is its
 /// `arnNamespace` and its SigV4 signing name alike (`smithy_query(query="service_info")`): a
@@ -100,9 +100,10 @@ const NOT_AUTHORIZED_SENTENCE: &str = "User is not authorized to perform this ac
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
 const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 
-/// The envelope a pre-dispatch failure of this service renders in: this service speaks
-/// awsQuery (`smithy_query(query="service_info")`), whose error envelope the framework owns.
-const QUERY_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Query { ec2: false };
+// The envelope a pre-dispatch failure of this service renders in, declared once beside the
+// wrapper that owns this service's error envelope (`super::query_error_envelope`), so the two
+// gates asked ahead of every operation cannot drift about it.
+use super::query_error_envelope::QUERY_ENVELOPE;
 
 /// The most form parameters this gate walks in one request: a bound on the work a request can
 /// ask of it, well above the longest identifier list an ElastiCache request carries.
@@ -317,7 +318,15 @@ pub fn addressed_resource(req: &RtRequest, operation: &str, region: &str) -> Str
 
 /// The `(name, value)` form parameters `req` carries, body first and then its query string, at
 /// most [`MAX_PARAMETERS_READ`] of them.
-fn request_parameters(req: &RtRequest) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+///
+/// `pub(crate)` because the gate ahead of every operation reads the request twice over: this
+/// module asks WHICH RESOURCE it addresses, and
+/// [`crate::service::parameter_combination`] asks WHICH PARAMETERS it carries. One reader,
+/// so the two cannot disagree about what a request sent, or about the bound on the work one
+/// can ask of them.
+pub(crate) fn request_parameters(
+    req: &RtRequest,
+) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
     let body = req.body().bytes().unwrap_or_default();
     let query = req
         .uri()

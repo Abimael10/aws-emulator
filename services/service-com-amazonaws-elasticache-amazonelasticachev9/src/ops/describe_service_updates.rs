@@ -181,8 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ServiceUpdateStatus` filters the answer down to the statuses it
         // names. Its member is a modelled enum, so a filter naming a value
-        // outside `available | cancelled | expired` is already refused by the
-        // boundary validator and cannot reach here.
+        // outside `available | cancelled | expired` is refused before this
+        // handler runs and cannot reach here — with this service's own sentence
+        // for that member rather than the framework's constraint prose, which no
+        // operation of this service models a code for
+        // (`crate::service::enum_value`).
         let statuses = input.service_update_status.unwrap_or_default();
         let matches_status = |update: &crate::state::ServiceUpdateRecord| {
             statuses.is_empty() || statuses.iter().any(|status| status == update.status(now))

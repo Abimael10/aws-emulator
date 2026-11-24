@@ -715,18 +715,30 @@ async fn each_filter_reports_exactly_the_actions_it_names() {
         ),
         (
             format!("UpdateActionStatus {}", state::UPDATE_ACTION_NOT_APPLIED),
-            params(&[(
-                "UpdateActionStatus.member.1",
-                state::UPDATE_ACTION_NOT_APPLIED,
-            )]),
-            Box::new(|_| true),
+            params(&[
+                ("ServiceUpdateName", &redis.name),
+                (
+                    "UpdateActionStatus.member.1",
+                    state::UPDATE_ACTION_NOT_APPLIED,
+                ),
+            ]),
+            // An action status is only served together with the update it
+            // belongs to, so this row names one: nothing has been applied, so
+            // every action of that update is `not-applied`.
+            Box::new({
+                let name = redis.name.clone();
+                move |pair: &(String, &'static str, String)| pair.0 == name
+            }),
         ),
         (
             format!("UpdateActionStatus {}", state::UPDATE_ACTION_COMPLETE),
-            params(&[(
-                "UpdateActionStatus.member.1",
-                state::UPDATE_ACTION_COMPLETE,
-            )]),
+            params(&[
+                ("ServiceUpdateName", &redis.name),
+                (
+                    "UpdateActionStatus.member.1",
+                    state::UPDATE_ACTION_COMPLETE,
+                ),
+            ]),
             Box::new(|_| false),
         ),
         (
@@ -992,11 +1004,15 @@ async fn an_applied_action_is_reported_as_the_clock_carries_it() {
     }
 
     // The action status filter now selects it, and the statuses nothing is in
-    // select nothing.
-    let mut complete = params(&[(
-        "UpdateActionStatus.member.1",
-        state::UPDATE_ACTION_COMPLETE,
-    )]);
+    // select nothing. The filter travels with the update it belongs to, which is
+    // the only way ElastiCache serves it.
+    let mut complete = params(&[
+        ("ServiceUpdateName", update.name.as_str()),
+        (
+            "UpdateActionStatus.member.1",
+            state::UPDATE_ACTION_COMPLETE,
+        ),
+    ]);
     complete.extend(id_filter("CacheClusterIds", &["ua-memcached"]));
     let got = reported_identities(&emulator, "filter on complete", &complete).await;
     assert_eq!(
@@ -1076,9 +1092,10 @@ async fn a_value_the_describe_cannot_serve_is_refused() {
     type Row = (&'static str, Vec<(String, String)>, &'static str);
     // The axis: which parameter carries a value the service cannot serve — a
     // page size that is no page, a marker this service never minted, an
-    // `Engine` naming no cache engine, and a time range whose two bounds cannot
-    // hold together.
-    let rows: [Row; 8] = [
+    // `Engine` naming no cache engine, a time range whose two bounds cannot
+    // hold together, a status outside the modelled enum, and a status filter
+    // sent without the service update it belongs to.
+    let rows: [Row; 9] = [
         ("MaxRecords 0", params(&[("MaxRecords", "0")]), "InvalidParameterValue"),
         ("MaxRecords -5", params(&[("MaxRecords", "-5")]), "InvalidParameterValue"),
         (
@@ -1108,9 +1125,20 @@ async fn a_value_the_describe_cannot_serve_is_refused() {
             "InvalidParameterCombination",
         ),
         (
-            "UpdateActionStatus outside the modelled enum",
-            params(&[("UpdateActionStatus.member.1", "finished")]),
-            "ValidationError",
+            "UpdateActionStatus outside the modelled enum, with the update it belongs to",
+            params(&[
+                ("ServiceUpdateName", "some-update"),
+                ("UpdateActionStatus.member.1", "finished"),
+            ]),
+            "InvalidParameterValue",
+        ),
+        (
+            "UpdateActionStatus without a ServiceUpdateName",
+            params(&[(
+                "UpdateActionStatus.member.1",
+                state::UPDATE_ACTION_NOT_APPLIED,
+            )]),
+            "InvalidParameterCombination",
         ),
     ];
     for (case, pairs, code) in rows {

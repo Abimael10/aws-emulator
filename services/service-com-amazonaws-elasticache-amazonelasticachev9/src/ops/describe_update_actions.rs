@@ -223,8 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The two status filters. Both members are modelled enums, so a value
-        // outside `ServiceUpdateStatus` / `UpdateActionStatus` is already
-        // refused by the boundary validator and cannot reach here.
+        // outside `ServiceUpdateStatus` / `UpdateActionStatus` is refused before
+        // this handler runs and cannot reach here, worded as this service words
+        // a bad enum value (`crate::service::enum_value`). `UpdateActionStatus`
+        // is only served together with `ServiceUpdateName`, and that is a fact
+        // about which parameters the request carries rather than about their
+        // values, so it is refused ahead of the whole walk
+        // (`crate::service::parameter_combination`) and a request reaching here
+        // with an action-status filter named an update too.
         let update_statuses = input.service_update_status.unwrap_or_default();
         let action_statuses = input.update_action_status.unwrap_or_default();
 

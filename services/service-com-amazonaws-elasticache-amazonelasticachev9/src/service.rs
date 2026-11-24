@@ -74,8 +74,12 @@
 //! * [`absent_parameter`] — the code and the sentence a request that omits a parameter the
 //!   model requires is refused with, which belongs to no handler at all: the framework
 //!   refuses it before one runs.
-//! * [`event_source_type`] — the code and the sentence an event source type outside the
-//!   model's enum is refused with, which the framework also decides before a handler runs.
+//! * [`enum_value`] — the code and the sentence a value outside a modelled enum is refused
+//!   with, per member, which the framework also decides before a handler runs; the sentence
+//!   for an event source type is [`event_source_type`]'s.
+//! * [`parameter_combination`] — the filters an operation serves only together with another
+//!   parameter, refused as the incompatible set they are BEFORE any member's value is read,
+//!   which is why no handler can decide them.
 //!
 //! # The gate ahead of every operation
 //!
@@ -91,8 +95,10 @@ pub mod absent_parameter;
 pub mod access_string_categories;
 pub mod authorization;
 pub mod cache_parameter_group_not_found;
+pub mod enum_value;
 pub mod event_source_type;
 pub mod identifier_length_rules;
+pub mod parameter_combination;
 pub mod query_error_envelope;
 pub mod refusal_messages;
 pub mod replication_group_not_found;
@@ -163,13 +169,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Two are this service's own: an ABSENT parameter,
-        // worded as [`absent_parameter`] states it, and an event source type
-        // outside the model's enum, worded as [`event_source_type`] states it —
-        // both as the bad parameter value ElastiCache calls them. Every other
-        // refusal keeps the framework's wording, which already names the value
-        // and the constraint it failed.
+        // worded as [`absent_parameter`] states it, and a value outside a
+        // modelled enum, worded as [`enum_value`] states it per member — both as
+        // the bad parameter value ElastiCache calls them. Every other refusal
+        // keeps the framework's wording, which already names the value and the
+        // constraint it failed.
         absent_parameter::absent_parameter_refusal(refusal)
-            .or_else(|| event_source_type::event_source_type_refusal(refusal))
+            .or_else(|| enum_value::enum_value_refusal(refusal))
     }
 
     fn override_routing_error(

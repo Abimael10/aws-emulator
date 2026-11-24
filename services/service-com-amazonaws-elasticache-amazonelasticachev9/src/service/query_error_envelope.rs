@@ -63,8 +63,18 @@ use aws_smithy_types::body::SdkBody;
 use sha2::{Digest, Sha256};
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
-    ServerHttpProtocol, Service, ServiceIdentity,
+    PreDispatchProtocol, ServerHttpProtocol, Service, ServiceIdentity,
 };
+
+/// The envelope a PRE-DISPATCH failure of this service renders in: this service speaks awsQuery
+/// (`smithy_query(query="service_info")`), whose error envelope the framework owns.
+///
+/// Declared beside the wrapper that finishes every one of this service's error responses, so
+/// the gates asked ahead of an operation — the authorization gate
+/// ([`crate::service::authorization`]) and the parameter-combination gate
+/// ([`crate::service::parameter_combination`]) — render through one envelope rather than each
+/// naming its own.
+pub const QUERY_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Query { ec2: false };
 
 /// The closing tag of the awsQuery error envelope, and the only marker that tells an
 /// error document apart from a success envelope (whose own request id already sits in
@@ -222,6 +232,10 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 ///   force at the instant of the call, so it is decided here, before the operation reaches the
 ///   store, and the refusal is finished with the same envelope element every other error
 ///   carries;
+/// * the PARAMETER COMBINATIONS this service refuses
+///   ([`crate::service::parameter_combination::refusal_response`]): which parameters a
+///   request carries is decided before the framework reads any of their values, so that
+///   refusal can belong to no handler;
 /// * a cache cluster's event is published to the Amazon SNS topic its notification
 ///   configuration names, and an event is recorded by the lifecycle calls AND by every call
 ///   that materialises a change the clock made due, so the delivery is made here rather than
@@ -258,7 +272,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<
                 svc,
                 req,
                 ctx,
-            );
+            )
+            // Then the parameter COMBINATIONS this service refuses: which parameters a
+            // request carries is decided before the framework reads any of their values, so
+            // a request that omits the companion parameter one of its filters is only served
+            // with is refused on the combination whatever those values are (see
+            // [`crate::service::parameter_combination`]).
+            .or_else(|| crate::service::parameter_combination::refusal_response(svc, req));
             let answered = match refused {
                 Some(response) => with_request_id(response),
                 None => match modeled_operation(svc, req) {
