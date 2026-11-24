@@ -596,8 +596,9 @@ async fn an_instruction_states_its_distance_in_the_requested_measurement_system(
 }
 
 /// The instructions are rendered in a requested language this emulator holds text in, and
-/// otherwise in the default language of the road text — which the answer reports with the
-/// model's own `MainLanguageNotFound` notice rather than passing off as a translation.
+/// otherwise in the default locale of the road text — reported under that locale's own
+/// region-qualified tag, with the model's own `MainLanguageNotFound` notice rather than
+/// passed off as a translation.
 #[tokio::test]
 async fn a_language_the_instructions_are_not_held_in_is_reported_as_a_notice() {
     let router = routes_service();
@@ -606,12 +607,12 @@ async fn a_language_the_instructions_are_not_held_in_is_reported_as_a_notice() {
     // name, requested `Languages`, the language tag the strings must carry, whether the
     // answer must carry the notice.
     let cases: [(&str, Option<Vec<&str>>, &str, bool); 7] = [
-        ("no language asked for", None, "en", false),
+        ("no language asked for", None, "en-us", false),
         ("the language the text is held in", Some(vec!["en"]), "en", false),
         ("a regional variant of it", Some(vec!["en-GB"]), "en-GB", false),
         ("another language it is held in", Some(vec!["es-ES"]), "es-ES", false),
-        ("a language it is not held in", Some(vec!["ja"]), "en", true),
-        ("several, none of them held", Some(vec!["ja", "zh-CN"]), "en", true),
+        ("a language it is not held in", Some(vec!["ja"]), "en-us", true),
+        ("several, none of them held", Some(vec!["ja", "zh-CN"]), "en-us", true),
         ("several, one of them held", Some(vec!["ja", "en-US"]), "en-US", false),
     ];
 

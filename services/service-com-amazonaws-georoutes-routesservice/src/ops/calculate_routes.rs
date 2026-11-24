@@ -72,7 +72,10 @@
 //! resolves and the leg reports the language it was rendered in. Only a request where
 //! NONE of the tags resolves falls back to the regional default, and that is the one case
 //! the model's own `MainLanguageNotFound` notice reports, since "the request uses the
-//! regional default as the fallback if the requested language can't be provided". A
+//! regional default as the fallback if the requested language can't be provided". A leg
+//! answered in that default reports it as the region-qualified default locale tag
+//! ([`DEFAULT_LANGUAGE_TAG`]), which is also what a request naming no language at all is
+//! answered under. A
 //! step's distance is stated in metres and kilometres for `Metric` and in feet and miles
 //! for `Imperial`.
 //!
@@ -402,11 +405,17 @@ impl Narration {
 }
 
 /// The language tag this emulator reports when it renders the narration and the road text
-/// in its own default rather than in a language the request asked for: English, which is
-/// the language this network's road names and route numbers are held in. A request that
-/// asked for a language the catalog HOLDS is answered under the tag it asked with instead,
-/// so a regional tag a caller sent is reported back as the caller spelled it.
-const DEFAULT_LANGUAGE_TAG: &str = "en";
+/// in its own default rather than in a language the request asked for: US English, the
+/// locale this network's road names and route numbers are held in. "The request uses the
+/// regional default as the fallback if the requested language can't be provided", and a
+/// regional default is a LOCALE rather than a language, so it is reported as a
+/// region-qualified BCP 47 tag — a language subtag and the region subtag — and never as
+/// the bare primary subtag, which is a different tag to any caller that compares the two.
+///
+/// A request that asked for a language the catalog HOLDS is answered under the tag it
+/// asked with instead, so a regional tag a caller sent is reported back as the caller
+/// spelled it.
+const DEFAULT_LANGUAGE_TAG: &str = "en-us";
 
 /// The narration of the regional default language, which a request resolving to none of
 /// the catalog's languages is answered in.
@@ -1323,9 +1332,11 @@ fn pedestrian_place(point: &SequencePoint) -> RoutePedestrianPlace {
 /// The requested tags are resolved IN ORDER against the languages this emulator holds
 /// narration in: the first whose primary subtag names one of them is the language used,
 /// and the tag is reported as asked, so `en-GB` is answered in English and `es-ES` in
-/// Spanish. Only a request where NONE of the tags resolves falls back to the regional
-/// default, which the caller is told about through the model's `MainLanguageNotFound`
-/// notice rather than by silently reading as a translation.
+/// Spanish. A request where NONE of the tags resolves is answered in the regional
+/// default, and so is one that asked for no language at all: either reports this service's
+/// own default locale tag ([`DEFAULT_LANGUAGE_TAG`]) rather than a tag the request
+/// supplied. Only the former is TOLD about it, through the model's `MainLanguageNotFound`
+/// notice, rather than by the fallback silently reading as a translation.
 fn instruction_language(requested: &[String]) -> (String, &'static Narration, bool) {
     for tag in requested {
         let primary = primary_subtag(tag);

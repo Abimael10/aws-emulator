@@ -789,7 +789,7 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
             json!({ "Thresholds": { "Time": [600] } }),
             Some((
                 "Origin",
-                "At least one of the following fields must be set: Origin, Destination.",
+                "At least one of the following fields must be set: 'Origin', 'Destination'.",
             )),
         ),
         (
@@ -809,8 +809,8 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
             json!({ "Origin": GOOD, "Thresholds": {} }),
             Some((
                 "Thresholds.Distance",
-                "At least one of the following fields must be set: Thresholds.Distance, \
-                 Thresholds.Time.",
+                "At least one of the following fields must be set: 'Thresholds.Distance', \
+                 'Thresholds.Time'.",
             )),
         ),
         (

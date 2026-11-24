@@ -770,7 +770,9 @@ async fn a_cell_outside_the_routing_boundary_carries_the_unqualified_code() {
 ///
 /// The languages below are the ones the service's own narration catalog holds
 /// (`NARRATIONS` in `src/ops/calculate_routes.rs`), each asked for through a tag the issue
-/// did not cite, beside tags of languages the catalog does not hold.
+/// did not cite, beside tags of languages the catalog does not hold. A request answered in
+/// the service's own default locale reports that locale's region-qualified tag
+/// (`DEFAULT_LANGUAGE_TAG`), which the suite's own table pins.
 #[tokio::test]
 async fn the_fallback_notice_is_reported_only_when_no_requested_language_resolves() {
     let router = routes_service();
@@ -780,7 +782,7 @@ async fn the_fallback_notice_is_reported_only_when_no_requested_language_resolve
     // fallback notice must be reported.
     type LanguageCase = (&'static str, Vec<&'static str>, &'static str, bool);
     let cases: [LanguageCase; 11] = [
-        ("none asked for", vec![], "en", false),
+        ("none asked for", vec![], "en-us", false),
         ("the default language", vec!["en"], "en", false),
         ("a regional variant of it", vec!["en-AU"], "en-AU", false),
         ("Spanish", vec!["es-ES"], "es-ES", false),
@@ -789,7 +791,7 @@ async fn the_fallback_notice_is_reported_only_when_no_requested_language_resolve
         ("German", vec!["de-AT"], "de-AT", false),
         ("Italian", vec!["it"], "it", false),
         ("Portuguese", vec!["pt-BR"], "pt-BR", false),
-        ("a language the catalog does not hold", vec!["ja-JP"], "en", true),
+        ("a language the catalog does not hold", vec!["ja-JP"], "en-us", true),
         ("the first held language of several", vec!["ja", "fr", "es"], "fr", false),
     ];
 
@@ -862,6 +864,222 @@ async fn instruction_text(
             panic!("case {case:?}: the narration was asked for, so a step carries an instruction: {answer:?}")
         })
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// CalculateRoutes: the tag the service's own default locale is reported under
+// ---------------------------------------------------------------------------
+
+/// A request the service answers in its OWN default locale — because it asked for a
+/// language the narration catalog does not hold, or because it asked for none — reports
+/// that locale as a REGION-QUALIFIED tag: a primary language subtag and a region subtag,
+/// the one tag for the one default locale, never the bare primary subtag and never a tag
+/// the request supplied.
+///
+/// The tag is reported on every leg of the route and on every localized string of it, so a
+/// client reading the locale off any of them reads the same one.
+///
+/// Rows span what the fallback generalises over: how many tags were asked for and whether
+/// any was asked for at all, the shape of the unsupported tags (a reserved/undetermined
+/// subtag, a language the catalog does not hold, a region-qualified and a script-qualified
+/// variant of one, a tag that merely looks like a held one), the travel mode and how many
+/// legs the journey has.
+#[tokio::test]
+async fn a_route_answered_in_the_services_own_locale_reports_a_region_qualified_tag() {
+    let router = routes_service();
+    // name, requested `Languages`, the destination, the waypoints between origin and it, the
+    // travel mode, and whether the request asked for a language at all — which is the one
+    // thing that decides whether the fallback is also NOTICED.
+    type FallbackCase = (
+        &'static str,
+        Vec<&'static str>,
+        [f64; 2],
+        Vec<[f64; 2]>,
+        &'static str,
+        bool,
+    );
+    let cases: [FallbackCase; 7] = [
+        (
+            "no language asked for",
+            vec![],
+            [-123.12, 49.26],
+            vec![],
+            "Car",
+            false,
+        ),
+        (
+            // "qqq" is the reserved subtag for an undetermined language: no catalog holds
+            // it, and it must not come back echoed.
+            "a reserved language subtag",
+            vec!["qqq"],
+            [-123.12, 49.26],
+            vec![],
+            "Car",
+            true,
+        ),
+        (
+            "a language the catalog does not hold",
+            vec!["ja"],
+            [-123.12, 49.26],
+            vec![],
+            "Car",
+            true,
+        ),
+        (
+            // A walking route stays short: a pedestrian travels the footpaths of the grid
+            // rather than its roads.
+            "a region-qualified tag of one it does not hold",
+            vec!["zh-CN"],
+            [-123.103, 49.277],
+            vec![],
+            "Pedestrian",
+            true,
+        ),
+        (
+            "a script-qualified tag of one it does not hold",
+            vec!["sr-Cyrl-RS"],
+            [-123.12, 49.26],
+            vec![],
+            "Truck",
+            true,
+        ),
+        (
+            // Several unsupported tags resolve no better than one, and a tag whose primary
+            // subtag merely starts like a held one ("eng") is not that language.
+            "several unsupported tags",
+            vec!["ja-JP", "zh", "eng"],
+            [-123.12, 49.26],
+            vec![],
+            "Scooter",
+            true,
+        ),
+        (
+            "a multi-leg journey in a language it does not hold",
+            vec!["ko"],
+            [-123.12, 49.26],
+            vec![[-123.11, 49.275], [-123.105, 49.27]],
+            "Car",
+            true,
+        ),
+    ];
+
+    // Every row must report the SAME locale, so the first row's tag is what the rest are
+    // held to.
+    let mut reported: Option<String> = None;
+    for (case, languages, destination, waypoints, travel_mode, expects_notice) in cases {
+        let mut body = json!({
+            "Origin": VANCOUVER,
+            "Destination": destination,
+            "TravelMode": travel_mode,
+            "LegAdditionalFeatures": ["TravelStepInstructions"],
+        });
+        if !languages.is_empty() {
+            body["Languages"] = json!(languages);
+        }
+        if !waypoints.is_empty() {
+            body["Waypoints"] = json!(waypoints
+                .iter()
+                .map(|position| json!({ "Position": position }))
+                .collect::<Vec<Value>>());
+        }
+        let (status, answer, _) = post(&router, ROUTES, &body).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+
+        let notices = answer["Notices"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: Notices is required, got {answer:?}"));
+        let noticed = notices
+            .iter()
+            .any(|notice| notice["Code"] == json!("MainLanguageNotFound"));
+        assert_eq!(
+            noticed, expects_notice,
+            "case {case:?}: the fallback notice is for a language that was asked for and cannot be \
+             provided, got {notices:?}"
+        );
+
+        let legs = answer["Routes"][0]["Legs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: Legs is required, got {answer:?}"));
+        assert_eq!(
+            legs.len(),
+            waypoints.len() + 1,
+            "case {case:?}: one leg per pair of consecutive stops, got {}",
+            legs.len()
+        );
+        for leg in legs {
+            let tag = leg["Language"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: the leg names its language, got {leg:?}"));
+            // A region-qualified tag: the primary language subtag, then the region subtag,
+            // both non-empty — not the bare primary subtag a caller cannot tell the locale
+            // from.
+            let subtags: Vec<&str> = tag.split('-').collect();
+            assert_eq!(
+                subtags.len(),
+                2,
+                "case {case:?}: the default locale is reported region-qualified, got {tag:?}"
+            );
+            assert!(
+                subtags.iter().all(|subtag| !subtag.is_empty()
+                    && subtag.chars().all(|character| character.is_ascii_alphanumeric())),
+                "case {case:?}: both subtags of the tag are present, got {tag:?}"
+            );
+            assert!(
+                !languages.iter().any(|asked| asked.eq_ignore_ascii_case(tag)),
+                "case {case:?}: a language that cannot be provided is not echoed back, got {tag:?}"
+            );
+            match &reported {
+                None => reported = Some(tag.to_string()),
+                Some(first) => assert_eq!(
+                    tag, first,
+                    "case {case:?}: one default locale is one tag, got {tag:?} against {first:?}"
+                ),
+            }
+            // The localized strings of the leg declare the same locale as the leg does.
+            for name in localized_languages(leg) {
+                assert_eq!(
+                    name, tag,
+                    "case {case:?}: a localized string carries the locale the leg reports, got \
+                     {name:?} against {tag:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Every `LocalizedString`-style `Language` member reachable under a leg: the road names and
+/// route numbers of its travel steps, which declare the locale their text is rendered in.
+fn localized_languages(leg: &Value) -> Vec<String> {
+    fn walk(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(members) => {
+                for (name, member) in members {
+                    if name == "Language" {
+                        if let Some(tag) = member.as_str() {
+                            found.push(tag.to_string());
+                        }
+                    } else {
+                        walk(member, found);
+                    }
+                }
+            }
+            Value::Array(entries) => {
+                for entry in entries {
+                    walk(entry, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for (name, member) in leg.as_object().into_iter().flatten() {
+        // The leg's own `Language` is what the caller compares these against, so it is read
+        // separately rather than collected here.
+        if name != "Language" {
+            walk(member, &mut found);
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------

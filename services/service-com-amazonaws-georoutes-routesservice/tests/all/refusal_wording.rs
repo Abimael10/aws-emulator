@@ -29,6 +29,7 @@ use crate::routing::{post, routes_service, ROUTES, SNAP};
 /// crate's other suites share; the rest are named here.
 const MATRIX: &str = "/v2/route-matrix";
 const OPTIMIZE: &str = "/v2/optimize-waypoints";
+const ISOLINES: &str = "/v2/isolines";
 
 /// A position well inside the WGS 84 domain and on this service's network.
 const GOOD: [f64; 2] = [-123.1, 49.28];
@@ -273,6 +274,165 @@ async fn the_mutually_sufficient_members_are_named_as_the_model_spells_them() {
         );
         assert_eq!(
             read.field_name, ALTERNATIVES[0],
+            "case {case:?}: the refusal names the first of the alternatives, got {:?}",
+            read.field_name
+        );
+    }
+}
+
+/// How a name is spelled in the list a missing-alternative-members sentence states: each
+/// one single-quoted, or each one bare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    Quoted,
+    Bare,
+}
+
+impl Naming {
+    /// `members` as the sentence lists them: this spelling, separated by `", "`.
+    fn list(self, members: &[&str]) -> String {
+        members
+            .iter()
+            .map(|member| match self {
+                Self::Quoted => format!("'{member}'"),
+                Self::Bare => (*member).to_string(),
+            })
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
+}
+
+/// The sentence for "at least one of these members must be set" is worded by the OPERATION
+/// that refuses the request, not by one shared convention: each operation states the
+/// members of the rule the way its own refusal of that rule words them — `CalculateIsolines`
+/// quotes every name it lists, `OptimizeWaypoints` lists them bare — while the rest of the
+/// sentence is fixed text in both: the prefix, `", "` between the names and a single
+/// terminating ".".
+///
+/// Rows span what the sentence generalises over: which operation refuses the request, which
+/// set of alternative members it is about (members of the request itself, and members of a
+/// nested structure, which are named by their path), and what ELSE the request carries —
+/// none of which moves the fixed text.
+#[tokio::test]
+async fn each_operation_words_the_missing_alternative_members_sentence_its_own_way() {
+    let router = routes_service();
+    // The fixed text every refusal of this class opens with; the member list and a
+    // terminating "." are all that follow it.
+    const PREFIX: &str = "At least one of the following fields must be set: ";
+    // The alternative members of each operation, in the order the operation lists them —
+    // smithy_query(query="operation", operation="CalculateIsolines,OptimizeWaypoints"):
+    // CalculateIsolinesRequest marks only Thresholds @required, leaving Origin and
+    // Destination the optional pair an area is measured from, and IsolineThresholds
+    // declares Distance and Time as the alternative threshold kinds; OptimizeWaypointsRequest
+    // marks only Origin @required, leaving Destination and Waypoints the pair a journey
+    // needs one of.
+    const ANCHORS: [&str; 2] = ["Origin", "Destination"];
+    const THRESHOLD_KINDS: [&str; 2] = ["Thresholds.Distance", "Thresholds.Time"];
+    const JOURNEY_ENDS: [&str; 2] = ["Destination", "Waypoints"];
+
+    // case, the operation's path, the body, how that operation spells the names, and the
+    // members it lists.
+    type Row = (&'static str, &'static str, Value, Naming, &'static [&'static str]);
+    let rows: [Row; 7] = [
+        (
+            "an isoline with neither anchor",
+            ISOLINES,
+            json!({ "Thresholds": { "Time": [600] }, "TravelMode": "Car" }),
+            Naming::Quoted,
+            &ANCHORS,
+        ),
+        (
+            "an isoline with neither anchor and a distance threshold instead",
+            ISOLINES,
+            json!({ "Thresholds": { "Distance": [1_000, 2_000] } }),
+            Naming::Quoted,
+            &ANCHORS,
+        ),
+        (
+            "an isoline anchored at an origin with no threshold kind",
+            ISOLINES,
+            json!({ "Origin": GOOD, "Thresholds": {} }),
+            Naming::Quoted,
+            &THRESHOLD_KINDS,
+        ),
+        (
+            "an isoline anchored at a destination with no threshold kind",
+            ISOLINES,
+            json!({
+                "Destination": GOOD,
+                "Thresholds": {},
+                "IsolineGranularity": { "MaxPoints": 31 }
+            }),
+            Naming::Quoted,
+            &THRESHOLD_KINDS,
+        ),
+        (
+            "an optimization with nowhere to go",
+            OPTIMIZE,
+            json!({ "Origin": GOOD }),
+            Naming::Bare,
+            &JOURNEY_ENDS,
+        ),
+        (
+            "an optimization whose waypoint list is empty",
+            OPTIMIZE,
+            json!({ "Origin": GOOD, "Waypoints": [] }),
+            Naming::Bare,
+            &JOURNEY_ENDS,
+        ),
+        (
+            "an optimization that named a travel mode and a departure time only",
+            OPTIMIZE,
+            json!({
+                "Origin": GOOD,
+                "TravelMode": "Truck",
+                "DepartureTime": "2024-05-01T09:30:00Z"
+            }),
+            Naming::Bare,
+            &JOURNEY_ENDS,
+        ),
+    ];
+
+    for (case, path, body, naming, members) in rows {
+        let (status, answer, _) = post(&router, path, &body).await;
+        let read = refusal(case, status, &answer);
+        let expected = format!("{PREFIX}{}.", naming.list(members));
+        assert_eq!(
+            read.message, expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            read.message
+        );
+        // The list is the only variable part: the sentence is the prefix, the names as this
+        // operation spells them, and one terminating ".".
+        let listed = read
+            .message
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_suffix('.'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected {PREFIX:?} then the member list then \".\", got {:?}",
+                    read.message
+                )
+            });
+        let names: Vec<&str> = listed.split(", ").collect();
+        assert_eq!(
+            names.len(),
+            members.len(),
+            "case {case:?}: the sentence lists every alternative member once, got {names:?}"
+        );
+        for (name, member) in names.iter().zip(members) {
+            // A quoted name carries the quotes and nothing else; a bare one reads as the
+            // member path the model spells, undecorated.
+            let expected_name = naming.list(&[member]);
+            assert_eq!(
+                *name, expected_name,
+                "case {case:?}: expected {expected_name:?} in the list, got {name:?}"
+            );
+        }
+        // Whatever the spelling in the sentence, the member the refusal POINTS at is named
+        // as an identifier the request shape carries.
+        assert_eq!(
+            read.field_name, members[0],
             "case {case:?}: the refusal names the first of the alternatives, got {:?}",
             read.field_name
         );

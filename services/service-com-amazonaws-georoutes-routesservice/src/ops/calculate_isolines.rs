@@ -487,6 +487,8 @@ impl Anchor {
     /// can reach it — so a request names exactly one of them.
     fn resolve(input: &CalculateIsolinesInput) -> Result<Self, CalculateIsolinesError> {
         match (input.origin.as_deref(), input.destination.as_deref()) {
+            // This operation states the members of a field rule QUOTED, the same way the
+            // sibling sentence just below states the same pair.
             (None, None) => Err(invalid(
                 ORIGIN_MEMBER,
                 state::at_least_one_of(&ANCHOR_MEMBERS),

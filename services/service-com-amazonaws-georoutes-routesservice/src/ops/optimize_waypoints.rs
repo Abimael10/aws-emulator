@@ -308,7 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.destination.is_none() && input.waypoints.as_deref().unwrap_or_default().is_empty() {
             return Err(invalid(
                 MUTUALLY_SUFFICIENT_MEMBERS[0],
-                state::at_least_one_of(&MUTUALLY_SUFFICIENT_MEMBERS),
+                // THIS operation states the members of that rule BARE — undecorated
+                // identifiers, spelled as the model spells them — which is how its own
+                // recorded refusal words them.
+                state::at_least_one_of_bare(&MUTUALLY_SUFFICIENT_MEMBERS),
             ));
         }
 

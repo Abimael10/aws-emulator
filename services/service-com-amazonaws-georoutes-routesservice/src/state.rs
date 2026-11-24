@@ -1771,18 +1771,29 @@ fn must_be_between(
 }
 
 /// The sentence for a rule no model can express: a set of otherwise-optional members of
-/// which a request must set at least one. The members are the only variable part — listed
-/// bare, which is how a recorded refusal of this class states them — and the member the
-/// refusal names in its `fieldList` is the first of them.
+/// which a request must set at least one. The member list is the only variable part, and
+/// the member the refusal names in its `fieldList` is the first of them.
 ///
-/// The sibling sentences of this service's other field rules state their member lists
-/// QUOTED ([`only_one_of`], [`only_one_of_within`]): each class is worded as this service
-/// words that class.
+/// Each name is single-quoted here, the way this service's other field-rule sentences
+/// spell a member name ([`member_rule`], [`only_one_of`], [`only_one_of_within`]). How
+/// this class is WORDED belongs to the operation that refuses the request rather than to
+/// the rule, so an operation that states its member list undecorated renders it with
+/// [`at_least_one_of_bare`] and says so at its call site.
 pub fn at_least_one_of(members: &[&str]) -> String {
-    format!(
-        "At least one of the following fields must be set: {}.",
-        members.join(", ")
-    )
+    at_least_one_of_listed(&quoted_list(members))
+}
+
+/// [`at_least_one_of`] for an operation that states the members of this rule BARE: each
+/// name spelled exactly as the model spells that member and decorated with nothing, so a
+/// consumer that splits the list out of the sentence reads identifiers.
+pub fn at_least_one_of_bare(members: &[&str]) -> String {
+    at_least_one_of_listed(&members.join(", "))
+}
+
+/// The fixed text both renderings of the rule share: the prefix, the member list as the
+/// operation spells it, and a terminating period.
+fn at_least_one_of_listed(listed: &str) -> String {
+    format!("At least one of the following fields must be set: {listed}.")
 }
 
 /// The sentence for the opposite rule, equally inexpressible: a set of members that are

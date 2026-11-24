@@ -386,7 +386,7 @@ async fn a_major_road_label_identifies_a_road_the_way_the_road_is_identified() {
             "Car",
             Some("ShortestRoute"),
             None,
-            "en",
+            "en-us",
             true,
         ),
         (
@@ -406,7 +406,7 @@ async fn a_major_road_label_identifies_a_road_the_way_the_road_is_identified() {
             "Pedestrian",
             None,
             None,
-            "en",
+            "en-us",
             false,
         ),
         (
@@ -416,7 +416,7 @@ async fn a_major_road_label_identifies_a_road_the_way_the_road_is_identified() {
             "Pedestrian",
             None,
             Some("ja"),
-            "en",
+            "en-us",
             false,
         ),
         (
@@ -428,7 +428,7 @@ async fn a_major_road_label_identifies_a_road_the_way_the_road_is_identified() {
             "Scooter",
             None,
             None,
-            "en",
+            "en-us",
             true,
         ),
     ];
