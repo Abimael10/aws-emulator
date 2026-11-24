@@ -202,12 +202,27 @@ aws-smithy-types = { workspace = true }
 # earliest due instant the store holds (`state::task_events::drive_task_clock`), and a
 # container's program waits for the seconds a `sleep` in it names
 # (`state::container_shell`). `rt`: both of those, and each container's run, are in-process
-# tasks spawned onto the runtime serving the request.
-tokio = { workspace = true, features = ["time", "rt"] }
+# tasks spawned onto the runtime serving the request. `io-util` and `sync`: a session's data
+# channel reads and writes the core-owned socket it is carried over and waits on the signals
+# raised on a run (`src/service/exec_data_channel.rs`, `state::container_runtime`).
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The RFC 6455 WebSocket protocol, server side: an execute-command session's data channel
+# completes the opening handshake and frames every agent message with this maintained
+# implementation over the core-owned socket (`src/service/exec_data_channel.rs`) rather than
+# with anything hand-written. `handshake` only — this crate serves the SERVER half and opens
+# no connection of its own, and the core owns TLS.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The `Stream`/`Sink` halves of that socket, so a frame arriving and a frame written back are
+# awaited on the one connection.
+futures-util = { version = "0.3", default-features = false }
+# `sha2`: the agent message of a session's data channel carries the SHA-256 of its payload in
+# the digest field the protocol puts there, and a message's own id is derived with it
+# (`src/service/exec_data_channel/agent_message.rs`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -217,6 +232,12 @@ emulator-core-build-support = { workspace = true }
 # `tests/all/<name>.rs`, so a new suite is a new file and nothing lists it.
 automod = { workspace = true }
 sha2 = { workspace = true }
+# The client half of the data-channel suite: a case dials the announced session socket over TCP
+# (`tokio/net`) in this process, as a Session Manager client handed that address does, and
+# frames every agent message with the same maintained WebSocket implementation.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false }
 # EventBridge and Amazon SQS are mounted beside Amazon ECS on one engine in the integration
 # tests, because this service publishes an `ECS Task State Change` event onto the default
 # event bus as a task moves and a rule on that bus delivers it to an SQS queue: without them
@@ -236,6 +257,10 @@ percent-encoding = "2.3"
 # launch: the execution role whose trust policy and policies those launches are decided
 # against is created through IAM's own API rather than written into its store. The crate
 # itself is a dependency above, for the trust-policy read the launch makes.
+# Systems Manager is MOUNTED beside it too, for the same reason: the SESSION an
+# `ExecuteCommand` opens is held in that service's own session registry, so the suite reads it
+# back with that service's own `DescribeSessions` and ends it with its `TerminateSession`.
+# The crate itself is a dependency above.
 
 [lints]
 workspace = true

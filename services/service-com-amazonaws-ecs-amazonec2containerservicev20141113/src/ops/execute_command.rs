@@ -18,12 +18,14 @@
 //!   either of them is resolved;
 //! * a cluster, task or container that resolves to nothing is reported on that resource;
 //! * a container with NO running execute-command agent — a task launched without the flag,
-//!   or one whose agent is not running — earns the one `InvalidParameterException` sentence
-//!   Amazon ECS states both of those conditions in;
-//! * a container that IS running one is a target the data channel does not reach: this
-//!   emulator serves no WebSocket upgrade, so nothing carries a session's stream, and the
-//!   call earns the modelled `TargetNotConnectedException` rather than a `session` whose
-//!   `streamUrl` nothing answers.
+//!   or one whose agent is not running (which includes one whose task role does not authorize
+//!   the Systems Manager channel the agent connects over) — earns the one
+//!   `InvalidParameterException` sentence Amazon ECS states both of those conditions in;
+//! * a container that IS running one is a target a session is opened to: a `Session` is
+//!   minted — its id, the `streamUrl` of the data channel this emulator SERVES for it
+//!   (`crate::service::exec_data_channel`) and a `tokenValue` that channel admits the
+//!   connection on — and the call is answered 200. `TargetNotConnectedException` is left for
+//!   the genuinely unconnected case: nothing on this emulator could carry the stream.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // Whether the execute-command agent of a task can reach the Systems Manager channel
+        // at all is an IAM question about the TASK ROLE, taken for every exec-enabled task
+        // this store holds that has not been decided yet
+        // ([`crate::state::settle_execute_command_agent_connections`]): the agent's own status
+        // follows from that answer, and the call below reads that status.
+        crate::state::settle_execute_command_agent_connections(ctx.callback(), &self.engine);
+
         // `interactive`: "Amazon ECS only supports initiating interactive sessions, so you
         // must specify true for this value" — a request that asks for any other kind of
         // session asks for one Amazon ECS does not open, which is a property of ONE member
@@ -256,97 +265,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Everything the session is opened FOR is resolved under one guard of the store, and
+        // the guard is released with the block: the socket the stream is carried on is opened
+        // with no lock held (see below).
+        let (
+            task_arn,
+            container_arn,
+            container_name,
+            cluster_arn,
+            task_id,
+            container_runtime_id,
+        ) = {
+            let mut guard = state.lock();
+            guard.advance_clock(now);
+
+            if !guard.has_active_cluster(&cluster_name) {
+                return Err(ExecuteCommandErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::cluster_refusal_message(
+                            guard.clusters.get(&cluster_name),
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // "The Amazon Resource Name (ARN) or ID of the task the container is part of",
+            // scoped by the cluster the request named: a task of another cluster is not one
+            // this request names.
+            let task_arn =
+                crate::state::task_arn_from_reference(&region, &cluster_name, &input.task);
+            let task = guard
+                .tasks
+                .get(&task_arn)
+                .filter(|task| task.cluster_name == cluster_name);
+            let Some(task) = task else {
+                return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+
+            // "A container name only needs to be specified for tasks containing multiple
+            // containers": a request that names none runs on the task's only container, and
+            // one that names a container has to name a container the task really holds.
+            let container = match input.container.as_deref() {
+                Some(requested) => task
+                    .containers
+                    .iter()
+                    .find(|container| container.name.as_deref() == Some(requested)),
+                None => task.containers.first(),
+            };
+            let Some(container) = container else {
+                return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            let container_arn = container.container_arn.clone();
+            let container_name = container.name.clone();
+            let cluster_arn = task.cluster_arn.clone();
+            let task_id = task.task_id.clone();
+            // `Container$runtimeId` is "the ID of the Docker container", which is how a
+            // Session Manager session names the container it is a session of
+            // ([`crate::state::exec_session_target`]); a container this store holds no runtime
+            // id for is named by its own id, the last segment of its ARN.
+            let container_runtime_id = container.runtime_id.clone().unwrap_or_else(|| {
+                container_arn
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(container_arn.as_str())
+                    .to_string()
+            });
+
+            // A session is opened on the `ExecuteCommandAgent` managed agent running inside
+            // the container ("when the execute command feature is turned on, the managed agent
+            // name is ExecuteCommandAgent"), which Amazon ECS puts there only for a task whose
+            // launch turned the feature on — so a session needs BOTH the flag the launch
+            // recorded and that agent reported running
+            // ([`crate::state::execute_command_agent_is_running`]). Amazon ECS states the two
+            // conditions that leave a task without such an agent in ONE sentence — "execute
+            // command was not enabled when the task was run OR the execute command agent isn't
+            // running" — so either of them earns that one `InvalidParameterException`, and a
+            // caller is told what to change without being told which it was.
+            if !guard.execute_command_agent_is_running(&task_arn, &container_arn) {
+                return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            (
+                task_arn,
+                container_arn,
+                container_name,
+                cluster_arn,
+                task_id,
+                container_runtime_id,
+            )
+        };
+
+        // The agent IS running, so a session is opened ON it and its stream is CARRIED: the
+        // channel the `Session$streamUrl` names is a socket this emulator serves
+        // ([`crate::state::ensure_exec_data_channel`], `crate::service::exec_data_channel`),
+        // so the address answered is one the client that was handed it can open. Opening the
+        // socket and minting the token both happen with NO guard of the store held — the one
+        // is awaited and the other takes the emulator's credential store — and the session is
+        // then recorded under the lock.
+        let Some(authority) =
+            crate::state::ensure_exec_data_channel(&self.engine, ctx.callback().clone()).await
+        else {
+            // Nothing can carry the stream on this emulator, so there is no session to hand a
+            // caller: an address nothing serves would be worse than the modelled refusal.
+            return Err(ExecuteCommandErrorModeled::TargetNotConnectedException(
+                TargetNotConnectedException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `Session$tokenValue` is a SECRET handed to the caller, minted by the one component
+        // of this emulator that generates secrets ([`crate::state::mint_exec_session_token`]).
+        let Some(token_value) = crate::state::mint_exec_session_token(ctx.credential_store())
+        else {
+            return Err(ExecuteCommandErrorModeled::ServerException(ServerException {
+                message: Some("the session's token could not be minted".to_string()),
+            })
+            .into());
+        };
         let mut guard = state.lock();
-        guard.advance_clock(now);
-
-        if !guard.has_active_cluster(&cluster_name) {
-            return Err(ExecuteCommandErrorModeled::ClusterNotFoundException(
-                ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // "The Amazon Resource Name (ARN) or ID of the task the container is part of",
-        // scoped by the cluster the request named: a task of another cluster is not one
-        // this request names.
-        let task_arn = crate::state::task_arn_from_reference(&region, &cluster_name, &input.task);
-        let task = guard
-            .tasks
-            .get(&task_arn)
-            .filter(|task| task.cluster_name == cluster_name);
-        let Some(task) = task else {
-            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        crate::state::EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
-
-        // "A container name only needs to be specified for tasks containing multiple
-        // containers": a request that names none runs on the task's only container, and
-        // one that names a container has to name a container the task really holds.
-        let container = match input.container.as_deref() {
-            Some(requested) => task
-                .containers
-                .iter()
-                .find(|container| container.name.as_deref() == Some(requested)),
-            None => task.containers.first(),
-        };
-        let Some(container) = container else {
-            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        crate::state::EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
-        let container_arn = container.container_arn.clone();
-
-        // A session is opened on the `ExecuteCommandAgent` managed agent running inside the
-        // container ("when the execute command feature is turned on, the managed agent name
-        // is ExecuteCommandAgent"), which Amazon ECS puts there only for a task whose launch
-        // turned the feature on — so a session needs BOTH the flag the launch recorded and
-        // that agent reported running
-        // ([`crate::state::execute_command_agent_is_running`]). Amazon ECS states the two
-        // conditions that leave a task without such an agent in ONE sentence — "execute
-        // command was not enabled when the task was run OR the execute command agent isn't
-        // running" — so either of them earns that one `InvalidParameterException`, and a
-        // caller is told what to change without being told which it was.
-        if !guard.execute_command_agent_is_running(&task_arn, &container_arn) {
-            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        crate::state::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The agent IS running, and what remains is the channel a session's stream is
-        // carried over: `Session$streamUrl` is "a URL to the managed agent on the container
-        // that the SSM Session Manager client uses to send commands and receive output", a
-        // WebSocket data channel — and this emulator answers no WebSocket upgrade at all, so
-        // nothing of it can carry that stream. A target the channel does not reach is a
-        // target no session can be opened to, which is what
-        // `TargetNotConnectedException` covers; answering a `session` instead would hand the
-        // caller an address nothing serves and a token for a stream nothing carries.
-        Err(ExecuteCommandErrorModeled::TargetNotConnectedException(
-            TargetNotConnectedException {
-                message: Some(
-                    crate::state::EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE.to_string(),
-                ),
+        let opened = guard.open_exec_session(
+            crate::state::ExecSessionRequest {
+                cluster_name: cluster_name.clone(),
+                task_arn: task_arn.clone(),
+                container_arn: container_arn.clone(),
+                container_name: container_name.clone().unwrap_or_default(),
+                command: input.command.clone(),
+                token_value: token_value.clone(),
+                region: region.clone(),
             },
-        )
-        .into())
+            now,
+        );
+        let Some(session_id) = opened else {
+            // This emulator is already carrying as many sessions as it holds at once, so this
+            // target is one it cannot open another to.
+            return Err(ExecuteCommandErrorModeled::TargetNotConnectedException(
+                TargetNotConnectedException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        drop(guard);
+
+        // The session is a SESSION MANAGER session, so Systems Manager is where the session
+        // itself lives: the record is written through that service's own registry, under the
+        // target an execute-command session names its container by, so a client reads this
+        // session back with that service's own `DescribeSessions`
+        // ([`crate::state::register_ssm_session`]). Written with no guard of this store held.
+        crate::state::register_ssm_session(
+            &*self.engine,
+            &session_id,
+            &region,
+            &crate::state::exec_session_target(&cluster_name, &task_id, &container_runtime_id),
+            &::service_com_amazonaws_ssm_amazonssm::state::identity_authorization::caller_arn(
+                &*self.engine,
+                ctx,
+            ),
+            now,
+        );
+        // And the records of the sessions that have ENDED since the last call, which the same
+        // service holds ([`crate::state::settle_exec_session_records`]).
+        crate::state::settle_exec_session_records(&*self.engine, now);
+
+        Ok(ExecuteCommandOutput {
+            cluster_arn: Some(cluster_arn),
+            container_arn: Some(container_arn),
+            container_name,
+            // "Amazon ECS only supports initiating interactive sessions", and a request
+            // asking for any other kind was refused above, so the session reported is the
+            // interactive one that was opened.
+            interactive: true,
+            session: Some(Session {
+                session_id: Some(session_id.clone()),
+                stream_url: Some(crate::state::exec_stream_url(&authority, &session_id)),
+                token_value: Some(token_value),
+            }),
+            task_arn: Some(task_arn),
+        })
     }
 }

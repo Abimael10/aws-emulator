@@ -22,15 +22,22 @@
 //! along, which is the same reading of a stale report every other status of this service
 //! takes ([`super::container_stage_rank`]).
 //!
+//! # What the agent has to REACH
+//!
+//! Being in the container is not being connected: the agent opens its control and data
+//! channels to Systems Manager as the TASK ROLE, so a container of a task whose role does not
+//! authorize those channel actions carries an agent that never reaches [`STATUS_RUNNING`]
+//! ([`super::exec_sessions::settle_execute_command_agent_connections`] is where that question
+//! is put to IAM, and the stage below is capped on its answer).
+//!
 //! # What it decides
 //!
-//! Whether a container has such an agent at all is what `ExecuteCommand` reads: a session is
+//! Whether a container has a RUNNING agent is what `ExecuteCommand` reads: a session is
 //! opened ON that agent, so a container without one is a container no session can be opened
 //! on, which is the condition Amazon ECS states in one sentence
-//! ([`super::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE`]). What a session would be CARRIED over
-//! — the Systems Manager data channel the `Session$streamUrl` names — is not something this
-//! emulator serves, so a container that does have a running agent is a target that cannot be
-//! connected to rather than a session (see `crate::ops::execute_command`).
+//! ([`super::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE`]). A container that HAS one is a target a
+//! session is opened to, carried over the data channel this emulator serves for it
+//! ([`super::exec_sessions`], and `crate::ops::execute_command`).
 
 use super::*;
 
@@ -51,12 +58,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// managed agent was last started", so it is stamped at the instant the agent first
     /// reaches [`STATUS_RUNNING`].
     pub(super) fn start_execute_command_agents(&mut self, now: SystemTime) {
+        // Which tasks' agents can reach the Systems Manager channel at all, read before the
+        // tasks are walked so the walk needs nothing but the task it is on
+        // ([`super::exec_sessions`]).
+        let reaching: ::std::collections::BTreeSet<String> = self
+            .exec
+            .agent_connections
+            .iter()
+            .filter(|(_, reaches)| **reaches)
+            .map(|(task_arn, _)| task_arn.clone())
+            .collect();
         for task in self.tasks.values_mut() {
             if !task.enable_execute_command {
                 continue;
             }
+            let reaches = reaching.contains(&task.task_arn);
             let mut changed = false;
             for container in &mut task.containers {
+                let stage = agent_stage(&container.last_status, reaches);
                 if !container
                     .managed_agents
                     .iter()
@@ -64,15 +83,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 {
                     container.managed_agents.push(ManagedAgentRecord {
                         name: EXECUTE_COMMAND_AGENT.to_string(),
-                        last_status: container.last_status.clone(),
+                        last_status: stage.clone(),
                         reason: None,
-                        last_started_at: (container.last_status == STATUS_RUNNING)
-                            .then(|| reported_instant(now)),
+                        last_started_at: (stage == STATUS_RUNNING).then(|| reported_instant(now)),
                     });
                     changed = true;
                     continue;
                 }
-                let stage = container.last_status.clone();
                 let Some(agent) = container
                     .managed_agents
                     .iter_mut()
@@ -131,9 +148,45 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 }
 
+/// How far one container's execute-command agent has got, given how far the CONTAINER has
+/// got and whether that agent can reach the Systems Manager channel.
+///
+/// The agent is where its container is — it starts with the container and ends with it — with
+/// one exception: an agent that cannot reach the channel has not STARTED, so a running
+/// container whose task role does not authorize those actions carries an agent that is still
+/// [`STATUS_PENDING`]. Every other stage is the container's own, so such an agent still ends
+/// with the container it is in.
+fn agent_stage(container_stage: &str, reaches: bool) -> String {
+    if container_stage == STATUS_RUNNING && !reaches {
+        return STATUS_PENDING.to_string();
+    }
+    container_stage.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent is where its container is, except that one which cannot reach the Systems
+    /// Manager channel has not started: the rows span the whole container lifecycle against
+    /// both answers, and a stage this service does not rank.
+    #[test]
+    fn an_agent_that_cannot_reach_the_channel_is_not_running() {
+        for stage in CONTAINER_LIFECYCLE.iter().chain([&"ACTIVATING"]) {
+            assert_eq!(
+                agent_stage(stage, true),
+                *stage,
+                "case {stage:?}: an agent that reaches the channel is where its container is"
+            );
+            let withheld = agent_stage(stage, false);
+            let expected = if *stage == STATUS_RUNNING { STATUS_PENDING } else { stage };
+            assert_eq!(
+                withheld, expected,
+                "case {stage:?}: expected {expected:?} for an agent that cannot reach the \
+                 channel, got {withheld:?}"
+            );
+        }
+    }
 
     /// The agent this plane is about is the one the model declares, so a model revision
     /// cannot leave the name behind.

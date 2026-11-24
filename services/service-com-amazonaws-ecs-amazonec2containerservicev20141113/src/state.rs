@@ -4731,4 +4731,8 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// outlives the container it reports on or holds its slot against
     /// [`MAX_HEALTH_PROBES_IN_FLIGHT`].
     health_probes: HashMap<String, ::tokio::task::JoinHandle<()>>,
+    /// The EXECUTE-COMMAND plane: the sessions this store has opened, the socket their
+    /// streams are carried on, and what IAM answered about each task's agent reaching the
+    /// Systems Manager channel (see [`exec_sessions`]).
+    pub exec: ExecPlane,
 }

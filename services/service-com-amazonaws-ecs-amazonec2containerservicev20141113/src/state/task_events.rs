@@ -779,6 +779,15 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     // minting it needs the credential store this request's own context carries
     // ([`super::settle_task_role_credentials`]), which the pump has none of.
     super::settle_task_role_credentials(ctx.credential_store(), &**engine);
+    // And the agent-connection decision every exec-enabled task waits for: whether its task
+    // role authorizes the Systems Manager channel its execute-command agent connects over is
+    // an IAM question, which the pump cannot ask either
+    // ([`super::settle_execute_command_agent_connections`]).
+    super::settle_execute_command_agent_connections(ctx.callback(), engine);
+    // And the Session Manager records of the execute-command sessions that have ended: the
+    // session is this store's and the record is that service's, so what a clock pass left
+    // owed is carried out here ([`super::settle_exec_session_records`]).
+    super::settle_exec_session_records(&**engine, SystemTime::now());
     // The container data plane is settled BEFORE the pump's claim is taken, so a door that
     // finds a pump already running still has the containers of the task it just wrote
     // started or signalled ([`super::settle_container_runtime`]).
@@ -916,6 +925,12 @@ fn spawn_task_clock_pump<Eng: Send + Sync + 'static>(
             // polls the service makes no call that would otherwise notice
             // ([`super::settle_deployment_alarms`]). Read with no guard of this store held.
             super::settle_deployment_alarms(&*engine);
+            // The Session Manager records of the execute-command sessions a pass of the clock
+            // has ended — a session whose task it has just stopped carries no stream any
+            // longer — and the sessions that service has been asked to end, which is the same
+            // fact read from its side ([`super::settle_exec_session_records`]). Read with no
+            // guard of this store held.
+            super::settle_exec_session_records(&*engine, SystemTime::now());
             publish_pending(&callback, &*engine, &region).await;
         }
         if capped {

@@ -322,6 +322,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // container pass above, so a container this pass started carries a running agent by
         // the end of it.
         self.start_execute_command_agents(now);
+        // And the execute-command SESSIONS whose idle timeout has run out, or whose task is
+        // gone: a session nothing has used for that long is over whether or not anybody
+        // called to look ([`super::exec_sessions`]).
+        self.expire_exec_sessions(now);
         // The scheduler's confirmation that a task set has reached a steady state, owed at
         // the instant the write that touched it put on the record: once it is due the task
         // set is stable whether or not anybody called to look.

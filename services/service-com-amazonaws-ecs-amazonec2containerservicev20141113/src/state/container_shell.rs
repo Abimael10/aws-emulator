@@ -267,8 +267,18 @@ const EXEC_COMMAND: &str = "exec";
 pub const BUILT_IN_COMMANDS: &[&str] = &[
     "echo", PRINTF_COMMAND, "true", "false", ":", "exit", "export", "unset", "trap", "sleep",
     "wait", "test", "[", "set", "exec", "hostname", "pwd", "id", "ulimit", "df", BREAK_COMMAND,
-    CONTINUE_COMMAND,
+    CONTINUE_COMMAND, "stty", "tput",
 ];
+
+/// The commands of [`BUILT_IN_COMMANDS`] that report the TERMINAL this session is attached to
+/// — the one an interactive session of an execute-command call is carried over, whose size the
+/// client states on the channel ([`ContainerShell::resize_terminal`]).
+///
+/// `stty` reports "the terminal line settings" of the session's own terminal and `tput`
+/// answers "the value of the terminal-dependent capability" asked for, so what each of them
+/// writes is a fact about THIS session; a session attached to no terminal — a container's own
+/// program, the agent's health-check probe — performs neither.
+const TERMINAL_REPORT_COMMANDS: [&str; 2] = ["stty", "tput"];
 
 /// The commands of [`BUILT_IN_COMMANDS`] that REPORT a fact about the process this session
 /// is, rather than doing anything to it: where it runs (`pwd`), who it runs as (`id`), the
@@ -584,6 +594,24 @@ fn within_parse_bounds(text: &str) -> bool {
     grouped.saturating_add(worded) <= MAX_COMMAND_NESTING
 }
 
+/// The size of the TERMINAL a session is attached to, in the order `stty size` reports the
+/// two: an interactive session of an execute-command call runs in a pseudo-terminal, and its
+/// client states that terminal's size on the channel.
+#[derive(Debug, Clone, Copy)]
+struct TerminalSize {
+    /// How many rows it has.
+    rows: u32,
+    /// How many columns it has.
+    columns: u32,
+}
+
+/// The variable a shell holds its terminal's WIDTH in, which a program that formats its
+/// output reads.
+const TERMINAL_COLUMNS_VARIABLE: &str = "COLUMNS";
+
+/// The variable it holds its terminal's HEIGHT in.
+const TERMINAL_LINES_VARIABLE: &str = "LINES";
+
 /// The session ONE container's program runs in: the variables it sees and changes, the
 /// signal handlers it has installed, where its output goes, and how much running it has
 /// left.
@@ -725,6 +753,11 @@ pub struct ContainerShell {
     /// The instant that accounting was last brought up to date — what the next span this
     /// session spends executing is measured from.
     executing_since: Instant,
+    /// The TERMINAL this session is attached to, and `None` for one attached to none: a
+    /// container's own program and the agent's probes run with no terminal, while an
+    /// interactive session of an execute-command call runs in the pseudo-terminal its client
+    /// states the size of ([`ContainerShell::resize_terminal`]).
+    terminal: Option<TerminalSize>,
 }
 
 impl ContainerShell {
@@ -786,6 +819,7 @@ impl ContainerShell {
             process: ContainerProcess::default(),
             consumption: Arc::new(ContainerConsumption::new()),
             executing_since: Instant::now(),
+            terminal: None,
         }
     }
 
@@ -825,6 +859,63 @@ impl ContainerShell {
         self.consumption = consumption;
         self.executing_since = Instant::now();
         self
+    }
+
+    /// This session attached to a TERMINAL of `rows` by `columns` — the pseudo-terminal an
+    /// interactive session of an execute-command call runs in. A session built without one is
+    /// attached to no terminal, which is what a container's own program and the agent's probes
+    /// run as.
+    #[must_use]
+    pub fn with_terminal(mut self, rows: u32, columns: u32) -> Self {
+        self.resize_terminal(rows, columns);
+        self
+    }
+
+    /// Resize the terminal this session is attached to, as the client carrying it stated.
+    ///
+    /// The shell holds its terminal's size in `COLUMNS` and `LINES` — "the shell sets
+    /// `COLUMNS` and `LINES` to the terminal's width and height" — so a program that reads
+    /// either reads the size the client stated, and so does `stty size`
+    /// ([`Self::run_terminal_report`]).
+    pub fn resize_terminal(&mut self, rows: u32, columns: u32) {
+        self.terminal = Some(TerminalSize { rows, columns });
+        let _ = self.set_variable(TERMINAL_COLUMNS_VARIABLE.to_string(), columns.to_string());
+        let _ = self.set_variable(TERMINAL_LINES_VARIABLE.to_string(), rows.to_string());
+    }
+
+    /// Run ONE command line a client typed into an interactive session of this container and
+    /// answer the status the shell answered for it.
+    ///
+    /// Everything the session holds — its variables, its signal handlers, its terminal and the
+    /// container's filesystem — is kept between lines, exactly as a shell reading its standard
+    /// input keeps them, so the file one line wrote is the file the next line reads. What the
+    /// line WROTE is delivered where this session's output goes before the status is answered,
+    /// so a caller reading the output after the line has all of it.
+    pub async fn run_typed_line(&mut self, line: &str) -> i32 {
+        let mut status = self.run_text(line).await;
+        // A line that ends while the signal it installed a handler for is outstanding still
+        // runs that handler, exactly as a whole program does ([`Self::run`]).
+        self.deliver_pending_signal().await;
+        if let Some(latched) = self.exit_status {
+            status = latched;
+        }
+        self.flush_pending_line().await;
+        self.account_for_execution();
+        status
+    }
+
+    /// Whether this session is OVER: a line performed `exit` (or a signal ended it), or a bound
+    /// of this emulator was spent — after which it runs no further line, the way a shell that
+    /// has exited reads no further input.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        self.stopped()
+    }
+
+    /// The status this session ended with, and `None` while it is still running.
+    #[must_use]
+    pub fn ended_status(&self) -> Option<i32> {
+        self.exit_status
     }
 
     /// Run `program` to its end and answer what the container's run ended as.
@@ -2248,6 +2339,9 @@ impl ContainerShell {
                 _ if PROCESS_REPORT_COMMANDS.contains(&name) => {
                     self.run_process_report(name, arguments, redirections).await
                 }
+                _ if TERMINAL_REPORT_COMMANDS.contains(&name) => {
+                    self.run_terminal_report(name, arguments, redirections).await
+                }
                 _ => self.declined(),
             }
         })
@@ -2282,6 +2376,41 @@ impl ContainerShell {
                 self.process
                     .storage_report(arguments, self.filesystem.layer_bytes(), in_a_mount)
             }
+            _ => None,
+        };
+        let Some(written) = written else {
+            return self.declined();
+        };
+        if self.write_stdout(&written, redirections).await {
+            EXIT_SUCCESS
+        } else {
+            EXIT_FAILURE
+        }
+    }
+
+    /// `stty size` and `tput cols`/`tput lines`: the size of the TERMINAL this session is
+    /// attached to, which for an interactive session of an execute-command call is the size
+    /// its client stated on the channel ([`Self::resize_terminal`]).
+    ///
+    /// `stty size` "print[s] the number of rows and columns" of that terminal, in that order;
+    /// `tput` answers "the value of the terminal-dependent capability" asked for, of which the
+    /// two this session holds a value for are the screen's columns and lines. A session
+    /// attached to NO terminal, and any other form or capability, is a command that did not
+    /// run ([`Self::declined`]) rather than a value nothing backs.
+    async fn run_terminal_report(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        let Some(terminal) = self.terminal else {
+            return self.declined();
+        };
+        let asked: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let written = match (name, asked.as_slice()) {
+            ("stty", ["size"]) => Some(format!("{} {}\n", terminal.rows, terminal.columns)),
+            ("tput", ["cols"]) => Some(format!("{}\n", terminal.columns)),
+            ("tput", ["lines"]) => Some(format!("{}\n", terminal.rows)),
             _ => None,
         };
         let Some(written) = written else {

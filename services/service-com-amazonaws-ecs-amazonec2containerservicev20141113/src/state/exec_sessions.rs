@@ -1,22 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The SESSION an `ExecuteCommand` asks for: what one IS, and the sentences a call that
-//! cannot be given one carries.
+//! The SESSION an `ExecuteCommand` asks for: what one IS, where its stream is carried, and
+//! the sentences a call that cannot be given one carries.
 //!
 //! `ExecuteCommandResponse$session` is "the details for the execute command session": an id,
 //! a `streamUrl` — "a URL to the managed agent on the container that the SSM Session Manager
 //! client uses to send commands and receive output from the container" — and a `tokenValue`
 //! the client authenticates that connection with. So a session is not a record: it IS the
-//! stream, carried over the Systems Manager data channel that URL names, which a client
-//! opens as a WebSocket.
+//! stream, carried over the Systems Manager data channel that URL names, which a client opens
+//! as a WebSocket.
 //!
-//! This emulator answers no WebSocket upgrade, so nothing of it can carry that stream, and
-//! there is therefore no session to hand a caller — an id and a URL on their own would be an
-//! address nothing answers. What a call is told instead is decided by the task's own state
-//! ([`super::execute_command_agent`]), in the two conditions Amazon ECS models for it: a
-//! container with no running execute-command agent is the `InvalidParameterException` below,
-//! and a container that HAS one is a target the channel does not reach, which is
-//! `TargetNotConnectedException`.
+//! That stream is SERVED here. The emulator's front door carries one buffered request per
+//! call, so the channel is served on a socket of its own ([`data_channel`], a core-owned
+//! listener) and the `streamUrl` a session reports is that socket's own address, with the
+//! session id on the data-channel path a client reads it from. The token a session reports is
+//! minted by the emulator's credential store and is what the channel admits a connection on
+//! ([`sessions`]), so a token of another session, or of a session that is over, opens
+//! nothing.
+//!
+//! What a session is opened ON is the `ExecuteCommandAgent` managed agent inside the
+//! container ([`super::execute_command_agent`]), and whether that agent is CONNECTED is the
+//! IAM question [`agent_connection`] answers: the agent reaches the Systems Manager channel
+//! as the task role, so a task whose role does not authorize those channel actions has no
+//! connected agent and no session can be opened on it.
+
+mod agent_connection;
+mod data_channel;
+mod sessions;
+mod ssm_record;
+
+pub use agent_connection::*;
+pub use data_channel::*;
+pub use sessions::*;
+pub use ssm_record::*;
 
 /// `InvalidParameterException$message` for an `ExecuteCommand` a session cannot be opened
 /// for because no execute-command agent of the task is there to open it on.
@@ -40,15 +56,14 @@ pub const EXECUTE_COMMAND_INTERACTIVE_ONLY_MESSAGE: &str =
     "Amazon ECS only supports initiating interactive sessions, so you must specify true for \
      this value.";
 
-/// `TargetNotConnectedException$message` for an `ExecuteCommand` whose target container IS
-/// running its execute-command agent, so what is left is the channel the session's stream is
-/// carried over (see this module's own documentation).
+/// `TargetNotConnectedException$message` for an `ExecuteCommand` whose target container the
+/// data channel does not reach.
 ///
 /// `TargetNotConnectedException` is the error class for exactly that: "The execute command
-/// cannot run. This error can be caused by any of the following configuration issues: …The
-/// SSM agent is not installed or is not running… There is an interface Amazon VPC endpoint
-/// for Amazon ECS, but there is not one for Systems Manager Session Manager." The sentence is
-/// the one AWS publishes for this error class in its Amazon ECS Exec troubleshooting
-/// guidance: fixed text, carrying nothing of the request.
+/// cannot run. This error can be caused by any of the following configuration issues:
+/// …The SSM agent is not installed or is not running… There is an interface Amazon VPC
+/// endpoint for Amazon ECS, but there is not one for Systems Manager Session Manager." The
+/// sentence is the one AWS publishes for this error class in its Amazon ECS Exec
+/// troubleshooting guidance: fixed text, carrying nothing of the request.
 pub const EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE: &str =
     "The execute command failed due to an internal error. Wait and try again.";

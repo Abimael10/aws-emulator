@@ -12,12 +12,11 @@
 //! > WITHOUT `enableExecuteCommand` carries no such agent and earns the ONE fixed
 //! > `InvalidParameterException` sentence that states both conditions leaving a task without
 //! > one, without saying which of them held; a task launched WITH it reports that agent
-//! > running once its containers are running, and the call gets past that condition to the
-//! > channel a session's stream is carried over — which this emulator serves no WebSocket
-//! > upgrade for, so the target is one no session can be connected to and the call earns the
-//! > modelled `TargetNotConnectedException`. A session of any other KIND is not one Amazon
-//! > ECS opens at all: `interactive` "only supports initiating interactive sessions, so you
-//! > must specify true for this value", which is a property of the request and is refused
+//! > running once its containers are running, and the call then answers 200 with a `Session`
+//! > whose `streamUrl` is the data channel this emulator serves for it (the stream itself is
+//! > driven in [`crate::exec_session_data_channel`]). A session of any other KIND is not one
+//! > Amazon ECS opens at all: `interactive` "only supports initiating interactive sessions, so
+//! > you must specify true for this value", which is a property of the request and is refused
 //! > whatever task it names.
 //!
 //! # What the rows span
@@ -62,10 +61,6 @@ const NOT_AVAILABLE: &str =
     "The execute command failed because execute command was not enabled when the task was \
      run or the execute command agent isn't running. Wait and try again or run a new task \
      with execute command enabled and try again.";
-
-/// `TargetNotConnectedException$message` for a task whose agent IS running but whose session
-/// stream nothing carries: fixed text, with no part taken from the request.
-const NOT_CONNECTED: &str = "The execute command failed due to an internal error. Wait and try again.";
 
 /// `InvalidParameterException$message` for a request asking for a session of a kind Amazon
 /// ECS does not open, worded as `ExecuteCommandRequest$interactive` states its own rule:
@@ -268,19 +263,60 @@ async fn execute_command_turns_on_the_flag_the_launch_recorded() {
 
             // What each row earns: the kind of session asked for is judged first and is a
             // property of the REQUEST, so it is refused whichever task the request names;
-            // after it, the task's own agent decides which of the two modelled conditions
-            // the call meets.
-            let expected = match (interactive, flag) {
-                (false, _) => ("InvalidParameterException", INTERACTIVE_ONLY),
-                (true, false) => ("InvalidParameterException", NOT_AVAILABLE),
-                (true, true) => ("TargetNotConnectedException", NOT_CONNECTED),
-            };
-            let (code, message) = refusal(&router, "ExecuteCommand", request, &case).await;
-            assert_eq!(
-                (code.as_str(), message.as_str()),
-                expected,
-                "case {case:?}: expected {expected:?}, got {code:?} with {message:?}"
-            );
+            // after it, the task's own agent decides whether a session is opened at all.
+            match (interactive, flag) {
+                (false, _) => {
+                    let (code, message) =
+                        refusal(&router, "ExecuteCommand", request, &case).await;
+                    assert_eq!(
+                        (code.as_str(), message.as_str()),
+                        ("InvalidParameterException", INTERACTIVE_ONLY),
+                        "case {case:?}: expected the interactive-only sentence, got {code:?} \
+                         with {message:?}"
+                    );
+                }
+                (true, false) => {
+                    let (code, message) =
+                        refusal(&router, "ExecuteCommand", request, &case).await;
+                    assert_eq!(
+                        (code.as_str(), message.as_str()),
+                        ("InvalidParameterException", NOT_AVAILABLE),
+                        "case {case:?}: expected the agent-not-running sentence, got {code:?} \
+                         with {message:?}"
+                    );
+                }
+                (true, true) => {
+                    // The agent is running, so a session is OPENED: its id, the channel it is
+                    // carried on and the token that channel admits, reported for the container
+                    // the request named ([`crate::exec_session_data_channel`] drives the
+                    // stream itself).
+                    let answer = ok(&router, "ExecuteCommand", request, &case).await;
+                    let session = &answer["session"];
+                    let session_id = string(session, "sessionId", &case);
+                    let stream_url = string(session, "streamUrl", &case);
+                    assert!(
+                        !string(session, "tokenValue", &case).is_empty(),
+                        "case {case:?}: expected a minted token, got {answer}"
+                    );
+                    assert!(
+                        stream_url.starts_with("wss://") && stream_url.contains(&session_id),
+                        "case {case:?}: expected the channel of this session, got \
+                         {stream_url:?}"
+                    );
+                    assert_eq!(
+                        answer["interactive"].as_bool(),
+                        Some(true),
+                        "case {case:?}: expected the interactive session that was opened, got \
+                         {answer}"
+                    );
+                    assert_eq!(
+                        answer["containerName"].as_str(),
+                        Some(requested.unwrap_or(FIRST_CONTAINER)),
+                        "case {case:?}: expected the container the session was opened on, got \
+                         {answer}"
+                    );
+                }
+            }
         }
     }
 }

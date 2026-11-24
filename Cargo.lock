@@ -14335,6 +14335,7 @@ dependencies = [
  "brush-parser",
  "bytes",
  "chrono",
+ "futures-util",
  "hex",
  "http",
  "percent-encoding",
@@ -14359,6 +14360,7 @@ dependencies = [
  "service-common",
  "sha2 0.10.9",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

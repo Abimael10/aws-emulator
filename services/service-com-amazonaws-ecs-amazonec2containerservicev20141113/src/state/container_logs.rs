@@ -30,7 +30,8 @@
 //! CloudWatch Logs holds is split into events of at most that size
 //! ([`MAX_LOG_EVENT_BYTES`]), which is what the driver does with a line past the ceiling.
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use crate::ops::types::LogConfiguration;
 
@@ -179,6 +180,11 @@ struct OutputBudget {
 /// status — and the lines it writes are counted against the same budget and go nowhere
 /// else: nothing is kept in this store, because the log group is where container output is
 /// read from.
+///
+/// A session of an EXECUTE-COMMAND call writes to one of these too, with the lines COLLECTED
+/// for the channel carrying that session instead of delivered to a log driver
+/// ([`Self::collecting`]): the client that typed the command is where an exec session's
+/// output goes, while the driver delivers what the container's own program writes.
 #[derive(Debug)]
 pub struct ContainerOutput {
     /// The CloudWatch Logs client the lines are delivered through, and `None` for a
@@ -186,6 +192,9 @@ pub struct ContainerOutput {
     client: Option<::aws_sdk_cloudwatchlogs::Client>,
     /// Where they are delivered.
     target: Option<AwsLogsTarget>,
+    /// Where they are COLLECTED, for a session whose output goes to the caller carrying it
+    /// rather than to a log driver.
+    collected: Option<Arc<CollectedOutput>>,
     /// What is left of this run's output budget.
     budget: Mutex<OutputBudget>,
 }
@@ -205,6 +214,26 @@ impl ContainerOutput {
         Self {
             client,
             target,
+            collected: None,
+            budget: Mutex::new(OutputBudget {
+                lines_left: MAX_CONTAINER_LOG_LINES,
+                bytes_left: MAX_CONTAINER_LOG_BYTES,
+            }),
+        }
+    }
+
+    /// The output of a session whose lines are COLLECTED into `collected` rather than
+    /// delivered to a log driver: what a session carried over a channel writes goes to the
+    /// client that typed it ([`CollectedOutput`]).
+    ///
+    /// Bounded by the same per-run budget a delivered output is, so a program that writes
+    /// without end cannot grow this process without end either.
+    #[must_use]
+    pub fn collecting(collected: Arc<CollectedOutput>) -> Self {
+        Self {
+            client: None,
+            target: None,
+            collected: Some(collected),
             budget: Mutex::new(OutputBudget {
                 lines_left: MAX_CONTAINER_LOG_LINES,
                 bytes_left: MAX_CONTAINER_LOG_BYTES,
@@ -279,6 +308,10 @@ impl ContainerOutput {
         if !self.claim(line.len()) {
             return;
         }
+        if let Some(collected) = self.collected.as_ref() {
+            collected.write_line(line);
+            return;
+        }
         let (Some(client), Some(target)) = (self.client.as_ref(), self.target.as_ref()) else {
             return;
         };
@@ -328,6 +361,46 @@ impl ContainerOutput {
         budget.lines_left -= 1;
         budget.bytes_left -= bytes;
         true
+    }
+}
+
+/// Where the lines a session writes are COLLECTED when they go to the caller carrying that
+/// session rather than to a log driver ([`ContainerOutput::collecting`]).
+///
+/// Held behind an `Arc` by both sides: the session writes lines into it as its program runs,
+/// and whoever is carrying that session takes what has accumulated and writes it out. The
+/// lines are kept in the order they were written, and at most [`MAX_COLLECTED_LINES`] wait at
+/// once — past that the oldest is dropped rather than growing this process, which is what a
+/// terminal whose client has stopped reading does to the bytes behind it.
+#[derive(Debug, Default)]
+pub struct CollectedOutput {
+    /// The lines written and not taken yet, oldest first.
+    lines: Mutex<VecDeque<String>>,
+}
+
+/// How many written-and-not-taken lines one [`CollectedOutput`] holds. THIS NUMBER IS THE
+/// EMULATOR'S: the session's own output budget bounds a run's whole output
+/// ([`MAX_CONTAINER_LOG_LINES`]) while this bounds what waits in memory for a reader.
+pub const MAX_COLLECTED_LINES: usize = 4096;
+
+impl CollectedOutput {
+    /// Collect ONE line the session wrote.
+    pub fn write_line(&self, line: &str) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        if lines.len() >= MAX_COLLECTED_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line.to_string());
+    }
+
+    /// Take every line collected so far, in the order they were written, leaving none.
+    pub fn take(&self) -> Vec<String> {
+        let Ok(mut lines) = self.lines.lock() else {
+            return Vec::new();
+        };
+        lines.drain(..).collect()
     }
 }
 
