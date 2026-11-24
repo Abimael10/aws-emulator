@@ -34,6 +34,14 @@
 //! where its own target write is refused: an empty target queue then means refused, never
 //! "never ran".
 //!
+//! A rule hands a function target its event ASYNCHRONOUSLY, so what a relay whose handler
+//! raises leaves behind is a LADDER of runs and not one: "if you invoke a function
+//! asynchronously and it returns an error, Lambda executes the function up to two more times"
+//! (`Invoke`), and each of those attempts runs the handler and so writes the witness again,
+//! while a handler that returns is run once. The handover leg therefore waits for the WHOLE
+//! ladder every relay's grant earns it ([`Relay::runs`]) and reads what each run of it
+//! carried — never for a count of arrivals that how fast the host runs would decide.
+//!
 //! Six crates have to agree for the rule to hold — CloudFormation deploys the queues, the
 //! roles, the functions, the rules and the invoke statements together, IAM holds each role and
 //! its inline document, the token service vends each function's session, EventBridge matches a
@@ -70,6 +78,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::MAX_ASYNC_DELIVERY_ATTEMPTS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
@@ -231,6 +240,23 @@ impl Relay {
             GOOD_QUEUE
         } else {
             DENIED_QUEUE
+        }
+    }
+
+    /// How many RUNS of this relay's handler ONE asynchronous handover earns it, and so how
+    /// many witness writes that handover leaves.
+    ///
+    /// A handler that returned is done with its event; one that raised is handed it again,
+    /// "up to two more times" (`Invoke`) — the attempt ladder Lambda states for an event
+    /// whose qualifier configures no `MaximumRetryAttempts` of its own
+    /// ([`MAX_ASYNC_DELIVERY_ATTEMPTS`], read off the owning crate so the two cannot drift).
+    /// An under-permissioned relay raises on the write its role does not allow, so every
+    /// attempt of its ladder runs the handler and writes the witness first.
+    fn runs(&self) -> usize {
+        if self.delivers() {
+            1
+        } else {
+            usize::try_from(MAX_ASYNC_DELIVERY_ATTEMPTS).unwrap_or(1)
         }
     }
 
@@ -925,13 +951,16 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
     );
 
     // Every relay was handed its own entry: the witness write each of them IS granted arrives,
-    // one per relay, carrying the envelope that relay's rule matched.
-    let witnessed = drained(&router, "handed over", &witness_url, RELAYS.len()).await;
+    // carrying the envelope that relay's rule matched, once per RUN the handover earned it
+    // ([`Relay::runs`]) — one for the handler that returns, and the whole attempt ladder for
+    // each handler that raises on the write its role does not allow.
+    let ladders: usize = RELAYS.iter().map(Relay::runs).sum();
+    let witnessed = drained(&router, "handed over", &witness_url, ladders).await;
     assert_eq!(
         witnessed.len(),
-        RELAYS.len(),
-        "handed over: expected each of the {} relays to have been handed its entry, got \
-         {witnessed:?}",
+        ladders,
+        "handed over: expected the {} relays to have been handed their entries over {ladders} \
+         run(s) in all, got {witnessed:?}",
         RELAYS.len()
     );
     for relay in RELAYS {
@@ -942,27 +971,40 @@ async fn a_deployed_relays_sdk_write_follows_its_own_execution_role() {
             .collect();
         assert_eq!(
             seen.len(),
-            1,
-            "case {case:?}/handed over: expected this relay to be handed its entry exactly once, \
-             got {seen:?}"
+            relay.runs(),
+            "case {case:?}/handed over: expected this relay to have been handed its entry over \
+             {} run(s), got {seen:?}",
+            relay.runs()
         );
-        let envelope = &seen[0]["event"];
-        assert_eq!(
-            envelope["source"],
-            json!(SOURCE),
-            "case {case:?}/handed over: expected the published source, got {envelope}"
-        );
-        assert_eq!(
-            envelope["detail-type"],
-            json!(DETAIL_TYPE),
-            "case {case:?}/handed over: expected the published detail-type, got {envelope}"
-        );
-        assert_eq!(
-            envelope["detail"],
-            detail(relay),
-            "case {case:?}/handed over: expected the published detail unchanged, got {envelope}"
-        );
+        for written in &seen {
+            let envelope = &written["event"];
+            assert_eq!(
+                envelope["source"],
+                json!(SOURCE),
+                "case {case:?}/handed over: expected the published source, got {envelope}"
+            );
+            assert_eq!(
+                envelope["detail-type"],
+                json!(DETAIL_TYPE),
+                "case {case:?}/handed over: expected the published detail-type, got {envelope}"
+            );
+            assert_eq!(
+                envelope["detail"],
+                detail(relay),
+                "case {case:?}/handed over: expected the published detail unchanged, got \
+                 {envelope}"
+            );
+        }
     }
+
+    // And the ladders are SPENT: every relay's attempts are accounted for above, so the quiet
+    // window that follows them finds no further run of any handler.
+    let beyond = drained(&router, "handed over", &witness_url, 0).await;
+    assert!(
+        beyond.is_empty(),
+        "handed over: expected no run past the attempts each relay's handover earns, got \
+         {beyond:?}"
+    );
 
     // The permitted relay's handover DELIVERED, exactly once, carrying what was published…
     let delivered = drained(&router, "handed over", &good_url, 1).await;
