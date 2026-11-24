@@ -4,12 +4,19 @@
 //!
 //! Reports the rules of the listener `ListenerArn` names, or the rules `RuleArns` names
 //! — "You must specify either a listener or rules", so a request naming neither is
-//! refused — in one page walked by `Marker`/`PageSize`.
+//! refused.
 //!
-//! A request that names no `PageSize` is answered with the WHOLE selection in one page and
-//! no `NextMarker`, so a client that does not paginate sees every rule; a `PageSize` caps
-//! the page and the `NextMarker` beside it is this store's own opaque token
-//! ([`crate::state::pagination`]), never a position a caller could compute.
+//! `Marker` and `PageSize` name a page of the COLLECTION this read walks, which is the
+//! rules of one listener. A request that ENUMERATES the rules it wants states the whole
+//! answer itself, bounded by its own selector ([`MAX_RULES_PER_CALL`]), so there is no
+//! collection left to page: every rule it names comes back in one page with no
+//! `NextMarker`, whatever page members it carries.
+//!
+//! A walk of a listener's rules that names no `PageSize` is answered with the WHOLE
+//! selection in one page and no `NextMarker` too, so a client that does not paginate sees
+//! every rule; a `PageSize` caps the page and the `NextMarker` beside it is this store's
+//! own opaque token ([`crate::state::pagination`]), never a position a caller could
+//! compute.
 //!
 //! Every listener has a DEFAULT rule, minted with the listener: the rule that carries
 //! the listener's default actions, matches on no condition and reports the priority
@@ -258,23 +265,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "The maximum number of results to return with this call": a read handed no
-        // `PageSize` reports the whole selection in one page, so a client that does not
-        // paginate sees every rule the selection names and no `NextMarker` comes back
-        // with it. The marker that resumes a walk is this store's own opaque token
+        // "The maximum number of results to return with this call": `Marker` and
+        // `PageSize` name a page of the COLLECTION this read walks — the rules of one
+        // listener. A request that ENUMERATES the rules it wants has already stated the
+        // whole answer, bounded by its own selector ([`MAX_RULES_PER_CALL`]), so there is
+        // no collection left to page and the page members name no page of it: every rule
+        // the selector names is reported in one page, with no `NextMarker` beside it.
+        // Neither member is read there — a `Marker` names a position in a collection, and
+        // a selection the caller enumerated is not one — so the refusal for a marker this
+        // store did not issue belongs to the walk below, which is where a position can be
+        // resumed from at all.
+        //
+        // Walking a listener's rules with no `PageSize` reports the whole selection in one
+        // page the same way, so a client that does not paginate sees every rule, and the
+        // marker that resumes such a walk is this store's own opaque token
         // ([`crate::state::pagination`]), never a position a caller could compute.
-        let (page, next_marker) = crate::state::paginate(
-            selected,
-            input.marker.as_deref(),
-            input.page_size,
-            &guard.page_token_key(),
-            crate::state::PagedCollection::Rules,
-        )
-        .map_err(|_| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+        let (page, next_marker) = if requested.is_empty() {
+            crate::state::paginate(
+                selected,
                 input.marker.as_deref(),
-            ))
-        })?;
+                input.page_size,
+                &guard.page_token_key(),
+                crate::state::PagedCollection::Rules,
+            )
+            .map_err(|_| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::invalid_marker_message(input.marker.as_deref()),
+                )
+            })?
+        } else {
+            (selected, None)
+        };
 
         Ok(DescribeRulesOutput {
             rules: Some(page),
