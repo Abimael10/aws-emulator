@@ -39,21 +39,26 @@ use crate::distribution_lifecycle::{
 };
 use crate::waf_control_plane::{create_web_acl, COUNTING_RULE, SCOPE_CLOUDFRONT};
 
-/// Web ACL identifiers a CONFIGURATION may name, spanning the forms the member takes: the
+/// Web ACL identifiers a CUSTOMIZATION may name, spanning the forms the member takes: the
 /// WAF generation (`wafv2`, and the `waf`/`waf-regional` services of WAF Classic), the
 /// partition, the account and region segments, and the bare ACL id WAF Classic is named by.
 ///
-/// These are the forms `DistributionConfig$WebACLId` and `Customizations$WebAcl` CARRY, which
-/// is not the same question as which of them an ASSOCIATION resolves: a configuration states
-/// the identifier it states — "use the ACL ARN, for example
+/// These are the forms `Customizations$WebAcl` CARRY, which is not the same question as which
+/// of them an ASSOCIATION resolves: the customization states the identifier it states — "use
+/// the ACL ARN, for example
 /// `arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`
 /// … To specify a web ACL created using WAF Classic, use the ACL ID, for example
-/// `a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`" — while `AssociateDistributionWebACL` resolves the
-/// web ACL it is handed against WAF and refuses one the account does not hold
+/// `a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`" — while `AssociateDistributionTenantWebACL`
+/// resolves the web ACL it is handed against WAF and refuses one the account does not hold
 /// ([`held_web_acls`], and [`crate::associated_web_acl_resolution`] for the rule).
 ///
-/// `pub(crate)` so every suite that states a web ACL in a configuration or a customization
-/// states one of these same forms.
+/// A DISTRIBUTION's own `WebACLId` is resolved by every write that admits a
+/// `DistributionConfig`, so a configuration may name only a `wafv2` web ACL WAF really holds
+/// ([`held_web_acls`]) or an identifier of a generation this emulator resolves nothing for
+/// ([`CLASSIC_WEB_ACLS`]).
+///
+/// `pub(crate)` so every suite that states a web ACL in a customization states one of these
+/// same forms.
 pub(crate) const WEB_ACLS: &[(&str, &str)] = &[
     (
         "wafv2-global",
@@ -70,6 +75,26 @@ pub(crate) const WEB_ACLS: &[(&str, &str)] = &[
         "arn:aws-us-gov:wafv2:us-gov-west-1:123456789012:global/webacl/GovWebACL/\
          11112222-3333-4444-5555-EXAMPLE66666",
     ),
+    (
+        "waf-classic-arn",
+        "arn:aws:waf::123456789012:webacl/473e64fd-f30b-4765-81a0-62ad96dd167a",
+    ),
+    (
+        "waf-classic-id",
+        "473e64fd-f30b-4765-81a0-62ad96dd167a",
+    ),
+];
+
+/// The WAF CLASSIC identifiers a `DistributionConfig$WebACLId` may name: the ARN of a WAF
+/// Classic web ACL, and the bare ACL id that generation is named by ("to specify a web ACL
+/// created using WAF Classic, use the ACL ID").
+///
+/// These name a resource of a service this emulator holds no web ACL of, so nothing resolves
+/// them either way and a configuration naming one is stored as submitted — which is why they
+/// are the forms a create may state beside a `wafv2` web ACL WAF really holds.
+///
+/// `pub(crate)` so every suite whose create states one states the same two forms.
+pub(crate) const CLASSIC_WEB_ACLS: &[(&str, &str)] = &[
     (
         "waf-classic-arn",
         "arn:aws:waf::123456789012:webacl/473e64fd-f30b-4765-81a0-62ad96dd167a",

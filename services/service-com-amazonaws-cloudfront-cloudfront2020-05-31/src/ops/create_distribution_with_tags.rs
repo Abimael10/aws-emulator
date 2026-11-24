@@ -469,6 +469,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::CreateRefusal::InvalidViewerCertificate(message.to_string()),
             ));
         }
+        // The same resolution `CreateDistribution` makes of the web ACL the configuration
+        // names, for the reason it gives: the member reports a protection, so it names a web
+        // ACL WAF holds or the configuration is not admitted.
+        if let Some(message) =
+            crate::service::web_acl::inaccessible_web_acl(&*self.engine, &distribution_config)
+        {
+            return Err(
+                CreateDistributionWithTagsErrorModeled::InvalidWebACLId(InvalidWebACLId {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
         if crate::state::mismatched_origin_access_control(&*self.engine, &distribution_config)
             .is_some()
         {

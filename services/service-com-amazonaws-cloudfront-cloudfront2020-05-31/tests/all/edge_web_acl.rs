@@ -15,7 +15,8 @@
 //! same web ACL on a path its rule does not match (which its `DefaultAction` then allows), a
 //! web ACL whose default action blocks everything, and the three ways a configuration names
 //! no WAFv2 web ACL at all — the member left out, a WAF Classic ACL id (which is no ARN, and
-//! whose rules this emulator holds none of), and an ARN this emulator does not hold. Every
+//! whose rules this emulator holds none of), and a WAF Classic web ACL ARN (an ARN of a
+//! generation this emulator holds no web ACL of). Every
 //! row is driven over the SAME distribution configuration and the same origin, so what
 //! decides each answer is the web ACL and nothing else.
 //!
@@ -217,10 +218,9 @@ async fn the_web_acl_a_distribution_names_decides_its_viewer_traffic() {
             Expected::Served,
         ),
         (
-            "an ARN this emulator does not hold",
+            "a WAF Classic web ACL ARN, of a generation this emulator holds none of",
             Some(
-                "arn:aws:wafv2:us-east-1:000000000000:global/webacl/absent/\
-                 a1b2c3d4-5678-90ab-cdef-EXAMPLE11111"
+                "arn:aws:waf::123456789012:webacl/473e64fd-f30b-4765-81a0-62ad96dd167a"
                     .to_string(),
             ),
             served_path.clone(),

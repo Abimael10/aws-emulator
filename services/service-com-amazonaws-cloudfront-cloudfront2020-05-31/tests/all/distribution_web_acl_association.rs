@@ -41,7 +41,9 @@ use crate::distribution_lifecycle::{
     Config, API_VERSION,
 };
 use crate::waf_control_plane::{create_web_acl, SCOPE_CLOUDFRONT};
-use crate::web_acl_association::{associate_web_acl, create, read_back, Stated, WEB_ACLS};
+use crate::web_acl_association::{
+    associate_web_acl, create, read_back, Stated, CLASSIC_WEB_ACLS,
+};
 
 // The sentences this service answers these two codes with, spelled out here rather than
 // imported from the implementation: each is fixed service text naming nothing about the
@@ -82,8 +84,13 @@ pub(crate) async fn disassociate_web_acl(
 /// How the distribution came to name the web ACL a disassociation takes off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reached {
-    /// Named in the `DistributionConfig` the create submitted.
+    /// Named in the `DistributionConfig` the create submitted, as one of the WAF Classic
+    /// identifiers this emulator resolves nothing for ([`CLASSIC_WEB_ACLS`]).
     ByCreate,
+    /// Named in the `DistributionConfig` the create submitted, as a `wafv2` web ACL WAF
+    /// really holds — the only `wafv2` form a configuration may name, because every write
+    /// that admits a `DistributionConfig` resolves that member against WAF.
+    ByCreateHeld,
     /// Named by a later `AssociateDistributionWebACL` call.
     ByAssociate,
     /// Never associated with anything: the member reads as the empty value.
@@ -95,47 +102,46 @@ enum Reached {
 #[derive(Debug, Clone, Copy)]
 struct Removal {
     case: &'static str,
-    /// An index into [`WEB_ACLS`] for a row the CREATE's configuration names its web ACL in;
-    /// `None` for a row that reaches its web ACL by associating one WAF holds, and for the
-    /// distribution that names no web ACL at all.
+    /// An index into [`CLASSIC_WEB_ACLS`] for a row whose CREATE names a WAF Classic
+    /// identifier; `None` for every other row, whose web ACL is one WAF really holds (or
+    /// which names none at all).
     web_acl: Option<usize>,
     reached: Reached,
     precondition: Stated,
 }
 
-/// Every form the stored association can take — each [`WEB_ACLS`] form a CONFIGURATION may
-/// name (a `wafv2` ARN of the global namespace in two accounts, another partition, a WAF
-/// Classic ARN and a bare WAF Classic id), plus the web ACL an ASSOCIATION reaches (one WAF
-/// really holds, since that call resolves it) and the distribution that never named one —
-/// crossed with the forms the optional `If-Match` takes.
+/// Every form the stored association can take — the forms a CONFIGURATION may name (a
+/// `wafv2` web ACL WAF really holds, a WAF Classic ARN and a bare WAF Classic id), plus the
+/// web ACL an ASSOCIATION reaches (one WAF really holds, since that call resolves it) and the
+/// distribution that never named one — crossed with the forms the optional `If-Match` takes.
 const REMOVALS: &[Removal] = &[
     Removal {
-        case: "wafv2-global-from-the-create-config",
-        web_acl: Some(0),
-        reached: Reached::ByCreate,
+        case: "a-web-acl-waf-holds-from-the-create-config",
+        web_acl: None,
+        reached: Reached::ByCreateHeld,
         precondition: Stated::Current,
     },
     Removal {
-        case: "wafv2-global-other-account-from-the-create-config",
-        web_acl: Some(1),
-        reached: Reached::ByCreate,
+        case: "a-web-acl-waf-holds-from-the-create-config-no-precondition",
+        web_acl: None,
+        reached: Reached::ByCreateHeld,
         precondition: Stated::Absent,
     },
     Removal {
-        case: "other-partition-from-the-create-config",
-        web_acl: Some(2),
-        reached: Reached::ByCreate,
+        case: "a-web-acl-waf-holds-from-the-create-config-quoted-precondition",
+        web_acl: None,
+        reached: Reached::ByCreateHeld,
         precondition: Stated::QuotedCurrent,
     },
     Removal {
         case: "waf-classic-arn-from-the-create-config",
-        web_acl: Some(3),
+        web_acl: Some(0),
         reached: Reached::ByCreate,
         precondition: Stated::Absent,
     },
     Removal {
         case: "waf-classic-id-from-the-create-config",
-        web_acl: Some(4),
+        web_acl: Some(1),
         reached: Reached::ByCreate,
         precondition: Stated::Current,
     },
@@ -172,8 +178,8 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         // create states it in, and a web ACL WAF really holds for a row that reaches it by
         // associating one — that call resolves the web ACL, so only one WAF holds can land.
         let web_acl: Option<String> = match row.reached {
-            Reached::ByCreate => row.web_acl.map(|index| WEB_ACLS[index].1.to_string()),
-            Reached::ByAssociate => Some(
+            Reached::ByCreate => row.web_acl.map(|index| CLASSIC_WEB_ACLS[index].1.to_string()),
+            Reached::ByCreateHeld | Reached::ByAssociate => Some(
                 create_web_acl(
                     &router,
                     &format!("removal-{case}"),
@@ -194,7 +200,7 @@ async fn disassociating_a_web_acl_clears_it_from_the_distribution() {
         // price class, through the lifecycle suite's `DistributionConfig` builder.
         let template = Config {
             web_acl_id: match row.reached {
-                Reached::ByCreate => web_acl.clone(),
+                Reached::ByCreate | Reached::ByCreateHeld => web_acl.clone(),
                 Reached::ByAssociate | Reached::Never => None,
             },
             ..config(case, &format!("ref-disassoc-{case}"))

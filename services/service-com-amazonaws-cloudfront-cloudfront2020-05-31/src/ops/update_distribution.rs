@@ -536,6 +536,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create path applies: a distribution reports the web ACL in front
+        // of it through `WebACLId`, so an update cannot leave a distribution claiming a
+        // protection no web ACL WAF holds backs
+        // (`crate::service::web_acl::inaccessible_web_acl`). Read here, with no store guard
+        // held, because it locks the WAFv2 store.
+        if let Some(message) = crate::service::web_acl::inaccessible_web_acl(
+            &*self.engine,
+            &input.distribution_config,
+        ) {
+            return Err(UpdateDistributionErrorModeled::InvalidWebACLId(InvalidWebACLId {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
+
         // A CloudFront function runs on a VIEWER event, so an update cannot leave a
         // behaviour carrying a function association CloudFront could not invoke either: the
         // value is outside the set the member admits, which is the same defect the request

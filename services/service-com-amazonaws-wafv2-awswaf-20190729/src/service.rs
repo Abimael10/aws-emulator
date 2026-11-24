@@ -55,6 +55,10 @@
 //! `LoggingConfiguration` names, which is the other channel a web ACL reports on itself
 //! through.
 
+/// The CloudFront distributions a web ACL is in front of, which — alone among the
+/// protected resources — are bound in the DISTRIBUTION's own configuration rather than
+/// here, so only CloudFront can report them.
+pub mod cloudfront_distributions;
 pub mod edge;
 /// The log record a web ACL's `LoggingConfiguration` delivers about each request it
 /// decided, and the write of that record into the destination it names.

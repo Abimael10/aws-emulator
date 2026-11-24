@@ -482,6 +482,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::CreateRefusal::InvalidViewerCertificate(message.to_string()),
             ));
         }
+        // A distribution reports the web ACL in front of it through `WebACLId`, so the web
+        // ACL that configuration names is RESOLVED against the service that holds web ACLs
+        // before a distribution exists to claim the protection
+        // (`crate::service::web_acl::inaccessible_web_acl`) — otherwise a client auditing
+        // its posture by reading the member back would be told it is protected by a web ACL
+        // nothing holds. Read with no store guard held, because it locks the WAFv2 store.
+        if let Some(message) = crate::service::web_acl::inaccessible_web_acl(
+            &*self.engine,
+            &input.distribution_config,
+        ) {
+            return Err(CreateDistributionErrorModeled::InvalidWebACLId(InvalidWebACLId {
+                message: Some(message.to_string()),
+            })
+            .into());
+        }
         // An origin access control signs the origin request CloudFront makes to the ONE
         // service its origin type names, so a control may front only an origin of that kind:
         // a configuration attaching one to an origin addressed at another service is refused

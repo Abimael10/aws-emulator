@@ -353,6 +353,23 @@ async fn a_web_acl_deleted_in_waf_can_no_longer_be_associated() {
         web_acl.arn, landed.status, landed.raw
     );
 
+    // The web ACL cannot be deleted while a distribution still names it, so the association
+    // this step proved is taken off first — which is what WAF's own documentation tells an
+    // operator to do ("before deleting any web ACL, first disassociate it from all
+    // resources").
+    let cleared = crate::distribution_web_acl_association::disassociate_web_acl(
+        &router,
+        &held_id,
+        Some(landed.header("etag")),
+    )
+    .await;
+    assert_eq!(
+        cleared.status, 200,
+        "case {case}: expected HTTP 200 taking the association off before the delete, got {} \
+         with {}",
+        cleared.status, cleared.raw
+    );
+
     delete_web_acl(&router, &web_acl).await;
 
     // Once WAF no longer holds it, the very same ARN resolves to nothing.

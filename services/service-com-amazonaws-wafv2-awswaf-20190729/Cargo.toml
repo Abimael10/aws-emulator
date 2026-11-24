@@ -107,6 +107,14 @@ aws-sdk-apprunner = { version = "1", default-features = false }
 aws-sdk-ec2 = { version = "1", default-features = false }
 aws-sdk-amplify = { version = "1", default-features = false }
 aws-sdk-bedrockagentcorecontrol = { version = "1", default-features = false }
+# `service::cloudfront_distributions`: a CloudFront distribution names the web ACL in front
+# of it in its OWN configuration, not through `AssociateWebACL` ("for Amazon CloudFront
+# distributions, use the CloudFront call ListDistributionsByWebACLId" — `DeleteWebACL`'s own
+# documentation), so the distributions a web ACL still protects are read with that call, over
+# the same in-process transport the protected-resource reads above take. The generated
+# CLIENT, not CloudFront's emulated crate, which is also why no dependency cycle is formed
+# with the service that asks this one for a decision.
+aws-sdk-cloudfront = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

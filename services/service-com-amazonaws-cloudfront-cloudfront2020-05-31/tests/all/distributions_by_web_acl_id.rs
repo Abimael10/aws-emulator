@@ -7,26 +7,29 @@
 //! association got there, the configuration a create submitted or a later association
 //! call — and the sentinel `null` lists the distributions associated with no web ACL at
 //! all ("if you specify "null" for the ID, the request returns a list of the distributions
-//! that aren't associated with a web ACL"). A web ACL lives in WAF, which this service
-//! cannot resolve, so the identifier is COMPARED and never validated: one no distribution
-//! carries lists nothing at HTTP 200, whatever form it takes. The page contract is the one
+//! that aren't associated with a web ACL"). This operation's own `WebACLId` parameter is
+//! COMPARED and never resolved: one no distribution carries lists nothing at HTTP 200,
+//! whatever form it takes, which is why this operation answers no `InvalidWebACLId`. The
+//! page contract is the one
 //! every CloudFront distribution listing states: `MaxItems` is the page size and is
 //! echoed, `Marker` is echoed and resumes after the id the previous page ended at,
 //! `NextMarker` and `IsTruncated` arrive exactly when matching distributions remain, and
 //! `Quantity` states the length of `Items`.
 //!
 //! The rows below span what that rule generalises over: WHICH form the identifier takes
-//! (the `wafv2` ARN in two scopes and a second partition, a WAF Classic ARN, a bare WAF
-//! Classic id, and a web ACL WAF really holds), HOW the association got onto the distribution
+//! (three distinct `wafv2` web ACLs WAF really holds, a WAF Classic ARN and a bare WAF
+//! Classic id), HOW the association got onto the distribution
 //! (named in the create's configuration, set by `AssociateDistributionWebACL`, moved from one
 //! web ACL to another), how many distributions share one web ACL (so a page can cut inside a
 //! matching set), distributions associated with no web ACL at all, and a well-formed
 //! identifier no distribution carries.
 //!
-//! The identifier catalog is [`catalog`]: the forms a CONFIGURATION may name
-//! ([`crate::web_acl_association::WEB_ACLS`], whose source is the model's own documentation
-//! of `DistributionConfig$WebACLId`) plus one web ACL WAF holds, because
-//! `AssociateDistributionWebACL` resolves the web ACL it is handed. The wire harness (the
+//! The identifier catalog is [`catalog`]: the forms a CONFIGURATION may name — a `wafv2` web
+//! ACL WAF really holds, because every write that admits a `DistributionConfig` resolves that
+//! member against WAF, and the WAF Classic identifiers this emulator resolves nothing for
+//! ([`crate::web_acl_association::CLASSIC_WEB_ACLS`], whose source is the model's own
+//! documentation of `DistributionConfig$WebACLId`) — plus one more web ACL WAF holds, which
+//! is what an association CALL can put on a distribution. The wire harness (the
 //! router, the request helpers and the element scanner) is the one
 //! [`crate::distribution_lifecycle`] builds.
 
@@ -40,19 +43,37 @@ use crate::distribution_lifecycle::{
     Answer, Node, API_VERSION,
 };
 use crate::waf_control_plane::{create_web_acl, SCOPE_CLOUDFRONT};
-use crate::web_acl_association::{associate_web_acl, WEB_ACLS};
+use crate::web_acl_association::{associate_web_acl, CLASSIC_WEB_ACLS};
 
-/// The identifiers under test, in the order the rows index them: every form a CONFIGURATION
-/// may name ([`WEB_ACLS`]), then one web ACL WAF really HOLDS, created through its own
-/// control plane on this router — the association call resolves the web ACL it is handed, so
-/// only such a one can be put on a distribution by a call rather than by a create.
+/// The identifiers under test, in the order the rows index them: three distinct `wafv2` web
+/// ACLs WAF really HOLDS — every write that admits a `DistributionConfig` resolves that
+/// member against WAF, so only such a one can be named by a create — then the WAF Classic
+/// identifiers this emulator resolves nothing for ([`CLASSIC_WEB_ACLS`]), then one more web
+/// ACL WAF holds, which is what an association CALL can put on a distribution.
+///
+/// Nothing here builds a WAFv2 ARN by hand: each is the one WAF's own control plane minted on
+/// this router.
 async fn catalog(router: &MultiServiceRouter) -> Vec<(&'static str, String)> {
-    let mut identifiers: Vec<(&'static str, String)> = WEB_ACLS
-        .iter()
-        .map(|(case, arn)| (*case, (*arn).to_string()))
-        .collect();
+    let mut identifiers: Vec<(&'static str, String)> = Vec::new();
+    for (case, name) in [
+        ("a web ACL WAF holds", "by-web-acl-id-first"),
+        ("a second web ACL WAF holds", "by-web-acl-id-second"),
+        ("a third web ACL WAF holds", "by-web-acl-id-third"),
+    ] {
+        identifiers.push((
+            case,
+            create_web_acl(router, name, SCOPE_CLOUDFRONT, "{\"Allow\":{}}", "")
+                .await
+                .arn,
+        ));
+    }
+    identifiers.extend(
+        CLASSIC_WEB_ACLS
+            .iter()
+            .map(|(case, identifier)| (*case, (*identifier).to_string())),
+    );
     identifiers.push((
-        "a web ACL WAF holds",
+        "a fourth web ACL WAF holds",
         create_web_acl(
             router,
             "by-web-acl-id-held",
@@ -85,37 +106,37 @@ impl Row {
     }
 }
 
-/// The index in [`catalog`] no row below ever associates, so a well-formed identifier
-/// nothing carries is covered.
+/// The catalog index no row below ever associates, so a well-formed identifier nothing
+/// carries is covered.
 const UNUSED_WEB_ACL: usize = 4;
 
-/// The catalog index of the web ACL WAF holds, which is the one an association CALL can put
-/// on a distribution.
+/// The catalog index of the web ACL an association CALL puts on a distribution — one WAF
+/// holds, since that call resolves what it is handed.
 const HELD_WEB_ACL: usize = 5;
 
 const ROWS: &[Row] = &[
     Row {
-        case: "the create's configuration names the wafv2 global web ACL",
+        case: "the create's configuration names a web ACL WAF holds",
         in_config: Some(0),
         associated: None,
     },
     Row {
-        case: "a second distribution created under the same wafv2 global web ACL",
+        case: "a second distribution created under the same web ACL",
         in_config: Some(0),
         associated: None,
     },
     Row {
-        case: "a third distribution created under the same wafv2 global web ACL",
+        case: "a third distribution created under the same web ACL",
         in_config: Some(0),
         associated: None,
     },
     Row {
-        case: "the create's configuration names the wafv2 global web ACL of another account",
+        case: "the create's configuration names a second web ACL WAF holds",
         in_config: Some(1),
         associated: None,
     },
     Row {
-        case: "the create's configuration names a web ACL in another partition",
+        case: "the create's configuration names a third web ACL WAF holds",
         in_config: Some(2),
         associated: None,
     },
@@ -140,7 +161,7 @@ const ROWS: &[Row] = &[
         associated: Some(HELD_WEB_ACL),
     },
     Row {
-        case: "created under the wafv2 global web ACL, then moved to a web ACL WAF holds",
+        case: "created under one web ACL WAF holds, then moved to another",
         in_config: Some(0),
         associated: Some(HELD_WEB_ACL),
     },
@@ -479,8 +500,9 @@ async fn walking_the_pages_enumerates_each_web_acl_exactly_once() {
 }
 
 /// An identifier no distribution carries lists NOTHING at HTTP 200 — never the whole store,
-/// and never a refusal: a web ACL is a WAF resource this service cannot resolve, so a
-/// well-formed identifier nothing carries and a malformed one answer the same way.
+/// and never a refusal: this operation's `WebACLId` parameter is compared rather than
+/// resolved, so a well-formed identifier nothing carries and a malformed one answer the same
+/// way.
 #[tokio::test]
 async fn an_identifier_nothing_carries_lists_nothing() {
     let router = emulator();
@@ -492,16 +514,20 @@ async fn an_identifier_nothing_carries_lists_nothing() {
     );
 
     let known = identifiers[0].1.clone();
+    // The same web ACL's ARN with its trailing id segment replaced: the layout a WAFv2
+    // resource ARN ends with is `…/<name>/<id>`, so this names a web ACL of the same name
+    // that WAF never minted.
+    let (known_prefix, _) = known
+        .rsplit_once('/')
+        .expect("a wafv2 web ACL ARN ends with the id WAF minted");
+    let other_id = format!("{known_prefix}/a1b2c3d4-5678-90ab-cdef-EXAMPLE99999");
     let absent: Vec<(&str, String)> = vec![
         (
             "a catalogued identifier no distribution carries",
             identifiers[UNUSED_WEB_ACL].1.clone(),
         ),
         ("a known identifier in upper case", known.to_uppercase()),
-        (
-            "a known identifier with its trailing id changed",
-            known.replace("EXAMPLE11111", "EXAMPLE99999"),
-        ),
+        ("a known identifier with its trailing id changed", other_id),
         ("a token that is no ARN and no id", "not-a-web-acl".to_string()),
         ("an ARN whose segments are empty", "arn:aws:wafv2:::".to_string()),
         ("a bare word", "NULL".to_string()),

@@ -19,9 +19,11 @@
 //! can do — name WHICH web ACL the distribution put in front of itself, and read the viewer
 //! request into the components a `FieldToMatch` names — and says what the edge answers.
 //!
-//! The same resolution is what an ASSOCIATION is admitted by ([`associable`]): the web ACL a
-//! CloudFront resource is put behind has to be one WAF holds, so the one module that asks
-//! WAF about a distribution's web ACL is where that question is asked too.
+//! The same resolution is what an ASSOCIATION is admitted by ([`associable`]), and what a
+//! write carrying a whole `DistributionConfig` is admitted by
+//! ([`inaccessible_web_acl`]): the web ACL a CloudFront resource is put behind has to be one
+//! WAF holds, however the configuration naming it arrived, so the one module that asks WAF
+//! about a distribution's web ACL is where both questions are asked.
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
@@ -146,6 +148,56 @@ pub fn associable<Eng: Send + Sync + 'static>(engine: &Eng, web_acl_arn: &str) -
     };
     let store = waf.lock();
     store.web_acl_by_arn(web_acl_arn).is_some()
+}
+
+/// The sentence CloudFront refuses a CONFIGURATION whose `WebACLId` names a WAFv2 web ACL
+/// the requester cannot reach with: the whole text is fixed — it says the web ACL named is
+/// not one this requester can use, and names neither the identifier submitted nor the reason
+/// it did not resolve — so nothing of the request reaches it. Recorded behaviour.
+///
+/// It is the OTHER sentence of this one resolution: [`crate::state::INVALID_WEB_ACL_MESSAGE`]
+/// is what an ASSOCIATION call is told, whose `WebACLArn` is the whole request, and this one
+/// is what a write carrying a whole `DistributionConfig` is told about one member of it.
+pub const INACCESSIBLE_WEB_ACL_MESSAGE: &str = "Web ACL is not accessible by the requester.";
+
+/// `Some(message)` when the `WebACLId` of `config` names a WAFv2 web ACL this account does
+/// not hold for CloudFront, and `None` when it names one it does — or names no web ACL this
+/// emulator can resolve at all.
+///
+/// A distribution reports the web ACL in front of it through this one member, so a
+/// configuration naming one that resolves to nothing would report a protection that does not
+/// exist. The web ACL is therefore a resource the write RESOLVES rather than a string it
+/// stores, against the service that HOLDS web ACLs ([`associable`]) — which is the same
+/// question, asked of the same records, that an association call resolves before it writes
+/// the very same member.
+///
+/// Only a value that NAMES a WAFv2 resource is resolved: `WebACLId` carries either
+/// generation — "to specify a web ACL created using the latest version of WAF, use the ACL
+/// ARN … To specify a web ACL created using WAF Classic, use the ACL ID" — and a WAF Classic
+/// identifier names a resource of a service this emulator holds no web ACL of, so it is
+/// evidence of nothing and is stored as submitted. A configuration naming no web ACL at all
+/// states the empty value, which names nothing to resolve.
+///
+/// Call it with NO lock of this service's store held, for the reason [`associable`] gives.
+pub fn inaccessible_web_acl<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    config: &crate::ops::types::DistributionConfig,
+) -> Option<&'static str> {
+    let web_acl_id = config.web_acl_id.as_deref().unwrap_or_default().trim();
+    if !names_a_wafv2_resource(web_acl_id) || associable(engine, web_acl_id) {
+        return None;
+    }
+    Some(INACCESSIBLE_WEB_ACL_MESSAGE)
+}
+
+/// Whether `web_acl_id` names a WAFv2 resource at all, which is what makes it a value the
+/// service that holds web ACLs can be asked about.
+///
+/// The ARN layout is read by the service that mints it
+/// (`service_com_amazonaws_wafv2_awswaf_20190729::state::is_wafv2_resource_arn`), so this
+/// service holds no second reading of a WAFv2 ARN.
+fn names_a_wafv2_resource(web_acl_id: &str) -> bool {
+    ::service_com_amazonaws_wafv2_awswaf_20190729::state::is_wafv2_resource_arn(web_acl_id)
 }
 
 /// Whether `web_acl_id` names a WAFv2 web ACL by its ARN.

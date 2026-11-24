@@ -5,6 +5,12 @@
 //! matches the stored one. A stale token is `WAFOptimisticLockException` and an
 //! unknown triple `WAFNonexistentItemException` (both HTTP 400).
 //!
+//! A web ACL that is still in front of something is `WAFAssociatedItemException` (HTTP
+//! 400): "before deleting any web ACL, first disassociate it from all resources". Both
+//! halves of "in front of something" are asked — the bindings this service holds, and the
+//! CloudFront distributions whose own configuration names the web ACL, which only CloudFront
+//! can report ([`crate::service::cloudfront_distributions`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,13 +205,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
         // The namespace this delete addresses: a REGIONAL web ACL is resolved in the
         // region of the endpoint the call reached
         // (`crate::state::namespace_region`), and the same key resolves the entry
         // below and removes it, so the web ACL this call deletes is the one it
         // resolved and checked the lock token of.
         let region = crate::service::requests::namespace_region(&input.scope, ctx.parts());
+
+        // WHICH CloudFront distributions still name this web ACL is CloudFront's own answer
+        // — the association lives in the distribution's configuration, not in this store —
+        // so it is asked of CloudFront, through the one read `DeleteWebACL`'s documentation
+        // names for it (`crate::service::cloudfront_distributions`). Asked BEFORE this
+        // service's store is locked, because the hop awaits and no guard may be held across
+        // it; the ARN it asks about is the one the store holds for the triple, so a triple
+        // that resolves to nothing asks nobody anything, and the refusals below are still
+        // answered in WAF's own order.
+        let web_acl_arn = {
+            let store = state.lock();
+            store
+                .web_acl(&input.scope, &region, &input.name, &input.id)
+                .map(|entry| entry.web_acl.arn.clone())
+        };
+        let named_by_a_distribution = match &web_acl_arn {
+            Some(arn) => crate::service::cloudfront_distributions::protected_distributions(ctx, arn)
+                .await,
+            None => false,
+        };
+
+        let mut state = state.lock();
 
         let Some(entry) = state.web_acl(&input.scope, &region, &input.name, &input.id) else {
             crate::state::audit(
@@ -238,9 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "WAF couldn’t perform the operation because your resource is being used by
         // another resource or it’s associated with another resource"
         // (`WAFAssociatedItemException`, this operation's own modelled error) is what
-        // that refusal is: the association has to be taken away first.
+        // that refusal is: the association has to be taken away first. Both halves of
+        // "in front of something" count — the bindings this service holds, and the
+        // CloudFront distributions that name the web ACL in their own configuration,
+        // which only CloudFront can report.
         let web_acl_arn = entry.web_acl.arn.clone();
-        if !state.protected_resources(&web_acl_arn).is_empty() {
+        if named_by_a_distribution || !state.protected_resources(&web_acl_arn).is_empty() {
             crate::state::audit(
                 "DeleteWebACL",
                 &input.scope,

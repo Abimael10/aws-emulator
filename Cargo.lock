@@ -22594,6 +22594,7 @@ dependencies = [
  "aws-sdk-apprunner",
  "aws-sdk-appsync",
  "aws-sdk-bedrockagentcorecontrol",
+ "aws-sdk-cloudfront",
  "aws-sdk-cognitoidentityprovider",
  "aws-sdk-ec2",
  "aws-sdk-elasticloadbalancingv2",
