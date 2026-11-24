@@ -1,34 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH values of one answered call carry BYTES, read from the called service's own model.
+//! WHICH values of one answered call an SDK MATERIALISES rather than hand over as the text or
+//! the number the wire carried, read from the called service's own model.
 //!
-//! A JSON protocol has no byte type: a member whose shape is a `blob` travels as the base64
-//! text of its bytes. An AWS SDK gives the caller the BYTES — `bytes` in Python, a byte array
-//! in JavaScript — because the SDK knows from the service's model which members are blobs and
-//! decodes exactly those. So the runtime has to know the same thing: this module reads it out
-//! of the model and answers WHERE in an answer document those values sit.
+//! A JSON protocol carries two kinds of value in a form that is not the value itself:
+//!
+//! * BYTES. The protocol has no byte type, so a member whose shape is a `blob` travels as the
+//!   base64 text of its bytes. An AWS SDK gives the caller the BYTES — `bytes` in Python, a
+//!   byte array in JavaScript — because the SDK knows from the service's model which members
+//!   are blobs and decodes exactly those.
+//! * INSTANTS. A member whose shape is a `timestamp` travels as the seconds since the epoch,
+//!   and an AWS SDK gives the caller its language's own instant — a `Date` in JavaScript — for
+//!   the same reason: the model says which members are timestamps.
+//!
+//! So the runtime has to know the same thing: this module reads it out of the model and
+//! answers WHERE in an answer document those values sit.
 //!
 //! The answer is a list of PATHS — each a list of object keys and array indices from the root
 //! of the output document — rather than a rewritten document, because the seam between the
 //! host and a run's engine carries JSON text ([`super::aws_api::Answer`]): the host says which
-//! values are bytes and the SDK the guest calls materialises them
+//! values are bytes and which are instants, and the SDK the guest calls materialises them
 //! ([`super::aws_sdk_guest`], [`super::node_sdk_guest`]). Nothing about a value is changed
 //! here, and a path is reported only where the document really carries a value.
 //!
-//! What is KEPT between calls is a [`BlobPlan`]: the few shapes of that service whose values
-//! can carry bytes at all, and which member of each leads to them. The model document itself
-//! is parsed once to build that plan and then dropped, so a service whose answers carry bytes
-//! in one corner of one operation does not cost this process its whole model for the life of
-//! the run. The plan is a GRAPH keyed by shape id rather than a tree, which is what lets a
-//! shape that contains itself — a DynamoDB attribute value holds a list of attribute values —
-//! be described at all.
+//! What is KEPT between calls is an [`AnswerPlan`] per kind: the shapes of that service whose
+//! values can carry one at all, and which member of each leads to them. The model document
+//! itself is parsed once to build that plan and then dropped, so a service whose answers carry
+//! bytes in one corner of one operation does not cost this process its whole model for the
+//! life of the run. The plan is a GRAPH keyed by shape id rather than a tree, which is what
+//! lets a shape that contains itself — a DynamoDB attribute value holds a list of attribute
+//! values — be described at all.
 //!
 //! The walk over an answer is driven by the DOCUMENT: it descends only where the answer
 //! carries a value, so a plan whose shapes refer to one another cannot make it recurse without
 //! end — the document's own nesting, which `serde_json`'s parse limit bounds, bounds the walk.
 //!
-//! Two kinds of blob are deliberately left out, because neither travels as base64 in a JSON
-//! body:
+//! Two kinds of value are deliberately left out, because neither travels in the form the
+//! kind's own leaves do:
 //!
 //! * a `@streaming` blob, which an SDK hands over as a stream rather than as bytes and which
 //!   this runtime reports separately ([`super::aws_api::Answer::streams`]);
@@ -48,7 +56,7 @@ const STREAMING: &str = "smithy.api#streaming";
 const JSON_NAME: &str = "smithy.api#jsonName";
 
 /// The traits that bind a member of an ANSWER somewhere other than its JSON body, so what the
-/// value reads as is that binding's and not the base64 a JSON body carries.
+/// value reads as is that binding's and not the form a JSON body carries.
 const OUTSIDE_THE_BODY: [&str; 4] = [
     "smithy.api#httpPayload",
     "smithy.api#httpHeader",
@@ -66,13 +74,14 @@ pub struct ServiceModel {
     /// The model document.
     pub source: &'static str,
     /// The plan read out of it.
-    pub plan: OnceLock<BlobPlan>,
+    pub plan: OnceLock<AnswerPlan>,
 }
 
 impl ServiceModel {
     /// The plan, reading it on first use.
-    pub fn plan(&self) -> &BlobPlan {
-        self.plan.get_or_init(|| BlobPlan::of(self.source))
+    pub fn plan(&self) -> &AnswerPlan {
+        self.plan
+            .get_or_init(|| AnswerPlan::of(self.source, Materialised::Bytes))
     }
 
     /// Where the answer of `operation` carries BYTES, in this service.
@@ -81,23 +90,67 @@ impl ServiceModel {
     }
 }
 
-/// Which values of one service's answers carry bytes: the output shape of each operation whose
-/// answer can carry any, and the shapes that lead to them.
+/// What an SDK MATERIALISES a value of one shape into, rather than hand it over as the text or
+/// the number the wire carried it as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Materialised {
+    /// The bytes of a `blob`, which a JSON protocol carries as base64 text.
+    Bytes,
+    /// The instant of a `timestamp`, which a JSON protocol carries as the seconds since the
+    /// epoch.
+    Instant,
+}
+
+impl Materialised {
+    /// The type a model declares the shapes of this kind as (`blob`, `timestamp`).
+    fn declared(self) -> &'static str {
+        match self {
+            Self::Bytes => "blob",
+            Self::Instant => "timestamp",
+        }
+    }
+
+    /// The prelude's own shape of that type, which a member may target although no service's
+    /// model declares it.
+    fn prelude(self) -> &'static str {
+        match self {
+            Self::Bytes => PRELUDE_BLOB,
+            Self::Instant => PRELUDE_TIMESTAMP,
+        }
+    }
+
+    /// Whether a value an answer carries is one of this kind: the base64 TEXT of a blob's
+    /// bytes, and the NUMBER of seconds — or, for a member whose own trait states another
+    /// form, the text — a timestamp travels as.
+    fn carried_by(self, document: &Value) -> bool {
+        match self {
+            Self::Bytes => document.is_string(),
+            Self::Instant => document.is_number() || document.is_string(),
+        }
+    }
+}
+
+/// Which values of one service's answers an SDK materialises for ONE kind ([`Materialised`]):
+/// the output shape of each operation whose answer can carry one, and the shapes that lead to
+/// them.
 #[derive(Debug, Default)]
-pub struct BlobPlan {
-    /// The output shape of each operation whose answer can carry bytes, by the operation's own
+pub struct AnswerPlan {
+    /// The kind this plan is about, which is what a value reached at one of its leaves is.
+    /// `None` for the empty plan of a model that could not be read, which reports nothing.
+    kind: Option<Materialised>,
+    /// The output shape of each operation whose answer can carry one, by the operation's own
     /// short name — which is the name a client calls it by.
     outputs: BTreeMap<String, String>,
-    /// Every shape whose values can carry bytes, by shape id.
+    /// Every shape whose values can carry one, by shape id.
     shapes: BTreeMap<String, Carrier>,
 }
 
-/// How one shape's values carry bytes.
+/// How one shape's values carry the plan's own kind.
 #[derive(Debug)]
 enum Carrier {
-    /// The value IS the bytes: a blob the wire carries as base64 text.
-    Bytes,
-    /// A structure or a union: these of its members lead to bytes.
+    /// The value IS one: the blob, or the timestamp, itself.
+    Leaf,
+    /// A structure or a union: these of its members lead to one.
     Members(Vec<Member>),
     /// A list or a set: every entry is this shape.
     Entries(String),
@@ -105,7 +158,7 @@ enum Carrier {
     Values(String),
 }
 
-/// One member of a structure or a union that leads to bytes.
+/// One member of a structure or a union that leads to a value of the plan's kind.
 #[derive(Debug)]
 struct Member {
     /// The member's own name, which is what a REST-bound answer's document is keyed by.
@@ -116,10 +169,10 @@ struct Member {
     target: String,
 }
 
-impl BlobPlan {
-    /// The plan `source`, a Smithy model document, states.
+impl AnswerPlan {
+    /// The plan `source`, a Smithy model document, states for `kind`.
     #[must_use]
-    pub fn of(source: &str) -> Self {
+    pub fn of(source: &str, kind: Materialised) -> Self {
         let Some(shapes) = ::serde_json::from_str::<Value>(source)
             .ok()
             .and_then(|document| document.get("shapes").cloned())
@@ -130,14 +183,25 @@ impl BlobPlan {
         else {
             return Self::default();
         };
-        let carrying = carrying_shapes(&shapes);
-        let mut plan = Self::default();
+        Self::of_shapes(&shapes, kind)
+    }
+
+    /// The same, for a model whose shapes are ALREADY parsed — which is how a seam that reads
+    /// several things out of one reading of one model builds it
+    /// ([`super::node_sdk_guest::exports`]).
+    #[must_use]
+    pub fn of_shapes(shapes: &Map<String, Value>, kind: Materialised) -> Self {
+        let carrying = carrying_shapes(shapes, kind);
+        let mut plan = Self {
+            kind: Some(kind),
+            ..Self::default()
+        };
         for id in &carrying {
-            if let Some(carrier) = carrier_of(&shapes, id, &carrying) {
+            if let Some(carrier) = carrier_of(shapes, id, &carrying, kind) {
                 plan.shapes.insert(id.clone(), carrier);
             }
         }
-        for (id, shape) in &shapes {
+        for (id, shape) in shapes {
             if shape.get("type").and_then(Value::as_str) != Some("operation") {
                 continue;
             }
@@ -158,8 +222,8 @@ impl BlobPlan {
         plan
     }
 
-    /// Where the answer of `operation` carries BYTES: one path per value this plan types as a
-    /// blob and the document carries as text.
+    /// Where the answer of `operation` carries a value of this plan's kind: one path per value
+    /// the plan types as one and the document really carries.
     ///
     /// `document` is the output document as the guest will read it — the answered body for a
     /// service whose protocol carries the output document as the body, and the document
@@ -176,13 +240,15 @@ impl BlobPlan {
         paths
     }
 
-    /// Collect the paths of every blob value `document` carries under the shape `id`.
+    /// Collect the paths of every value of this plan's kind that `document` carries under the
+    /// shape `id`.
     fn walk(&self, id: &str, document: &Value, path: &mut Vec<Value>, paths: &mut Vec<Value>) {
         match self.shapes.get(id) {
-            Some(Carrier::Bytes) => {
-                // A blob the document carries as text is the base64 of its bytes; anything
-                // else is not a value this seam decodes.
-                if document.is_string() {
+            Some(Carrier::Leaf) => {
+                // A blob the document carries as text is the base64 of its bytes, and a
+                // timestamp it carries as a number is the seconds since the epoch; anything
+                // else is not a value this seam materialises.
+                if self.kind.is_some_and(|kind| kind.carried_by(document)) {
                     paths.push(Value::Array(path.clone()));
                 }
             }
@@ -237,22 +303,23 @@ impl Member {
     }
 }
 
-/// Every shape of `shapes` whose values can carry bytes.
+/// Every shape of `shapes` whose values can carry a value of `kind`.
 ///
 /// Computed by passes over the shapes until nothing more is added, rather than by descending
 /// each shape: a shape that contains itself — a DynamoDB attribute value holds a list of
 /// attribute values — has no bottom to descend to, while the passes simply stop when the set
 /// stops growing. The model's shape count bounds how many passes there can be.
-fn carrying_shapes(shapes: &Map<String, Value>) -> BTreeSet<String> {
+fn carrying_shapes(shapes: &Map<String, Value>, kind: Materialised) -> BTreeSet<String> {
     let mut carrying: BTreeSet<String> = BTreeSet::new();
-    // The blobs themselves, including the prelude's own `smithy.api#Blob`, which a member may
-    // target although no service declares it.
+    // The leaves themselves, including the prelude's own shape of that type, which a member
+    // may target although no service declares it. A `@streaming` blob is left out for the
+    // reason the module docs give; no other shape carries that trait.
     for id in shapes
         .keys()
         .map(String::as_str)
-        .chain(::std::iter::once(PRELUDE_BLOB))
+        .chain(::std::iter::once(kind.prelude()))
     {
-        if kind_of(shapes, id) == "blob" && !is_streaming(shapes, id) {
+        if kind_of(shapes, id) == kind.declared() && !is_streaming(shapes, id) {
             carrying.insert(id.to_string());
         }
     }
@@ -262,7 +329,7 @@ fn carrying_shapes(shapes: &Map<String, Value>) -> BTreeSet<String> {
             if carrying.contains(id) {
                 continue;
             }
-            if leads_to_bytes(shapes, id, &carrying) {
+            if leads_to_a_leaf(shapes, id, &carrying) {
                 carrying.insert(id.clone());
                 grew = true;
             }
@@ -274,7 +341,7 @@ fn carrying_shapes(shapes: &Map<String, Value>) -> BTreeSet<String> {
 }
 
 /// Whether the shape `id` leads to a value in `carrying`.
-fn leads_to_bytes(shapes: &Map<String, Value>, id: &str, carrying: &BTreeSet<String>) -> bool {
+fn leads_to_a_leaf(shapes: &Map<String, Value>, id: &str, carrying: &BTreeSet<String>) -> bool {
     let reached = |field: &str| {
         nested(shapes, id, field).is_some_and(|member| carrying.contains(target_of(member)))
     };
@@ -290,20 +357,24 @@ fn leads_to_bytes(shapes: &Map<String, Value>, id: &str, carrying: &BTreeSet<Str
     }
 }
 
-/// How the shape `id` carries bytes, for a shape already known to carry them.
+/// How the shape `id` carries a value of `kind`, for a shape already known to carry one.
 fn carrier_of(
     shapes: &Map<String, Value>,
     id: &str,
     carrying: &BTreeSet<String>,
+    kind: Materialised,
 ) -> Option<Carrier> {
-    match kind_of(shapes, id) {
-        "blob" => Some(Carrier::Bytes),
+    let declared = kind_of(shapes, id);
+    if declared == kind.declared() {
+        return Some(Carrier::Leaf);
+    }
+    match declared {
         "structure" | "union" => {
             let members = members_of(shapes, id)?
                 .iter()
                 .filter(|(_name, member)| carrying.contains(target_of(member)))
-                // A member an answer binds outside its JSON body carries no base64 to
-                // decode, so it is not part of the plan at all.
+                // A member an answer binds outside its JSON body does not carry the form a
+                // JSON body carries, so it is not part of the plan at all.
                 .filter(|(_name, member)| {
                     !OUTSIDE_THE_BODY
                         .iter()
@@ -332,8 +403,11 @@ fn carrier_of(
 /// The prelude's own blob shape, which a member may target although no service declares it.
 const PRELUDE_BLOB: &str = "smithy.api#Blob";
 
-/// The type the shape `id` declares (`structure`, `list`, `blob`, …), or the prelude's own
-/// type for a shape of the prelude, which a service's model does not declare.
+/// The prelude's own timestamp shape, which members target far more often than a service's own.
+const PRELUDE_TIMESTAMP: &str = "smithy.api#Timestamp";
+
+/// The type the shape `id` declares (`structure`, `list`, `blob`, `timestamp`, …), or the
+/// prelude's own type for a shape of the prelude, which a service's model does not declare.
 fn kind_of(shapes: &Map<String, Value>, id: &str) -> &'static str {
     if let Some(kind) = shapes
         .get(id)
@@ -342,6 +416,7 @@ fn kind_of(shapes: &Map<String, Value>, id: &str) -> &'static str {
     {
         return match kind {
             "blob" => "blob",
+            "timestamp" => "timestamp",
             "structure" => "structure",
             "union" => "union",
             "list" => "list",
@@ -352,6 +427,7 @@ fn kind_of(shapes: &Map<String, Value>, id: &str) -> &'static str {
     }
     match id {
         PRELUDE_BLOB => "blob",
+        PRELUDE_TIMESTAMP => "timestamp",
         _ => "",
     }
 }
@@ -437,7 +513,8 @@ mod tests {
 
     /// The model the rows below are read against: one operation whose output carries a blob
     /// member, a blob inside a list, a blob inside a map, a blob under a `@jsonName`, a
-    /// streaming blob, a blob bound to the payload, and a text member.
+    /// streaming blob, a blob bound to the payload, a text member, and the timestamp members
+    /// the instant rows are read off.
     const MODEL: &str = r#"{
       "smithy": "2.0",
       "shapes": {
@@ -468,29 +545,46 @@ mod tests {
             "Payload": {
               "target": "example#Bytes",
               "traits": {"smithy.api#httpPayload": {}}
+            },
+            "At": {"target": "smithy.api#Timestamp"},
+            "Count": {"target": "smithy.api#Long"},
+            "Stamps": {"target": "example#Stamps"},
+            "Header": {
+              "target": "example#Instant",
+              "traits": {"smithy.api#httpHeader": "X-At"}
             }
           }
         },
         "example#Nested": {
           "type": "structure",
-          "members": {"Inner": {"target": "example#Bytes"}}
+          "members": {
+            "Inner": {"target": "example#Bytes"},
+            "InnerAt": {"target": "example#Instant"}
+          }
         },
         "example#Entries": {"type": "list", "member": {"target": "example#Bytes"}},
+        "example#Stamps": {"type": "list", "member": {"target": "example#Instant"}},
         "example#Held": {
           "type": "map",
           "key": {"target": "smithy.api#String"},
           "value": {"target": "example#Bytes"}
         },
         "example#Bytes": {"type": "blob"},
+        "example#Instant": {"type": "timestamp"},
         "example#Streamed": {"type": "blob", "traits": {"smithy.api#streaming": {}}}
       }
     }"#;
+
+    /// The plan of one kind, read off the model above.
+    fn plan(kind: Materialised) -> AnswerPlan {
+        AnswerPlan::of(MODEL, kind)
+    }
 
     /// Every blob value an answer carries is reported by its path, at whatever depth and
     /// under whichever name the wire carried it — and a value that is not one is not.
     #[test]
     fn every_blob_value_of_an_answer_is_reported_by_its_path() {
-        let plan = BlobPlan::of(MODEL);
+        let plan = plan(Materialised::Bytes);
         // Each row: the answer document, and the paths its blob values sit at.
         let cases: &[(&str, Value, Value)] = &[
             (
@@ -559,7 +653,7 @@ mod tests {
     /// report no path rather than guessing at the answer's shape.
     #[test]
     fn an_operation_whose_answer_carries_no_bytes_reports_no_path() {
-        let plan = BlobPlan::of(MODEL);
+        let plan = plan(Materialised::Bytes);
         let document = json!({"Value": "AAE=", "Entries": ["AAE="]});
         for operation in ["Write", "ReadOutput", "Describe", ""] {
             let paths = plan.answer_paths(operation, &document);
@@ -576,7 +670,7 @@ mod tests {
     /// `SecretString`, so one is reported and the other is not.
     #[test]
     fn a_blob_member_of_an_embedded_services_model_is_reported() {
-        let plan = BlobPlan::of(super::super::aws_api::SECRETSMANAGER_MODEL);
+        let plan = AnswerPlan::of(super::super::aws_api::SECRETSMANAGER_MODEL, Materialised::Bytes);
         let paths = plan.answer_paths(
             "GetSecretValue",
             &json!({"SecretBinary": "AAE=", "SecretString": "text", "Name": "a-secret"}),
@@ -594,7 +688,7 @@ mod tests {
     /// put them.
     #[test]
     fn a_blob_nested_in_an_embedded_services_model_is_reported_at_its_depth() {
-        let plan = BlobPlan::of(super::super::aws_api::DYNAMODB_MODEL);
+        let plan = AnswerPlan::of(super::super::aws_api::DYNAMODB_MODEL, Materialised::Bytes);
         let paths = plan.answer_paths(
             "GetItem",
             &json!({
@@ -617,6 +711,101 @@ mod tests {
                 "Item.set.BS.1".to_string(),
             ],
             "expected every blob of the item at its own depth, got {paths:?}"
+        );
+    }
+
+    /// Every value an answer carries for a member the model types as a TIMESTAMP is reported by
+    /// its path, at whatever depth — and a number the model types as anything else is not.
+    #[test]
+    fn every_timestamp_value_of_an_answer_is_reported_by_its_path() {
+        let plan = plan(Materialised::Instant);
+        // Each row: the answer document, and the paths its timestamp values sit at.
+        let cases: &[(&str, Value, Value)] = &[
+            (
+                "a timestamp member of the output structure",
+                json!({"At": 1_761_000_000, "Text": "not an instant"}),
+                json!([["At"]]),
+            ),
+            (
+                "a timestamp carrying a fraction of a second",
+                json!({"At": 1_761_000_000.5_f64}),
+                json!([["At"]]),
+            ),
+            (
+                "a timestamp inside a structure the output carries",
+                json!({"Nested": {"InnerAt": 0}}),
+                json!([["Nested", "InnerAt"]]),
+            ),
+            (
+                "a timestamp at each index of a list",
+                json!({"Stamps": [1, 2]}),
+                json!([["Stamps", 0], ["Stamps", 1]]),
+            ),
+            (
+                "a timestamp beside a blob and a long, each at its own path",
+                json!({"At": 1, "Value": "AAE=", "Count": 1_761_000_000_000_i64}),
+                json!([["At"]]),
+            ),
+            (
+                "a member the model types as a long, which is not an instant",
+                json!({"Count": 1_761_000_000_000_i64}),
+                json!([]),
+            ),
+            (
+                "a timestamp the answer binds to a header, whose form is that binding's",
+                json!({"Header": 1}),
+                json!([]),
+            ),
+            (
+                "an answer carrying none of them",
+                json!({"Text": "1761000000", "Value": "AAE="}),
+                json!([]),
+            ),
+        ];
+        for (case, document, expected) in cases {
+            let paths = plan.answer_paths("Read", document);
+            let expected = rendered(expected.as_array().expect("the expectation is a list"));
+            assert_eq!(
+                rendered(&paths),
+                expected,
+                "case {case:?}: expected the timestamp paths {expected:?}, got {paths:?}"
+            );
+        }
+    }
+
+    /// The instant plan read out of a model this crate really embeds, for operations the issue
+    /// that prompted it did not cite: DynamoDB's `ListBackups` carries one timestamp per backup
+    /// summary, at the depth the listing puts it, and `GetItem` carries none at all — an item's
+    /// attribute values have no timestamp type.
+    #[test]
+    fn a_timestamp_member_of_an_embedded_services_model_is_reported_at_its_depth() {
+        let plan = AnswerPlan::of(super::super::aws_api::DYNAMODB_MODEL, Materialised::Instant);
+        let paths = plan.answer_paths(
+            "ListBackups",
+            &json!({
+                "BackupSummaries": [
+                    {
+                        "TableName": "items",
+                        "BackupCreationDateTime": 1_761_000_000,
+                        "BackupExpiryDateTime": 1_761_000_001,
+                    },
+                    {"TableName": "other", "BackupCreationDateTime": 1_761_000_002},
+                ],
+            }),
+        );
+        assert_eq!(
+            rendered(&paths),
+            vec![
+                "BackupSummaries.0.BackupCreationDateTime".to_string(),
+                "BackupSummaries.0.BackupExpiryDateTime".to_string(),
+                "BackupSummaries.1.BackupCreationDateTime".to_string(),
+            ],
+            "expected every timestamp of the listing at its own depth, got {paths:?}"
+        );
+        let item = plan.answer_paths("GetItem", &json!({"Item": {"at": {"N": "1761000000"}}}));
+        assert!(
+            item.is_empty(),
+            "expected no instant in an item's attribute values, got {item:?}"
         );
     }
 }

@@ -52,7 +52,12 @@
 //!   made-up success.
 //! * A `Date` a handler puts on a timestamp member travels as the seconds since the epoch
 //!   an AWS JSON protocol carries a timestamp as, which is the form a v3 client sends one
-//!   in — not the ISO text a `Date` reports itself as.
+//!   in — not the ISO text a `Date` reports itself as. An answer's own timestamp members come
+//!   back the other way round: a member the called service's model types as a timestamp is
+//!   handed over as the `Date` a v3 client materialises from the epoch seconds the answer
+//!   carried ([`super::blob_members`] says WHICH of an answer's values those are), so a handler
+//!   reads `d instanceof Date`, `d.getTime()` and `d.toISOString()` off one exactly as it does
+//!   on a managed runtime.
 //! * Nothing here is the containment. Which services can be reached, the bounds on a call
 //!   and the signature it carries are all host code's ([`super::aws_api`], [`super::node`]).
 
@@ -502,12 +507,12 @@ function collectedBody(base64Text) {
     return bytes;
 }
 
-// Every OTHER value an answer carries BYTES in is handed over as the byte array a v3 client
-// gives a caller for a blob member, decoded from the base64 a JSON protocol travels it as.
-// `path` is the keys and indices that reach the one value from the document's root, as the
-// runtime read them out of the called operation's own model; a path this document does not
-// hold, or a value that is not that text, is left exactly as it arrived.
-function materialiseBytes(document, path) {
+// The value ONE path reaches, replaced by what `convert` makes of it. `path` is the keys and
+// indices that reach that value from the document's root, as the runtime read them out of the
+// called operation's own model; a path this document does not hold is left alone, and so is a
+// value `convert` answers `undefined` for — one that did not arrive in the form the protocol
+// carries that kind of value in.
+function materialise(document, path, convert) {
     if (!Array.isArray(path) || path.length === 0) {
         return;
     }
@@ -522,9 +527,39 @@ function materialiseBytes(document, path) {
         return;
     }
     var last = path[path.length - 1];
-    if (typeof held[last] === 'string') {
-        held[last] = new Uint8Array(globalThis.Buffer.from(held[last], 'base64'));
+    var made = convert(held[last]);
+    if (made !== undefined) {
+        held[last] = made;
     }
+}
+
+// Every OTHER value an answer carries BYTES in is handed over as the byte array a v3 client
+// gives a caller for a blob member, decoded from the base64 a JSON protocol travels it as.
+function materialiseBytes(document, path) {
+    materialise(document, path, function (held) {
+        return typeof held === 'string'
+            ? new Uint8Array(globalThis.Buffer.from(held, 'base64'))
+            : undefined;
+    });
+}
+
+// Every value an answer carries an INSTANT in is handed over as the `Date` a v3 client gives a
+// caller for a member its service's model types as a timestamp: an AWS JSON protocol carries one
+// as the SECONDS since the epoch — whole or fractional — which is that many thousand
+// milliseconds, and a member whose own trait states the ISO text instead carries that text. A
+// value in neither form is left exactly as it arrived rather than handed over as an invalid
+// date.
+function materialiseInstant(document, path) {
+    materialise(document, path, function (held) {
+        if (typeof held === 'number') {
+            return Number.isFinite(held) ? new Date(held * 1000) : undefined;
+        }
+        if (typeof held !== 'string') {
+            return undefined;
+        }
+        var parsed = new Date(held);
+        return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+    });
 }
 
 function notMade(answered) {
@@ -740,6 +775,12 @@ Client.prototype.send = function (command) {
             if (typeof document[member] === 'string') {
                 document[member] = collectedBody(document[member]);
             }
+        });
+        var instants = answered.instants === undefined || answered.instants === null
+            ? []
+            : answered.instants;
+        instants.forEach(function (path) {
+            materialiseInstant(document, path);
         });
         document.$metadata = {
             httpStatusCode: answered.status,

@@ -223,7 +223,9 @@ mod sdk_call;
 /// Binding one of those calls to HTTP for a service whose protocol is `restJson1`.
 pub mod rest_json;
 
-/// WHICH values of an answered call carry BYTES, which the called service's own model says.
+/// WHICH values of an answered call an SDK MATERIALISES rather than hand over as the text or
+/// the number the wire carried — its bytes and its instants — which the called service's own
+/// model says.
 pub mod blob_members;
 
 /// The AUTHENTICATION TOKEN the SDK mints in the CLIENT for a handler connecting to a

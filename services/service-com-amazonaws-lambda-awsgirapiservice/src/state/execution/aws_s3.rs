@@ -1135,6 +1135,11 @@ impl Observed {
             // than as a member of a JSON document, so the bytes of this answer are the ones
             // `streams` names and no value of its document is base64.
             blobs: Vec::new(),
+            // WHERE this answer carries an INSTANT is read where every protocol's is
+            // ([`super::aws_api::AwsAccess::call_within`]), from the called operation's own
+            // model: the document above states a timestamp as the epoch seconds a JSON
+            // protocol carries one as ([`super::sdk_call::insert_timestamp`]).
+            instants: Vec::new(),
             // The object bytes an S3 answer carries are a `@streaming` payload, which is what
             // `streams` names, so no answer of its binds a collected payload blob either.
             payload_blobs: Vec::new(),
@@ -1177,6 +1182,7 @@ fn refused<E: ProvideErrorMetadata>(
         error_members: ::std::collections::BTreeMap::new(),
         streams: Vec::new(),
         blobs: Vec::new(),
+        instants: Vec::new(),
         payload_blobs: Vec::new(),
     })
 }
@@ -1216,6 +1222,7 @@ fn refused_without_a_document<E: ProvideErrorMetadata>(
         error_members: ::std::collections::BTreeMap::new(),
         streams: Vec::new(),
         blobs: Vec::new(),
+        instants: Vec::new(),
         payload_blobs: Vec::new(),
     })
 }

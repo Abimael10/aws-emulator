@@ -13,8 +13,10 @@
 //! exception classes are built from (`crate::state::execution::aws_sdk_guest`, the Python SDK,
 //! asks the same question), which members each of those shapes declares — what a client hands
 //! the caller beside a refusal's code and message — which members it generates a value for when
-//! the caller leaves them out (`crate::state::execution::idempotency_token`) and how a
-//! paginator of it pages one operation through (the same Python SDK's `client.get_paginator`).
+//! the caller leaves them out (`crate::state::execution::idempotency_token`), how a
+//! paginator of it pages one operation through (the same Python SDK's `client.get_paginator`)
+//! and which of an ANSWER's values a client materialises as an instant rather than hand over as
+//! the epoch seconds a JSON protocol carries a timestamp as.
 //!
 //! It states none of those itself: they are read out of the target service's own Smithy
 //! model — the same file that service's emulator crate is generated from, embedded by
@@ -29,6 +31,7 @@ use ::std::sync::{Arc, OnceLock};
 use ::serde_json::Value;
 
 use crate::state::execution::aws_api;
+use crate::state::execution::blob_members::{AnswerPlan, Materialised};
 
 /// What one service's model states for a client of it, beside the client class and the base
 /// exception its own name gives ([`super`]).
@@ -65,6 +68,15 @@ pub struct ClientExports {
     /// operation the model does not mark is not held at all, which is what makes a client
     /// report it as one that cannot be paginated.
     pub pagination: BTreeMap<String, Pagination>,
+    /// WHERE each operation's answer carries an INSTANT: the plan that answers, for one answer
+    /// document, the path of every value the model types as a `timestamp`
+    /// ([`crate::state::execution::blob_members`]).
+    ///
+    /// A JSON protocol carries a timestamp as the seconds since the epoch, and an SDK hands the
+    /// caller its language's own instant for one — a `Date` in JavaScript — because the model
+    /// says which members are timestamps. So the same reading of the model that says which
+    /// names a client package exports says which of an answer's values a client materialises.
+    pub answer_instants: AnswerPlan,
 }
 
 /// How ONE operation is paged through, as its own model states it (`@paginated`).
@@ -228,6 +240,9 @@ fn exports_of(model: &str) -> ClientExports {
         operation_errors,
         idempotency_tokens,
         pagination,
+        // Read from the SAME parse of the same model: which of an answer's values a client of
+        // this service materialises as an instant is a fact of its model like the rest.
+        answer_instants: AnswerPlan::of_shapes(&shapes, Materialised::Instant),
     }
 }
 

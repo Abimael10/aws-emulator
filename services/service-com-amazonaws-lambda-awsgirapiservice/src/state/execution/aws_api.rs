@@ -2326,7 +2326,18 @@ impl AwsAccess {
         let body = filled.as_deref().unwrap_or(body);
         match ::tokio::time::timeout(within, self.dispatched(api, region, operation, body)).await
         {
-            Ok(answer) => answer,
+            // WHERE the answer carries an INSTANT: a JSON protocol carries a timestamp as the
+            // seconds since the epoch, and the SDK the guest calls hands the caller its own
+            // language's instant for one, so the host says which of the answer's values those
+            // are ([`super::blob_members`]). Read HERE, after the dispatch, so every protocol
+            // this seam reaches is served by one reading: a service whose answer is built from
+            // the output members its own client reported ([`super::sdk_call`]) states its
+            // instants in the same form a JSON body carries them in.
+            Ok(Ok(answer)) => Ok(Answer {
+                instants: answer_instants(api.sdk_token, operation, &answer).await,
+                ..answer
+            }),
+            Ok(refused) => refused,
             Err(_elapsed) => Err(Refusal::TimedOut),
         }
     }
@@ -2681,6 +2692,15 @@ pub struct Answer {
     /// of its bytes, and the SDK the guest calls hands over the BYTES, so a handler reads
     /// bytes where it reads bytes on a managed runtime. Empty for an answer carrying none.
     pub blobs: Vec<::serde_json::Value>,
+    /// WHERE in [`Self::body`] the answer carries an INSTANT: one path per value the called
+    /// operation's own model types as a `timestamp` ([`super::blob_members`]), in the same form
+    /// [`Self::blobs`] takes.
+    ///
+    /// A JSON protocol carries a timestamp as the seconds since the epoch, and the SDK the
+    /// guest calls hands the caller its language's own instant for one — a `Date` in JavaScript
+    /// — so a handler reads an instant where it reads one on a managed runtime. Empty for an
+    /// answer carrying none, and for every refusal.
+    pub instants: Vec<::serde_json::Value>,
     /// The member a REST-bound answer binds to the WHOLE body whose shape is a blob the model
     /// does NOT mark `@streaming`, as the base64 of the body's own bytes.
     ///
@@ -2906,6 +2926,12 @@ async fn sent(
         }
         _ => Vec::new(),
     };
+    // WHERE the answer carries an INSTANT is the called service's own model's to say as well,
+    // and it is read in ONE place for every protocol this seam reaches
+    // ([`AwsAccess::call_within`]), because a service whose answer this seam builds from the
+    // output members its own client reported hands its instants over in the same form a JSON
+    // body carries them in.
+    let instants = Vec::new();
     // WHICH members a REFUSAL carries is the called service's own model's to say too: an error
     // shape is a structure, and a client hands its members to the caller beside the code and the
     // message. Read on a blocking thread for the same reason the answer's blob paths are.
@@ -2929,8 +2955,44 @@ async fn sent(
         error_members,
         streams,
         blobs,
+        instants,
         payload_blobs,
     })
+}
+
+/// WHERE the answer of a call to the service `token` carries an INSTANT: one path per value
+/// `answered` holds that the called operation's own model types as a `timestamp`
+/// ([`super::blob_members`]).
+///
+/// A JSON protocol carries a timestamp as the seconds since the epoch, and every AWS SDK hands
+/// the caller its own language's instant for one, because the model says which members are
+/// timestamps. The answer is read from the same held reading of that model every other question
+/// about the called service is answered from ([`super::sdk_model::client_exports`]).
+///
+/// Nothing is reported for a REFUSAL: an answer that is not a success carries no output member
+/// at all. The reading runs on a BLOCKING THREAD of the runtime for the reason the blob paths
+/// are read on one: reading a service's model for the first time in this process parses a
+/// document of several megabytes, and the thread this is called on is the RUN's own, whose
+/// faulted pages are what the invocation's memory ceiling is measured from.
+async fn answer_instants(
+    token: &'static str,
+    operation: &str,
+    answered: &Answer,
+) -> Vec<::serde_json::Value> {
+    if !(200..300).contains(&answered.status) {
+        return Vec::new();
+    }
+    let operation = operation.to_string();
+    let body = answered.body.clone();
+    ::tokio::task::spawn_blocking(move || {
+        let document =
+            ::serde_json::from_str::<::serde_json::Value>(&body).unwrap_or(::serde_json::Value::Null);
+        super::sdk_model::client_exports(token)
+            .answer_instants
+            .answer_paths(&operation, &document)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// The members the error shape a refusal named declares, as the SDK the guest calls reports

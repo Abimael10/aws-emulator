@@ -411,6 +411,11 @@ impl Observed {
             error_members: ::std::collections::BTreeMap::new(),
             streams: Vec::new(),
             blobs: Vec::new(),
+            // WHERE this answer carries an INSTANT is read where every protocol's is
+            // ([`super::aws_api::AwsAccess::call_within`]), from the called operation's own
+            // model: the document above states a timestamp as the epoch seconds a JSON
+            // protocol carries one as ([`insert_timestamp`]).
+            instants: Vec::new(),
             payload_blobs: Vec::new(),
         })
     }
@@ -460,6 +465,7 @@ impl Observed {
             error_members: ::std::collections::BTreeMap::new(),
             streams: Vec::new(),
             blobs: Vec::new(),
+            instants: Vec::new(),
             payload_blobs: Vec::new(),
         })
     }

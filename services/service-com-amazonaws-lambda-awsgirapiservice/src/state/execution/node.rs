@@ -967,6 +967,7 @@ fn call_answer(answered: &Result<Answer, Refusal>) -> String {
         "errorMembers": answer.error_members,
         "streams": answer.streams,
         "blobs": answer.blobs,
+        "instants": answer.instants,
         "payloadBlobs": answer.payload_blobs,
     })
     .to_string()
