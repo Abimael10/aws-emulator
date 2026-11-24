@@ -663,6 +663,10 @@ impl StoredStack {
                 .iter()
                 .map(|resource| (resource.logical_id.clone(), resource.clone()))
                 .collect();
+            let resolved_before: Vec<::serde_json::Value> = resources
+                .iter()
+                .map(|resource| resource.properties.clone())
+                .collect();
             template::resolve_properties(
                 &declared,
                 &mut resources,
@@ -672,6 +676,12 @@ impl StoredStack {
                 },
                 &mut budget,
             );
+            // ...and an attribute a record publishes STRAIGHT FROM one of those properties
+            // moves with it ([`republish_declared_attributes`]): the value the deployment
+            // publishes for it is the one the property resolves to now.
+            for (resource, before) in resources.iter_mut().zip(&resolved_before) {
+                republish_declared_attributes(resource, before);
+            }
         }
         // ...and a resource an `UpdatePolicy` asks this deployment to REPLACE rather than
         // change takes a physical name of its own, now that the identities in force are
@@ -3986,6 +3996,40 @@ pub(super) fn published_from_a_declared_property(resource: &StoredResource) -> B
 /// that integration, the response of that route — and bounded, so no template can make the
 /// walk go on indefinitely.
 const MAX_IDENTITY_PASSES: usize = 4;
+
+/// Re-publish the attributes `resource` publishes STRAIGHT FROM a declared property
+/// ([`published_from_a_declared_property`]), now that its properties have been resolved
+/// against the identities in force — `previously` being what they resolved to before that.
+///
+/// "Fn::GetAtt returns the value of an attribute from a resource in the template": such an
+/// attribute IS the property, so a property that resolves to another value — a reference to a
+/// resource whose identity its owning service MINTED, re-resolved once that identity is in
+/// force — publishes that value under the attribute's name too. Without this the record goes
+/// on publishing the STAND-IN the naming rules computed before the identity existed, and every
+/// reader of it reads an identifier nothing answers to: an output or another resource's
+/// property that `Fn::GetAtt`s it, and the calls this stack itself makes about the resource,
+/// which are addressed by the attributes its record carries.
+///
+/// Only an attribute whose value is exactly what the property resolved to BEFORE is moved: a
+/// value the resource's own type publishes as its return value is not a copy of a declared
+/// property, so nothing recomputed here may overwrite it.
+fn republish_declared_attributes(resource: &mut StoredResource, previously: &::serde_json::Value) {
+    let names: Vec<String> = resource.attributes.keys().cloned().collect();
+    for name in names {
+        let (Some(was), Some(now)) = (
+            previously.get(&name).and_then(super::scalar_text),
+            resource.properties.get(&name).and_then(super::scalar_text),
+        ) else {
+            continue;
+        };
+        if was == now {
+            continue;
+        }
+        if resource.attributes.get(&name) == Some(&was) {
+            resource.attributes.insert(name, now);
+        }
+    }
+}
 
 /// Give every record of a deployment the identity in force for the resource it declares, and
 /// answer whether any of them took one over that the properties were NOT resolved against.
