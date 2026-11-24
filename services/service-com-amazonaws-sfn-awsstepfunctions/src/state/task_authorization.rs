@@ -701,19 +701,19 @@ pub fn acting<Eng: Send + Sync + 'static>(
     }
 }
 
-/// What the task a run-a-job (`.sync`) pattern is parked at fails with when the
-/// execution role `role_arn` may not make `call` — the
-/// call that REPORTS its job — on
-/// `resource`, the ARN of the resource that job belongs to; `None` when nothing of the
-/// kind can be shown (see the module docs).
+/// The REFUSAL the call that reports a run-a-job (`.sync`) pattern's job answers with
+/// when the execution role `role_arn` may not make `call` on `resource`, the ARN of the
+/// resource that job belongs to; `None` when nothing of the kind can be shown (see the
+/// module docs).
 ///
 /// The pattern's own calls are the execution's too: Step Functions polls the job acting
 /// as the same role the starting call was made as, so a role whose policies do not
-/// allow the reporting call makes that poll not happen. The task was already submitted
-/// and the job is really running, so what the failure says is not a status — nothing
-/// reported one — but that the task's own work failed: ASL's
-/// [`TASK_FAILED_ERROR`], carrying the refusal the invoked service answers an
-/// unauthorized call with, exactly as the starting call's refusal carries it.
+/// allow the reporting call makes that poll not happen. What the task parked at the job
+/// is then left with is the integration's own
+/// ([`super::integration::ReportDenial`], applied by [`super::run_a_job`]): this is the
+/// refusal itself, worded as the invoked service words an unauthorized call, under ASL's
+/// [`TASK_FAILED_ERROR`] for the integration whose poll surfaces it, exactly as the
+/// starting call's refusal is.
 ///
 /// The poll is a call of its own, made under a session of its own
 /// ([`new_session_name`]).

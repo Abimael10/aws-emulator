@@ -50,8 +50,11 @@
 //! The execution role, as the starting call was made as: the reporting call is the
 //! execution's own call, so the policies in force on that role decide whether it is
 //! made ([`super::task_authorization::job_report_denial`]). A role that may not report
-//! the job leaves nothing to read about it, and the task was already submitted, so it
-//! fails with that refusal rather than with a status nothing answered.
+//! the job leaves nothing to read about it, and what that leaves the task with is the
+//! integration's own ([`integration::ReportDenial`]): one integration's poll surfaces
+//! the refusal and fails the task with it, while another's takes a refused report as no
+//! observation of the job at all — the task stays submitted, so the time the state
+//! allowed it is what ends the execution, with no failure of the task reported.
 
 use std::sync::Arc;
 
@@ -157,23 +160,23 @@ async fn poll<Eng: Send + Sync + 'static>(
             integration::describing(task.api, task.family, task.job, &task.job_id, &task.naming);
         // The poll is one of the execution's own calls, so the policies in force on
         // its role decide whether it is made: a role that may not report the job
-        // cannot be told what the job did, and the task it belongs to has already been
-        // submitted — so the task fails with that refusal instead of with a status
-        // nothing answered. Decided with no store of this service locked.
-        let denied = task
-            .acts_on
-            .as_deref()
-            .and_then(|resource| {
-                super::task_authorization::job_report_denial(
-                    &**engine,
-                    &role_arn,
-                    &call,
-                    resource,
-                )
-            })
-            .map(asl::reported);
+        // cannot be told what the job did. What that leaves the task with is the
+        // integration's own ([`integration::ReportDenial`]): the refusal is the task's
+        // failure for an integration whose poll surfaces it, and for one whose poll
+        // takes it as no observation of the job at all the task stays submitted — so
+        // the time the state allowed it is what ends the execution, through the same
+        // settle above that ends any other parked job's. Decided with no store of this
+        // service locked.
+        let denied = task.acts_on.as_deref().and_then(|resource| {
+            super::task_authorization::job_report_denial(&**engine, &role_arn, &call, resource)
+        });
         if let Some(refusal) = denied {
-            resolve(engine, callback, depth, execution_arn, &task, Err(refusal)).await;
+            if task.job.report_denial == integration::ReportDenial::FailsTheTask {
+                // Converted the one way this service converts what a call answered
+                // ([`asl::reported`]), as the starting call's own refusal is.
+                let failed = asl::reported(refusal);
+                resolve(engine, callback, depth, execution_arn, &task, Err(failed)).await;
+            }
             continue;
         }
         let reported = integration::call_api(callback, &task.region, &call, &request).await;

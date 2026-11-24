@@ -86,6 +86,9 @@ pub struct RunAJob {
     /// access request each is subject to ([`JobTarget`]); `None` for an integration
     /// whose target resource is not stated, whose calls are then made as before.
     pub acts_on: Option<JobTarget>,
+    /// What a refusal of the REPORTING call does to the task that started the job
+    /// ([`ReportDenial`]).
+    pub report_denial: ReportDenial,
     /// How long the invoked service holds a job it has just accepted before its own
     /// clock can have given it an outcome — the span that service's submission falls
     /// due after.
@@ -123,6 +126,29 @@ pub enum JobTarget {
 /// The members of the starting request that name the job, beside its own identifier
 /// ([`RunAJob::names_job_with`]), as the calls that report and stop it carry them.
 pub type JobNaming = ::std::collections::BTreeMap<String, String>;
+
+/// What an authorization refusal of the call that REPORTS a job does to the task the
+/// job belongs to.
+///
+/// Such a refusal is not an answer ABOUT the job: it says the execution role may not
+/// ask, and says nothing about what the job did. So the task is left with one of two
+/// readings, and which one is the integration's own behaviour rather than a rule that
+/// holds for every one of them — the completion poll is each optimized integration's
+/// own piece of Step Functions, and they do not agree. It is therefore stated per
+/// entry, from what each integration is OBSERVED to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportDenial {
+    /// The refusal is the task's own failure: the job was submitted and the pattern
+    /// surfaces what the report answered, so the task fails with it
+    /// ([`crate::state::task_authorization::job_report_denial`]).
+    FailsTheTask,
+    /// The refusal leaves the job UNOBSERVED: the task stays submitted, because
+    /// nothing has said the job reached a terminal status, so it is the time the state
+    /// allowed its task that ends it — the Amazon States Language's own timeout
+    /// ([`crate::state::JobTask::times_out_at`], which reports
+    /// [`crate::state::TASK_TIMEOUT_ERROR`]) — and no failure of the task is reported.
+    LeavesTheJobUnobserved,
+}
 
 impl RunAJob {
     /// The members of the starting call's `request` that the calls which REPORT and
@@ -337,6 +363,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the EXECUTION the start minted, whose ARN
         // is the identifier it answered.
         acts_on: Some(JobTarget::Identifier),
+        // RECORDED: a nested execution whose role may not report it fails its parent's
+        // task with the refusal of that report, so the pattern surfaces it here.
+        report_denial: ReportDenial::FailsTheTask,
         // A child execution is THIS service's own job, and its outcome falls due one
         // settle delay after the start that minted it
         // ([`crate::state::EXECUTION_SETTLE_DELAY`]), so that is the span it is held
@@ -378,6 +407,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the WORKGROUP the query runs in, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("athena:startQueryExecution")),
+        // RECORDED: a query whose role may not report it fails the task with the
+        // refusal of that report, so this integration's poll surfaces it.
+        report_denial: ReportDenial::FailsTheTask,
         // A submitted query is QUEUED — "the query has been submitted to the service,
         // and Athena will execute the query as soon as resources are available" — and
         // then RUNNING before it completes, which in this emulator is the span an
@@ -423,6 +455,12 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the JOB the run belongs to, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("glue:startJobRun")),
+        // RECORDED: a run whose role may not report it does NOT fail the task. The
+        // execution keeps its submission, gains neither a succeeded nor a failed task,
+        // and ends on the time the state allowed its task — the run itself goes on to
+        // its own terminal state in Glue, the denial being on observing it rather than
+        // on running it.
+        report_denial: ReportDenial::LeavesTheJobUnobserved,
         // A started run is STARTING before it is RUNNING, each for the span an accepted
         // submission's outcome falls due after ([`JOB_SETTLES_AFTER`]), so one span is
         // the soonest the run can have reported anything at all.

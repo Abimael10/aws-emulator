@@ -863,6 +863,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             return;
         }
         let before = execution.retained_bytes;
+        // A `TaskTimedOut` event names the work its state asked for, required on that
+        // event's details, and the names are the ones the state's own scheduling already
+        // recorded ([`Execution::recorded_work`]); an ACTIVITY's own event reports no
+        // such names, the model giving its details none.
+        let work = match task.activity_arn {
+            Some(_) => EventDetails::default(),
+            None => execution.recorded_work(&task.state_name),
+        };
         execution.pending = None;
         execution.status = EXECUTION_STATUS_FAILED.to_string();
         execution.stop_date = Some(due);
@@ -880,10 +888,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             timed_out,
             &task.state_name,
             due,
-            EventDetails::of_failure(
-                Some(TASK_TIMEOUT_ERROR.to_string()),
-                execution.cause.clone(),
-            ),
+            EventDetails {
+                error: Some(TASK_TIMEOUT_ERROR.to_string()),
+                cause: execution.cause.clone(),
+                ..work
+            },
         );
         execution.push_detailed_event(
             EVENT_EXECUTION_FAILED,
@@ -1247,6 +1256,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             return;
         }
         let before = execution.retained_bytes;
+        // The names a `TaskTimedOut` event reports the work under are required on its
+        // details, and they are the ones the task's own submission already recorded
+        // ([`Execution::recorded_work`]).
+        let work = execution.recorded_work(&task.state_name);
         execution.pending = None;
         execution.status = EXECUTION_STATUS_FAILED.to_string();
         execution.stop_date = Some(due);
@@ -1263,10 +1276,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         execution.push_detailed_event(
             EVENT_TASK_TIMED_OUT,
             due,
-            EventDetails::of_failure(
-                Some(TASK_TIMEOUT_ERROR.to_string()),
-                execution.cause.clone(),
-            ),
+            EventDetails {
+                error: Some(TASK_TIMEOUT_ERROR.to_string()),
+                cause: execution.cause.clone(),
+                ..work
+            },
         );
         execution.push_detailed_event(
             EVENT_EXECUTION_FAILED,
@@ -3429,6 +3443,38 @@ pub struct Stopped {
     /// The job a run-a-job task of this execution had started and nothing has
     /// finished, for the caller to stop through that job's own service.
     pub parked: Option<JobTask>,
+}
+
+impl Execution {
+    /// The names the events of the `Task` state `state_name` report its WORK under —
+    /// "the service name of the resource in a task state" and "the action of the
+    /// resource called by a task state", which the model makes required on each of
+    /// that family's event details — as the last event of that state recorded them.
+    ///
+    /// Read off the history rather than derived a second time, so every event of one
+    /// task's work names that work alike: an event the CLOCK writes — the task that
+    /// ran out of the time its state allowed it — names what the state's own
+    /// scheduling or submission named.
+    ///
+    /// Empty only for a state whose history holds no event naming its work, where
+    /// there is nothing to report: a task the clock can close was SCHEDULED or
+    /// SUBMITTED by the walk first, and each of those events names the work, so the
+    /// events written from this carry those names.
+    pub(super) fn recorded_work(&self, state_name: &str) -> EventDetails {
+        self.history
+            .iter()
+            .rev()
+            .find(|event| {
+                event.state_name.as_deref() == Some(state_name)
+                    && event.details.resource.is_some()
+                    && event.details.resource_type.is_some()
+            })
+            .map_or_else(EventDetails::default, |event| EventDetails {
+                resource_type: event.details.resource_type.clone(),
+                resource: event.details.resource.clone(),
+                ..EventDetails::default()
+            })
+    }
 }
 
 /// One worker's open poll of an activity, counted against [`MAX_ACTIVITY_POLLERS`].
