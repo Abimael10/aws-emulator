@@ -40,6 +40,10 @@ const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000000";
 /// the not-found rows read.
 const UNMINTED_EXECUTION: &str = "8e58232c-89af-4f1d-89b5-0ebc79aa8b03";
 
+/// A notebook id this suite never created, which is what the scaffold row names: the row's
+/// subject is the header a 501 carries, so the id only has to satisfy the modelled member.
+const UNMINTED_NOTEBOOK: &str = "a3c0e8f6-4b2d-4a21-9f1c-6d5b7e8a9c04";
+
 /// One answer of this service: the call that produces it, and the status it comes back
 /// with.
 struct Answer {
@@ -124,8 +128,8 @@ async fn answers(router: &MultiServiceRouter) -> Vec<Answer> {
         Answer {
             // The scaffold's 501: an answer a still-stubbed operation produced.
             case: "a scaffolded operation's 501",
-            operation: "ListApplicationDPUSizes",
-            body: json!({}),
+            operation: "DeleteNotebook",
+            body: json!({ "NotebookId": UNMINTED_NOTEBOOK }),
             status: Some(501),
         },
         Answer {

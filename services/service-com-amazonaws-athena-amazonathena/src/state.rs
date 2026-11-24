@@ -217,6 +217,10 @@ pub use work_group_deletion::*;
 mod engine_versions;
 pub use engine_versions::*;
 
+/// The application runtimes this service publishes, and the DPU sizes each one supports.
+mod application_dpu_sizes;
+pub use application_dpu_sizes::*;
+
 /// What a workgroup's configuration holds when nobody said, and what a read reports for it.
 mod work_group_configuration;
 pub use work_group_configuration::*;
