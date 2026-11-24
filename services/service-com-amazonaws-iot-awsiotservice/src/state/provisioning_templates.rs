@@ -179,11 +179,27 @@ pub fn template_versions_limit_message(template_name: &str) -> String {
     )
 }
 
+/// The sentence a `templateBody` this service cannot read as a provisioning template is
+/// refused with: the modelled `InvalidRequestException` (HTTP 400).
+///
+/// `templateBody` is "The JSON formatted contents of the provisioning template"
+/// (`smithy_query(query="operation",operation="CreateProvisioningTemplate")`), so what the
+/// refusal states is that the document given is no such template. The sentence is entirely
+/// fixed text: it names no position in the body, carries no parser's complaint and echoes
+/// nothing the request sent, because WHERE the document stops being a template is this
+/// service's own reading of it and not part of what AWS answers.
+pub const INVALID_TEMPLATE_BODY_MESSAGE: &str = "The template body is invalid";
+
 /// Why a string is not a provisioning template body.
+///
+/// Every variant is refused with the one sentence
+/// ([`INVALID_TEMPLATE_BODY_MESSAGE`]) — the distinction is this service's reading of
+/// the document, not something the caller is told — and the variants exist so the
+/// reading itself stays legible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisioningTemplateBodyRejection {
-    /// It is not JSON at all; carries the parser's own complaint.
-    NotJson(String),
+    /// It is not JSON at all.
+    NotJson,
     /// It is JSON, but not a JSON object, so it cannot be a template body.
     NotAnObject,
     /// It carries no `Resources` at all.
@@ -191,17 +207,9 @@ pub enum ProvisioningTemplateBodyRejection {
 }
 
 impl ProvisioningTemplateBodyRejection {
-    /// What to tell the caller: the rule that was violated.
+    /// What to tell the caller: that the body is no provisioning template.
     pub fn message(&self) -> String {
-        match self {
-            Self::NotJson(complaint) => {
-                format!("templateBody is not a valid JSON document: {complaint}")
-            }
-            Self::NotAnObject => {
-                "templateBody must be a JSON object carrying Resources".to_string()
-            }
-            Self::MissingResources => "templateBody must carry Resources".to_string(),
-        }
+        INVALID_TEMPLATE_BODY_MESSAGE.to_string()
     }
 }
 
@@ -219,7 +227,7 @@ pub fn validate_provisioning_template_body(
     body: &str,
 ) -> Result<(), ProvisioningTemplateBodyRejection> {
     let document: ::serde_json::Value = ::serde_json::from_str(body)
-        .map_err(|complaint| ProvisioningTemplateBodyRejection::NotJson(complaint.to_string()))?;
+        .map_err(|_| ProvisioningTemplateBodyRejection::NotJson)?;
     let Some(members) = document.as_object() else {
         return Err(ProvisioningTemplateBodyRejection::NotAnObject);
     };
