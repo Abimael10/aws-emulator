@@ -29,6 +29,14 @@ use crate::workflow_execution_lifecycle::{
     error_code, full_defaults, merge, register_domain_body, string_at, Emulator,
 };
 
+/// `ListDomains`, the account-wide listing that selects on the very `RegistrationStatus`
+/// this suite's calls move, which is why it is a child of this suite rather than a second
+/// suite beside it. The `#[path]` is what keeps it one: this crate's `tests/all.rs`
+/// declares the suites directly under `tests/all/`, and a module of a `#[path]`-declared
+/// file resolves next to that file unless it says otherwise.
+#[path = "domain_deprecation/domain_listing.rs"]
+mod domain_listing;
+
 /// One type identity: `(name, version)` — the pair every SWF type record is keyed by.
 type TypeId = (&'static str, &'static str);
 

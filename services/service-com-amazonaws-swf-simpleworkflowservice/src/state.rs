@@ -254,6 +254,12 @@ pub const MAX_EXECUTION_PAGE_SIZE: usize = 1_000;
 /// `PageSize` maximum (range 0..1000).
 pub const MAX_TYPE_PAGE_SIZE: usize = 1_000;
 
+/// The page size a listing of the account's registered domains uses when the caller
+/// passes no `maximumPageSize` (the member defaults to `0`), so one unparameterised
+/// request cannot materialise a response that grows without bound. It is the modelled
+/// `PageSize` maximum (range 0..1000).
+pub const MAX_DOMAIN_PAGE_SIZE: usize = 1_000;
+
 /// The `timeoutType` of a decision task that was handed to a decider and not completed
 /// within its `startToCloseTimeout` ("The maximum duration for this decision task. The
 /// task is considered timed out if it doesn't completed within this duration."). One of
@@ -4300,6 +4306,54 @@ fn type_order_tag(reverse_order: bool) -> &'static str {
         "tr"
     } else {
         "tf"
+    }
+}
+
+/// A domain listing's `nextPageToken` for the next unread domain: the ordering the page
+/// was read in, then the domain `name` the page ended on.
+///
+/// A domain's `name` is its whole identity (the account holds one record per name), so
+/// the name alone is the total order a domain listing pages through — "the results are
+/// returned in ascending alphabetical order by name of the domains". Like
+/// [`encode_type_page_token`] the token names a POSITION IN THE ORDER rather than a
+/// stored record, so a domain registered, deprecated or undeprecated between two pages
+/// cannot invalidate it, and the direction is part of the token because "after this one"
+/// means something different in each of them.
+pub fn encode_domain_page_token(reverse_order: bool, name: &str) -> String {
+    // Hex-encoded for the same reason as [`encode_type_page_token`]: the token is a
+    // response member with no structure of its own, and a domain `name` may hold any
+    // character SWF's naming rule allows.
+    format!(
+        "{}{}",
+        domain_order_tag(reverse_order),
+        ::hex::encode(name)
+    )
+}
+
+/// The domain `name` a `nextPageToken` resumes AFTER, for a listing in `reverse_order`.
+pub fn decode_domain_page_token(token: &str, reverse_order: bool) -> Result<String, String> {
+    let rejected = || {
+        format!(
+            "nextPageToken {token:?} was not issued for a reverseOrder={reverse_order} listing \
+             of this account's domains; pass the token back unchanged, with every other \
+             argument unchanged"
+        )
+    };
+    token
+        .strip_prefix(domain_order_tag(reverse_order))
+        .and_then(|encoded| ::hex::decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(rejected)
+}
+
+/// The ordering tag [`encode_domain_page_token`] stamps into a page token: the direction
+/// the page was walked in. It differs from every other tag of this module so that two
+/// kinds of token cannot be mistaken for one another.
+fn domain_order_tag(reverse_order: bool) -> &'static str {
+    if reverse_order {
+        "mr"
+    } else {
+        "mf"
     }
 }
 

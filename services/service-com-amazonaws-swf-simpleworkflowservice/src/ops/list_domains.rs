@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a pure read of the `Domain` records stored for this account, filtered to
+//! those whose own `RegistrationStatus` is the requested one; ordered ascending by name
+//! (a domain's name is its whole identity, so the name is the total order), reversed when
+//! `reverseOrder` is set, and cut into pages of `maximumPageSize` with a `nextPageToken`
+//! naming the position the page ended at. An account holding no domain of the requested
+//! status is an empty list, not a fault.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +163,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomains"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDomainsErrorModeled::OperationNotPermittedFault(OperationNotPermittedFault {
+                message: Some("the SWF domain store is unavailable".to_string()),
+            })
+        })?;
+
+        let guard = state.lock();
+        // "Returns the list of domains registered in the account": the listing is scoped
+        // to the whole account and names no resource of its own, so an account holding no
+        // domain of the requested status is an empty list rather than a fault.
+        // `registrationStatus` is required and selects on each record's OWN stored status
+        // ("Specifies the registration status of the domains to list"), so a deprecated
+        // domain is reported by a DEPRECATED listing and by no other.
+        let mut matching: Vec<&crate::state::Domain> = guard
+            .domains
+            .values()
+            .filter(|domain| domain.status == input.registration_status)
+            .collect();
+
+        // "By default, the results are returned in ascending alphabetical order by name
+        // of the domains"; `reverseOrder` returns them descending instead. The name is
+        // the whole order key because the account holds one domain per name — the store
+        // holds them in a map with no order of its own.
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+        if input.reverse_order {
+            matching.reverse();
+        }
+
+        // `maximumPageSize` defaults to 0 ("not specified"), which means every match up
+        // to the modelled page maximum. The modelled `PageSize` range (0..1000) is
+        // enforced by the boundary validator before this handler runs, so a value above
+        // the maximum never reaches here; the clamp is the internal safety bound that
+        // keeps one response bounded regardless.
+        let page_size = match usize::try_from(input.maximum_page_size) {
+            Ok(size) if size > 0 => size.min(crate::state::MAX_DOMAIN_PAGE_SIZE),
+            _ => crate::state::MAX_DOMAIN_PAGE_SIZE,
+        };
+
+        // The token names the position the previous page ended at, so this page starts at
+        // the first match that sorts after it in THIS ordering. `partition_point` reads
+        // that off the sorted ordering, so a domain registered, deprecated or
+        // undeprecated between the two calls shifts nothing the token addresses.
+        let start = match crate::state::non_empty(&input.next_page_token) {
+            Some(token) => {
+                let resume_after =
+                    crate::state::decode_domain_page_token(&token, input.reverse_order)
+                        .map_err(crate::scaffolded::Scaffolded::validation)?;
+                matching.partition_point(|domain| {
+                    if input.reverse_order {
+                        domain.name >= resume_after
+                    } else {
+                        domain.name <= resume_after
+                    }
+                })
+            }
+            None => 0,
+        };
+        let total = matching.len();
+        let end = (start + page_size).min(total);
+        let page = &matching[start..end];
+
+        Ok(ListDomainsOutput {
+            domain_infos: page.iter().map(|domain| domain.info()).collect(),
+            // The token names the last domain of THIS page, so `last()` is what the
+            // cursor is built from, and it is issued only while matches remain.
+            next_page_token: page.last().filter(|_| end < total).map(|last| {
+                crate::state::encode_domain_page_token(input.reverse_order, &last.name)
+            }),
+        })
     }
 }
