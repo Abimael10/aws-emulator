@@ -21,6 +21,12 @@
 //! values of `includeAllRecommendations` — beside the forms that ARE actionable,
 //! so the refusal is shown to be about the missing dimension and not about
 //! `orderBy` itself.
+//!
+//! The other half of the same rule is WHICH dimensions are actionable: every
+//! `Recommendation` member carrying an ordered value is one, whatever kind of
+//! value it carries, so the table below spans all of them (and each member's
+//! casings, since the name is matched case-insensitively) and leaves refused
+//! only the names that are no such member.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -236,6 +242,219 @@ async fn an_order_outside_the_modelled_enum_is_refused() {
             "case {case:?}: expected ValidationException, got {code:?} in {payload}"
         );
     }
+}
+
+/// Every `Recommendation` member that carries an ordered value, named as the
+/// model names it (`smithy_query(query="shape", shape="Recommendation")`, which
+/// declares these twenty beside `tags`, the one member carrying a list). The
+/// sortable set is defined as exactly these members, so each one is a dimension
+/// the rows can be put in order of — the identifiers, the categorical values,
+/// the two resource descriptions, the booleans, the count, the timestamp and the
+/// three money figures alike.
+const ORDERED_MEMBERS: &[&str] = &[
+    "recommendationId",
+    "accountId",
+    "region",
+    "resourceId",
+    "resourceArn",
+    "currentResourceType",
+    "recommendedResourceType",
+    "currentResourceSummary",
+    "recommendedResourceSummary",
+    "actionType",
+    "implementationEffort",
+    "source",
+    "currencyCode",
+    "restartNeeded",
+    "rollbackPossible",
+    "recommendationLookbackPeriodInDays",
+    "lastRefreshTimestamp",
+    "estimatedMonthlyCost",
+    "estimatedMonthlySavings",
+    "estimatedSavingsPercentage",
+];
+
+/// Ordering by ANY member of that set is served and applied: the values come
+/// back non-decreasing under `Asc`, the `Desc` sequence is that one reversed, an
+/// absent `order` leaves the dimension's own order, and the answer still carries
+/// every row the unordered listing does — ordering re-arranges the rows, it
+/// neither drops nor duplicates one.
+#[tokio::test]
+async fn every_ordered_recommendation_member_can_be_ordered_by() {
+    let router = enrolled_router().await;
+
+    let catalog = rows(&router, None, true).await;
+    let catalog_ids = sorted_ids(&catalog);
+    assert!(
+        catalog_ids.len() > 1,
+        "case catalog: expected several rows to order, got {catalog_ids:?}"
+    );
+
+    for member in ORDERED_MEMBERS {
+        let ascending = rows(&router, Some(&json!({"dimension": member, "order": "Asc"})), true).await;
+        let descending =
+            rows(&router, Some(&json!({"dimension": member, "order": "Desc"})), true).await;
+        let unordered = rows(&router, Some(&json!({"dimension": member})), true).await;
+
+        assert_eq!(
+            sorted_ids(&ascending),
+            catalog_ids,
+            "case {member:?}: expected the ordering to serve every row of the catalog and no \
+             other, got {:?}",
+            sorted_ids(&ascending)
+        );
+        let ascending = values(&ascending, member);
+        let descending = values(&descending, member);
+        let unordered = values(&unordered, member);
+        assert!(
+            ascending.iter().all(|value| !value.is_null()),
+            "case {member:?}: expected every row to carry the dimension's value, got {ascending:?}"
+        );
+        assert!(
+            ascending.windows(2).all(|pair| ordered(&pair[0], &pair[1])),
+            "case {member:?}: expected the Asc values non-decreasing, got {ascending:?}"
+        );
+        let mut reversed = descending.clone();
+        reversed.reverse();
+        assert_eq!(
+            ascending, reversed,
+            "case {member:?}: expected the Desc values to be the Asc values reversed, got \
+             {descending:?} against {ascending:?}"
+        );
+        assert_eq!(
+            unordered, ascending,
+            "case {member:?}: expected an absent order to leave the dimension's own order, got \
+             {unordered:?} against {ascending:?}"
+        );
+    }
+}
+
+/// A dimension is resolved by the member it names and not by its spelling: the
+/// name is compared case-insensitively, so every casing of a member of the
+/// sortable set puts the rows in the same order. Asserted over each member,
+/// against the sequence its own spelling serves.
+#[tokio::test]
+async fn a_dimension_names_its_member_whatever_its_casing() {
+    let router = enrolled_router().await;
+
+    for member in ORDERED_MEMBERS {
+        let expected = values(
+            &rows(&router, Some(&json!({"dimension": member, "order": "Asc"})), true).await,
+            member,
+        );
+        for spelling in [
+            member.to_ascii_lowercase(),
+            member.to_ascii_uppercase(),
+            capitalized(member),
+        ] {
+            let case = format!("dimension {spelling:?} for member {member:?}");
+            let served = values(
+                &rows(&router, Some(&json!({"dimension": spelling, "order": "Asc"})), true).await,
+                member,
+            );
+            assert_eq!(
+                served, expected,
+                "case {case:?}: expected the same order as the member's own spelling, got \
+                 {served:?} against {expected:?}"
+            );
+        }
+    }
+}
+
+/// The two members that describe the resource — `currentResourceSummary` and
+/// `recommendedResourceSummary`, plain strings the list answer already carries
+/// for every row — order the rows by that description, on the de-duped listing
+/// as well as the full one. Each carries more than one distinct value across the
+/// catalog, so the order is observable rather than vacuous.
+#[tokio::test]
+async fn the_resource_summaries_order_the_rows_by_their_description() {
+    let router = enrolled_router().await;
+
+    for member in ["currentResourceSummary", "recommendedResourceSummary"] {
+        for include_all in [true, false] {
+            let case = format!("dimension {member:?} (includeAllRecommendations {include_all})");
+            let served = values(
+                &rows(
+                    &router,
+                    Some(&json!({"dimension": member, "order": "Asc"})),
+                    include_all,
+                )
+                .await,
+                member,
+            );
+            let mut distinct: Vec<&Value> = Vec::new();
+            for value in &served {
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            assert!(
+                distinct.len() > 1,
+                "case {case:?}: expected more than one distinct description to order, got \
+                 {served:?}"
+            );
+            assert!(
+                served.windows(2).all(|pair| ordered(&pair[0], &pair[1])),
+                "case {case:?}: expected the descriptions non-decreasing, got {served:?}"
+            );
+            let mut sorted = served.clone();
+            sorted.sort_by(|left, right| {
+                left.as_str()
+                    .unwrap_or_default()
+                    .cmp(right.as_str().unwrap_or_default())
+            });
+            assert_eq!(
+                served, sorted,
+                "case {case:?}: expected the served descriptions in the order the strings take, \
+                 got {served:?} against {sorted:?}"
+            );
+        }
+    }
+}
+
+/// `member` with its first character upper-cased, one more spelling of the same
+/// member name.
+fn capitalized(member: &str) -> String {
+    let mut characters = member.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The `items` a `ListRecommendations` answer carries for one `orderBy`, in the
+/// order the answer carries them.
+async fn rows(router: &MultiServiceRouter, order_by: Option<&Value>, include_all: bool) -> Vec<Value> {
+    let mut request = json!({"includeAllRecommendations": include_all});
+    if let Some(order_by) = order_by {
+        request["orderBy"] = order_by.clone();
+    }
+    let payload = ok(router, "ListRecommendations", &request).await;
+    payload["items"]
+        .as_array()
+        .expect("items is a list")
+        .clone()
+}
+
+/// The value of `member` in each row, in the rows' order.
+fn values(rows: &[Value], member: &str) -> Vec<Value> {
+    rows.iter().map(|row| row[member].clone()).collect()
+}
+
+/// The ids the rows carry, sorted — the set of rows an answer serves, with the
+/// order it served them in set aside.
+fn sorted_ids(rows: &[Value]) -> Vec<String> {
+    let mut sorted: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row["recommendationId"]
+                .as_str()
+                .expect("every recommendation carries an id")
+                .to_string()
+        })
+        .collect();
+    sorted.sort();
+    sorted
 }
 
 /// Two values of one dimension in order: `true` when `left` sorts at or before

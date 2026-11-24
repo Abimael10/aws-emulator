@@ -600,6 +600,12 @@ impl StoredRecommendation {
             Dimension::RecommendedResourceType => {
                 SortKey::Text(self.recommended_resource_type.clone())
             }
+            Dimension::CurrentResourceSummary => {
+                SortKey::Text(self.current_resource_summary.clone())
+            }
+            Dimension::RecommendedResourceSummary => {
+                SortKey::Text(self.recommended_resource_summary.clone())
+            }
             Dimension::ActionType => SortKey::Text(self.action_type.clone()),
             Dimension::ImplementationEffort => SortKey::Text(self.implementation_effort.clone()),
             Dimension::Source => SortKey::Text(self.source.clone()),
@@ -627,7 +633,9 @@ const DAYS_PER_MONTH: f64 = 30.0;
 /// names it (`smithy_query query="shape" shape="Recommendation"`); the two
 /// mode-dependent money members are not here because the value they carry
 /// depends on the caller's stored `savingsEstimationMode`, so
-/// [`Dimension::parse`] resolves them in the handler instead.
+/// [`Dimension::parse`] resolves them in the handler instead, and `tags` is not
+/// here because it is the one member carrying a list rather than an ordered
+/// value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {
     RecommendationId,
@@ -637,6 +645,8 @@ pub enum Dimension {
     ResourceArn,
     CurrentResourceType,
     RecommendedResourceType,
+    CurrentResourceSummary,
+    RecommendedResourceSummary,
     ActionType,
     ImplementationEffort,
     Source,
@@ -698,6 +708,8 @@ impl Dimension {
             "resourcearn" => Self::ResourceArn,
             "currentresourcetype" => Self::CurrentResourceType,
             "recommendedresourcetype" => Self::RecommendedResourceType,
+            "currentresourcesummary" => Self::CurrentResourceSummary,
+            "recommendedresourcesummary" => Self::RecommendedResourceSummary,
             "actiontype" => Self::ActionType,
             "implementationeffort" => Self::ImplementationEffort,
             "source" => Self::Source,
@@ -734,7 +746,8 @@ impl Dimension {
 /// three as unsupported for this API, and one group per resource is no summary —
 /// and neither are the continuous members (the money figures, the lookback
 /// period and the refresh timestamp), which carry a quantity rather than a
-/// category.
+/// category, nor the two resource summaries, which describe one resource's own
+/// configuration and so are per-resource as well.
 pub const GROUP_DIMENSIONS: &[Dimension] = &[
     Dimension::AccountId,
     Dimension::Region,
