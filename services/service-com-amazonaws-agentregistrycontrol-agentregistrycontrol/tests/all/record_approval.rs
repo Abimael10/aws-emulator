@@ -21,7 +21,9 @@
 //!   state, so the submission is the modelled `ValidationException` (HTTP 400): a status
 //!   the record can still leave is worded in this operation's own one sentence, whose only
 //!   variable part is that stored status, while the lifecycle's TERMINAL status is answered
-//!   with the one sentence every change to a retired record is refused with.
+//!   with the one sentence every change to a retired record is refused with — and that
+//!   sentence comes FIRST, ahead of every other precondition on the stored record a
+//!   submission is held to, because a retired record admits no change at all.
 //!
 //! Every test asserts over a TABLE of inputs, so it holds for a class of requests rather
 //! than for one recorded shape.
@@ -1032,6 +1034,203 @@ async fn a_record_in_any_status_other_than_draft_is_refused_with_the_sentence_of
             (status, &before.body["updatedAt"]),
             "case {case:?}: a refused submission changes nothing, got {:?}",
             after.body
+        );
+    }
+}
+
+/// The one sentence this service refuses every change to a retired record with. Its only
+/// variable part is the status the record is stored in, and `DEPRECATED` is the only status
+/// the record lifecycle makes terminal (`smithy_query(query="shape",
+/// shape="RegistryRecordStatus")`).
+const TERMINAL_SENTENCE: &str =
+    "Cannot update registry record in DEPRECATED status (terminal state)";
+
+/// The `statusReason` a retired record is staged with, so a refused change can be shown to
+/// have left it alone.
+const RETIRED_REASON: &str = "retired by the suite";
+
+/// How this service words a refusal of custom metadata the registry's schema does not
+/// admit: the fixed text naming the record type the schema was selected for, then the
+/// failure the evaluation reported — the JSON pointer of the offending node and the
+/// constraint of that schema it does not satisfy.
+fn schema_refusal(record_type: &str, failure: &str) -> String {
+    format!("Custom metadata validation failed for record type {record_type}: {failure}")
+}
+
+/// Delete a record: `DELETE /registries/{registryId}/records/{recordId}`.
+async fn delete_record(router: &MultiServiceRouter, registry_id: &str, record_id: &str) -> Reply {
+    call(
+        router,
+        "DELETE",
+        &format!(
+            "/registries/{}/records/{}",
+            encode_label(registry_id),
+            encode_label(record_id)
+        ),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_retired_records_submission_states_the_terminal_sentence_ahead_of_the_schema_gate() {
+    let router = router();
+
+    // Rows: a registry declaring a custom-metadata schema that requires a field, and a
+    // record of a type that schema applies to carrying no metadata at all — so the schema
+    // reports that record non-compliant and the registry's gate on a submission demonstrably
+    // fires. They differ along the record type, the field the schema requires, WHICH schema
+    // of the configuration selects it (`defaultSchema`, or the record type's own entry in
+    // `recordTypeSchemaOverrides`) and the identifier form the refused call addresses the
+    // record by. Member names are `CustomMetadataSchemaConfiguration`'s own
+    // (`smithy_query(query="shape", shape="CustomMetadataSchemaConfiguration")`).
+    let rows: Vec<(&str, &str, Value, &str, bool)> = vec![
+        (
+            "a retired record under the registry's default schema",
+            "CUSTOM",
+            json!({
+                "defaultSchema":
+                    r#"{"type":"object","properties":{"environment":{"type":"string"}},"required":["environment"]}"#
+            }),
+            ": required property 'environment' not found",
+            false,
+        ),
+        (
+            "a retired record under a default schema requiring another field, named by ARN",
+            "AGENT",
+            json!({
+                "defaultSchema":
+                    r#"{"type":"object","properties":{"owner":{"type":"string"}},"required":["owner"]}"#
+            }),
+            ": required property 'owner' not found",
+            true,
+        ),
+        (
+            "a retired record held to its record type's own schema override",
+            "MCP",
+            json!({
+                "recordTypeSchemaOverrides": [{
+                    "recordType": "MCP",
+                    "schema":
+                        r#"{"type":"object","properties":{"tier":{"type":"integer"}},"required":["tier"]}"#
+                }]
+            }),
+            ": required property 'tier' not found",
+            false,
+        ),
+    ];
+
+    for (at, (case, record_type, configuration, failure, by_arn)) in rows.into_iter().enumerate() {
+        let registry_id = ready_registry(
+            &router,
+            case,
+            json!({
+                "name": format!("terminal-precedence-{at}"),
+                "customMetadataSchemaConfiguration": configuration,
+            }),
+        )
+        .await;
+
+        // The gate this registry puts on a submission, shown on a record that is still IN
+        // the lifecycle: a `DRAFT` record whose metadata the registry's schema does not
+        // admit is refused in that schema's own words.
+        let draft_id = draft_record(&router, case, &registry_id, "draft.probe", record_type).await;
+        let held = submit_record(&router, &registry_id, &draft_id).await;
+        assert_eq!(
+            (held.status, held.error_code.as_deref(), held.message()),
+            (
+                400,
+                Some("ValidationException"),
+                schema_refusal(record_type, failure)
+            ),
+            "case {case:?}: a DRAFT record the registry's schema does not admit is refused \
+             with that schema's sentence, got {} {:?}",
+            held.status,
+            held.body
+        );
+
+        // The same registry and the same metadata, on a record retired straight from
+        // `DRAFT`: it is past the lifecycle, so the sentence stating that is the answer —
+        // the gate above never decides it.
+        let record_id =
+            draft_record(&router, case, &registry_id, "retired.probe", record_type).await;
+        let retired = update_status(
+            &router,
+            &registry_id,
+            &record_id,
+            json!({ "status": "DEPRECATED", "statusReason": RETIRED_REASON }),
+        )
+        .await;
+        assert_eq!(
+            retired.status, 202,
+            "case {case:?}: retiring a DRAFT record must answer 202, got {} {:?}",
+            retired.status, retired.body
+        );
+        record_reaching(&router, case, &registry_id, &record_id, "DEPRECATED").await;
+
+        let before = get_record(&router, &registry_id, &record_id).await;
+        let retired_at = before.body["updatedAt"].clone();
+        let (registry_label, record_label) = if by_arn {
+            (
+                before.str_field("registryArn").to_string(),
+                before.str_field("recordArn").to_string(),
+            )
+        } else {
+            (registry_id.clone(), record_id.clone())
+        };
+
+        let refused = submit_record(&router, &registry_label, &record_label).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                TERMINAL_SENTENCE.to_string()
+            ),
+            "case {case:?}: a retired record's submission states the terminal sentence, got \
+             {} {:?}",
+            refused.status,
+            refused.body
+        );
+
+        // The refused submission changed nothing: the record is still retired, still
+        // carrying the reason it was retired with, at the instant that retirement wrote.
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (
+                after.str_field("status"),
+                after.str_field("statusReason"),
+                &after.body["updatedAt"]
+            ),
+            ("DEPRECATED", RETIRED_REASON, &retired_at),
+            "case {case:?}: the refused submission leaves the retired record as it was, got \
+             {:?}",
+            after.body
+        );
+
+        // A retired record is past the lifecycle, not undeletable: deleting it removes it,
+        // and the read that follows resolves to nothing.
+        let deleted = delete_record(&router, &registry_label, &record_label).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: DeleteRegistryRecord removes a retired record, got {} {:?}",
+            deleted.status, deleted.body
+        );
+        let gone = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (gone.status, gone.error_code.as_deref(), gone.message()),
+            (
+                404,
+                Some("ResourceNotFoundException"),
+                format!("Registry record with ID {record_id} not found.")
+            ),
+            "case {case:?}: the deleted record resolves to nothing, got {} {:?}",
+            gone.status,
+            gone.body
         );
     }
 }
