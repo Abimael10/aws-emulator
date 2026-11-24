@@ -10,7 +10,10 @@
 //! a real key" (`ListObjectsV2Output$NextContinuationToken`) — written in the alphabet AWS
 //! writes THAT listing's own tokens in: the account's bucket listing and the listings of a
 //! bucket's id-addressed configurations hand back a lowercase-hex value, the listings of what
-//! a bucket holds hand back a value in the standard base64 alphabet (RFC 4648 §4). Whichever
+//! a bucket holds hand back a value in base64's URL-SAFE alphabet (RFC 4648 §5), unpadded —
+//! base64 written in the characters a query component carries unchanged, which is what lets a
+//! caller hand the value back as it was given
+//! ([`super::continuation_token_query_safety`]). Whichever
 //! alphabet it is, the value is a cursor the service reads back and no caller can mint: the
 //! page it names is served, a value one character away from it is refused, and a token one
 //! listing issued names no page of another's.
@@ -38,7 +41,7 @@ use super::object_storage::{list_objects_v2, listing_of, store_keys};
 enum Alphabet {
     /// Lowercase hexadecimal.
     Hex,
-    /// Standard base64 (RFC 4648 §4), `A-Za-z0-9+/` with `=` padding.
+    /// Base64 in the url-safe alphabet, unpadded (RFC 4648 §5), `A-Za-z0-9-_`.
     Base64,
 }
 
@@ -51,7 +54,7 @@ impl Alphabet {
                     .chars()
                     .all(|character| matches!(character, '0'..='9' | 'a'..='f')),
                 Self::Base64 => token.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
                 }),
             }
     }
@@ -226,10 +229,10 @@ async fn a_configuration_listing_writes_its_cursor_in_lowercase_hex() {
     );
 }
 
-/// RULE, on the other alphabet: a bucket's object listing writes its cursor in standard
+/// RULE, on the other alphabet: a bucket's object listing writes its cursor in url-safe
 /// base64, and that value resumes the listing where the page stopped.
 #[tokio::test]
-async fn an_object_listing_writes_its_cursor_in_standard_base64() {
+async fn an_object_listing_writes_its_cursor_in_url_safe_base64() {
     let router = router();
     let case = "one bucket's objects, one per page";
     let name = "spelling-objects";

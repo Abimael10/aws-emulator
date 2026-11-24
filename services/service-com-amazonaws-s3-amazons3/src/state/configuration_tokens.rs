@@ -38,9 +38,21 @@
 //! the one AWS writes that listing's token in ([`PagedListing::spelling`]): the bucket
 //! listing and the four listings of a bucket's id-addressed configurations hand back a
 //! lowercase-hex value, and the object listings and the directory-bucket listing hand back a
-//! standard-base64 one. A client round-trips either unread, so the alphabet is a fidelity
-//! question and not a functional one — which is exactly why it is read off the recordings
-//! rather than chosen.
+//! base64 one. A client round-trips either unread, so WHICH of the two a listing writes is a
+//! fidelity question — which is why it is read off the recordings rather than chosen.
+//!
+//! What is NOT free in either alphabet is the CHARACTER SET. The value a caller hands back
+//! travels on the `continuation-token` query parameter of a SIGNED request, and a character a
+//! query component does not carry unchanged has two spellings on the wire — the character
+//! itself and its percent-encoding — of which a request's SigV4 canonical form covers one: a
+//! token carrying such a character resumes the listing for a client that encodes it and is
+//! refused for the signature for a client that hands the value back verbatim, which "you can
+//! use this ContinuationToken for the pagination of the list results"
+//! (`ListDirectoryBucketsRequest$ContinuationToken`) gives a caller no way to tell apart. So
+//! every token of this service is written in the characters a query component carries
+//! unchanged (RFC 3986's unreserved set): lowercase hex already is, and the base64 one is
+//! written in base64's URL-SAFE alphabet without padding (RFC 4648 §5) — the same base64
+//! width, with `-` and `_` for `+` and `/` and no `=`.
 //!
 //! No page is kept on the side: the cursor is the position the next page resumes at — a
 //! configuration id, a bucket name, an object key, an annotation name — which is why every
@@ -96,12 +108,14 @@ impl PagedListing {
     /// The alphabet THIS listing's token is written in, which is the alphabet the recorded
     /// answers of that listing write it in: a lowercase-hex value for the account's own
     /// bucket listing and for the four listings of a bucket's id-addressed configurations, a
-    /// standard-base64 one for the listings of what a bucket or an object version holds and
-    /// for the directory-bucket listing.
+    /// base64 one for the listings of what a bucket or an object version holds and for the
+    /// directory-bucket listing.
     ///
     /// The token is round-tripped unread either way — "an opaque value that Amazon S3
-    /// understands" — so the alphabet changes nothing a client can do with the value; it is
-    /// what a client that reads the value's FORM, or a recorded-answer comparison, sees.
+    /// understands" — so which of the two it is changes nothing a client can do with the
+    /// value; it is what a client that reads the value's FORM, or a recorded-answer
+    /// comparison, sees. Both are written in the characters a query component carries
+    /// unchanged, which is NOT a free choice (the module docs).
     fn spelling(self) -> Spelling {
         match self {
             Self::Analytics
@@ -120,16 +134,20 @@ impl PagedListing {
 enum Spelling {
     /// Lowercase hexadecimal (RFC 4648 §8's alphabet, lowercased).
     Hex,
-    /// Base64 in the STANDARD alphabet (RFC 4648 §4, `A-Za-z0-9+/` with `=` padding).
+    /// Base64 in the URL-SAFE alphabet, unpadded (RFC 4648 §5, `A-Za-z0-9-_`): base64 of the
+    /// same width as the standard alphabet's, written in the characters a URI query component
+    /// carries unchanged, so the value a response hands out is the value a signed request can
+    /// hand back (the module docs).
     Base64,
 }
 
 impl Spelling {
     /// `bytes` as the string a response carries.
     fn write(self, bytes: &[u8]) -> String {
+        use ::base64::Engine as _;
         match self {
             Self::Hex => ::hex::encode(bytes),
-            Self::Base64 => ::aws_smithy_types::base64::encode(bytes),
+            Self::Base64 => ::base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
         }
     }
 
@@ -151,9 +169,10 @@ impl Spelling {
                 }
                 ::hex::decode(token).ok()
             }
-            // A base64 token travels on a query parameter, where a `+` a client handed back
-            // unencoded arrives as a space ([`handed_back`]).
-            Self::Base64 => ::aws_smithy_types::base64::decode(handed_back(token)).ok(),
+            Self::Base64 => {
+                use ::base64::Engine as _;
+                ::base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token).ok()
+            }
         }
     }
 }
@@ -315,22 +334,6 @@ pub fn read_continuation_token(
     }
 }
 
-/// The token a caller handed back, as the value this store MINTED.
-///
-/// A base64 token travels on the `continuation-token` query parameter, and this emulator's
-/// query reader is a form decoder: a `+` a client handed back without percent-encoding it
-/// arrives as a SPACE. Amazon S3 reads the parameter as the opaque value it handed out — "you
-/// can use this ContinuationToken for pagination of the list results" — so a caller that
-/// returns that value verbatim resumes its listing, and the base64 alphabet has no space,
-/// which makes a space in a token that `+` and nothing else.
-///
-/// Every other character of the alphabet survives a query component unchanged, so nothing
-/// else is rewritten here: a value this store did not mint still names no page
-/// ([`ContinuationTokenReading::Unknown`]), because the authenticator is what decides that.
-fn handed_back(token: &str) -> String {
-    token.replace(' ', "+")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,14 +392,16 @@ mod tests {
                 Some(id),
                 "case {listing:?}/{id:?}: a minted token must name its position, got {token:?}"
             );
-            // The same token handed back VERBATIM on a query parameter, where the form
-            // decoder has made a space of every `+` it carried ([`handed_back`]).
-            assert_eq!(
-                decode_continuation_token(&key, listing, scope, &token.replace('+', " "))
-                    .as_deref(),
-                Some(id),
-                "case {listing:?}/{id:?}: a token whose `+` arrived as a space must name the \
-                 same position, got {token:?}"
+            // The same token handed back VERBATIM on a query parameter: every character of
+            // either alphabet is one a query component carries unchanged, so nothing has to
+            // be repaired on the way in (the module docs).
+            assert!(
+                token
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '.' | '_' | '~')),
+                "case {listing:?}/{id:?}: a token is written in the characters a query \
+                 component carries unchanged, got {token:?}"
             );
             assert_eq!(
                 decode_continuation_token(&other_store, listing, scope, &token),
@@ -446,9 +451,9 @@ mod tests {
                 Spelling::Base64 => assert!(
                     !token.is_empty()
                         && token.chars().all(|character| character.is_ascii_alphanumeric()
-                            || matches!(character, '+' | '/' | '=')),
-                    "case {listing:?}/{id:?}: a token of this listing is standard base64, \
-                     got {token:?}"
+                            || matches!(character, '-' | '_')),
+                    "case {listing:?}/{id:?}: a token of this listing is unpadded url-safe \
+                     base64, got {token:?}"
                 ),
             }
         }
@@ -459,9 +464,11 @@ mod tests {
         // alphabet's reading serves a value this store never minted.
         let shaped_hex =
             ::hex::encode([0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1]);
-        let shaped_base64 = ::aws_smithy_types::base64::encode(
-            [0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1],
-        );
+        let shaped_base64 = {
+            use ::base64::Engine as _;
+            ::base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode([0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1])
+        };
         for listing in [PagedListing::Metrics, PagedListing::Objects] {
             for (case, token) in [
                 ("an id", "kept".to_string()),
