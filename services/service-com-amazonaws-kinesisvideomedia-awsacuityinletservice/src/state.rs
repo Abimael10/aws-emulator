@@ -71,6 +71,10 @@ pub struct MediaStream {
     pub content_type: String,
     /// The fragments this log still holds, oldest first. `GetMedia` emits a contiguous
     /// run of these, so the index of a fragment in this vector IS the stream cursor.
+    ///
+    /// The ingest plane ([`crate::service::put_media`]) is what keeps it so: a Cluster
+    /// captured before the newest fragment the log already holds is refused rather than
+    /// appended, across sessions as within one.
     pub fragments: Vec<Fragment>,
     /// The number the next fragment written to this stream gets.
     pub next_fragment_number: u64,

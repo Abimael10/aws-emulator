@@ -385,17 +385,30 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
         let mut acknowledgements: Vec<::serde_json::Value> = Vec::new();
         let mut persisted: Vec<::serde_json::Value> = Vec::new();
         let mut fault: Option<::serde_json::Value> = None;
-        let mut previous: Option<u64> = None;
+        // The time ordering is a property of the LOG, not of one session: a fragment is
+        // appended to a log ordered by time, so the Cluster a session opens with is taken
+        // against the newest fragment the stream ALREADY holds, whichever session
+        // produced it. The log's newest fragment is its last — nothing behind it was ever
+        // appended — and a stream nothing has been produced to holds no such instant, so
+        // it takes whatever its first Cluster names.
+        let mut previous: Option<SystemTime> = store
+            .resolve_stream(&*self.engine, name, arn)
+            .and_then(|held| held.fragments.last().map(|newest| newest.producer_timestamp));
         let mut ingested_frames = 0usize;
         for cluster in clusters {
             // The number this fragment was RECEIVED under, which every acknowledgement of
             // it carries — the fault acknowledgements below included, since the fault was
             // found in a fragment the service had already taken in.
             let received_as = store.received_fragment_number(&*self.engine, name, arn);
+            // When the producer says this fragment was captured: the instant the log is
+            // ordered by, and so the value a submitted Cluster is compared AT — the
+            // timecode itself is read against a session's own timecode type and producer
+            // start, which the session that wrote the fragment before it need not share.
+            let producer_instant = session.producer_instant(&cluster);
             // "A cluster timecode moving backwards" ends the session at that Cluster:
             // the fragment log is ordered by time, so a fragment that goes back cannot
             // be appended to it. The Clusters already taken stay ingested.
-            if previous.is_some_and(|held| cluster.timecode < held) {
+            if previous.is_some_and(|held| producer_instant < held) {
                 fault = Some(error_acknowledgement(
                     FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS,
                     FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS_ID,
@@ -421,8 +434,6 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
                 ));
                 break;
             }
-            previous = Some(cluster.timecode);
-            let producer_instant = session.producer_instant(&cluster);
             // A fragment cannot have been captured at an instant the service has not
             // reached: the timecode names a moment that has not happened, so there is no
             // instant to record it at and the session ends at that Cluster. The service's
@@ -452,6 +463,9 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
                 // removed it mid-session, which is the same request-level fault.
                 return stream_not_found().response();
             };
+            // The fragment just appended is the log's newest, so it is what the next
+            // Cluster — of this session or of the one after it — is taken against.
+            previous = Some(producer_instant);
             for event in [EVENT_BUFFERING, EVENT_RECEIVED] {
                 acknowledgements.push(fragment_acknowledgement(
                     event,
@@ -508,7 +522,8 @@ const EVENT_PERSISTED: &str = "PERSISTED";
 /// `EventType` of an acknowledgement reporting a fault in the submitted media.
 const EVENT_ERROR: &str = "ERROR";
 
-/// `ErrorCode` of a Cluster whose timecode goes back before the Cluster before it.
+/// `ErrorCode` of a Cluster captured before the newest fragment the stream already holds
+/// — the Cluster before it in this session, or the last one a previous session left.
 const FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS: &str = "FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS";
 
 /// `ErrorId` of [`FRAGMENT_TIMECODE_LESSER_THAN_PREVIOUS`].

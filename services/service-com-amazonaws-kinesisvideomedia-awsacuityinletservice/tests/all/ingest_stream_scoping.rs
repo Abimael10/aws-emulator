@@ -63,9 +63,20 @@ fn producer_start() -> std::time::SystemTime {
     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_761_000_000_000)
 }
 
-/// One two-Cluster container, as a producer submits one session's media.
-fn container(marker: u8) -> Vec<u8> {
-    Container::of(vec![cluster(0, 2, 20, marker), cluster(1000, 2, 20, marker ^ 0x11)]).bytes()
+/// How far apart one stream's successive sessions are captured, in milliseconds: a
+/// fragment log is ordered by capture time, so a session following another on the same
+/// stream submits Clusters captured after the ones it already holds.
+const SESSION_SPACING_MILLIS: u64 = 4_000;
+
+/// One two-Cluster container, as a producer submits one session's media, captured after
+/// the `session` sessions a stream may already have taken.
+fn container(session: usize, marker: u8) -> Vec<u8> {
+    let from = session as u64 * SESSION_SPACING_MILLIS;
+    Container::of(vec![
+        cluster(from, 2, 20, marker),
+        cluster(from + 1000, 2, 20, marker ^ 0x11),
+    ])
+    .bytes()
 }
 
 /// `headers` with the declared payload hash replaced by `declared`, or removed when it is
@@ -206,7 +217,7 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
         // The identical session, differing only in the stream it names.
         let headers = ingest_headers(addressing, "RELATIVE", producer_start());
         let response = harness
-            .put_media_at(&own_host, &headers, container(0x40 + index as u8))
+            .put_media_at(&own_host, &headers, container(index, 0x40 + index as u8))
             .await;
 
         if row.answer == Answer::Served {
@@ -314,7 +325,7 @@ async fn an_ingest_endpoint_serves_only_the_stream_it_was_discovered_for() {
                 "RELATIVE",
                 producer_start(),
             ),
-            container(0x80),
+            container(0, 0x80),
         )
         .await;
     assert_eq!(
@@ -397,7 +408,7 @@ async fn an_ingest_session_declaring_no_payload_hash_is_refused_and_persists_not
         // covers.
         let headers = declaring(&signed, declared);
         let response = harness
-            .put_media_at(&host, &headers, container(0x20 + index as u8))
+            .put_media_at(&host, &headers, container(index, 0x20 + index as u8))
             .await;
 
         if admitted {
@@ -470,7 +481,9 @@ async fn the_signature_is_settled_before_the_stream_the_session_names_is_resolve
             ),
             None,
         );
-        let response = harness.put_media_at(&host, &headers, container(0x60)).await;
+        let response = harness
+            .put_media_at(&host, &headers, container(0, 0x60))
+            .await;
         assert_eq!(
             status(&response),
             403,
