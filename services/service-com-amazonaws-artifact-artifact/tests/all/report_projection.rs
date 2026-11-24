@@ -115,7 +115,39 @@ const REPORT_WIDE_MEMBERS: &[&str] = &[
 /// issue that reported this divergence quotes the recorded `ListReports` body:
 /// `(report id, member, published value)`. A timestamp is named as the INSTANT it denotes
 /// and compared as one, so the row says nothing about the width of its fraction.
+///
+/// The rows span the members a recording discloses (a published title, a series, an
+/// acceptance type and both ends of a reporting period) over the reports it discloses an
+/// id for, in both publication classes — which is what makes them a check that each
+/// entry's members come from the row its own id names.
 const RECORDED_PUBLISHED: &[(&str, &str, &str)] = &[
+    (
+        "report-0c1IXmudeXuTlHJJ",
+        "name",
+        "Accessibility Conformance Report (VPAT) - Amazon Polly",
+    ),
+    ("report-0c1IXmudeXuTlHJJ", "series", "ACR"),
+    (
+        "report-0c1IXmudeXuTlHJJ",
+        "periodStart",
+        "2025-10-01T00:00:00Z",
+    ),
+    (
+        "report-5eevElBv6MyRmQsD",
+        "name",
+        "United Arab Emirates (UAE) Information Assurance Regulation (IAR) Compliance \
+         Assessment Report",
+    ),
+    (
+        "report-5eevElBv6MyRmQsD",
+        "periodStart",
+        "2024-11-01T00:00:00Z",
+    ),
+    (
+        "report-5eevElBv6MyRmQsD",
+        "periodEnd",
+        "2025-10-31T00:00:00Z",
+    ),
     (
         "report-7g5j2DTVeNXWx7St",
         "name",
@@ -806,4 +838,177 @@ async fn the_recorded_published_metadata_is_what_the_catalog_reports() {
             );
         }
     }
+}
+
+/// The instant `published` denotes, in seconds since the Unix epoch, from a table row.
+fn published_instant(published: &str) -> i64 {
+    DateTime::from_str(published, Format::DateTime)
+        .unwrap_or_else(|error| panic!("the table names a date-time ({error}): {published:?}"))
+        .secs()
+}
+
+/// The publication batches of the accessibility-conformance class, as
+/// `(periodStart, periodEnd)`: a version of that class is published in a batch — AWS
+/// evaluates its products in rounds and publishes the conformance reports of a round
+/// together — and covers the window the batch opens, closing on the 1 January that follows
+/// it.
+///
+/// The last two rows are the windows the corpus records for this class (the AWS Transfer
+/// Family report's only version and the Amazon Polly report's third); the rows before them
+/// are the same cycle in the preceding years, which this catalog publishes
+/// (`accessibility_reports` in `src/state.rs`). Spelled out here so a reseeded class whose
+/// versions carry a window off the cycle fails this suite.
+const ACR_BATCHES: &[(&str, &str)] = &[
+    ("2022-11-01T00:00:00Z", "2023-01-01T00:00:00Z"),
+    ("2023-11-01T00:00:00Z", "2024-01-01T00:00:00Z"),
+    ("2024-11-01T00:00:00Z", "2025-01-01T00:00:00Z"),
+    ("2025-10-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+];
+
+#[tokio::test]
+async fn every_version_of_the_accessibility_class_covers_one_published_batch() {
+    let router = emulator();
+    let entries = walked_catalog(&router, "the accessibility batch cycle", None).await;
+    let batches: Vec<(i64, i64)> = ACR_BATCHES
+        .iter()
+        .map(|(start, end)| (published_instant(start), published_instant(end)))
+        .collect();
+
+    // Every row of the class, not only the ones a recording names: the cycle is the
+    // class's, so a row the issue never cited carries a window of it too.
+    let class: Vec<&String> = entries
+        .iter()
+        .filter(|(_, entry)| entry["series"].as_str() == Some(ACR_SERIES))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        class.len() > 1,
+        "the accessibility-conformance class is published per product, got {class:?}"
+    );
+
+    let mut covered: BTreeSet<(i64, i64)> = BTreeSet::new();
+    for id in class {
+        let versions = list_report_versions(&router, &format!("?reportId={id}")).await;
+        assert_eq!(
+            versions.status, 200,
+            "case {id:?}: expected HTTP 200 from ListReportVersions, got {} with {:?}",
+            versions.status, versions.body
+        );
+        let mut newest: Option<(i64, i64)> = None;
+        for summary in versions.reports() {
+            let case = format!("{id} v{}", summary["version"].as_i64().unwrap_or_default());
+            let window = (
+                instant(&case, "periodStart", &summary["periodStart"]),
+                instant(&case, "periodEnd", &summary["periodEnd"]),
+            );
+            assert!(
+                batches.contains(&window),
+                "case {case:?}: a version of this class covers one of the batches the class \
+                 publishes, got {summary:?}"
+            );
+            if let Some(earlier) = newest {
+                assert!(
+                    earlier.0 < window.0 && earlier.1 < window.1,
+                    "case {case:?}: a later version covers a later batch, got {window:?} after \
+                     {earlier:?}"
+                );
+            }
+            newest = Some(window);
+            covered.insert(window);
+        }
+
+        // And the catalog entry reports the window of the newest batch that evaluated this
+        // product — the version the entry names.
+        let entry = &entries[id.as_str()];
+        let case = format!("{id} listed");
+        let listed = (
+            instant(&case, "periodStart", &entry["periodStart"]),
+            instant(&case, "periodEnd", &entry["periodEnd"]),
+        );
+        assert_eq!(
+            Some(listed),
+            newest,
+            "case {case:?}: an entry reports the window of the version it names, got {entry:?}"
+        );
+    }
+
+    // The windows the corpus records for this class are ones the class really publishes:
+    // a cycle no row is published in is a table that says nothing.
+    for recorded in batches.iter().rev().take(2) {
+        assert!(
+            covered.contains(recorded),
+            "a recorded window of this class must be published by it, got {covered:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reported_period_is_the_window_of_the_version_the_entry_names() {
+    let router = emulator();
+    let entries = walked_catalog(&router, "per-version windows", None).await;
+
+    let mut listed_windows: BTreeSet<(i64, i64)> = BTreeSet::new();
+    for expected in CATALOG {
+        let id = expected.id;
+        let versions = list_report_versions(&router, &format!("?reportId={id}")).await;
+        assert_eq!(
+            versions.status, 200,
+            "case {id:?}: expected HTTP 200 from ListReportVersions, got {} with {:?}",
+            versions.status, versions.body
+        );
+        assert_eq!(
+            versions.reports().len(),
+            expected.versions.len(),
+            "case {id:?}: every published version must be listed, got {:?}",
+            versions.body
+        );
+
+        let mut per_version: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        for summary in versions.reports() {
+            let version = summary["version"].as_i64().unwrap_or_default();
+            let case = format!("{id} v{version}");
+            let window = (
+                instant(&case, "periodStart", &summary["periodStart"]),
+                instant(&case, "periodEnd", &summary["periodEnd"]),
+            );
+            assert!(
+                window.0 < window.1,
+                "case {case:?}: a reporting period opens before it closes, got {window:?}"
+            );
+            assert!(
+                per_version.insert(version, window).is_none(),
+                "case {case:?}: a version is listed once, got {:?}",
+                versions.body
+            );
+        }
+        // A report publishes a version for a cycle and the next version for the following
+        // one, so two versions of one report never cover the same window.
+        let distinct: BTreeSet<(i64, i64)> = per_version.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            per_version.len(),
+            "case {id:?}: each version covers its own window, got {per_version:?}"
+        );
+
+        let entry = &entries[id];
+        let case = format!("{id} listed");
+        let listed = (
+            instant(&case, "periodStart", &entry["periodStart"]),
+            instant(&case, "periodEnd", &entry["periodEnd"]),
+        );
+        assert_eq!(
+            Some(&listed),
+            per_version.get(&expected.latest()),
+            "case {case:?}: the entry must report the window of the version it names, got \
+             {entry:?} against {per_version:?}"
+        );
+        listed_windows.insert(listed);
+    }
+
+    // And the catalog's entries do not all carry one window: a period is read off the
+    // report it belongs to, never synthesized for the page.
+    assert!(
+        listed_windows.len() > 1,
+        "the reported periods must be the reports' own, got {listed_windows:?}"
+    );
 }

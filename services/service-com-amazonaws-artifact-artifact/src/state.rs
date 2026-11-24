@@ -3283,10 +3283,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // The seeded, service-owned catalog.
 // ---------------------------------------------------------------------------
 
-/// Seconds since the Unix epoch at 2022-01-01T00:00:00Z.
-const T2022JAN: u64 = 1_640_995_200;
-/// Seconds since the Unix epoch at 2022-07-01T00:00:00Z.
-const T2022JUL: u64 = 1_656_633_600;
 /// Seconds since the Unix epoch at 2023-01-01T00:00:00Z.
 const T2023JAN: u64 = 1_672_531_200;
 /// Seconds since the Unix epoch at 2023-04-01T00:00:00Z.
@@ -3305,6 +3301,8 @@ const T2025JAN: u64 = 1_735_689_600;
 const T2025APR: u64 = 1_743_465_600;
 /// Seconds since the Unix epoch at 2025-07-01T00:00:00Z.
 const T2025JUL: u64 = 1_751_328_000;
+/// Seconds since the Unix epoch at 2025-10-01T00:00:00Z.
+const T2025OCT: u64 = 1_759_276_800;
 /// Seconds since the Unix epoch at 2026-01-01T00:00:00Z.
 const T2026JAN: u64 = 1_767_225_600;
 
@@ -3316,6 +3314,22 @@ const T2026JAN: u64 = 1_767_225_600;
 // so the report the recording names at three published versions carries that window and
 // its earlier versions the preceding years' windows.
 
+/// Seconds since the Unix epoch at 2018-11-01T00:00:00Z.
+const T2018NOV: u64 = 1_541_030_400;
+/// Seconds since the Unix epoch at 2019-10-31T00:00:00Z.
+const T2019OCT31: u64 = 1_572_480_000;
+/// Seconds since the Unix epoch at 2019-11-01T00:00:00Z.
+const T2019NOV: u64 = 1_572_566_400;
+/// Seconds since the Unix epoch at 2020-10-31T00:00:00Z.
+const T2020OCT31: u64 = 1_604_102_400;
+/// Seconds since the Unix epoch at 2020-11-01T00:00:00Z.
+const T2020NOV: u64 = 1_604_188_800;
+/// Seconds since the Unix epoch at 2021-10-31T00:00:00Z.
+const T2021OCT31: u64 = 1_635_638_400;
+/// Seconds since the Unix epoch at 2021-11-01T00:00:00Z.
+const T2021NOV: u64 = 1_635_724_800;
+/// Seconds since the Unix epoch at 2022-10-31T00:00:00Z.
+const T2022OCT31: u64 = 1_667_174_400;
 /// Seconds since the Unix epoch at 2022-11-01T00:00:00Z.
 const T2022NOV: u64 = 1_667_260_800;
 /// Seconds since the Unix epoch at 2023-10-31T00:00:00Z.
@@ -3389,16 +3403,19 @@ const PRODUCT_NAME: &str = "AWS";
 /// into being — it is the published catalog itself, the same for every account, keyed by
 /// the `ReportId` AWS assigned each report. A client's whole report flow starts by
 /// listing it and then naming one of these ids (or one of these series) to
-/// `GetReportMetadata`, `GetTermForReport` and `GetReport`, which is why the first three
-/// rows carry the ids and names AWS publishes for them, as the issue's recording of a
-/// live `ListReports` shows them: `report-073F0fUCdVVNKJrF`, `report-0c1IXmudeXuTlHJJ`
-/// and `report-5eevElBv6MyRmQsD`.
+/// `GetReportMetadata`, `GetTermForReport` and `GetReport`, which is why the two rows the
+/// corpus discloses an id for carry the id and the published name AWS publishes them
+/// under, as a recording of a live `ListReports` shows them: `report-073F0fUCdVVNKJrF`
+/// and `report-5eevElBv6MyRmQsD`. An id the corpus discloses names the report AWS
+/// publishes under it and no other, so it is carried by THAT row: the other ids the same
+/// recording discloses name reports of the accessibility-conformance class and are
+/// therefore seeded in [`accessibility_reports`].
 ///
-/// Every row after those three carries a report AWS really publishes in Artifact (the SOC
-/// reports, the ISO certificates, the PCI DSS attestation, the FedRAMP, IRAP and C5
-/// packages and the CSA questionnaire) under an id this catalog assigns, because the
-/// recording names an id only for the three above: those ids satisfy `ReportId`'s pattern
-/// and are this emulator's, not a claim that AWS issued them.
+/// Every other row carries a report AWS really publishes in Artifact (the SOC reports, the
+/// ISO certificates, the PCI DSS attestation, the FedRAMP, IRAP and C5 packages and the
+/// CSA questionnaire) under an id this catalog assigns, because the recording names an id
+/// only for the two above: those ids satisfy `ReportId`'s pattern and are this
+/// emulator's, not a claim that AWS issued them.
 ///
 /// This is one row per compliance PROGRAMME. The accessibility-conformance reports, which
 /// AWS publishes one of per evaluated PRODUCT, are the catalog's other class and are
@@ -3418,6 +3435,11 @@ const PRODUCT_NAME: &str = "AWS";
 /// both `AcceptanceType` values, one, two, three and seven published versions, and
 /// reporting periods on the calendar-annual, the November-annual and the semiannual
 /// windows AWS publishes on.
+///
+/// A row's period members are the window the REPORT itself covers, version by version: a
+/// programme publishes a version for a cycle and the next version for the following one,
+/// so a window belongs to the row that published it and is never shared with another row
+/// because both happen to be listed on one page.
 ///
 /// Every `id` matches `ReportId`'s `^report-[a-zA-Z0-9]{16}$`. A published title is
 /// reported as it is published, punctuation included: `ShortStringAttribute`'s `@pattern`
@@ -3469,7 +3491,11 @@ const SEED: &[SeedReport] = &[
         ],
     },
     SeedReport {
-        id: "report-0c1IXmudeXuTlHJJ",
+        // An id this catalog assigns. The recorded `ListReports` body names
+        // `report-0c1IXmudeXuTlHJJ` as an accessibility-conformance report, so that id is
+        // carried by that row in [`accessibility_reports`] and this certificate — which
+        // AWS publishes but the recording discloses no id for — is keyed here.
+        id: "report-T5xWnQ8dKb3VzL6p",
         name: "ISO 27001 2022 Certification",
         description: "The ISO/IEC 27001:2022 certificate records the certification of the \
                       AWS information security management system by an accredited \
@@ -3509,7 +3535,12 @@ const SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-5eevElBv6MyRmQsD",
-        name: "UAE IAR Compliance Report",
+        // The title AWS publishes this assessment under, as the recorded catalog entry for
+        // this id carries it: the jurisdiction, the regulation assessed against and the
+        // kind of document, spelled in full. A published title is reported as published —
+        // an abbreviation of it names a document the publisher does not publish.
+        name: "United Arab Emirates (UAE) Information Assurance Regulation (IAR) \
+               Compliance Assessment Report",
         // The description AWS publishes for this document, as the corpus records it: one
         // sentence naming the assessment and the regulation it was made against. A
         // published description is as long as its publisher wrote it — this one is a single
@@ -3524,54 +3555,60 @@ const SEED: &[SeedReport] = &[
         document_object: "UAE-TDRA-IAR.pdf",
         term_object: "UAE-TDRA-IAR-Term.txt",
         source_link: "https://aws.amazon.com/compliance/uae-iar/",
+        // This assessment is published on the ANNUAL November cycle: a version covers 1
+        // November to 31 October of the following year, which is the window the recorded
+        // catalog entry carries for the version it reports, and its earlier versions carry
+        // the preceding years' windows of the same cycle. An assessment report is published
+        // once the period it reports on has elapsed, so a version's `published_at` closes
+        // its window.
         versions: &[
             SeedVersion {
                 version: 1,
-                period_start: T2022JAN,
-                period_end: T2022JUL,
-                published_at: T2022JUL,
+                period_start: T2018NOV,
+                period_end: T2019OCT31,
+                published_at: T2019OCT31,
                 sequence_number: 1,
             },
             SeedVersion {
                 version: 2,
-                period_start: T2022JUL,
-                period_end: T2023JAN,
-                published_at: T2023JAN,
+                period_start: T2019NOV,
+                period_end: T2020OCT31,
+                published_at: T2020OCT31,
                 sequence_number: 2,
             },
             SeedVersion {
                 version: 3,
-                period_start: T2023JAN,
-                period_end: T2023JUL,
-                published_at: T2023JUL,
+                period_start: T2020NOV,
+                period_end: T2021OCT31,
+                published_at: T2021OCT31,
                 sequence_number: 3,
             },
             SeedVersion {
                 version: 4,
-                period_start: T2023JUL,
-                period_end: T2024JAN,
-                published_at: T2024JAN,
+                period_start: T2021NOV,
+                period_end: T2022OCT31,
+                published_at: T2022OCT31,
                 sequence_number: 4,
             },
             SeedVersion {
                 version: 5,
-                period_start: T2024JAN,
-                period_end: T2024JUL,
-                published_at: T2024JUL,
+                period_start: T2022NOV,
+                period_end: T2023OCT31,
+                published_at: T2023OCT31,
                 sequence_number: 5,
             },
             SeedVersion {
                 version: 6,
-                period_start: T2024JUL,
-                period_end: T2025JAN,
-                published_at: T2025JAN,
+                period_start: T2023NOV,
+                period_end: T2024OCT31,
+                published_at: T2024OCT31,
                 sequence_number: 6,
             },
             SeedVersion {
                 version: 7,
-                period_start: T2025JAN,
-                period_end: T2025JUL,
-                published_at: T2025JUL,
+                period_start: T2024NOV,
+                period_end: T2025OCT31,
+                published_at: T2025OCT31,
                 sequence_number: 7,
             },
         ],

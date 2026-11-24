@@ -163,9 +163,9 @@ pub fn a_report_requiring_acceptance() -> &'static Expected {
 /// the published report set. They are spelled out here, independently of the seed in
 /// `src/state.rs`, so a changed or fabricated catalog fails these suites rather than
 /// quietly redefining what they assert. The ids and names AWS publishes are the ones a
-/// recording of a live `ListReports` shows (`report-073F0fUCdVVNKJrF`,
-/// `report-0c1IXmudeXuTlHJJ`, `report-5eevElBv6MyRmQsD`, and `report-7g5j2DTVeNXWx7St`
-/// and `report-0QjvdIs6Bsw4uPxb` of the accessibility-conformance class); every other row
+/// recording of a live `ListReports` shows (`report-073F0fUCdVVNKJrF` and
+/// `report-5eevElBv6MyRmQsD`, and `report-7g5j2DTVeNXWx7St`, `report-0QjvdIs6Bsw4uPxb`
+/// and `report-0c1IXmudeXuTlHJJ` of the accessibility-conformance class); every other row
 /// is a report AWS publishes in Artifact under an id this emulator assigns (see `SEED` and
 /// `accessibility_reports` in `src/state.rs`).
 ///
@@ -197,15 +197,16 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-0c1IXmudeXuTlHJJ",
-        name: "ISO 27001 2022 Certification",
-        series: "ISO",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Polly",
+        series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
         versions: &[1, 2, 3],
     },
     Expected {
         id: "report-5eevElBv6MyRmQsD",
-        name: "UAE IAR Compliance Report",
+        name: "United Arab Emirates (UAE) Information Assurance Regulation (IAR) \
+               Compliance Assessment Report",
         series: "UAE TDRA IAR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -362,6 +363,14 @@ pub const CATALOG: &[Expected] = &[
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
         versions: &[1],
+    },
+    Expected {
+        id: "report-T5xWnQ8dKb3VzL6p",
+        name: "ISO 27001 2022 Certification",
+        series: "ISO",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        versions: &[1, 2, 3],
     },
 ];
 

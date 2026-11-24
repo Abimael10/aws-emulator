@@ -14,20 +14,26 @@
 //!
 //! Catalog membership is not something the model bounds: AWS Artifact has no
 //! `CreateReport`, so what the catalog holds is the published inventory, and this class is
-//! part of it. Two rows below carry the ids the corpus discloses for an
-//! accessibility-conformance report — `report-7g5j2DTVeNXWx7St` at one published version
-//! and `report-0QjvdIs6Bsw4uPxb` at two — which are AWS's own, as a recorded `ListReports`
-//! body shows them; the remaining rows carry ids this catalog assigns (they satisfy
-//! `ReportId`'s `^report-[a-zA-Z0-9]{16}$` and are not a claim that AWS issued them), as
-//! [`super::SEED`]'s own doc comment explains for the rows there.
+//! part of it. Three rows below carry the ids the corpus discloses for an
+//! accessibility-conformance report — `report-7g5j2DTVeNXWx7St` at one published version,
+//! `report-0QjvdIs6Bsw4uPxb` at two and `report-0c1IXmudeXuTlHJJ` at three — which are
+//! AWS's own, as a recorded `ListReports` body shows them; the remaining rows carry ids
+//! this catalog assigns (they satisfy `ReportId`'s `^report-[a-zA-Z0-9]{16}$` and are not a
+//! claim that AWS issued them), as [`super::SEED`]'s own doc comment explains for the rows
+//! there.
+//!
+//! An id the corpus discloses names ONE published report, so the row that carries it is
+//! the report the recording reports under it: a listing projects each entry from the row
+//! its id names, which is why `report-0c1IXmudeXuTlHJJ` is seeded here, in the class the
+//! recording reports it in, rather than beside the compliance programmes.
 //!
 //! What each member CARRIES is the published metadata of the document the row's id names,
 //! never prose re-authored about the product: every row is TITLED the way AWS titles this
 //! class — the kind of document, the template it is reported on, then the product evaluated
 //! ("Accessibility Conformance Report (VPAT) - <product>", as the recorded catalog entry of
 //! this class is titled) — and carries the published description of the template
-//! ([`ACCESSIBILITY_DESCRIPTION`]) and the cycle the class is published on (the window
-//! constants each version names). A published title carries punctuation that
+//! ([`ACCESSIBILITY_DESCRIPTION`]) and the cycle the class is published on (the batch each
+//! version names). A published title carries punctuation that
 //! `ShortStringAttribute`'s `@pattern` — a constraint on what a REQUEST may send — does not
 //! admit; a response reports the title as it is published, which is what the recorded
 //! catalog entry of this class shows. Each `description` satisfies `LongStringAttribute`'s
@@ -69,13 +75,68 @@ const ACCESSIBILITY_DESCRIPTION: &str =
 /// reports as its `sourceLink` ([`super::Report::source_link`]).
 const ACCESSIBILITY_SOURCE_LINK: &str = "https://aws.amazon.com/accessibility/";
 
+/// One publication cycle of this class: when a batch of accessibility-conformance reports
+/// is published, and the instant the versions it publishes are effective to.
+///
+/// The class is published in BATCHES — AWS evaluates its products and publishes the
+/// conformance reports of a round together — so a version's window opens on the batch it
+/// was published in and closes on the 1 January that follows it, which is the pair the
+/// recorded catalog entries of this class carry: one of them opens on 1 November 2024 and
+/// closes on 1 January 2025, and another opens on 1 October 2025 and closes on 1 January
+/// 2026. A row publishing several versions carries the last that many batches, so the
+/// version a catalog listing reports is the one of the newest batch that evaluated it.
+struct Batch {
+    /// When the batch was published, which opens the window its versions cover.
+    published_at: u64,
+    /// The 1 January the batch's versions are effective to.
+    effective_to: u64,
+}
+
+/// The batch published in the fourth quarter of 2022.
+const BATCH_2022: Batch = Batch {
+    published_at: T2022NOV,
+    effective_to: T2023JAN,
+};
+/// The batch published in the fourth quarter of 2023.
+const BATCH_2023: Batch = Batch {
+    published_at: T2023NOV,
+    effective_to: T2024JAN,
+};
+/// The batch published in the fourth quarter of 2024 — the one the recorded entry of the
+/// AWS Transfer Family report is published in.
+const BATCH_2024: Batch = Batch {
+    published_at: T2024NOV,
+    effective_to: T2025JAN,
+};
+/// The batch published in the fourth quarter of 2025 — the one the recorded entry of the
+/// Amazon Polly report is published in.
+const BATCH_2025: Batch = Batch {
+    published_at: T2025OCT,
+    effective_to: T2026JAN,
+};
+
+/// One version of a report of this class: `version`, published in `batch`.
+const fn published_in(version: i64, batch: Batch) -> SeedVersion {
+    SeedVersion {
+        version,
+        period_start: batch.published_at,
+        period_end: batch.effective_to,
+        published_at: batch.published_at,
+        // A version is the n-th document published for the report, so the sequence number
+        // the optimistic-locking member reports is that version's own position.
+        sequence_number: version,
+    }
+}
+
 /// The accessibility-conformance reports the catalog publishes, one per evaluated product.
 ///
 /// The rows differ along what the report surface generalises over: the product evaluated,
-/// the number of published versions (one, two and three) and the windows those versions
-/// cover. A window is the one the evaluation it reports covers — a property of that
-/// document rather than of the class — and the only one the corpus discloses is the AWS
-/// Transfer Family report's, which opens on 1 November.
+/// the number of published versions (one, two and three) and the publication batches those
+/// versions were published in. Which batches a row carries is a property of that document —
+/// AWS evaluates a product in the rounds it evaluates it in — and the ones the corpus
+/// discloses are the AWS Transfer Family report's single version, published in the fourth
+/// quarter of 2024, and the Amazon Polly report's third, published in the fourth quarter of
+/// 2025.
 ///
 /// A version's `published_at` opens the window it covers rather than closing it: an
 /// accessibility conformance report states the conformance of a product AS EVALUATED, and
@@ -94,21 +155,26 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-Amazon-Connect.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-Connect-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
+        versions: &[published_in(1, BATCH_2023), published_in(2, BATCH_2024)],
+    },
+    SeedReport {
+        // The id the recorded `ListReports` body names this report under: the recording
+        // reports it as the accessibility-conformance report of Amazon Polly at its third
+        // published version, so that id names THIS row and the members a listing projects
+        // under it are this row's.
+        id: "report-0c1IXmudeXuTlHJJ",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Polly",
+        description: ACCESSIBILITY_DESCRIPTION,
+        series: ACCESSIBILITY_SERIES,
+        category: ACCESSIBILITY_CATEGORY,
+        acceptance_type: ACCESSIBILITY_ACCEPTANCE,
+        document_object: "Accessibility-Conformance-Report-Amazon-Polly.pdf",
+        term_object: "Accessibility-Conformance-Report-Amazon-Polly-Term.txt",
+        source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
-            SeedVersion {
-                version: 1,
-                period_start: T2023JAN,
-                period_end: T2024JAN,
-                published_at: T2023JAN,
-                sequence_number: 1,
-            },
-            SeedVersion {
-                version: 2,
-                period_start: T2024JAN,
-                period_end: T2025JAN,
-                published_at: T2024JAN,
-                sequence_number: 2,
-            },
+            published_in(1, BATCH_2023),
+            published_in(2, BATCH_2024),
+            published_in(3, BATCH_2025),
         ],
     },
     SeedReport {
@@ -121,15 +187,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-AWS-Transfer-Family.pdf",
         term_object: "Accessibility-Conformance-Report-AWS-Transfer-Family-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        // The window the corpus records for this report opens on 1 November 2024; its
-        // close is the one this catalog publishes, which the recording does not contradict.
-        versions: &[SeedVersion {
-            version: 1,
-            period_start: T2024NOV,
-            period_end: T2025JAN,
-            published_at: T2024NOV,
-            sequence_number: 1,
-        }],
+        versions: &[published_in(1, BATCH_2024)],
     },
     SeedReport {
         id: "report-M2hXsL5bQw9TnF4j",
@@ -141,22 +199,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-Amazon-WorkSpaces.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-WorkSpaces-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        versions: &[
-            SeedVersion {
-                version: 1,
-                period_start: T2023JUL,
-                period_end: T2024JUL,
-                published_at: T2023JUL,
-                sequence_number: 1,
-            },
-            SeedVersion {
-                version: 2,
-                period_start: T2024JUL,
-                period_end: T2025JUL,
-                published_at: T2024JUL,
-                sequence_number: 2,
-            },
-        ],
+        versions: &[published_in(1, BATCH_2023), published_in(2, BATCH_2024)],
     },
     SeedReport {
         id: "report-N7kDvR3mYt8ZpB6c",
@@ -168,13 +211,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-Amazon-QuickSight.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-QuickSight-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        versions: &[SeedVersion {
-            version: 1,
-            period_start: T2024JAN,
-            period_end: T2025JAN,
-            published_at: T2024JAN,
-            sequence_number: 1,
-        }],
+        versions: &[published_in(1, BATCH_2024)],
     },
     SeedReport {
         id: "report-P5qZmJ8hXc2VtL9d",
@@ -187,27 +224,9 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         term_object: "Accessibility-Conformance-Report-Amazon-Chime-SDK-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
         versions: &[
-            SeedVersion {
-                version: 1,
-                period_start: T2023JAN,
-                period_end: T2024JAN,
-                published_at: T2023JAN,
-                sequence_number: 1,
-            },
-            SeedVersion {
-                version: 2,
-                period_start: T2024JAN,
-                period_end: T2025JAN,
-                published_at: T2024JAN,
-                sequence_number: 2,
-            },
-            SeedVersion {
-                version: 3,
-                period_start: T2025JAN,
-                period_end: T2026JAN,
-                published_at: T2025JAN,
-                sequence_number: 3,
-            },
+            published_in(1, BATCH_2022),
+            published_in(2, BATCH_2023),
+            published_in(3, BATCH_2024),
         ],
     },
     SeedReport {
@@ -220,13 +239,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-AWS-CloudShell.pdf",
         term_object: "Accessibility-Conformance-Report-AWS-CloudShell-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        versions: &[SeedVersion {
-            version: 1,
-            period_start: T2024JUL,
-            period_end: T2025JUL,
-            published_at: T2024JUL,
-            sequence_number: 1,
-        }],
+        versions: &[published_in(1, BATCH_2025)],
     },
     SeedReport {
         id: "report-R3vYkT9pLd5XnQ7b",
@@ -238,22 +251,7 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-Amazon-SageMaker-Studio.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-SageMaker-Studio-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        versions: &[
-            SeedVersion {
-                version: 1,
-                period_start: T2024APR,
-                period_end: T2025APR,
-                published_at: T2024APR,
-                sequence_number: 1,
-            },
-            SeedVersion {
-                version: 2,
-                period_start: T2025APR,
-                period_end: T2026JAN,
-                published_at: T2025APR,
-                sequence_number: 2,
-            },
-        ],
+        versions: &[published_in(1, BATCH_2024), published_in(2, BATCH_2025)],
     },
     SeedReport {
         id: "report-S6mFqH2xVb8JtZ4n",
@@ -265,12 +263,6 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
         document_object: "Accessibility-Conformance-Report-Amazon-Lex.pdf",
         term_object: "Accessibility-Conformance-Report-Amazon-Lex-Term.txt",
         source_link: ACCESSIBILITY_SOURCE_LINK,
-        versions: &[SeedVersion {
-            version: 1,
-            period_start: T2025JAN,
-            period_end: T2026JAN,
-            published_at: T2025JAN,
-            sequence_number: 1,
-        }],
+        versions: &[published_in(1, BATCH_2025)],
     },
 ];

@@ -69,11 +69,7 @@ const PUBLISHED: &[(&str, &str)] = &[
     ),
     (
         "report-0c1IXmudeXuTlHJJ",
-        "The ISO/IEC 27001:2022 certificate records the certification of the AWS \
-         information security management system by an accredited independent registrar. It \
-         names the services and AWS Regions in the scope of the certification and the dates \
-         of the certification cycle it was issued for. The certificate is reissued after \
-         each surveillance and recertification audit.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-5eevElBv6MyRmQsD",
@@ -210,6 +206,14 @@ const PUBLISHED: &[(&str, &str)] = &[
     (
         "report-S6mFqH2xVb8JtZ4n",
         ACCESSIBILITY_DESCRIPTION,
+    ),
+    (
+        "report-T5xWnQ8dKb3VzL6p",
+        "The ISO/IEC 27001:2022 certificate records the certification of the AWS \
+         information security management system by an accredited independent registrar. It \
+         names the services and AWS Regions in the scope of the certification and the dates \
+         of the certification cycle it was issued for. The certificate is reissued after \
+         each surveillance and recertification audit.",
     ),
 ];
 
