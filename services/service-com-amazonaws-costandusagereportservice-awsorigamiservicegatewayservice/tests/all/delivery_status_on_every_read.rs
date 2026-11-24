@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every report definition a read serves states its delivery status.
+//! Every report definition a read serves states the delivery recorded against it, and no
+//! more.
 //!
 //! The rule: the modelled `ReportStatus` is "a two element dictionary with a
 //! `lastDelivery` and `lastStatus` key whose values describe the date and status of the
 //! last delivered report for a particular report definition"
-//! (`smithy_query(shape="ReportStatus")`), and the read path states that dictionary, with
-//! both of its keys, on EVERY report definition it serves — only the two VALUES depend on
-//! the report's delivery history: the instant of the delivery and the outcome it ended
-//! with once one has been recorded, and the empty string in each key until one has. So a
-//! client polling `lastStatus` to learn whether its report has been delivered reads the
-//! "not yet" sentinel rather than finding the member it polls absent.
+//! (`smithy_query(shape="ReportStatus")`), so the read path states that dictionary, with
+//! both of its keys, for every report definition a delivery HAS been recorded against —
+//! the instant of that delivery and the outcome it ended with — and states no
+//! `ReportStatus` at all for one none has: the member's modelled constraints admit only
+//! the values a delivery has, so there is nothing a report nothing delivered can fill it
+//! with.
 //!
 //! The rows span what the rule generalises over: how many definitions the account holds
 //! (one, several, more than one page's worth), which position in the page a definition
@@ -23,11 +24,11 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_costandusagereportservice_awsorigamiservicegatewayservice as cur;
 
-use cur::state::{ReportDelivery, StoredReport, NO_DELIVERY};
+use cur::state::{ReportDelivery, StoredReport};
 
 use super::report_definition_lifecycle::{
-    at_epoch_seconds, is_report_timestamp, minimal_definition, never_delivered,
-    recorded_deliveries, stored_report_at, Cur,
+    assert_delivery_status, at_epoch_seconds, minimal_definition, recorded_deliveries,
+    stored_report_at, Cur,
 };
 
 /// A stored report called `report_name` carrying `last_delivery`, created at one fixed
@@ -37,47 +38,6 @@ use super::report_definition_lifecycle::{
 /// ([`super::report_definition_lifecycle::stored_report_at`]).
 fn stored_with(report_name: &str, last_delivery: Option<ReportDelivery>) -> StoredReport {
     stored_report_at(report_name, at_epoch_seconds(1_767_225_600), last_delivery)
-}
-
-/// The delivery status `reported` states, checked against the delivery (if any) recorded
-/// against the report: the two-key dictionary, both keys present, and the values the
-/// report's history gives them.
-fn assert_delivery_status(case: &str, reported: &Value, recorded: Option<&ReportDelivery>) {
-    let status = reported
-        .get("ReportStatus")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let keys: Vec<&str> = status
-        .as_object()
-        .map(|object| object.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    assert_eq!(
-        keys,
-        vec!["lastDelivery", "lastStatus"],
-        "case {case:?}: expected the two-element delivery-status dictionary, got {reported:?}"
-    );
-
-    match recorded {
-        None => assert_eq!(
-            status,
-            never_delivered(),
-            "case {case:?}: no delivery was recorded, so both keys must hold \
-             {NO_DELIVERY:?}, got {status:?}"
-        ),
-        Some(delivery) => {
-            let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
-            assert!(
-                is_report_timestamp(last_delivery),
-                "case {case:?}: expected lastDelivery stated as yyyymmddThhmmssZ, got {status:?}"
-            );
-            assert_eq!(
-                status["lastStatus"],
-                json!(delivery.status),
-                "case {case:?}: expected lastStatus {:?}, got {status:?}",
-                delivery.status
-            );
-        }
-    }
 }
 
 /// The deliveries a seeded store is built from: the histories every suite of this target
@@ -103,7 +63,7 @@ fn recorded() -> Vec<ReportDelivery> {
 const PAGE_SIZE: usize = 5;
 
 #[tokio::test]
-async fn every_definition_a_read_serves_states_its_delivery_status() {
+async fn every_definition_a_read_serves_states_the_delivery_recorded_against_it() {
     // Rows differ in how many definitions the account holds and in which of them have a
     // delivery recorded: a single undelivered report (the recorded case), a single
     // delivered one, a mixed account, every report delivered, and an account holding more
@@ -168,7 +128,7 @@ async fn every_definition_a_read_serves_states_its_delivery_status() {
 }
 
 #[tokio::test]
-async fn a_requested_page_states_the_delivery_status_on_each_of_its_elements() {
+async fn a_requested_page_states_the_delivery_status_of_each_of_its_elements() {
     // The page size the request asks for changes which definitions one response carries,
     // and the rule holds on each element of each page: the modelled `MaxResults` is pinned
     // to 5 (`smithy_query(operation="DescribeReportDefinitions")`), so the sizes spanned
@@ -236,7 +196,7 @@ async fn a_requested_page_states_the_delivery_status_on_each_of_its_elements() {
 async fn the_delivery_status_is_stated_whatever_call_the_read_follows() {
     // Rows differ in the call the read follows: the create, each update, a create refused
     // as a duplicate name, a tagging, and a delete. Nothing in this service's modelled
-    // surface delivers a report, so every read states the never-delivered sentinel.
+    // surface delivers a report, so no read after any of them states a delivery status.
     let cur = Cur::new();
     let (status, body) = cur.put(&minimal_definition("lifecycle-report"), None).await;
     assert_eq!(status, 200, "case create: got {body:?}");

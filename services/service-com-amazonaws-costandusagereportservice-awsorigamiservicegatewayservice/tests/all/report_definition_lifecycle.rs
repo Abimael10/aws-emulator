@@ -192,9 +192,8 @@ pub(crate) fn primary_billing_view_arn() -> String {
 /// preference is on, an unstated versioning preference delivers a new version, and an
 /// unstated billing view is the account's primary one. The report's delivery status is the
 /// service's and not the caller's: nothing in this service delivers a report, so a report
-/// created through the API has never been delivered and its read-back states the
-/// delivery-status dictionary with both keys empty ([`never_delivered`]) — whatever the
-/// request put there.
+/// created through the API has never been delivered and its read-back states NO
+/// `ReportStatus` at all — whatever the request put there.
 /// `ReportCreationDate` is a per-run instant, so [`read_back_of`] checks its form
 /// and drops it rather than this expectation carrying a value.
 pub(crate) fn expected_read_back(definition: &Value) -> Value {
@@ -214,18 +213,59 @@ pub(crate) fn expected_read_back(definition: &Value) -> Value {
     object
         .entry("BillingViewArn")
         .or_insert_with(|| json!(primary_billing_view_arn()));
-    object.insert("ReportStatus".to_string(), never_delivered());
+    object.remove("ReportStatus");
     expected
 }
 
-/// The delivery status a read states for a report no delivery has been recorded against:
-/// the modelled two-key dictionary with the empty string in each key.
+/// The `ReportStatus` a read states for a report, checked against the delivery (if any)
+/// recorded against it. Shared by every suite of this target that reads a definition back.
 ///
-/// The two empty strings are the RECORDED ground truth for a definition that has never
-/// had a delivery, written here as literals so this expectation stands on its own rather
-/// than on whatever value the projection happens to carry.
-pub(crate) fn never_delivered() -> Value {
-    json!({ "lastDelivery": "", "lastStatus": "" })
+/// A report a delivery HAS been recorded against states the modelled two-element
+/// dictionary: the instant of that delivery, in the form this service states a report
+/// timestamp in, and the outcome it ended with. A report none has been recorded against
+/// states no `ReportStatus` at all — the modelled `ReportStatus` describes "the date and
+/// status of the last delivered report" (`smithy_query(shape="ReportStatus")`) and its two
+/// members are constrained to the values a DELIVERY has (`lastDelivery` length 16..20 with
+/// the pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` the `LastStatus`
+/// catalog, `smithy_query(shape="LastDelivery,LastStatus")`), so there is no value the
+/// member admits for a report nothing has delivered and the optional member is left out.
+pub(crate) fn assert_delivery_status(
+    case: &str,
+    reported: &Value,
+    recorded: Option<&ReportDelivery>,
+) {
+    let status = reported.get("ReportStatus").cloned();
+    match recorded {
+        None => assert_eq!(
+            status, None,
+            "case {case:?}: no delivery was recorded, so the read must state no ReportStatus, \
+             got {reported:?}"
+        ),
+        Some(delivery) => {
+            let status = status.unwrap_or(Value::Null);
+            let keys: Vec<&str> = status
+                .as_object()
+                .map(|object| object.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                keys,
+                vec!["lastDelivery", "lastStatus"],
+                "case {case:?}: expected the two-element delivery-status dictionary, got \
+                 {reported:?}"
+            );
+            let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
+            assert!(
+                is_report_timestamp(last_delivery),
+                "case {case:?}: expected lastDelivery stated as yyyymmddThhmmssZ, got {status:?}"
+            );
+            assert_eq!(
+                status["lastStatus"],
+                json!(delivery.status),
+                "case {case:?}: expected lastStatus {:?}, got {status:?}",
+                delivery.status
+            );
+        }
+    }
 }
 
 /// One instant, as a number of seconds after the epoch, for a test that pins what the

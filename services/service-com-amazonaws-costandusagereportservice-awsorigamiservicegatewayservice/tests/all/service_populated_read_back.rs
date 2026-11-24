@@ -9,8 +9,8 @@
 //!    answers the stored definition PLUS every member the service itself populates: the
 //!    billing view the report is scoped to (the one the request named, or the account's
 //!    primary billing view when it named none), the status of the report's last delivery
-//!    (stated on every read, with both of its keys empty while nothing has delivered the
-//!    report) and the date the definition was
+//!    (stated for a report a delivery has been recorded against, and left out while
+//!    nothing has delivered the report) and the date the definition was
 //!    created. Each comes from the stored record, so every read answers the same value and
 //!    none of them can be dictated by the caller.
 //! 2. **An optional output member the service does not populate is not serialized.**
@@ -41,9 +41,8 @@ use cur::state::ReportDelivery;
 // `stored_report_at` is the one seeded-report builder the suites of this target share; it
 // is the stored record a test pins the read-back projection against.
 use super::report_definition_lifecycle::{
-    at_epoch_seconds, error_code, expected_read_back, is_report_timestamp, minimal_definition,
-    never_delivered, primary_billing_view_arn, read_back_of, stored_report_at as stored_at,
-    Cur,
+    assert_delivery_status, at_epoch_seconds, error_code, expected_read_back, is_report_timestamp,
+    minimal_definition, primary_billing_view_arn, read_back_of, stored_report_at as stored_at, Cur,
 };
 
 #[tokio::test]
@@ -106,15 +105,12 @@ async fn a_read_back_carries_the_status_of_the_report_last_delivery() {
     // Rows differ in whether a delivery has been recorded against the report and in how
     // that delivery ended: every value of the modelled `LastStatus` enum
     // (`smithy_query(shape="LastStatus")`) is covered, beside the report nothing has
-    // delivered, whose read-back states the same two-key dictionary with the empty string
-    // in each key — the dictionary is unconditional on this read path and only its values
-    // depend on the report's delivery history.
+    // delivered, whose read-back states no `ReportStatus` at all — the dictionary
+    // describes a delivery, and its members' modelled constraints admit no value for a
+    // report that has had none.
     let delivered_at = at_epoch_seconds(1_700_000_000);
-    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> = vec![(
-        "no delivery recorded".to_string(),
-        None,
-        Some(never_delivered()),
-    )];
+    let mut table: Vec<(String, Option<ReportDelivery>, Option<Value>)> =
+        vec![("no delivery recorded".to_string(), None, None)];
     for status in cur::ops::types::LAST_STATUS_VALUES {
         table.push((
             format!("a delivery that ended {status}"),
@@ -267,12 +263,9 @@ async fn a_caller_cannot_dictate_the_members_the_service_populates() {
                 json!(claimed_name),
                 "case {case:?} via {operation}: expected the report to be listed, got {listed:?}"
             );
-            assert_eq!(
-                subject.get("ReportStatus"),
-                Some(&never_delivered()),
-                "case {case:?} via {operation}: nothing delivered this report, so its read-back \
-                 must state the delivery status with both keys empty, got {subject:?}"
-            );
+            // Nothing in this service delivers a report, so what the request claimed about
+            // the last delivery is not what the read states.
+            assert_delivery_status(&format!("{case} via {operation}"), &subject, None);
             let created = subject["ReportCreationDate"].as_str().unwrap_or_default();
             assert!(
                 is_report_timestamp(created) && created != "20200101T000000Z",

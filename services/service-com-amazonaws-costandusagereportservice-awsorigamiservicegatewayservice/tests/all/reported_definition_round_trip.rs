@@ -1,35 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The definition a read reports, and the definition a caller supplies, are accepted back
-//! member for member.
+//! The definition a read reports is a definition this service accepts back, member for
+//! member.
 //!
-//! Two rules, both about the read path:
+//! Three rules, all about the read path:
 //!
-//! 1. **A read states the report's delivery status on every read.** The modelled
+//! 1. **A read states the delivery recorded against the report, and no more.** The modelled
 //!    `ReportStatus` is "a two element dictionary with a `lastDelivery` and `lastStatus`
-//!    key" (`smithy_query(shape="ReportStatus")`), and the dictionary and both of its keys
-//!    are unconditional on this read path: only the two VALUES depend on the report's
-//!    delivery history, which is the delivered instant and the outcome it ended with once a
-//!    delivery has been recorded and the empty string until one has.
-//! 2. **The members the service populates are the service's, and the rest round-trips.**
-//!    `ModifyReportDefinition` replaces a definition wholesale, so read-modify-write is
-//!    this API's normal way to change one: every member of a reported definition a caller
-//!    supplies is a member `PutReportDefinition` and `ModifyReportDefinition` take back.
-//!    The never-delivered sentinel is the one output-only value among them — the modelled
-//!    constraints on the two `ReportStatus` members describe the values a DELIVERY has
-//!    (`lastDelivery` length 16..20 and the pattern
-//!    `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` the `LastStatus` catalog
-//!    `SUCCESS | ERROR_PERMISSIONS | ERROR_NO_BUCKET`,
-//!    `smithy_query(shape="LastDelivery,LastStatus")`), and the boundary validator holds
-//!    every request to them (its refusals are pinned by `modelled_constraints.rs`), so the
-//!    replay below carries the sentinel back no more than a caller would.
+//!    key whose values describe the date and status of the last delivered report for a
+//!    particular report definition" (`smithy_query(shape="ReportStatus")`), so a report a
+//!    delivery HAS been recorded against states that dictionary with the instant of the
+//!    delivery and the outcome it ended with, and a report none has been recorded against
+//!    states no `ReportStatus` at all.
+//! 2. **Every member a read fills holds a value the model admits for it.** The members this
+//!    service populates are constrained like every other: `lastDelivery` is length 16..20
+//!    with the pattern `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$`, `lastStatus` is the
+//!    `LastStatus` catalog `SUCCESS | ERROR_PERMISSIONS | ERROR_NO_BUCKET`
+//!    (`smithy_query(shape="LastDelivery,LastStatus")`), `BillingViewArn` is length 0..128,
+//!    and each enum member is its own catalog — so a member the service holds no value for
+//!    is left out of the response rather than filled with a stand-in outside those
+//!    constraints.
+//! 3. **A reported definition round-trips.** `ModifyReportDefinition` replaces a definition
+//!    wholesale, so read-modify-write is this API's normal way to change one: the whole
+//!    `ReportDefinition` a read serves, replayed verbatim, is accepted by both operations
+//!    that take that shape — the boundary validator holds a request to the same
+//!    constraints the read's own values satisfy (its refusals are pinned by
+//!    `modelled_constraints.rs`).
 //!
 //! The table's rows differ along what the rules generalise over: whether a delivery has
 //! been recorded against the report, how that delivery ended (every value of the modelled
-//! catalog), the instant it was delivered, and which optional members the stored
-//! definition carries and in which form. The create leg of each row also replays a
-//! reported definition that CLAIMS a delivery status, which the new report must not take
-//! as its own.
+//! catalog), the instant it was delivered, which optional members the stored definition
+//! carries and in which form, and how many reports the account holds (one, and more than
+//! one page's worth). The create leg of each row also replays a reported definition that
+//! CLAIMS a delivery status, which the new report must not take as its own.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -38,11 +41,15 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_costandusagereportservice_awsorigamiservicegatewayservice as cur;
 
-use cur::ops::types::ReportDefinition;
+use cur::ops::types::{
+    ReportDefinition, ADDITIONAL_ARTIFACT_VALUES, A_W_S_REGION_VALUES, COMPRESSION_FORMAT_VALUES,
+    LAST_STATUS_VALUES, REPORT_FORMAT_VALUES, REPORT_VERSIONING_VALUES, SCHEMA_ELEMENT_VALUES,
+    TIME_UNIT_VALUES,
+};
 use cur::state::{ReportDelivery, StoredReport};
 
 use super::report_definition_lifecycle::{
-    at_epoch_seconds, error_code, is_report_timestamp, minimal_definition, never_delivered,
+    assert_delivery_status, at_epoch_seconds, error_code, is_report_timestamp, minimal_definition,
     recorded_deliveries, Cur,
 };
 
@@ -64,19 +71,20 @@ fn text(definition: &Value, member: &str) -> Option<String> {
     definition[member].as_str().map(str::to_string)
 }
 
-/// A stored report holding `definition`, created at `created_at`, with `last_delivery`
-/// recorded against it.
+/// A stored report holding `definition` under `report_name`, created at `created_at`, with
+/// `last_delivery` recorded against it.
 ///
 /// Seeding is how a delivered report is set up at all: nothing in this service's modelled
 /// surface delivers a report, so the API cannot put a delivery on one.
 fn stored_report(
+    report_name: &str,
     definition: &Value,
     created_at: SystemTime,
     last_delivery: Option<ReportDelivery>,
 ) -> StoredReport {
     StoredReport {
         definition: ReportDefinition {
-            report_name: definition["ReportName"].as_str().unwrap_or_default().to_string(),
+            report_name: report_name.to_string(),
             time_unit: definition["TimeUnit"].as_str().unwrap_or_default().to_string(),
             format: definition["Format"].as_str().unwrap_or_default().to_string(),
             compression: definition["Compression"].as_str().unwrap_or_default().to_string(),
@@ -144,27 +152,109 @@ fn definitions() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The reported definition as a caller supplies it back: the never-delivered sentinel is
-/// an output-only value, so a replay drops it exactly as a caller that has never had a
-/// delivery reported would, and carries a recorded delivery status back as it was read.
-fn as_supplied_back(reported: &Value) -> Value {
-    let mut supplied = reported.clone();
-    if supplied.get("ReportStatus") == Some(&never_delivered()) {
-        supplied
-            .as_object_mut()
-            .expect("a report definition is an object")
-            .remove("ReportStatus");
+/// One seeded report per (definition, delivery) pair, each under its own name, so one
+/// account holds every row of the table at once — more than one page's worth.
+fn every_row_seeded() -> Vec<(String, Option<ReportDelivery>, StoredReport)> {
+    let mut seeded = Vec::new();
+    for (definition_index, (definition_case, definition)) in definitions().into_iter().enumerate() {
+        for (delivery_case, delivery) in recorded_deliveries() {
+            let report_name = format!("row-{definition_index}-{}", seeded.len());
+            seeded.push((
+                format!("{definition_case} / {delivery_case}"),
+                delivery.clone(),
+                stored_report(
+                    &report_name,
+                    &definition,
+                    at_epoch_seconds(1_767_225_600),
+                    delivery,
+                ),
+            ));
+        }
     }
-    supplied
+    seeded
+}
+
+/// Every member of a served definition holds a value the model's constraints on that
+/// member admit.
+///
+/// The catalogs and bounds are the modelled ones: the enum catalogs this crate generates
+/// from the model (`smithy_query(shape="TimeUnit,ReportFormat,CompressionFormat,AWSRegion,\
+/// ReportVersioning,SchemaElement,AdditionalArtifact,LastStatus")`), `BillingViewArn`'s
+/// length 0..128, `ReportName`'s length 0..256 and the `LastDelivery` length 16..20 with
+/// its `^[0-9]{8}[T][0-9]{6}([Z]|[+-][0-9]{4})$` form.
+fn assert_members_are_admissible(case: &str, reported: &Value) {
+    for (member, catalog) in [
+        ("TimeUnit", TIME_UNIT_VALUES),
+        ("Format", REPORT_FORMAT_VALUES),
+        ("Compression", COMPRESSION_FORMAT_VALUES),
+        ("S3Region", A_W_S_REGION_VALUES),
+        ("ReportVersioning", REPORT_VERSIONING_VALUES),
+    ] {
+        let value = reported[member].as_str().unwrap_or_default();
+        assert!(
+            catalog.contains(&value),
+            "case {case:?}: expected {member} inside its modelled catalog {catalog:?}, got \
+             {value:?}"
+        );
+    }
+    for (member, catalog) in [
+        ("AdditionalSchemaElements", SCHEMA_ELEMENT_VALUES),
+        ("AdditionalArtifacts", ADDITIONAL_ARTIFACT_VALUES),
+    ] {
+        for entry in strings(&reported[member]) {
+            assert!(
+                catalog.contains(&entry.as_str()),
+                "case {case:?}: expected every {member} entry inside its modelled catalog \
+                 {catalog:?}, got {entry:?}"
+            );
+        }
+    }
+
+    let name = reported["ReportName"].as_str().unwrap_or_default();
+    assert!(
+        (1..=256).contains(&name.chars().count()),
+        "case {case:?}: expected a ReportName inside the modelled length 0..256 its pattern \
+         admits, got {name:?}"
+    );
+    let billing_view = reported["BillingViewArn"].as_str().unwrap_or_default();
+    assert!(
+        (1..=128).contains(&billing_view.chars().count()),
+        "case {case:?}: expected a BillingViewArn inside the modelled length 0..128 its pattern \
+         admits, got {billing_view:?}"
+    );
+    let created = reported["ReportCreationDate"].as_str().unwrap_or_default();
+    assert!(
+        is_report_timestamp(created),
+        "case {case:?}: expected a ReportCreationDate stated as yyyymmddThhmmssZ, got {created:?}"
+    );
+
+    // The member the service fills from the report's delivery history: present only for a
+    // report a delivery was recorded against, and then holding the values the two
+    // constrained members admit.
+    if let Some(status) = reported.get("ReportStatus") {
+        let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
+        assert!(
+            (16..=20).contains(&last_delivery.chars().count()) && is_report_timestamp(last_delivery),
+            "case {case:?}: expected a lastDelivery inside the modelled length 16..20 and its \
+             pattern, got {status:?}"
+        );
+        let last_status = status["lastStatus"].as_str().unwrap_or_default();
+        assert!(
+            LAST_STATUS_VALUES.contains(&last_status),
+            "case {case:?}: expected a lastStatus inside the modelled catalog \
+             {LAST_STATUS_VALUES:?}, got {status:?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_reported_definition_states_a_delivery_status_on_every_read() {
+async fn a_reported_definition_states_the_delivery_recorded_against_the_report() {
     for (definition_case, definition) in definitions() {
         for (delivery_case, delivery) in recorded_deliveries() {
             let case = format!("{definition_case} / {delivery_case}");
             let cur = Cur::new();
             cur.seed(vec![stored_report(
+                "round-trip-report",
                 &definition,
                 at_epoch_seconds(1_767_225_600),
                 delivery.clone(),
@@ -177,32 +267,35 @@ async fn a_reported_definition_states_a_delivery_status_on_every_read() {
                 1,
                 "case {case:?}: expected the seeded report to be listed, got {listed:?}"
             );
-            let status = reported.get("ReportStatus").cloned();
-
-            match &delivery {
-                None => assert_eq!(
-                    status,
-                    Some(never_delivered()),
-                    "case {case:?}: no delivery was recorded, so the read-back must state the \
-                     delivery status with both keys empty, got {reported:?}"
-                ),
-                Some(recorded) => {
-                    let status = status.unwrap_or(Value::Null);
-                    let last_delivery = status["lastDelivery"].as_str().unwrap_or_default();
-                    assert!(
-                        is_report_timestamp(last_delivery),
-                        "case {case:?}: expected lastDelivery stated as yyyymmddThhmmssZ, got \
-                         {status:?}"
-                    );
-                    assert_eq!(
-                        status["lastStatus"],
-                        json!(recorded.status),
-                        "case {case:?}: expected lastStatus {:?}, got {status:?}",
-                        recorded.status
-                    );
-                }
-            }
+            assert_delivery_status(&case, &reported, delivery.as_ref());
         }
+    }
+}
+
+#[tokio::test]
+async fn every_member_a_read_fills_holds_a_value_the_model_admits() {
+    // One account holding every row at once, so the rule is asserted on each element of
+    // each page rather than on the first element of the first one.
+    let seeded = every_row_seeded();
+    let cur = Cur::new();
+    cur.seed(
+        seeded
+            .iter()
+            .map(|(_, _, report)| report.clone())
+            .collect(),
+    );
+
+    let listed = cur.describe_all().await;
+    assert_eq!(
+        listed.len(),
+        seeded.len(),
+        "expected every seeded report to be listed, got {listed:?}"
+    );
+    for (index, reported) in listed.iter().enumerate() {
+        let (case, delivery, _) = &seeded[index];
+        let case = format!("{case} / element {index}");
+        assert_members_are_admissible(&case, reported);
+        assert_delivery_status(&case, reported, delivery.as_ref());
     }
 }
 
@@ -213,6 +306,7 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
             let case = format!("{definition_case} / {delivery_case}");
             let cur = Cur::new();
             cur.seed(vec![stored_report(
+                "round-trip-report",
                 &definition,
                 at_epoch_seconds(1_767_225_600),
                 delivery.clone(),
@@ -230,38 +324,13 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
                 .unwrap_or_default()
                 .to_string();
 
-            // The never-delivered sentinel is an output-only value: the modelled
-            // constraints on the two `ReportStatus` members describe the values a delivery
-            // has, and the boundary validator holds a request to them like any other
-            // constrained member, so replaying the dictionary the service states for a
-            // report nothing has delivered is refused rather than stored.
-            if reported.get("ReportStatus") == Some(&never_delivered()) {
-                let (status, body) = cur
-                    .call(
-                        "ModifyReportDefinition",
-                        &json!({ "ReportName": report_name, "ReportDefinition": reported }),
-                    )
-                    .await;
-                assert_eq!(
-                    (status, error_code(&body)),
-                    (400, "ValidationException"),
-                    "case {case:?}: the never-delivered sentinel is not a value the modelled \
-                     constraints admit on the way in, got {status} {body:?}"
-                );
-                assert_eq!(
-                    cur.describe_all().await,
-                    listed,
-                    "case {case:?}: a refused update must leave the report as it was, got \
-                     {reported:?}"
-                );
-            }
-
-            // Read-modify-write: the definition just read, replayed as a caller supplies it.
-            let supplied = as_supplied_back(&reported);
+            // Read-modify-write: the definition just read, replayed verbatim. Every value
+            // it carries is one the modelled constraints admit, so the boundary validator
+            // takes the whole of it back.
             let (status, body) = cur
                 .call(
                     "ModifyReportDefinition",
-                    &json!({ "ReportName": report_name, "ReportDefinition": supplied }),
+                    &json!({ "ReportName": report_name, "ReportDefinition": reported }),
                 )
                 .await;
             assert_eq!(
@@ -279,7 +348,7 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
 
             // The same definition under a free name, through the create path: accepted,
             // and the new report has no delivery of its own to report.
-            let mut copy = supplied.clone();
+            let mut copy = reported.clone();
             copy["ReportName"] = json!(format!("{report_name}-copy"));
             let (status, body) = cur.put(&copy, None).await;
             assert_eq!(
@@ -295,12 +364,7 @@ async fn a_reported_definition_is_accepted_back_unchanged() {
                 .into_iter()
                 .find(|listed| listed["ReportName"] == copy["ReportName"])
                 .unwrap_or(Value::Null);
-            assert_eq!(
-                created.get("ReportStatus"),
-                Some(&never_delivered()),
-                "case {case:?}: nothing delivered the new report, so it must state the delivery \
-                 status with both keys empty, got {created:?}"
-            );
+            assert_delivery_status(&format!("{case} / the new report"), &created, None);
             // Every member of the definition is the one the service reported, so the copy
             // differs from it only in the name and in the facts the service holds.
             let definition_members = [
