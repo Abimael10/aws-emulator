@@ -22,6 +22,15 @@
 //! `smithy_query(query="shape",shape="ThingName")`), which instruction the update request
 //! carries, and whether the name never existed or named a thing that was registered,
 //! updated and then deleted.
+//!
+//! The split is pinned on BOTH sides of the family, over the operations it holds for: every
+//! operation that READS a thing addressed by its `thingName` label states the qualified
+//! sentence, and the write states the unqualified one AHEAD of every other refusal the same
+//! request would earn — a `thingTypeName` naming no type, a contradictory thing-type
+//! instruction, an `expectedVersion` that can match nothing — because the thing the request
+//! addresses is what it is missing. The unqualified wording belongs to that MISS and not to
+//! `UpdateThing`'s 404 in general: the same request against a REGISTERED thing is refused
+//! with the thing-TYPE family's own account-qualified sentence.
 
 use std::sync::Arc;
 
@@ -56,6 +65,15 @@ struct Reply {
 }
 
 impl Reply {
+    /// The error SHAPE a client resolves the refusal from: the `x-amzn-errortype` value up
+    /// to the `:` that some of this service's error shapes qualify it with, which is the
+    /// part an SDK matches the modelled error on.
+    fn error_shape(&self) -> Option<&str> {
+        self.error_code
+            .as_deref()
+            .map(|value| value.split(':').next().unwrap_or(value))
+    }
+
     /// The error message the refusal carries, or the empty string when it carries none.
     fn message(&self) -> String {
         self.body
@@ -174,6 +192,88 @@ fn read_wording(thing_name: &str) -> String {
 /// asked about, and ` not found.` — with no account id and no `:` separator.
 fn write_wording(thing_name: &str) -> String {
     format!("Thing {thing_name} not found.")
+}
+
+/// What the thing-TYPE family states for a `thingTypeName` it does not hold: its own noun
+/// as TWO words, the account the record would belong to, the name the request carried and
+/// ` not found.` — the sentence an `UpdateThing` of an EXISTING thing earns, which is how
+/// the unqualified wording above is shown to belong to the missing THING and not to this
+/// operation's 404 in general.
+fn missing_thing_type_wording(thing_type_name: &str) -> String {
+    format!(
+        "Thing Type {}:{thing_type_name} not found.",
+        engine::emulator_account_id()
+    )
+}
+
+/// The operations that READ the thing a `thingName` label addresses, each as the method
+/// and path its model binds — `DescribeThing` `GET /things/{thingName}` and
+/// `ListThingGroupsForThing` `GET /things/{thingName}/thing-groups`, from
+/// `smithy_query(query="operation",operation="DescribeThing,ListThingGroupsForThing")`.
+/// Both report on one thing record, so both state the family's READ sentence.
+fn read_operations(thing_name: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("DescribeThing", format!("/things/{thing_name}")),
+        (
+            "ListThingGroupsForThing",
+            format!("/things/{thing_name}/thing-groups"),
+        ),
+    ]
+}
+
+/// The `thingTypeName` the precedence table names: a type no case registers, so the
+/// request carries an instruction the registry cannot carry out either.
+const ABSENT_THING_TYPE: &str = "no-such-thing-type";
+
+/// One row of the precedence table: an update instruction that earns a refusal OF ITS OWN
+/// against a thing the registry holds, and what that refusal is — so the row shows that
+/// a missing thing is answered with the write half's sentence ahead of it, and that the
+/// unqualified wording is the missing THING's and not this operation's in general.
+struct Precedence {
+    /// What the request instructs, for the case label.
+    instruction: &'static str,
+    /// The `UpdateThing` request body.
+    request: Value,
+    /// The status a thing the registry HOLDS earns for this request.
+    held_status: u16,
+    /// The wire error shape it earns.
+    held_code: &'static str,
+    /// The message it carries, in that family's own wording.
+    held_message: String,
+}
+
+/// The precedence table for `thing_name`, whose registered record sits at version 1: a
+/// `thingTypeName` naming no thing type (that family's own 404), a request that both sets
+/// and removes the association (`InvalidRequestException`, 400) and an `expectedVersion`
+/// the record is not at (`VersionConflictException`, 409) — the three refusals
+/// `UpdateThing` models besides the missing thing.
+fn precedence_table(thing_name: &str) -> Vec<Precedence> {
+    vec![
+        Precedence {
+            instruction: "a thingTypeName naming no type",
+            request: json!({ "thingTypeName": ABSENT_THING_TYPE }),
+            held_status: 404,
+            held_code: NOT_FOUND,
+            held_message: missing_thing_type_wording(ABSENT_THING_TYPE),
+        },
+        Precedence {
+            instruction: "a contradictory thing-type instruction",
+            request: json!({ "thingTypeName": ABSENT_THING_TYPE, "removeThingType": true }),
+            held_status: 400,
+            held_code: "InvalidRequestException",
+            held_message: "Can not remove thing type and set thing type in the same request"
+                .to_string(),
+        },
+        Precedence {
+            instruction: "an expectedVersion the record is not at",
+            request: json!({ "expectedVersion": 97 }),
+            held_status: 409,
+            held_code: "VersionConflictException",
+            held_message: format!(
+                "The version for thing {thing_name} does not match the expected version."
+            ),
+        },
+    ]
 }
 
 #[tokio::test]
@@ -295,5 +395,105 @@ async fn a_thing_registered_updated_and_deleted_is_worded_the_same_as_one_never_
             "case {case:?}: expected message {expected:?}, got {:?}",
             refused.message()
         );
+    }
+}
+
+#[tokio::test]
+async fn every_read_of_an_unheld_thing_qualifies_the_name_that_its_write_states_alone() {
+    for thing_name in absent_names() {
+        let emulator = Emulator::new();
+
+        // The READ half, over each operation that reports on the thing a `thingName`
+        // label addresses: one wording for the whole half, not one per operation.
+        for (operation, path) in read_operations(&thing_name) {
+            let case = format!("{operation}({thing_name:?})");
+            let refused = emulator.call("GET", &path, None).await;
+            assert_eq!(
+                refused.status, 404,
+                "case {case:?}: expected status 404, got {refused:?}"
+            );
+            assert_eq!(
+                refused.error_shape(),
+                Some(NOT_FOUND),
+                "case {case:?}: expected error shape {NOT_FOUND:?}, got {refused:?}"
+            );
+            let expected = read_wording(&thing_name);
+            assert_eq!(
+                refused.message(),
+                expected,
+                "case {case:?}: expected message {expected:?}, got {:?}",
+                refused.message()
+            );
+        }
+
+        // The WRITE half on the same name in the same store states it unqualified, so the
+        // two halves are genuinely different sentences for one missing record.
+        let case = format!("UpdateThing({thing_name:?})");
+        let refused = emulator.update_thing(&thing_name, &json!({})).await;
+        let expected = write_wording(&thing_name);
+        assert_eq!(
+            refused.message(),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            refused.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_unheld_thing_is_worded_ahead_of_every_other_refusal_the_request_earns() {
+    for thing_name in absent_names() {
+        for row in precedence_table(&thing_name) {
+            let emulator = Emulator::new();
+            let case = format!("UpdateThing({thing_name:?}) with {}", row.instruction);
+
+            // Nothing is registered, so whatever else the request instructs, the record it
+            // addresses is what is missing: the thing family's write sentence.
+            let refused = emulator.update_thing(&thing_name, &row.request).await;
+            let expected = write_wording(&thing_name);
+            assert_eq!(
+                refused.status, 404,
+                "case {case:?}: expected status 404, got {refused:?}"
+            );
+            assert_eq!(
+                refused.error_shape(),
+                Some(NOT_FOUND),
+                "case {case:?}: expected error shape {NOT_FOUND:?}, got {refused:?}"
+            );
+            assert_eq!(
+                refused.message(),
+                expected,
+                "case {case:?}: expected message {expected:?}, got {:?}",
+                refused.message()
+            );
+
+            // The SAME request against a thing the registry does hold earns that row's own
+            // refusal, in its own family's wording: the unqualified sentence above belongs
+            // to the missing thing, not to this operation's refusals in general.
+            let created = emulator.create_thing(&thing_name, &json!({})).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: the fixture thing must register, got {created:?}"
+            );
+            let held = emulator.update_thing(&thing_name, &row.request).await;
+            assert_eq!(
+                held.status, row.held_status,
+                "case {case:?}: the registered thing must answer {}, got {held:?}",
+                row.held_status
+            );
+            assert_eq!(
+                held.error_shape(),
+                Some(row.held_code),
+                "case {case:?}: expected error shape {:?}, got {held:?}",
+                row.held_code
+            );
+            assert_eq!(
+                held.message(),
+                row.held_message,
+                "case {case:?}: expected message {:?}, got {:?}",
+                row.held_message,
+                held.message()
+            );
+        }
     }
 }
