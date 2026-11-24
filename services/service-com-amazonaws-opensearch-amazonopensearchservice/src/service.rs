@@ -195,8 +195,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> 
                 // HERE: this service's store has been released by now, and the request has
                 // not been answered yet, so a client that reads the channel's own
                 // subscriptions after its request answered finds them there.
-                crate::state::notification_publication::publish(ctx, &answered.notifications)
-                    .await;
+                crate::state::notification_publication::publish(
+                    ctx.callback(),
+                    &answered.notifications,
+                )
+                .await;
                 return answered.response;
             }
             // Unreachable: `override_operation` names this only for a request this data

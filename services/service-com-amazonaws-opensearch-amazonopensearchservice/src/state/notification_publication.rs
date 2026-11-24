@@ -35,7 +35,7 @@
 //!   route to another service: a run it drives reports that as the action's own error rather
 //!   than as a send, so nothing is reported sent that was not.
 
-use ::smithy_server_runtime::OperationContext;
+use ::smithy_server_runtime::EmbeddedEmulator;
 
 /// How many notifications ONE data-plane request may publish.
 ///
@@ -68,12 +68,15 @@ pub struct Publication {
 
 /// Publish each notification `publications` holds to the topic it names.
 ///
-/// Call it with NO store of this service locked, and before the request is answered. `ctx` is
-/// the operation context of the request that caused the run, which is what the in-process
-/// callback is reached through.
-pub async fn publish(ctx: &OperationContext<'_>, publications: &[Publication]) {
+/// Call it with NO store of this service locked, and before the request is answered.
+/// `callback` is the handle onto the emulator this service runs within, which is what the
+/// in-process hop to Amazon SNS is made over: a request the router serves reaches it through
+/// its operation context, and a request accepted on a domain's own listener through the handle
+/// that listener was opened with — the two are the same seam, so a run publishes the same way
+/// at either address.
+pub async fn publish(callback: &EmbeddedEmulator, publications: &[Publication]) {
     for publication in publications.iter().take(MAX_PUBLICATIONS_PER_REQUEST) {
-        let client = ::service_common::sns_client::sns_client(ctx.callback(), &publication.region);
+        let client = ::service_common::sns_client::sns_client(callback, &publication.region);
         let mut call = client
             .publish()
             .topic_arn(&publication.topic_arn)
@@ -105,12 +108,12 @@ pub async fn publish(ctx: &OperationContext<'_>, publications: &[Publication]) {
 /// Trace a notification that reached no channel because the request owing it had no caller
 /// to send as.
 ///
-/// The one case that could reach this is a data-plane request carrying NO AWS credential:
-/// such a request is answered before the router authenticates anything, so it has no
-/// operation context and there is no in-process callback to publish through. The RUN of such
-/// a request owes no publication — it reports that as the action's own error, the way it
-/// reports a channel it cannot reach — so this normally traces nothing; it is here so a
-/// publication that ever did reach this path is recorded rather than dropped in silence.
+/// The one case that reaches this is a data-plane request carrying NO AWS credential: such a
+/// request is answered before the router authenticates anything, so it has no operation
+/// context and there is no in-process handle to publish through. The RUN of such a request
+/// owes no publication — it reports that as the action's own error, the way it reports a
+/// channel it cannot reach — so this normally traces nothing; it is here so a publication that
+/// ever did reach this path is recorded rather than dropped in silence.
 pub fn trace_undelivered(publications: &[Publication]) {
     for publication in publications {
         ::tracing::warn!(

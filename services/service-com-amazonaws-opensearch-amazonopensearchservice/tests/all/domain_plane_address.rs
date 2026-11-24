@@ -94,8 +94,10 @@ fn routes() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
 /// One OpenSearch REST request as it arrives ON THE LISTENER the domain is published on:
 /// the core hands every request accepted there to this one function
 /// ([`service_com_amazonaws_opensearch_amazonopensearchservice::state::domain_plane`]), with
-/// no operation context, so WHO it speaks for is read from the credential it presents.
-fn through_the_listener(
+/// no operation context, so WHO it speaks for is read from the credential it presents — and
+/// with the handle onto this emulator the listener was opened with, which is what a run served
+/// there reaches another service through.
+async fn through_the_listener(
     emulator: &Emulator,
     domain: &str,
     address: &str,
@@ -117,7 +119,9 @@ fn through_the_listener(
         )
         .body(Vec::new())
         .expect("the test request is well formed");
-    let answered = serve_published(&**emulator.engine(), domain, &request);
+    let callback = emulator.callback();
+    let answered =
+        serve_published(&**emulator.engine(), domain, &request, Some(&callback)).await;
     let status = answered.status().as_u16();
     let body: Value = serde_json::from_slice(answered.body()).unwrap_or(Value::Null);
     (status, body)
@@ -278,7 +282,8 @@ async fn the_listener_serves_the_surface_for_the_principal_its_credential_names(
         MASTER_KEY,
         "GET",
         "/_cluster/health",
-    );
+    )
+    .await;
     assert_eq!(
         (status, health["cluster_name"].as_str()),
         (
@@ -298,7 +303,8 @@ async fn the_listener_serves_the_surface_for_the_principal_its_credential_names(
         READER_KEY,
         "POST",
         "/catalog/_search",
-    );
+    )
+    .await;
     assert_eq!(
         (status, refused["error"]["type"].as_str()),
         (403, Some("security_exception")),
@@ -315,7 +321,8 @@ async fn the_listener_serves_the_surface_for_the_principal_its_credential_names(
         "ASIAEXAMPLENOBODY001",
         "GET",
         "/_cluster/health",
-    );
+    )
+    .await;
     assert_eq!(
         (status, nobody["error"]["type"].as_str()),
         (403, Some("security_exception")),

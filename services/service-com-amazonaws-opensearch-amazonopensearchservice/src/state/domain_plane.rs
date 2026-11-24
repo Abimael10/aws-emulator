@@ -110,12 +110,13 @@ pub fn publish_in_background<Eng: Send + Sync + 'static>(
     engine: ::std::sync::Arc<Eng>,
     state: &::engine::ServiceState<ServiceState>,
     domain_name: &str,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
 ) {
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
     let (state, domain_name) = (state.clone(), domain_name.to_string());
-    runtime.spawn(async move { publish(engine, &state, &domain_name).await });
+    runtime.spawn(async move { publish(engine, &state, &domain_name, callback).await });
 }
 
 /// Open the listener the domain `domain_name` is published on and record its address on the
@@ -130,11 +131,12 @@ pub async fn publish<Eng: Send + Sync + 'static>(
     engine: ::std::sync::Arc<Eng>,
     state: &::engine::ServiceState<ServiceState>,
     domain_name: &str,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
 ) {
     if state.lock().domain_planes.contains_key(domain_name) {
         return;
     }
-    let Some(plane) = open(engine, domain_name).await else {
+    let Some(plane) = open(engine, domain_name, callback).await else {
         return;
     };
     let authority = plane.authority().to_string();
@@ -166,6 +168,7 @@ pub async fn publish<Eng: Send + Sync + 'static>(
 async fn open<Eng: Send + Sync + 'static>(
     engine: ::std::sync::Arc<Eng>,
     domain_name: &str,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
 ) -> Option<DomainPlane> {
     let listeners = shared_engine(&*engine)?.listeners();
     // Where the address this listener is opened at is recorded, read before the engine is
@@ -175,6 +178,7 @@ async fn open<Eng: Send + Sync + 'static>(
     let handler = DomainRestServer {
         engine,
         domain_name: domain_name.to_string(),
+        callback,
     };
     let listener = match listeners
         .http(handler, ::emulator_server::HttpPolicy::default())
@@ -222,9 +226,17 @@ fn shared_engine<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<&::engine::
 /// alone: WHO a request speaks for is a question about the account's identity records, which
 /// live in that engine beside this service's own store
 /// (`crate::service::domain_rest::serve_published`).
+///
+/// The CALLBACK is held for the same reason: what a request accepted here does is not this
+/// service's alone either — a monitor run whose trigger fires publishes its action's
+/// notification to another service's topic — and reaching that service in process is what this
+/// handle is. It is the handle of the call that opened this listener, and it stays usable for
+/// as long as the emulator does, so every request served at this address can hand over what it
+/// owes just as one served at the front door can.
 struct DomainRestServer<Eng> {
     engine: ::std::sync::Arc<Eng>,
     domain_name: String,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
 }
 
 impl<Eng: Send + Sync + 'static> ::emulator_server::HttpHandler for DomainRestServer<Eng> {
@@ -234,8 +246,15 @@ impl<Eng: Send + Sync + 'static> ::emulator_server::HttpHandler for DomainRestSe
     ) -> Pin<Box<dyn Future<Output = ::http::Response<Vec<u8>>> + Send>> {
         let engine = ::std::sync::Arc::clone(&self.engine);
         let domain_name = self.domain_name.clone();
+        let callback = self.callback.clone();
         Box::pin(async move {
-            crate::service::domain_rest::serve_published(&*engine, &domain_name, &req)
+            crate::service::domain_rest::serve_published(
+                &*engine,
+                &domain_name,
+                &req,
+                Some(&callback),
+            )
+            .await
         })
     }
 }

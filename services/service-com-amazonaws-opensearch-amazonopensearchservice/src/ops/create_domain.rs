@@ -1182,6 +1182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::sync::Arc::clone(&self.engine),
             &state,
             &name,
+            ctx.callback().clone(),
         );
         Ok(CreateDomainOutput {
             domain_status: Some(domain_status),

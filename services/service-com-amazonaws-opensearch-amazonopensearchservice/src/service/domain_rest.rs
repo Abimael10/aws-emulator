@@ -816,16 +816,24 @@ pub fn served<Eng: Send + Sync + 'static>(
 /// the request path.
 ///
 /// The same function serves it as serves the front door's own addressings ([`answered`]), so
-/// the two addressings of one domain cannot diverge in what they answer. What differs is where
-/// each reads the request from: the router hands the front door a runtime-API request and an
-/// operation context, and the core hands this one a plain HTTP request and no context at all —
-/// so the calling principal is resolved from the credential the request PRESENTS
-/// ([`state::authorization::key_principal`]), against the same identity records the front
-/// door's resolution reads.
-pub fn serve_published<Eng: Send + Sync + 'static>(
+/// the two addressings of one domain cannot diverge in what they answer OR in what they do.
+/// What differs is where each reads the request from: the router hands the front door a
+/// runtime-API request and an operation context, and the core hands this one a plain HTTP
+/// request and no context at all — so the calling principal is resolved from the credential the
+/// request PRESENTS ([`state::authorization::key_principal`]), against the same identity
+/// records the front door's resolution reads.
+///
+/// `callback` is the handle onto this emulator the listener was opened with
+/// ([`crate::state::domain_plane`]), which is the in-process route to another service's own
+/// operations: a monitor run accepted here hands its notifications over through it, exactly as
+/// a run accepted at the front door hands them over through the operation context's. A caller
+/// holding no such handle passes `None`, and a run it drives traces what it owed rather than
+/// reporting a send nothing performed.
+pub async fn serve_published<Eng: Send + Sync + 'static>(
     engine: &Eng,
     domain_name: &str,
     req: &::http::Request<Vec<u8>>,
+    callback: Option<&::smithy_server_runtime::EmbeddedEmulator>,
 ) -> ::http::Response<Vec<u8>> {
     let authorization = req
         .headers()
@@ -853,13 +861,20 @@ pub fn serve_published<Eng: Send + Sync + 'static>(
                 principal: resolved.arn,
                 identity: resolved.identity,
             },
-            can_notify: false,
+            can_notify: callback.is_some(),
         },
     );
-    // Nothing on this plane can hand a notification over — reaching another service needs the
-    // operation context the router builds — so a monitor run driven here traces what it owed,
-    // exactly as the front door's anonymous path does ([`serve`]).
-    state::notification_publication::trace_undelivered(&answered.notifications);
+    // The notifications a monitor run driven here owes its channels are handed over with this
+    // service's store released and before the request is answered, as the front door hands
+    // them over — so a client that reads the channel's own subscriptions after its request
+    // answered finds them there. A caller that gave no handle onto this emulator can reach no
+    // other service, so what such a run owed is traced instead.
+    match callback {
+        Some(callback) => {
+            state::notification_publication::publish(callback, &answered.notifications).await;
+        }
+        None => state::notification_publication::trace_undelivered(&answered.notifications),
+    }
     as_http(answered.response)
 }
 
