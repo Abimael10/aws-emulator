@@ -219,6 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: a `gatewayIdentifier` naming no gateway is the
+        // modelled 404 whatever else the request carries, because the only
+        // members refused ahead of a lookup are the ones the MODEL constrains,
+        // which the protocol boundary enforces.
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            CreateGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+
         // A rule entry's dimensions are the rate limit's own dimension keys, so a
         // rule naming a dimension this limit is not scoped by is refused before
         // anything is written — by the one helper every write of a single rate
@@ -229,12 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
         }
-
-        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
-            CreateGatewayRateLimitErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
-            )
-        })?;
         // A rate limit is enforced BY the gateway, so the gateway has to exist and
         // not be on its way out. The one precondition every write of a gateway's
         // rate limits puts on it, decided in `crate::state` so the single create

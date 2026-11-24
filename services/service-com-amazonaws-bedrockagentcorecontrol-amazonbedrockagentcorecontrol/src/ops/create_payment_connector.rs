@@ -221,6 +221,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let quick_create =
             provision_mode == crate::state::PAYMENT_CONNECTOR_PROVISION_MODE_QUICK_CREATE;
 
+        let mut store = state.lock();
+
+        // The resource the PATH addresses is resolved BEFORE this operation's own judgement
+        // of the body: a connector belongs TO a payment manager, this route carries that
+        // manager's id, and an id this account holds no manager under names nothing to
+        // create a connector on, whatever the body carries.
+        if !store
+            .payment_managers
+            .contains_key(&input.payment_manager_id)
+        {
+            return Err(
+                CreatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+                .into(),
+            );
+        }
+
         // The configuration a `MANUAL` connector authenticates with is the caller's to
         // supply — "MANUAL - You provide the credential provider configurations
         // directly" — and `credentialProviderConfigurations` is modelled `len 0..1`, so
@@ -262,12 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-
         // A replayed request carrying the same `clientToken` answers with the connector
         // that token first created, rather than adding a second one: "If this token
         // matches a previous request, the service ignores the request, but doesn't
-        // return an error."
+        // return an error." Decided where it was before the path's manager was hoisted
+        // above it — after the body this service judges for itself — so a token replayed
+        // with a body this service refuses is still refused.
         if let Some(replayed) = store
             .payment_managers
             .get(&input.payment_manager_id)
@@ -280,11 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replayed.create_output(now));
         }
 
-        // A connector belongs TO a payment manager, so the manager has to exist: this
-        // route carries its id, and an id this account holds no manager under names
-        // nothing to create a connector on. A manager the clock is still moving through
-        // a transient status TAKES a connector, because the connector carries a
-        // clock-owed status of its own.
+        // The manager the connector is written onto, read again for the preconditions it
+        // puts on this create. A manager the clock is still moving through a transient
+        // status TAKES a connector, because the connector carries a clock-owed status of
+        // its own.
         let manager = store
             .payment_managers
             .get(&input.payment_manager_id)

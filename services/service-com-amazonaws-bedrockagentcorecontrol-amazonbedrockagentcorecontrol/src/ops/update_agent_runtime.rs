@@ -231,6 +231,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(replayed);
         }
 
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: an `agentRuntimeId` naming no runtime is the
+        // modelled 404 whatever the body carries, so the resolutions below are
+        // made only for a request that would otherwise be written. Decided under
+        // its own guard, which is DROPPED before those calls — a lock is not held
+        // across an await — and the runtime is read again under the guard that
+        // WRITES, because nothing promises it is still there.
+        {
+            let mut store = state.lock();
+            // A runtime whose deletion the clock has already made due is gone
+            // before this call looks for it.
+            store.expire_deleted_agent_runtimes(now);
+            if !store.agent_runtimes.contains_key(&input.agent_runtime_id) {
+                return Err(UpdateAgentRuntimeErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_runtime_not_found_on_update(&input.agent_runtime_id),
+                )
+                .into());
+            }
+        }
+
         // The version this request would publish RUNS the code its artifact
         // names, so a `codeConfiguration` artifact's object-storage location is
         // resolved before anything is written — the same gate

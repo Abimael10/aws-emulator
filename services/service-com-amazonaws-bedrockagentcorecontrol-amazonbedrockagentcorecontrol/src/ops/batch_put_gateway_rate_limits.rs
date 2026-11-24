@@ -201,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: a `gatewayIdentifier` naming no gateway is the
+        // modelled 404 whatever else the request carries, because the only
+        // members refused ahead of a lookup are the ones the MODEL constrains,
+        // which the protocol boundary enforces.
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            BatchPutGatewayRateLimitsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+
         // "If the operation fails, the service applies no changes": everything
         // that can refuse this batch is decided before anything is written, so a
         // refused call leaves the gateway's existing set exactly as it was.
@@ -209,12 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 BatchPutGatewayRateLimitsErrorModeled::ValidationException(refusal).into(),
             );
         }
-
-        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
-            BatchPutGatewayRateLimitsErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
-            )
-        })?;
         // A rate limit is enforced BY the gateway, so the gateway has to exist and
         // not be on its way out. The one precondition every write of a gateway's
         // rate limits puts on it, shared with the single create: a gateway the

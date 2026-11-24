@@ -248,6 +248,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call looks for it.
         store.expire_deleted_gateways_and_targets(now);
 
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: `gatewayIdentifier` is the `gatewayId` the create
+        // minted, which is how the store is keyed, and an identifier naming no
+        // stored gateway is the modelled 404 — whatever else the request carries —
+        // rather than a gateway minted by an update. The only members refused
+        // ahead of this lookup are the ones the MODEL constrains, which the
+        // protocol boundary enforces; every rule THIS service has about the body
+        // is judged below, once the gateway is known to be there.
+        let record = store
+            .gateways
+            .get_mut(&input.gateway_identifier)
+            .ok_or_else(|| {
+                UpdateGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+                )
+            })?;
+
         // The same prose rule `CreateGateway` carries, which the framework's
         // constraint walk cannot refuse: "If you specify CUSTOM_JWT as the
         // authorizerType, you must provide an authorizerConfiguration." It is a
@@ -267,18 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // `gatewayIdentifier` is the `gatewayId` the create minted, which is how
-        // the store is keyed; an identifier naming no stored gateway is the
-        // modelled 404 rather than a gateway minted by an update.
-        let record = store
-            .gateways
-            .get_mut(&input.gateway_identifier)
-            .ok_or_else(|| {
-                UpdateGatewayErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
-                )
-            })?;
 
         // `name` is `@required` on the request and the model states what it must
         // carry: "This name must be the same as the one when the gateway was

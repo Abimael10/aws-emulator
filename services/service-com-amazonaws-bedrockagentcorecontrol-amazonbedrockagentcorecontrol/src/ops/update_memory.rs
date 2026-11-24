@@ -505,6 +505,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // The resource the PATH addresses is resolved BEFORE this operation's own
+        // judgement of the body: a `memoryId` naming no memory is the modelled 404
+        // whatever the body carries, so neither the other service this request
+        // reaches nor the caller-sized work its strategy lists imply is spent on a
+        // request whose path names nothing. Decided under its own guard, which is
+        // DROPPED for that work, and the memory is read again under the guard that
+        // WRITES — nothing promises it is still there.
+        {
+            let mut store = state.lock();
+            // A memory whose accepted deletion the clock has already made due is
+            // gone before this update looks for it.
+            store.expire_deleted_memories(now);
+            if !store.memories.contains_key(&input.memory_id) {
+                return Err(UpdateMemoryErrorModeled::ResourceNotFoundException(
+                    crate::state::memory_not_found(Self::NAME, &input.memory_id),
+                )
+                .into());
+            }
+        }
+
         // A memory configured for stream delivery writes its records INTO the stream the
         // configuration names, so that stream is resolved against the account's Kinesis
         // before anything is written: a configuration naming a stream this account does
