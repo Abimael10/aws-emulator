@@ -5,33 +5,30 @@
 //! The centralized walk enforces the modelled input constraints and hands [`Refusal`] to
 //! [`crate::service`] STRUCTURALLY — one `Violation` per offending member, carrying the
 //! dotted path it sits at, what it failed and what it held — because no model records the
-//! sentence a service says. TWO choices about that sentence are this service's, and each is
-//! made for a constraint CLASS rather than for an operation or a member:
+//! sentence a service says. ONE choice about that sentence is this service's, and it is made
+//! for a constraint CLASS rather than for an operation or a member: a `@pattern` requirement
+//! is quoted as the expression this service publishes, without the pair of whole-value
+//! anchors the model wraps it in. The CHECK is unchanged — it still runs the model's pattern
+//! as written — so only the rendering drops the pair.
 //!
-//! * a `@pattern` requirement is quoted as the expression this service publishes, without
-//!   the pair of whole-value anchors the model wraps it in. The CHECK is unchanged — it
-//!   still runs the model's pattern as written — so only the rendering drops the pair.
-//! * a `@range` clause states the member and the bound and WITHHOLDS the value: `Value at
-//!   '<member path>' failed to satisfy constraint: <requirement>`. That holds at either end
-//!   of any declared range and at whatever depth the member sits — a page size on either
-//!   listing, a widget's width or height on either dashboard write — so nothing of the
-//!   number a caller sent is read back to it.
-//!
-//! Every other constraint class states the standard AWS clause IN FULL, the value half
-//! included: `Value '<the value the request submitted>' at '<member path>' failed to satisfy
+//! Every constraint class states the standard AWS clause IN FULL, the value half included:
+//! `Value '<the value the request submitted>' at '<member path>' failed to satisfy
 //! constraint: <requirement>`. That is how a string outside a `@length` or a `@pattern` is
-//! stated, and a member absent from the request states the `null` it was.
+//! stated, how a number outside a `@range` is stated at either end of the range and at
+//! whatever depth the member sits, and a member absent from the request states the `null` it
+//! was. The one half that is dropped is a COLLECTION's: a list or a map over its `@length`
+//! has no scalar rendering to quote, so its clause names the member and the bound alone.
 //!
-//! The envelope, its error count, the clause, the member paths and every constraint class's
-//! requirement sentence belong to [`service_common::validation_message`] — the shared home
-//! for this wording — and to the framework behind it. None of them is spelled here, so this
-//! service cannot word a constraint differently from the services that state the same
-//! sentence. `tests/all/range_refusal_wording.rs` pins the range clause over the wire, and
-//! `tests/all/refused_value_echo.rs` pins the withheld value over the whole numeric domain a
-//! declared range refuses.
+//! The envelope, its error count, the clause, the member paths, the value half and every
+//! constraint class's requirement sentence belong to [`service_common::validation_message`] —
+//! the shared home for this wording — and to the framework behind it. None of them is spelled
+//! here, so this service cannot word a constraint differently from the services that state
+//! the same sentence. `tests/all/range_refusal_wording.rs` pins the range clause over the
+//! wire, and `tests/all/refused_value_echo.rs` pins the quoted value over the whole numeric
+//! domain a declared range refuses.
 
-use service_common::validation_message::aws_validation_refusal_withholding_violations;
-use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
+use service_common::validation_message::aws_validation_refusal;
+use smithy_server_runtime::{Refusal, Refused};
 
 /// How this service states `refusal`, or `None` to keep the framework's own wording.
 ///
@@ -40,67 +37,64 @@ use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 /// to word. The code travels with the message and stays the modelled `ValidationException`
 /// (HTTP 400) a client branches on.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
-    aws_validation_refusal_withholding_violations(refusal, withholds_value)
-}
-
-/// Whether the clause for `violation` states no value: the `@range` class does, every other
-/// class keeps the value half the framework wrote.
-///
-/// Keyed to the CLASS and not to a member path, so a range this service gains tomorrow is
-/// stated the same way as the ones it has without anything being listed here.
-fn withholds_value(violation: &Violation) -> bool {
-    matches!(
-        violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
-    )
+    aws_validation_refusal(refusal)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithy_server_runtime::{Violation, ViolationKind};
 
     /// One violation of `kind` at `path`, for the value a request sent.
-    fn violation(path: &str, kind: ViolationKind) -> Violation {
+    fn violation(path: &str, kind: ViolationKind, value: &str) -> Violation {
         Violation {
             path: path.to_owned(),
             kind,
-            value: Some("101".to_owned()),
+            value: Some(value.to_owned()),
             sensitive: false,
         }
     }
 
-    /// Either end of a declared range is stated with the member and the bound, and with no
-    /// value. The wire-level counterpart, over real operations and real members, is
-    /// `tests/all/range_refusal_wording.rs`.
+    /// Either end of a declared range is stated with the value the request submitted, the
+    /// member it sat at and the bound it broke. The wire-level counterpart, over real
+    /// operations and real members, is `tests/all/range_refusal_wording.rs`.
     #[test]
-    fn a_range_clause_states_the_member_and_the_bound_and_no_value() {
-        for (path, kind, expected) in [
+    fn a_range_clause_states_the_value_the_member_and_the_bound() {
+        for (path, kind, submitted, expected) in [
             (
                 "maxResults",
                 ViolationKind::MaxValue("100".to_owned()),
+                "101",
                 "Member must have value less than or equal to 100",
             ),
             (
                 "maxResults",
                 ViolationKind::MinValue("1".to_owned()),
+                "0",
                 "Member must have value greater than or equal to 1",
             ),
             (
                 "widgets.1.member.width",
                 ViolationKind::MaxValue("6".to_owned()),
+                "7",
                 "Member must have value less than or equal to 6",
             ),
             (
                 "widgets.1.member.height",
                 ViolationKind::MinValue("4".to_owned()),
+                "-7",
                 "Member must have value greater than or equal to 4",
             ),
         ] {
-            let stated = refused(&Refusal::Invalid(vec![violation(path, kind.clone())]))
-                .expect("an input-constraint refusal is this service's to state");
+            let stated = refused(&Refusal::Invalid(vec![violation(
+                path,
+                kind.clone(),
+                submitted,
+            )]))
+            .expect("an input-constraint refusal is this service's to state");
             let expected = format!(
-                "1 validation error detected: Value at '{path}' failed to satisfy \
-                 constraint: {expected}"
+                "1 validation error detected: Value '{submitted}' at '{path}' failed to \
+                 satisfy constraint: {expected}"
             );
             assert_eq!(
                 stated.message, expected,
@@ -110,8 +104,8 @@ mod tests {
         }
     }
 
-    /// Every other class states its value: a string what it submitted, an absent member the
-    /// `null` it was.
+    /// Every other class states its value too: a string what it submitted, an absent member
+    /// the `null` it was.
     #[test]
     fn another_class_states_its_value() {
         for (kind, expected) in [
@@ -131,7 +125,7 @@ mod tests {
                  regular expression pattern: [0-9a-f]{32}",
             ),
         ] {
-            let stated = refused(&Refusal::Invalid(vec![violation("arn", kind.clone())]))
+            let stated = refused(&Refusal::Invalid(vec![violation("arn", kind.clone(), "101")]))
                 .expect("an input-constraint refusal is this service's to state");
             let expected = format!("1 validation error detected: {expected}");
             assert_eq!(
@@ -158,19 +152,39 @@ mod tests {
         );
     }
 
+    /// A COLLECTION over its `@length` is the one clause that states no value: the walk's own
+    /// summary of a list is not anything a caller submitted, and a list has no scalar
+    /// rendering to quote.
+    #[test]
+    fn a_collection_length_clause_states_no_value() {
+        let stated = refused(&Refusal::Invalid(vec![violation(
+            "widgets",
+            ViolationKind::MaxLength(20),
+            "21 items",
+        )]))
+        .expect("an input-constraint refusal is this service's to state");
+        assert_eq!(
+            stated.message,
+            "1 validation error detected: Value at 'widgets' failed to satisfy constraint: \
+             Member must have length less than or equal to 20",
+            "a collection states the member and the bound alone, got {:?}",
+            stated.message
+        );
+    }
+
     /// One request breaking a range AND another class states each clause under one envelope,
-    /// each in its own class's voice.
+    /// each quoting what it was given.
     #[test]
     fn each_class_states_its_clause_under_one_envelope() {
         let stated = refused(&Refusal::Invalid(vec![
-            violation("maxResults", ViolationKind::MaxValue("100".to_owned())),
-            violation("nextToken", ViolationKind::MinLength(1)),
+            violation("maxResults", ViolationKind::MaxValue("100".to_owned()), "101"),
+            violation("nextToken", ViolationKind::MinLength(1), ""),
         ]))
         .expect("an input-constraint refusal is this service's to state");
         assert_eq!(
             stated.message,
-            "2 validation errors detected: Value at 'maxResults' failed to satisfy \
-             constraint: Member must have value less than or equal to 100; Value '101' at \
+            "2 validation errors detected: Value '101' at 'maxResults' failed to satisfy \
+             constraint: Member must have value less than or equal to 100; Value '' at \
              'nextToken' failed to satisfy constraint: Member must have length greater than \
              or equal to 1",
             "each class states its own clause, got {:?}",
@@ -190,6 +204,7 @@ mod tests {
         let chosen = refused(&Refusal::Invalid(vec![violation(
             "maxResults",
             ViolationKind::MaxValue("100".to_owned()),
+            "101",
         )]))
         .expect("an input-constraint refusal is reworded");
         assert_eq!(

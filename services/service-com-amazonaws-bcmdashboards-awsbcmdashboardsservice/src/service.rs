@@ -59,10 +59,9 @@
 //!   here, so the framework answers it as the unroutable request it is.
 //! - `override_refusal` is taken for a different reason: a boundary refusal of a
 //!   `@pattern`-constrained member quotes the expression the service publishes rather than
-//!   the anchored spelling the model wraps it in, and a numeric value outside its member's
-//!   declared range is stated with the member and the bound alone. Routing, status, codes,
-//!   the envelope, the member paths and every other requirement stay with the framework.
-//!   Both choices live in [`validation`].
+//!   the anchored spelling the model wraps it in. Routing, status, codes, the envelope, the
+//!   member paths, the value each clause quotes and every other requirement stay with the
+//!   framework. That choice lives in [`validation`].
 //!
 //! One step that is NOT a seam lives here too: [`authorization`], the IAM decision every
 //! operation whose model declares `AccessDeniedException` takes before it reads or writes
@@ -155,9 +154,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service state it its own way. What this service states, and all it states, is
         // in [`validation`]: the `ValidationException` envelope the framework already
         // renders, with a `@pattern` requirement quoted as the expression a value has to
-        // satisfy and a numeric range stated without the number the request carried. The
-        // code, the envelope, the member paths and every other requirement stay the
-        // framework's, and the sentences stay in `service-common`.
+        // satisfy. The code, the envelope, the member paths, the value each clause quotes
+        // and every other requirement stay the framework's, and the sentences stay in
+        // `service-common`.
         validation::refused(refusal)
     }
 }
