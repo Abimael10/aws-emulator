@@ -60,6 +60,16 @@
 //! the programs that ask about it (a guest's `findmnt`, its `stat -f`) answer out of the one
 //! mount table rather than out of a second notion of what is mounted where.
 //!
+//! # What the guest SENDS rather than stores
+//!
+//! One family of paths a program writes is not storage at all: a shell opens a socket for a
+//! redirection to `/dev/udp/<host>/<port>` ([`DATAGRAM_PATH_PREFIX`]), which is how a program
+//! inside a machine hands a datagram to something listening in it without a transfer program.
+//! A tree given a SINK for those addresses ([`ShellVolume::with_datagram_sink`]) hands such a
+//! write to it — the machine's own network stack, held by whoever owns the machine — instead of
+//! keeping a file at that path, and the sink decides what, if anything, receives it. A tree
+//! given none keeps the write as what it is to this tree: a path like any other.
+//!
 //! # Bounds
 //!
 //! Every write is bounded by [`VolumeLimits`], held here rather than in the program's
@@ -105,6 +115,41 @@ impl Default for VolumeLimits {
             device_line_bytes: 4 * 1024,
         }
     }
+}
+
+/// The prefix of the paths a shell opens a UDP socket for rather than a file: a redirection to
+/// `/dev/udp/<host>/<port>` sends what it writes to that address, which is how a program in a
+/// machine hands a datagram to something listening in it with no transfer program at all.
+pub const DATAGRAM_PATH_PREFIX: &str = "/dev/udp/";
+
+/// The address the resolved `path` names, for a path under [`DATAGRAM_PATH_PREFIX`] that names
+/// a host and a port — and `None` for every other path, including one under that prefix whose
+/// last segment is no port number at all.
+#[must_use]
+pub fn datagram_address(path: &str) -> Option<(String, u16)> {
+    let (host, port) = path.strip_prefix(DATAGRAM_PATH_PREFIX)?.split_once('/')?;
+    if host.is_empty() || port.contains('/') {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// Where a datagram a program of this machine SENDS goes: the machine's own network stack,
+/// held by whoever owns the machine.
+///
+/// A tree is given one so that a write to `/dev/udp/<host>/<port>` is a send rather than a file
+/// ([`DATAGRAM_PATH_PREFIX`]). The implementation answers out of state its own holder keeps —
+/// which of the machine's own programs is listening on that port — and nothing here opens a
+/// socket, resolves a name or reaches the host: a datagram this process delivers travels inside
+/// it, and one nothing is listening for is dropped, which is what a datagram sent to a port
+/// nothing listens on does.
+pub trait DatagramSink: ::std::fmt::Debug + Send + Sync {
+    /// Take the datagram `payload` addressed to `port` at `host`, answering whether the SEND
+    /// happened — `false` being what the command performing it reports as its own failure.
+    ///
+    /// A send to a port nothing listens on still happened: the datagram was handed to the
+    /// stack, which is why delivery is not what this answers.
+    fn send(&self, host: &str, port: u16, payload: &str) -> bool;
 }
 
 /// What one DEVICE of the tree does with the lines written to it.
@@ -302,6 +347,9 @@ pub struct ShellVolume {
     /// first, so a path lands in the deepest mount that holds it — which is how a mount
     /// inside another mount's directory shadows it.
     mounts: Vec<Mount>,
+    /// Where a write to one of the machine's datagram addresses goes, for a tree whose owner
+    /// gave it one ([`ShellVolume::with_datagram_sink`]).
+    datagrams: Option<Arc<dyn DatagramSink>>,
     limits: VolumeLimits,
 }
 
@@ -369,8 +417,17 @@ impl ShellVolume {
             modified: BTreeMap::from([(ROOT.to_string(), SystemTime::now())]),
             held_bytes: 0,
             mounts: Vec::new(),
+            datagrams: None,
             limits,
         }
+    }
+
+    /// The same tree, with `sink` as where a write to one of the machine's datagram addresses
+    /// goes ([`DatagramSink`]) — so such a write is a SEND rather than a file of this tree.
+    #[must_use]
+    pub fn with_datagram_sink(mut self, sink: Arc<dyn DatagramSink>) -> Self {
+        self.datagrams = Some(sink);
+        self
     }
 
     /// Mount `tree` at `path`, so every path under it is a path of that filesystem from now
@@ -727,6 +784,15 @@ impl ShellVolume {
             self.in_mount_mut(&resolved, |files, inside| files.write(inside, contents, append))
         {
             return wrote;
+        }
+        // A write to one of the machine's DATAGRAM addresses is a send rather than storage
+        // ([`DATAGRAM_PATH_PREFIX`]): it is handed to the machine's own network stack, and this
+        // tree keeps no file at that path. A tree whose owner gave it no stack keeps the write
+        // as the file it is here.
+        if let Some(sink) = self.datagrams.clone() {
+            if let Some((host, port)) = datagram_address(&resolved) {
+                return sink.send(&host, port, contents);
+            }
         }
         if self.sealed.contains(&resolved) || self.directories.contains(&resolved) {
             return false;

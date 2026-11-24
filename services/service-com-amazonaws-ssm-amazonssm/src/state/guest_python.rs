@@ -47,7 +47,9 @@
 //!   the module `-m` names — the forms a script writes an interpreter in;
 //! * the ENVIRONMENT the program runs with, which is the variables the session holds, handed
 //!   to the engine so they are installed by the HOST before a line of the program is read —
-//!   a value an earlier line of the script exported is what `os.environ` answers;
+//!   a value an earlier line of the script exported is what `os.environ` answers, beside what
+//!   the command reads on STANDARD INPUT, which is the program's own `sys.stdin`: `… | python3
+//!   -c …` is how a script hands an inline program the stage before it;
 //! * the KERNEL ([`KERNEL_SOURCE`]) — ordinary Python, handed to the engine as the module the
 //!   run resolves — which executes the program as `__main__` with its two output streams kept
 //!   APART, so what the program wrote to standard output is the command's output and its
@@ -488,13 +490,13 @@ impl Invocation {
                 let Some(source) = words.next() else {
                     return Self::usage(format!("Argument expected for the {COMMAND_OPTION} option"));
                 };
-                return Self::source(source, COMMAND_FILE, COMMAND_OPTION, words);
+                return Self::source(source, COMMAND_FILE, COMMAND_OPTION, words, standard_input);
             }
             if word == MODULE_OPTION {
                 let Some(module) = words.next() else {
                     return Self::usage(format!("Argument expected for the {MODULE_OPTION} option"));
                 };
-                return Self::module(module, words);
+                return Self::module(module, words, standard_input);
             }
             if word == STANDARD_INPUT_OPERAND {
                 return Self::from_standard_input(standard_input, words);
@@ -511,7 +513,7 @@ impl Invocation {
             if word == "-V" || word == "--version" {
                 // The release is the interpreter's OWN, read off the interpreter running the
                 // program rather than written out here.
-                return Self::source(VERSION_PROGRAM, COMMAND_FILE, COMMAND_OPTION, words);
+                return Self::source(VERSION_PROGRAM, COMMAND_FILE, COMMAND_OPTION, words, None);
             }
             if word.starts_with('-') {
                 return Self::Usage {
@@ -532,7 +534,7 @@ impl Invocation {
             if source.len() > MAX_PROGRAM_BYTES {
                 return Self::too_large();
             }
-            return Self::source(&source, word, word, words);
+            return Self::source(&source, word, word, words, standard_input);
         }
         // No program named at all: the interpreter reads one from standard input, as it does
         // when it is given neither a file nor a command.
@@ -541,6 +543,10 @@ impl Invocation {
 
     /// The invocation of a program read from STANDARD INPUT — a here-document, a pipeline's
     /// earlier stage, or the file an input redirection named.
+    ///
+    /// The program ITSELF came off that stream, so the program reads nothing on it: an
+    /// interpreter that read its program from standard input leaves the stream at its end,
+    /// which is what a program reading it then finds.
     fn from_standard_input<'a>(
         standard_input: Option<&str>,
         rest: impl Iterator<Item = &'a str>,
@@ -552,34 +558,45 @@ impl Invocation {
                 STANDARD_INPUT_FILE,
                 STANDARD_INPUT_OPERAND,
                 rest,
+                None,
             ),
             None => Self::Nothing,
         }
     }
 
     /// The invocation of the program `source`, whose frames name `file`, with `first` as the
-    /// word the program reads as `sys.argv[0]` and `rest` as the arguments after it.
+    /// word the program reads as `sys.argv[0]`, `rest` as the arguments after it and `stdin` as
+    /// what the command reads on STANDARD INPUT — which is what a program reading `sys.stdin`
+    /// reads, the way `… | python3 -c …` hands a program the stage before it.
     fn source<'a>(
         source: &str,
         file: &str,
         first: &str,
         rest: impl Iterator<Item = &'a str>,
+        stdin: Option<&str>,
     ) -> Self {
         Self::Program {
             event: ::serde_json::json!({
                 "source": source,
                 "file": file,
                 "argv": argv(first, rest),
+                "stdin": stdin.unwrap_or_default(),
             }),
         }
     }
 
-    /// The invocation of the MODULE `module`, run as `__main__` the way `-m` runs one.
-    fn module<'a>(module: &str, rest: impl Iterator<Item = &'a str>) -> Self {
+    /// The invocation of the MODULE `module`, run as `__main__` the way `-m` runs one, with
+    /// `stdin` as what it reads on standard input.
+    fn module<'a>(
+        module: &str,
+        rest: impl Iterator<Item = &'a str>,
+        stdin: Option<&str>,
+    ) -> Self {
         Self::Program {
             event: ::serde_json::json!({
                 "module": module,
                 "argv": argv(module, rest),
+                "stdin": stdin.unwrap_or_default(),
             }),
         }
     }
@@ -864,7 +881,9 @@ fn read_answer(name: &str, answer: &str) -> ProgramStreams {
 /// INVOCATION: the program's `sys.argv`; its two output streams kept APART, because the
 /// invocation reports each as a member of its own; and the status it ended on, which is zero
 /// for a program that ran to its end, the status a `SystemExit` named, and one for a program
-/// that ended on an uncaught exception, as CPython exits for each. The program's own
+/// that ended on an uncaught exception, as CPython exits for each. What the command reads on
+/// STANDARD INPUT is installed as the program's own `sys.stdin`, which is what `… | python3 -c
+/// …` hands a program. The program's own
 /// ENVIRONMENT is not this kernel's either: the host installs it before this runs.
 const KERNEL_SOURCE: &str = r#"
 """The program one `python3` invocation of a node's guest runs."""
@@ -901,9 +920,11 @@ def _reported(out, err):
 def main(event, context):
     out = io.StringIO()
     err = io.StringIO()
+    given = io.StringIO(event.get("stdin") or "")
     namespace = {"__name__": "__main__", "__file__": event.get("file") or ""}
     held_out, held_err, held_argv = sys.stdout, sys.stderr, sys.argv
-    sys.stdout, sys.stderr = out, err
+    held_in = sys.stdin
+    sys.stdout, sys.stderr, sys.stdin = out, err, given
     sys.argv = list(event.get("argv") or [""])
     status = 0
     try:
@@ -925,5 +946,6 @@ def main(event, context):
             status = 1
     finally:
         sys.stdout, sys.stderr, sys.argv = held_out, held_err, held_argv
+        sys.stdin = held_in
     return {"stdout": out.getvalue(), "stderr": err.getvalue(), "exitCode": status}
 "#;

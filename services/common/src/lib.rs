@@ -538,6 +538,10 @@ pub mod front_door;
 /// `greengrass` — the 2017-06-07 and 2020-11-30 API versions of one product, which AWS
 /// serves from one endpoint and tells apart by the `restJson1` route a request addresses.
 pub mod greengrass;
+/// The PACKAGE QUERY a guest's package database is read with — the option grammar `rpm` takes
+/// a query in, the glob a query names a package by, and the format it renders one under — for
+/// every service that installs that program into a guest's session.
+pub mod guest_package_query;
 /// The ONE framing seam between an H.264 byte stream and the MP4 file that carries it —
 /// the length-prefixed samples a track holds, the parameter sets its configuration record
 /// states, and the Annex B form a decoder reads back — for every service that renders or

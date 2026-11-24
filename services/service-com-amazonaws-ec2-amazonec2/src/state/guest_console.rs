@@ -831,7 +831,10 @@ fn run_guest_program(
             }
         }
     }
-    let volume = guest_volume(machine, boot_id, booted_at, &held);
+    let volume = guest_volume(machine, boot_id, booted_at, &held, &services.taken())
+        // Where a datagram this program SENDS goes: the machine's own network stack, which is
+        // what carries it to whatever of this guest is listening ([`super::guest_services`]).
+        .with_datagram_sink(::std::sync::Arc::new(services.clone()));
     let mut session = ShellSession::in_volume(
         guest_environment(machine, number),
         SessionConfig {
@@ -887,6 +890,7 @@ pub(super) fn guest_volume(
     boot_id: &str,
     booted_at: SystemTime,
     files: &BTreeMap<String, String>,
+    runtime: &super::guest_services::GuestRuntime,
 ) -> ShellVolume {
     let published = guest_published_files(machine, boot_id, booted_at);
     let published_bytes: usize = published
@@ -927,6 +931,18 @@ pub(super) fn guest_volume(
     }
     volume.add_keeping_device(GUEST_CONSOLE_DEVICE);
     volume.add_discarding_device(GUEST_NULL_DEVICE);
+    // What the kernel publishes about the machine's own SOCKETS is not sealed: a program of
+    // this guest that opens or closes a listener publishes the table again
+    // ([`super::guest_cloudwatch_agent::publish_socket_tables`]), the way the kernel does when
+    // one of its sockets changes.
+    volume.put_file(
+        super::guest_cloudwatch_agent::GUEST_NET_UDP_PATH,
+        &super::guest_cloudwatch_agent::udp_socket_table(&runtime.cloudwatch_agent),
+    );
+    volume.put_file(
+        super::guest_cloudwatch_agent::GUEST_NET_UDP6_PATH,
+        &super::guest_cloudwatch_agent::udp6_socket_table(),
+    );
     volume
 }
 
@@ -953,10 +969,12 @@ fn directories_above(path: &str) -> Vec<String> {
 /// with, how long this boot has been up, the instance id cloud-init published to it — and, for a
 /// machine whose CPU layout this
 /// emulator knows, everything the kernel publishes about its processors
-/// ([`super::guest_cpu::published_cpu_files`]), beside what it publishes about each of the
+/// ([`super::guest_cpu::published_cpu_files`]), beside what it publishes about its MEMORY
+/// ([`super::guest_memory`]) and about each of the
 /// machine's block devices ([`super::guest_block_devices::published_block_device_files`]). A
 /// machine with no known layout gets none of the former rather than a layout nothing derived,
-/// and one with nothing attached none of the latter.
+/// one whose memory size this emulator does not hold no memory figures, and one with nothing
+/// attached none of the latter.
 ///
 /// The ONE listing of that seed, so every program a guest runs reads the same published
 /// values and the budget above is computed from exactly what is seeded.
@@ -990,6 +1008,17 @@ fn guest_published_files(
     ];
     if let Some(cpu) = machine.cpu {
         published.extend(super::guest_cpu::published_cpu_files(cpu));
+    }
+    // What the kernel publishes about this machine's MEMORY ([`super::guest_memory`]), for a
+    // machine whose memory size this emulator holds: how much it has, and how much of it its
+    // own operating system accounts for.
+    if let Some(memory) =
+        super::guest_memory::guest_memory(machine.processor.map(|(_, memory_mib)| memory_mib))
+    {
+        published.push((
+            super::guest_memory::GUEST_MEMINFO_PATH.to_string(),
+            super::guest_memory::meminfo_contents(memory),
+        ));
     }
     // What the kernel publishes about this machine's block devices, for a guest that has any
     // ([`super::guest_block_devices`]).

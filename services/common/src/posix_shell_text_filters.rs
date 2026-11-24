@@ -20,7 +20,9 @@
 //!   when it was given one;
 //! * `cut -c LIST` / `-f LIST [-d DELIM]` — "select portions of each line of a file", the
 //!   characters or the delimited fields the list names, one output line per input line;
-//! * `head -n COUNT` — "the first COUNT lines of each file", ten lines when no count is given;
+//! * `head -n COUNT` — "the first COUNT lines of each file", ten lines when no count is given,
+//!   written in any of the forms the count is given in (`-n COUNT`, `-nCOUNT`,
+//!   `--lines=COUNT`, and the obsolescent `-COUNT`);
 //! * `tail -n COUNT` — "the last COUNT lines of each file", ten lines when no count is given,
 //!   which is the other end of the same selection `head` makes;
 //! * `sort [-r] [-u] [-n] [-f] [-b]` — "write sorted concatenation of all FILE(s)": the lines
@@ -518,13 +520,27 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// How many lines a `head` or `tail` invocation keeps, or `None` for an option form this
 /// module does not perform.
 ///
+/// The count is written in any of the forms the utility takes it in: `-n COUNT`, `-nCOUNT`,
+/// `--lines=COUNT`, and the obsolescent `-COUNT` — "`-NUM` … same as `-n NUM`" (the GNU
+/// coreutils manual), which is how a script written `tail -1` names one line.
+///
 /// A count written with a SIGN is not read as a count: `-n +COUNT` means "begin at line
 /// COUNT" to `tail` and "all but the last COUNT" to `head`, neither of which is the count of
 /// the lines kept.
 fn head_lines(options: &[String]) -> Option<usize> {
     let mut lines = None;
     for option in options {
-        let written = non_empty(option.strip_prefix("-n"))?.trim();
+        let written = match option.strip_prefix("-n").or_else(|| {
+            option
+                .strip_prefix("--lines=")
+                .or_else(|| option.strip_prefix("--lines"))
+        }) {
+            Some(value) => non_empty(Some(value))?,
+            // The obsolescent form, whose digits follow the one dash: an option that is not
+            // digits at all is no count, and so no form this module performs.
+            None => non_empty(option.strip_prefix('-'))?,
+        }
+        .trim();
         if written.starts_with('+') || written.starts_with('-') {
             return None;
         }
@@ -1405,32 +1421,41 @@ fn character_class(name: &str, in_set2: bool) -> Option<Vec<char>> {
 /// What `tr` writes for `input`: each of its characters translated, deleted and squeezed, in
 /// the order the utility does those — "copy the standard input to the standard output with
 /// substitution or deletion of selected characters".
+///
+/// The sets are read into LOOKUPS once per invocation rather than scanned once per character of
+/// the input. Both halves are a caller's — the sets are its arguments, expanded as far as
+/// [`MAX_SET_CHARACTERS`] allows, and the input is whatever the stage before it wrote — so a
+/// per-character scan would cost their PRODUCT, which is what one command could then make this
+/// process spend. What it costs here is the length of the input, with a logarithmic lookup per
+/// character whatever the sets come to.
 fn translated(work: &TranslateWork, input: &str) -> String {
+    let deleted: ::std::collections::BTreeSet<char> =
+        work.delete.iter().flatten().copied().collect();
+    let squeezed: ::std::collections::BTreeSet<char> =
+        work.squeeze.iter().flatten().copied().collect();
+    // The character each one SET1 names is written as: the one at the same position of SET2,
+    // and the character itself where SET2 is shorter. A character SET1 names twice is written
+    // as its FIRST position says, which is the position the utility's own left-to-right reading
+    // of the sets finds.
+    let mut mapped: ::std::collections::BTreeMap<char, char> =
+        ::std::collections::BTreeMap::new();
+    if let Some((from, to)) = &work.translate {
+        for (index, held) in from.iter().enumerate() {
+            mapped
+                .entry(*held)
+                .or_insert_with(|| to.get(index).copied().unwrap_or(*held));
+        }
+    }
     let mut written = String::new();
     let mut last: Option<char> = None;
     for character in input.chars() {
-        if work
-            .delete
-            .as_ref()
-            .is_some_and(|set| set.contains(&character))
-        {
+        if deleted.contains(&character) {
             continue;
         }
-        let character = match &work.translate {
-            Some((from, to)) => match from.iter().position(|held| *held == character) {
-                Some(index) => *to.get(index).unwrap_or(&character),
-                None => character,
-            },
-            None => character,
-        };
+        let character = mapped.get(&character).copied().unwrap_or(character);
         // "Replace each sequence of a repeated character that is listed in the last specified
         // SET with a single occurrence of that character."
-        if last == Some(character)
-            && work
-                .squeeze
-                .as_ref()
-                .is_some_and(|set| set.contains(&character))
-        {
+        if last == Some(character) && squeezed.contains(&character) {
             continue;
         }
         written.push(character);
@@ -1620,6 +1645,30 @@ mod tests {
                 STANDARD_INPUT_LABEL,
                 "1\n2",
                 "1\n2".to_string(),
+            ),
+            (
+                "head -COUNT is the same count, written the obsolescent way",
+                "head",
+                words(&["-2"]),
+                STANDARD_INPUT_LABEL,
+                "1\n2\n3\n",
+                "1\n2\n".to_string(),
+            ),
+            (
+                "tail -COUNT is the same count from the other end",
+                "tail",
+                words(&["-1"]),
+                STANDARD_INPUT_LABEL,
+                "1\n2\n3\n",
+                "3\n".to_string(),
+            ),
+            (
+                "head --lines=COUNT is the same count, written long",
+                "head",
+                words(&["--lines=2"]),
+                STANDARD_INPUT_LABEL,
+                "1\n2\n3\n",
+                "1\n2\n".to_string(),
             ),
             (
                 // The digest of no bytes at all, which is the published SHA-256 of the empty

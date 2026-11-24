@@ -257,7 +257,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // start or stop ([`super::guest_services`]).
         let services =
             super::guest_services::GuestServices::starting_from(&instance.guest_runtime);
-        let volume = guest_volume(&machine, &boot_id, booted_at, &files);
+        let volume = guest_volume(&machine, &boot_id, booted_at, &files, &services.taken())
+            // Where a datagram this script SENDS goes: the machine's own network stack, which
+            // carries it to whatever of this guest is listening
+            // ([`super::guest_services::GuestServices::send_datagram`]).
+            .with_datagram_sink(::std::sync::Arc::new(services.clone()));
         let session = ShellSession::in_volume(
             guest_environment(&machine, number),
             SessionConfig {
@@ -425,8 +429,9 @@ impl ComAmazonawsEc2Amazonec2State {
         let boot = instance.boots.last()?;
         let (boot_id, booted_at) = (boot.boot_id.clone(), boot.booted_at);
         let held = instance.guest_files.clone();
+        let runtime = instance.guest_runtime.clone();
         let machine = self.guest_machine(instance);
-        let mut volume = guest_volume(&machine, &boot_id, booted_at, &held);
+        let mut volume = guest_volume(&machine, &boot_id, booted_at, &held, &runtime);
         let answered = change(&mut volume);
         let stored: ::std::collections::BTreeMap<String, String> = volume
             .stored_files()

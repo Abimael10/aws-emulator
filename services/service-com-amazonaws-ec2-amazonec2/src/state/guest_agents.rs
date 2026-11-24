@@ -17,9 +17,10 @@
 //!
 //! # What is real here
 //!
-//! The catalog below is what this guest can hold: the two AWS agents an instance installs, and
+//! The catalog below is what this guest can hold: the AWS agents an instance installs, and
 //! the packages the agents' own installation procedure names. Installing one records it on the
-//! machine ([`super::guest_services::GuestRuntime::installed`]) and nothing else; the unit is
+//! machine ([`super::guest_services::GuestRuntime::installed`]) and puts the files that package
+//! ships on its storage ([`GuestAgent::shipped`]) and nothing else; the unit is
 //! RUNNING only once something started it — the init system's control program, or the agent's
 //! own installer. A unit this machine never installed is not active, and `systemctl` answers
 //! for it the way it answers for a unit file it does not have.
@@ -57,33 +58,56 @@ pub struct GuestAgent {
     /// agents' own installation procedure names (its runtime, its downloader) which ships no
     /// unit: `systemctl` answers about the first and knows nothing of the second.
     pub unit: bool,
+    /// The files installing it leaves on the machine's storage, as `(path, contents)` — the
+    /// programs the package ships, which the documented procedure then invokes by path. Empty
+    /// for a package whose installation this emulator records and nothing else.
+    pub shipped: &'static [(&'static str, &'static str)],
+    /// The DIRECTORIES installing it leaves there: the layout the package has, so a script
+    /// that writes a file of that package's own under one of them writes into a directory the
+    /// machine HAS.
+    pub directories: &'static [&'static str],
 }
 
 /// The packages a guest of this emulator can install.
 ///
-/// The two AWS agents an instance holds as units of its own — the CodeDeploy agent, whose
-/// unit is `codedeploy-agent`, and the Systems Manager agent, whose unit is
-/// `amazon-ssm-agent` — and beside them the packages the agents' documented installation
-/// procedure installs first: `ruby`, the runtime the CodeDeploy agent is written for, and
-/// `wget`, the downloader that fetches its installer ("install ruby and wget", the CodeDeploy
-/// user guide's Amazon Linux instructions). A name that is not one of these is a package this
-/// guest has nothing for.
+/// The AWS agents an instance holds as units of its own — the CodeDeploy agent, whose unit is
+/// `codedeploy-agent`, the Systems Manager agent, whose unit is `amazon-ssm-agent`, and the
+/// CloudWatch agent, whose unit is `amazon-cloudwatch-agent` and which ships the control
+/// program that configures and starts it ([`super::guest_cloudwatch_agent`]) — and beside them
+/// the packages the agents' documented installation procedure installs first: `ruby`, the
+/// runtime the CodeDeploy agent is written for, and `wget`, the downloader that fetches its
+/// installer ("install ruby and wget", the CodeDeploy user guide's Amazon Linux instructions).
+/// A name that is not one of these is a package this guest has nothing for.
 pub const GUEST_AGENT_PACKAGES: &[GuestAgent] = &[
     GuestAgent {
         name: "codedeploy-agent",
         unit: true,
+        shipped: &[],
+        directories: &[],
     },
     GuestAgent {
         name: "amazon-ssm-agent",
         unit: true,
+        shipped: &[],
+        directories: &[],
+    },
+    GuestAgent {
+        name: super::guest_cloudwatch_agent::AGENT_PACKAGE,
+        unit: true,
+        shipped: super::guest_cloudwatch_agent::AGENT_SHIPPED_FILES,
+        directories: super::guest_cloudwatch_agent::AGENT_DIRECTORIES,
     },
     GuestAgent {
         name: "ruby",
         unit: false,
+        shipped: &[],
+        directories: &[],
     },
     GuestAgent {
         name: "wget",
         unit: false,
+        shipped: &[],
+        directories: &[],
     },
 ];
 

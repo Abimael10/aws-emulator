@@ -378,19 +378,29 @@ pub fn perform_delivery<Eng: Send + Sync + 'static>(
     commands: &[String],
     delivery: GuestDelivery,
 ) -> Option<ec2_store::GuestRun> {
-    let ec2 = ec2_store::service_state(engine)?;
-    let mut store = ec2.lock();
-    // The moves that service already owed the instance — its launch reaching `running` and
-    // its guest's first boot — were due at their own instants whether or not anybody called,
-    // and a script runs in the guest that boot brought up. Materialising them is EC2's own
-    // write, through its own one-stop materialiser.
-    store.materialize_due_transitions();
-    store.run_in_instance_guest_with(
-        instance_id,
-        commands,
-        delivery.supplied,
-        &delivery.identity,
-    )
+    let run = {
+        let ec2 = ec2_store::service_state(engine)?;
+        let mut store = ec2.lock();
+        // The moves that service already owed the instance — its launch reaching `running` and
+        // its guest's first boot — were due at their own instants whether or not anybody called,
+        // and a script runs in the guest that boot brought up. Materialising them is EC2's own
+        // write, through its own one-stop materialiser.
+        store.materialize_due_transitions();
+        store.run_in_instance_guest_with(
+            instance_id,
+            commands,
+            delivery.supplied,
+            &delivery.identity,
+        )
+    };
+    // What the script left the guest's own PUBLISHERS owing is published with no store guard
+    // held: a CloudWatch agent the script configured and started has its first collections and
+    // the StatsD values its listener received to publish, and those datapoints are the store
+    // that owns them (CloudWatch's) to take. It is the service that owns the guest that
+    // publishes them, through its own seam, so this delivery reaching a guest is what makes
+    // them due rather than a second publisher of the same series.
+    ec2_store::publish_instance_metrics(engine);
+    run
 }
 
 /// The VPC the node `instance_id` names is IN, as the service that owns instances reports it
@@ -417,7 +427,9 @@ fn node_vpc_id<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -> O
 ///
 /// The build and the machine's architecture are the NODE's own
 /// (`InstanceInformation$AgentVersion`, `InstanceProperty$Architecture`), so what the guest's
-/// package database answers and what this service reports for the node are one fact.
+/// package database answers and what this service reports for the node are one fact. Every
+/// OTHER package that database holds is the owning service's record of the machine, answered by
+/// that machine's own program, which the session asks first.
 fn agent_package_programs<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,

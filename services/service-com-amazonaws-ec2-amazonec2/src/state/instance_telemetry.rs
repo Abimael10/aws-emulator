@@ -82,6 +82,15 @@
 //!   sample is due — [`due_period_start`] alone decides that — only how soon after a period
 //!   closes the reading of it is taken.
 //!
+//! # The agent's series travel the same way
+//!
+//! A guest may also hold the CLOUDWATCH AGENT ([`super::guest_cloudwatch_agent`]), which
+//! publishes the series its own configuration declares — measurements of the machine no API of
+//! this account can derive, and the StatsD values its listener received. Those are datapoints
+//! of the same account's metric store, due at the agent's own interval rather than at the
+//! instance's monitoring cadence, so they are collected and appended by the two seams above
+//! ([`due_agent_samples`]) instead of by a second clock over the same store.
+//!
 //! # What one sample says
 //!
 //! Each metric is a measurement taken on the instance's GUEST, and this emulator runs no guest
@@ -386,20 +395,143 @@ pub fn publish_instance_metrics_at<Eng: Send + Sync + 'static>(
     let Some(state) = service_state(engine) else {
         return false;
     };
-    let (samples, publishing) = {
+    let (samples, agent_samples, publishing) = {
         let mut store = state.lock();
         // Every move the clock already owed is materialised before the instances are read: an
         // instance whose launch has come due is RUNNING at this instant whether or not anybody
         // called, and so is the monitoring move that selects its cadence.
         store.materialize_due_transitions();
         let samples = due_samples(&mut store, now);
+        // What the CloudWatch agent in each guest owes at this instant, which is due at its
+        // own interval rather than at the instance's cadence ([`due_agent_samples`]).
+        let agent_samples = due_agent_samples(&mut store, now);
         let publishing = store.instances.values().any(publishes_metrics);
-        (samples, publishing)
+        (samples, agent_samples, publishing)
     };
     if !samples.is_empty() {
         append(engine, &samples, now);
     }
+    if !agent_samples.is_empty() {
+        append_agent_samples(engine, &agent_samples, now);
+    }
     publishing
+}
+
+/// The datapoints the CLOUDWATCH AGENT in each of this store's guests owes at `now`, recording
+/// what it publishes as taken.
+///
+/// Only a RUNNING instance has a guest, and only a guest whose agent was started and configured
+/// has an agent collecting at all ([`super::guest_cloudwatch_agent::due_samples`], which states
+/// what one of those datapoints is). What each measurement reads is computed from the machine
+/// — its memory and its root filesystem — so the series the agent publishes and what the
+/// guest's own programs report about the same machine are one fact.
+fn due_agent_samples(
+    store: &mut ComAmazonawsEc2Amazonec2State,
+    now: SystemTime,
+) -> Vec<super::guest_cloudwatch_agent::AgentSample> {
+    // What each running agent MEASURES, read while the whole store is to hand: the instance's
+    // own record, its instance type's published memory and its root volume's size all have to
+    // be read before the instance is taken for the collection itself.
+    let measuring: Vec<(String, super::guest_cloudwatch_agent::GuestMeasurements)> = store
+        .instances
+        .values()
+        .filter(|instance| {
+            publishes_metrics(instance) && instance.guest_runtime.cloudwatch_agent.is_running()
+        })
+        .map(|instance| {
+            (
+                instance.instance_id.clone(),
+                guest_measurements(store, instance),
+            )
+        })
+        .collect();
+    let mut samples: Vec<super::guest_cloudwatch_agent::AgentSample> = Vec::new();
+    for (instance_id, measurements) in measuring {
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            continue;
+        };
+        samples.extend(super::guest_cloudwatch_agent::due_samples(
+            &mut instance.guest_runtime.cloudwatch_agent,
+            &measurements,
+            now,
+        ));
+    }
+    samples
+}
+
+/// What the agent in the guest of `instance` can measure of that machine: its memory
+/// ([`super::guest_memory`]) and its root filesystem, both read off the stored instance.
+fn guest_measurements(
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance: &InstanceRecord,
+) -> super::guest_cloudwatch_agent::GuestMeasurements {
+    let stored_bytes = super::guest_memory::stored_bytes(&instance.guest_files);
+    super::guest_cloudwatch_agent::GuestMeasurements {
+        memory: super::guest_memory::guest_memory(
+            super::instance_type_record(&instance.instance_type).map(|record| record.memory_mib),
+        ),
+        filesystem: super::guest_cloudwatch_agent::GuestFilesystem::of(
+            store
+                .launched_root_device(instance.image_id.as_deref())
+                .and_then(|(_device, ebs)| ebs.volume_size),
+            stored_bytes,
+        ),
+    }
+}
+
+/// Append the agent's datapoints to the CloudWatch metric store, and make the alarms watching
+/// those series due for evaluation.
+///
+/// The same store, through the same accessor, as the instance's own series
+/// ([`append`]): a metric has one home, so the agent's series and every reader of them cannot
+/// drift. Each datapoint is ONE observation — a collection the agent took, or a value its
+/// listener received — so a `Sum` over a period is what that period's datagrams came to and an
+/// `Average` is their mean, exactly as a published datapoint of the same series is.
+fn append_agent_samples<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    samples: &[super::guest_cloudwatch_agent::AgentSample],
+    at: SystemTime,
+) {
+    let Some(state) = cloudwatch::state::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    let mut written: Vec<cloudwatch::state::WrittenSeries> = Vec::new();
+    for sample in samples {
+        #[allow(clippy::cast_precision_loss)]
+        let datum = cloudwatch::state::StoredDatum {
+            timestamp_secs: sample.at_secs as f64,
+            sample_count: 1.0,
+            sum: sample.value,
+            minimum: sample.value,
+            maximum: sample.value,
+            unit: sample.unit.clone(),
+            storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
+        };
+        let key = cloudwatch::state::MetricKey {
+            namespace: sample.namespace.clone(),
+            metric_name: sample.metric_name.clone(),
+            dimensions: sample.dimensions.clone(),
+        };
+        let unit = datum.unit().to_string();
+        if store.append_datapoints(key.clone(), vec![datum]).is_err() {
+            // The metric store holds no more series. Whatever request this reading came off was
+            // already answered, so nothing is failed for it; the dropped reading is reported
+            // where a developer can see it.
+            ::tracing::warn!(
+                namespace = %sample.namespace,
+                metric = %sample.metric_name,
+                "the CloudWatch metric store is at capacity, so this agent measurement was not \
+                 published"
+            );
+            continue;
+        }
+        written.push(cloudwatch::state::WrittenSeries {
+            key,
+            units: vec![unit],
+        });
+    }
+    store.make_alarms_due(&written, epoch_secs(at));
 }
 
 /// Start the one in-process task that keeps sampling this store's instances, and stands down

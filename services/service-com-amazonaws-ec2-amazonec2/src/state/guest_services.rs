@@ -101,6 +101,40 @@ const NO_SUCH_PACKAGE: i32 = 1;
 /// have.
 const NO_SUCH_UNIT: i32 = 5;
 
+/// The status it exits with when the unit it started did not come up: the program the unit runs
+/// exited, which for an agent is one that has nothing to run with.
+const UNIT_START_FAILED: i32 = 1;
+
+/// The names the program that SENDS a datagram is invoked under, which is how every documented
+/// "send a StatsD value from inside the instance" line is written.
+const DATAGRAM_PROGRAMS: &[&str] = &["nc", "ncat", "netcat"];
+
+/// The options of that program whose VALUE is the next word, so the address it was given is
+/// read off the operands alone: how long it waits, how long it waits after the stream ends,
+/// which local port and address it sends from, how long it waits between lines, and the proxy
+/// options.
+const DATAGRAM_VALUE_OPTIONS: &[&str] = &["-w", "-q", "-p", "-s", "-i", "-X", "-x"];
+
+/// Whether `word` is the option that makes that program send a DATAGRAM rather than open a
+/// connection — the only form of it this guest performs.
+fn is_datagram_option(word: &str) -> bool {
+    word == "-u" || word == "--udp" || (word.starts_with('-') && !word.starts_with("--") && word.contains('u'))
+}
+
+/// Whether `host` is one of the machine's OWN loopback addresses, which is what makes a
+/// datagram sent to it one the machine sends to itself.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host == "::1"
+        || host == ALL_ADDRESSES
+        || host.starts_with("127.")
+}
+
+/// The address every port of the machine is reachable at from inside it, which a program
+/// addresses its own machine by as well.
+const ALL_ADDRESSES: &str = "0.0.0.0";
+
 /// The status it answers a question about a unit that is not running with.
 const UNIT_INACTIVE: i32 = 3;
 
@@ -143,6 +177,14 @@ pub struct GuestRuntime {
     /// that something STARTED it — the init system's control program, or the agent's own
     /// installer — and nothing about it can be read off [`Self::listening`].
     pub running: BTreeSet<String>,
+    /// The CloudWatch agent as this guest holds it: the configuration it was handed, whether
+    /// it is running, the datagrams its StatsD listener received and the collections it has
+    /// published ([`super::guest_cloudwatch_agent`]).
+    ///
+    /// It is not among [`Self::running`]: that set is what the init system has started, and
+    /// what the agent PUBLISHES depends on the configuration it was handed as well, which is
+    /// the agent's own state rather than the init system's.
+    pub cloudwatch_agent: super::guest_cloudwatch_agent::AgentRuntime,
 }
 
 impl GuestRuntime {
@@ -157,6 +199,13 @@ impl GuestRuntime {
             enabled: self.enabled.clone(),
             listening: BTreeMap::new(),
             running: BTreeSet::new(),
+            // What the CloudWatch agent was CONFIGURED with is on the machine's storage, so it
+            // survives a boot; it is not running until something starts it, exactly as a unit
+            // is not.
+            cloudwatch_agent: super::guest_cloudwatch_agent::AgentRuntime {
+                config: self.cloudwatch_agent.config.clone(),
+                ..super::guest_cloudwatch_agent::AgentRuntime::default()
+            },
         };
         for unit in &self.enabled {
             if let Some(package) = package_named(unit) {
@@ -167,6 +216,14 @@ impl GuestRuntime {
             // same way an enabled server is listening again.
             if super::guest_agents::agent_unit_named(unit).is_some() {
                 started.running.insert(unit.clone());
+                // ... and an agent that is running again is COLLECTING again, from the boot
+                // it came up in: the CloudWatch agent's unit is what starts it, and the
+                // configuration it kept is what it runs with.
+                if unit == super::guest_cloudwatch_agent::AGENT_PACKAGE
+                    && started.cloudwatch_agent.config.is_some()
+                {
+                    started.cloudwatch_agent.started_at = Some(::std::time::SystemTime::now());
+                }
             }
         }
         started
@@ -258,10 +315,22 @@ impl GuestServices {
         for name in packages {
             let Some(package) = package_named(name) else {
                 // An AGENT, or one of the packages an agent's own installation procedure
-                // names: installing it records it on the machine and starts nothing, because
-                // installing a package does not start its unit ([`super::guest_agents`]).
+                // names: installing it records it on the machine and puts the files that
+                // package ships on its storage, and starts nothing, because installing a
+                // package does not start its unit ([`super::guest_agents`]).
                 if let Some(agent) = super::guest_agents::agent_named(name) {
                     self.held().installed.insert(agent.name.to_string());
+                    for directory in agent.directories {
+                        files.make_directories(directory);
+                    }
+                    for (path, contents) in agent.shipped {
+                        if let Some(directory) = ::service_common::posix_shell_volume::parent_path(
+                            path,
+                        ) {
+                            files.make_directories(&directory);
+                        }
+                        files.write(path, contents);
+                    }
                     output.push(format!("Installed: {}", agent.name));
                     continue;
                 }
@@ -300,6 +369,12 @@ impl GuestServices {
                 held.installed.remove(agent.name);
                 held.enabled.remove(agent.name);
                 held.running.remove(agent.name);
+                if agent.name == super::guest_cloudwatch_agent::AGENT_PACKAGE {
+                    // A package that is no longer installed has no agent state left either:
+                    // what it was configured with went with it.
+                    held.cloudwatch_agent =
+                        super::guest_cloudwatch_agent::AgentRuntime::default();
+                }
                 drop(held);
                 output.push(format!("Removed: {}", agent.name));
                 continue;
@@ -323,11 +398,22 @@ impl GuestServices {
     /// Perform one verb of the init system's control program on `unit`.
     ///
     /// `now` is the `--now` an `enable` or a `disable` may carry, which starts or stops the
-    /// unit beside enabling it.
-    fn control(&self, verb: &str, unit: &str, now: bool) -> Option<ProgramOutcome> {
+    /// unit beside enabling it. `host` is the machine the unit's own program runs on, which is
+    /// what an agent resolves its configuration against, and `files` is the machine's own
+    /// storage — where that configuration is, and what starting or stopping a unit that LISTENS
+    /// changes what the kernel publishes about
+    /// ([`super::guest_cloudwatch_agent::udp_socket_table`]).
+    fn control(
+        &self,
+        verb: &str,
+        unit: &str,
+        now: bool,
+        host: &super::guest_cloudwatch_agent::AgentHost,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
         let unit = unit.trim().trim_end_matches(UNIT_SUFFIX);
         if let Some(agent) = super::guest_agents::agent_unit_named(unit) {
-            return self.control_agent(verb, agent, unit, now);
+            return self.control_agent(verb, agent, unit, now, host, files);
         }
         let known = package_named(unit);
         let answered = |status: i32, line: String| {
@@ -421,12 +507,20 @@ impl GuestServices {
     /// ([`GuestRuntime::running`]), an `enable --now` does the same beside enabling it, and
     /// a unit this machine never installed is one the init system has no unit file for —
     /// which is what it reports rather than starting anything.
+    ///
+    /// One of these agents does more than be running: starting the CloudWatch agent's unit
+    /// starts the AGENT, with the configuration the machine handed it
+    /// ([`super::guest_cloudwatch_agent`]) — so its unit comes up only once it has one, which
+    /// is what the init system reports for a unit whose program exits, and stopping it closes
+    /// what it had open.
     fn control_agent(
         &self,
         verb: &str,
         agent: &'static super::guest_agents::GuestAgent,
         unit: &str,
         now: bool,
+        host: &super::guest_cloudwatch_agent::AgentHost,
+        files: &mut dyn ProgramFiles,
     ) -> Option<ProgramOutcome> {
         let installed = self.has(agent.name);
         let answered = |status: i32, line: String| {
@@ -449,11 +543,21 @@ impl GuestServices {
                         ),
                     );
                 }
+                if !self.agent_unit_started(agent, host, files) {
+                    return answered(
+                        UNIT_START_FAILED,
+                        format!(
+                            "Job for {unit}{UNIT_SUFFIX} failed because the control process \
+                             exited with error code."
+                        ),
+                    );
+                }
                 self.held().running.insert(agent.name.to_string());
                 changed
             }
             "stop" => {
                 self.held().running.remove(agent.name);
+                self.agent_unit_stopped(agent, files);
                 changed
             }
             "enable" | "disable" => {
@@ -463,19 +567,17 @@ impl GuestServices {
                         format!("Failed to {verb} unit: Unit file {unit}{UNIT_SUFFIX} does not exist."),
                     );
                 }
-                let mut held = self.held();
                 if verb == "enable" {
-                    held.enabled.insert(agent.name.to_string());
+                    self.held().enabled.insert(agent.name.to_string());
                     if now {
-                        held.running.insert(agent.name.to_string());
+                        return self.control_agent("start", agent, unit, false, host, files);
                     }
                 } else {
-                    held.enabled.remove(agent.name);
+                    self.held().enabled.remove(agent.name);
                     if now {
-                        held.running.remove(agent.name);
+                        return self.control_agent("stop", agent, unit, false, host, files);
                     }
                 }
-                drop(held);
                 changed
             }
             "is-active" | "status" => {
@@ -495,6 +597,111 @@ impl GuestServices {
             "daemon-reload" | "daemon-reexec" => changed,
             _ => None,
         }
+    }
+
+    /// Start whatever the agent `agent` names IS, beside its unit being up — answering whether
+    /// the unit came up at all.
+    ///
+    /// The CloudWatch agent is the one that is more than a unit: starting it starts the agent
+    /// with the configuration the MACHINE holds
+    /// ([`super::guest_cloudwatch_agent::started`]), and a unit whose agent has no
+    /// configuration anywhere does not come up. Every other agent here is up as soon as
+    /// something started its unit.
+    fn agent_unit_started(
+        &self,
+        agent: &'static super::guest_agents::GuestAgent,
+        host: &super::guest_cloudwatch_agent::AgentHost,
+        files: &mut dyn ProgramFiles,
+    ) -> bool {
+        if agent.name != super::guest_cloudwatch_agent::AGENT_PACKAGE {
+            return true;
+        }
+        let mut held = self.held();
+        super::guest_cloudwatch_agent::started(
+            &mut held.cloudwatch_agent,
+            host,
+            files,
+            ::std::time::SystemTime::now(),
+        )
+    }
+
+    /// Stop whatever that agent IS, beside its unit being down: the CloudWatch agent stops
+    /// collecting and closes its listener, which is what the kernel then publishes about the
+    /// machine's sockets.
+    fn agent_unit_stopped(
+        &self,
+        agent: &'static super::guest_agents::GuestAgent,
+        files: &mut dyn ProgramFiles,
+    ) {
+        if agent.name != super::guest_cloudwatch_agent::AGENT_PACKAGE {
+            return;
+        }
+        let mut held = self.held();
+        held.cloudwatch_agent.stop();
+        let table = super::guest_cloudwatch_agent::udp_socket_table(&held.cloudwatch_agent);
+        drop(held);
+        super::guest_cloudwatch_agent::publish_socket_tables(&table, files);
+    }
+
+    /// What one invocation of the CloudWatch agent's own control program answers.
+    ///
+    /// `None` when this machine has not installed the agent — the control program is a file
+    /// that package ships, so a machine without it has no such program at all — or when the
+    /// invocation is written in a form that program performs nothing of
+    /// ([`super::guest_cloudwatch_agent::ControlInvocation`]).
+    ///
+    /// The agent's UNIT is active exactly while the agent is running, because the unit is what
+    /// runs it: a `fetch-config … -s` through this program is what the documented procedure
+    /// starts the agent with, and `systemctl is-active` has to report it.
+    fn cloudwatch_agent_control(
+        &self,
+        host: &super::guest_cloudwatch_agent::AgentHost,
+        arguments: &[String],
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramStreams> {
+        if !self.has(super::guest_cloudwatch_agent::AGENT_PACKAGE) {
+            return None;
+        }
+        let invocation = super::guest_cloudwatch_agent::ControlInvocation::read(arguments)?;
+        let mut held = self.held();
+        let GuestRuntime {
+            running,
+            cloudwatch_agent,
+            ..
+        } = &mut *held;
+        let streams = super::guest_cloudwatch_agent::controlled(
+            &invocation,
+            cloudwatch_agent,
+            host,
+            files,
+            ::std::time::SystemTime::now(),
+        );
+        if cloudwatch_agent.is_running() {
+            running.insert(super::guest_cloudwatch_agent::AGENT_PACKAGE.to_string());
+        } else {
+            running.remove(super::guest_cloudwatch_agent::AGENT_PACKAGE);
+        }
+        Some(streams)
+    }
+
+    /// Hand the datagram `payload` addressed to `port` at `host` to this machine's own network
+    /// stack, answering whether the SEND happened.
+    ///
+    /// A datagram addressed to one of the machine's own LOOPBACK addresses is one it sends to
+    /// itself, so whatever of its own programs is listening on that port receives it — which
+    /// for a guest of this emulator is the CloudWatch agent's StatsD listener. An address of
+    /// any other host is one this emulator carries no datagram to: the send happened, as a
+    /// send of a datagram always does, and nothing received it.
+    pub fn send_datagram(&self, host: &str, port: u16, payload: &str) -> bool {
+        if !is_loopback(host) {
+            return true;
+        }
+        self.held().cloudwatch_agent.received_datagram(
+            port,
+            payload,
+            ::std::time::SystemTime::now(),
+        );
+        true
     }
 
     /// Install `agent` and start its unit, which is what running the agent's OWN installer
@@ -551,6 +758,17 @@ impl GuestServices {
     }
 }
 
+/// What one guest's own NETWORK STACK does with a datagram a program of it sends: a write to
+/// one of the machine's datagram addresses
+/// ([`::service_common::posix_shell_volume::DATAGRAM_PATH_PREFIX`]) is handed here, so a shell
+/// redirection and the sender program reach the machine's listeners the one way
+/// ([`GuestServices::send_datagram`]).
+impl ::service_common::posix_shell_volume::DatagramSink for GuestServices {
+    fn send(&self, host: &str, port: u16, payload: &str) -> bool {
+        self.send_datagram(host, port, payload)
+    }
+}
+
 /// The programs the GUEST of `machine` has installed in it: the metadata client
 /// ([`super::guest_metadata`]), the programs that install, start and run its services, which
 /// change `services`, the ones that report its CPU layout ([`super::guest_cpu`]), the one
@@ -567,7 +785,21 @@ pub fn installed_programs(
     let own: Box<dyn EnvironmentPrograms> = Box::new(GuestEnvironment {
         metadata: super::guest_metadata::guest_programs(machine),
         services: services.clone(),
+        agent_host: super::guest_cloudwatch_agent::AgentHost {
+            instance_id: machine.instance_id.clone(),
+            image_id: machine.image_id.clone(),
+            instance_type: machine.instance_type.clone(),
+        },
     });
+    // The programs a guest reads its own MEMORY with ([`super::guest_memory`]), for a machine
+    // whose memory size this emulator holds: asked AFTER the programs above, so nothing here
+    // can shadow one of them.
+    let own = match super::guest_memory::memory_programs(super::guest_memory::guest_memory(
+        machine.processor.map(|(_, memory_mib)| memory_mib),
+    )) {
+        Some(memory) => ::service_common::posix_shell_session::layered(own, memory),
+        None => own,
+    };
     // The programs that report the machine's own CPU layout ([`super::guest_cpu`]), for a
     // machine whose layout this emulator knows: asked AFTER the programs above, so nothing
     // here can shadow one of them.
@@ -581,6 +813,14 @@ pub fn installed_programs(
         Some(devices) => ::service_common::posix_shell_session::layered(own, devices),
         None => own,
     };
+    // ... and the one it queries its own PACKAGE DATABASE with
+    // ([`super::guest_cloudwatch_agent::package_query_programs`]), which answers out of what
+    // this machine has installed at the instant the query runs, asked after the programs above
+    // for the same reason.
+    let own = ::service_common::posix_shell_session::layered(
+        own,
+        super::guest_cloudwatch_agent::package_query_programs(services, &machine.architecture),
+    );
     // ... and the ones that report the filesystems mounted into it, which every machine has
     // (what they answer is what the session's own mount table holds), asked last for the same
     // reason.
@@ -595,6 +835,9 @@ struct GuestEnvironment {
     metadata: Box<dyn EnvironmentPrograms>,
     /// The services of this guest, which the programs below change.
     services: GuestServices,
+    /// The facts of this machine the CloudWatch agent's configuration resolves its own
+    /// `${aws:…}` references against ([`super::guest_cloudwatch_agent::AgentHost`]).
+    agent_host: super::guest_cloudwatch_agent::AgentHost,
 }
 
 impl EnvironmentPrograms for GuestEnvironment {
@@ -609,7 +852,7 @@ impl EnvironmentPrograms for GuestEnvironment {
         }
         // What this form of the seam reports is the program's standard OUTPUT alone, which is
         // what a caller asking it reads; the form the session asks carries both streams.
-        self.service_program(name, arguments, SESSION_WORKING_DIRECTORY, files)
+        self.service_program(name, arguments, SESSION_WORKING_DIRECTORY, None, files)
             .map(|streams| ProgramOutcome {
                 status: streams.status,
                 output: streams.output,
@@ -629,11 +872,17 @@ impl EnvironmentPrograms for GuestEnvironment {
         {
             return Some(outcome);
         }
-        self.service_program(name, arguments, SESSION_WORKING_DIRECTORY, files)
-            .map(|streams| ProgramOutcome {
-                status: streams.status,
-                output: streams.output,
-            })
+        self.service_program(
+            name,
+            arguments,
+            SESSION_WORKING_DIRECTORY,
+            standard_input,
+            files,
+        )
+        .map(|streams| ProgramOutcome {
+            status: streams.status,
+            output: streams.output,
+        })
     }
 
     /// The form the session asks, which is answered on BOTH streams: what one of these
@@ -651,6 +900,7 @@ impl EnvironmentPrograms for GuestEnvironment {
             invocation.name,
             invocation.arguments,
             invocation.working_directory,
+            invocation.standard_input,
             files,
         )
     }
@@ -662,12 +912,14 @@ impl GuestEnvironment {
     ///
     /// `working_directory` is the directory the session is in, which is what a program whose
     /// own default is the directory it was started in serves out of
-    /// ([`GuestServices::serve_module`]).
+    /// ([`GuestServices::serve_module`]), and `standard_input` is what the stage before this
+    /// command wrote — which is what a program that SENDS what it reads sends.
     fn service_program(
         &self,
         name: &str,
         arguments: &[String],
         working_directory: &str,
+        standard_input: Option<&str>,
         files: &mut dyn ProgramFiles,
     ) -> Option<ProgramStreams> {
         // A path of this machine's OWN storage holding an agent's installer is a program of
@@ -709,7 +961,13 @@ impl GuestEnvironment {
             let (verb, operands, now) = invocation(arguments);
             return self
                 .services
-                .control(verb?, operands.first().copied()?, now)
+                .control(
+                    verb?,
+                    operands.first().copied()?,
+                    now,
+                    &self.agent_host,
+                    files,
+                )
                 .map(written);
         }
         if name == SERVICE_CONTROL {
@@ -717,12 +975,34 @@ impl GuestEnvironment {
             let (unit, operands, now) = invocation(arguments);
             return self
                 .services
-                .control(operands.first().copied()?, unit?, now)
+                .control(
+                    operands.first().copied()?,
+                    unit?,
+                    now,
+                    &self.agent_host,
+                    files,
+                )
                 .map(written);
         }
         if name == APACHE_CONTROL {
             let (verb, _, now) = invocation(arguments);
-            return self.services.control(verb?, APACHE_UNIT, now).map(written);
+            return self
+                .services
+                .control(verb?, APACHE_UNIT, now, &self.agent_host, files)
+                .map(written);
+        }
+        // The CloudWatch agent's own control program, which the documented procedure hands the
+        // agent's configuration to and starts it with
+        // ([`super::guest_cloudwatch_agent::controlled`]).
+        if name == super::guest_cloudwatch_agent::AGENT_CONTROL_PROGRAM {
+            return self
+                .services
+                .cloudwatch_agent_control(&self.agent_host, arguments, files);
+        }
+        // The program that SENDS what it reads to an address of this machine, which is how a
+        // program inside the guest hands a datagram to something listening in it.
+        if DATAGRAM_PROGRAMS.contains(&name) {
+            return self.sent_datagram(arguments, standard_input);
         }
         if ::service_common::static_web_servers::INTERPRETERS.contains(&name) {
             return self
@@ -744,6 +1024,47 @@ impl GuestEnvironment {
     /// The services of this guest, for a program that reads what it is listening with.
     fn held(&self) -> ::std::sync::MutexGuard<'_, GuestRuntime> {
         self.services.held()
+    }
+
+    /// What the datagram sender answers for one invocation: the address it names takes what the
+    /// command read on standard input ([`GuestServices::send_datagram`]).
+    ///
+    /// Only its DATAGRAM form is a program of this guest (`nc -u <host> <port>`, the form every
+    /// documented "send a StatsD value" line is written in): a connection is not something this
+    /// emulator carries, so an invocation without it is one this guest performs nothing of, and
+    /// so is one naming no address.
+    fn sent_datagram(
+        &self,
+        arguments: &[String],
+        standard_input: Option<&str>,
+    ) -> Option<ProgramStreams> {
+        if !arguments.iter().any(|word| is_datagram_option(word)) {
+            return None;
+        }
+        let mut operands: Vec<&String> = Vec::new();
+        let mut words = arguments.iter();
+        while let Some(word) = words.next() {
+            if word.starts_with('-') {
+                // An option whose value is the NEXT word takes that word with it, so the
+                // address is read off the operands alone.
+                if DATAGRAM_VALUE_OPTIONS.contains(&word.as_str()) {
+                    let _ = words.next();
+                }
+                continue;
+            }
+            operands.push(word);
+        }
+        let [host, port] = operands.as_slice() else {
+            return None;
+        };
+        let port: u16 = port.parse().ok()?;
+        self.services
+            .send_datagram(host, port, standard_input.unwrap_or_default());
+        Some(ProgramStreams {
+            status: SUCCESS,
+            output: Vec::new(),
+            errors: Vec::new(),
+        })
     }
 
     /// One package-manager invocation: its subcommand decides what it does, and the operands
