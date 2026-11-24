@@ -616,11 +616,14 @@ pub fn mint_keys_and_certificate(
 
 /// How long the certificate `CreateProvisioningClaim` issues is valid for.
 ///
-/// AWS IoT documents the provisioning claim certificate as a TEMPORARY one: "Provisioning
-/// claim certificates expire 1 hour after they are created", which is also what the
-/// operation's `expiration` member reports — so the certificate's `notAfter` and the
-/// reported expiration are one instant, this span after the call that minted them.
-pub const PROVISIONING_CLAIM_VALIDITY: Duration = Duration::from_secs(60 * 60);
+/// AWS IoT documents the provisioning claim certificate as a TEMPORARY one that a device
+/// must exchange for a permanent certificate straight away: the AWS IoT Core Developer
+/// Guide's fleet provisioning ("Provisioning by claim") section states that a
+/// provisioning claim certificate expires five minutes after it is created. That is also
+/// the instant the operation's `expiration` member reports — so the certificate's
+/// `notAfter` and the reported expiration are one instant, this span after the call that
+/// minted them.
+pub const PROVISIONING_CLAIM_VALIDITY: Duration = Duration::from_secs(5 * 60);
 
 /// Mint the key pair and certificate above, valid from `now` until `not_after`.
 ///

@@ -14,6 +14,8 @@
 //!   real certificate and the key pair for it, the certificate is on record under the id
 //!   reported — `DescribeCertificate` reads it back — and its validity ends at the
 //!   `expiration` reported, since a claim certificate is temporary;
+//! * a claim certificate is SHORT-LIVED: its validity is the documented five minutes
+//!   after the call that minted it, for every claim and every template;
 //! * a `templateName` the account holds no template under is
 //!   `ResourceNotFoundException` (404) and nothing is issued.
 
@@ -21,7 +23,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_iot_awsiotservice::state::PROVISIONING_CLAIM_VALIDITY;
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -31,6 +32,18 @@ const REGION: &str = "ap-south-1";
 /// The role a provisioning template provisions under, of more than the modelled minimum
 /// length (`RoleArn`, len 20..2048).
 const PROVISIONING_ROLE: &str = "arn:aws:iam::123456789012:role/fleet-provisioning";
+
+/// How long a provisioning claim certificate is valid for, in seconds: AWS IoT documents
+/// the claim as a temporary credential that expires five minutes after it is created
+/// (AWS IoT Core Developer Guide, fleet provisioning "Provisioning by claim"). Written
+/// out here rather than read from the crate, so this suite pins the published duration
+/// instead of whatever the emulator happens to hold.
+const DOCUMENTED_CLAIM_VALIDITY_SECONDS: f64 = 300.0;
+
+/// The tolerance the timestamp assertions allow: the `expiration`, the `notAfter` and the
+/// `creationDate` of one claim are all derived from the SAME instant, so they differ only
+/// by their wire encoding, never by how fast the host runs.
+const SAME_INSTANT_TOLERANCE_SECONDS: f64 = 1.0;
 
 /// One emulator: a router with this service mounted on its own engine.
 struct Emulator {
@@ -155,6 +168,51 @@ fn template_body() -> String {
     .to_string()
 }
 
+/// The instants the service holds for the claim certificate `certificate_id`, read back
+/// through `DescribeCertificate`: `(creationDate, notBefore, notAfter)`.
+///
+/// ONE reader for both rules below, so neither can disagree with the other about where a
+/// claim's instants come from; it also asserts the read reports the id it was asked about,
+/// since a claim that is not on record under the id reported has no instants to compare.
+async fn certificate_instants(
+    emulator: &Emulator,
+    certificate_id: &str,
+    label: &str,
+) -> (f64, f64, f64) {
+    let described = emulator.describe_certificate(certificate_id).await;
+    assert_eq!(
+        described.status,
+        200,
+        "case {label}: expected the claim certificate to read back, got {} body {}",
+        described.status,
+        described.text()
+    );
+    let description = described.json();
+    assert_eq!(
+        description["certificateDescription"]["certificateId"],
+        json!(certificate_id),
+        "case {label}: the read must report the issued id, got {}",
+        described.text()
+    );
+    let read = |value: &Value, member: &str| -> f64 {
+        value.as_f64().unwrap_or_else(|| {
+            panic!(
+                "case {label}: no {member} for {certificate_id} in {}",
+                described.text()
+            )
+        })
+    };
+    let validity = &description["certificateDescription"]["validity"];
+    (
+        read(
+            &description["certificateDescription"]["creationDate"],
+            "creationDate",
+        ),
+        read(&validity["notBefore"], "notBefore"),
+        read(&validity["notAfter"], "notAfter"),
+    )
+}
+
 /// RULE: a claim for a template the account holds is a real certificate and key pair,
 /// on record under the id reported and valid until the expiration reported.
 #[tokio::test]
@@ -217,37 +275,18 @@ async fn a_claim_is_issued_for_a_template_the_account_holds() {
         // The certificate is ON RECORD under the id reported, and the validity it holds
         // ends exactly at the expiration this response reported — a claim certificate is
         // temporary, so the two are one instant.
-        let described = emulator.describe_certificate(&certificate_id).await;
-        assert_eq!(
-            described.status,
-            200,
-            "case {label}: expected the claim certificate to read back, got {} body {}",
-            described.status,
-            described.text()
-        );
-        let description = described.json();
-        assert_eq!(
-            description["certificateDescription"]["certificateId"],
-            json!(certificate_id),
-            "case {label}: the read must report the issued id, got {}",
-            described.text()
-        );
-        let not_after = description["certificateDescription"]["validity"]["notAfter"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {label}: no notAfter in {}", described.text()));
+        let (_, not_before, not_after) =
+            certificate_instants(&emulator, &certificate_id, label).await;
         assert!(
-            (not_after - expiration).abs() < 1.0,
+            (not_after - expiration).abs() < SAME_INSTANT_TOLERANCE_SECONDS,
             "case {label}: expected the certificate to expire at the reported expiration \
              {expiration}, got {not_after}"
         );
-        let not_before = description["certificateDescription"]["validity"]["notBefore"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {label}: no notBefore in {}", described.text()));
         let validity = not_after - not_before;
         assert!(
-            (validity - PROVISIONING_CLAIM_VALIDITY.as_secs_f64()).abs() < 1.0,
-            "case {label}: expected a claim valid for {}s, got {validity}s",
-            PROVISIONING_CLAIM_VALIDITY.as_secs()
+            (validity - DOCUMENTED_CLAIM_VALIDITY_SECONDS).abs() < SAME_INSTANT_TOLERANCE_SECONDS,
+            "case {label}: expected a claim valid for \
+             {DOCUMENTED_CLAIM_VALIDITY_SECONDS}s, got {validity}s"
         );
 
         // Two claims for one template are two certificates: each call issues its own.
@@ -264,6 +303,82 @@ async fn a_claim_is_issued_for_a_template_the_account_holds() {
             json!(certificate_id),
             "case {label}: each claim must be its own certificate, got {}",
             second.text()
+        );
+    }
+}
+
+/// RULE: a claim certificate's validity is the documented five minutes, measured from the
+/// call that minted it — the `expiration` reported, the certificate's `notAfter` and its
+/// `creationDate` all come from that one instant, so the claim a device is handed is
+/// short-lived whatever template it was issued for.
+#[tokio::test]
+async fn a_claim_certificate_expires_the_documented_span_after_it_is_issued() {
+    // The rows span what the rule generalises over: the template a claim is issued for
+    // (enabled or not, either admitted `TemplateName` form) and WHICH claim of that
+    // template it is — every claim carries its own five minutes, not a shared deadline.
+    let cases = [
+        ("the first claim for an enabled template", "fleet-template", true, 1),
+        ("a later claim for an enabled template", "fleet-template", true, 3),
+        (
+            "a claim for a template that is not enabled",
+            "disabled_template_1",
+            false,
+            2,
+        ),
+    ];
+
+    for (label, template_name, enabled, claims) in cases {
+        let emulator = Emulator::new();
+        emulator.create_template(label, template_name, enabled).await;
+
+        let mut last = None;
+        for issue in 1..=claims {
+            let claim = emulator.create_claim(template_name).await;
+            assert_eq!(
+                claim.status,
+                200,
+                "case {label} (claim {issue}): expected 200, got {} body {}",
+                claim.status,
+                claim.text()
+            );
+            last = Some(claim);
+        }
+        let claim = last.expect("every case issues at least one claim");
+        let body = claim.json();
+        let certificate_id = body["certificateId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label}: no certificateId in {}", claim.text()))
+            .to_string();
+        let expiration = body["expiration"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {label}: no expiration in {}", claim.text()));
+
+        let (created, not_before, not_after) =
+            certificate_instants(&emulator, &certificate_id, label).await;
+
+        let reported_ttl = expiration - created;
+        assert!(
+            (reported_ttl - DOCUMENTED_CLAIM_VALIDITY_SECONDS).abs()
+                < SAME_INSTANT_TOLERANCE_SECONDS,
+            "case {label}: expected the claim to expire {DOCUMENTED_CLAIM_VALIDITY_SECONDS}s \
+             after it was issued, got {reported_ttl}s"
+        );
+        let certificate_ttl = not_after - not_before;
+        assert!(
+            (certificate_ttl - DOCUMENTED_CLAIM_VALIDITY_SECONDS).abs()
+                < SAME_INSTANT_TOLERANCE_SECONDS,
+            "case {label}: expected the certificate itself to be valid for \
+             {DOCUMENTED_CLAIM_VALIDITY_SECONDS}s, got {certificate_ttl}s"
+        );
+        assert!(
+            (not_before - created).abs() < SAME_INSTANT_TOLERANCE_SECONDS,
+            "case {label}: expected the certificate to be valid from its creation \
+             {created}, got {not_before}"
+        );
+        assert!(
+            (not_after - expiration).abs() < SAME_INSTANT_TOLERANCE_SECONDS,
+            "case {label}: expected the certificate to expire at the reported expiration \
+             {expiration}, got {not_after}"
         );
     }
 }
