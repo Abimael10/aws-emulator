@@ -18,14 +18,19 @@
 
 use super::*;
 
-/// The processes `SuspendProcesses` and `ResumeProcesses` name, and the catalog
-/// `DescribeScalingProcessTypes` reports.
+/// The processes `DescribeScalingProcessTypes` reports, and the ones a refusal of an
+/// unknown process offers ([`suspended_processes::unknown_process_message`]).
 ///
 /// Membership from the model's own documentation for `ProcessType$ProcessName`
 /// ("One of the following processes: Launch, Terminate, AddToLoadBalancer,
 /// AlarmNotification, AZRebalance, HealthCheck, InstanceRefresh,
 /// ReplaceUnhealthy, ScheduledActions"). Held in ASCII order, which is the order
 /// the service reports the catalog in.
+///
+/// What a suspension or a resumption may NAME is this catalog and the one process the
+/// service accepts the name of without publishing it
+/// ([`suspended_processes::suspendable_processes`]), so the two are read apart: this is what
+/// the service publishes.
 pub const SCALING_PROCESS_TYPES: &[&str] = &[
     "AZRebalance",
     "AddToLoadBalancer",

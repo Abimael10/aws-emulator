@@ -172,8 +172,9 @@ pub use warm_pools::{
 pub mod suspended_processes;
 
 pub use suspended_processes::{
-    named_processes, resumed_convergence_cause, suspension_reason, unknown_process_message,
-    ProcessRefusal, SuspendedProcesses, PROCESS_HEALTH_CHECK, PROCESS_LAUNCH,
+    is_suspendable_process, named_processes, resumed_convergence_cause, suspendable_processes,
+    suspension_reason, unknown_process_message, ProcessRefusal, SuspendedProcesses,
+    PROCESS_HEALTH_CHECK, PROCESS_LAUNCH, PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY,
     PROCESS_REPLACE_UNHEALTHY, PROCESS_TERMINATE,
 };
 

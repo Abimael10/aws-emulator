@@ -7,8 +7,10 @@
 //! (`smithy_query(query="operation",operation="SuspendProcesses")`), its modelled output is
 //! `Unit`, and "if you omit this property, all processes are specified"
 //! (`ScalingProcessQuery$ScalingProcesses`). The processes a request may name are the
-//! service's own catalog — the one `DescribeScalingProcessTypes` publishes — so this suite
-//! reads that catalog over the wire rather than writing it out, and a name outside it is
+//! service's own catalog — the one `DescribeScalingProcessTypes` publishes — together with
+//! the one name the service accepts without publishing it ([`UNPUBLISHED_PROCESS`], whose
+//! own suite is `unpublished_suspendable_process`), so this suite reads that catalog over
+//! the wire rather than writing it out, and a name outside that set is
 //! refused with a 400 `ValidationError` that leaves the group's suspensions as they were.
 //!
 //! What a suspension IS, as the group reports it: one `SuspendedProcess` per suspended
@@ -42,6 +44,22 @@ const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1"
 /// The fixed text of a suspension reason; what follows it is the instant the process was
 /// suspended at.
 const REASON_PREFIX: &str = "User suspended at ";
+
+/// The one process a request may name that the service publishes nowhere — recorded
+/// behaviour of `SuspendProcesses`, which accepts the name, and of
+/// `DescribeAutoScalingGroups`, which reports it among the suspensions of a group that
+/// suspended every process. Named here so the rows below can state what a request naming no
+/// process suspends; what it means is the `unpublished_suspendable_process` suite's own.
+const UNPUBLISHED_PROCESS: &str = "RemoveFromLoadBalancerLowPriority";
+
+/// Every process a suspension may name: the published catalog and that one name beside it,
+/// in the ASCII order a group reports its suspensions in.
+fn suspendable(catalog: &[String]) -> Vec<String> {
+    let mut processes = catalog.to_vec();
+    processes.push(UNPUBLISHED_PROCESS.to_string());
+    processes.sort();
+    processes
+}
 
 /// The processes the service publishes as its own catalog, read over the wire from
 /// `DescribeScalingProcessTypes` — the same set a request may name — so no row here writes
@@ -165,13 +183,40 @@ enum Named {
     WholePublishedCatalog,
 }
 
+/// What a row expects the group to report afterwards.
+enum Expected {
+    /// Every process a request may name, the unpublished one among them.
+    EverySuspendableProcess,
+    /// Only the processes the service publishes.
+    ThePublishedCatalog,
+    /// Exactly these, in the ASCII order the group reports them in.
+    Processes(Vec<&'static str>),
+}
+
+impl Expected {
+    /// The process names one row expects, given the catalog the service publishes.
+    fn names(&self, catalog: &[String]) -> Vec<String> {
+        match self {
+            Self::EverySuspendableProcess => suspendable(catalog),
+            Self::ThePublishedCatalog => {
+                let mut published = catalog.to_vec();
+                published.sort();
+                published
+            }
+            Self::Processes(processes) => processes
+                .iter()
+                .map(|process| (*process).to_string())
+                .collect(),
+        }
+    }
+}
+
 /// One row of the suspension table.
 struct SuspensionCase {
     case: &'static str,
     named: Named,
-    /// The processes the group then reports suspended, in the ASCII order it reports them;
-    /// `None` for a row that suspends the whole published catalog.
-    expected: Option<Vec<&'static str>>,
+    /// The processes the group then reports suspended, in the ASCII order it reports them.
+    expected: Expected,
 }
 
 /// A suspension is recorded against the group it names, for exactly the processes the
@@ -186,39 +231,43 @@ async fn suspend_processes_records_the_processes_the_request_names() {
 
     let cases = [
         SuspensionCase {
-            case: "no process named: every published process is suspended",
+            case: "no process named: every process a request may name is suspended",
             named: Named::Omitted,
-            expected: None,
+            expected: Expected::EverySuspendableProcess,
         },
         SuspensionCase {
             case: "the whole published catalog named explicitly",
             named: Named::WholePublishedCatalog,
-            expected: None,
+            expected: Expected::ThePublishedCatalog,
         },
         SuspensionCase {
             case: "one process",
             named: Named::Processes(vec!["AZRebalance"]),
-            expected: Some(vec!["AZRebalance"]),
+            expected: Expected::Processes(vec!["AZRebalance"]),
         },
         SuspensionCase {
             case: "three processes, named out of the order they are reported in",
             named: Named::Processes(vec!["ScheduledActions", "AddToLoadBalancer", "HealthCheck"]),
-            expected: Some(vec!["AddToLoadBalancer", "HealthCheck", "ScheduledActions"]),
+            expected: Expected::Processes(vec![
+                "AddToLoadBalancer",
+                "HealthCheck",
+                "ScheduledActions",
+            ]),
         },
         SuspensionCase {
             case: "the same process twice: one suspension",
             named: Named::Processes(vec!["InstanceRefresh", "InstanceRefresh"]),
-            expected: Some(vec!["InstanceRefresh"]),
+            expected: Expected::Processes(vec!["InstanceRefresh"]),
         },
         SuspensionCase {
             case: "the two processes that move instances",
             named: Named::Processes(vec!["Terminate", "Launch"]),
-            expected: Some(vec!["Launch", "Terminate"]),
+            expected: Expected::Processes(vec!["Launch", "Terminate"]),
         },
         SuspensionCase {
             case: "a process the group is left running beside one it suspends",
             named: Named::Processes(vec!["ReplaceUnhealthy"]),
-            expected: Some(vec!["ReplaceUnhealthy"]),
+            expected: Expected::Processes(vec!["ReplaceUnhealthy"]),
         },
     ];
 
@@ -257,19 +306,7 @@ async fn suspend_processes_records_the_processes_the_request_names() {
             case.case
         );
 
-        let expected: Vec<String> = case.expected.as_ref().map_or_else(
-            || {
-                let mut all = catalog.clone();
-                all.sort();
-                all
-            },
-            |processes| {
-                processes
-                    .iter()
-                    .map(|process| (*process).to_string())
-                    .collect()
-            },
-        );
+        let expected = case.expected.names(&catalog);
         let reported = reported_suspensions(&router, &name).await;
         assert_eq!(
             reported
@@ -580,11 +617,12 @@ async fn suspending_again_adds_no_second_suspension() {
     let (status, body) = suspend(&router, "twice", &[]).await;
     assert_eq!(status, 200, "suspending every process: got {status}: {body}");
     let after_all = reported_suspensions(&router, "twice").await;
+    let suspendable = suspendable(&catalog);
     assert_eq!(
         after_all.len(),
-        catalog.len(),
-        "every published process is suspended once, got {after_all:?} for the catalog \
-         {catalog:?}"
+        suspendable.len(),
+        "every process a request may name is suspended once, got {after_all:?} for \
+         {suspendable:?}"
     );
     let relaunched = after_all
         .iter()

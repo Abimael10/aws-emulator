@@ -9,8 +9,10 @@
 //! `Unit`, and "if you omit this property, all processes are specified"
 //! (`ScalingProcessQuery$ScalingProcesses`) — the same reading of that member a suspension
 //! takes. The processes a request may name are the service's own catalog, the one
-//! `DescribeScalingProcessTypes` publishes, so this suite reads that catalog over the wire
-//! rather than writing it out, and a name outside it is refused with a 400
+//! `DescribeScalingProcessTypes` publishes, together with the one name the service accepts
+//! without publishing it ([`UNPUBLISHED_PROCESS`], whose own suite is
+//! `unpublished_suspendable_process`), so this suite reads that catalog over the wire
+//! rather than writing it out, and a name outside that set is refused with a 400
 //! `ValidationError` that leaves the group's suspensions as they were.
 //!
 //! What a resumption IS, as the group reports it: the `SuspendedProcess` entries
@@ -40,6 +42,14 @@ use crate::support::{
 /// The launch source every group here is created from: a launch TEMPLATE, because no
 /// account can create a launch configuration (`CreateLaunchConfiguration` is refused).
 const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1");
+
+/// The one process a request may name that the service publishes nowhere — recorded
+/// behaviour of `SuspendProcesses`, which accepts the name, and of
+/// `DescribeAutoScalingGroups`, which reports it among the suspensions of a group that
+/// suspended every process. Named here so the rows below can state what a resumption of the
+/// published catalog leaves suspended; what it means is the
+/// `unpublished_suspendable_process` suite's own.
+const UNPUBLISHED_PROCESS: &str = "RemoveFromLoadBalancerLowPriority";
 
 /// How long a case that waits for something the clock owes keeps looking before it calls the
 /// wait a failure. Far above the work one capacity change takes, because what is waited for
@@ -217,7 +227,10 @@ async fn resume_processes_turns_off_the_suspensions_the_request_names() {
             case: "every process suspended, the whole published catalog resumed explicitly",
             suspend: Named::Omitted,
             resume: Named::WholePublishedCatalog,
-            expected: Vec::new(),
+            // A resumption turns off the suspensions it NAMES, and the published catalog
+            // does not name the one process the service publishes nowhere, so that one is
+            // left suspended.
+            expected: vec![UNPUBLISHED_PROCESS],
         },
         ResumptionCase {
             case: "one of three resumed",

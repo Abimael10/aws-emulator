@@ -12,11 +12,12 @@
 //!
 //! The processes a request may name are the service's own catalog
 //! ([`super::SCALING_PROCESS_TYPES`], the same set `DescribeScalingProcessTypes`
-//! publishes), and "if you omit this property, all processes are specified"
+//! publishes) and the one process it still accepts the name of without publishing it
+//! ([`PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY`]) — [`suspendable_processes`] is that
+//! set — and "if you omit this property, all processes are specified"
 //! (`ScalingProcessQuery$ScalingProcesses`) — so a request that names none suspends every
-//! process of the catalog. A name outside the catalog names no process of this service, so
-//! the request is refused and nothing is written
-//! ([`ProcessRefusal::UnknownProcesses`]).
+//! one of them. A name outside that set names no process of this service, so the request is
+//! refused and nothing is written ([`ProcessRefusal::UnknownProcesses`]).
 //!
 //! The collection is keyed by process name, so naming a process twice in one request, or
 //! naming one a later request names again, leaves ONE suspension: a process is either
@@ -129,6 +130,21 @@ pub const PROCESS_REPLACE_UNHEALTHY: &str = "ReplaceUnhealthy";
 /// while it was suspended — those instants have passed.
 pub const PROCESS_SCHEDULED_ACTIONS: &str = "ScheduledActions";
 
+/// The process a group's instances were removed from its load balancers by at a lower
+/// priority, as the service names it.
+///
+/// The service no longer performs it: it is outside the catalog the service publishes
+/// ([`super::SCALING_PROCESS_TYPES`]) and outside the processes
+/// `ScalingProcessQuery$ScalingProcesses` documents, and it does nothing a group would
+/// otherwise do. What is left of it is the NAME: a suspension or a resumption may name it,
+/// and a group that has it suspended reports it among its suspensions beside the processes
+/// it does perform ([`StoredGroup::suspended_process_views`]) — so a caller that suspends
+/// every process of a group and reads the group back gets this name too, and may submit it
+/// again. It is published by nothing, so neither the catalog a read reports nor the names an
+/// unknown-process refusal offers ([`unknown_process_message`]) names it.
+pub const PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY: &str =
+    "RemoveFromLoadBalancerLowPriority";
+
 /// The process that REGISTERS a group's instances with the load balancers and target groups
 /// the group is attached to, as the catalog names it.
 ///
@@ -169,8 +185,8 @@ impl ProcessRefusal {
 }
 
 impl StoredGroup {
-    /// Suspend the processes `requested` names — or every process of the catalog when it
-    /// names none — as of `now`.
+    /// Suspend the processes `requested` names — or every suspendable process when it
+    /// names none ([`suspendable_processes`]) — as of `now`.
     ///
     /// Every name is checked BEFORE the first write, so a refused request leaves the
     /// group's suspensions exactly as they were. A process already suspended keeps the
@@ -187,8 +203,9 @@ impl StoredGroup {
         Ok(())
     }
 
-    /// Resume the processes `requested` names — or every process of the catalog when it
-    /// names none — and answer the ones that were actually suspended until now.
+    /// Resume the processes `requested` names — or every suspendable process when it
+    /// names none ([`suspendable_processes`]) — and answer the ones that were actually
+    /// suspended until now.
     ///
     /// Every name is checked BEFORE the first write, exactly as a suspension checks it, so a
     /// refused request leaves the group's suspensions exactly as they were. Resuming a
@@ -277,21 +294,47 @@ impl StoredGroup {
     }
 }
 
-/// The processes a request names: the ones it listed, or the whole catalog when it listed
-/// none.
+/// Every process a suspension or a resumption may name: the catalog the service publishes
+/// ([`super::SCALING_PROCESS_TYPES`]) and the one process it accepts the name of without
+/// publishing it ([`PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY`]), in the ASCII order a
+/// group reports its suspensions in.
 ///
-/// A name outside the catalog is refused here, so neither a suspension nor a resumption
+/// THE ONE spelling of that set, so the processes a request is admitted with and the
+/// processes a request naming none suspends are one set — and the published catalog, which
+/// this is built from, stays the one list a read reports and a refusal offers.
+#[must_use]
+pub fn suspendable_processes() -> Vec<String> {
+    let mut processes: Vec<String> = super::SCALING_PROCESS_TYPES
+        .iter()
+        .chain(::std::iter::once(
+            &PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY,
+        ))
+        .map(|process| (*process).to_string())
+        .collect();
+    processes.sort();
+    processes
+}
+
+/// Whether `process` is one a suspension or a resumption may name
+/// ([`suspendable_processes`]).
+#[must_use]
+pub fn is_suspendable_process(process: &str) -> bool {
+    super::SCALING_PROCESS_TYPES.contains(&process)
+        || process == PROCESS_REMOVE_FROM_LOAD_BALANCER_LOW_PRIORITY
+}
+
+/// The processes a request names: the ones it listed, or every suspendable process when it
+/// listed none ([`suspendable_processes`]).
+///
+/// A name outside that set is refused here, so neither a suspension nor a resumption
 /// can write a process this service does not have.
 pub fn named_processes(requested: &[String]) -> Result<Vec<String>, ProcessRefusal> {
     if requested.is_empty() {
-        return Ok(super::SCALING_PROCESS_TYPES
-            .iter()
-            .map(|process| (*process).to_string())
-            .collect());
+        return Ok(suspendable_processes());
     }
     let unknown: Vec<String> = requested
         .iter()
-        .filter(|candidate| !super::SCALING_PROCESS_TYPES.contains(&candidate.as_str()))
+        .filter(|candidate| !is_suspendable_process(candidate.as_str()))
         .cloned()
         .collect();
     if !unknown.is_empty() {
@@ -325,13 +368,13 @@ pub fn resumed_convergence_cause(at: SystemTime, desired_capacity: i32) -> Strin
     )
 }
 
-/// The message a request naming processes outside this service's own catalog is refused
-/// with.
+/// The message a request naming processes this service does not have is refused with.
 ///
 /// The fixed text names what the request contained and then the catalog the caller has to
-/// choose from, and closes the sentence with its full stop; the one variable part is the
-/// names the request wrote that the catalog does not hold, EVERY one of them, since one
-/// call may name several and none of them is suspended.
+/// choose from — the processes the service PUBLISHES, which is what the refusal offers — and
+/// closes the sentence with its full stop; the one variable part is the names the request
+/// wrote that no process of this service answers to, EVERY one of them, since one call may
+/// name several and none of them is suspended.
 pub fn unknown_process_message(processes: &[String]) -> String {
     format!(
         "Request contained illegal suspendable process names: [{}].Valid names are :[{}].",
