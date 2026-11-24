@@ -57,31 +57,51 @@ pub fn is_assessment_id(value: &str) -> bool {
     }
 }
 
-/// The assessment `identifier` names, for an identifier of either form
-/// `AssessmentIdentifier` documents: the id itself, or the id at the end of an
-/// assessment ARN of `catalog` in this service's own ARN namespace. `None` for
-/// anything else, which is what the caller refuses the request for.
+/// The fields an ARN of THIS service's namespace carries beside the two fixed
+/// ones: its partition, region, account and resource portion.
 ///
-/// The ARN alternative of the modelled pattern constrains only the SHAPE of an
-/// ARN (`arn:<partition>:<service>:<region>:<account>:<type>/Assessment/assessment-…`),
-/// so an ARN naming another service's namespace or another catalog satisfies it
-/// while naming no assessment of this catalog. The partition, region and account
-/// are the caller's: this service serves one catalog, whatever region a caller
-/// signs for, so they do not select the record.
-pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a str> {
-    if !(1..=ASSESSMENT_IDENTIFIER_MAX).contains(&identifier.chars().count()) {
-        return None;
-    }
-    if is_assessment_id(identifier) {
-        return Some(identifier);
-    }
-    let mut fields = identifier.splitn(6, ':');
+/// The two fixed fields are not members of this struct because a value that does
+/// not carry them is no ARN of this service at all, so [`service_arn`] answers
+/// `None` for it rather than reporting what they held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceArn<'a> {
+    /// The partition field: where, in AWS's own partitioning, the resource lives.
+    pub partition: &'a str,
+    /// The region field, which an ARN of this service may leave empty.
+    pub region: &'a str,
+    /// The account field: which account the resource belongs to.
+    pub account: &'a str,
+    /// Everything after the account field, separators included — the resource
+    /// portion [`entity_arn`] and [`change_set_arn`] write as
+    /// `<catalog>/<type>/<id>`.
+    pub resource: &'a str,
+}
+
+/// The variable fields of `value` when it is an ARN of this service's own
+/// `arnNamespace` — the literal `arn`, then five `:`-separated fields of which
+/// the second names [`ARN_NAMESPACE`] — or `None` when it is not one at all.
+///
+/// This is the one place this service decides what an ARN of its own namespace
+/// is, so every surface addressed by one ([`assessment_id_of`],
+/// [`is_resource_arn`], [`parse_resource_arn`]) agrees on the question and adds
+/// only its OWN further conditions on the fields it gets back: the characters
+/// each field may carry, which account owns the resource, or which resource the
+/// resource portion names.
+///
+/// The resource portion is everything after the account field, so a resource
+/// carrying `:` of its own stays whole.
+///
+/// [`arn_resource`] deliberately does NOT go through this: it reports the
+/// resource portion of an ARN of ANY namespace, including one this service never
+/// minted, so requiring this namespace there would change what it answers.
+pub fn service_arn(value: &str) -> Option<ServiceArn<'_>> {
+    let mut fields = value.splitn(6, ':');
     let (
         Some("arn"),
-        Some(_partition),
+        Some(partition),
         Some(ARN_NAMESPACE),
-        Some(_region),
-        Some(_account),
+        Some(region),
+        Some(account),
         Some(resource),
     ) = (
         fields.next(),
@@ -94,7 +114,40 @@ pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a st
     else {
         return None;
     };
-    let id = resource.strip_prefix(&format!("{catalog}/{ASSESSMENT_ARN_RESOURCE_TYPE}/"))?;
+    Some(ServiceArn {
+        partition,
+        region,
+        account,
+        resource,
+    })
+}
+
+/// The assessment `identifier` names, for an identifier of either form
+/// `AssessmentIdentifier` documents: the id itself, or the id at the end of an
+/// assessment ARN of `catalog` in this service's own ARN namespace. `None` for
+/// anything else, which is what the caller refuses the request for.
+///
+/// The ARN alternative of the modelled pattern constrains only the SHAPE of an
+/// ARN (`arn:<partition>:<service>:<region>:<account>:<type>/Assessment/assessment-…`),
+/// so an ARN naming another service's namespace or another catalog satisfies it
+/// while naming no assessment of this catalog. The partition, region and account
+/// are the caller's: this service serves one catalog, whatever region a caller
+/// signs for, so they do not select the record.
+///
+/// Whether the identifier is an ARN of this service's namespace at all is
+/// [`service_arn`]'s decision; the extra condition here is that its resource
+/// portion names an assessment of `catalog`.
+pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a str> {
+    if !(1..=ASSESSMENT_IDENTIFIER_MAX).contains(&identifier.chars().count()) {
+        return None;
+    }
+    if is_assessment_id(identifier) {
+        return Some(identifier);
+    }
+    let fields = service_arn(identifier)?;
+    let id = fields
+        .resource
+        .strip_prefix(&format!("{catalog}/{ASSESSMENT_ARN_RESOURCE_TYPE}/"))?;
     is_assessment_id(id).then_some(id)
 }
 
@@ -243,10 +296,12 @@ const RESOURCE_ARN_MAX: usize = 255;
 ///
 /// The six fields the pattern names: the literal `arn`, a partition, this
 /// service's `arnNamespace`, a region (which may be empty), an account of
-/// digits, and a resource of `/`-separated non-empty segments. WHICH resource an
-/// ARN inside this syntax names is [`parse_resource_arn`]'s decision; this one
-/// says only that the value is an ARN of this service's namespace, which is what
-/// a caller is told to satisfy.
+/// digits, and a resource of `/`-separated non-empty segments. The first three
+/// are [`service_arn`]'s decision; the extra condition here is the characters
+/// each remaining field may carry. WHICH resource an ARN inside this syntax
+/// names is [`parse_resource_arn`]'s decision; this one says only that the value
+/// is an ARN of this service's namespace, which is what a caller is told to
+/// satisfy.
 pub fn is_resource_arn(value: &str) -> bool {
     if !(1..=RESOURCE_ARN_MAX).contains(&value.chars().count()) {
         return false;
@@ -257,35 +312,20 @@ pub fn is_resource_arn(value: &str) -> bool {
     let segment = |c: char| {
         c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '=' | ',' | '.' | '@' | '-')
     };
-    let mut fields = value.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(partition),
-        Some(ARN_NAMESPACE),
-        Some(region),
-        Some(account),
-        Some(resource),
-    ) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    )
-    else {
+    let Some(fields) = service_arn(value) else {
         return false;
     };
-    if partition.is_empty() || !partition.chars().all(field) {
+    if fields.partition.is_empty() || !fields.partition.chars().all(field) {
         return false;
     }
-    if !region.chars().all(field) {
+    if !fields.region.chars().all(field) {
         return false;
     }
-    if account.is_empty() || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+    if fields.account.is_empty() || !fields.account.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
-    resource
+    fields
+        .resource
         .split('/')
         .all(|part| !part.is_empty() && part.chars().all(segment))
 }
@@ -319,30 +359,16 @@ pub fn invalid_resource_arn(arn: &str) -> ValidationException {
 /// The partition and region fields are not constrained: they name where the
 /// resource lives, not what it is, and the modelled `ResourceARN` pattern
 /// already bounds their characters.
+///
+/// Whether the value is an ARN of this service's namespace at all is
+/// [`service_arn`]'s decision; the extra conditions here are the account and the
+/// form of the resource portion.
 pub fn parse_resource_arn(arn: &str) -> Option<CatalogResource> {
-    let mut fields = arn.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(_partition),
-        Some(ARN_NAMESPACE),
-        Some(_region),
-        Some(account),
-        Some(resource),
-    ) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    )
-    else {
-        return None;
-    };
-    if account != ::engine::emulator_account_id() {
+    let fields = service_arn(arn)?;
+    if fields.account != ::engine::emulator_account_id() {
         return None;
     }
-    let mut segments = resource.split('/');
+    let mut segments = fields.resource.split('/');
     let (Some(AWS_MARKETPLACE_CATALOG), Some(resource_type), Some(id), None) = (
         segments.next(),
         segments.next(),
