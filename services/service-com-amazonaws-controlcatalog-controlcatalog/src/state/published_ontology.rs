@@ -106,15 +106,19 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "Asset inventory reconciliation and audit",
                         "Reconcile the asset inventory against the assets discovered in the environment on a defined schedule, and audit the differences.",
                     ),
+                    // The record the library names by an identifier is the one served under
+                    // it: this identifier is the library's for "Unauthorized asset
+                    // management", so that record carries it and the ownership entry beside
+                    // it takes another of this objective's published identifiers.
+                    (
+                        "unauthorized-asset-management",
+                        "Unauthorized asset management",
+                        "Remove an unauthorized asset from the environment, quarantine it, or deny it connectivity to the network.",
+                    ),
                     (
                         "asset-ownership-assignment",
                         "Asset ownership assignment",
                         "Assign each inventoried asset an owner who is accountable for protecting it.",
-                    ),
-                    (
-                        "unauthorized-asset-detection",
-                        "Unauthorized asset detection",
-                        "Detect assets that are connected to the environment but absent from the inventory.",
                     ),
                     (
                         "asset-inventory-attributes",
@@ -136,7 +140,8 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
             // The catalog publishes classification as an OBJECTIVE of its own (its
             // published ARN is recorded in PUBLISHED_CATALOG_IDENTIFIERS below), met by
             // the common controls that classify an asset along each dimension the
-            // library classifies by.
+            // library classifies by, and the labelling that carries an asset's identity
+            // on the asset itself.
             (
                 "asset-classification",
                 "Asset classification",
@@ -158,14 +163,17 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "Record how critical each asset is to the services that depend on it.",
                     ),
                     (
-                        "asset-classification-scheme",
-                        "Asset classification scheme",
-                        "Maintain the scheme assets are classified against, and the handling each classification calls for.",
+                        "asset-classification-and-categorization",
+                        "Asset classification and categorization",
+                        "Classify and categorize each asset against the scheme the organization publishes, and apply the handling that classification calls for.",
                     ),
+                    // The record the library names by an identifier is the one served under
+                    // it: the library publishes asset labelling under this objective, and
+                    // this identifier is the one it names that record by.
                     (
-                        "asset-classification-review",
-                        "Asset classification review",
-                        "Review an asset's classification when the data it holds or the service it provides changes.",
+                        "asset-labeling",
+                        "Asset labeling",
+                        "Label assets with unique identifiers.",
                     ),
                 ],
             ),
@@ -268,11 +276,6 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "asset-transfer-authorization",
                         "Asset transfer authorization",
                         "Authorize and record the movement of an asset into, out of or between facilities.",
-                    ),
-                    (
-                        "asset-labeling",
-                        "Asset labeling",
-                        "Label assets so that their classification and ownership are visible to whoever handles them.",
                     ),
                 ],
             ),
@@ -919,15 +922,19 @@ pub(super) const PUBLISHED_ONTOLOGY: &[DomainSeed] = &[
                         "Change deployment and automation",
                         "Implement an automated change deployment pipeline that automates deployment of systems, software, and infrastructure as code (IaC) to production environments through a controlled and consistent process. Enforce automated security controls, perform validation checks, and provide a rollback mechanism in case of deployment failures.",
                     ),
+                    // The record the library names by an identifier is the one served under
+                    // it: this identifier is the library's for "Rollback and recovery
+                    // procedures", so that record carries it and the emergency-change record
+                    // takes the other published identifier of this objective's set.
+                    (
+                        "rollback-and-recovery-procedures",
+                        "Rollback and recovery procedures",
+                        "Establish procedures for rolling a failed change back, keep backups of what a change alters, and restore the affected systems and data from them.",
+                    ),
                     (
                         "emergency-change-review",
                         "Emergency change review",
                         "Review an emergency change after the fact, and record its approval.",
-                    ),
-                    (
-                        "change-rollback-planning",
-                        "Change rollback planning",
-                        "Plan how a change is reversed before it is applied.",
                     ),
                 ],
             ),
@@ -1361,12 +1368,16 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
     ),
     (
         COMMON_CONTROL,
-        "asset-ownership-assignment",
+        "unauthorized-asset-management",
         "c0qrxhefhmxkbq22tiejp3enn",
     ),
+    // The entries from here to the end of this objective's set are served under the
+    // identifiers the catalog publishes for it while their NAME and DESCRIPTION are this
+    // table's own voice, as the module header allows for an entry whose published wording
+    // this crate does not have: the identifier is what a client joins on.
     (
         COMMON_CONTROL,
-        "unauthorized-asset-detection",
+        "asset-ownership-assignment",
         "1tejgq26c0djpzgskw31uscm4",
     ),
     (
@@ -1390,14 +1401,10 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
     (COMMON_CONTROL, "asset-criticality", "dlukqke1ha1ean2txc1juehes"),
     (
         COMMON_CONTROL,
-        "asset-classification-scheme",
+        "asset-classification-and-categorization",
         "5m9jk2j28m8m4nr53u4c3br0h",
     ),
-    (
-        COMMON_CONTROL,
-        "asset-classification-review",
-        "gr180qll01cux9k41amnf002",
-    ),
+    (COMMON_CONTROL, "asset-labeling", "gr180qll01cux9k41amnf002"),
     // The common controls published under the `asset-lifecycle-management` objective.
     (
         COMMON_CONTROL,
@@ -1435,12 +1442,12 @@ const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str, &str)] = &[
     ),
     (
         COMMON_CONTROL,
-        "emergency-change-review",
+        "rollback-and-recovery-procedures",
         "2o50zyyv219ir9r7brjq0y37f",
     ),
     (
         COMMON_CONTROL,
-        "change-rollback-planning",
+        "emergency-change-review",
         "bgzs5hpn3gsbmtvdzi7vuu7nb",
     ),
     // Published under the `code-review-and-testing` objective, whose whole set this crate

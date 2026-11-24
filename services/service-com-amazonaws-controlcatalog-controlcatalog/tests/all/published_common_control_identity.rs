@@ -65,10 +65,12 @@ const ASSET_MANAGEMENT_ID: &str = "d4msesd9vvmzmmuvlv06m92uq";
 /// has the publication's wording for them — "Asset acquisition", "Asset deployment", "Asset
 /// retirement and disposition", "Asset performance management", "Asset
 /// maintenance scheduling", "Change request and approval", "Change deployment and
-/// automation", "Asset valuation", "Asset sensitivity", "Asset criticality", "Inventory of
-/// authorized assets and automated discovery" and "Asset inventory reconciliation and audit"
-/// — and otherwise the entry's subject written in the library's voice (as
-/// `src/state/published_ontology.rs`'s header records); for the latter the name assertion
+/// automation", "Rollback and recovery procedures", "Asset valuation", "Asset sensitivity",
+/// "Asset criticality", "Asset classification and categorization", "Asset labeling",
+/// "Inventory of authorized assets and automated discovery", "Asset inventory
+/// reconciliation and audit" and "Unauthorized asset management" — and otherwise the entry's
+/// subject written in the library's voice (as `src/state/published_ontology.rs`'s header
+/// records); for the latter the name assertion
 /// pins the catalog against its own table rather than against the publication, which is why
 /// the set, paging and filtered-versus-unfiltered assertions are what carry this suite.
 const PUBLISHED_OBJECTIVES: &[PublishedObjective] = &[
@@ -107,8 +109,11 @@ const PUBLISHED_OBJECTIVES: &[PublishedObjective] = &[
         common_controls: &[
             ("1nxqoydhsjdyboc4frsrrmev", "Change request and approval"),
             ("8xy67kb7kojr38ozqpmrm60d7", "Change deployment and automation"),
-            ("2o50zyyv219ir9r7brjq0y37f", "Emergency change review"),
-            ("bgzs5hpn3gsbmtvdzi7vuu7nb", "Change rollback planning"),
+            (
+                "2o50zyyv219ir9r7brjq0y37f",
+                "Rollback and recovery procedures",
+            ),
+            ("bgzs5hpn3gsbmtvdzi7vuu7nb", "Emergency change review"),
         ],
     },
     PublishedObjective {
@@ -120,8 +125,11 @@ const PUBLISHED_OBJECTIVES: &[PublishedObjective] = &[
             ("7encqm6cfsw704eoahh3ujr7y", "Asset valuation"),
             ("3t7xstyxx02pdwx9qas1h0quh", "Asset sensitivity"),
             ("dlukqke1ha1ean2txc1juehes", "Asset criticality"),
-            ("5m9jk2j28m8m4nr53u4c3br0h", "Asset classification scheme"),
-            ("gr180qll01cux9k41amnf002", "Asset classification review"),
+            (
+                "5m9jk2j28m8m4nr53u4c3br0h",
+                "Asset classification and categorization",
+            ),
+            ("gr180qll01cux9k41amnf002", "Asset labeling"),
         ],
     },
     PublishedObjective {
@@ -138,8 +146,8 @@ const PUBLISHED_OBJECTIVES: &[PublishedObjective] = &[
                 "d4s7ik8fgv8082v3x31hifzcc",
                 "Asset inventory reconciliation and audit",
             ),
-            ("c0qrxhefhmxkbq22tiejp3enn", "Asset ownership assignment"),
-            ("1tejgq26c0djpzgskw31uscm4", "Unauthorized asset detection"),
+            ("c0qrxhefhmxkbq22tiejp3enn", "Unauthorized asset management"),
+            ("1tejgq26c0djpzgskw31uscm4", "Asset ownership assignment"),
             ("5u2qgwuw3z1y0lrof60yf6264", "Asset inventory attributes"),
             (
                 "ec1fxlvgtcxlf2nzremqcca7r",
@@ -332,5 +340,121 @@ async fn a_published_common_control_arn_resolves_across_the_whole_library() {
             through_filter, entry,
             "case {case}: the filtered and the unfiltered listing must report one record"
         );
+    }
+}
+
+/// A common control's `Name` and `Description` are the catalog's PUBLISHED text for that
+/// ARN, served byte for byte: the catalog is a publication, so the seeded record holds
+/// the published string and the handler and serializer pass it through — neither clipped
+/// to its first sentence, nor re-worded, nor composed from the entry's name — identically
+/// through the unfiltered listing and through its objective's filter, at every page size.
+///
+/// The rows are the common-control rows of `published_catalog_identity`'s
+/// `PUBLISHED_ENTRIES`, the one table of published catalog text this test target holds
+/// (which is where the published wording is checked for the domain and objective kinds);
+/// what this test adds for them is the objective-filter cross-check a client that walks
+/// the taxonomy depends on.
+#[tokio::test]
+async fn a_recorded_common_control_is_served_with_the_published_text_for_its_arn() {
+    let emulator = Emulator::new();
+    let recorded: Vec<_> = crate::published_catalog_identity::PUBLISHED_ENTRIES
+        .iter()
+        .filter(|row| row.kind == COMMON_CONTROL)
+        .collect();
+    assert!(
+        !recorded.is_empty(),
+        "case table: the published catalog text table must record common controls"
+    );
+
+    // The per-objective sets above carry the identifier SET each objective publishes and
+    // name its entries; the published text lives in the one table. Every recorded record
+    // belongs to one of those sets and the two must name it identically, so the tables
+    // cannot drift apart unnoticed.
+    for row in &recorded {
+        let case = format!("common control {}", row.identifier);
+        let in_a_set = PUBLISHED_OBJECTIVES
+            .iter()
+            .flat_map(|objective| objective.common_controls.iter())
+            .find(|(identifier, _)| *identifier == row.identifier);
+        let (_, name) = in_a_set.unwrap_or_else(|| {
+            panic!(
+                "case {case}: a recorded common control belongs to one of the objectives' \
+                 published sets"
+            )
+        });
+        assert_eq!(
+            *name, row.name,
+            "case {case}: the objective's set and the published text table must name one \
+             record, got {name:?} and {:?}",
+            row.name
+        );
+    }
+
+    for page_size in PAGE_SIZES {
+        let whole = drain(
+            &emulator,
+            "/common-controls",
+            "CommonControls",
+            page_size,
+            "{}",
+        )
+        .await;
+
+        for row in &recorded {
+            let arn = catalog_kind_arn(COMMON_CONTROL, row.identifier);
+            let case = format!("common control {} maxResults={page_size:?}", row.identifier);
+            let entry = whole
+                .iter()
+                .find(|item| at_path(item, &["Arn"]) == Some(arn.as_str()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: the library must publish {arn}, got {:?}",
+                        arns(&whole)
+                    )
+                });
+
+            assert_eq!(
+                at_path(entry, &["Name"]),
+                Some(row.name),
+                "case {case}: expected the published name {:?}, got {:?}",
+                row.name,
+                entry["Name"]
+            );
+            match row.description {
+                Some(published) => assert_eq!(
+                    at_path(entry, &["Description"]),
+                    Some(published),
+                    "case {case}: expected the published description {published:?}, got {:?}",
+                    entry["Description"]
+                ),
+                None => assert!(
+                    at_path(entry, &["Description"]).is_some_and(|text| !text.is_empty()),
+                    "case {case}: a published common control carries its description, \
+                     got {:?}",
+                    entry["Description"]
+                ),
+            }
+
+            // The same text, read the way a client that walks the taxonomy reads it: the
+            // objective filter must report the one record, member for member.
+            let objective_arn = at_path(entry, &["Objective", "Arn"])
+                .unwrap_or_else(|| panic!("case {case}: the entry reports its objective"))
+                .to_string();
+            let filtered = common_controls_of(&emulator, &objective_arn, page_size).await;
+            let through_filter = filtered
+                .iter()
+                .find(|item| at_path(item, &["Arn"]) == Some(arn.as_str()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: the objective {objective_arn} it reports must serve it, \
+                         got {:?}",
+                        arns(&filtered)
+                    )
+                });
+            assert_eq!(
+                through_filter, entry,
+                "case {case}: the filtered and the unfiltered listing must report one record"
+            );
+        }
     }
 }

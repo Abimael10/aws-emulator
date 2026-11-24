@@ -12,10 +12,11 @@
 //! with the catalog's own publication instants, not under an identifier or a date of the
 //! emulator's making. Four consequences each have a test below:
 //!
-//! 1. A domain or an objective whose published identifier the catalog records is served
-//!    under `arn:{PARTITION}:controlcatalog:::{KIND}/{IDENTIFIER}`, with its published
-//!    name, and an objective reports the published ARN and name of the domain it belongs
-//!    to (`ObjectiveSummary.Domain` is the "domain that the objective belongs to").
+//! 1. A domain, an objective or a common control whose published identifier the catalog
+//!    records is served under `arn:{PARTITION}:controlcatalog:::{KIND}/{IDENTIFIER}`, with
+//!    its published name, and an objective or common control reports the published ARN and
+//!    name of the domain it belongs to (`ObjectiveSummary.Domain` is the "domain that the
+//!    objective belongs to").
 //! 2. The same entry is enumerated with the catalog's published WORDING, and the whole
 //!    recorded set is enumerated whatever page size the caller walks the listing with:
 //!    `MaxResults`/`NextToken` page the publication, they do not select which of it is
@@ -53,20 +54,25 @@ use crate::control_catalog::{at_path, catalog_arn, catalog_kind_arn, drain, Emul
 /// One entry of the library whose published identity the catalog records.
 ///
 /// Source: the Control Catalog's own published ontology — the ARN
-/// `arn:{PARTITION}:controlcatalog:::domain/{identifier}` or
-/// `arn:{PARTITION}:controlcatalog:::objective/{identifier}` it names the entry by, and
-/// the name it publishes for it. `domain` is the name of the domain an objective belongs
-/// to, and `None` for a domain itself. `description` is the paragraph the catalog
-/// publishes for the entry, as a recorded response of the taxonomy listings quotes it,
-/// and `None` for an entry whose recorded quote is absent — so no paragraph is written
-/// here that the publication's own wording does not carry; such an entry still has to be
-/// served with a description, which the test below checks separately.
-struct PublishedEntry {
-    kind: &'static str,
-    identifier: &'static str,
-    name: &'static str,
-    domain: Option<&'static str>,
-    description: Option<&'static str>,
+/// `arn:{PARTITION}:controlcatalog:::domain/{identifier}`,
+/// `arn:{PARTITION}:controlcatalog:::objective/{identifier}`,
+/// `arn:{PARTITION}:controlcatalog:::common-control/{identifier}` or
+/// `arn:{PARTITION}:controlcatalog:::control/{identifier}` it names the entry by, and the
+/// name it publishes for it. `domain` is the name of the domain an objective or a common
+/// control belongs to, and `None` for a domain or a control itself. `description` is the
+/// paragraph the catalog publishes for the entry, as a recorded response of the listings
+/// quotes it, and `None` for an entry whose recorded quote is clipped or absent — so no
+/// paragraph is written here that the publication's own wording does not carry; such an
+/// entry still has to be served with a description, which the test below checks separately.
+///
+/// `pub(crate)`: the ONE table of published catalog text this test target holds, read by
+/// the sibling common-control suite too rather than copied beside it.
+pub(crate) struct PublishedEntry {
+    pub(crate) kind: &'static str,
+    pub(crate) identifier: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) domain: Option<&'static str>,
+    pub(crate) description: Option<&'static str>,
 }
 
 /// The `domain` kind, as a catalog ARN spells it.
@@ -74,17 +80,25 @@ const DOMAIN: &str = "domain";
 /// The `objective` kind, as a catalog ARN spells it.
 const OBJECTIVE: &str = "objective";
 /// The `common-control` kind, as a catalog ARN spells it.
-const COMMON_CONTROL: &str = "common-control";
+pub(crate) const COMMON_CONTROL: &str = "common-control";
 /// The `control` kind, as a catalog ARN spells it.
 const CONTROL: &str = "control";
 
 /// The name of the domain the published objectives below belong to.
 const ASSET_MANAGEMENT: &str = "Asset management";
+/// The name of the domain the change-management common controls below belong to.
+const SECURE_DEVELOPMENT_LIFECYCLE: &str = "Secure development lifecycle and change management";
 
-/// Library entries whose published identity the catalog records, spanning both kinds the
-/// two taxonomy listings serve and, within the objectives, one whose parent domain is
-/// itself recorded here and one published under a different domain.
-const PUBLISHED_ENTRIES: &[PublishedEntry] = &[
+/// Library entries whose published identity the catalog records, spanning all three kinds
+/// the library listings serve and, within the objectives and common controls, entries under
+/// a parent domain that is itself recorded here as well as entries published under a
+/// different domain. The common-control rows additionally span four objectives, published
+/// descriptions of one, two and three sentences, and records whose published paragraph is
+/// not recorded at all.
+///
+/// `pub(crate)`: read by the sibling common-control suite, which cross-checks the
+/// common-control rows through an objective filter as well.
+pub(crate) const PUBLISHED_ENTRIES: &[PublishedEntry] = &[
     PublishedEntry {
         kind: DOMAIN,
         identifier: "d4msesd9vvmzmmuvlv06m92uq",
@@ -193,8 +207,133 @@ const PUBLISHED_ENTRIES: &[PublishedEntry] = &[
         kind: OBJECTIVE,
         identifier: "14qj3s9axkdma059lhktc14dx",
         name: "Change management",
-        domain: Some("Secure development lifecycle and change management"),
+        domain: Some(SECURE_DEVELOPMENT_LIFECYCLE),
         description: None,
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "1nxqoydhsjdyboc4frsrrmev",
+        name: "Change request and approval",
+        domain: Some(SECURE_DEVELOPMENT_LIFECYCLE),
+        description: Some(
+            "Define, document, implement, and maintain a formal process for submitting \
+             and approving change requests. Change requests should outline the proposed \
+             changes, their impact, and any associated risks. The requests should then be \
+             reviewed and approved by the appropriate stakeholders, ensuring that changes \
+             are properly assessed, authorized, and tracked.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "8xy67kb7kojr38ozqpmrm60d7",
+        name: "Change deployment and automation",
+        domain: Some(SECURE_DEVELOPMENT_LIFECYCLE),
+        description: Some(
+            "Implement an automated change deployment pipeline that automates deployment \
+             of systems, software, and infrastructure as code (IaC) to production \
+             environments through a controlled and consistent process. Enforce automated \
+             security controls, perform validation checks, and provide a rollback \
+             mechanism in case of deployment failures.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "2o50zyyv219ir9r7brjq0y37f",
+        name: "Rollback and recovery procedures",
+        domain: Some(SECURE_DEVELOPMENT_LIFECYCLE),
+        description: None,
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "ez1ccu4xkxrmlekcvjqo3jk59",
+        name: "Asset performance management",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Monitor and optimize the performance and security of assets, including \
+             hardware and software.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "ez4hcdf2fpirhuyojurkval9w",
+        name: "Asset maintenance scheduling",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Schedule and track maintenance activities for assets, including preventive \
+             maintenance and repairs.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "7encqm6cfsw704eoahh3ujr7y",
+        name: "Asset valuation",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Assign a value to assets based on their cost, replacement value, or other \
+             relevant factors.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "5m9jk2j28m8m4nr53u4c3br0h",
+        name: "Asset classification and categorization",
+        domain: Some(ASSET_MANAGEMENT),
+        description: None,
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "gr180qll01cux9k41amnf002",
+        name: "Asset labeling",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some("Label assets with unique identifiers."),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "1ukpmkewk4i92tjmhsvewi4y7",
+        name: "Inventory of authorized assets and automated discovery",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Maintain an asset inventory of organization authorized and existing \
+             hardware, software, and media. Where possible, utilize automated tools to \
+             facilitate the discovery and ongoing tracking of such assets.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "c0qrxhefhmxkbq22tiejp3enn",
+        name: "Unauthorized asset management",
+        domain: Some(ASSET_MANAGEMENT),
+        description: None,
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "aaaq1vhzpslfrk1o4hvgk3ti4",
+        name: "Asset acquisition",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Assess potential security and compliance risks as part of the asset \
+             acquisition process.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "eboqkjlzo44e0ia5wba1770tw",
+        name: "Asset deployment",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Configure assets securely prior to deployment in the environment. Confirm \
+             the proper integration of new assets with existing systems.",
+        ),
+    },
+    PublishedEntry {
+        kind: COMMON_CONTROL,
+        identifier: "bme9uq29isv0jdrdy4yj2c702",
+        name: "Asset retirement and disposition",
+        domain: Some(ASSET_MANAGEMENT),
+        description: Some(
+            "Retire and dispose of assets, including media, that are no longer needed. \
+             Securely erase or destroy any sensitive data before asset disposal.",
+        ),
     },
 ];
 
@@ -260,14 +399,14 @@ async fn listed_by_arn(
         .collect()
 }
 
-/// Both taxonomy listings, each keyed by catalog kind and then by `Arn`, walked with
-/// `max_results` items per page.
+/// Every listing a recorded row names, each keyed by catalog kind and then by `Arn`, walked
+/// with `max_results` items per page.
 async fn taxonomy_listings(
     emulator: &Emulator,
     max_results: Option<u32>,
 ) -> BTreeMap<&'static str, BTreeMap<String, Value>> {
     let mut listings: BTreeMap<&str, BTreeMap<String, Value>> = BTreeMap::new();
-    for kind in [DOMAIN, OBJECTIVE] {
+    for kind in [DOMAIN, OBJECTIVE, COMMON_CONTROL] {
         let (path, items_key) = listing_for(kind);
         listings.insert(
             kind,
@@ -285,8 +424,9 @@ fn timestamp(case: &str, entry: &Value, member: &str) -> f64 {
         .unwrap_or_else(|| panic!("case {case}: {member} must be a timestamp, got {entry:?}"))
 }
 
-/// Every recorded published domain and objective is served under the catalog's own ARN,
-/// with its published name, and an objective reports its owning domain's published ARN.
+/// Every recorded published entry — domain, objective or common control — is served under
+/// the catalog's own ARN, with its published name, and an objective or a common control
+/// reports its owning domain's published ARN.
 #[tokio::test]
 async fn every_published_library_entry_is_served_under_its_published_arn() {
     let emulator = Emulator::new();
@@ -351,10 +491,10 @@ async fn every_published_library_entry_is_served_under_its_published_arn() {
 /// Every recorded published entry is enumerated by its listing, with the catalog's own
 /// name and published paragraph, at every page size the listing is walked with.
 ///
-/// The rows span both taxonomy kinds, objectives under two different domains and entries
-/// whose published paragraph this project records as well as entries it does not (which
-/// still have to be served with a description of some kind). The listing is walked both
-/// in its default page and one item per page: `control_catalog`'s
+/// The rows span every kind the library listings serve, objectives and common controls under
+/// two different domains, and entries whose published paragraph this project records as well
+/// as entries it does not (which still have to be served with a description of some kind).
+/// The listing is walked both in its default page and one item per page: `control_catalog`'s
 /// `every_list_operation_pages_its_whole_collection_exactly_once` already pins the item
 /// set and order across page sizes, so what is added here is that the published WORDING
 /// survives a resumed walk.
