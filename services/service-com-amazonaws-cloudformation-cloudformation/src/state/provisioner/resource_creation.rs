@@ -756,6 +756,15 @@ impl Provisioner {
             Self::BatchServiceEnvironment => {
                 create_service_environment(ctx, region, resource, propagated).await
             }
+            // Both SHARING-plane types are taggable and their creates take the tag set as a
+            // member of their own, so the tags CloudFormation gives the resource reach AWS
+            // Batch on the call that makes it.
+            Self::BatchSchedulingPolicy => {
+                create_batch_scheduling_policy(ctx, region, resource, propagated).await
+            }
+            Self::BatchQuotaShare => {
+                create_batch_quota_share(ctx, region, resource, propagated).await
+            }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
             Self::EksCluster => create_eks_cluster(ctx, region, resource, propagated).await,
             // An add-on and a node group are taggable types whose create takes the tag set

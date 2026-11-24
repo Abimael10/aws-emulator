@@ -280,6 +280,12 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         BATCH_JOB_QUEUE => "JobQueueArn",
         BATCH_JOB_DEFINITION => "JobDefinitionArn",
         BATCH_SERVICE_ENVIRONMENT => "ServiceEnvironmentArn",
+        // The same service's SHARING plane: a scheduling policy is identified by the ARN its
+        // create answered — the `arn` every call on a policy takes, and what a job queue names
+        // one by — and a quota share by the ARN that service composed under its queue, the one
+        // identifier every call on a share takes.
+        BATCH_SCHEDULING_POLICY => crate::state::provisioner::SCHEDULING_POLICY_ARN_ATTRIBUTE,
+        BATCH_QUOTA_SHARE => crate::state::provisioner::QUOTA_SHARE_ARN_ATTRIBUTE,
         ECS_TASK_DEFINITION => "TaskDefinitionArn",
         // The three Amazon EFS types, each identified by the identifier that service minted:
         // the `fs-` id every call naming a file system takes, the `fsap-` id of an access

@@ -2018,6 +2018,24 @@ pub const BATCH_JOB_DEFINITION: &str = "AWS::Batch::JobDefinition";
 /// An AWS Batch service environment's resource type. "Ref returns the service environment
 /// ARN"; `Fn::GetAtt`: `ServiceEnvironmentArn`.
 pub const BATCH_SERVICE_ENVIRONMENT: &str = "AWS::Batch::ServiceEnvironment";
+/// An AWS Batch SCHEDULING POLICY's resource type. "Ref returns the scheduling policy ARN";
+/// `Fn::GetAtt`: `Arn`.
+///
+/// That ARN is the identifier `CreateJobQueue$schedulingPolicyArn` takes ("the format is
+/// aws:Partition:batch:Region:Account:scheduling-policy/Name"), so it is the one value a
+/// queue of the same stack can be created against
+/// ([`crate::state::provisioner::batch_share_policies`] creates the policy).
+pub const BATCH_SCHEDULING_POLICY: &str = "AWS::Batch::SchedulingPolicy";
+/// An AWS Batch QUOTA SHARE's resource type. "Ref returns the quota share ARN";
+/// `Fn::GetAtt`: `QuotaShareArn`.
+///
+/// A share is created ON a job queue and AWS Batch composes its ARN under that queue's own
+/// (`…:job-queue/<queue>/quota-share/<share>`), which is the only identifier
+/// `DescribeQuotaShare`, `UpdateQuotaShare` and `DeleteQuotaShare` take — so the ARN is
+/// built around the queue the declaration points at, and the identity in force is the one
+/// that service answered ([`crate::state::provisioner::batch_share_policies`] creates the
+/// share).
+pub const BATCH_QUOTA_SHARE: &str = "AWS::Batch::QuotaShare";
 /// AWS Batch's ARN namespace, from its model's `awsService.arnNamespace`.
 pub(super) const BATCH_ARN_NAMESPACE: &str = "batch";
 

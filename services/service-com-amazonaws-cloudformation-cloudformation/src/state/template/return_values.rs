@@ -266,6 +266,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         BATCH_JOB_QUEUE => &["JobQueueArn"],
         BATCH_JOB_DEFINITION => &["JobDefinitionArn"],
         BATCH_SERVICE_ENVIRONMENT => &["ServiceEnvironmentArn"],
+        // The two SHARING-plane types: a scheduling policy publishes the ARN AWS Batch mints
+        // for it, and a quota share the ARN that service composes under the queue it is on.
+        BATCH_SCHEDULING_POLICY => &[crate::state::provisioner::SCHEDULING_POLICY_ARN_ATTRIBUTE],
+        BATCH_QUOTA_SHARE => &[crate::state::provisioner::QUOTA_SHARE_ARN_ATTRIBUTE],
         ECS_TASK_DEFINITION => &["TaskDefinitionArn"],
         ELB_LOAD_BALANCER => &[
             "CanonicalHostedZoneID",

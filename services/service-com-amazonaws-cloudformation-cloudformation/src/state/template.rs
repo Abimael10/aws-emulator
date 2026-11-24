@@ -3029,6 +3029,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,
+    // The two types of the same service's SHARING plane: the policy a queue is scheduled by
+    // and the quota share created on a queue, each publishing the ARN AWS Batch identifies it
+    // by.
+    BATCH_QUOTA_SHARE,
+    BATCH_SCHEDULING_POLICY,
     BATCH_SERVICE_ENVIRONMENT,
     // The two Billing and Cost Management Dashboards types, each publishing the ARN that
     // service mints for it and the instants of its clock.

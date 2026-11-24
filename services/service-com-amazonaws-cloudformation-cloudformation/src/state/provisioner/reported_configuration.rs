@@ -603,6 +603,14 @@ impl Provisioner {
                 )
                 .await
             }
+            // The two SHARING-plane types read back the same way: by the ARN that is the
+            // resource's physical id, through a reader whose answer is a LIST.
+            Self::BatchSchedulingPolicy => {
+                describe_batch_scheduling_policy(ctx, region, physical_resource_id).await
+            }
+            Self::BatchQuotaShare => {
+                describe_batch_quota_share(ctx, region, physical_resource_id).await
+            }
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
             Self::EksCluster => describe_eks_cluster(ctx, region, physical_resource_id).await,

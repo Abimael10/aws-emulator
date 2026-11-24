@@ -487,6 +487,7 @@ use super::template::{
     BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BCM_DASHBOARD,
+    BATCH_QUOTA_SHARE, BATCH_SCHEDULING_POLICY,
     BCM_SCHEDULED_REPORT, BEDROCK_DATA_SOURCE,
     BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
@@ -1238,6 +1239,20 @@ pub(super) enum Provisioner {
     BatchComputeEnvironment,
     BatchJobQueue,
     BatchServiceEnvironment,
+    /// `AWS::Batch::SchedulingPolicy`: the scheduling policy `CreateSchedulingPolicy` creates
+    /// under the name the template states and `DeleteSchedulingPolicy` removes, whose arms are
+    /// [`batch_share_policies`]'s.
+    ///
+    /// Its identity is the ARN that service answered — the identifier a job queue's
+    /// `schedulingPolicyArn` is created against, so a queue of the same stack cannot be
+    /// created at all until the policy beside it really exists.
+    BatchSchedulingPolicy,
+    /// `AWS::Batch::QuotaShare`: the quota share `CreateQuotaShare` creates ON a job queue and
+    /// `DeleteQuotaShare` removes, whose arms are [`batch_share_policies`]'s too.
+    ///
+    /// Its identity is the ARN AWS Batch composed under that queue, which is the only
+    /// identifier every call on a share takes.
+    BatchQuotaShare,
     /// `AWS::Batch::JobDefinition`: the job-definition REVISION `RegisterJobDefinition`
     /// registers and `DeregisterJobDefinition` takes out of `ACTIVE`, whose arms are
     /// [`batch_job_definitions`]'s.
@@ -1921,6 +1936,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
         BATCH_JOB_DEFINITION => Some(Provisioner::BatchJobDefinition),
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
+        BATCH_SCHEDULING_POLICY => Some(Provisioner::BatchSchedulingPolicy),
+        BATCH_QUOTA_SHARE => Some(Provisioner::BatchQuotaShare),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
         EKS_CLUSTER => Some(Provisioner::EksCluster),
         EKS_ADDON => Some(Provisioner::EksAddon),
@@ -2666,6 +2683,14 @@ impl Provisioner {
             Self::BatchServiceEnvironment => {
                 delete_batch_service_environment(ctx, region, physical_resource_id).await
             }
+            // The policy is addressed by its own ARN, and the share by the ARN AWS Batch
+            // composed under its queue — each this resource's physical id.
+            Self::BatchSchedulingPolicy => {
+                delete_batch_scheduling_policy(ctx, region, physical_resource_id).await
+            }
+            Self::BatchQuotaShare => {
+                delete_batch_quota_share(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
@@ -3257,6 +3282,11 @@ mod application_insights;
 /// identity is the revision-qualified ARN that service allocates, which makes its create,
 /// delete and read a concern of their own.
 mod batch_job_definitions;
+/// The AWS Batch SHARING-plane arms, beside the four type arms the same owning service has in
+/// [`network_and_delivery`] and [`batch_job_definitions`]: the scheduling policy a job queue is
+/// scheduled by and the quota share created ON a queue, each identified by the ARN that service
+/// answered rather than by a name.
+mod batch_share_policies;
 pub(super) mod elasticache_caches;
 /// The Amazon ElastiCache SERVERLESS cache arm: the cache an
 /// `AWS::ElastiCache::ServerlessCache` declares, created in the service that owns it so every
@@ -3382,6 +3412,7 @@ use application_insights::*;
 use auto_scaling_policies::*;
 use auto_scaling_group_children::*;
 use batch_job_definitions::*;
+pub(crate) use batch_share_policies::*;
 use compute_fleet::*;
 pub(crate) use network_and_delivery::*;
 use ec2_in_place::{

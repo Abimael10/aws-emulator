@@ -1283,6 +1283,52 @@ pub(crate) fn return_values(
             attributes.insert("ServiceEnvironmentArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // "Ref returns the scheduling policy ARN"; Fn::GetAtt: Arn. The same shape again, on
+        // the ARN AWS Batch mints for a policy from the Region and the name
+        // (`scheduling_policy_arn` in its own state module) — which is the identifier a job
+        // queue's `schedulingPolicyArn` is created against, so a queue of the same stack
+        // resolves `!Ref` of the policy beside it.
+        BATCH_SCHEDULING_POLICY => {
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!("scheduling-policy/{name}"),
+            );
+            attributes.insert(
+                crate::state::provisioner::SCHEDULING_POLICY_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
+        // "Ref returns the quota share ARN"; Fn::GetAtt: QuotaShareArn.
+        //
+        // A quota share is identified UNDER the job queue it allocates capacity in: AWS
+        // Batch composes its ARN as `job-queue/<queue>/quota-share/<share>` (`quota_share_arn`
+        // in its own state module), the only identifier `DescribeQuotaShare` takes. So the
+        // ARN is built around the queue the declaration points at — the `JobQueue` property,
+        // evaluated through the template's intrinsics like every other declared value, whose
+        // `Ref` is that queue's own ARN — and the identity really in force is the one that
+        // service answered ([`crate::state::provisioner::batch_share_policies`] creates the
+        // share and reports it).
+        BATCH_QUOTA_SHARE => {
+            let queue = properties
+                .get("JobQueue")
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            let arn = ::emulator_server::emulator_arn(
+                BATCH_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "job-queue/{}/quota-share/{name}",
+                    crate::state::provisioner::batch_resource_name(&queue)
+                ),
+            );
+            attributes.insert(
+                crate::state::provisioner::QUOTA_SHARE_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
         // "Ref returns the Amazon Resource Name (ARN) of the task definition";
         // Fn::GetAtt: TaskDefinitionArn.
         //

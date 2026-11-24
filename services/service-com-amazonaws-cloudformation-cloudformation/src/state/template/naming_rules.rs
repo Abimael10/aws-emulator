@@ -277,9 +277,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // "can be up to 128 characters long. It can contain uppercase and lowercase letters,
         // numbers, hyphens (-), and underscores (_)" (those members' own docs) — Batch's model
         // types them all as plain strings.
+        // The same service's `CreateSchedulingPolicy.name` ("up to 128 letters long … It can
+        // contain uppercase and lowercase letters, numbers, hyphens (-), and underscores (_)")
+        // and `CreateQuotaShare.quotaShareName` ("up to 128 characters long", the same charset)
+        // are the same rule, so the sharing plane's two types share the arm.
         BATCH_COMPUTE_ENVIRONMENT
         | BATCH_JOB_QUEUE
         | BATCH_JOB_DEFINITION
+        | BATCH_QUOTA_SHARE
+        | BATCH_SCHEDULING_POLICY
         | BATCH_SERVICE_ENVIRONMENT => rules(128, Characters::AsGenerated),
         // Elastic Load Balancing `CreateLoadBalancer.Name` and
         // `CreateTargetGroup.Name`: each "can have a maximum of 32 characters" (Elastic
