@@ -45,3 +45,23 @@ Model citation: smithy_query query=operation operation=DescribeAlarmContributors
 2. Replay the simparity-wire-aws-v1 wire corpus (replay_wire_corpus).
 3. Cause 1: fixture cloudwatch-metric-alarm-history-and-contributors, step task#5 — DescribeAlarmContributors for the alarm created earlier in that fixture must answer HTTP 200 with body {"AlarmContributors": []} (required member present and empty, no NextToken), not HTTP 400 with the member absent.
 4. Re-replay cloudwatch-metric-alarm-history-and-contributors#task#5 after the fix; it must pass. Note that task#4 of the same fixture asserts the OPPOSITE direction for a plain metric alarm (400 ValidationException) and is tracked by 20261108T134822Z-monitoring-cloudwatch-read-and-write-fidelity-describealarmcontributors-skips-its.md — both steps must pass together, so gate on the alarm's type rather than on whether the contributor list is empty.
+
+## Disposition
+
+Cause 1 — FIXED, and now pinned by a test. The checkout drifted since the report was written:
+`DescribeAlarmContributors` gates on the ALARM's TYPE (whether its configuration grades a vector
+of series) and not on whether the contributor projection is empty
+(`src/ops/describe_alarm_contributors.rs`), so an alarm that has contributors to report but none
+in `ALARM` right now is answered HTTP 200 with the required `AlarmContributors` member present and
+empty and no `NextToken`, while the two modelled refusals stay where the model puts them
+(`InvalidNextToken` 400, `ResourceNotFoundException` 404) and the alarm-type refusal stays on the
+plain-alarm path of the related issue. Both replay keys of this cluster pass, and every step of
+the fixture — task#4's refusal and task#5's empty page together — replays green.
+
+`tests/all/empty_contributor_page.rs` is the new suite that holds it: a table over the form the
+query is stated in and over WHY nothing is in `ALARM` (as configured, each of the other states a
+caller can force, after leaving `ALARM`, and with every resolved entry graded under the
+threshold, which is the case where the store holds contributors and none is in `ALARM`), each row
+asserting the 200, the present and empty required member, the absent token, and that the read
+moves neither the page nor the alarm; plus one alarm read over each protocol the model declares
+(`awsJson1_0`, `awsQuery`, `rpcv2Cbor`), since "present and empty" is a claim about the wire.
