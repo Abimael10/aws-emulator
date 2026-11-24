@@ -37,15 +37,15 @@ const REGION: &str = "us-west-2";
 /// The bucket the queried data lives in, and the one the results are written to: Clean
 /// Rooms refuses a result location in the bucket holding the data it reads, so they are
 /// two buckets here as well.
-const DATA_BUCKET: &str = "cleanrooms-run-data";
-const RESULTS_BUCKET: &str = "cleanrooms-run-results";
+pub(crate) const DATA_BUCKET: &str = "cleanrooms-run-data";
+pub(crate) const RESULTS_BUCKET: &str = "cleanrooms-run-results";
 
 /// The Data Catalog database the two queried tables live in.
-const DATABASE: &str = "cleanrooms_run_db";
+pub(crate) const DATABASE: &str = "cleanrooms_run_db";
 
 /// The prefix the membership's default result configuration names, which the effective
 /// prefix is the collaboration partition of.
-const RESULT_PREFIX: &str = "results/";
+pub(crate) const RESULT_PREFIX: &str = "results/";
 
 /// The role a result configuration and an association name. Nothing here reads it: the
 /// members are modelled as ARNs and echoed.
@@ -62,16 +62,16 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// Generous rather than tight: the completion is due a span after the start call, so this
 /// deadline is only the point at which the run is declared never to have happened — a
 /// loaded host must not be the thing that trips it.
-const PATIENCE: Duration = Duration::from_secs(120);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(120);
 
 /// How often that poll asks again.
-const POLL: Duration = Duration::from_millis(25);
+pub(crate) const POLL: Duration = Duration::from_millis(25);
 
 /// The `ProtectedQueryStatus` values a query is still being processed in.
-const PENDING_STATUSES: [&str; 3] = ["SUBMITTED", "STARTED", "CANCELLING"];
+pub(crate) const PENDING_STATUSES: [&str; 3] = ["SUBMITTED", "STARTED", "CANCELLING"];
 
 /// Clean Rooms, Glue and Amazon S3 over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -101,7 +101,12 @@ fn authorization(service: &str) -> String {
 
 /// One raw request to the emulator's Amazon S3 front door: path-style, so the bucket and
 /// the key live in the URI and the body is the payload.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -116,7 +121,12 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
 }
 
 /// One Glue call (`awsJson1_1` under the target prefix `AWSGlue`), requiring a 200.
-async fn glue(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn glue(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -167,7 +177,7 @@ async fn cleanrooms_try(
 }
 
 /// The same call, requiring a 200.
-async fn cleanrooms(
+pub(crate) async fn cleanrooms(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -183,7 +193,13 @@ async fn cleanrooms(
 }
 
 /// Create a bucket and put `body` at `key` in it.
-async fn given_object(router: &MultiServiceRouter, case: &str, bucket: &str, key: &str, body: &str) {
+pub(crate) async fn given_object(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    key: &str,
+    body: &str,
+) {
     let (status, answered) = s3(router, "PUT", &format!("/{bucket}/{key}"), body.as_bytes()).await;
     assert_eq!(
         status,
@@ -194,7 +210,7 @@ async fn given_object(router: &MultiServiceRouter, case: &str, bucket: &str, key
 }
 
 /// Create `bucket`.
-async fn given_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
     let configuration = format!(
         "<CreateBucketConfiguration xmlns=\"{S3_XMLNS}\">\
          <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
@@ -216,7 +232,7 @@ async fn given_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
 
 /// Register one Data Catalog table over the objects under `s3://DATA_BUCKET/<folder>/`,
 /// declaring `columns` as `(name, Hive type)` pairs, comma-separated with one header line.
-async fn given_table(
+pub(crate) async fn given_table(
     router: &MultiServiceRouter,
     case: &str,
     table: &str,
@@ -258,18 +274,18 @@ async fn given_table(
 /// What one relation of the collaboration is made of: the catalog table behind it, the
 /// alias a statement names it by, the columns the configured table allows, and the ones
 /// its `list` analysis rule lets a query join on and list.
-struct Exposed<'names> {
-    table: &'names str,
-    alias: &'names str,
-    allowed_columns: &'names [&'names str],
-    join_columns: &'names [&'names str],
-    list_columns: &'names [&'names str],
+pub(crate) struct Exposed<'names> {
+    pub(crate) table: &'names str,
+    pub(crate) alias: &'names str,
+    pub(crate) allowed_columns: &'names [&'names str],
+    pub(crate) join_columns: &'names [&'names str],
+    pub(crate) list_columns: &'names [&'names str],
 }
 
 /// Configure `exposed.table` for the collaboration, give it a `list` analysis rule over
 /// its join and list columns, and associate it under its alias: the membership's own
 /// association is what a statement names.
-async fn given_association(
+pub(crate) async fn given_association(
     router: &MultiServiceRouter,
     case: &str,
     membership_id: &str,
@@ -329,7 +345,7 @@ async fn given_association(
 /// A collaboration this account can query in, joined with a membership whose default
 /// result configuration writes CSV under [`RESULT_PREFIX`]: `(membership id,
 /// collaboration id)`.
-async fn given_membership(router: &MultiServiceRouter, case: &str) -> (String, String) {
+pub(crate) async fn given_membership(router: &MultiServiceRouter, case: &str) -> (String, String) {
     let collaboration = cleanrooms(
         router,
         case,
@@ -376,18 +392,41 @@ async fn given_membership(router: &MultiServiceRouter, case: &str) -> (String, S
     (membership_id, collaboration_id)
 }
 
-/// Submit `sql` and answer the protected query once it is terminal. Waits for the
-/// CONDITION, never for a fixed time.
-async fn ran(router: &MultiServiceRouter, case: &str, membership_id: &str, sql: &str) -> Value {
+/// Submit `sql` under the membership's own default result configuration and answer the
+/// protected query once it is terminal.
+pub(crate) async fn ran(
+    router: &MultiServiceRouter,
+    case: &str,
+    membership_id: &str,
+    sql: &str,
+) -> Value {
+    ran_with(router, case, membership_id, sql, None).await
+}
+
+/// Submit `sql` with `result_configuration` as the call's own
+/// `StartProtectedQueryInput$resultConfiguration` (`None` leaves the membership's default
+/// in effect) and answer the protected query once it is terminal. Waits for the CONDITION,
+/// never for a fixed time.
+pub(crate) async fn ran_with(
+    router: &MultiServiceRouter,
+    case: &str,
+    membership_id: &str,
+    sql: &str,
+    result_configuration: Option<&Value>,
+) -> Value {
+    let mut body = json!({
+        "type": "SQL",
+        "sqlParameters": { "queryString": sql },
+    });
+    if let Some(configuration) = result_configuration {
+        body["resultConfiguration"] = configuration.clone();
+    }
     let started = cleanrooms(
         router,
         case,
         "POST",
         &format!("/memberships/{membership_id}/protectedQueries"),
-        Some(&json!({
-            "type": "SQL",
-            "sqlParameters": { "queryString": sql },
-        })),
+        Some(&body),
     )
     .await;
     let query_id = started["protectedQuery"]["id"]
@@ -417,13 +456,18 @@ async fn ran(router: &MultiServiceRouter, case: &str, membership_id: &str, sql: 
     }
 }
 
-/// Every key the results bucket holds under `prefix`, read through `ListObjectsV2`.
-async fn listed_keys(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+/// Every key `bucket` holds under `prefix`, read through `ListObjectsV2`.
+pub(crate) async fn listed_keys(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Vec<String> {
     let encoded = prefix.replace('=', "%3D");
     let (status, body) = s3(
         router,
         "GET",
-        &format!("/{RESULTS_BUCKET}?list-type=2&prefix={encoded}"),
+        &format!("/{bucket}?list-type=2&prefix={encoded}"),
         &[],
     )
     .await;
@@ -440,15 +484,31 @@ async fn listed_keys(router: &MultiServiceRouter, case: &str, prefix: &str) -> V
         .collect()
 }
 
-/// The bytes the results bucket holds at `key`.
-async fn object_body(router: &MultiServiceRouter, case: &str, key: &str) -> String {
-    let (status, body) = s3(router, "GET", &format!("/{RESULTS_BUCKET}/{key}"), &[]).await;
-    let text = String::from_utf8_lossy(&body).to_string();
+/// The bytes `bucket` holds at `key`.
+pub(crate) async fn object_bytes(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    key: &str,
+) -> Vec<u8> {
+    let (status, body) = s3(router, "GET", &format!("/{bucket}/{key}"), &[]).await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: the result object {key:?} must be served, got {status} with {text}"
+        status,
+        200,
+        "case {case:?}: the result object {key:?} must be served, got {status} with {}",
+        String::from_utf8_lossy(&body)
     );
-    text
+    body
+}
+
+/// Those bytes as text.
+pub(crate) async fn object_body(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    key: &str,
+) -> String {
+    String::from_utf8_lossy(&object_bytes(router, case, bucket, key).await).to_string()
 }
 
 /// The whole round trip: the data is staged in the object store, the catalog tables over
@@ -573,13 +633,13 @@ async fn a_protected_query_runs_over_its_configured_tables_and_writes_the_rows_i
 
     // BACKED: the object store itself serves an object at that address, and its bytes are
     // the rows the data really holds, joined as the statement asked.
-    let keys = listed_keys(&router, case, &folder).await;
+    let keys = listed_keys(&router, case, RESULTS_BUCKET, &folder).await;
     assert_eq!(
         keys.len(),
         1,
         "case {case:?}: the run wrote one result object under {folder:?}, got {keys:?}"
     );
-    let body = object_body(&router, case, &keys[0]).await;
+    let body = object_body(&router, case, RESULTS_BUCKET, &keys[0]).await;
     let mut lines: Vec<&str> = body.lines().collect();
     let header = lines.first().copied().unwrap_or_default().to_string();
     lines.remove(0);
