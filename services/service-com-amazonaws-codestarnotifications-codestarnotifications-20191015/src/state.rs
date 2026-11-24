@@ -559,21 +559,31 @@ pub fn no_rule_with_identifier(identifier: &str) -> String {
     format!("A notification rule with the Id {identifier} was not found.")
 }
 
-/// Mint a `NotificationRuleId`: a randomly drawn version-4 UUID in its canonical
-/// hyphenated, lowercase form — 36 characters, inside the modelled 1..40 — which is the
-/// form a notification rule's id is reported in, both on its own and as the resource
-/// segment of the rule's ARN ([`notification_rule_arn`]).
+/// How long a minted `NotificationRuleId` is: forty lowercase hexadecimal characters,
+/// which is the whole width the member allows
+/// (`smithy_query(query="shape",shape="NotificationRuleId")`: `@length` min 1 max 40,
+/// with no pattern — the characters themselves are the service's choice, not the model's).
+pub const RULE_ID_LENGTH: usize = 40;
+
+/// Mint a `NotificationRuleId`: [`RULE_ID_LENGTH`] lowercase hexadecimal characters, which
+/// is the form a notification rule's identifier is reported in, both on its own and as
+/// the resource segment of the rule's ARN ([`notification_rule_arn`]).
 ///
-/// Drawn by `uuid`, so every one of the 122 random bits is random: the id is unique
-/// however two rules were created, and it is not a function of anything this service
-/// knows (not the creation order, not the clock, not the request), so no two ids of one
-/// account are related and nothing about a rule can be inferred from the one it got.
+/// The characters are the hex rendering of `RULE_ID_LENGTH / 2` freshly drawn random
+/// bytes, so every bit of the id is random: the id is unique however two rules were
+/// created, and it is not a function of anything this service knows (not the creation
+/// order, not the clock, not the request), so no two ids of one account are related and
+/// nothing about a rule can be inferred from the one it got.
 ///
 /// The id is OPAQUE: nothing may be parsed back out of it, and no handler may derive
 /// anything from one — it is only ever compared for equality or used as the ARN's
 /// resource segment.
 pub fn new_rule_id() -> String {
-    ::uuid::Uuid::new_v4().as_hyphenated().to_string()
+    use ::rand::RngCore;
+
+    let mut bytes = [0u8; RULE_ID_LENGTH / 2];
+    ::rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 /// A stable fingerprint of the parameters a request carried, used to tell a genuine

@@ -3,8 +3,9 @@
 //! The identity a notification rule is reported under, over the wire.
 //!
 //! ONE rule, asserted over a TABLE of inputs rather than one recorded request: the
-//! identifier this service mints for a rule is a canonical, hyphenated version-4 UUID
-//! (inside `NotificationRuleId`'s modelled `@length` 1..40), it is unique per rule, it is
+//! identifier this service mints for a rule is forty lowercase hexadecimal characters
+//! (the whole width `NotificationRuleId`'s modelled `@length` 1..40 allows), it is unique
+//! per rule, it is
 //! byte-for-byte the resource segment of that rule's `Arn`, and every path that names the
 //! rule reports that same pair — the create's `Arn`, and `NotificationRuleSummary.Id`
 //! beside its `Arn` in every listing, unfiltered, filtered on any of
@@ -29,9 +30,13 @@ use serde_json::{json, Value};
 
 use crate::notification_rule_lifecycle::{string, Emulator};
 
+/// How wide an identifier this service mints is: the whole of `NotificationRuleId`'s
+/// modelled length, in lowercase hexadecimal characters.
+pub(crate) const RULE_ID_LENGTH: usize = 40;
+
 /// `NotificationRuleId`'s modelled bounds
 /// (`smithy_query(query="shape",shape="NotificationRuleId")`: `@length min 1 max 40`).
-const ID_LENGTH_BOUNDS: std::ops::RangeInclusive<usize> = 1..=40;
+const ID_LENGTH_BOUNDS: std::ops::RangeInclusive<usize> = 1..=RULE_ID_LENGTH;
 
 /// The filter names a listing may be narrowed by — `ListNotificationRulesFilterName`'s
 /// own values
@@ -67,8 +72,8 @@ pub(crate) fn id_of_arn<'a>(case: &str, arn: &'a str) -> &'a str {
         })
 }
 
-/// A minted rule id is a version-4 UUID in its canonical hyphenated lowercase form, and
-/// fits the member's modelled length.
+/// A minted rule id is [`RULE_ID_LENGTH`] lowercase hexadecimal characters, and so fits
+/// the member's modelled length.
 ///
 /// `pub(crate)` for the same reason as [`id_of_arn`]: one statement of the id form, read
 /// by every suite that asserts it.
@@ -78,22 +83,15 @@ pub(crate) fn assert_canonical_rule_id(case: &str, id: &str) {
         "case {case:?}: NotificationRuleId is length 1..40, got {} for {id:?}",
         id.len()
     );
-    let parsed = uuid::Uuid::parse_str(id)
-        .unwrap_or_else(|error| panic!("case {case:?}: {id:?} is not a UUID: {error}"));
     assert_eq!(
-        parsed.as_hyphenated().to_string(),
-        id,
-        "case {case:?}: the id must be the canonical hyphenated lowercase rendering, got {id:?}"
+        id.len(),
+        RULE_ID_LENGTH,
+        "case {case:?}: a rule id is {RULE_ID_LENGTH} characters, got {} for {id:?}",
+        id.len()
     );
-    assert_eq!(
-        parsed.get_version_num(),
-        4,
-        "case {case:?}: a rule id is a version-4 UUID, got {id:?}"
-    );
-    assert_eq!(
-        parsed.get_variant(),
-        uuid::Variant::RFC4122,
-        "case {case:?}: a rule id carries the RFC-4122 variant, got {id:?}"
+    assert!(
+        id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "case {case:?}: a rule id is lowercase hexadecimal, got {id:?}"
     );
 }
 
@@ -260,10 +258,10 @@ async fn list_pairs(
     pairs
 }
 
-/// The id of every rule is a canonical version-4 UUID and no two rules share one,
-/// whatever the rule was created with.
+/// The id of every rule is forty lowercase hexadecimal characters and no two rules share
+/// one, whatever the rule was created with.
 #[tokio::test]
-async fn a_minted_rule_id_is_a_canonical_version_4_uuid_unique_per_rule() {
+async fn a_minted_rule_id_is_forty_lowercase_hex_characters_unique_per_rule() {
     let emulator = Emulator::new();
     let seeded = seed(&emulator, "id-form").await;
 
@@ -950,7 +948,8 @@ fn generate_narrowing(
 }
 
 /// RULE (as an invariant, over generated input): the identity a listing reports for a
-/// rule is that rule's OWN drawn identifier — a canonical version-4 UUID, byte-for-byte
+/// rule is that rule's OWN drawn identifier — forty lowercase hexadecimal characters,
+/// byte-for-byte
 /// the resource segment of that entry's `Arn`, issued to one rule of one store and to no
 /// other — whatever the store holds and however the listing is narrowed, and reading the
 /// same listing again reports it unchanged.
@@ -1069,4 +1068,248 @@ async fn a_generated_population_reports_each_rules_own_identity_under_any_narrow
             );
         }
     }
+}
+
+/// One rule of the id-FORM table: the rows differ along what the form generalises over —
+/// the region the request is signed for, the type of resource the rule watches, the detail
+/// type, how many event types and targets it carries and whether it is tagged — so the
+/// form is asserted over a SET of rules rather than one request.
+struct FormCase {
+    label: &'static str,
+    region: &'static str,
+    resource: &'static str,
+    detail_type: &'static str,
+    /// Event type ids out of the catalog `ListEventTypes` publishes
+    /// (`crate::state::EVENT_TYPE_CATALOG`).
+    event_type_ids: &'static [&'static str],
+    targets: &'static [(&'static str, &'static str)],
+    tags: &'static [(&'static str, &'static str)],
+}
+
+const FORM_CASES: &[FormCase] = &[
+    FormCase {
+        label: "codecommit repository, one SNS target, us-east-1",
+        region: "us-east-1",
+        resource: "arn:aws:codecommit:us-east-1:123456789012:FormRepo",
+        detail_type: "BASIC",
+        event_type_ids: &["codecommit-repository-pull-request-created"],
+        targets: &[("SNS", "arn:aws:sns:us-east-1:123456789012:form-topic")],
+        tags: &[],
+    },
+    FormCase {
+        label: "codebuild project, no target, two event types, eu-west-1",
+        region: "eu-west-1",
+        resource: "arn:aws:codebuild:eu-west-1:123456789012:project/FormProject",
+        detail_type: "FULL",
+        event_type_ids: &[
+            "codebuild-project-build-state-failed",
+            "codebuild-project-build-state-succeeded",
+        ],
+        targets: &[],
+        tags: &[("Team", "builders")],
+    },
+    FormCase {
+        label: "codepipeline pipeline, two targets, two tags, ap-southeast-2",
+        region: "ap-southeast-2",
+        resource: "arn:aws:codepipeline:ap-southeast-2:123456789012:FormPipeline",
+        detail_type: "BASIC",
+        event_type_ids: &["codepipeline-pipeline-manual-approval-needed"],
+        targets: &[
+            ("SNS", "arn:aws:sns:ap-southeast-2:123456789012:form-topic-b"),
+            (
+                "AWSChatbotSlack",
+                "arn:aws:chatbot:us-east-1:123456789012:chat-configuration/slack-channel/form",
+            ),
+        ],
+        tags: &[("env", "test"), ("owner", "codestar")],
+    },
+    FormCase {
+        label: "codedeploy application, second rule of its region, us-west-2",
+        region: "us-west-2",
+        resource: "arn:aws:codedeploy:us-west-2:123456789012:application:FormApp",
+        detail_type: "FULL",
+        event_type_ids: &["codedeploy-application-deployment-succeeded"],
+        targets: &[("SNS", "arn:aws:sns:us-west-2:123456789012:form-topic-c")],
+        tags: &[],
+    },
+    FormCase {
+        label: "codecommit repository again, same resource as row 1, us-west-2",
+        region: "us-west-2",
+        resource: "arn:aws:codecommit:us-east-1:123456789012:FormRepo",
+        detail_type: "BASIC",
+        event_type_ids: &["codecommit-repository-branches-and-tags-created"],
+        targets: &[],
+        tags: &[("env", "test")],
+    },
+];
+
+impl FormCase {
+    fn request(&self, name: &str) -> Value {
+        let mut body = json!({
+            "Name": name,
+            "Resource": self.resource,
+            "DetailType": self.detail_type,
+            "EventTypeIds": self.event_type_ids,
+            "Targets": self.targets
+                .iter()
+                .map(|(target_type, address)| json!({
+                    "TargetType": target_type,
+                    "TargetAddress": address,
+                }))
+                .collect::<Vec<Value>>(),
+        });
+        if !self.tags.is_empty() {
+            body["Tags"] = Value::Object(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), json!(value)))
+                    .collect(),
+            );
+        }
+        body
+    }
+}
+
+/// The six fields `NotificationRuleArn` fixes
+/// (`smithy_query(query="shape",shape="NotificationRuleArn")`:
+/// `^arn:aws[^:\s]*:codestar-notifications:[^:\s]+:\d{12}:notificationrule\/(.*\S)?$`),
+/// read off the value the service answered with.
+fn assert_rule_arn_fields(case: &str, region: &str, arn: &str) {
+    // The resource segment may itself hold colons, so only the five fields before it are
+    // split off.
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    assert_eq!(
+        fields.len(),
+        6,
+        "case {case:?}: a rule ARN carries six colon-separated fields, got {arn:?}"
+    );
+    assert_eq!(
+        fields[0], "arn",
+        "case {case:?}: the ARN must open on `arn`, got {arn:?}"
+    );
+    assert!(
+        fields[1].starts_with("aws"),
+        "case {case:?}: the partition must be an `aws` partition, got {arn:?}"
+    );
+    assert_eq!(
+        fields[2], "codestar-notifications",
+        "case {case:?}: the namespace must be this service's, got {arn:?}"
+    );
+    assert_eq!(
+        fields[3], region,
+        "case {case:?}: the ARN must name the region the request was signed for, got {arn:?}"
+    );
+    assert!(
+        fields[4].len() == 12 && fields[4].bytes().all(|byte| byte.is_ascii_digit()),
+        "case {case:?}: the account must be twelve digits, got {arn:?}"
+    );
+    assert!(
+        fields[5].starts_with("notificationrule/"),
+        "case {case:?}: the resource must open on `notificationrule/`, got {arn:?}"
+    );
+}
+
+/// RULE: the identifier this service mints for a notification rule is
+/// [`RULE_ID_LENGTH`] lowercase hexadecimal characters — nothing else, in particular no
+/// hyphen and no uppercase digit — and every path that reports the rule's identity
+/// reports exactly that value: the create's `Arn` carries it as its `notificationrule/`
+/// segment, a describe through that ARN answers the same ARN, and the rule's listing
+/// entry reports it as `NotificationRuleSummary.Id` beside the same ARN.
+#[tokio::test]
+async fn every_path_reports_the_minted_identifier_in_the_hex_form_it_is_minted_in() {
+    let emulator = Emulator::new();
+    let mut minted: HashSet<String> = HashSet::new();
+
+    for (index, case) in FORM_CASES.iter().enumerate() {
+        let label = case.label;
+        let request = case.request(&format!("form-{index}"));
+        let (status, created) = emulator
+            .post_in(case.region, "/createNotificationRule", &request)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200 from /createNotificationRule, got {status} with {created}"
+        );
+        let arn = string(&created, "Arn");
+        assert_rule_arn_fields(label, case.region, &arn);
+
+        let id = id_of_arn(label, &arn).to_string();
+        assert_canonical_rule_id(label, &id);
+        // A hyphenated identifier would fit the modelled length just as well, so the
+        // absence of a hyphen is asserted in its own right rather than left to the
+        // character check above.
+        assert!(
+            !id.contains('-'),
+            "case {label:?}: a minted identifier carries no hyphen, got {id:?}"
+        );
+        assert!(
+            id.chars().all(|character| !character.is_uppercase()),
+            "case {label:?}: a minted identifier is lowercase, got {id:?}"
+        );
+        assert!(
+            minted.insert(id.clone()),
+            "case {label:?}: {id:?} was already minted for another rule"
+        );
+
+        // The ARN a client rebuilds from the reported identifier addresses this rule.
+        let rebuilt = ::engine::emulator_arn(
+            "codestar-notifications",
+            case.region,
+            &format!("notificationrule/{id}"),
+        );
+        assert_eq!(
+            rebuilt, arn,
+            "case {label:?}: the identifier must rebuild the rule's own ARN, got {rebuilt:?}"
+        );
+
+        let (status, described) = emulator
+            .post_in(
+                case.region,
+                "/describeNotificationRule",
+                &json!({ "Arn": rebuilt }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200 from /describeNotificationRule, got {status} with {described}"
+        );
+        assert_eq!(
+            string(&described, "Arn"),
+            arn,
+            "case {label:?}: a describe through the rebuilt ARN must answer the same ARN, \
+             got {described}"
+        );
+
+        let (status, listed) = emulator
+            .post_in(case.region, "/listNotificationRules", &json!({}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200 from /listNotificationRules, got {status} with {listed}"
+        );
+        let summary = listed
+            .get("NotificationRules")
+            .and_then(Value::as_array)
+            .and_then(|summaries| {
+                summaries
+                    .iter()
+                    .find(|summary| string(summary, "Arn") == arn)
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                panic!("case {label:?}: the listing must name the rule {arn:?}, got {listed}")
+            });
+        let reported = string(&summary, "Id");
+        assert_canonical_rule_id(label, &reported);
+        assert_eq!(
+            reported, id,
+            "case {label:?}: the listing must report the minted identifier, got {reported:?}"
+        );
+    }
+
+    assert_eq!(
+        minted.len(),
+        FORM_CASES.len(),
+        "every row must have minted its own identifier, got {minted:?}"
+    );
 }

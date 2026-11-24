@@ -24,8 +24,9 @@ tracing = { workspace = true }
 # Hashing (idempotency fingerprints) and hex (opaque page tokens).
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The rule ids this service mints: canonical, randomly drawn version-4 UUIDs.
-uuid = { version = "1", features = ["v4"] }
+# The random bytes the rule ids this service mints are drawn from, and the seeded
+# generator the property-based identity suite draws its rule populations from.
+rand = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,9 +34,6 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The seeded generator the property-based identity suite draws its rule populations and
-# listing narrowings from.
-rand = "0.9"
 # Percent-encoding for the `@httpLabel` / `@httpQuery` values a test puts on the request
 # line (an ARN's `:` and `/` have to travel escaped).
 percent-encoding = "2"

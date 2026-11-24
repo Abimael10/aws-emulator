@@ -13,6 +13,22 @@ Issue-Commit: b89f41e6cc4db360cb043b357635b76c01311ad8
 
 # codestar-notifications rule identifiers diverge: CreateNotificationRule Arn shape and ListNotificationRules Id values
 
+## Resolution (all four causes fixed: the minted identifier's form)
+
+`crate::state::new_rule_id` now mints a notification-rule identifier as forty lowercase
+hexadecimal characters drawn from random bytes — the whole width `NotificationRuleId`'s
+`@length` 1..40 allows — instead of a 36-character hyphenated UUID. `notification_rule_arn`
+embeds that value as the ARN's `notificationrule/<id>` segment and `ListNotificationRules`
+keeps reporting the stored id verbatim beside the stored ARN, so the create's `Arn` now
+satisfies the shape the recording asserts for a generated rule ARN and every listing
+reports an id in the form AWS's own rule ids take. All four replay clusters
+(codestar-notifications-rule-lifecycle#task#4 and
+codestar-notifications-list-and-filter-rules#task#6/#7/#8) pass.
+
+The earlier reports of this same root cause that declined it as a per-run value
+(20261110T182312Z, 20261110T210013Z, 20261114T201431Z) were wrong about the discriminator:
+the corpus asserts the identifier's FORM, and the hyphenated-UUID form is not it.
+
 > _Note: this issue was identified against the code base at commit `b89f41e6cc4db360cb043b357635b76c01311ad8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
