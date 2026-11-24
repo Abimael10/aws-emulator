@@ -17,8 +17,13 @@
 //! * a replacement tag the rendering REACHES and the data holds no value for is a missing
 //!   rendering attribute, reported with the tag it names rather than substituted as nothing —
 //!   and a tag inside a branch the data did not take is never reached, so it is never missing;
-//! * a value substituted into the HTML body is escaped as markup and one substituted into the
-//!   subject line or the text body is not ([`Escaping`]);
+//! * a substituted value goes into EVERY part as the data holds it — the subject line, the
+//!   text body and the HTML body alike — so a rendering emits no markup entity of its own;
+//!   Amazon SES substitutes the value a template refers to verbatim wherever the template
+//!   refers to it, under the double-brace spelling (`{{name}}`) as much as under the
+//!   unescaped spellings (`{{{name}}}`, `{{&name}}`), so markup supplied through the data is
+//!   markup of the message. The same rule the account's other email API renders a saved
+//!   template by, so one template renders the same way whichever of the two reads it;
 //! * what the rendering produces is ONE MIME message: the rendered subject line as the
 //!   message's `Subject` header, the instant it was composed as its `Date` header, and the
 //!   rendered body parts as its content — the two of them as the alternatives of a
@@ -337,16 +342,9 @@ pub fn rendered_template(
     // measured cost turned out to be an under-estimate instead of leaving it running.
     let mut budget = MAX_MESSAGE_BYTES;
     let deadline = ::std::time::Instant::now() + RENDER_DEADLINE;
-    let subject = rendered_part(
-        subject_part,
-        &data,
-        widest,
-        Escaping::None,
-        &mut budget,
-        deadline,
-    )?;
-    let text = rendered_part(text_part, &data, widest, Escaping::None, &mut budget, deadline)?;
-    let html = rendered_part(html_part, &data, widest, Escaping::Html, &mut budget, deadline)?;
+    let subject = rendered_part(subject_part, &data, widest, &mut budget, deadline)?;
+    let text = rendered_part(text_part, &data, widest, &mut budget, deadline)?;
+    let html = rendered_part(html_part, &data, widest, &mut budget, deadline)?;
     let message = super::composed_message::compose(&super::composed_message::Composition::of_parts(
         subject.as_deref(),
         text.as_deref(),
@@ -376,23 +374,6 @@ fn rendering_data(template_data: &str) -> Result<Value, RenderingFailure> {
     Ok(data)
 }
 
-/// Whether the values a part substitutes are escaped as markup.
-///
-/// The HTML body IS markup, so a replacement value substituted into it is escaped: a value
-/// carrying `&` or `<` reaches the reader as that character rather than as the start of an
-/// entity or a tag. The subject line and the text body are not markup, so a value belongs in
-/// them as the data wrote it. A part that wants a value in HTML as written says so with the
-/// template language's own unescaped spelling (`{{{name}}}`). The same rule the account's
-/// other email API renders a saved template by, so one template renders the same way whichever
-/// of the two reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escaping {
-    /// The value is substituted as the data holds it.
-    None,
-    /// The value is escaped as HTML.
-    Html,
-}
-
 /// One part rendered over `data`, with `budget` bytes left for the message, or `None` for a
 /// part the template does not carry. Takes what it wrote out of the budget.
 ///
@@ -402,7 +383,6 @@ fn rendered_part(
     source: Option<&str>,
     data: &Value,
     widest: u64,
-    escaping: Escaping,
     budget: &mut usize,
     deadline: ::std::time::Instant,
 ) -> Result<Option<String>, RenderingFailure> {
@@ -432,30 +412,26 @@ fn rendered_part(
     if cost.evaluations > MAX_RENDER_STEPS {
         return Err(too_large());
     }
-    let rendered = rendered_text(parsed, data, escaping, *budget, deadline)?;
+    let rendered = rendered_text(parsed, data, *budget, deadline)?;
     *budget = budget.saturating_sub(rendered.len());
     Ok(Some(rendered))
 }
 
-/// `parsed` rendered over `data`, escaping its substituted values as `escaping` says, and
-/// writing at most `budget` bytes.
+/// `parsed` rendered over `data`, writing at most `budget` bytes.
 ///
 /// The engine is configured for the reading an email template is written against: a
 /// replacement tag the data holds no value for FAILS the rendering rather than resolving to
 /// nothing, which is what makes a missing rendering attribute reportable instead of silently
-/// dropping part of the message; and a value is escaped only where the part it is substituted
-/// into is markup ([`Escaping`]).
+/// dropping part of the message; and a substituted value is written as the data holds it,
+/// into every part, so the engine's own escaping is off.
 fn rendered_text(
     parsed: ::handlebars::Template,
     data: &Value,
-    escaping: Escaping,
     budget: usize,
     deadline: ::std::time::Instant,
 ) -> Result<String, RenderingFailure> {
     let mut engine = ::handlebars::Handlebars::new();
-    if escaping == Escaping::None {
-        engine.register_escape_fn(::handlebars::no_escape);
-    }
+    engine.register_escape_fn(::handlebars::no_escape);
     engine.set_strict_mode(true);
     engine.register_template(RENDERED, parsed);
     let mut written = Capped::new(budget, deadline);

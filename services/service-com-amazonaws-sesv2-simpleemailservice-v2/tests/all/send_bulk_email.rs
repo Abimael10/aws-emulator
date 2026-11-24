@@ -1189,11 +1189,12 @@ async fn the_values_a_send_states_are_substituted_into_the_template() {
 }
 
 #[tokio::test]
-async fn the_html_part_escapes_what_it_substitutes_and_the_text_part_does_not() {
-    // The same value in the three parts: the subject line and the text body are not HTML,
-    // so the value belongs in them as the caller wrote it, while the HTML body's escaped
-    // spelling (`{{name}}`) cannot be made to open or close an element and its unescaped
-    // spelling (`{{{name}}}`) is the value as written.
+async fn every_part_carries_a_substituted_value_as_the_caller_wrote_it() {
+    // The same value in the three parts: Amazon SES substitutes the value a template
+    // refers to verbatim wherever the template refers to it, so markup supplied through
+    // the data is markup of the message in the HTML body under the double-brace spelling
+    // (`{{name}}`) exactly as it is under the unescaped spelling (`{{{name}}}`), and the
+    // message carries no HTML entity the render introduced.
     let ses = Ses::new();
     let identity = ses.create_identity(SENDER_DOMAIN).await;
     assert_eq!(
@@ -1247,9 +1248,13 @@ async fn the_html_part_escapes_what_it_substitutes_and_the_text_part_does_not() 
     );
     assert_eq!(
         logged.body_html.as_deref(),
-        Some("<p>&lt;b&gt;Ada&lt;/b&gt; &amp; Grace</p><p><b>Ada</b> & Grace</p>"),
-        "expected the HTML part to escape the value it substitutes and the unescaped \
-         spelling to carry it as written, got {:?}",
+        Some("<p><b>Ada</b> & Grace</p><p><b>Ada</b> & Grace</p>"),
+        "expected the HTML part to carry the value as written under both spellings, got {:?}",
+        logged.body_html
+    );
+    assert!(
+        !logged.body_html.as_deref().unwrap_or_default().contains("&lt;"),
+        "expected no HTML entity the render introduced, got {:?}",
         logged.body_html
     );
 }

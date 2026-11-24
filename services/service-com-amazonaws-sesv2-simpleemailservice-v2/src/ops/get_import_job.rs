@@ -146,10 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An import job belongs to the account rather than to a Region-scoped resource,
-        // so no request metadata is needed — the same reading this service's other job
-        // operations take.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the scaffold's
             // 501 rather than a modelled error that reads as one.
@@ -160,6 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let job_id = input.job_id;
         let now = ::std::time::SystemTime::now();
+        // A run reads the Amazon S3 object its data source names when it reaches its
+        // terminal transition, which the clock makes due whether or not anybody calls — so
+        // this read materialises that resolution before it reports the job, and records
+        // what the object store answered. Nothing else about any job is touched, and the
+        // answer is the store's: a read reports the same status every later caller sees.
+        crate::state::import_source::resolve_due_sources(
+            &state,
+            ctx.callback(),
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )
+        .await;
         let store = state.lock();
         let Some(record) = store.import_jobs.get(&job_id) else {
             // "The resource you attempted to access doesn't exist": the account holds no
@@ -177,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // supplied them.
             import_destination: Some(record.destination.clone()),
             import_data_source: Some(record.data_source.clone()),
-            // "The failure details about an import job": nothing has diagnosed a failure
-            // of this run, so the job carries no failure details to report.
-            failure_info: None,
+            // "The failure details about an import job": what the run's read of its own
+            // Amazon S3 data source diagnosed, recorded on the job rather than composed
+            // here, and absent for a run nothing diagnosed a failure of.
+            failure_info: record.failure.clone(),
             // The status the clock has made due, derived from the record rather than
             // moved by this read.
             job_status: Some(record.status(now).to_string()),

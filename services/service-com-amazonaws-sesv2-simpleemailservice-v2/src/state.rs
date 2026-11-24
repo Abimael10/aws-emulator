@@ -73,6 +73,10 @@ mod pricing;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
+/// The import-job plane's one piece of behaviour: the Amazon S3 data source a run reads,
+/// resolved against the account's own object storage, and what the store's answer about it
+/// means for the run.
+pub mod import_source;
 /// A tenant's reputation-entity status records and its suppression preferences: what
 /// each is held as while nothing has written it, and what a read reports it as.
 mod tenant_reputation;
@@ -275,16 +279,24 @@ pub const IMPORT_JOB_CREATED: &str = "CREATED";
 /// Job is processing."
 pub const IMPORT_JOB_PROCESSING: &str = "PROCESSING";
 
-/// The terminal `JobStatus` an import job's run reaches: "COMPLETED – Job has
-/// completed processing successfully."
+/// The terminal `JobStatus` an import job's run reaches when it processed the data source
+/// it was created for: "COMPLETED – Job has completed processing successfully."
 ///
-/// WHY the terminal record is this value rather than one of the failure ones: the
-/// model's `FAILED` reports an error something would have had to DIAGNOSE and
-/// `CANCELLED` needs a call that cancels a job, which this service models none of for
-/// an import job. Nothing about an accepted create is wrong, so the lifecycle the
-/// create owed settles into its success state — the same reading this service's
-/// export jobs take of the same modelled enum.
+/// A run reaches it only where the account's object storage ANSWERED for the source the
+/// job reads ([`import_source`]); a run whose source could not be read reaches
+/// [`IMPORT_JOB_FAILED`] instead. `CANCELLED` needs a call that cancels an import job,
+/// which this service models none of.
 pub const IMPORT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// The terminal `JobStatus` an import job's run reaches when it could not process its data
+/// source at all: the model's `FAILED`, which the enum's own documentation glosses as "an
+/// error occurred during processing".
+///
+/// What diagnosed the error is the run's read of the Amazon S3 object the job's
+/// `ImportDataSource` names ([`import_source`]): the store answering that it holds no such
+/// object, or that the read is not permitted, is a source the run cannot process, and the
+/// job carries the `FailureInfo` saying so.
+pub const IMPORT_JOB_FAILED: &str = "FAILED";
 
 /// How long after an import job is created its `CREATED` -> `PROCESSING` transition
 /// becomes due.
@@ -3448,11 +3460,28 @@ pub fn email_template_size(content: &crate::ops::types::EmailTemplateContent) ->
 
 /// How this service words `NotFoundException` for an email template it does not hold.
 ///
-/// One wording for every operation that takes an `EmailTemplateName` — the read, the
-/// update, the delete and the render — so a client sees the same sentence whichever
-/// call first tells it the template is not there.
+/// One wording for every operation that takes an `EmailTemplateName` as the resource it
+/// reads or writes — the read, the update and the delete — so a client sees the same
+/// sentence whichever call first tells it the template is not there. The RENDER path words
+/// the same condition differently ([`email_template_not_found_to_render`]), as SES does.
 pub fn email_template_not_found(template_name: &str) -> String {
     format!("Template {template_name} does not exist.")
+}
+
+/// How this service words `NotFoundException` on the RENDER path for an email template the
+/// account holds nothing under.
+///
+/// SES words this one condition differently per surface, and the render path's sentence is
+/// ACCOUNT-SCOPED: the fixed text "Unable to find <", "> for <" and ">" around the name
+/// the request asked for and the caller's own account id, which says that this account can
+/// see no such template rather than that no such resource exists. The account is the one
+/// this emulator serves, read from the emulator rather than from anything the request
+/// carries — the same reading [`email_template_already_exists`] takes of it.
+pub fn email_template_not_found_to_render(template_name: &str) -> String {
+    format!(
+        "Unable to find <{template_name}> for <{}>",
+        ::emulator_server::emulator_account_id()
+    )
 }
 
 /// How this service words `AlreadyExistsException` for a template name the account
@@ -3869,12 +3898,15 @@ pub fn import_job_not_found(job_id: &str) -> String {
 ///
 /// That status is a RECORD of the lifecycle the create owed, not a report on records
 /// something imported: the records an import job reads live in the Amazon S3 object the
-/// job's data source names, which this emulator does not read, so
-/// [`Self::processed_records_count`] and [`Self::failed_records_count`] count what this
-/// emulator really imported — none — and nothing synthesises a number to match the
-/// status the lifecycle reached. An operation that comes to ingest an import job's
-/// records must take them from somewhere this emulator really holds and bump those
-/// counts as it does.
+/// job's data source names, so [`Self::processed_records_count`] and
+/// [`Self::failed_records_count`] count what this emulator really imported — none — and
+/// nothing synthesises a number to match the status the lifecycle reached. An operation
+/// that comes to ingest an import job's records must take them from somewhere this
+/// emulator really holds and bump those counts as it does.
+///
+/// What the run DOES resolve is whether that object is there to be read at all
+/// ([`import_source`]): the outcome of that read is recorded on [`Self::failure`], and it
+/// is what decides which terminal status the run reaches.
 #[derive(Debug, Clone)]
 pub struct ImportJobRecord {
     /// The `JobId` this record is keyed by, minted when the job was created and stable
@@ -3891,7 +3923,7 @@ pub struct ImportJobRecord {
     pub created_at: SystemTime,
     /// When the `CREATED` -> `PROCESSING` transition falls due.
     pub processing_due_at: SystemTime,
-    /// When the `PROCESSING` -> `COMPLETED` transition falls due.
+    /// When the run's terminal transition falls due.
     pub completion_due_at: SystemTime,
     /// `ProcessedRecordsCount`: "the current number of records processed" — the records
     /// this emulator has really imported for the job.
@@ -3899,6 +3931,14 @@ pub struct ImportJobRecord {
     /// `FailedRecordsCount`: "the number of records that failed processing because of
     /// invalid input or other reasons" — the ones this emulator really rejected.
     pub failed_records_count: i32,
+    /// Whether the account's object storage has ANSWERED about the data source this run
+    /// reads, which is what makes the answer below a fact about the source rather than an
+    /// assumption; until it has, the resolution is still owed
+    /// ([`import_source::resolve_due_sources`]).
+    pub source_answered: bool,
+    /// `FailureInfo`: "an object that contains the failure details about a job" — what the
+    /// run's read of its data source diagnosed, or `None` when it diagnosed no failure.
+    pub failure: Option<crate::ops::types::FailureInfo>,
 }
 
 impl ImportJobRecord {
@@ -3922,17 +3962,23 @@ impl ImportJobRecord {
                 .unwrap_or(processing_due_at),
             processed_records_count: 0,
             failed_records_count: 0,
+            source_answered: false,
+            failure: None,
         }
     }
 
     /// The status of the job's run at `now`.
     ///
     /// Derived, so nothing is written because a job was read, and a run whose whole span
-    /// has already elapsed reports [`IMPORT_JOB_COMPLETED`] rather than one status per
-    /// call.
+    /// has already elapsed reports the terminal status its own data source decided rather
+    /// than one status per call: [`IMPORT_JOB_FAILED`] where the run's read of that source
+    /// diagnosed a failure of it, and [`IMPORT_JOB_COMPLETED`] where it diagnosed none.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now >= self.completion_due_at {
-            IMPORT_JOB_COMPLETED
+            match self.failure {
+                Some(_) => IMPORT_JOB_FAILED,
+                None => IMPORT_JOB_COMPLETED,
+            }
         } else if now >= self.processing_due_at {
             IMPORT_JOB_PROCESSING
         } else {
@@ -3940,7 +3986,14 @@ impl ImportJobRecord {
         }
     }
 
-    /// When the run completed, once the clock has made its completion due.
+    /// Whether the run's own read of its Amazon S3 data source is still owed at `now`:
+    /// the run has reached its terminal transition and nothing has answered about that
+    /// source yet.
+    pub fn source_resolution_falls_due(&self, now: SystemTime) -> bool {
+        now >= self.completion_due_at && !self.source_answered
+    }
+
+    /// When the run completed, once the clock has made its terminal transition due.
     ///
     /// "The time stamp of when the import job was completed": a run that has not
     /// completed has no such instant, and one that has completed finished when it fell

@@ -30,6 +30,10 @@
 //! markup, non-ASCII, a value carrying a line break), and the ways a render is refused
 //! (an attribute the data omits, data that is no set of key-value pairs, text the
 //! language does not accept, a template the account does not hold).
+//!
+//! How the rendered parts are WRITTEN into that document — the transfer encoding each
+//! carries and the delimiter between two of them — is the sibling suite
+//! `email_template_render_mime_transport`.
 
 use std::sync::Arc;
 
@@ -429,7 +433,7 @@ const RENDER_CASES: &[RenderCase] = &[
         html: None,
     },
     RenderCase {
-        case: "a value carrying markup: escaped in the HTML part, as written elsewhere",
+        case: "a value carrying markup, which goes into every part as the data wrote it",
         content: || {
             json!({
                 "Subject": "Hi {{name}}",
@@ -440,7 +444,7 @@ const RENDER_CASES: &[RenderCase] = &[
         data: r#"{"name":"<b>Ada</b> & Grace"}"#,
         subject: "Hi <b>Ada</b> & Grace",
         text: Some("Hi <b>Ada</b> & Grace"),
-        html: Some("<p>&lt;b&gt;Ada&lt;/b&gt; &amp; Grace</p><p><b>Ada</b> & Grace</p>"),
+        html: Some("<p><b>Ada</b> & Grace</p><p><b>Ada</b> & Grace</p>"),
     },
     RenderCase {
         case: "non-ASCII template text and non-ASCII values",
@@ -862,8 +866,11 @@ async fn a_render_of_a_template_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            format!("Template {name} does not exist."),
-            "case {case:?}: expected the refusal to name the template, got {:?}",
+            format!(
+                "Unable to find <{name}> for <{}>",
+                emulator_server::emulator_account_id()
+            ),
+            "case {case:?}: expected the render path's account-scoped sentence, got {:?}",
             reply.message()
         );
     }

@@ -145,9 +145,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Lists all of the import jobs": the listing covers the import jobs of the one
-        // emulated account, so no request metadata is needed — the same reading this
-        // service's other listings take.
-        let _ = ctx;
+        // emulated account, so the only request metadata it reads is the Region the hop
+        // into the account's object storage is addressed with below.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No store at all, which is not a modelled SES state: answer the scaffold's
             // 501 rather than a throttle an SDK would retry forever.
@@ -190,10 +189,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        // Reporting only, and nothing is owed materialising for it: how far an import
-        // job's run has got is derived from the instants its transitions fall due at
-        // ([`crate::state::ImportJobRecord::status`]), so a listing reports what a read of
-        // the same job reports and leaves every later caller seeing exactly what it saw.
+        // A run reads the Amazon S3 object its data source names when it reaches its
+        // terminal transition, which the clock makes due whether or not anybody calls — so
+        // a listing materialises that resolution before it reports a page, exactly as a
+        // read of one job does, and reports the status every later caller sees. Nothing
+        // else about any job is touched: how far a run has got is still derived from the
+        // instants its transitions fall due at
+        // ([`crate::state::ImportJobRecord::status`]).
+        crate::state::import_source::resolve_due_sources(
+            &state,
+            ctx.callback(),
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )
+        .await;
         let store = state.lock();
 
         // Each matching job carries its position in the listing, so the page is a window

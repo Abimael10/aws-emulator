@@ -32,8 +32,10 @@
 //! `(…,operation="CreateEmailIdentityPolicy")`), with each maximum exercised at the bound
 //! itself and one byte past it.
 
+use mailparse::MailHeaderMap;
 use serde_json::{json, Map, Value};
 
+use crate::email_template_render::{part_of, part_with};
 use crate::json_wire::{Reply, Ses};
 
 /// `CreateEmailTemplate` with the request body the case supplies.
@@ -497,7 +499,10 @@ async fn a_value_past_a_modelled_length_maximum_is_refused_without_echoing_it() 
 #[tokio::test]
 async fn rendering_data_at_the_modelled_maximum_is_accepted_and_substituted_whole() {
     // The bound itself: the largest rendering data the member admits is substituted into
-    // both body parts, whole.
+    // both body parts, whole. A part carrying a value that long is not the short-line
+    // US-ASCII a part may carry unencoded, so the document writes it quoted-printable with
+    // the codec's soft line breaks — and decoding the part recovers the whole value once
+    // per alternative.
     let ses = Ses::new();
     let template = "limit-probe";
     let created = create_template(&ses, create_body(template, substituting_template(), 0)).await;
@@ -524,11 +529,39 @@ async fn rendering_data_at_the_modelled_maximum_is_accepted_and_substituted_whol
         .expect("the pair's value")
         .to_string();
     let document = rendered(&reply);
-    let substituted = document.matches(value.as_str()).count();
-    assert_eq!(
-        substituted, 2,
-        "expected the whole value in both the text and the HTML alternative, got {substituted} \
-         occurrences in {} bytes of document",
+    let parsed = mailparse::parse_mail(document.as_bytes())
+        .unwrap_or_else(|error| panic!("expected a MIME document, got {error}"));
+    for media_type in ["text/plain", "text/html"] {
+        let part = part_with(&parsed, media_type)
+            .unwrap_or_else(|| panic!("expected a {media_type} alternative in the document"));
+        assert_eq!(
+            part.headers
+                .get_first_value("Content-Transfer-Encoding")
+                .as_deref(),
+            Some("quoted-printable"),
+            "expected the {media_type} part to declare the encoding a long line needs, got {:?}",
+            part.headers.get_first_value("Content-Transfer-Encoding")
+        );
+        let decoded = part_of(&parsed, media_type).unwrap_or_default();
+        let substituted = decoded.matches(value.as_str()).count();
+        assert_eq!(
+            substituted, 1,
+            "expected the whole value once in the decoded {media_type} part, got {substituted} \
+             occurrences in {} bytes",
+            decoded.len()
+        );
+    }
+    // Every line of the document is one a message may carry, which is what the soft line
+    // breaks are for.
+    let longest = document
+        .split("\r\n")
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    assert!(
+        longest <= 998,
+        "expected every line to be at most 998 octets, got one of {longest} in {} bytes of \
+         document",
         document.len()
     );
 }

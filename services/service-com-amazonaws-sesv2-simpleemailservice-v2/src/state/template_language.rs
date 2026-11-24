@@ -37,11 +37,13 @@
 //!   it omits selects the other branch instead of failing the render — which is what a
 //!   conditional over optional data is for. Every other reference, an iteration's
 //!   included, is a value the data has to state.
-//! * The HTML part's substituted values are HTML-escaped and the subject line's and the
-//!   text part's are not: the subject line and the text body are not HTML, so a value
-//!   carrying an HTML metacharacter belongs in them as the data wrote it. A part that
-//!   wants a value in HTML as written says so with the language's unescaped spelling
-//!   (`{{{name}}}` or `{{&name}}`). This is the same rule the inline-substitution module
+//! * A substituted value goes into EVERY part as the rendering data wrote it — the subject
+//!   line, the text body and the HTML body alike — so the engine's escaping is off for all
+//!   of them and a rendered message carries no HTML entity this evaluation introduced.
+//!   Amazon SES substitutes the value a template refers to verbatim wherever the template
+//!   refers to it, under the double-brace spelling (`{{name}}`) as much as under the
+//!   unescaped spellings (`{{{name}}}`, `{{&name}}`), so markup supplied through the data
+//!   is markup of the message. This is the same rule the inline-substitution module
 //!   follows, so one template renders the same way whichever of the two read it.
 //!
 //! # What bounds it
@@ -315,30 +317,20 @@ fn evaluate_parts(
     variables: &Value,
 ) -> Result<RenderedMessage, EvaluationFailure> {
     Ok(RenderedMessage {
-        subject: evaluate_part(content.subject.as_deref(), variables, Escape::None)?,
-        text: evaluate_part(content.text.as_deref(), variables, Escape::None)?,
-        html: evaluate_part(content.html.as_deref(), variables, Escape::Html)?,
+        subject: evaluate_part(content.subject.as_deref(), variables)?,
+        text: evaluate_part(content.text.as_deref(), variables)?,
+        html: evaluate_part(content.html.as_deref(), variables)?,
     })
-}
-
-/// How a substituted value is written into the part it goes in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escape {
-    /// As the data wrote it.
-    None,
-    /// With the HTML metacharacters replaced by their entities.
-    Html,
 }
 
 /// One optional part, evaluated.
 fn evaluate_part(
     part: Option<&str>,
     variables: &Value,
-    escape: Escape,
 ) -> Result<Option<String>, EvaluationFailure> {
     match part {
         None => Ok(None),
-        Some(source) => evaluate_one(source, variables, escape).map(Some),
+        Some(source) => evaluate_one(source, variables).map(Some),
     }
 }
 
@@ -348,11 +340,7 @@ fn evaluate_part(
 /// The template the ceilings are read from is the very one that is evaluated: it is parsed
 /// ONCE here and handed to the registry, so nothing can be true of the text the ceilings
 /// saw and false of the tree the engine evaluates.
-fn evaluate_one(
-    source: &str,
-    variables: &Value,
-    escape: Escape,
-) -> Result<String, EvaluationFailure> {
+fn evaluate_one(source: &str, variables: &Value) -> Result<String, EvaluationFailure> {
     // Before the parse, because the parse is what these bound: see [`MAX_TAGS`] and
     // [`MAX_PARENTHESES`].
     if source.matches(TAG_OPEN).count() > MAX_TAGS {
@@ -381,9 +369,9 @@ fn evaluate_one(
     // STRICT: an expression naming an attribute the data does not state is a failure of
     // the render, not the empty string.
     engine.set_strict_mode(true);
-    if escape == Escape::None {
-        engine.register_escape_fn(::handlebars::no_escape);
-    }
+    // Every part carries a substituted value as the data wrote it, so the engine writes
+    // one unchanged wherever a template refers to it.
+    engine.register_escape_fn(::handlebars::no_escape);
     engine.register_template(RENDERED, template);
     let mut part = BoundedPart::default();
     match engine.render_to_write(RENDERED, variables, &mut part) {

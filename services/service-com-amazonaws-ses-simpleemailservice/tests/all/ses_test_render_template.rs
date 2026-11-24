@@ -10,8 +10,8 @@
 //! * a replacement tag stands for the value the replacement data holds under it — whatever
 //!   that value is, and wherever the tag sits (the subject line, either body part, a nested
 //!   path, a block's body) — and a block takes the branch the data chooses or repeats its body
-//!   once per element of what it names; a value substituted into the HTML body is escaped as
-//!   markup, one substituted into the subject line or the text body is not;
+//!   once per element of what it names; a substituted value goes into every part as the data
+//!   holds it, so the message carries no markup entity the rendering introduced;
 //! * the preview is ONE MIME message: the rendered subject line as its `Subject` header, the
 //!   instant it was composed as its `Date` header, and the rendered body parts as its
 //!   content — the two of them as the alternatives of a `multipart/alternative` message when
@@ -413,9 +413,10 @@ async fn a_tag_renders_the_value_the_data_holds_and_the_parts_compose_one_messag
             )],
         },
         RenderCase {
-            // The HTML body IS markup, so a value substituted into it is escaped, while the
-            // same value in the subject line and the text body is carried as the data holds
-            // it; the unescaped spelling `{{{name}}}` asks for it as written.
+            // Amazon SES substitutes the value a template refers to verbatim wherever the
+            // template refers to it, so markup supplied through the data is markup of the
+            // message in the HTML body under the double-brace spelling exactly as it is
+            // under the unescaped spelling `{{{name}}}`.
             case: "a value carrying markup characters in the HTML part",
             subject: "Hello {{name}}",
             text: Some("Hello {{name}}"),
@@ -427,7 +428,7 @@ async fn a_tag_renders_the_value_the_data_holds_and_the_parts_compose_one_messag
                 Part::new(
                     "text/html; charset=UTF-8",
                     "7bit",
-                    "<p>A &amp; B &lt;c&gt;</p><pre>A & B <c></pre>",
+                    "<p>A & B <c></p><pre>A & B <c></pre>",
                 ),
             ],
         },

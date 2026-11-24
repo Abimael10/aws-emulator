@@ -132,40 +132,33 @@ pub fn missing_rendering_attribute(attribute: &str) -> String {
 
 /// `content` rendered with `variables`.
 ///
-/// The HTML part's substituted values are HTML-escaped and the subject line's and the text
-/// part's are not: the subject line and the text body are not HTML, so a value that
-/// carries an HTML metacharacter belongs in them as the caller wrote it. A part that wants
-/// a value in HTML as written says so with the unescaped form (`{{{name}}}` or
-/// `{{&name}}`).
+/// A substituted value goes into EVERY part as the caller wrote it — the subject line, the
+/// text body and the HTML body alike — so a render introduces no HTML entity of its own.
+/// Amazon SES substitutes the value a template refers to verbatim wherever the template
+/// refers to it, under the double-brace spelling (`{{name}}`) as much as under the
+/// unescaped spellings (`{{{name}}}`, `{{&name}}`), so markup supplied through the data is
+/// markup of the message. The same rule the full language's evaluation follows
+/// ([`crate::state::template_language`]), so one template renders the same way whichever of
+/// the two read it.
 pub fn render(
     content: &crate::ops::types::EmailTemplateContent,
     variables: &Value,
 ) -> Result<RenderedMessage, RenderRefusal> {
     Ok(RenderedMessage {
-        subject: substitute_part(content.subject.as_deref(), variables, Escape::None)?,
-        text: substitute_part(content.text.as_deref(), variables, Escape::None)?,
-        html: substitute_part(content.html.as_deref(), variables, Escape::Html)?,
+        subject: substitute_part(content.subject.as_deref(), variables)?,
+        text: substitute_part(content.text.as_deref(), variables)?,
+        html: substitute_part(content.html.as_deref(), variables)?,
     })
-}
-
-/// How a substituted value is written into the part it goes in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escape {
-    /// As the caller wrote it.
-    None,
-    /// With the HTML metacharacters replaced by their entities.
-    Html,
 }
 
 /// One optional part, substituted.
 fn substitute_part(
     part: Option<&str>,
     variables: &Value,
-    escape: Escape,
 ) -> Result<Option<String>, RenderRefusal> {
     match part {
         None => Ok(None),
-        Some(source) => substitute(source, variables, escape).map(Some),
+        Some(source) => substitute(source, variables).map(Some),
     }
 }
 
@@ -184,18 +177,14 @@ const NOT_A_VARIABLE: [char; 6] = ['#', '/', '^', '>', '!', '*'];
 /// itself reads like a reference is written out as the value it is. Unterminated text — a
 /// `{{` with no closing `}}` after it — is no reference at all and is written out as the
 /// template wrote it.
-fn substitute(
-    source: &str,
-    variables: &Value,
-    escape: Escape,
-) -> Result<String, RenderRefusal> {
+fn substitute(source: &str, variables: &Value) -> Result<String, RenderRefusal> {
     let mut rendered = String::new();
     let mut rest = source;
     while let Some(at) = rest.find(OPEN) {
         let (literal, reference) = rest.split_at(at);
         push_bounded(&mut rendered, literal)?;
-        // The unescaped form of a reference is written with three braces; the escaped one
-        // with two.
+        // A reference is written with two braces or with three; both spellings name the
+        // same message variable, and the value goes in as the data wrote it either way.
         let (open, close) = if reference.starts_with("{{{") {
             ("{{{", "}}}")
         } else {
@@ -208,24 +197,16 @@ fn substitute(
         };
         let name = body[..end].trim();
         rest = &body[end + close.len()..];
-        // `{{&name}}` is the other spelling of the unescaped form, so the value goes in as
-        // written whichever of the two the part used.
-        let (name, escape) = match name.strip_prefix('&') {
-            Some(unescaped) => (unescaped.trim(), Escape::None),
-            None if open.len() == 3 => (name, Escape::None),
-            None => (name, escape),
-        };
+        // `{{&name}}` is the third spelling of a reference, so the ampersand is part of
+        // the spelling rather than of the name.
+        let name = name.strip_prefix('&').map_or(name, str::trim);
         if !is_variable_path(name) {
             return Err(RenderRefusal::Unsupported);
         }
         let Some(found) = variable_value(variables, name) else {
             return Err(RenderRefusal::MissingAttribute(name.to_string()));
         };
-        let value = value_text(found);
-        match escape {
-            Escape::None => push_bounded(&mut rendered, &value)?,
-            Escape::Html => push_bounded(&mut rendered, &html_escaped(&value))?,
-        }
+        push_bounded(&mut rendered, &value_text(found))?;
     }
     push_bounded(&mut rendered, rest)?;
     Ok(rendered)
@@ -289,23 +270,4 @@ fn value_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
-}
-
-/// `value` with the HTML metacharacters replaced by their entities, so a substituted value
-/// cannot close or open an element of the part it is written into.
-fn html_escaped(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#x27;"),
-            '`' => escaped.push_str("&#x60;"),
-            '=' => escaped.push_str("&#x3D;"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }

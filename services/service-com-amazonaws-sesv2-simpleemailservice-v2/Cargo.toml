@@ -82,6 +82,17 @@ handlebars = "6"
 # goes into a MIME header as when it is not printable US-ASCII
 # (`ops::test_render_email_template`). The same codec `mailparse` decodes one with.
 base64 = "0.22"
+# `quoted_printable`: the ONE encoder of the RFC 2045 quoted-printable form a rendered body
+# part goes into a MIME document as when its text is not short-line US-ASCII
+# (`ops::test_render_email_template`), so the `=XX` escaping and the 76-octet soft line
+# break are the codec's rule rather than a second copy of it. The same codec `mailparse`
+# decodes such a part with.
+quoted_printable = "0.5"
+# `getrandom`: the operating system's own randomness, which the per-response MIME boundary a
+# rendered multipart document is delimited by is drawn from
+# (`ops::test_render_email_template`) — a delimiter of that message rather than a function
+# of its content.
+getrandom = "0.3"
 # `csv`: the ONE writer of the comma-separated form of an export job's file
 # (`state::export_file`), so the quoting of a cell that needs it is the codec's rule and
 # not re-derived here. The same crate the other emulated services that publish a CSV
@@ -107,6 +118,12 @@ service-com-amazonaws-ses-simpleemailservice = { workspace = true }
 # certificate rather than about the association, so it is read from that service's own
 # store in the one shared engine (`state::identity_certificates`) instead of being assumed.
 service-com-amazonaws-acm-certificatemanager = { workspace = true }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: an import job's run
+# reads the object its `ImportDataSource$S3Url` names from the account's own object storage,
+# so which terminal status the run reaches is decided by what that store answered
+# (`state::import_source`). Only the generated client is needed — the emulator supplies the
+# transport.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -132,11 +149,9 @@ percent-encoding = "2.3"
 # The object store a receipt rule's `S3Action` writes a received message into, mounted beside
 # this service on ONE engine in the receive-path suite: the object a message this surface
 # accepted produces is read back through Amazon S3's own operations, and the bucket and its
-# policy are made through them too.
+# policy are made through them too. It is also where an import job's suite stages the data
+# source a run reads.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
-# The AWS SDK for Amazon S3, driven over the same in-process callback, which is how that suite
-# makes the bucket and reads the object back.
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The reader of the stored message's header block in that suite — the same crate this service
 # reads a raw message's headers with.
 mailparse = "0.16"

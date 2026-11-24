@@ -10,9 +10,10 @@
 //! Nothing is written: a preview reports what a send of that template would carry, so
 //! the store is read and left exactly as it was.
 //!
-//! Two pieces of this are a crate's rather than this file's: the template language is
-//! evaluated by the engine the state module drives, and the one encoding a header value
-//! may need is `base64`'s. What is written here is the DOCUMENT — the header block, the
+//! Three pieces of this are a crate's rather than this file's: the template language is
+//! evaluated by the engine the state module drives, the one encoding a header value may
+//! need is `base64`'s, and the one a body part may need is `quoted_printable`'s. What is
+//! written here is the DOCUMENT — the header block, the
 //! part headers and the boundary that separates two parts — which is an assembly of the
 //! rendered parts rather than a reading of anything; reading an RFC 5322 / MIME message is
 //! `mailparse`'s job in this crate, and this operation's own suite parses every document
@@ -176,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(stored) = store.email_templates.get(&name) else {
                 return Err(TestRenderEmailTemplateErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(crate::state::email_template_not_found(&name)),
+                        message: Some(crate::state::email_template_not_found_to_render(&name)),
                     },
                 )
                 .into());
@@ -329,6 +330,10 @@ const CHARSET: &str = "UTF-8";
 ///   separate anything from;
 /// * neither: an empty `text/plain` body, because a template that carries only a subject
 ///   line renders a message with no body rather than no message.
+///
+/// Each call ASSEMBLES a new message: the boundary that separates two parts is minted per
+/// document ([`boundary`]), so two renders of one template and one set of data are two
+/// messages rather than one repeated.
 fn mime_document(rendered: &crate::state::template_rendering::RenderedMessage) -> String {
     let parts: Vec<(&str, &str)> = [
         ("text/plain", rendered.text.as_deref()),
@@ -349,23 +354,33 @@ fn mime_document(rendered: &crate::state::template_rendering::RenderedMessage) -
 
     match parts.as_slice() {
         [] => {
-            document.push_str(&part_headers("text/plain", ""));
+            let (encoding, written) = part_body("");
+            document.push_str(&part_headers("text/plain", encoding));
             document.push_str(LINE_ENDING);
+            document.push_str(&written);
         }
         [(media_type, body)] => {
-            document.push_str(&part_headers(media_type, body));
+            let (encoding, written) = part_body(body);
+            document.push_str(&part_headers(media_type, encoding));
             document.push_str(LINE_ENDING);
-            document.push_str(body);
+            document.push_str(&written);
         }
         several => {
-            let boundary = boundary(several);
+            let written: Vec<(&str, &'static str, String)> = several
+                .iter()
+                .map(|(media_type, body)| {
+                    let (encoding, written) = part_body(body);
+                    (*media_type, encoding, written)
+                })
+                .collect();
+            let boundary = boundary(&written);
             document.push_str(&format!(
                 "Content-Type: multipart/alternative; boundary=\"{boundary}\"{LINE_ENDING}\
                  {LINE_ENDING}"
             ));
-            for (media_type, body) in several {
+            for (media_type, encoding, body) in &written {
                 document.push_str(&format!("--{boundary}{LINE_ENDING}"));
-                document.push_str(&part_headers(media_type, body));
+                document.push_str(&part_headers(media_type, encoding));
                 document.push_str(LINE_ENDING);
                 document.push_str(body);
                 document.push_str(LINE_ENDING);
@@ -378,18 +393,57 @@ fn mime_document(rendered: &crate::state::template_rendering::RenderedMessage) -
 
 /// The header lines one body part carries: its media type with the character set its text
 /// is in, and the encoding that text is written in.
-///
-/// A part is written as it was rendered rather than re-encoded, so the transfer encoding
-/// states which it is: `7bit` for text that is all US-ASCII, `8bit` for text that is not
-/// (RFC 2045 section 6.2 — both are unencoded line-oriented data, and they differ in
-/// exactly that).
-fn part_headers(media_type: &str, body: &str) -> String {
-    let encoding = if body.is_ascii() { "7bit" } else { "8bit" };
+fn part_headers(media_type: &str, encoding: &str) -> String {
     format!(
         "Content-Type: {media_type}; charset={CHARSET}{LINE_ENDING}\
          Content-Transfer-Encoding: {encoding}{LINE_ENDING}"
     )
 }
+
+/// The transfer encoding one part's rendered text is written in, and the text as written
+/// in it.
+///
+/// RFC 2045 section 6.2 admits `7bit` only for data that is already US-ASCII in lines
+/// short enough for a message to carry, which a rendered part is not in general: the data
+/// substituted into it may carry any text at all, and the only ceiling on its size is what
+/// this emulator renders ([`crate::state::template_rendering::MAX_RENDERED_PART_BYTES`]).
+/// So text that is already such data goes in as it is and says `7bit`; anything else —
+/// text carrying a non-ASCII character, or a line longer than a message may carry — is
+/// QUOTED-PRINTABLE encoded (RFC 2045 section 6.7), which writes those octets as `=XX`
+/// and breaks a long line with a soft `=` line break, so the part is transportable over a
+/// 7-bit path and decodes back to exactly the text that was rendered.
+///
+/// The encoding is the maintained `quoted_printable` crate's — the same codec `mailparse`
+/// decodes a part with — so the escaping and the 76-octet line bound are the codec's rule
+/// rather than a second copy of it here. It grows a part by at most three times its own
+/// size, and a part is bounded before it gets here
+/// ([`crate::state::template_rendering::MAX_RENDERED_PART_BYTES`]), so the document stays
+/// bounded too.
+fn part_body(body: &str) -> (&'static str, String) {
+    if is_seven_bit(body) {
+        return (SEVEN_BIT, body.to_string());
+    }
+    (
+        QUOTED_PRINTABLE,
+        ::quoted_printable::encode_to_str(body.as_bytes()),
+    )
+}
+
+/// Whether `body` is data a part may carry unencoded: US-ASCII, in lines a message may
+/// carry (RFC 5322 section 2.1.1 bounds a line at 998 octets).
+fn is_seven_bit(body: &str) -> bool {
+    body.is_ascii()
+        && body
+            .split('\n')
+            .all(|line| line.trim_end_matches('\r').len() <= MAX_LINE_OCTETS)
+}
+
+/// `Content-Transfer-Encoding: 7bit` — unencoded line-oriented US-ASCII data.
+const SEVEN_BIT: &str = "7bit";
+
+/// `Content-Transfer-Encoding: quoted-printable` — the encoding a part whose text is not
+/// short-line US-ASCII is written in.
+const QUOTED_PRINTABLE: &str = "quoted-printable";
 
 /// `subject` as a header field's value.
 ///
@@ -407,7 +461,7 @@ fn header_value(subject: &str) -> String {
     let printable_ascii = subject
         .chars()
         .all(|character| character.is_ascii() && !character.is_ascii_control());
-    if printable_ascii && SUBJECT_FIELD.len() + subject.len() <= MAX_HEADER_LINE_OCTETS {
+    if printable_ascii && SUBJECT_FIELD.len() + subject.len() <= MAX_LINE_OCTETS {
         return subject.to_string();
     }
     let mut words: Vec<String> = Vec::new();
@@ -442,7 +496,7 @@ const SUBJECT_FIELD: &str = "Subject: ";
 
 /// The longest line a message may carry, excluding its terminator: RFC 5322 section 2.1.1
 /// bounds a line at 998 octets.
-const MAX_HEADER_LINE_OCTETS: usize = 998;
+const MAX_LINE_OCTETS: usize = 998;
 
 /// How many bytes of the subject go into one encoded word.
 ///
@@ -457,23 +511,36 @@ const BOUNDARY_PREFIX: &str = "----=_Part_";
 /// The boundary delimiter `parts` are separated by: one that appears in none of them,
 /// since a delimiter a part's own text carries would end that part early.
 ///
-/// It is derived from the parts themselves, so the same rendered message is always
-/// previewed with the same document rather than one that differs per call, and so a part
-/// would have to carry the digest of the very text it is part of to collide. The loop
-/// below is what makes that impossible rather than merely unlikely: each turn lengthens
+/// MINTED per document, not derived from the parts: a boundary is this message's own
+/// delimiter, so each render gets one of its own and a client may nest or concatenate two
+/// renders without an inner delimiter ending an outer part. The loop below is what keeps
+/// it out of the parts rather than merely making a collision unlikely: each turn lengthens
 /// the candidate, and the parts are bounded
 /// ([`crate::state::template_rendering::MAX_RENDERED_PART_BYTES`]), so it ends.
-fn boundary(parts: &[(&str, &str)]) -> String {
-    let mut digest = ::std::hash::DefaultHasher::new();
-    for (_, body) in parts {
-        ::std::hash::Hash::hash(body, &mut digest);
-    }
-    let mut boundary = format!(
-        "{BOUNDARY_PREFIX}{:016x}",
-        ::std::hash::Hasher::finish(&digest)
-    );
-    while parts.iter().any(|(_, body)| body.contains(&boundary)) {
+fn boundary(parts: &[(&str, &'static str, String)]) -> String {
+    let mut boundary = format!("{BOUNDARY_PREFIX}{}", minted_token());
+    while parts.iter().any(|(_, _, body)| body.contains(&boundary)) {
         boundary.push('_');
     }
     boundary
+}
+
+/// The unpredictable token one document's boundary carries.
+///
+/// Sixteen bytes of the operating system's own randomness, rendered in the form this
+/// project renders opaque minted bytes in ([`::service_common::uuid_from_random_bytes`]),
+/// whose characters are all ones a boundary may carry (RFC 2046 section 5.1.1). With
+/// nothing to draw from — a platform whose generator is unavailable — the instant the
+/// document is assembled at stands in, which is still a value of this response rather than
+/// of its content.
+fn minted_token() -> String {
+    let mut bytes = [0_u8; 16];
+    if ::getrandom::fill(&mut bytes).is_err() {
+        bytes = ::std::time::SystemTime::now()
+            .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_be_bytes();
+    }
+    ::service_common::uuid_from_random_bytes(bytes)
 }
