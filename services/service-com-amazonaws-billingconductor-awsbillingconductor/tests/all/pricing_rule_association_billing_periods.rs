@@ -29,7 +29,11 @@ use crate::pricing_rule_association_periods::{
 };
 
 /// `ListPricingPlansAssociatedWithPricingRule` — the plans one rule is associated with.
-const PLANS_FOR_RULE: &str = "/list-pricing-plans-associated-with-pricing-rule";
+///
+/// `pub(crate)` because the sibling suite
+/// `tests/all/association_token_period_subset_scope.rs` drives the same route rather than
+/// re-spelling it.
+pub(crate) const PLANS_FOR_RULE: &str = "/list-pricing-plans-associated-with-pricing-rule";
 
 /// `ListPricingRulesAssociatedToPricingPlan` — the inverse read.
 pub(crate) const RULES_FOR_PLAN: &str = "/list-pricing-rules-associated-to-pricing-plan";
