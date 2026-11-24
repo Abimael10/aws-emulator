@@ -19914,6 +19914,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-common",

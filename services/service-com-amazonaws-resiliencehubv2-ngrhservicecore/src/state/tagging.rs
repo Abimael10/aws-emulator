@@ -10,6 +10,9 @@
 //! and writes into the record that holds it ([`ComAmazonawsResiliencehubv2NgrhservicecoreState::resource_tags_mut`]).
 //! Every reader of that resource projects the SAME stored map through [`tag_map_view`], so
 //! a tag write is visible to the next read of the resource and the two cannot drift.
+//! `ListTagsForResource` reads that same map through
+//! [`ComAmazonawsResiliencehubv2NgrhservicecoreState::resource_tags`], which resolves an
+//! ARN exactly as the write path does.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -59,6 +62,22 @@ pub fn tagged_resource_type(arn: &str) -> &str {
 }
 
 impl ComAmazonawsResiliencehubv2NgrhservicecoreState {
+    /// The stored tag map of the resource `arn` names, to READ, or `None` when the ARN
+    /// names no resource this store holds.
+    ///
+    /// The same resolution [`Self::resource_tags_mut`] writes through, so a tag listing and
+    /// a tag write address exactly the same records: an ARN one of them resolves is one the
+    /// other resolves too, and no reader can miss a map a writer reached.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(service) = self.services.get(arn) {
+            return Some(&service.tags);
+        }
+        if let Some(system) = self.systems.get(arn) {
+            return Some(&system.tags);
+        }
+        self.policies.get(arn).map(|policy| &policy.tags)
+    }
+
     /// The stored tag map of the resource `arn` names, to write into, or `None` when the
     /// ARN names no resource this store holds.
     ///

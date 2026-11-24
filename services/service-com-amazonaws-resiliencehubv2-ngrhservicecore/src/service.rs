@@ -113,7 +113,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// The protocol this service answers modelled requests in: the model's own `restJson1`,
 /// with the one framing correction `service-common`'s no-content module states — an answer
 /// at HTTP 204 carries no body, where the serializer renders the empty JSON object for an
-/// output structure that declares no member. `TagResource` is such an operation.
+/// output structure that declares no member. The tag writes `TagResource` and
+/// `UntagResource` are such operations.
 ///
 /// Implemented on the service itself because the model-derived protocol it delegates to is
 /// owned by the generated entry and reached by reference (`self.entry.protocol()`), and

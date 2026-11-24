@@ -45,6 +45,11 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs`, so the crate's single integration-test
 # target picks up every suite without a hand-maintained list.
 automod = { workspace = true }
+# Percent-encoding for the `resourceArn` @httpLabel a tag call carries in its URI path and
+# for the tag keys `UntagResource` carries as @httpQuery values: the encoding is the
+# crate's, as the sibling services' tag suites do it, rather than another hand-written copy
+# of RFC 3986.
+percent-encoding = "2"
 
 [lints]
 workspace = true
