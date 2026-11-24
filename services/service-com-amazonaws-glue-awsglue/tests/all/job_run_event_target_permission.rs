@@ -52,12 +52,12 @@ use crate::wire::{ok, REGION};
 /// The `source` and `detail-type` Glue publishes a job run's terminal state under, spelled out
 /// here rather than imported, so a wrong constant in the implementation cannot make a test
 /// pass.
-const EVENT_SOURCE: &str = "aws.glue";
-const JOB_STATE_CHANGE: &str = "Glue Job State Change";
+pub(crate) const EVENT_SOURCE: &str = "aws.glue";
+pub(crate) const JOB_STATE_CHANGE: &str = "Glue Job State Change";
 
 /// A script that ends the program with a non-zero exit status, which is what a `pythonshell`
 /// job whose own work failed does.
-const EXITS_NON_ZERO: &str = r#"
+pub(crate) const EXITS_NON_ZERO: &str = r#"
 import sys
 sys.exit(1)
 "#;
@@ -79,15 +79,15 @@ const ROLE_NAME: &str = "glue-job-event-target-role";
 /// asserts on how long it took. The deadline is generous because this suite RUNS the job's
 /// script, which is the one piece of work here that a loaded host slows down: the rest of the
 /// workspace's tests running beside it must not be able to decide this case.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(240);
-const DELIVERY_POLL: Duration = Duration::from_millis(50);
+pub(crate) const DELIVERY_DEADLINE: Duration = Duration::from_secs(240);
+pub(crate) const DELIVERY_POLL: Duration = Duration::from_millis(50);
 
 /// An emulator with Glue, IAM, Amazon S3, EventBridge AND SQS on one shared engine.
 ///
 /// IAM because each run is admitted against the role's own record, Amazon S3 because a run
 /// reads its script from it, EventBridge and SQS because the publication goes onto the
 /// account's default bus and a rule on that bus delivers it to a queue.
-fn emulator_with_a_bus_and_iam() -> MultiServiceRouter {
+pub(crate) fn emulator_with_a_bus_and_iam() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = crate::wire::emulator_on(Arc::clone(&engine));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
@@ -108,7 +108,7 @@ fn emulator_with_a_bus_and_iam() -> MultiServiceRouter {
 }
 
 /// One IAM `awsQuery` call, which must answer 200, as its body.
-async fn iam(router: &MultiServiceRouter, action: &str, parameters: &str) -> String {
+pub(crate) async fn iam(router: &MultiServiceRouter, action: &str, parameters: &str) -> String {
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -137,7 +137,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, parameters: &str) -> Str
 
 /// Create, through IAM's own API, the role Glue performs these runs as: it trusts the Glue
 /// service principal, and it may read the scripts the runs execute. Answers its ARN.
-async fn given_role(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_role(router: &MultiServiceRouter) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -182,7 +182,7 @@ async fn given_role(router: &MultiServiceRouter) -> String {
 }
 
 /// Call one EventBridge operation, which must answer 200.
-async fn events(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn events(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -251,7 +251,7 @@ async fn given_rule(
 /// Grant `events.amazonaws.com` the `sqs:SendMessage` a rule's target needs on the queue at
 /// `url`, conditioned on the delivery coming FROM `rule_arn` — the queue policy a client writes
 /// for an EventBridge target.
-async fn grant_delivery_from(
+pub(crate) async fn grant_delivery_from(
     router: &MultiServiceRouter,
     url: &str,
     queue_arn: &str,
@@ -278,7 +278,7 @@ async fn grant_delivery_from(
 
 /// Every envelope the queue at `url` holds, drained and deleted, so nothing read here can come
 /// back when its visibility timeout lapses and be read as a second delivery.
-async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
     let received = sqs(
         router,
         "ReceiveMessage",
@@ -308,7 +308,11 @@ async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
 ///
 /// Nothing of Glue is called while waiting: the run's terminal state and its publication are
 /// both owed by the service's own clock, so a client that only polls its queue observes them.
-async fn delivered_envelope(router: &MultiServiceRouter, case: &str, url: &str) -> Value {
+pub(crate) async fn delivered_envelope(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Value {
     let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let envelopes = drain(router, url).await;
