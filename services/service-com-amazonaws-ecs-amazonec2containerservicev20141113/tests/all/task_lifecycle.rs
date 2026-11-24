@@ -446,64 +446,67 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
     // FARGATE, so a positional read names the same launch type the real
     // service named. `networkMode` is the closed `NetworkMode` enum (bridge, host, awsvpc,
     // none) plus the documented default: "If no network mode is specified, the default is
-    // bridge."
+    // bridge" — which the derivation reads while the member itself carries no default, so
+    // a revision that declared none reads back with no `networkMode` at all.
     /// One row of the compatibilities table.
     struct Row {
         case: &'static str,
         network_mode: Option<&'static str>,
         task_size: bool,
-        expected_mode: &'static str,
+        /// The `networkMode` the revision must read back as, or `None` for the member
+        /// staying absent.
+        expected_mode: Option<&'static str>,
         expected: &'static [&'static str],
     }
 
     let cases = [
         Row {
-            case: "absent defaults to bridge",
+            case: "absent stays absent, and derives the bridge-mode launch types",
             network_mode: None,
             task_size: false,
-            expected_mode: "bridge",
+            expected_mode: None,
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge",
             network_mode: Some("bridge"),
             task_size: false,
-            expected_mode: "bridge",
+            expected_mode: Some("bridge"),
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "bridge with task size",
             network_mode: Some("bridge"),
             task_size: true,
-            expected_mode: "bridge",
+            expected_mode: Some("bridge"),
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "host",
             network_mode: Some("host"),
             task_size: false,
-            expected_mode: "host",
+            expected_mode: Some("host"),
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "none",
             network_mode: Some("none"),
             task_size: false,
-            expected_mode: "none",
+            expected_mode: Some("none"),
             expected: &["EXTERNAL", "EC2"],
         },
         Row {
             case: "awsvpc without task size",
             network_mode: Some("awsvpc"),
             task_size: false,
-            expected_mode: "awsvpc",
+            expected_mode: Some("awsvpc"),
             expected: &["EC2"],
         },
         Row {
             case: "awsvpc with task size",
             network_mode: Some("awsvpc"),
             task_size: true,
-            expected_mode: "awsvpc",
+            expected_mode: Some("awsvpc"),
             expected: &["EC2", "FARGATE"],
         },
     ];
@@ -530,9 +533,9 @@ async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
 
         let body = ok(&router, "RegisterTaskDefinition", request, case).await;
         let definition = &body["taskDefinition"];
+        let reported_mode = definition.get("networkMode").and_then(Value::as_str);
         assert_eq!(
-            string(definition, "networkMode", case),
-            expected_mode,
+            reported_mode, expected_mode,
             "case {case:?}: expected networkMode {expected_mode:?}, got {definition}"
         );
         let actual: Vec<String> = list(definition, "compatibilities", case)

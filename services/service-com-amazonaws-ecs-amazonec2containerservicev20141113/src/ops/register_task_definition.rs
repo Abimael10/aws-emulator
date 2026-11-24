@@ -369,6 +369,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // Fargate capacity is Amazon ECS's own, so a revision that REQUIRES it may
+            // only declare what that capacity can present to a container: a device of the
+            // caller's container instance, or a path of one, is not among it
+            // ([`crate::state::fargate_feature_violation`] — the same rule the derived
+            // compatibilities of a stored revision are filtered by).
+            if let Some(message) = crate::state::fargate_feature_violation(
+                &input.container_definitions,
+                input.volumes.as_deref().unwrap_or_default(),
+            ) {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
             // "On Fargate for Linux containers, the only valid value is `task`": the host
             // the `host` PID mode shares its process namespace with is a container
             // instance of the caller's own, which a Fargate task has none of.
@@ -690,8 +706,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &network_mode,
             ),
             network_mode,
-            cpu: input.cpu.clone(),
-            memory: input.memory.clone(),
+            // The member as the request spelled it, so a registration that named no mode
+            // reads back with none (the stored mode above is the one its task runs in).
+            declared_network_mode: input.network_mode.clone(),
+            // "String values are converted to an integer indicating the CPU units when
+            // the task definition is registered", and the same for `memory` in MiB: the
+            // conversion is made ONCE, here, so every read of the revision reports the
+            // number of units it holds ([`crate::state::stored_task_cpu`]).
+            cpu: crate::state::stored_task_cpu(input.cpu.as_deref()),
+            memory: crate::state::stored_task_memory(input.memory.as_deref()),
             volumes: input.volumes.clone().unwrap_or_default(),
             placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
             requires_compatibilities,

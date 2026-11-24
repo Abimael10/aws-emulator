@@ -205,6 +205,28 @@ pub fn fargate_task_size_message(cpu: &str, memory: &str) -> String {
     )
 }
 
+/// The task-level `cpu` a registration STORES for the value the request named, or `None`
+/// when it named none.
+///
+/// `RegisterTaskDefinition$cpu` is read "as an integer using CPU units (for example,
+/// `1024`) or as a string using vCPUs (for example, `1 vCPU` or `1 vcpu`)", and "String
+/// values are converted to an integer indicating the CPU units when the task definition is
+/// registered" — so the conversion happens ONCE, where the revision is stored, and every
+/// later read of it reports the number of units rather than the spelling the request used.
+/// A value that spells no number of units at all ([`cpu_units`]) is stored as the request
+/// sent it: there is no count to convert it to.
+pub fn stored_task_cpu(cpu: Option<&str>) -> Option<String> {
+    cpu.map(|cpu| stated_units(cpu, cpu_units(cpu)))
+}
+
+/// The task-level `memory` a registration STORES, read the same way: `memory` is "an
+/// integer using MiB (for example ,`1024`) or ... a string using GB (for example, `1GB` or
+/// `1 GB`)", and "String values are converted to an integer indicating the MiB when the
+/// task definition is registered".
+pub fn stored_task_memory(memory: Option<&str>) -> Option<String> {
+    memory.map(|memory| stated_units(memory, memory_mib(memory)))
+}
+
 /// The same refusal where the task size came from a PLACEMENT's `overrides` rather than
 /// from the registration: the one fixed sentence, naming neither value.
 pub const FARGATE_TASK_SIZE_MESSAGE: &str = "No Fargate configuration exists for given values.";

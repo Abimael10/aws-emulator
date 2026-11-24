@@ -67,6 +67,28 @@ fn container() -> Value {
     json!({ "name": "app", "image": "public.ecr.aws/nginx/nginx:latest", "memory": 128 })
 }
 
+/// What a revision STORES for a size one of the rows below states: "String values are
+/// converted to an integer indicating the CPU units"/"the MiB when the task definition is
+/// registered" (`RegisterTaskDefinition$cpu`/`$memory`), and one vCPU is 1024 CPU units as
+/// one GB is 1024 MiB, so a row already stated in units stores itself. The conversion is
+/// tabled over every documented spelling in
+/// [`crate::fargate_feature_support_and_representation`]; here it is only what the pair a
+/// row registered is read back as.
+fn stored_size(value: &str) -> String {
+    let lowered = value.trim().to_ascii_lowercase();
+    let Some(count) = lowered
+        .strip_suffix("vcpu")
+        .or_else(|| lowered.strip_suffix("gb"))
+    else {
+        return lowered;
+    };
+    let count: f64 = count
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("a documented spelling states a count, got {value:?}"));
+    ((count * 1024.0).round() as i64).to_string()
+}
+
 /// The refusal a Fargate `cpu`/`memory` pair outside the catalog carries, for the values
 /// as the request stated them.
 fn no_configuration(cpu: &str, memory: &str) -> String {
@@ -328,7 +350,7 @@ async fn a_fargate_task_definition_takes_only_a_documented_cpu_memory_pair() {
                     string(revision, "cpu", case),
                     string(revision, "memory", case)
                 ),
-                (cpu.to_string(), memory.to_string()),
+                (stored_size(cpu), stored_size(memory)),
                 "case {case:?}: expected the registered size back, got {revision}"
             );
             let described = ok(
@@ -341,7 +363,7 @@ async fn a_fargate_task_definition_takes_only_a_documented_cpu_memory_pair() {
             let read = &described["taskDefinition"];
             assert_eq!(
                 (string(read, "cpu", case), string(read, "memory", case)),
-                (cpu.to_string(), memory.to_string()),
+                (stored_size(cpu), stored_size(memory)),
                 "case {case:?}: the stored revision keeps its size, got {read}"
             );
             continue;
