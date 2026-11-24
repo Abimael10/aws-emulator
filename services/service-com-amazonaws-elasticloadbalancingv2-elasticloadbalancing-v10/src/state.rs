@@ -234,6 +234,15 @@ pub use target_type_protocol::{
     LOAD_BALANCER_TARGET_TYPE,
 };
 
+/// Which members a target group HAS for the kind of target it holds: the target type whose
+/// targets are invoked rather than connected to carries no network identity at all.
+pub mod lambda_target_group_members;
+
+pub use lambda_target_group_members::{
+    check_members_for_target_type, member_not_for_target_type_message, member_stated,
+    stated_member_name,
+};
+
 /// The ADDRESS a load balancer publishes as its `DNSName`, and the socket of this
 /// emulator's own that answers there.
 pub mod load_balancer_endpoint;

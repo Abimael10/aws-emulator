@@ -317,6 +317,11 @@ pub async fn vpc_of(router: &MultiServiceRouter, subnet: &SeededSubnet) -> Strin
 
 /// Create one Elastic Load Balancing v2 target group over that service's own wire and answer
 /// the ARN it minted for it.
+///
+/// A target group whose targets are INVOKED rather than connected to (`TargetType` `lambda`)
+/// has no network identity, and Elastic Load Balancing refuses a create that states one for
+/// it — `Protocol`, `Port` and `VpcId` each document "if the target is a Lambda function,
+/// this parameter does not apply" — so such a row asks for none of the three.
 pub async fn create_target_group(
     router: &MultiServiceRouter,
     name: &str,
@@ -324,18 +329,13 @@ pub async fn create_target_group(
     target_type: &str,
     vpc_id: &str,
 ) -> String {
-    let (status, body) = elbv2_query(
-        router,
-        "CreateTargetGroup",
-        &[
-            p("Name", name),
-            p("Protocol", "HTTP"),
-            p("Port", port.to_string()),
-            p("VpcId", vpc_id),
-            p("TargetType", target_type),
-        ],
-    )
-    .await;
+    let mut params = vec![p("Name", name), p("TargetType", target_type)];
+    if target_type != "lambda" {
+        params.push(p("Protocol", "HTTP"));
+        params.push(p("Port", port.to_string()));
+        params.push(p("VpcId", vpc_id));
+    }
+    let (status, body) = elbv2_query(router, "CreateTargetGroup", &params).await;
     assert_eq!(
         status, 200,
         "CreateTargetGroup for {name:?} expected 200, got {status}: {body}"

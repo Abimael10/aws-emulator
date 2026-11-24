@@ -222,6 +222,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every refusal is raised before the first write, so a refused modify leaves
         // the stored health check exactly as it was.
         //
+        // The two members that address a target OVER THE NETWORK are not members a target
+        // group whose targets are invoked rather than connected to HAS — the ONE reading of
+        // that rule in `crate::state`, which `CreateTargetGroup` applies to the group it
+        // mints ([`crate::state::check_members_for_target_type`]). It is judged on the
+        // target type the group was created with, so such a group can no more be GIVEN a
+        // health-check protocol or port than it could be created with one — which is what
+        // keeps a stored Lambda target group reporting neither, as AWS reports it.
+        crate::state::check_members_for_target_type(
+            &group.target_type,
+            &[
+                (
+                    "HealthCheckProtocol",
+                    crate::state::member_stated(input.health_check_protocol.as_deref()),
+                ),
+                (
+                    "HealthCheckPort",
+                    crate::state::member_stated(input.health_check_port.as_deref()),
+                ),
+            ],
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // `HealthCheckPort` is a bare string in the model, so nothing in the model
         // bounds its VALUE and this handler is the only gate — the same rule, and the
         // same refusal, `CreateTargetGroup` applies to the member.

@@ -932,10 +932,12 @@ async fn target_group_health_check_defaults_follow_the_model() {
             },
         ),
         (
-            // HTTPS: the health check still defaults to HTTP ("for Application Load
-            // Balancers, the default is HTTP"), while the timeout follows the TARGET
-            // GROUP protocol: "for target groups with a protocol of TCP, TLS or
-            // HTTPS, the default is 10 seconds".
+            // HTTPS: the health check speaks the target group's own protocol, and takes
+            // the same 5-second timeout an HTTP group's does — RECORDED behaviour, which
+            // the member's own "for Application Load Balancers, the default is HTTP" and
+            // "for target groups with a protocol of TCP, TLS or HTTPS, the default is 10
+            // seconds" disagree with. The whole default set of each protocol is tabled in
+            // `all/target_group_protocol_version_and_health_check_defaults.rs`.
             "https-instance",
             vec![
                 p("Protocol", "HTTPS"),
@@ -943,11 +945,11 @@ async fn target_group_health_check_defaults_follow_the_model() {
                 p("VpcId", "vpc-1"),
             ],
             HealthCheckExpectation {
-                protocol: Some("HTTP"),
+                protocol: Some("HTTPS"),
                 port: Some("traffic-port"),
                 path: Some("/"),
                 interval: "30",
-                timeout: "10",
+                timeout: "5",
                 healthy: "5",
                 unhealthy: "2",
                 http_matcher: Some("200"),

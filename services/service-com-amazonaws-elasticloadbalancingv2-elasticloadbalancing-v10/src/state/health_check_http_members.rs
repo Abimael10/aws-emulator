@@ -18,24 +18,29 @@
 //! good path or matcher, just not one such a check can carry.
 //!
 //! Which protocol the probe speaks is the EFFECTIVE one: what the request names, else the
-//! default `HealthCheckProtocol` documents for that target group ("For Application Load
-//! Balancers, the default is HTTP. For Network Load Balancers and Gateway Load Balancers,
-//! the default is TCP") on a create, or what the target group already stores on a modify.
+//! default a target group of that protocol takes ([`default_health_check_protocol`]) on a
+//! create, or what the target group already stores on a modify.
 //! So a request that names a path and no protocol is judged against the protocol the
 //! check it asks for would actually speak.
 
 use super::is_http_protocol;
 
 /// The protocol the health check of a target group whose own protocol is `protocol`
-/// speaks when the request names none, from `HealthCheckProtocol`'s own documentation:
-/// "For Application Load Balancers, the default is HTTP. For Network Load Balancers and
-/// Gateway Load Balancers, the default is TCP" — an HTTP or HTTPS target group is an
-/// Application Load Balancer's, every other protocol a Network or Gateway one's.
+/// speaks when the request names none.
+///
+/// RECORDED behaviour: the probe speaks the target group's OWN protocol wherever a health
+/// check can speak it — which `ProtocolEnum` leaves as HTTP and HTTPS, since "the GENEVE,
+/// TLS, UDP, TCP_UDP, QUIC, and TCP_QUIC protocols are not supported for health checks" —
+/// and TCP for every other target group, whose protocol no health check could use. The
+/// member's own documentation says "for Application Load Balancers, the default is HTTP",
+/// and what the service ANSWERS is the contract where its documentation disagrees with it:
+/// a recorded create of an HTTPS target group that names no `HealthCheckProtocol` reports
+/// `HealthCheckProtocol` HTTPS.
 pub fn default_health_check_protocol(protocol: Option<&str>) -> &'static str {
-    if is_http_protocol(protocol) {
-        "HTTP"
-    } else {
-        "TCP"
+    match protocol {
+        Some("HTTPS") => "HTTPS",
+        Some("HTTP") => "HTTP",
+        _ => "TCP",
     }
 }
 
@@ -101,7 +106,7 @@ mod tests {
         // (the target group's protocol, the probe protocol it defaults to)
         let rows: &[(Option<&str>, &str)] = &[
             (Some("HTTP"), "HTTP"),
-            (Some("HTTPS"), "HTTP"),
+            (Some("HTTPS"), "HTTPS"),
             (Some("TCP"), "TCP"),
             (Some("TLS"), "TCP"),
             (Some("UDP"), "TCP"),
@@ -116,7 +121,7 @@ mod tests {
             assert_eq!(
                 default_health_check_protocol(*protocol),
                 *expected,
-                "case {protocol:?}: expected the documented default {expected}"
+                "case {protocol:?}: expected the default probe protocol {expected}"
             );
         }
     }

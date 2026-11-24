@@ -36,7 +36,7 @@ use crate::provisioning_loop::{
 };
 use crate::target_group_attributes_and_modification::{create_target_group, unescaped};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
-    check_security_groups, check_subnet_ipv6_cidrs,
+    check_security_groups, check_subnet_ipv6_cidrs, member_not_for_target_type_message,
     network::{NetworkRefusal, SecurityGroupFacts, SecurityGroupLookup, SubnetFacts},
     Refusal, SecurityGroupRefusal, INVALID_SECURITY_GROUPS, IPV6_CIDR_REQUIRED,
     SECURITY_GROUP_NOT_FOUND, SUBNETS_IN_TWO_ZONES_REQUIRED,
@@ -813,7 +813,10 @@ const NO_PORT_SPECIFIED: &str = "A port must be specified";
 
 /// `Port` is bracketed exactly as `VpcId` is — "the port on which the targets receive
 /// traffic", not used for a Lambda target — and is required wherever it applies: a target
-/// group whose targets receive traffic has to state on which port.
+/// group whose targets receive traffic has to state on which port, while the target type
+/// whose targets are INVOKED rather than connected to has no such member at all, so naming
+/// it there is refused under the member rule instead (tabled over the whole member set in
+/// `all/target_group_lambda_network_members.rs`).
 ///
 /// The rows cross every target type with a request that states a port and one that leaves
 /// the member out.
@@ -851,22 +854,28 @@ async fn a_target_group_whose_targets_receive_traffic_needs_a_port() {
             }
             let reply = call(&router, &form).await;
 
-            if !needs_port || port.is_some() {
+            // What the request asks for: a member the target type HAS and states is
+            // served, one it has and leaves out is refused for being required, and one it
+            // does not have at all is refused for being named.
+            let expected = match (*needs_port, port) {
+                (true, Some(_)) | (false, None) => None,
+                (true, None) => Some(NO_PORT_SPECIFIED.to_string()),
+                (false, Some(_)) => {
+                    Some(member_not_for_target_type_message("Port", target_type))
+                }
+            };
+            let Some(expected) = expected else {
                 assert_eq!(
                     reply.status, 200,
                     "case {case:?}: expected the create to be served, got {} body {}",
                     reply.status, reply.body
                 );
                 continue;
-            }
+            };
             assert_eq!(
                 refusal(&reply),
-                (
-                    400,
-                    VALIDATION_ERROR.to_string(),
-                    NO_PORT_SPECIFIED.to_string()
-                ),
-                "case {case:?}: expected 400 {VALIDATION_ERROR} {NO_PORT_SPECIFIED:?}, got {}",
+                (400, VALIDATION_ERROR.to_string(), expected.clone()),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {expected:?}, got {}",
                 reply.body
             );
             // A refused create stores nothing: the name is reported by nothing.
@@ -886,9 +895,11 @@ async fn a_target_group_whose_targets_receive_traffic_needs_a_port() {
 
 /// `VpcId` is optional in the model and REQUIRED for every target type whose targets are
 /// addressed inside a VPC — `instance`, `ip` and `alb`, and the default the model
-/// documents for an absent `TargetType` is `instance`. Only a `lambda` target group is
-/// exempt ("if the target type is lambda, this parameter does not apply"), and a create
-/// refused for it stores nothing.
+/// documents for an absent `TargetType` is `instance`. The target type whose targets are
+/// invoked rather than connected to has no VPC at all ("if the target type is lambda, this
+/// parameter does not apply"), so naming one there is refused under the member rule
+/// instead (`all/target_group_lambda_network_members.rs`), and a create refused either way
+/// stores nothing.
 ///
 /// The rows cross every target type (including the one the request leaves out) with the
 /// three shapes the member arrives in: a VPC id, no member at all, and the member carrying
@@ -931,22 +942,28 @@ async fn a_target_group_whose_targets_live_in_a_vpc_needs_one() {
             }
             let reply = call(&router, &form).await;
 
-            if !needs_vpc || *named {
+            // The same reading as the port rule above: a member the target type HAS and
+            // states is served, one it has and leaves out is refused for being required,
+            // and one it does not have at all is refused for being named.
+            let expected = match (*needs_vpc, *named) {
+                (true, true) | (false, false) => None,
+                (true, false) => Some(NO_VPC_SPECIFIED.to_string()),
+                (false, true) => {
+                    Some(member_not_for_target_type_message("VpcId", target_type))
+                }
+            };
+            let Some(expected) = expected else {
                 assert_eq!(
                     reply.status, 200,
                     "case {case:?}: expected the create to be served, got {} body {}",
                     reply.status, reply.body
                 );
                 continue;
-            }
+            };
             assert_eq!(
                 refusal(&reply),
-                (
-                    400,
-                    VALIDATION_ERROR.to_string(),
-                    NO_VPC_SPECIFIED.to_string()
-                ),
-                "case {case:?}: expected 400 {VALIDATION_ERROR} {NO_VPC_SPECIFIED:?}, got {}",
+                (400, VALIDATION_ERROR.to_string(), expected.clone()),
+                "case {case:?}: expected 400 {VALIDATION_ERROR} {expected:?}, got {}",
                 reply.body
             );
             // A refused create stores nothing: the name is reported by nothing.

@@ -251,7 +251,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| "instance".to_string());
         let lambda = target_type == crate::state::LAMBDA_TARGET_TYPE;
-        // `VpcId` is optional in the model and REQUIRED for every target type whose
+        // A target group whose targets are INVOKED rather than connected to has no network
+        // identity at all, so none of the members that state where or how traffic reaches
+        // its targets applies to it ([`crate::state::check_members_for_target_type`]).
+        // Judged before anything else about those members — and before the insert — so a
+        // self-inconsistent create is refused rather than quietly stripped of the values it
+        // asked for, and so it persists nothing.
+        //
+        // `Port` comes first, which is the member the recorded refusal of such a create
+        // names; the request's own protocol, VPC and health-check network members follow.
+        crate::state::check_members_for_target_type(
+            &target_type,
+            &[
+                ("Port", input.port.is_some()),
+                ("Protocol", stated(input.protocol.as_deref())),
+                ("VpcId", stated(input.vpc_id.as_deref())),
+                (
+                    "HealthCheckProtocol",
+                    stated(input.health_check_protocol.as_deref()),
+                ),
+                (
+                    "HealthCheckPort",
+                    stated(input.health_check_port.as_deref()),
+                ),
+            ],
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;        // `VpcId` is optional in the model and REQUIRED for every target type whose
         // targets live in a VPC — an `instance`, `ip` or `alb` target is addressed inside
         // one, while "if the target type is lambda, this parameter does not apply". The
         // model cannot express the dependency, so the handler refuses the request before
@@ -296,24 +321,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         validate_health_check_path(input.health_check_path.as_deref())?;
         validate_http_only_health_check_members(&input, &target_type)?;
         validate_protocol_version(
-            input.protocol_version.as_deref(),
+            stated_protocol_version(&input),
             input.protocol.as_deref(),
             &target_type,
         )?;
 
         // "If the target is a Lambda function, this parameter does not apply" —
         // `Protocol`, `Port` and `VpcId` each carry that sentence, and `ProtocolVersion`
-        // is "[HTTP/HTTPS protocol]". A Lambda target group therefore stores none of
-        // them, whatever the request carried, so a later read reports what AWS reports.
+        // is "[HTTP/HTTPS protocol]". A Lambda target group therefore stores none of them:
+        // a request that STATED one was refused above, and one that carried a member with
+        // nothing in it stated nothing, so a later read reports what AWS reports.
         let protocol = input.protocol.clone().filter(|_| !lambda);
         // "The default is HTTP1, which sends requests to targets using HTTP/1.1" — a
-        // protocol version belongs to an HTTP/HTTPS target group alone.
+        // protocol version belongs to an HTTP/HTTPS target group alone, and one such group
+        // always reports one: the version the request STATED, else that documented
+        // default. A member the request carried with nothing in it states no version, so
+        // it takes the default too rather than being stored — and reported — as a value
+        // that matches none of the ones `ProtocolVersion` documents.
         let protocol_version = if crate::state::is_http_protocol(protocol.as_deref()) {
             Some(
-                input
-                    .protocol_version
-                    .clone()
-                    .unwrap_or_else(|| "HTTP1".to_string()),
+                stated_protocol_version(&input)
+                    .unwrap_or("HTTP1")
+                    .to_string(),
             )
         } else {
             None
@@ -592,6 +621,19 @@ fn validate_protocol_version(
     )))
 }
 
+// Whether a string member the request carried STATES a value: the ONE reading of that in
+// `crate::state`, which `ModifyTargetGroup` reads too.
+use crate::state::member_stated as stated;
+
+/// The `ProtocolVersion` this request STATED, reading a member that carries nothing as
+/// absent (see [`stated`]).
+fn stated_protocol_version(input: &CreateTargetGroupInput) -> Option<&str> {
+    input
+        .protocol_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+}
+
 /// The tags to store. `CreateTargetGroup` models no duplicate-key error, so a
 /// repeated key keeps its last value.
 fn tag_map(tags: Option<&[Tag]>) -> std::collections::HashMap<String, String> {
@@ -622,10 +664,9 @@ fn health_check_config(
     let protocol = input.protocol.as_deref().filter(|_| !lambda);
     let geneve = protocol == Some("GENEVE");
 
-    // "For Application Load Balancers, the default is HTTP. For Network Load
-    // Balancers and Gateway Load Balancers, the default is TCP." An HTTP or HTTPS
-    // target group is an Application Load Balancer's; every other protocol is a
-    // Network or Gateway Load Balancer's.
+    // The probe speaks the target group's own protocol wherever a health check can speak
+    // it, and TCP otherwise (RECORDED behaviour — see
+    // [`crate::state::default_health_check_protocol`], the one reading of that default).
     let health_check_protocol = input.health_check_protocol.clone().or_else(|| {
         if lambda {
             None
@@ -655,7 +696,7 @@ fn health_check_config(
     let path = input.health_check_path.clone().or_else(|| {
         if health_check_is_http {
             Some(crate::state::default_health_check_path(
-                input.protocol_version.as_deref(),
+                stated_protocol_version(input),
             ))
         } else {
             None
@@ -681,19 +722,16 @@ fn health_check_config(
     // For target groups with a protocol of GENEVE, the default is 5 seconds. If the
     // target type is lambda, the default is 30 seconds."
     //
-    // The HTTP row follows the RECORDED response rather than that sentence: a recorded
-    // `CreateTargetGroup` of an HTTP target group answers
-    // `HealthCheckTimeoutSeconds` 5 (the issue this change answers quotes the whole
-    // defaulted member set of
-    // `elasticloadbalancing-create-target-group-health-check-defaults#task#2`), and
-    // what the service answers is the contract where its own documentation disagrees
-    // with it. It lands on the same 5 seconds GENEVE is documented with, which is why
-    // the two share an arm. Every other row has no recording to prefer, so it stays as
-    // documented.
+    // The HTTP and HTTPS rows follow the RECORDED response rather than those sentences: a
+    // recorded `CreateTargetGroup` of an HTTP target group and one of an HTTPS target
+    // group each answer `HealthCheckTimeoutSeconds` 5, and what the service answers is the
+    // contract where its own documentation disagrees with it. Both land on the same 5
+    // seconds GENEVE is documented with, which is why the three share an arm. Every other
+    // row has no recording to prefer, so it stays as documented.
     let timeout_seconds = input.health_check_timeout_seconds.unwrap_or({
         if lambda {
             30
-        } else if geneve || protocol == Some("HTTP") {
+        } else if geneve || is_http(protocol) {
             5
         } else {
             10
@@ -730,7 +768,7 @@ fn health_check_config(
         .or_else(|| {
             if health_check_is_http {
                 Some(crate::state::default_health_check_matcher(
-                    input.protocol_version.as_deref(),
+                    stated_protocol_version(input),
                     family,
                 ))
             } else {
