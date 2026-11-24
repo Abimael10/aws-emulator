@@ -1193,3 +1193,184 @@ async fn the_refusal_names_the_database_the_read_addressed() {
         );
     }
 }
+
+/// Register a table named `table` in the governed [`DATABASE`], through Glue's own wire API
+/// and by the ACCOUNT's own credential — the database hands the tables made in it no
+/// `IAM_ALLOWED_PRINCIPALS` default, so the table starts out holding nothing for a principal
+/// that did not create it.
+async fn create_governed_table(router: &MultiServiceRouter, case: &str, table: &str) {
+    let (status, body) = call(
+        router,
+        "CreateTable",
+        &json!({ "DatabaseName": DATABASE, "TableInput": { "Name": table } }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: creating {DATABASE}.{table} must succeed, got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_table_refusal_names_the_table_the_read_addressed() {
+    // The variable part of the TABLE-level refusal on its own: the sentence is the same for
+    // every table and the name it carries is the one the read addressed, so the rows differ
+    // along the form of that name — its length, from one character up to the modelled
+    // ceiling (`NameString`, which a `GetTable$Name` is, like a database name), and the
+    // characters in it. Each row then shows a grant on that table restoring the same read,
+    // and the rows differ along the permission the grant carries too, because WHICH
+    // permission it carries does not decide whether the metadata may be read.
+    let longest = "t".repeat(NAME_STRING_MAX_LENGTH);
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "a one-character name, the shortest a NameString may be",
+            "t".to_string(),
+            "DESCRIBE",
+        ),
+        (
+            "a name carrying an underscore, restored by SELECT alone",
+            "page_views".to_string(),
+            "SELECT",
+        ),
+        (
+            "a name carrying digits and underscores, restored by ALL",
+            "clicks_2024_eu".to_string(),
+            "ALL",
+        ),
+        (
+            "a name at the NameString length ceiling",
+            longest,
+            "DESCRIBE",
+        ),
+    ];
+
+    for (case, table, permission) in &cases {
+        let governed = governed_catalog().await;
+        create_governed_table(&governed.router, case, table).await;
+
+        let (status, body) = glue_as(
+            &governed.router,
+            &governed.session_key,
+            "GetTable",
+            &json!({ "DatabaseName": DATABASE, "Name": table }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: with nothing held on the table the read must be refused, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Insufficient Lake Formation permission(s): Required Describe on {table}"),
+            "case {case:?}: expected the refusal to name the permission required and the table \
+             the read addressed, got {body}"
+        );
+
+        grant(
+            &governed.router,
+            case,
+            &reader_arn(),
+            json!({ "Table": { "DatabaseName": DATABASE, "Name": table } }),
+            &[permission],
+        )
+        .await;
+
+        let (status, body) = glue_as(
+            &governed.router,
+            &governed.session_key,
+            "GetTable",
+            &json!({ "DatabaseName": DATABASE, "Name": table }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a {permission} grant on the table must make it readable, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["Table"]["Name"].as_str(),
+            Some(table.as_str()),
+            "case {case:?}: expected the table to be answered, got {body}"
+        );
+    }
+}
+
+/// A database created WITHOUT a `CreateTableDefaultPermissions` of its own, so the tables
+/// made in it carry the `ALL`-to-`IAM_ALLOWED_PRINCIPALS` grant a catalog under IAM access
+/// control hands out — the control the governed database above is read against.
+const OPEN_DATABASE: &str = "open_lake";
+
+#[tokio::test]
+async fn the_table_refusal_is_lake_formations_and_not_the_readers_iam() {
+    // What isolates the refusal: the SAME reader, in the same session, reading two tables of
+    // the same name — one in a database that hands its tables the IAM_ALLOWED_PRINCIPALS
+    // grant, one in a database that hands them nothing. The open table is answered, which
+    // says the reader's own access to the catalog read is not what the other read lacks, and
+    // the governed one is refused by Lake Formation in the sentence naming the permission it
+    // required.
+    let case = "the same reader on an open and a governed table";
+    let governed = governed_catalog().await;
+
+    let (status, body) = call(
+        &governed.router,
+        "CreateDatabase",
+        &json!({ "DatabaseInput": { "Name": OPEN_DATABASE } }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: creating {OPEN_DATABASE} must succeed, got {status} with {body}"
+    );
+    let (status, body) = call(
+        &governed.router,
+        "CreateTable",
+        &json!({ "DatabaseName": OPEN_DATABASE, "TableInput": { "Name": TABLE } }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: creating {OPEN_DATABASE}.{TABLE} must succeed, got {status} with {body}"
+    );
+
+    let (status, body) = glue_as(
+        &governed.router,
+        &governed.session_key,
+        "GetTable",
+        &json!({ "DatabaseName": OPEN_DATABASE, "Name": TABLE }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the table of the open database must be answered, got {status} with \
+         {body}"
+    );
+
+    let (status, body) = glue_as(
+        &governed.router,
+        &governed.session_key,
+        "GetTable",
+        &json!({ "DatabaseName": DATABASE, "Name": TABLE }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: the governed table must be refused, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "AccessDeniedException",
+        "case {case:?}: expected AccessDeniedException, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("Insufficient Lake Formation permission(s): Required Describe on {TABLE}"),
+        "case {case:?}: expected the refusal to name the permission required and the table the \
+         read addressed, got {body}"
+    );
+}
